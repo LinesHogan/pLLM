@@ -37,6 +37,13 @@ from tllm.consumers.devlist.ttrl import (
     TTRLStats,
     majority_vote_rewards,
 )
+from tllm.consumers.devlist.tlm import (
+    TLMConsumer,
+    TLMConsumerConfig,
+    TLMEngine,
+    TLMStats,
+    select_ttl_samples,
+)
 
 __all__ = [
     "FTTTConsumer",
@@ -63,6 +70,11 @@ __all__ = [
     "TTRLEngine",
     "TTRLSample",
     "TTRLStats",
+    "TLMConsumer",
+    "TLMConsumerConfig",
+    "TLMEngine",
+    "TLMStats",
     "majority_vote_rewards",
     "parse_reward",
+    "select_ttl_samples",
 ]
