@@ -192,6 +192,57 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         self.assertEqual(batch.entries[1].reward, 1.0)
         self.assertEqual(batch.entries[1].label, "5")
 
+    def test_consume_bundle_writes_boxed_majority_reward_outcome_sink(self) -> None:
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
+        from tllm.contracts.port_bundle import BundleKey, PortBundle
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.batches: list[RewardOutcomeBatch] = []
+
+            def append(self, batch: RewardOutcomeBatch) -> int:
+                self.batches.append(batch)
+                return len(batch.entries)
+
+        sink = _Sink()
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"\boxed{4}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=0,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(),
+                    text="Answer: 4",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+            )
+        )
+        bundle = PortBundle(
+            key=BundleKey(engine_step_id=1, phase="post_generate", request_id="", sample_idx=0),
+            entries={"generation_trace": trace, "reward_outcome": sink},
+        )
+
+        TTRLConsumer(TTRLConsumerConfig()).consume_bundle(bundle, ctx=object())
+
+        self.assertEqual(len(sink.batches), 1)
+        self.assertEqual(len(sink.batches[0].entries), 2)
+        self.assertEqual(sink.batches[0].entries[0].reward, 1.0)
+        self.assertEqual(sink.batches[0].entries[1].skip_reason, "missing-boxed-answer")
+
     def test_ttrl_module_does_not_import_verl(self) -> None:
         before = set(sys.modules)
 

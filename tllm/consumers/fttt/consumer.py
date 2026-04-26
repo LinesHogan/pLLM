@@ -439,6 +439,17 @@ class FTTTConsumer(BaseConsumer):
                 )
         return RewardOutcomeBatch(entries=tuple(outcomes))
 
+    def consume_bundle(self, bundle, ctx) -> None:
+        _ = ctx
+        trace = bundle.entries.get("generation_trace")
+        if not isinstance(trace, GenerationTraceBatch):
+            raise TypeError("generation_trace entry must be GenerationTraceBatch")
+        sink = bundle.entries.get("reward_outcome")
+        append = getattr(sink, "append", None)
+        if not callable(append):
+            raise TypeError("reward_outcome entry must provide append")
+        append(self.process_generation_trace(trace))
+
     def apply_feedback_update(self, hidden: torch.Tensor, feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord]) -> None:
         records = list(feedback)
         self.engine.update(hidden, records)

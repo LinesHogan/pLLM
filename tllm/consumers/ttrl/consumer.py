@@ -326,6 +326,19 @@ class TTRLConsumer(BaseConsumer):
 
         return write_reward_outcomes(runtime, build_ttrl_reward_outcome_batch(trace))
 
+    def consume_bundle(self, bundle, ctx) -> None:
+        _ = ctx
+        from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
+
+        trace = bundle.entries.get("generation_trace")
+        if not isinstance(trace, GenerationTraceBatch):
+            raise TypeError("generation_trace entry must be GenerationTraceBatch")
+        sink = bundle.entries.get("reward_outcome")
+        append = getattr(sink, "append", None)
+        if not callable(append):
+            raise TypeError("reward_outcome entry must provide append")
+        append(build_ttrl_reward_outcome_batch(trace))
+
     def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
         reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)
         self.engine.update(hidden, reward_tensor)

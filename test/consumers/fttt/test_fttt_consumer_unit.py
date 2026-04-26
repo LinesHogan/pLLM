@@ -206,6 +206,55 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         self.assertEqual(queued[0].feedback, "Your answer is incorrect. Recheck the arithmetic.")
         self.assertEqual(queued[0].reward, 0.0)
 
+    def test_consume_bundle_writes_reward_outcome_sink(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.contracts.port_bundle import BundleKey, PortBundle
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.batches: list[RewardOutcomeBatch] = []
+
+            def append(self, batch: RewardOutcomeBatch) -> int:
+                self.batches.append(batch)
+                return len(batch.entries)
+
+        sink = _Sink()
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text=f"fix {entry.text}",
+                judge="toy",
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-fail",
+                    prompt_idx=7,
+                    sample_idx=2,
+                    output_index=0,
+                    token_ids=(),
+                    text="5",
+                    finish_reason="stop",
+                    group_id="round-1",
+                ),
+            )
+        )
+        bundle = PortBundle(
+            key=BundleKey(engine_step_id=1, phase="post_generate", request_id="", sample_idx=0),
+            entries={"generation_trace": trace, "reward_outcome": sink},
+        )
+
+        consumer.consume_bundle(bundle, ctx=object())
+
+        self.assertEqual(len(sink.batches), 1)
+        self.assertEqual(sink.batches[0].entries[0].feedback_text, "fix 5")
+        self.assertEqual(consumer.read_stats().queued_feedback, 1)
+
     def test_trace_success_is_judged_and_not_queued_for_feedback(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
