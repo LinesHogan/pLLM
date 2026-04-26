@@ -95,7 +95,7 @@ Commands are shown with placeholders to avoid local machine paths.
 Result:
 
 ```text
-11 passed
+12 passed
 ```
 
 Environment check:
@@ -227,8 +227,9 @@ by row id. It still does not itself patch vLLM or perform sampling.
 
 - `flows()` returns empty, so the current consumer is a manual logits/sampler
   primitive rather than an automatically wired runtime consumer.
-- Iteration selection is explicit via the `iteration` argument; upstream derives
-  it from request ids and supports multiple iteration groups in one batch.
+- The batch bridge can parse iteration groups from request ids or accept
+  explicit iteration ids, but tLLM still lacks an automatic vLLM sampler/runtime
+  hook that feeds those groups through decoding.
 - The local update path does not use `ignore_index=-100`; upstream does. This
   should not matter for ordinary sampled token ids, but it matters if masked
   targets are ever passed through the same API.

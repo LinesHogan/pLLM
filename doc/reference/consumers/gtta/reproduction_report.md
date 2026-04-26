@@ -2,7 +2,7 @@
 
 ## Scope
 
-- tLLM revision inspected: `21b76bd`
+- tLLM revision inspected: current local `main` after consumer package migration
 - Upstream GTTA revision inspected: `24ba304`
 - tLLM files inspected: `tllm/consumers/gtta/consumer.py`, `test/consumers/gtta/test_gtta_consumer_unit.py`, `doc/reference/consumers/gtta/index.md`, `docs/devlist.md`, and the devlist consumer design docs.
 - Upstream files inspected: `README.md`, `WebArena/README.md`, `BFCLv3/README.md`, `WebArena/src/run_exploration.py`, `WebArena/src/run_agent.py`, `WebArena/src/agent/agentlab_agent.py`, `WebArena/src/agent/prompts/prompt_constructor.py`, `WebArena/src/process_into_jsons.py`, `BFCLv3/berkeley-function-call-leaderboard/bfcl/model_handler/base_handler.py`, `BFCLv3/berkeley-function-call-leaderboard/bfcl/model_handler/utils.py`, and `vllm/model_runner.py`.
@@ -26,12 +26,16 @@ The WebArena, browsergym, bgym, agentlab, BFCL, notebooks, local website service
 
 ## tLLM Mapping
 
-The current tLLM GTTA implementation is a lightweight feedback ingester:
+The current tLLM GTTA implementation is a lightweight trajectory feedback and
+candidate-ranking ingester:
 
-- `TrajectoryFeedback` validates `task_id`, `action`, `observation`, and parseable reward.
+- `TrajectoryFeedback` validates `task_id`, `action`, and parseable reward.
 - `GTTAConsumer.enqueue_trajectory()` stores feedback in a bounded queue and reports drops.
-- `GTTAConsumer.process_queued_trajectories()` drains queued records and updates a per-action score with optional momentum.
+- `GTTAConsumer.process_queued_trajectories()` drains queued records and updates
+  task/state/action-scoped scores with optional momentum.
 - `GTTAConsumer.score_action()` exposes the local score table.
+- `GTTAConsumer.rank_candidate_actions()` ranks candidate actions for a given
+  task and state signature.
 - `GTTAConsumer.read_stats()` reports queued, dropped, processed, and updated counts.
 - The module imports only stdlib plus tLLM consumer contracts; it does not import WebArena, browsergym, bgym, agentlab, or BFCL.
 
@@ -59,7 +63,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
    PYTHONDONTWRITEBYTECODE=1 <repo-venv>/bin/python -m pytest -q -p no:cacheprovider test/consumers/gtta/test_gtta_consumer_unit.py
    ```
 
-   Result: `7 passed`.
+   Result: `10 passed`.
 
 2. Toy trajectory check:
 
@@ -69,7 +73,8 @@ Commands are summarized with placeholders to avoid machine-specific paths.
      - accepted flags: `[True, True, True, False]`
      - after partial drain: `queued_trajectories=1`, `dropped_trajectories=1`, `processed_trajectories=2`, `update_count=2`
      - final stats: `queued_trajectories=0`, `dropped_trajectories=1`, `processed_trajectories=3`, `update_count=3`
-     - final scores: `click search=0.5625`, `click ad=0.0`, `type query=0.0`
+     - final scores are scoped by task and state signature, so the same action
+       string can have different values in different states/tasks.
      - selected score order placed `click search` first.
 
 3. Dependency probe:
@@ -96,7 +101,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 
 ## Alignment Conclusion
 
-**Against the tLLM devlist target:** the implementation is aligned. It preserves the environment boundary, avoids large dependencies, validates and queues feedback, updates action scores in the expected direction, and exposes counters that prove work happened.
+**Against the tLLM devlist target:** the implementation is aligned. It preserves the environment boundary, avoids large dependencies, validates and queues feedback, updates task/state/action-scoped scores in the expected direction, exposes counters that prove work happened, and provides a local candidate-ranking API.
 
 **Against full upstream GTTA:** this is only an inspired subset, not a full reproduction. The following upstream mechanisms are not reproduced:
 
@@ -113,13 +118,17 @@ So the correct classification is: **tLLM GTTA is a dependency-light trajectory f
 
 ## Gaps And Risks
 
-- `observation` is stored but not used in scoring, so the score table cannot learn state-conditioned dynamics.
-- Scores are keyed only by raw action text; identical action strings in different states/tasks are conflated.
-- `task_id` is validated but not used for per-task isolation.
-- There is no consumer flow, sampler/reranker integration, or policy intervention; callers must manually use `score_action()`.
+- State/task-aware dynamics records and candidate ranking exist locally, but they
+  are not connected to tLLM prompt injection, sampler/reranker integration, or
+  policy intervention; callers must manually use `score_action()` or
+  `rank_candidate_actions()`.
 - The reward update is scalar exponential smoothing, not upstream DG prompt grounding, q-judge preference learning, or SA parameter adaptation.
 - There is no real-model comparison because the current implementation has no model path to compare against upstream GTTA's prompt or vLLM adaptation behavior.
 
 ## Recommendation
 
-Keep the current implementation documented as **GTTA-inspired**. If the goal is closer reproduction, the next minimum step should be state/task-aware dynamics records plus a policy-facing selection API, still without importing WebArena or BFCL. A faithful full reproduction would require a separate design for DG prompt injection and SA hidden-state adaptation rather than expanding this simple score-table consumer silently.
+Keep the current implementation documented as **GTTA-inspired**. If the goal is
+closer reproduction, the next minimum step is framework integration: DG prompt
+injection, trajectory/dynamics store plumbing, sampler or policy-facing use of
+the ranking API, and a separate SA hidden-state adaptation design. A faithful
+full reproduction should not be hidden inside this simple score-table consumer.

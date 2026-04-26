@@ -34,26 +34,30 @@ What maps reasonably:
 
 - It exposes explicit `online` and `offline` modes.
 - Offline mode buffers updates until `flush_offline()`.
-- It has a threshold-selection helper.
-- It has a local low-rank adapter and verifies that adapter weights change.
+- It has a CE threshold-selection helper that selects rows with
+  `sentence_ce > threshold`, matching the upstream direction.
+- Its logits path implements the selected-row weighted one-hot KL/CE objective
+  with `lamb * exp(sentence_ce - threshold)`.
+- Offline mode accepts caller-supplied `base_logits` for base-model CE
+  selection before the local adapter update.
+- It has a local low-rank hidden-to-vocab adapter and verifies that adapter
+  weights change.
 - It intentionally avoids importing LLaMA-Factory or upstream training
   dependencies.
 
 What does not map to the upstream core:
 
-- Selection direction is inverted for raw upstream CE. tLLM selects scores below
-  threshold, while upstream selects CE above threshold. This can align only if
-  callers pass a quality/confidence score that decreases as CE increases, such
-  as `exp(-CE)`, and transform the threshold accordingly.
-- The objective is different. tLLM trains `adapter(hidden)` with MSE toward
-  `1 - score`; upstream trains LoRA parameters using weighted KL over token
-  logits and labels.
-- The `lamb * exp(CE - threshold)` weighting is not implemented.
-- tLLM adapts a standalone scalar low-rank adapter head, not the model's LoRA
-  target modules.
+- The scalar-score fallback path still trains `adapter(hidden)` with MSE toward
+  `1 - score`; that fallback is not equivalent to upstream TTL and should not
+  be used as the primary aligned path.
+- tLLM adapts a local hidden-to-vocab low-rank head, not the model's LoRA target
+  modules such as `q_proj,v_proj`.
 - `adapter_slots` is allocated but only slot 0 is trained.
 - `flows()` is empty, so this consumer is not wired to collect hidden states,
   logits, labels, request metadata, or generation events from the tLLM runtime.
+- Offline base-logit selection is caller supplied. tLLM does not yet
+  autonomously disable a runtime LoRA adapter and compute base logits inside the
+  engine.
 - Online/offline ordering is a local API convention only. It does not enforce
   upstream's "predict then train" online loop or "train then predict" offline
   loop inside decode/runtime execution.
@@ -77,14 +81,14 @@ tensors.
 All Python checks used the repo virtual environment as `<repo>/.venv/bin/python`.
 
 - `pytest -q -p no:cacheprovider test/consumers/tlm/test_tlm_consumer_unit.py`
-  - Result: `7 passed`.
+  - Result: `13 passed`.
 - Checked availability of local packages:
   - `torch`, `transformers`, and `vllm` are available.
   - `datasets`, `peft`, and installed `llamafactory` are not available.
 - Tried importing upstream TTL trainer with `PYTHONPATH=<upstream>/src`.
   - Result: `ModuleNotFoundError: No module named 'accelerate'`.
 - Ran a cached `sshleifer/tiny-gpt2` local-only check to compute upstream-style
-  CE/KL and compare threshold selection with tLLM selection.
+  CE/KL and compare threshold selection with the tLLM CE path.
 - Ran a synthetic online/offline tLLM state-machine check.
 
 ## Local Model / Toycase Results
@@ -98,11 +102,8 @@ Cached tiny model check:
   `[10.8277, 10.8280]`.
 - With threshold set to the mean CE, upstream selection
   `CE > threshold` selected row `[1]`.
-- tLLM selection on transformed quality scores `exp(-CE) < exp(-threshold)`
-  also selected row `[1]`.
-- tLLM selection on raw CE with its default "score below threshold" rule selected
-  row `[0]`, the opposite side of the upstream boundary.
-- A tLLM online update changed adapter weights and produced
+- tLLM selection on raw CE also selected row `[1]`.
+- A tLLM online logits update changed adapter weights and produced
   `update_count=1`, `loss_count=1`, `selected_count=1`.
 
 Synthetic state-machine check:
@@ -114,37 +115,32 @@ Synthetic state-machine check:
   before flush `update_count=0`, `buffered_count=4`;
   after flush `update_count=1`, `loss_count=1`, `selected_count=2`.
 
-These checks confirm the tLLM implementation's own local behavior, and they
-also show that raw upstream CE cannot be passed directly into tLLM selection
-without reversing the selection semantics.
+These checks confirm that the tLLM logits path now matches the upstream CE
+selection direction and weighted one-hot KL/CE formula at the local objective
+level.
 
 ## Alignment Conclusion
 
-The current tLLM TLM consumer is not a correct reproduction of upstream TLM's
-core learning mechanism. It is better described as a lightweight TLM-inspired
-state-machine smoke implementation.
+The current tLLM TLM consumer is a partial formula-level reproduction of the
+upstream TTL objective, but not a full runtime reproduction.
 
-It partially captures the surface ideas of online/offline test-time adaptation,
-threshold-based sample filtering, and low-rank parameter updates. It does not
-reproduce the upstream training objective, CE-based selection semantics,
-loss weighting, base-model CE selection in offline TTL, model-LoRA update target,
-or integration into an actual predict/train test-time loop.
+It now captures online/offline test-time adaptation APIs, CE-threshold sample
+filtering, selected-row exponential weighting, and a local logits/label loss. It
+still does not reproduce the upstream model-LoRA update target or integration
+into an actual predict/train runtime loop. Offline base-model selection is
+available only when the caller supplies base logits.
 
 ## Gaps And Risks
 
-- Correctness gap: upstream selects difficult samples by high CE; tLLM selects
-  low scalar scores. This needs an explicit score contract or a CE-specific
-  selection path.
-- Objective gap: MSE to `1 - score` is not equivalent to weighted KL over token
-  logits and labels.
-- Adaptation gap: training a detached scalar adapter cannot reproduce LoRA
+- Fallback gap: the scalar-score path remains approximate and should be treated
+  as a legacy fallback, not the aligned TTL path.
+- Adaptation gap: training a local hidden-to-vocab adapter cannot reproduce LoRA
   updates to model attention projections.
 - Runtime gap: no declared flows means the consumer cannot run autonomously in
   tLLM's producer-consumer path.
-- Offline gap: tLLM has no concept of disabling the adapter to compute base CE
-  before selecting samples.
+- Offline gap: tLLM does not yet disable runtime adapters itself to compute base
+  CE before selecting samples.
 - Online/offline loop gap: tLLM exposes update calls but does not own the
   upstream predict/train ordering.
-- Coverage gap: tests verify local counters and updates, but not equivalence to
-  upstream CE/KL formulas.
-
+- Coverage gap: tests verify local CE/KL formulas and counters, but not a real
+  vLLM LoRA target-module update.

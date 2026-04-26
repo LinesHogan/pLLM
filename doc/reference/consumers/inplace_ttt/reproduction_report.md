@@ -25,7 +25,8 @@ The local consumer is a tLLM-native, In-Place-TTT-inspired consumer rather than 
 - Prefill delivery is declared as ordinary `bundle` with borrowed tensors.
 - Decode delivery is declared as `device_lease` with runtime-owned active rows.
 - The local engine trains a `LowRankAdapter(source_hidden)` to predict `target_hidden - source_hidden` using MSE and Adam.
-- Rows are padded to the configured chunk multiple, while the loss and counters use only valid rows.
+- The engine trains only complete chunks and carries incomplete tail rows across
+  calls. It does not pad tail rows into training examples.
 
 This maps the broad online/local hidden-state adaptation idea, but it does not reproduce the exact upstream in-place MLP `down_proj` fast-weight update. It also does not implement upstream `ttt_conv`, optional `ttt_proj`, cumulative per-chunk fast weights, or per-layer cache tails.
 
@@ -34,18 +35,25 @@ This maps the broad online/local hidden-state adaptation idea, but it does not r
 Commands were run with the repo virtual environment, summarized without machine-local absolute paths:
 
 - `<repo>/.venv/bin/python -m pytest -q test/consumers/inplace_ttt/test_inplace_ttt_consumer_unit.py`
-  - Result: `7 passed`.
+  - Result: `10 passed`.
 - Upstream import smoke with `PYTHONPATH=<upstream>`:
   - Result: failed because `opt_einsum` is not installed in the current virtual environment.
 - Upstream import with a temporary in-memory `opt_einsum.contract` shim:
   - Result: failed later with a Transformers decorator API mismatch, so a direct upstream lightweight run was not reliable in this environment.
 - Local toycase for tLLM flow/update behavior:
   - Default flow phases: `prefill`, `prefill`.
-  - Default prefill bundle updated once: `update_count=1`, `loss_count=1`, `trained_rows=3`.
-  - Explicit decode-only flow used `device_lease` and updated only active rows: `update_count=1`, `loss_count=1`, `trained_rows=2`.
+  - With a deliberately small non-default chunk size, a prefill bundle updated
+    once: `update_count=1`, `loss_count=1`, `trained_rows=3`.
+  - With a deliberately small non-default chunk size, an explicit decode-only
+    flow used `device_lease` and updated only active rows:
+    `update_count=1`, `loss_count=1`, `trained_rows=2`.
 - Local cached real-model hidden smoke using `sshleifer/tiny-gpt2` with `local_files_only=True`:
   - Prompt hidden rows: `tokens=9`, `hidden=2`.
-  - Feeding source/target hidden rows to the tLLM consumer produced `update_count=1`, `loss_count=1`, `trained_rows=9`.
+  - Feeding source/target hidden rows to the tLLM consumer with a deliberately
+    small non-default chunk size produced `update_count=1`, `loss_count=1`,
+    `trained_rows=9`.
+  - With the default `chunk_size=4096`, these short toy/model rows remain tail
+    rows and do not train immediately.
 - Upstream-mechanism toycase:
   - Sequence length below chunk: zero updates.
   - Sequence length equal to chunk: one update.
@@ -56,7 +64,11 @@ Commands were run with the repo virtual environment, summarized without machine-
 
 ## Alignment conclusion
 
-At the consumer API and unit-test level, the tLLM implementation correctly avoids making decode the default. Its default flow is prefill-only, and decode has to be explicitly requested. The consumer also performs local online updates and accounts for chunk padding and active decode rows correctly in the checks above.
+At the consumer API and unit-test level, the tLLM implementation correctly
+avoids making decode the default. Its default flow is prefill-only, and decode
+has to be explicitly requested. The consumer also performs local online updates,
+complete-chunk training, tail carryover, and active decode row handling in the
+checks above.
 
 As an exact reproduction of upstream In-Place TTT, it is incomplete. The upstream core update is an in-place fast-weight update of the MLP down projection with chunkwise cumulative weights; the tLLM consumer trains a separate low-rank delta adapter from source to target hidden states. This is a reasonable tLLM-native approximation, but it should be described as inspired/approximate, not exact.
 

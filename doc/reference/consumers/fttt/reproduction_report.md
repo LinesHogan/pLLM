@@ -17,17 +17,28 @@ The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
 
 - `FeedbackRecord(prompt_idx, feedback, reward)`.
 - A bounded feedback queue and drain method.
-- A small zero-output low-rank adapter from hidden rows to one scalar.
-- MSE training from hidden rows to scalar rewards.
+- A small zero-output low-rank edit adapter that maps
+  `hidden + hashed feedback text features + reward` to a hidden-space delta.
+- MSE training of the hidden delta toward the feedback-conditioned edit target.
+- `edit_delta`, `apply_edit_to_hidden`, and `apply_edit_to_logits` helpers that
+  let the learned edit affect later hidden rows or logits.
+- Per-instance retry state, stop-on-correct handling, and explicit reset.
 - Stats for queued, dropped, consumed feedback, update count, loss count, and last loss.
 - No import of external feedback APIs or heavy upstream modules.
 
-This maps only to a small local reward-learning primitive. It does not map to the upstream FTTT loop's core runtime behavior:
+This maps to a local feedback-conditioned edit primitive. It is closer than a
+scalar reward head because feedback text can change the learned edit and the
+edit can be applied to hidden/logit tensors. It still does not map to the
+upstream FTTT loop's full runtime behavior:
 
-- The `feedback` text is stored but not tokenized, modeled, or used in the loss.
-- The update predicts scalar reward; it does not train on feedback tokens or the failed completion context.
-- The adapter output is not connected to next-token logits, model weights, or a named-delta mechanism, so the update cannot by itself change future reasoning/generation.
-- There is no generate/check/retry loop, no dataset judge, no stop-on-correct behavior, and no per-test-instance reset.
+- The `feedback` text is feature-hashed, not tokenized or trained with an LM
+  feedback-token loss.
+- The scalar reward is used as an edit input/training signal; the update does
+  not train on feedback tokens or the failed completion context.
+- The adapter output can be applied to hidden/logit tensors, but tLLM does not
+  yet own an integrated generate/check/retry loop that applies it during vLLM
+  decoding.
+- There is no dataset judge or runtime retry orchestrator.
 - There is no equivalent of upstream LoRA test-time optimization or OpTune's activation/gradient transform.
 - Positive/negative feedback is reduced to numeric regression targets, not the upstream target construction around incorrect feedback, correct completions, and ground-truth solutions.
 
@@ -52,7 +63,7 @@ Therefore, I did not treat upstream execution failure as evidence against the al
 Commands are summarized with placeholders to avoid machine-local paths:
 
 - `<repo>/.venv/bin/python -m pytest -q test/consumers/fttt/test_fttt_consumer_unit.py`
-  - Result: `6 passed in 1.11s`.
+  - Result: `10 passed in 1.17s`.
 - Dependency probe in `<repo>/.venv/bin/python`
   - `torch`, `transformers`, `fastapi`, `requests`, and `sentencepiece` present.
   - `peft` and `adapters` missing.
@@ -84,19 +95,35 @@ Cached real-model hidden-row update:
 - MSE decreased from approximately `0.470` after the first update to `0.256`.
 - Stats: `feedback_count=30`, `update_count=15`, `loss_count=15`.
 
-These checks validate that the tLLM adapter can consume feedback records, change parameters, reduce a scalar reward-regression objective, and update counters. They do not validate upstream-equivalent FTTT behavior because the adapted scalar head is not connected to generation.
+These checks validate that the tLLM adapter can consume feedback records, change
+parameters, reduce a local edit objective, apply feedback-conditioned hidden or
+logit deltas, and update counters. They do not validate upstream-equivalent FTTT
+behavior because tLLM still lacks the integrated generate -> judge -> edit ->
+retry loop.
 
 ## Alignment Conclusion
 
-Current status: partial inspiration, not a correct core reproduction.
+Current status: partial mechanism-level alignment, not a complete upstream
+reproduction.
 
-The implementation is a clean, local, dependency-light feedback consumer, and its tests demonstrate bounded queue behavior and reward-regression updates. However, it omits the central FTTT mechanism: failed-generation feedback is not converted into token-level training, no local model/LoRA/named-delta edit affects subsequent decoding, and there is no per-instance retry loop governed by correctness feedback. As a result, the consumer should be described as an FTTT-inspired feedback adapter primitive rather than a reproduction of the upstream method.
+The implementation is a clean, local, dependency-light feedback consumer. Its
+tests demonstrate bounded queue behavior, feedback-conditioned edits,
+hidden/logit edit application, stop-on-correct behavior, and per-instance reset.
+However, it omits the central runtime loop: failed-generation feedback is not
+converted into token-level LM training, no LoRA/named-delta path edits actual
+model target modules, and tLLM does not yet orchestrate retry generation from
+judge outcomes. As a result, the consumer should be described as an
+FTTT-inspired feedback edit primitive rather than a complete reproduction of the
+upstream method.
 
 ## Gaps and Risks
 
-- The `feedback` string currently has no behavioral effect.
-- Reward sign/value changes train only a scalar predictor, not the language model's reasoning trajectory.
+- Feedback text affects the local edit through deterministic feature hashing,
+  but this is not equivalent to upstream token-level feedback training.
+- Reward sign/value changes train a hidden/logit edit primitive, not the
+  language model's target modules or reasoning trajectory.
 - Positive feedback semantics are not aligned with upstream correct-trial handling.
-- No integration test shows that feedback changes next-token probabilities or final answers.
-- No test covers per-instance reset, repeated trials, stop-on-correct, or judge-driven retry behavior.
+- No integration test shows that feedback changes final answers inside a real
+  generate/retry loop.
+- No test covers judge-driven retry behavior across runtime generations.
 - The existing no-external-API constraint is satisfied, but any future attempt to reproduce reward-model feedback should keep it optional and local unless explicitly allowed.
