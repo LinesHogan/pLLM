@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from tllm.consumers.base import BaseConsumer
 from tllm.ports.base import ConsumerFlow
+from tllm.runtime.dynamics_store import PromptContextEntry, TrajectoryEvent
 
 
 def parse_reward(value: float | int | str | Mapping[str, Any]) -> float:
@@ -68,7 +70,7 @@ class GTTAConsumer(BaseConsumer):
 
     def __init__(self, config: GTTAConsumerConfig) -> None:
         self.config = config
-        self._queue: deque[TrajectoryFeedback] = deque()
+        self._queue: deque[TrajectoryFeedback | TrajectoryEvent] = deque()
         self._dropped_trajectories = 0
         self._processed_trajectories = 0
         self._update_count = 0
@@ -92,40 +94,80 @@ class GTTAConsumer(BaseConsumer):
         self._queue.append(feedback)
         return True
 
+    def enqueue_trajectory_event(self, event: TrajectoryEvent) -> bool:
+        if not isinstance(event, TrajectoryEvent):
+            raise TypeError("event must be TrajectoryEvent")
+        if len(self._queue) >= max(0, int(self.config.max_queue_size)):
+            self._dropped_trajectories += 1
+            return False
+        self._queue.append(event)
+        return True
+
     def process_queued_trajectories(self, *, limit: int = 0) -> None:
         max_items = len(self._queue) if int(limit) <= 0 else min(int(limit), len(self._queue))
         for _ in range(max_items):
-            feedback = self._queue.popleft()
+            item = self._queue.popleft()
             if not bool(self.config.enabled):
                 continue
+            if isinstance(item, TrajectoryEvent):
+                self._process_transition(
+                    task_id=item.task_id,
+                    state_signature=item.state_signature,
+                    action=item.action,
+                    previous_observation=item.previous_observation,
+                    next_observation=item.next_observation,
+                    reward=0.0 if item.reward is None else item.reward,
+                    environmental_dynamics="",
+                )
+                continue
+
+            feedback = item
             task_id = str(feedback.task_id).strip()
             previous_observation = feedback.previous_observation_text
-            state_signature = self.state_signature(previous_observation)
-            action = str(feedback.action).strip()
-            reward = float(feedback.reward_value)
-            state_key = (task_id, state_signature, action)
-            old = float(self._action_scores[action])
-            momentum = min(1.0, max(0.0, float(self.config.score_momentum)))
-            new_score = old * momentum + reward * (1.0 - momentum)
-            self._action_scores[action] = new_score
-            self._action_counts[action] += 1
-            old_state_score = float(self._state_action_scores[state_key])
-            new_state_score = old_state_score * momentum + reward * (1.0 - momentum)
-            self._state_action_scores[state_key] = new_state_score
-            self._state_action_counts[state_key] += 1
-            self._dynamics_records.append(
-                {
-                    "task_id": task_id,
-                    "state_signature": state_signature,
-                    "action": action,
-                    "previous_observation": previous_observation,
-                    "next_observation": str(feedback.next_observation),
-                    "environmental_dynamics": str(feedback.environmental_dynamics),
-                    "reward": reward,
-                }
+            self._process_transition(
+                task_id=task_id,
+                state_signature=self.state_signature(previous_observation),
+                action=str(feedback.action).strip(),
+                previous_observation=previous_observation,
+                next_observation=str(feedback.next_observation),
+                reward=float(feedback.reward_value),
+                environmental_dynamics=str(feedback.environmental_dynamics),
             )
-            self._processed_trajectories += 1
-            self._update_count += 1
+
+    def _process_transition(
+        self,
+        *,
+        task_id: str,
+        state_signature: str,
+        action: str,
+        previous_observation: str,
+        next_observation: str,
+        reward: float,
+        environmental_dynamics: str,
+    ) -> None:
+        state_key = (task_id, state_signature, action)
+        old = float(self._action_scores[action])
+        momentum = min(1.0, max(0.0, float(self.config.score_momentum)))
+        new_score = old * momentum + reward * (1.0 - momentum)
+        self._action_scores[action] = new_score
+        self._action_counts[action] += 1
+        old_state_score = float(self._state_action_scores[state_key])
+        new_state_score = old_state_score * momentum + reward * (1.0 - momentum)
+        self._state_action_scores[state_key] = new_state_score
+        self._state_action_counts[state_key] += 1
+        self._dynamics_records.append(
+            {
+                "task_id": task_id,
+                "state_signature": state_signature,
+                "action": action,
+                "previous_observation": previous_observation,
+                "next_observation": next_observation,
+                "environmental_dynamics": environmental_dynamics,
+                "reward": reward,
+            }
+        )
+        self._processed_trajectories += 1
+        self._update_count += 1
 
     @staticmethod
     def state_signature(observation: str) -> str:
@@ -193,6 +235,147 @@ class GTTAConsumer(BaseConsumer):
                 continue
             records.append(dict(record))
         return records
+
+    def render_ranked_dynamics_snippets(
+        self,
+        *,
+        task_id: str,
+        action: str | None = None,
+        observation: str | None = None,
+        state_signature: str | None = None,
+        candidate_actions: Sequence[str] | None = None,
+        max_records: int = 0,
+    ) -> tuple[str, ...]:
+        records = self._rank_dynamics_records(
+            task_id=task_id,
+            action=action,
+            observation=observation,
+            state_signature=state_signature,
+            candidate_actions=candidate_actions,
+            max_records=max_records,
+        )
+        return tuple(self._format_dynamics_snippet(record) for record in records)
+
+    def render_environment_dynamics_context(
+        self,
+        *,
+        task_id: str,
+        action: str | None = None,
+        observation: str | None = None,
+        state_signature: str | None = None,
+        candidate_actions: Sequence[str] | None = None,
+        max_records: int = 0,
+    ) -> str:
+        records = self._rank_dynamics_records(
+            task_id=task_id,
+            action=action,
+            observation=observation,
+            state_signature=state_signature,
+            candidate_actions=candidate_actions,
+            max_records=max_records,
+        )
+        return "\n".join(json.dumps(self._to_environment_dynamics_payload(record), sort_keys=True) for record in records)
+
+    def build_prompt_context_entry(
+        self,
+        *,
+        prompt_idx: int,
+        task_id: str,
+        action: str | None = None,
+        observation: str | None = None,
+        state_signature: str | None = None,
+        candidate_actions: Sequence[str] | None = None,
+        max_records: int = 0,
+        position: str = "prefix",
+    ) -> PromptContextEntry:
+        snippets = self.render_ranked_dynamics_snippets(
+            task_id=task_id,
+            action=action,
+            observation=observation,
+            state_signature=state_signature,
+            candidate_actions=candidate_actions,
+            max_records=max_records,
+        )
+        return PromptContextEntry(prompt_idx=prompt_idx, text="\n".join(snippets), position=position)
+
+    def build_environment_dynamics_prompt_context_entry(
+        self,
+        *,
+        prompt_idx: int,
+        task_id: str,
+        action: str | None = None,
+        observation: str | None = None,
+        state_signature: str | None = None,
+        candidate_actions: Sequence[str] | None = None,
+        max_records: int = 0,
+        position: str = "prefix",
+    ) -> PromptContextEntry:
+        text = self.render_environment_dynamics_context(
+            task_id=task_id,
+            action=action,
+            observation=observation,
+            state_signature=state_signature,
+            candidate_actions=candidate_actions,
+            max_records=max_records,
+        )
+        return PromptContextEntry(prompt_idx=prompt_idx, text=text, position=position)
+
+    def _rank_dynamics_records(
+        self,
+        *,
+        task_id: str,
+        action: str | None = None,
+        observation: str | None = None,
+        state_signature: str | None = None,
+        candidate_actions: Sequence[str] | None = None,
+        max_records: int = 0,
+    ) -> list[dict[str, Any]]:
+        candidate_set = None if candidate_actions is None else {str(candidate).strip() for candidate in candidate_actions}
+        records = self.query_dynamics_records(
+            task_id=task_id,
+            action=action,
+            observation=observation,
+            state_signature=state_signature,
+        )
+        if candidate_set is not None:
+            records = [record for record in records if record["action"] in candidate_set]
+        ranked = sorted(
+            enumerate(records),
+            key=lambda item: (
+                -float(item[1]["reward"]),
+                str(item[1]["action"]),
+                str(item[1]["state_signature"]),
+                str(item[1]["next_observation"]),
+                item[0],
+            ),
+        )
+        limit = int(max_records)
+        if limit < 0:
+            raise ValueError("max_records must be non-negative")
+        if limit > 0:
+            ranked = ranked[:limit]
+        return [record for _index, record in ranked]
+
+    @staticmethod
+    def _format_dynamics_snippet(record: Mapping[str, Any]) -> str:
+        return (
+            f"task={record['task_id']} state={record['state_signature']} action={record['action']} "
+            f"reward={float(record['reward']):.6g} next={record['next_observation']}"
+        )
+
+    @staticmethod
+    def _to_environment_dynamics_payload(record: Mapping[str, Any]) -> dict[str, object]:
+        environmental_dynamics = str(record["environmental_dynamics"])
+        if not environmental_dynamics:
+            environmental_dynamics = f"Next observation: {record['next_observation']}"
+        return {
+            "initial_state": str(record["previous_observation"]),
+            "action_taken": str(record["action"]),
+            "environmental_dynamics": environmental_dynamics,
+            "task_id": str(record["task_id"]),
+            "state_signature": str(record["state_signature"]),
+            "reward": float(record["reward"]),
+        }
 
     def score_global_action(self, action: str) -> float:
         return float(self._action_scores.get(str(action).strip(), 0.0))

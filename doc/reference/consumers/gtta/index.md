@@ -12,11 +12,16 @@ agent evaluation stacks.
 `GTTAConsumer` supports:
 
 - bounded trajectory feedback enqueueing,
+- runtime `TrajectoryEvent` enqueueing for explicit task/state/action dynamics,
 - numeric reward parsing,
 - local action-score updates keyed by `task_id`, state signature, and action,
 - candidate action ranking for a matching task/state,
 - export of retained observation and dynamics text,
 - query of retained dynamics records by task, state, and action,
+- deterministic dynamics snippets and `PromptContextEntry` text for later prompt
+  injection,
+- upstream-shaped environment-dynamics JSONL context for DG-style prompt
+  grounding,
 - disabled no-op processing.
 
 The first version expects callers to provide environment observations and
@@ -45,6 +50,29 @@ TrajectoryFeedback(
 
 When `previous_observation` is omitted, the legacy `observation` field is used
 as the previous state text.
+
+The runtime adoption path accepts the explicit runtime event contract:
+
+```python
+from tllm.runtime.dynamics_store import TrajectoryEvent
+
+consumer.enqueue_trajectory_event(
+    TrajectoryEvent(
+        task_id="task",
+        state_signature="state-signature-from-runtime",
+        previous_observation="state before the action",
+        action="click submit",
+        next_observation="state after the action",
+        reward=1.0,
+    )
+)
+```
+
+`enqueue_trajectory_event()` intentionally accepts only `TrajectoryEvent`. It
+does not infer events from dictionaries or loosely typed payloads. The explicit
+`state_signature` is written into the existing score and dynamics query path, so
+the same action text remains isolated across tasks and states even when the raw
+observation text is identical.
 
 ## Scoring and Ranking
 
@@ -101,6 +129,59 @@ score. Unknown actions score `0.0`, and tied scores preserve candidate order.
 
 This is intentionally a local data export only; the consumer does not import
 WebArena, BFCL, browsergym, or browser automation frameworks.
+
+For future prompt injection, `render_ranked_dynamics_snippets()` returns
+deterministic text snippets ranked by reward and scoped by task, state, action,
+and optional candidate actions:
+
+```python
+snippets = consumer.render_ranked_dynamics_snippets(
+    task_id="map_task",
+    state_signature="map-results",
+    candidate_actions=["click search", "open directions"],
+)
+```
+
+`build_prompt_context_entry()` wraps those snippets in the runtime
+`PromptContextEntry` contract:
+
+```python
+context = consumer.build_prompt_context_entry(
+    prompt_idx=0,
+    task_id="map_task",
+    state_signature="map-results",
+)
+```
+
+For a closer DG/BFCL-style prompt shape, use
+`render_environment_dynamics_context()`:
+
+```python
+context_text = consumer.render_environment_dynamics_context(
+    task_id="map_task",
+    state_signature="map-results",
+    candidate_actions=["click search", "open directions"],
+)
+```
+
+It returns newline-delimited JSON objects with:
+
+- `initial_state`
+- `action_taken`
+- `environmental_dynamics`
+- `task_id`
+- `state_signature`
+- `reward`
+
+`build_environment_dynamics_prompt_context_entry()` wraps that JSONL text in
+`PromptContextEntry`. This mirrors the prompt-side dynamics list used by
+upstream GTTA/BFCL, while keeping extraction and filtering outside this
+consumer.
+
+The runtime prompt-context port and trajectory-event port exist, but this
+consumer still does not wire itself into a vLLM generation loop or closed-loop
+policy. Callers must decide when to write events, when to build prompt context,
+and how to apply ranked snippets.
 
 ## Counters
 
