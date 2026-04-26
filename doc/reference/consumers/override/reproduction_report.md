@@ -10,6 +10,7 @@ Reviewed local files:
 
 - `tllm/consumers/override/consumer.py`
 - `test/consumers/override/test_override_consumer_unit.py`
+- `test/consumers/override/test_override_toy_parity_unit.py`
 - `doc/reference/consumers/override/index.md`
 - `docs/devlist.md`
 - `docs/plans/2026-04-26-devlist-consumers-design.md`
@@ -89,13 +90,13 @@ from the local docs.
 Commands are shown with placeholders to avoid local machine paths.
 
 ```bash
-<repo-env-python> -m pytest -q test/consumers/override/test_override_consumer_unit.py
+<repo-env-python> -m pytest -q test/consumers/override/
 ```
 
 Result:
 
 ```text
-12 passed
+15 passed, 6 subtests passed
 ```
 
 Environment check:
@@ -133,39 +134,45 @@ ImportError: cannot import name 'MultipleOf' from 'vllm.attention.backends.abstr
 ```
 
 The upstream README and requirements target vLLM `0.11.1`; the repo environment
-has vLLM `0.10.1.1` and is missing Hydra/OmegaConf. I did not install upstream
-dependencies or change the environment, per the dependency policy.
+has vLLM `0.10.1.1` and is missing Hydra/OmegaConf. A real upstream run is
+therefore not a lightweight local check: it requires changing the vLLM patch
+surface and installing extra upstream runtime dependencies before the runner can
+even import. I did not install upstream dependencies, download models, or change
+the environment, per the dependency policy.
 
-## Toy Mechanism Comparison
+## Fixed Toy Parity Coverage
 
-I imported `<upstream-repo>/modeling.py` and compared
-`OverRIDELogitsProcessor._compute_reweighted_logits` against the tLLM consumer
-on identical small tensors and identical manually copied head weights.
+The local test suite now includes a fixed toy reference in
+`test/consumers/override/test_override_toy_parity_unit.py`. The reference is a
+small PyTorch implementation of the upstream sampler-side math, not an import
+from the upstream repository. That keeps the test lightweight while still
+pinning the mechanism that mattered in the earlier comparison.
 
 Inputs:
 
 - hidden shape: `(2, 2)`
 - logits shape: `(2, 3)`
-- `lambda = 0.5`
+- fixed `lambda` values for both residual and update checks
 - `num_iteration = 3`
 - rank: `2`
 - current iteration: `2`
 
-Result:
+The fixed toy tests cover:
 
-```text
-max_reweighted_absdiff 0.0
-max_q_next_absdiff 0.0
-up_reweighted [[9.0, 17.0, 27.5], [0.75, 3.0, 3.25]]
-local_reweighted [[9.0, 17.0, 27.5], [0.75, 3.0, 3.25]]
-up_update_norm 0.12247449159622192
-local_update_norm 0.12247449159622192
-max_updated_head_absdiff 0.0
-```
+- residual reweighting as `logits - lambda * residual`;
+- `q_logits_next = logits + current_head(hidden)` with 0.0 max absolute
+  difference from the toy reference;
+- one sampled-token cross-entropy update with 0.0 max absolute difference in the
+  low-rank head weights after the optimizer step;
+- row id boundaries: non-integer Python ids, bool/float tensor ids, and
+  non-1D tensor ids are rejected;
+- row id lifecycle: tensor row ids are normalized to stable integer cache keys,
+  so mutating the original tensor after `reweight_logits_batch()` does not alter
+  which cached rows are updated.
 
-This confirms exact agreement for the residual subtraction, next-head logits,
-and one optimizer update when the two implementations start from the same
-weights.
+This codifies the previous toy parity result in local tests without depending
+on the upstream package, vLLM patch version, Hydra/OmegaConf, or a downloaded
+model.
 
 ## Cached Real-Model Tensor Comparison
 
@@ -222,6 +229,12 @@ The consumer exposes the right primitive operations and now includes the
 batch-row bridge needed by a sampler/runtime hook: request-id iteration parsing,
 batched grouping by iteration, cached `q_logits_next`, and sampled-token update
 by row id. It still does not itself patch vLLM or perform sampling.
+
+Runtime sampler integration remains the main gap. A complete runtime path still
+needs to feed final-token hidden states and logits into
+`reweight_logits_batch()`, sample from the returned reweighted logits, pass the
+sampled token ids back through `update_from_sampled_tokens_batch()`, and provide
+stable row ids for the same decode rows across those two calls.
 
 ## Gaps And Risks
 
