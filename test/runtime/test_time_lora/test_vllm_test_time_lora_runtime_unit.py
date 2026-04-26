@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 import sys
 from types import ModuleType
 import unittest
@@ -212,6 +213,35 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
         registered_lora = adapter_manager.registered[9].loras["model.layers.0.self_attn.q_proj"]
         self.assertTrue(torch.equal(registered_lora.lora_a, torch.ones(3, 2)))
         self.assertTrue(torch.equal(registered_lora.lora_b, torch.full((2, 4), 8.0)))
+        self.assertEqual(registered_lora.lora_a.device.type, "cpu")
+        self.assertEqual(registered_lora.lora_b.device.type, "cpu")
+
+    def test_vllm_layer_weights_are_cpu_contiguous_snapshots(self) -> None:
+        from tllm.contracts.test_time_lora import TestTimeLoRAWeights
+        from tllm.runtime.vllm_test_time_lora import _to_vllm_layer_weights
+
+        lora_a_src = torch.arange(12, dtype=torch.float32).reshape(2, 6).t()
+        lora_b_src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        weights = TestTimeLoRAWeights(
+            lora_a=lora_a_src,
+            lora_b=lora_b_src,
+            bias=torch.ones(4),
+            embeddings_tensor=torch.ones(1, 4),
+            alpha=4.0,
+        )
+
+        layer = _to_vllm_layer_weights("model.layers.0.self_attn.q_proj", 2, weights, _FakeLoRALayerWeights)
+
+        self.assertEqual(layer.lora_a.device.type, "cpu")
+        self.assertEqual(layer.lora_b.device.type, "cpu")
+        self.assertTrue(layer.lora_a.is_contiguous())
+        self.assertTrue(layer.lora_b.is_contiguous())
+        self.assertTrue(torch.equal(layer.lora_a, lora_a_src.contiguous()))
+        self.assertTrue(torch.equal(layer.lora_b, lora_b_src * 2.0))
+        lora_a_src.fill_(99.0)
+        lora_b_src.fill_(99.0)
+        self.assertFalse(torch.equal(layer.lora_a, lora_a_src.contiguous()))
+        self.assertFalse(torch.equal(layer.lora_b, lora_b_src))
 
     def test_vllm_manager_defers_registration_until_request_is_active(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
@@ -497,6 +527,118 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
         p_setup.assert_not_called()
         p_localize.assert_not_called()
         p_dispatch.assert_not_called()
+
+    def test_commit_apply_records_runtime_counts(self) -> None:
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, maybe_commit_and_apply_request_mapping
+
+        manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
+        service = TestTimeLoRAService(manager=manager, max_rank=4)
+        runtime = SimpleNamespace(test_time_lora_service=service)
+        update = TestTimeLoRAUpdate(
+            adapter_key="adapter-a",
+            lora_int_id=1,
+            rank=1,
+            scope="request",
+            request_ids=("req-a",),
+            target_modules={
+                "model.layers.0.self_attn.q_proj": TestTimeLoRAWeights(
+                    lora_a=torch.ones(3, 1),
+                    lora_b=torch.ones(1, 4),
+                )
+            },
+        )
+        input_batch = SimpleNamespace(
+            req_id_to_index={"req-a": 0},
+            request_lora_mapping=np.zeros((1,), dtype=np.int32),
+            lora_id_to_request_ids={},
+            lora_id_to_lora_request={},
+        )
+        runner = SimpleNamespace(input_batch=input_batch)
+
+        service.stage_update(update)
+        with _fake_vllm_lora_modules():
+            self.assertEqual(maybe_commit_and_apply_request_mapping(runtime=runtime, runner=runner), 2)
+
+        self.assertEqual(runtime.test_time_lora_last_committed, 1)
+        self.assertEqual(runtime.test_time_lora_last_applied, 1)
+        self.assertEqual(runtime.test_time_lora_total_committed, 1)
+        self.assertEqual(runtime.test_time_lora_total_applied, 1)
+
+
+class VLLMTestTimeLoRACachedModelSmokeTest(unittest.TestCase):
+    @unittest.skipUnless(
+        os.getenv("TLLM_TEST_TIME_LORA_RUN_CACHED_MODEL_SMOKE") == "1" and torch.cuda.is_available(),
+        "set TLLM_TEST_TIME_LORA_RUN_CACHED_MODEL_SMOKE=1 and provide CUDA to run cached-model vLLM smoke",
+    )
+    def test_in_memory_lora_update_changes_qwen_generation(self) -> None:
+        from vllm import LLM, SamplingParams
+
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
+        from tllm.runtime import residual_runtime as runtime
+
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        runtime.set_test_time_lora_enabled(True)
+        runtime.install_runner_patch()
+        llm = LLM(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dtype="bfloat16",
+            gpu_memory_utilization=0.45,
+            max_model_len=64,
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            enable_lora=True,
+            max_loras=1,
+            max_lora_rank=8,
+            max_cpu_loras=1,
+            trust_remote_code=True,
+        )
+        service = runtime.RUNTIME.test_time_lora_service
+        self.assertIsNotNone(service)
+        assert service is not None
+        target = "model.layers.0.mlp.down_proj"
+        module = service.modules[target]
+        rank = 8
+        input_size = int(getattr(module, "input_size"))
+        output_size = int(getattr(module, "output_size"))
+        params = SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True)
+        prompt = "Q: 1+1=\nA:"
+
+        base = llm.generate([prompt], params)[0].outputs[0]
+        original_add_request = llm.llm_engine.add_request
+
+        def _stage_update_for_request(request_id, prompt_arg, params_arg, *args, **kwargs):
+            torch.manual_seed(123)
+            service.stage_update(
+                TestTimeLoRAUpdate(
+                    adapter_key="smoke-adapter",
+                    lora_int_id=1,
+                    rank=rank,
+                    scope="request",
+                    request_ids=(str(request_id),),
+                    target_modules={
+                        target: TestTimeLoRAWeights(
+                            lora_a=torch.randn(input_size, rank, dtype=torch.float32) * 3.0,
+                            lora_b=torch.randn(rank, output_size, dtype=torch.float32) * 3.0,
+                            alpha=float(rank),
+                        )
+                    },
+                    step_id=1,
+                )
+            )
+            return original_add_request(request_id, prompt_arg, params_arg, *args, **kwargs)
+
+        llm.llm_engine.add_request = _stage_update_for_request
+        try:
+            adapted = llm.generate([prompt], params)[0].outputs[0]
+        finally:
+            llm.llm_engine.add_request = original_add_request
+
+        self.assertNotEqual(list(base.token_ids), list(adapted.token_ids))
+        self.assertGreater(int(getattr(runtime.RUNTIME, "test_time_lora_total_committed", 0) or 0), 0)
+        self.assertGreater(int(getattr(runtime.RUNTIME, "test_time_lora_total_applied", 0) or 0), 0)
 
 
 if __name__ == "__main__":

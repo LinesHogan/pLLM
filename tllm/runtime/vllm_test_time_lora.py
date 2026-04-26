@@ -103,19 +103,28 @@ class VLLMInMemoryLoRAManager:
 
 
 def _to_vllm_layer_weights(module_name: str, rank: int, weights: TestTimeLoRAWeights, cls: type[object]) -> object:
-    lora_b = weights.lora_b.detach().clone()
+    lora_a = _clone_for_vllm_lora_model(weights.lora_a)
+    lora_b = _clone_for_vllm_lora_model(weights.lora_b)
     if weights.scaling != 1.0:
         lora_b.mul_(weights.scaling)
     return cls(
         module_name=module_name,
         rank=rank,
         lora_alpha=rank,
-        lora_a=weights.lora_a.detach().clone(),
+        lora_a=lora_a,
         lora_b=lora_b,
-        bias=None if weights.bias is None else weights.bias.detach().clone(),
-        embeddings_tensor=None if weights.embeddings_tensor is None else weights.embeddings_tensor.detach().clone(),
+        bias=None if weights.bias is None else _clone_for_vllm_lora_model(weights.bias),
+        embeddings_tensor=None if weights.embeddings_tensor is None else _clone_for_vllm_lora_model(weights.embeddings_tensor),
         scaling=1.0,
     )
+
+
+def _clone_for_vllm_lora_model(tensor: torch.Tensor) -> torch.Tensor:
+    # vLLM's normal PEFT path builds LoRAModel weights on CPU, then the worker
+    # activates them into GPU slots. Keep the in-memory path on that boundary so
+    # CUDA-side update streams cannot expose partially-written adapter tensors to
+    # cudagraph replay.
+    return tensor.detach().to(device="cpu", copy=True).contiguous()
 
 
 def maybe_bind_test_time_lora_service(*, runtime: object, runner: object) -> TestTimeLoRAService | None:
@@ -142,9 +151,30 @@ def maybe_commit_and_apply_request_mapping(*, runtime: object, runner: object) -
         return 0
     committed = service.commit_staged_updates()
     input_batch = getattr(runner, "input_batch", None)
+    applied = 0
     if input_batch is None:
+        _record_lora_apply_stats(runtime=runtime, committed=committed, applied=applied)
         return committed
-    return committed + apply_request_lora_mapping(service=service, input_batch=input_batch)
+    applied = apply_request_lora_mapping(service=service, input_batch=input_batch)
+    _record_lora_apply_stats(runtime=runtime, committed=committed, applied=applied)
+    return committed + applied
+
+
+def _record_lora_apply_stats(*, runtime: object, committed: int, applied: int) -> None:
+    committed_i = int(committed)
+    applied_i = int(applied)
+    setattr(runtime, "test_time_lora_last_committed", committed_i)
+    setattr(runtime, "test_time_lora_last_applied", applied_i)
+    setattr(
+        runtime,
+        "test_time_lora_total_committed",
+        int(getattr(runtime, "test_time_lora_total_committed", 0) or 0) + committed_i,
+    )
+    setattr(
+        runtime,
+        "test_time_lora_total_applied",
+        int(getattr(runtime, "test_time_lora_total_applied", 0) or 0) + applied_i,
+    )
 
 
 def apply_request_lora_mapping(*, service: TestTimeLoRAService, input_batch: object) -> int:
