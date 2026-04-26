@@ -2,6 +2,13 @@
 """Shared primitives for devlist-inspired consumers."""
 
 from tllm.consumers.devlist.common import LowRankAdapter
+from tllm.consumers.devlist.fttt import (
+    FTTTConsumer,
+    FTTTConsumerConfig,
+    FTTTEngine,
+    FTTTStats,
+    FeedbackRecord,
+)
 from tllm.consumers.devlist.inplace_ttt import (
     InPlaceTTTConsumer,
     InPlaceTTTConsumerConfig,
@@ -25,6 +32,11 @@ from tllm.consumers.devlist.ttrl import (
 )
 
 __all__ = [
+    "FTTTConsumer",
+    "FTTTConsumerConfig",
+    "FTTTEngine",
+    "FTTTStats",
+    "FeedbackRecord",
     "InPlaceTTTConsumer",
     "InPlaceTTTConsumerConfig",
     "InPlaceTTTEngine",
