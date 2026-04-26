@@ -255,6 +255,64 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         self.assertEqual(sink.batches[0].entries[0].feedback_text, "fix 5")
         self.assertEqual(consumer.read_stats().queued_feedback, 1)
 
+    def test_consume_bundle_writes_closed_loop_retry_and_update_barrier_sinks(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.contracts.port_bundle import BundleKey, PortBundle
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.batches: list[object] = []
+
+            def append(self, batch: object) -> int:
+                self.batches.append(batch)
+                return len(batch.entries)
+
+        reward_sink = _Sink()
+        retry_sink = _Sink()
+        barrier_sink = _Sink()
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text="Your answer is incorrect.",
+                judge="toy",
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-fail",
+                    prompt_idx=5,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="wrong",
+                    finish_reason="stop",
+                    group_id="round-a",
+                ),
+            )
+        )
+        bundle = PortBundle(
+            key=BundleKey(engine_step_id=1, phase="post_generate", request_id="", sample_idx=0),
+            entries={
+                "generation_trace": trace,
+                "reward_outcome": reward_sink,
+                "retry_control": retry_sink,
+                "update_barrier": barrier_sink,
+            },
+        )
+
+        consumer.consume_bundle(bundle, ctx=object())
+
+        self.assertEqual(reward_sink.batches[0].entries[0].reward, 0.0)
+        self.assertEqual(retry_sink.batches[0].entries[0].action, "retry")
+        self.assertTrue(retry_sink.batches[0].entries[0].retry_after_update)
+        self.assertEqual(barrier_sink.batches[0].entries[0].state, "ready")
+        self.assertEqual(barrier_sink.batches[0].entries[0].ready_count, 1)
+        self.assertEqual(consumer.read_stats().queued_feedback, 1)
+
     def test_trace_success_is_judged_and_not_queued_for_feedback(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
@@ -294,6 +352,85 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         self.assertEqual(outcome.feedback_text, "correct final answer")
         self.assertEqual(outcome.label, "42")
         self.assertEqual(outcome.skip_reason, "correct-output")
+
+    def test_closed_loop_intent_turns_failed_completion_into_feedback_retry_and_barrier(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text=f"retry with corrected arithmetic for {entry.text}",
+                label="expected=4",
+                judge="toy-arithmetic",
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-fail",
+                    prompt_idx=9,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="5",
+                    finish_reason="stop",
+                    group_id="round-1",
+                ),
+            )
+        )
+
+        intent = consumer.closed_loop_intent_for_trace(trace)
+
+        self.assertEqual(intent.reward_outcomes.entries[0].feedback_text, "retry with corrected arithmetic for 5")
+        self.assertEqual(intent.feedback_records[0].feedback, "retry with corrected arithmetic for 5")
+        self.assertEqual(intent.retry_controls.entries[0].action, "retry")
+        self.assertEqual(intent.retry_controls.entries[0].reason, "feedback-update")
+        self.assertTrue(intent.retry_controls.entries[0].retry_after_update)
+        barrier = intent.update_barriers.entries[0]
+        self.assertEqual(barrier.barrier_id, "fttt:round-1:9:0")
+        self.assertEqual(barrier.group_id, "round-1")
+        self.assertEqual(barrier.consumer_id, "fttt")
+        self.assertEqual(barrier.state, "ready")
+        self.assertEqual(barrier.ready_count, 1)
+        self.assertEqual(intent.update_count, 1)
+
+    def test_closed_loop_intent_stops_retry_after_instance_lifecycle_reaches_limit(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(max_retries=1),
+            judge=lambda entry: FTTTJudgeResult(is_correct=False, reward=0.0, feedback_text="fix final answer"),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-fail",
+                    prompt_idx=3,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="bad",
+                    finish_reason="stop",
+                    group_id="round-stop",
+                ),
+            )
+        )
+
+        intent = consumer.closed_loop_intent_for_trace(trace)
+        consumer.apply_feedback_update(torch.randn(intent.update_count, 4), intent.feedback_records)
+
+        state = consumer.instance_state(3)
+        stats = consumer.read_stats()
+        self.assertEqual(intent.retry_controls.entries[0].action, "stop")
+        self.assertEqual(intent.retry_controls.entries[0].reason, "retry-limit")
+        self.assertTrue(state.stopped)
+        self.assertEqual(state.retries, 1)
+        self.assertEqual(stats.update_count, 1)
+        self.assertEqual(stats.feedback_count, 1)
 
     def test_trace_judge_loop_rejects_non_strict_identity_fields(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult

@@ -29,7 +29,9 @@
 - unboxed completion 不作为可判定答案参与投票；结构化结果和 reward outcome 会标记 `missing-boxed-answer`。
 - `build_ttrl_reward_result` 返回 majority label、majority ratio、每个样本的 normalized boxed label、reward、skip reason、以及被选中的训练索引。
 - `build_ttrl_reward_outcome_batch` 将完成的 `GenerationTraceBatch` 转换为 `RewardOutcomeBatch`，保留 `request_id`、`prompt_idx`、`sample_idx`、`output_index`、`group_id` 等 identity 字段。
+- `build_ttrl_closed_loop_intent` 将同一 trace 转换为 reward、retry control、update barrier 三类 runtime-native intent batch；多数派样本被 accept，非多数派或缺失答案样本走 retry/skip 路径。
 - `select_ttrl_training_indices` 对齐上游 `select_top_k_per_prompt`，支持从 `n_votes_per_prompt` 个投票样本中选择前 `n_samples_per_prompt` 个训练样本。
+- `TTRLClosedLoopIntent.training_rewards()` 只暴露被上游式 selection 选中的训练 reward，因此 toy adapter 更新计数不会把纯投票样本误当成训练样本。
 - `TTRLEngine` 用一个 `LowRankAdapter(in_dim=hidden_size, out_dim=1)` 预测 scalar reward，并以 MSE 训练。
 - `TTRLConsumer.flows()` 声明 completed generation trace 到 reward outcome 的 out-of-band toy flow；`rewards_for_samples`、`reward_result_for_samples`、`reward_outcome_batch_for_trace`、`write_reward_outcomes_for_trace` 和 `update_from_rewards` 暴露了 reward 构造、结构化结果、outcome 输出和 adapter 更新 API。
 - 单元测试覆盖了 package export、多数奖励、tie-breaking、无 verl import、adapter 更新计数和 disabled no-op。
@@ -72,9 +74,12 @@
 使用 repo virtualenv 运行：
 
 - `python -m pytest -q test/consumers/ttrl/test_ttrl_consumer_unit.py`
-  - 更新后结果：`12 passed`
+  - 早期更新结果：`12 passed`
+  - 当前 closed-loop adoption 结果：`17 passed`
 - `python -m pytest -q test/consumers/ttrl test/test_runtime_generation_trace_unit.py test/test_runtime_reward_outcome_unit.py`
   - 更新后结果：`21 passed`
+- `python -m pytest -q test/consumers/ttrl test/consumers/fttt`
+  - 当前结果：`34 passed`
 - 依赖探测：
   - `torch`、`transformers`、`vllm`、`sympy`、`ray` 可用。
   - `latex2sympy2_extended`、`omegaconf` 不可用。
@@ -125,6 +130,15 @@ trace-to-outcome toycase：
 - boxed majority 样本写入 `judge=ttrl_boxed_majority`、`reward=1.0`、`is_correct=True`。
 - boxed minority 样本写入 `reward=0.0`、`is_correct=False`。
 - unboxed 样本写入 `reward=None`、`is_correct=None`、`skip_reason=missing-boxed-answer`。
+
+closed-loop intent toycase：
+
+- 输入为包含同一 `group_id` 的 completed generation trace。
+- 输出同时包含 `RewardOutcomeBatch`、`RetryControlBatch` 和 `UpdateBarrierBatch`。
+- majority completion 的 retry action 为 `accept`。
+- non-majority completion 的 retry action 为 `retry`，并带 `retry_after_update=True`。
+- update barrier 的 `ready_count` 只统计上游式 selected training rows。
+- `consume_bundle()` 在可选 sinks 存在时会写入 reward、retry 和 update barrier 三类 batch。
 
 样本选择对照：
 

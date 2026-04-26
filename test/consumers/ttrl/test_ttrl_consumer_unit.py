@@ -43,7 +43,9 @@ class TTRLConsumerUnitTest(unittest.TestCase):
 
         self.assertEqual(result.rewards, [0.0, 1.0, 0.0])
         self.assertEqual(result.majority_by_prompt[0].label, "5")
+        self.assertEqual(result.majority_by_prompt[0].ratio, 1 / 3)
         self.assertEqual(result.majority_by_prompt[0].count, 1)
+        self.assertEqual(result.majority_by_prompt[0].total, 3)
         self.assertEqual(result.sample_results[0].skip_reason, "missing-boxed-answer")
         self.assertEqual(result.sample_results[2].skip_reason, "missing-boxed-answer")
 
@@ -59,6 +61,20 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         rewards = majority_vote_rewards(samples)
 
         self.assertEqual(rewards, [1.0, 1.0, 0.0])
+
+    def test_majority_rewards_use_last_boxed_answer_with_nested_braces(self) -> None:
+        from tllm.consumers.ttrl import TTRLSample, build_ttrl_reward_result
+
+        samples = [
+            TTRLSample(prompt_idx=0, sample_idx=0, completion=r"Draft \boxed{0}. Final \boxed{\frac{1}{2}}"),
+            TTRLSample(prompt_idx=0, sample_idx=1, completion=r"Final: \boxed{\frac{1}{2}}"),
+            TTRLSample(prompt_idx=0, sample_idx=2, completion=r"Final: \boxed{1}"),
+        ]
+
+        result = build_ttrl_reward_result(samples)
+
+        self.assertEqual(result.majority_by_prompt[0].label, r"\frac{1}{2}")
+        self.assertEqual([item.reward for item in result.sample_results], [1.0, 1.0, 0.0])
 
     def test_majority_rewards_break_ties_by_first_seen_completion(self) -> None:
         from tllm.consumers.ttrl import TTRLSample, majority_vote_rewards
@@ -242,6 +258,156 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         self.assertEqual(len(sink.batches[0].entries), 2)
         self.assertEqual(sink.batches[0].entries[0].reward, 1.0)
         self.assertEqual(sink.batches[0].entries[1].skip_reason, "missing-boxed-answer")
+
+    def test_consume_bundle_writes_closed_loop_retry_and_update_barrier_sinks(self) -> None:
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
+        from tllm.contracts.port_bundle import BundleKey, PortBundle
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.batches: list[object] = []
+
+            def append(self, batch: object) -> int:
+                self.batches.append(batch)
+                return len(batch.entries)
+
+        reward_sink = _Sink()
+        retry_sink = _Sink()
+        barrier_sink = _Sink()
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=2,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"\boxed{4}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=2,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"\boxed{5}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+            )
+        )
+        bundle = PortBundle(
+            key=BundleKey(engine_step_id=1, phase="post_generate", request_id="", sample_idx=0),
+            entries={
+                "generation_trace": trace,
+                "reward_outcome": reward_sink,
+                "retry_control": retry_sink,
+                "update_barrier": barrier_sink,
+            },
+        )
+
+        TTRLConsumer(TTRLConsumerConfig()).consume_bundle(bundle, ctx=object())
+
+        self.assertEqual([entry.reward for entry in reward_sink.batches[0].entries], [1.0, 0.0])
+        self.assertEqual([entry.action for entry in retry_sink.batches[0].entries], ["accept", "retry"])
+        self.assertEqual(barrier_sink.batches[0].entries[0].state, "ready")
+        self.assertEqual(barrier_sink.batches[0].entries[0].ready_count, 2)
+
+    def test_closed_loop_intent_builds_majority_retry_and_update_barrier_batches(self) -> None:
+        from tllm.consumers.ttrl import build_ttrl_closed_loop_intent
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=4,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"Path A. \boxed{8}",
+                    finish_reason="stop",
+                    group_id="vote-4",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=4,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"Path B. \boxed{8}",
+                    finish_reason="stop",
+                    group_id="vote-4",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-c",
+                    prompt_idx=4,
+                    sample_idx=2,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"Path C. \boxed{9}",
+                    finish_reason="stop",
+                    group_id="vote-4",
+                ),
+            )
+        )
+
+        intent = build_ttrl_closed_loop_intent(trace, n_votes_per_prompt=3, n_samples_per_prompt=2)
+
+        self.assertEqual([entry.reward for entry in intent.reward_outcomes.entries], [1.0, 1.0, 0.0])
+        self.assertEqual([entry.action for entry in intent.retry_controls.entries], ["accept", "accept", "retry"])
+        self.assertEqual(intent.retry_controls.entries[2].reason, "non-majority-answer")
+        self.assertTrue(intent.retry_controls.entries[2].retry_after_update)
+        self.assertEqual(len(intent.update_barriers.entries), 1)
+        barrier = intent.update_barriers.entries[0]
+        self.assertEqual(barrier.barrier_id, "ttrl:vote-4")
+        self.assertEqual(barrier.group_id, "vote-4")
+        self.assertEqual(barrier.consumer_id, "ttrl")
+        self.assertEqual(barrier.state, "ready")
+        self.assertEqual(barrier.ready_count, 2)
+        self.assertEqual(barrier.request_ids, ("req-a", "req-b", "req-c"))
+        self.assertEqual(intent.update_count, 2)
+
+    def test_closed_loop_intent_exposes_nonzero_toy_update_count_for_adapter_path(self) -> None:
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = TTRLConsumer(TTRLConsumerConfig(hidden_size=4, rank=2, learning_rate=0.1))
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"\boxed{1}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=0,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"\boxed{1}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+            )
+        )
+
+        intent = consumer.closed_loop_intent_for_trace(trace)
+        consumer.update_from_rewards(torch.randn(intent.update_count, 4), intent.training_rewards())
+
+        stats = consumer.read_stats()
+        self.assertEqual(intent.update_count, 2)
+        self.assertEqual(stats.update_count, 1)
+        self.assertEqual(stats.reward_count, 2)
 
     def test_ttrl_module_does_not_import_verl(self) -> None:
         before = set(sys.modules)

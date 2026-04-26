@@ -47,6 +47,13 @@ The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
     and are not queued for adaptation;
   - identity fields are handed to the strict reward outcome runtime types without
     consumer-side coercion.
+- A lightweight closed-loop intent path:
+  - `RewardOutcomeBatch` records the judge result and feedback text;
+  - `RetryControlBatch` retries failed completions below the configured retry
+    limit, stops at the limit, and accepts correct outputs;
+  - `UpdateBarrierBatch` marks failed-completion feedback rows ready for update;
+  - `FTTTClosedLoopIntent.feedback_records` feeds the local low-rank edit
+    adapter so tests can observe nonzero update counts.
 - No import of external feedback APIs or heavy upstream modules.
 
 This maps to a local feedback-conditioned edit primitive. It is closer than a
@@ -91,7 +98,9 @@ Therefore, I did not treat upstream execution failure as evidence against the al
 Commands are summarized with placeholders to avoid machine-local paths:
 
 - `<repo>/.venv/bin/python -m pytest -q test/consumers/fttt/test_fttt_consumer_unit.py`
-  - Result: `16 passed`.
+  - Earlier result before LoRA export coverage: `13 passed`.
+  - Result after LoRA export coverage: `16 passed`.
+  - Current result after closed-loop adoption coverage: `17 passed`.
 - Dependency probe in `<repo>/.venv/bin/python`
   - `torch`, `transformers`, `fastapi`, `requests`, and `sentencepiece` present.
   - `peft` and `adapters` missing.
@@ -146,6 +155,23 @@ parameters, reduce a local edit objective, apply feedback-conditioned hidden or
 logit deltas, and update counters. They do not validate upstream-equivalent FTTT
 behavior because tLLM still lacks the integrated generate -> judge -> edit ->
 retry loop.
+
+## Closed-Loop Toy Evidence
+
+The current consumer branch adds toy coverage for the runtime-facing loop shape:
+
+- a failed `GenerationTraceBatch` entry becomes a reward outcome, a feedback
+  record, a retry intent, and an update-barrier entry;
+- retry control switches from `retry` to `stop` when the instance retry lifecycle
+  reaches the configured limit;
+- `consume_bundle()` writes reward, retry, and update-barrier sinks when those
+  ports are present;
+- the local adapter update path consumes the emitted feedback records and reports
+  nonzero update/loss counts.
+
+This remains a consumer-side closed-loop intent, not full upstream FTTT. The
+runtime still needs to schedule an actual regenerate-after-update loop and apply
+feedback-token or LoRA updates to the model path.
 
 ## Alignment Conclusion
 

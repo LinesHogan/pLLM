@@ -3,6 +3,7 @@
 
 from tllm.consumers.fttt.consumer import (
     FTTTConsumer,
+    FTTTClosedLoopIntent,
     FTTTConsumerConfig,
     FTTTEngine,
     FTTTInstanceState,
@@ -13,6 +14,7 @@ from tllm.consumers.fttt.consumer import (
 
 __all__ = [
     "FTTTConsumer",
+    "FTTTClosedLoopIntent",
     "FTTTConsumerConfig",
     "FTTTEngine",
     "FTTTInstanceState",

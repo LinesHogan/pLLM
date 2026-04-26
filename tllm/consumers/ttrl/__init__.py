@@ -3,6 +3,7 @@
 
 from tllm.consumers.ttrl.consumer import (
     TTRLConsumer,
+    TTRLClosedLoopIntent,
     TTRLConsumerConfig,
     TTRLEngine,
     TTRLMajorityResult,
@@ -10,6 +11,7 @@ from tllm.consumers.ttrl.consumer import (
     TTRLSample,
     TTRLSampleReward,
     TTRLStats,
+    build_ttrl_closed_loop_intent,
     build_ttrl_reward_outcome_batch,
     build_ttrl_reward_result,
     majority_vote_rewards,
@@ -18,6 +20,7 @@ from tllm.consumers.ttrl.consumer import (
 
 __all__ = [
     "TTRLConsumer",
+    "TTRLClosedLoopIntent",
     "TTRLConsumerConfig",
     "TTRLEngine",
     "TTRLMajorityResult",
@@ -25,6 +28,7 @@ __all__ = [
     "TTRLSample",
     "TTRLSampleReward",
     "TTRLStats",
+    "build_ttrl_closed_loop_intent",
     "build_ttrl_reward_outcome_batch",
     "build_ttrl_reward_result",
     "majority_vote_rewards",

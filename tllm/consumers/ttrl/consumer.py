@@ -21,6 +21,8 @@ from tllm.consumers._common.alignment import (
 from tllm.ports.base import ConsumerFlow
 from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.reward_outcome import RewardOutcome
+from tllm.ports.retry_control import RetryControl
+from tllm.ports.update_barrier import UpdateBarrier
 
 
 _BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\s*\{([^{}]*)\}")
@@ -64,6 +66,18 @@ class TTRLRewardResult:
     selected_indices: list[int]
 
 
+@dataclass(frozen=True)
+class TTRLClosedLoopIntent:
+    reward_outcomes: object
+    retry_controls: object
+    update_barriers: object
+    update_count: int
+    training_reward_values: tuple[float, ...] = ()
+
+    def training_rewards(self) -> list[float]:
+        return [float(reward) for reward in self.training_reward_values]
+
+
 @dataclass
 class TTRLConsumerConfig:
     consumer_id: str = "ttrl"
@@ -81,11 +95,33 @@ class TTRLStats:
     last_loss: float = 0.0
 
 
-def _extract_boxed_answer_label(text: str) -> str:
-    matches = _BOXED_ANSWER_PATTERN.findall(str(text))
-    if not matches:
+def _last_boxed_answer_text(text: str) -> str:
+    raw = str(text)
+    idx = raw.rfind("\\boxed")
+    if idx < 0:
+        idx = raw.rfind("\\fbox")
+    if idx < 0:
         return ""
-    return normalize_answer_text(matches[-1])
+    left_brace_idx = raw.find("{", idx)
+    if left_brace_idx < 0:
+        return ""
+    depth = 0
+    for pos in range(left_brace_idx, len(raw)):
+        char = raw[pos]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[left_brace_idx + 1 : pos]
+    return ""
+
+
+def _extract_boxed_answer_label(text: str) -> str:
+    answer = _last_boxed_answer_text(str(text))
+    if not answer:
+        return ""
+    return normalize_answer_text(answer)
 
 
 def select_ttrl_training_indices(
@@ -123,7 +159,7 @@ def build_ttrl_reward_result(
             if not skip_reason and counts[label] == best_count:
                 majority_label = label
                 break
-        total = sum(1 for _, _, _, skip_reason in group if not skip_reason)
+        total = len(group)
         majority_ratio = (float(best_count) / float(total)) if total else 0.0
         majority_by_prompt[int(prompt_idx)] = TTRLMajorityResult(
             prompt_idx=int(prompt_idx),
@@ -204,6 +240,103 @@ def build_ttrl_reward_outcome_batch(trace: object) -> object:
             )
         )
     return RewardOutcomeBatch(entries=tuple(outcome_entries))
+
+
+def _ttrl_barrier_id(group_id: str, prompt_idx: int) -> str:
+    return f"ttrl:{group_id}" if group_id else f"ttrl:prompt:{int(prompt_idx)}"
+
+
+def build_ttrl_closed_loop_intent(
+    trace: object,
+    *,
+    consumer_id: str = "ttrl",
+    n_votes_per_prompt: int | None = None,
+    n_samples_per_prompt: int | None = None,
+) -> TTRLClosedLoopIntent:
+    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
+    from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
+    from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry
+
+    if not isinstance(trace, GenerationTraceBatch):
+        raise TypeError("trace must be GenerationTraceBatch")
+
+    reward_outcomes = build_ttrl_reward_outcome_batch(trace)
+    samples = [
+        TTRLSample(
+            prompt_idx=int(entry.prompt_idx),
+            sample_idx=int(entry.sample_idx),
+            completion=str(entry.text),
+        )
+        for entry in trace.entries
+    ]
+    reward_result = build_ttrl_reward_result(
+        samples,
+        n_votes_per_prompt=n_votes_per_prompt,
+        n_samples_per_prompt=n_samples_per_prompt,
+    )
+    selected_train_indices = {
+        int(idx)
+        for idx in reward_result.selected_indices
+        if reward_outcomes.entries[int(idx)].reward is not None
+    }
+    retry_entries: list[RetryControlEntry] = []
+    grouped: dict[tuple[str, int], list[object]] = defaultdict(list)
+    grouped_indices: dict[tuple[str, int], list[int]] = defaultdict(list)
+    training_reward_values: list[float] = []
+    for entry_idx, (trace_entry, outcome) in enumerate(zip(trace.entries, reward_outcomes.entries, strict=True)):
+        grouped[(str(trace_entry.group_id), int(trace_entry.prompt_idx))].append(outcome)
+        grouped_indices[(str(trace_entry.group_id), int(trace_entry.prompt_idx))].append(int(entry_idx))
+        if outcome.reward is None:
+            action = "retry"
+            reason = outcome.skip_reason or "missing-reward"
+            retry_after_update = False
+        elif bool(outcome.is_correct):
+            action = "accept"
+            reason = "majority-answer"
+            retry_after_update = False
+            if int(entry_idx) in selected_train_indices:
+                training_reward_values.append(float(outcome.reward))
+        else:
+            action = "retry"
+            reason = "non-majority-answer"
+            retry_after_update = True
+            if int(entry_idx) in selected_train_indices:
+                training_reward_values.append(float(outcome.reward))
+        retry_entries.append(
+            RetryControlEntry(
+                request_id=str(outcome.request_id),
+                prompt_idx=int(outcome.prompt_idx),
+                sample_idx=int(outcome.sample_idx),
+                output_index=int(outcome.output_index),
+                group_id=str(outcome.group_id),
+                action=action,
+                reason=reason,
+                retry_after_update=retry_after_update,
+            )
+        )
+
+    barrier_entries: list[UpdateBarrierEntry] = []
+    for (group_id, prompt_idx), outcomes in grouped.items():
+        ready_count = sum(1 for idx in grouped_indices[(group_id, prompt_idx)] if idx in selected_train_indices)
+        barrier_entries.append(
+            UpdateBarrierEntry(
+                barrier_id=_ttrl_barrier_id(group_id, prompt_idx),
+                group_id=group_id,
+                consumer_id=str(consumer_id),
+                state="ready" if ready_count else "blocked",
+                request_ids=tuple(str(outcome.request_id) for outcome in outcomes),
+                ready_count=int(ready_count),
+                reason="majority-reward-ready" if ready_count else "no-trainable-reward",
+            )
+        )
+
+    return TTRLClosedLoopIntent(
+        reward_outcomes=reward_outcomes,
+        retry_controls=RetryControlBatch(entries=tuple(retry_entries)),
+        update_barriers=UpdateBarrierBatch(entries=tuple(barrier_entries)),
+        update_count=len(training_reward_values),
+        training_reward_values=tuple(training_reward_values),
+    )
 
 
 def majority_vote_rewards(samples: Sequence[TTRLSample]) -> list[float]:
@@ -296,7 +429,11 @@ class TTRLConsumer(BaseConsumer):
         return (
             ConsumerFlow(
                 reads=(GenerationTrace.read(scope="completed"),),
-                writes=(RewardOutcome.write(scope="completed", mode="append"),),
+                writes=(
+                    RewardOutcome.write(scope="completed", mode="append"),
+                    RetryControl.write(scope="completed", mode="append"),
+                    UpdateBarrier.write(scope="completed", mode="append"),
+                ),
                 window="out_of_band",
             ),
         )
@@ -321,6 +458,20 @@ class TTRLConsumer(BaseConsumer):
     def reward_outcome_batch_for_trace(self, trace: object) -> object:
         return build_ttrl_reward_outcome_batch(trace)
 
+    def closed_loop_intent_for_trace(
+        self,
+        trace: object,
+        *,
+        n_votes_per_prompt: int | None = None,
+        n_samples_per_prompt: int | None = None,
+    ) -> TTRLClosedLoopIntent:
+        return build_ttrl_closed_loop_intent(
+            trace,
+            consumer_id=self.consumer_id,
+            n_votes_per_prompt=n_votes_per_prompt,
+            n_samples_per_prompt=n_samples_per_prompt,
+        )
+
     def write_reward_outcomes_for_trace(self, runtime: object, trace: object) -> int:
         from tllm.runtime.reward_outcome_runtime import write_reward_outcomes
 
@@ -337,7 +488,20 @@ class TTRLConsumer(BaseConsumer):
         append = getattr(sink, "append", None)
         if not callable(append):
             raise TypeError("reward_outcome entry must provide append")
-        append(build_ttrl_reward_outcome_batch(trace))
+        intent = self.closed_loop_intent_for_trace(trace)
+        append(intent.reward_outcomes)
+        retry_sink = bundle.entries.get("retry_control")
+        retry_append = getattr(retry_sink, "append", None)
+        if retry_sink is not None and not callable(retry_append):
+            raise TypeError("retry_control entry must provide append")
+        if callable(retry_append):
+            retry_append(intent.retry_controls)
+        barrier_sink = bundle.entries.get("update_barrier")
+        barrier_append = getattr(barrier_sink, "append", None)
+        if barrier_sink is not None and not callable(barrier_append):
+            raise TypeError("update_barrier entry must provide append")
+        if callable(barrier_append):
+            barrier_append(intent.update_barriers)
 
     def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
         reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)

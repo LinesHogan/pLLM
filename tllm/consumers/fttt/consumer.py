@@ -20,8 +20,12 @@ from tllm.consumers._common.alignment import LowRankAdapter
 from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.base import ConsumerFlow
 from tllm.ports.reward_outcome import RewardOutcome
+from tllm.ports.retry_control import RetryControl
+from tllm.ports.update_barrier import UpdateBarrier
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
+from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
+from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry
 
 
 def _require_feedback_int(value: object, *, field_name: str) -> int:
@@ -158,6 +162,15 @@ class FTTTStats:
     last_loss: float = 0.0
     skipped_feedback: int = 0
     stopped_instances: int = 0
+
+
+@dataclass(frozen=True)
+class FTTTClosedLoopIntent:
+    reward_outcomes: RewardOutcomeBatch
+    retry_controls: RetryControlBatch
+    update_barriers: UpdateBarrierBatch
+    feedback_records: tuple[FeedbackRecord, ...]
+    update_count: int
 
 
 class FTTTEngine(nn.Module):
@@ -428,7 +441,11 @@ class FTTTConsumer(BaseConsumer):
         return (
             ConsumerFlow(
                 reads=(GenerationTrace.read(),),
-                writes=(RewardOutcome.write(),),
+                writes=(
+                    RewardOutcome.write(),
+                    RetryControl.write(),
+                    UpdateBarrier.write(),
+                ),
                 window="out_of_band",
             ),
         )
@@ -494,6 +511,75 @@ class FTTTConsumer(BaseConsumer):
                 )
         return RewardOutcomeBatch(entries=tuple(outcomes))
 
+    def _retry_entry_for_failed_outcome(self, entry: RewardOutcomeEntry) -> RetryControlEntry:
+        state = self.instance_state(int(entry.prompt_idx))
+        next_retries = int(state.retries) + 1
+        max_retries = int(self.config.max_retries)
+        retry_limit_reached = max_retries > 0 and next_retries >= max_retries
+        return RetryControlEntry(
+            request_id=str(entry.request_id),
+            prompt_idx=int(entry.prompt_idx),
+            sample_idx=int(entry.sample_idx),
+            output_index=int(entry.output_index),
+            group_id=str(entry.group_id),
+            action="stop" if retry_limit_reached else "retry",
+            reason="retry-limit" if retry_limit_reached else "feedback-update",
+            retry_after_update=not retry_limit_reached,
+        )
+
+    def closed_loop_intent_for_trace(self, trace: GenerationTraceBatch) -> FTTTClosedLoopIntent:
+        reward_outcomes = self.process_generation_trace(trace, enqueue_failures=False)
+        retry_entries: list[RetryControlEntry] = []
+        barrier_entries: list[UpdateBarrierEntry] = []
+        feedback_records: list[FeedbackRecord] = []
+        for entry in reward_outcomes.entries:
+            if bool(entry.is_correct):
+                retry_entries.append(
+                    RetryControlEntry(
+                        request_id=str(entry.request_id),
+                        prompt_idx=int(entry.prompt_idx),
+                        sample_idx=int(entry.sample_idx),
+                        output_index=int(entry.output_index),
+                        group_id=str(entry.group_id),
+                        action="accept",
+                        reason="correct-output",
+                        retry_after_update=False,
+                    )
+                )
+                ready_count = 0
+                state = "blocked"
+                reason = "correct-output"
+            else:
+                feedback_records.append(
+                    FeedbackRecord(
+                        prompt_idx=int(entry.prompt_idx),
+                        feedback=entry.feedback_text,
+                        reward=entry.reward if entry.reward is not None else 0.0,
+                    )
+                )
+                retry_entries.append(self._retry_entry_for_failed_outcome(entry))
+                ready_count = 1
+                state = "ready"
+                reason = "feedback-update-ready"
+            barrier_entries.append(
+                UpdateBarrierEntry(
+                    barrier_id=f"fttt:{entry.group_id}:{int(entry.prompt_idx)}:{int(entry.sample_idx)}",
+                    group_id=str(entry.group_id),
+                    consumer_id=str(self.consumer_id),
+                    state=state,
+                    request_ids=(str(entry.request_id),),
+                    ready_count=ready_count,
+                    reason=reason,
+                )
+            )
+        return FTTTClosedLoopIntent(
+            reward_outcomes=reward_outcomes,
+            retry_controls=RetryControlBatch(entries=tuple(retry_entries)),
+            update_barriers=UpdateBarrierBatch(entries=tuple(barrier_entries)),
+            feedback_records=tuple(feedback_records),
+            update_count=len(feedback_records),
+        )
+
     def consume_bundle(self, bundle, ctx) -> None:
         _ = ctx
         trace = bundle.entries.get("generation_trace")
@@ -503,7 +589,22 @@ class FTTTConsumer(BaseConsumer):
         append = getattr(sink, "append", None)
         if not callable(append):
             raise TypeError("reward_outcome entry must provide append")
-        append(self.process_generation_trace(trace))
+        intent = self.closed_loop_intent_for_trace(trace)
+        append(intent.reward_outcomes)
+        for record in intent.feedback_records:
+            self.enqueue_feedback(record)
+        retry_sink = bundle.entries.get("retry_control")
+        retry_append = getattr(retry_sink, "append", None)
+        if retry_sink is not None and not callable(retry_append):
+            raise TypeError("retry_control entry must provide append")
+        if callable(retry_append):
+            retry_append(intent.retry_controls)
+        barrier_sink = bundle.entries.get("update_barrier")
+        barrier_append = getattr(barrier_sink, "append", None)
+        if barrier_sink is not None and not callable(barrier_append):
+            raise TypeError("update_barrier entry must provide append")
+        if callable(barrier_append):
+            barrier_append(intent.update_barriers)
 
     def apply_feedback_update(self, hidden: torch.Tensor, feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord]) -> None:
         records = list(feedback)
