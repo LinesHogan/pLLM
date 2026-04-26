@@ -16,6 +16,25 @@ class DevlistConsumerSurfaceUnitTest(unittest.TestCase):
 
         self.assertEqual(adapter.rank, 2)
 
+    def test_package_exports_alignment_public_types(self) -> None:
+        from tllm.consumers.devlist import (
+            FTTTInstanceState,
+            OverRIDEBatchLogitsResult,
+            TTRLMajorityResult,
+            TTRLRewardResult,
+            build_ttrl_reward_result,
+            run_tlm_ordered_step,
+            select_ttrl_training_indices,
+        )
+
+        self.assertTrue(FTTTInstanceState)
+        self.assertTrue(OverRIDEBatchLogitsResult)
+        self.assertTrue(TTRLMajorityResult)
+        self.assertTrue(TTRLRewardResult)
+        self.assertTrue(callable(build_ttrl_reward_result))
+        self.assertTrue(callable(run_tlm_ordered_step))
+        self.assertTrue(callable(select_ttrl_training_indices))
+
     def test_low_rank_adapter_zero_b_starts_as_noop(self) -> None:
         from tllm.consumers.devlist import LowRankAdapter
 

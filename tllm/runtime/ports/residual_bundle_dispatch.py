@@ -198,6 +198,66 @@ def _request_meta_payload_from_view(view: RowBatchMeta) -> list[dict[str, object
     ]
 
 
+def build_explicit_step_scope_port_bundle(
+    *,
+    flow: ConsumerFlow,
+    phase: str,
+    engine_step_id: int,
+    row_meta: RowBatchMeta,
+    entries: dict[str, object],
+) -> PortBundle:
+    """Build a step-scope bundle from explicit entries for any runtime phase."""
+    if tuple(flow.bundle_key) != ("engine_step_id", "phase"):
+        raise RuntimeError("explicit step-scope bundles require bundle_key=('engine_step_id', 'phase')")
+    phase_value = str(phase)
+    if str(row_meta.phase) != phase_value:
+        raise RuntimeError("row metadata phase does not match requested bundle phase")
+    if int(row_meta.engine_step_id) != int(engine_step_id):
+        raise RuntimeError("row metadata engine_step_id does not match requested bundle step")
+
+    out: dict[str, object] = {}
+    lease_entries: dict[str, torch.Tensor] = {}
+    delivery = str(getattr(flow, "delivery", "bundle"))
+    for read in flow.reads:
+        name = str(read.role).strip() or str(read.kind.value)
+        if read.kind is PortKind.REQUEST_META:
+            out[name] = row_meta
+            continue
+        if read.kind is PortKind.RESIDUAL_STREAM:
+            locator = read.locator
+            read_phase = str(getattr(locator, "phase", phase_value))
+            if read_phase != phase_value:
+                raise RuntimeError(f"flow read `{name}` is for phase `{read_phase}`, not `{phase_value}`")
+        if name not in entries:
+            raise RuntimeError(f"explicit step-scope bundle missing required entry `{name}`")
+        payload = entries[name]
+        if delivery == "device_lease":
+            if read.kind is not PortKind.RESIDUAL_STREAM or not isinstance(payload, torch.Tensor):
+                raise RuntimeError("device_lease explicit bundle supports residual_stream and request_meta reads")
+            lease_entries[name] = payload
+        else:
+            out[name] = payload
+
+    if delivery == "device_lease":
+        out["device_lease"] = DeviceTensorLease(
+            entries=lease_entries,
+            active_rows=len(row_meta.request_ids),
+            ownership=str(getattr(flow, "ownership", "runtime_lease")),
+        )
+
+    request_id = row_meta.request_ids[0] if row_meta.request_ids else ""
+    sample_idx = int(row_meta.sample_idxs[0]) if row_meta.sample_idxs else 0
+    return PortBundle(
+        key=BundleKey(
+            engine_step_id=int(engine_step_id),
+            phase=phase_value,
+            request_id=str(request_id),
+            sample_idx=sample_idx,
+        ),
+        entries=out,
+    )
+
+
 def _entry_for_flow_read(
     *,
     core: PortDispatchCoreLike,

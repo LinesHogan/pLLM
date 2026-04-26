@@ -49,6 +49,7 @@ class InPlaceTTTStats:
     update_count: int = 0
     loss_count: int = 0
     trained_rows: int = 0
+    tail_rows: int = 0
     last_loss: float = 0.0
 
 
@@ -75,6 +76,8 @@ class InPlaceTTTEngine(nn.Module):
         self._loss_count = 0
         self._trained_rows = 0
         self._last_loss = 0.0
+        self._tail_source: torch.Tensor | None = None
+        self._tail_target: torch.Tensor | None = None
         if int(config.hidden_size) > 0:
             self._build_adapter(int(config.hidden_size))
 
@@ -107,6 +110,35 @@ class InPlaceTTTEngine(nn.Module):
         if first_param is not None and (first_param.device != rows.device or first_param.dtype != rows.dtype):
             self.to(device=rows.device, dtype=rows.dtype)
 
+    def _store_tail(self, source: torch.Tensor, target: torch.Tensor) -> None:
+        if int(source.shape[0]) <= 0:
+            self._tail_source = None
+            self._tail_target = None
+            return
+        self._tail_source = source.detach().clone()
+        self._tail_target = target.detach().clone()
+
+    def _append_cached_tail(self, source: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._tail_source is None or self._tail_target is None:
+            return source, target
+        tail_source = self._tail_source.to(device=source.device, dtype=source.dtype)
+        tail_target = self._tail_target.to(device=target.device, dtype=target.dtype)
+        return torch.cat([tail_source, source], dim=0), torch.cat([tail_target, target], dim=0)
+
+    def _update_full_chunk(self, source: torch.Tensor, target: torch.Tensor) -> None:
+        assert self.adapter is not None
+        assert self.optimizer is not None
+        desired_delta = target - source
+        pred_delta = self.adapter(source)
+        loss = F.mse_loss(pred_delta, desired_delta)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self._update_count += 1
+        self._loss_count += 1
+        self._trained_rows += int(source.shape[0])
+        self._last_loss = float(loss.detach().cpu())
+
     def update(self, source: torch.Tensor, target: torch.Tensor) -> None:
         if not bool(self.config.enabled):
             return
@@ -119,24 +151,26 @@ class InPlaceTTTEngine(nn.Module):
         assert self.optimizer is not None
         source_train = self._detached_train_input(source)
         target_train = self._detached_train_input(target)
-        padded_source, valid_rows = pad_rows_to_chunk(source_train, chunk_size=int(self.config.chunk_size))
-        padded_target, _ = pad_rows_to_chunk(target_train, chunk_size=int(self.config.chunk_size))
-        desired_delta = padded_target - padded_source
-        pred_delta = self.adapter(padded_source)
-        loss = F.mse_loss(pred_delta[:valid_rows], desired_delta[:valid_rows])
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self._update_count += 1
-        self._loss_count += 1
-        self._trained_rows += int(valid_rows)
-        self._last_loss = float(loss.detach().cpu())
+        source_train, target_train = self._append_cached_tail(source_train, target_train)
+        chunk_size = max(1, int(self.config.chunk_size))
+        total_rows = int(source_train.shape[0])
+        full_rows = (total_rows // chunk_size) * chunk_size
+        if full_rows <= 0:
+            self._store_tail(source_train, target_train)
+            return
+
+        for start in range(0, full_rows, chunk_size):
+            end = start + chunk_size
+            self._update_full_chunk(source_train[start:end], target_train[start:end])
+        self._store_tail(source_train[full_rows:], target_train[full_rows:])
 
     def read_stats(self) -> InPlaceTTTStats:
+        tail_rows = 0 if self._tail_source is None else int(self._tail_source.shape[0])
         return InPlaceTTTStats(
             update_count=int(self._update_count),
             loss_count=int(self._loss_count),
             trained_rows=int(self._trained_rows),
+            tail_rows=tail_rows,
             last_loss=float(self._last_loss),
         )
 

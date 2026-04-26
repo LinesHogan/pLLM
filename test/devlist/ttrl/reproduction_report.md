@@ -2,7 +2,7 @@
 
 ## 结论
 
-当前 tLLM TTRL consumer 是一个无 verl 依赖的 TTRL-inspired 最小原语实现，不是端到端 TTRL 复现。它保留了“同一 prompt 多样本多数投票生成伪奖励”和“用伪奖励做一次轻量 test-time 更新”的方向，但没有复现上游的完整 test-time RL 训练闭环：采样扩展、答案抽取/化简、伪 ground truth 替换、reward function 打分、PPO/GRPO actor 更新和指标回填。
+当前 tLLM TTRL consumer 是一个无 verl 依赖的 TTRL-inspired 最小原语实现，不是端到端 TTRL 复现。它保留了“同一 prompt 多样本多数投票生成伪奖励”和“用伪奖励做一次轻量 test-time 更新”的方向，并补齐了数学 toycase 需要的答案抽取/normalize、多数标签/比例结构化结果、以及 vote/sample 分离索引；但没有复现上游的完整 test-time RL 训练闭环：伪 ground truth 写回 verl batch、PPO/GRPO actor 更新和指标回填。
 
 因此，评估结论是：核心思想部分对齐，工程实现刻意脱离 verl；若目标是可运行的 TTRL 算法复现，当前实现仍有关键差距。
 
@@ -25,9 +25,11 @@
 本仓库实现位于 `tllm/consumers/devlist/ttrl.py`：
 
 - `TTRLSample` 保存 `prompt_idx`、`sample_idx`、`completion`。
-- `majority_vote_rewards` 按 `prompt_idx` 分组，对 normalized completion 全文计数，并给赢家 completion 的样本 reward=1，其余 reward=0。
+- `majority_vote_rewards` 按 `prompt_idx` 分组，对 `normalize_answer_text` 抽取/normalize 后的答案计数，并给 majority label 匹配样本 reward=1，其余 reward=0。
+- `build_ttrl_reward_result` 返回 majority label、majority ratio、每个样本的 normalized label、reward、以及被选中的训练索引。
+- `select_ttrl_training_indices` 对齐上游 `select_top_k_per_prompt`，支持从 `n_votes_per_prompt` 个投票样本中选择前 `n_samples_per_prompt` 个训练样本。
 - `TTRLEngine` 用一个 `LowRankAdapter(in_dim=hidden_size, out_dim=1)` 预测 scalar reward，并以 MSE 训练。
-- `TTRLConsumer.rewards_for_samples` 和 `update_from_rewards` 暴露了 reward 构造和 adapter 更新 API。
+- `TTRLConsumer.rewards_for_samples`、`reward_result_for_samples` 和 `update_from_rewards` 暴露了 reward 构造、结构化结果和 adapter 更新 API。
 - 单元测试覆盖了 package export、多数奖励、tie-breaking、无 verl import、adapter 更新计数和 disabled no-op。
 
 这满足了“不要引入 verl”的约束；测试也明确保证导入 tLLM TTRL 模块不会加载 `verl`。
@@ -37,17 +39,18 @@
 已对齐的部分：
 
 - 对同一 prompt 的多 completion 做多数投票。
+- 多数投票基于抽取/normalize 后的答案；不同推理文本但同 boxed answer 会被合并。
 - 给多数派样本分配正 reward，少数派样本分配零 reward。
+- 暴露 majority label、majority ratio、sample label、reward、selected indices。
+- 支持 `n_votes_per_prompt` / `n_samples_per_prompt` 的上游式下采样索引。
 - 不依赖 verl。
 - 支持轻量本地更新，并记录 `update_count`、`loss_count`、`reward_count`。
 
 未对齐或仅弱对齐的部分：
 
-- 上游按抽取后的数学答案投票；tLLM 当前按 completion 全文投票。若两个样本答案同为 `4` 但推理文本不同，上游会合并为同一多数答案，tLLM 会视为不同 completion。
-- 上游 reward 是“模型响应 vs majority pseudo ground truth”的 task reward；tLLM reward 是直接对 completion 字符串投票，缺少 task-specific answer extraction、simplification、grader/self-check。
-- 上游区分 `n_votes_per_prompt` 和 `n_samples_per_prompt`，先大规模投票再下采样训练；tLLM 没有该采样策略。
+- 上游 reward 是“模型响应 vs majority pseudo ground truth”的 task reward；tLLM 现在对 boxed/math toycase 对齐，但仍缺少完整 latex/sympy/mathd grader/self-check。
 - 上游更新 actor policy；tLLM 只训练一个本地低秩 scalar score adapter。当前 `flows()` 返回空 tuple，adapter 更新本身不会自动改变后续 generation。
-- 上游保留 original gt 做诊断指标；tLLM 没有 label accuracy、reward accuracy、majority ratio、pass@n 等指标。
+- 上游保留 original gt 做诊断指标；tLLM 只有 majority ratio，没有 label accuracy、reward accuracy、pass@n 等完整指标。
 
 ## 原仓库轻量复现可行性
 
@@ -65,7 +68,7 @@
 使用 repo virtualenv 运行：
 
 - `python -m pytest -q test/devlist/ttrl/test_ttrl_consumer_unit.py`
-  - 结果：`6 passed`
+  - 更新后结果：`9 passed`
 - 依赖探测：
   - `torch`、`transformers`、`vllm`、`sympy`、`ray` 可用。
   - `latex2sympy2_extended`、`omegaconf` 不可用。
@@ -90,18 +93,16 @@
 - majority ratio: `0.6666666666666666`
 - reward: `[1.0, 1.0, 0.0]`
 
-tLLM 当前按全文 completion 投票：
-
-- reward: `[1.0, 0.0, 0.0]`
-
-若调用方先把 completion 预处理成答案字符串再交给 tLLM：
+tLLM 更新后按抽取/normalize 后答案投票：
 
 - reward: `[1.0, 1.0, 0.0]`
+- majority label: `4`
+- majority ratio: `0.6666666666666666`
 
 样本选择对照：
 
 - 上游 `select_top_k_per_prompt` 对 2 个 prompt、每个 4 个投票样本、每个保留 2 个训练样本，返回索引 `[0, 1, 4, 5]`。
-- tLLM 没有等价 API。
+- tLLM `select_ttrl_training_indices` 返回同样索引 `[0, 1, 4, 5]`。
 
 adapter update：
 
@@ -130,14 +131,11 @@ adapter update：
 主要风险：
 
 - 把当前 consumer 称为“TTRL 复现”会过度声明。更准确的说法是“TTRL-inspired majority reward utility plus bounded score-adapter update”。
-- 若调用方传入完整推理文本，当前 majority reward 会低估语义一致答案；这与上游数学任务核心机制不一致。
+- 当前 answer normalizer 覆盖 boxed answer toycase，但没有上游完整数学等价判断；复杂 latex/sympy 等价表达式仍可能被拆成不同 label。
 - adapter 更新没有接入 tLLM producer-consumer flows，对后续 token 分布没有直接影响。
-- 缺少 `n_votes_per_prompt`/`n_samples_per_prompt` 分离，会影响 TTRL 中“大投票、小训练”的算法形状。
 
 建议若要提升为更接近 TTRL 的复现：
 
-- 增加可插拔 answer extractor / normalizer / grader，默认支持 boxed answer。
-- 增加按 prompt 的 vote/sample selection API，显式支持 `n_votes_per_prompt` 和 `n_samples_per_prompt`。
-- 把 majority label 和 majority ratio 暴露为结构化结果，而不是只返回 reward list。
+- 增加可插拔 grader/self-check，覆盖上游 mathd/sympy/latex 等数学等价。
 - 明确 adapter 如何影响后续 generation；否则把它定位为诊断/score head，而不是 test-time RL policy update。
-- 增加 toy tests 覆盖“不同推理文本、相同 boxed answer”的场景。
+- 增加端到端小模型 smoke，将结构化 reward 结果传入轻量 adapter update 并验证统计计数。

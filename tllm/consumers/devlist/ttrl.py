@@ -12,7 +12,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers.devlist.common import LowRankAdapter
+from tllm.consumers.devlist.common import (
+    LowRankAdapter,
+    normalize_answer_text,
+    select_top_k_per_prompt,
+)
 from tllm.ports.base import ConsumerFlow
 
 
@@ -21,6 +25,34 @@ class TTRLSample:
     prompt_idx: int
     sample_idx: int
     completion: str
+
+
+@dataclass(frozen=True)
+class TTRLMajorityResult:
+    prompt_idx: int
+    label: str
+    ratio: float
+    count: int
+    total: int
+
+
+@dataclass(frozen=True)
+class TTRLSampleReward:
+    prompt_idx: int
+    sample_idx: int
+    completion: str
+    label: str
+    majority_label: str
+    majority_ratio: float
+    reward: float
+
+
+@dataclass(frozen=True)
+class TTRLRewardResult:
+    rewards: list[float]
+    majority_by_prompt: dict[int, TTRLMajorityResult]
+    sample_results: list[TTRLSampleReward]
+    selected_indices: list[int]
 
 
 @dataclass
@@ -41,25 +73,92 @@ class TTRLStats:
 
 
 def _normalize_completion(text: str) -> str:
-    return " ".join(str(text).strip().lower().split())
+    label = normalize_answer_text(text)
+    return label if label else "None"
+
+
+def select_ttrl_training_indices(
+    *,
+    num_prompts: int,
+    n_votes_per_prompt: int,
+    n_samples_per_prompt: int,
+) -> list[int]:
+    return select_top_k_per_prompt(
+        num_prompts=int(num_prompts),
+        votes_per_prompt=int(n_votes_per_prompt),
+        samples_per_prompt=int(n_samples_per_prompt),
+    )
+
+
+def build_ttrl_reward_result(
+    samples: Sequence[TTRLSample],
+    *,
+    n_votes_per_prompt: int | None = None,
+    n_samples_per_prompt: int | None = None,
+) -> TTRLRewardResult:
+    grouped: dict[int, list[tuple[int, TTRLSample, str]]] = defaultdict(list)
+    for idx, sample in enumerate(samples):
+        grouped[int(sample.prompt_idx)].append((idx, sample, _normalize_completion(sample.completion)))
+
+    majority_by_prompt: dict[int, TTRLMajorityResult] = {}
+    result_by_input_idx: dict[int, TTRLSampleReward] = {}
+    for prompt_idx, group in grouped.items():
+        counts = Counter(label for _, _, label in group)
+        best_count = max(counts.values()) if counts else 0
+        majority_label = "None"
+        for _, _, label in group:
+            if counts[label] == best_count:
+                majority_label = label
+                break
+        total = len(group)
+        majority_ratio = (float(best_count) / float(total)) if total else 0.0
+        majority_by_prompt[int(prompt_idx)] = TTRLMajorityResult(
+            prompt_idx=int(prompt_idx),
+            label=majority_label,
+            ratio=majority_ratio,
+            count=int(best_count),
+            total=int(total),
+        )
+        for idx, sample, label in group:
+            reward = 1.0 if label == majority_label else 0.0
+            sample_result = TTRLSampleReward(
+                prompt_idx=int(sample.prompt_idx),
+                sample_idx=int(sample.sample_idx),
+                completion=str(sample.completion),
+                label=label,
+                majority_label=majority_label,
+                majority_ratio=majority_ratio,
+                reward=reward,
+            )
+            result_by_input_idx[int(idx)] = sample_result
+
+    if n_votes_per_prompt is None and n_samples_per_prompt is None:
+        selected_indices = list(range(len(samples)))
+    elif n_votes_per_prompt is not None and n_samples_per_prompt is not None:
+        if int(n_votes_per_prompt) <= 0:
+            raise ValueError("n_votes_per_prompt must be positive")
+        if len(samples) % int(n_votes_per_prompt) != 0:
+            raise ValueError("sample count must be divisible by n_votes_per_prompt")
+        selected_indices = select_ttrl_training_indices(
+            num_prompts=len(samples) // int(n_votes_per_prompt),
+            n_votes_per_prompt=int(n_votes_per_prompt),
+            n_samples_per_prompt=int(n_samples_per_prompt),
+        )
+    else:
+        raise ValueError("n_votes_per_prompt and n_samples_per_prompt must be provided together")
+
+    sample_results = [result_by_input_idx[idx] for idx in selected_indices]
+    rewards = [sample_result.reward for sample_result in sample_results]
+    return TTRLRewardResult(
+        rewards=rewards,
+        majority_by_prompt=majority_by_prompt,
+        sample_results=sample_results,
+        selected_indices=selected_indices,
+    )
 
 
 def majority_vote_rewards(samples: Sequence[TTRLSample]) -> list[float]:
-    grouped: dict[int, list[tuple[int, str]]] = defaultdict(list)
-    for idx, sample in enumerate(samples):
-        grouped[int(sample.prompt_idx)].append((idx, _normalize_completion(sample.completion)))
-    rewards = [0.0] * len(samples)
-    for group in grouped.values():
-        counts = Counter(completion for _, completion in group)
-        best_count = max(counts.values()) if counts else 0
-        winner = ""
-        for _, completion in group:
-            if counts[completion] == best_count:
-                winner = completion
-                break
-        for idx, completion in group:
-            rewards[idx] = 1.0 if completion == winner else 0.0
-    return rewards
+    return build_ttrl_reward_result(samples).rewards
 
 
 class TTRLEngine(nn.Module):
@@ -148,6 +247,19 @@ class TTRLConsumer(BaseConsumer):
     def rewards_for_samples(self, samples: Sequence[TTRLSample]) -> torch.Tensor:
         rewards = majority_vote_rewards(samples)
         return torch.tensor(rewards, dtype=torch.float32)
+
+    def reward_result_for_samples(
+        self,
+        samples: Sequence[TTRLSample],
+        *,
+        n_votes_per_prompt: int | None = None,
+        n_samples_per_prompt: int | None = None,
+    ) -> TTRLRewardResult:
+        return build_ttrl_reward_result(
+            samples,
+            n_votes_per_prompt=n_votes_per_prompt,
+            n_samples_per_prompt=n_samples_per_prompt,
+        )
 
     def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
         reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)

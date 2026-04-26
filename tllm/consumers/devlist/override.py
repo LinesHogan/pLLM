@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Hashable, Sequence
 
 import torch
 from torch import nn
@@ -34,6 +34,14 @@ class OverRIDELogitsResult:
 
 
 @dataclass(frozen=True)
+class OverRIDEBatchLogitsResult:
+    logits: torch.Tensor
+    q_logits_next: tuple[torch.Tensor, ...]
+    q_indices: tuple[torch.Tensor, ...]
+    iterations: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class OverRIDEStats:
     reweight_count: int = 0
     modified_row_count: int = 0
@@ -55,6 +63,7 @@ class OverRIDEReweightEngine(nn.Module):
         self._loss_count = 0
         self._update_count = 0
         self._last_loss = 0.0
+        self._pending_q_logits_next: dict[Hashable, tuple[int, torch.Tensor]] = {}
         if self._has_shape:
             self._build_heads()
 
@@ -94,6 +103,20 @@ class OverRIDEReweightEngine(nn.Module):
         return self.heads[idx]
 
     @staticmethod
+    def iteration_from_request_id(request_id: str) -> int:
+        if "_" not in str(request_id):
+            return 1
+        idx_str = str(request_id).split("_", 1)[0]
+        try:
+            return int(idx_str) + 1
+        except ValueError:
+            return 1
+
+    @classmethod
+    def iterations_from_request_ids(cls, request_ids: Sequence[str]) -> tuple[int, ...]:
+        return tuple(cls.iteration_from_request_id(request_id) for request_id in request_ids)
+
+    @staticmethod
     def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
         out = tensor.detach()
         if torch.is_inference(out):
@@ -129,6 +152,92 @@ class OverRIDEReweightEngine(nn.Module):
             q_logits_next = logits_for_update + current_head(hidden_for_head).to(dtype=logits.dtype)
         return OverRIDELogitsResult(logits=reweighted, q_logits_next=q_logits_next)
 
+    @staticmethod
+    def _default_row_ids(row_count: int) -> tuple[int, ...]:
+        return tuple(range(int(row_count)))
+
+    @staticmethod
+    def _validate_row_ids(row_ids: Sequence[Hashable], row_count: int) -> tuple[Hashable, ...]:
+        normalized = tuple(row_ids)
+        if len(normalized) != int(row_count):
+            raise RuntimeError("OverRIDE runtime bridge requires one row id per logits row")
+        return normalized
+
+    def _resolve_iterations(
+        self,
+        *,
+        row_count: int,
+        request_ids: Sequence[str] | None,
+        iterations: Sequence[int] | None,
+    ) -> tuple[int, ...]:
+        if request_ids is not None and iterations is not None:
+            raise RuntimeError("OverRIDE runtime bridge accepts request_ids or iterations, not both")
+        if iterations is None:
+            if request_ids is None:
+                raise RuntimeError("OverRIDE runtime bridge requires request_ids or explicit iterations")
+            resolved = self.iterations_from_request_ids(request_ids)
+        else:
+            resolved = tuple(int(iteration) for iteration in iterations)
+        if len(resolved) != int(row_count):
+            raise RuntimeError("OverRIDE runtime bridge requires one iteration id per logits row")
+        return resolved
+
+    def reweight_logits_batch(
+        self,
+        hidden: torch.Tensor,
+        logits: torch.Tensor,
+        *,
+        request_ids: Sequence[str] | None = None,
+        iterations: Sequence[int] | None = None,
+        row_ids: Sequence[Hashable] | None = None,
+    ) -> OverRIDEBatchLogitsResult:
+        if hidden.ndim != 2 or logits.ndim != 2:
+            raise RuntimeError("OverRIDE runtime bridge expects 2D hidden and logits tensors")
+        if int(hidden.shape[0]) != int(logits.shape[0]):
+            raise RuntimeError("OverRIDE runtime bridge requires hidden/logits row counts to match")
+
+        row_count = int(logits.shape[0])
+        resolved_iterations = self._resolve_iterations(
+            row_count=row_count,
+            request_ids=request_ids,
+            iterations=iterations,
+        )
+        normalized_row_ids = self._validate_row_ids(
+            self._default_row_ids(row_count) if row_ids is None else row_ids,
+            row_count,
+        )
+        self._pending_q_logits_next.clear()
+
+        grouped_row_indices: dict[int, list[int]] = {}
+        for row_idx, iteration in enumerate(resolved_iterations):
+            grouped_row_indices.setdefault(int(iteration), []).append(row_idx)
+
+        reweighted_logits = torch.empty_like(logits)
+        q_logits_next: list[torch.Tensor] = []
+        q_indices: list[torch.Tensor] = []
+        q_iterations: list[int] = []
+        for iteration, row_indices in grouped_row_indices.items():
+            index = torch.tensor(row_indices, device=logits.device, dtype=torch.long)
+            result = self.reweight_logits(hidden.index_select(0, index), logits.index_select(0, index), iteration=iteration)
+            reweighted_logits.index_copy_(0, index, result.logits)
+            if result.q_logits_next is None:
+                continue
+            q_logits_next.append(result.q_logits_next)
+            q_indices.append(index)
+            q_iterations.append(int(iteration))
+            for local_idx, row_idx in enumerate(row_indices):
+                self._pending_q_logits_next[normalized_row_ids[row_idx]] = (
+                    int(iteration),
+                    result.q_logits_next[local_idx : local_idx + 1],
+                )
+
+        return OverRIDEBatchLogitsResult(
+            logits=reweighted_logits,
+            q_logits_next=tuple(q_logits_next),
+            q_indices=tuple(q_indices),
+            iterations=tuple(q_iterations),
+        )
+
     def update_from_sampled_tokens(self, q_logits_next: torch.Tensor | None, sampled_token_ids: torch.Tensor) -> None:
         if q_logits_next is None or not bool(self.config.enabled):
             return
@@ -145,6 +254,33 @@ class OverRIDEReweightEngine(nn.Module):
         self._loss_count += 1
         self._update_count += 1
         self._last_loss = float(loss.detach().cpu())
+
+    def update_from_sampled_tokens_batch(
+        self,
+        sampled_token_ids: torch.Tensor,
+        *,
+        row_ids: Sequence[Hashable] | None = None,
+    ) -> None:
+        if not bool(self.config.enabled) or not self._pending_q_logits_next:
+            return
+        targets = sampled_token_ids.reshape(-1)
+        target_count = int(targets.numel())
+        normalized_row_ids = self._validate_row_ids(
+            self._default_row_ids(target_count) if row_ids is None else row_ids,
+            target_count,
+        )
+        selected_q_logits: list[torch.Tensor] = []
+        selected_targets: list[torch.Tensor] = []
+        for token_idx, row_id in enumerate(normalized_row_ids):
+            pending = self._pending_q_logits_next.pop(row_id, None)
+            if pending is None:
+                continue
+            _iteration, q_logits = pending
+            selected_q_logits.append(q_logits)
+            selected_targets.append(targets[token_idx : token_idx + 1])
+        if not selected_q_logits:
+            return
+        self.update_from_sampled_tokens(torch.cat(selected_q_logits, dim=0), torch.cat(selected_targets, dim=0))
 
     def read_stats(self) -> OverRIDEStats:
         return OverRIDEStats(
@@ -173,8 +309,36 @@ class OverRIDEConsumer(BaseConsumer):
     def reweight_logits(self, hidden: torch.Tensor, logits: torch.Tensor, *, iteration: int) -> OverRIDELogitsResult:
         return self.engine.reweight_logits(hidden, logits, iteration=iteration)
 
+    def iterations_from_request_ids(self, request_ids: Sequence[str]) -> tuple[int, ...]:
+        return self.engine.iterations_from_request_ids(request_ids)
+
+    def reweight_logits_batch(
+        self,
+        hidden: torch.Tensor,
+        logits: torch.Tensor,
+        *,
+        request_ids: Sequence[str] | None = None,
+        iterations: Sequence[int] | None = None,
+        row_ids: Sequence[Hashable] | None = None,
+    ) -> OverRIDEBatchLogitsResult:
+        return self.engine.reweight_logits_batch(
+            hidden,
+            logits,
+            request_ids=request_ids,
+            iterations=iterations,
+            row_ids=row_ids,
+        )
+
     def update_from_sampled_tokens(self, q_logits_next: torch.Tensor | None, sampled_token_ids: torch.Tensor) -> None:
         self.engine.update_from_sampled_tokens(q_logits_next, sampled_token_ids)
+
+    def update_from_sampled_tokens_batch(
+        self,
+        sampled_token_ids: torch.Tensor,
+        *,
+        row_ids: Sequence[Hashable] | None = None,
+    ) -> None:
+        self.engine.update_from_sampled_tokens_batch(sampled_token_ids, row_ids=row_ids)
 
     def read_stats(self) -> OverRIDEStats:
         return self.engine.read_stats()

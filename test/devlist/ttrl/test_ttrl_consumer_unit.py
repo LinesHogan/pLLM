@@ -30,6 +30,19 @@ class TTRLConsumerUnitTest(unittest.TestCase):
 
         self.assertEqual(rewards, [1.0, 1.0, 0.0])
 
+    def test_majority_rewards_vote_on_normalized_extracted_answers(self) -> None:
+        from tllm.consumers.devlist.ttrl import TTRLSample, majority_vote_rewards
+
+        samples = [
+            TTRLSample(prompt_idx=0, sample_idx=0, completion=r"First derivation. Therefore \boxed{4}"),
+            TTRLSample(prompt_idx=0, sample_idx=1, completion=r"Second derivation. Final: \boxed{4}"),
+            TTRLSample(prompt_idx=0, sample_idx=2, completion=r"Wrong path. Therefore \boxed{5}"),
+        ]
+
+        rewards = majority_vote_rewards(samples)
+
+        self.assertEqual(rewards, [1.0, 1.0, 0.0])
+
     def test_majority_rewards_break_ties_by_first_seen_completion(self) -> None:
         from tllm.consumers.devlist.ttrl import TTRLSample, majority_vote_rewards
 
@@ -41,6 +54,33 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         rewards = majority_vote_rewards(samples)
 
         self.assertEqual(rewards, [1.0, 0.0])
+
+    def test_vote_sample_selection_matches_upstream_block_indices(self) -> None:
+        from tllm.consumers.devlist.ttrl import select_ttrl_training_indices
+
+        selected = select_ttrl_training_indices(
+            num_prompts=2,
+            n_votes_per_prompt=4,
+            n_samples_per_prompt=2,
+        )
+
+        self.assertEqual(selected, [0, 1, 4, 5])
+
+    def test_structured_vote_result_exposes_majority_label_ratio_and_rewards(self) -> None:
+        from tllm.consumers.devlist.ttrl import TTRLSample, build_ttrl_reward_result
+
+        samples = [
+            TTRLSample(prompt_idx=0, sample_idx=0, completion=r"Reasoning A. \boxed{4}"),
+            TTRLSample(prompt_idx=0, sample_idx=1, completion=r"Reasoning B. \boxed{4}"),
+            TTRLSample(prompt_idx=0, sample_idx=2, completion=r"Reasoning C. \boxed{5}"),
+        ]
+
+        result = build_ttrl_reward_result(samples)
+
+        self.assertEqual(result.majority_by_prompt[0].label, "4")
+        self.assertEqual(result.majority_by_prompt[0].ratio, 2 / 3)
+        self.assertEqual(result.sample_results[0].label, "4")
+        self.assertEqual([item.reward for item in result.sample_results], [1.0, 1.0, 0.0])
 
     def test_ttrl_module_does_not_import_verl(self) -> None:
         before = set(sys.modules)
