@@ -2,8 +2,8 @@
 
 ## Scope
 
-- tLLM revision inspected: local `consumer-gtta-runtime-adoption-contracts`
-  branch after runtime prompt-context and trajectory-event contracts landed
+- tLLM revision inspected: local `consumer-gtta-prompt-smoke-report` branch
+  after cached prompt-context smoke and fake capture-runner verification
 - Upstream GTTA revision inspected: `24ba304`
 - tLLM files inspected: `tllm/consumers/gtta/consumer.py`,
   `test/consumers/gtta/test_gtta_consumer_unit.py`,
@@ -87,9 +87,10 @@ The consumer-local toy coverage now fixes the narrow adoption subset:
 trajectory ranking, processed dynamics accumulation/export, filtered dynamics
 lookup, explicit runtime event ingestion, copy-safe query/export,
 deterministic snippet generation, upstream-shaped environment-dynamics JSONL,
-and opt-in cached-model evidence that prompt context changes real logits. The
-lookup is deliberately an in-process helper over already ingested feedback; it
-uses the existing runtime contracts instead of inventing a new runtime port.
+fake capture-runner prompt-context injection, and opt-in cached-model evidence
+that prompt context changes real logits. The lookup is deliberately an
+in-process helper over already ingested feedback; it uses the existing runtime
+contracts instead of inventing a new runtime port.
 
 ## Runtime Contract Alignment
 
@@ -133,7 +134,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 
    Result: `12 passed`.
 
-   Current result after runtime adoption coverage: `16 passed, 1 skipped`.
+   Current result after prompt smoke refresh: `17 passed, 1 skipped`.
 
 2. Consumer-local dynamics toy coverage:
 
@@ -143,7 +144,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 
    Result before adoption coverage: `2 passed`.
 
-   Current result after adoption coverage: `6 passed, 1 skipped`.
+   Current result after prompt smoke refresh: `7 passed, 1 skipped`.
 
    The toy case ingests three feedback transitions sharing an action string
    across different tasks and states. The consumer then:
@@ -153,6 +154,8 @@ Commands are summarized with placeholders to avoid machine-specific paths.
    - returns copied query results so callers cannot mutate the retained store;
    - keeps candidate ranking scoped to the requested task and state;
    - emits upstream-shaped JSONL dynamics context with deterministic ordering.
+   - proves a fake capture runner receives the `PromptContextEntry`-injected
+     prompt text and records the expected prompt index in the generation trace.
 
 3. Toy trajectory check:
 
@@ -192,11 +195,11 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 
    ```bash
    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TLLM_GTTA_RUN_CACHED_MODEL_SMOKE=1 \
-     <repo-venv>/bin/python -m pytest -q \
+     PYTHONDONTWRITEBYTECODE=1 <repo-venv>/bin/python -m pytest -q -p no:cacheprovider \
      test/consumers/gtta/test_gtta_dynamics_toy_unit.py::GTTACachedModelSmokeTest::test_prompt_context_changes_tiny_gpt2_logits
    ```
 
-   Result: `1 passed`.
+   Current local-cache result: `1 passed`.
 
    This uses a cached `sshleifer/tiny-gpt2` model with offline flags. The
    consumer writes a `PromptContextEntry`, the runtime prompt-context helper
