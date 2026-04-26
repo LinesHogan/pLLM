@@ -18,6 +18,7 @@ from tllm.ports.base import PortRead
 from tllm.runtime.dispatch_plan import DispatchPlan, FlowDispatchTarget
 from tllm.runtime.ports.frame import Ownership, PortFrame
 from tllm.runtime.ports.assembler import BundleAssembler
+from tllm.runtime.ports.post_generate_dispatch import is_post_generate_flow
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.decode_runtime_metadata import active_request_prompt_sample_metadata
 from tllm.runtime.ports import residual_bindings as _residual_bindings
@@ -428,7 +429,11 @@ def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLi
         return 0
 
     step_id = int(core.RUNTIME.event_step_id)
-    targets = [target for target in plan.flow_targets() if _flow_due_for_step(flow=target.flow, step_id=step_id)]
+    targets = [
+        target
+        for target in plan.flow_targets()
+        if (not is_post_generate_flow(target.flow)) and _flow_due_for_step(flow=target.flow, step_id=step_id)
+    ]
     if not targets:
         return 0
 

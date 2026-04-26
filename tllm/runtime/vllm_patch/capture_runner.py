@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from tllm.runtime.generation_trace_runtime import build_generation_trace_from_outputs
+from tllm.runtime.vllm_patch.port_runtime_hooks import dispatch_post_generate_port_bundles
 
 
 def _resolve_prompt_sample_for_req_id(runtime: Any, request_id: str) -> tuple[int, int]:
@@ -65,4 +66,5 @@ def run_generate_with_request_mapping(
         resolve_prompt_sample_fn=lambda request_id: _resolve_prompt_sample_for_req_id(runtime, str(request_id)),
         group_id=str(generation_group_id),
     )
+    dispatch_post_generate_port_bundles(runtime=runtime, runner=llm)
     return outputs

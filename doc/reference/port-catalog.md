@@ -86,6 +86,12 @@ completion token ids, completion text, finish reason, and optional generation
 group id. This is intended for closed-loop consumers such as TTRL and FTTT that
 need whole-completion outcomes rather than only decode-step tensors.
 
+Consumers can request this port through a `post_generate` flow. Runtime delivers
+one bundle after generation completes, with the `generation_trace` entry holding
+the full immutable `GenerationTraceBatch`. Post-generate flows are isolated from
+decode-step dispatch, so they do not trigger residual capture or decode frame
+assembly.
+
 ## `reward_outcome`
 
 Consumer-produced reward, judge, or label outcomes aligned with completed
@@ -100,3 +106,7 @@ or drains them. Each entry carries stable completion identity
 optional algorithm-owned fields such as `reward`, `judge`, `label`,
 `feedback_text`, `skip_reason`, and `is_correct`. Identity fields are strict:
 the runtime does not coerce numeric request IDs or trim surrounding whitespace.
+
+For `post_generate` flows, runtime exposes this port as a write-only sink in the
+bundle. Consumers append a `RewardOutcomeBatch`; the sink rejects other payload
+types and stores accepted entries in the runtime outcome store.

@@ -15,6 +15,7 @@ from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime import active_targets
 from tllm.runtime import hidden_event_bridge as _hidden_bridge
 from tllm.runtime.ports import residual_bundle_dispatch as _residual_bundle_dispatch
+from tllm.runtime.ports import post_generate_dispatch as _post_generate_dispatch
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports import residual_bindings as _residual_bindings
 from tllm.runtime.ports import residual_runtime_setup as _residual_runtime_setup
@@ -334,6 +335,14 @@ def build_step_scope_port_bundle(*, core: PortDispatchCoreLike, flow: ConsumerFl
 
 def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLike) -> int:
     return _residual_bundle_dispatch.dispatch_decode_port_bundles(core=core, runner=runner)
+
+
+def build_post_generate_port_bundle(*, runtime: object, flow: ConsumerFlow) -> PortBundle:
+    return _post_generate_dispatch.build_post_generate_port_bundle(runtime=runtime, flow=flow)
+
+
+def dispatch_post_generate_port_bundles(*, runtime: object, runner: RunnerLike) -> int:
+    return _post_generate_dispatch.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner)
 
 
 def maybe_launch_post_logits_decode_work(*, core: Any, runner: Any) -> None:
