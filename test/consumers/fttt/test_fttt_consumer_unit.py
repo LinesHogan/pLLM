@@ -149,6 +149,127 @@ class FTTTConsumerUnitTest(unittest.TestCase):
 
         self.assertEqual(consumer.read_stats().update_count, 0)
 
+    def test_trace_failure_is_judged_queued_and_returned_as_reward_outcome(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
+
+        judged: list[tuple[str, str]] = []
+
+        def judge(entry: CompletionTraceEntry) -> FTTTJudgeResult:
+            judged.append((entry.request_id, entry.text))
+            return FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text="Your answer is incorrect. Recheck the arithmetic.",
+                label="expected=4",
+                judge="toy-arithmetic",
+            )
+
+        consumer = FTTTConsumer(FTTTConsumerConfig(), judge=judge)
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-fail",
+                    prompt_idx=7,
+                    sample_idx=2,
+                    output_index=1,
+                    token_ids=(11, 12),
+                    text="5",
+                    finish_reason="stop",
+                    group_id="round-1",
+                ),
+            )
+        )
+
+        batch = consumer.process_generation_trace(trace)
+
+        self.assertIsInstance(batch, RewardOutcomeBatch)
+        self.assertEqual(judged, [("req-fail", "5")])
+        self.assertEqual(len(batch.entries), 1)
+        outcome = batch.entries[0]
+        self.assertEqual(outcome.request_id, "req-fail")
+        self.assertEqual(outcome.prompt_idx, 7)
+        self.assertEqual(outcome.sample_idx, 2)
+        self.assertEqual(outcome.output_index, 1)
+        self.assertEqual(outcome.group_id, "round-1")
+        self.assertEqual(outcome.reward, 0.0)
+        self.assertEqual(outcome.judge, "toy-arithmetic")
+        self.assertEqual(outcome.label, "expected=4")
+        self.assertEqual(outcome.feedback_text, "Your answer is incorrect. Recheck the arithmetic.")
+        self.assertEqual(outcome.skip_reason, "")
+        self.assertFalse(outcome.is_correct)
+
+        queued = consumer.drain_feedback()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].prompt_idx, 7)
+        self.assertEqual(queued[0].feedback, "Your answer is incorrect. Recheck the arithmetic.")
+        self.assertEqual(queued[0].reward, 0.0)
+
+    def test_trace_success_is_judged_and_not_queued_for_feedback(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=True,
+                reward=1.0,
+                feedback_text="correct final answer",
+                label="42",
+                judge="toy-exact-match",
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-ok",
+                    prompt_idx=1,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(4, 2),
+                    text="42",
+                    finish_reason="stop",
+                    group_id="round-ok",
+                ),
+            )
+        )
+
+        batch = consumer.process_generation_trace(trace)
+
+        self.assertEqual(consumer.drain_feedback(), [])
+        self.assertEqual(len(batch.entries), 1)
+        outcome = batch.entries[0]
+        self.assertTrue(outcome.is_correct)
+        self.assertEqual(outcome.reward, 1.0)
+        self.assertEqual(outcome.feedback_text, "correct final answer")
+        self.assertEqual(outcome.label, "42")
+        self.assertEqual(outcome.skip_reason, "correct-output")
+
+    def test_trace_judge_loop_rejects_non_strict_identity_fields(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
+
+        trace_entry = type(
+            "LooseTraceEntry",
+            (),
+            {
+                "request_id": 123,
+                "prompt_idx": True,
+                "sample_idx": 0,
+                "output_index": 0,
+                "group_id": "",
+                "text": "bad",
+            },
+        )()
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(),
+            judge=lambda entry: FTTTJudgeResult(is_correct=False, reward=0.0, feedback_text="incorrect"),
+        )
+
+        with self.assertRaisesRegex(TypeError, "request_id must be str"):
+            consumer.process_generation_trace(GenerationTraceBatch(entries=(trace_entry,)))  # type: ignore[arg-type]
+
     def test_fttt_module_does_not_import_external_feedback_apis(self) -> None:
         before = set(sys.modules)
 

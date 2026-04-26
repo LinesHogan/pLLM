@@ -19,9 +19,17 @@ reference repository modules.
 - per-instance retry accounting,
 - stop-on-correct behavior with per-instance reset,
 - disabled no-op behavior.
+- completed-generation trace judging into reward outcomes and queued feedback.
 
-The first version expects callers to provide feedback and rewards. It does not
-judge completions by itself.
+The trace judge path is intentionally lightweight. Callers may inject a local
+judge callable that receives each completed generation trace entry and returns
+`FTTTJudgeResult`. `process_generation_trace(trace)` then returns a
+`RewardOutcomeBatch`; incorrect outputs are also converted into `FeedbackRecord`
+items for the existing feedback queue, while correct outputs are marked with
+`skip_reason="correct-output"` and are not queued for adaptation.
+
+The default judge is only a toy heuristic for smoke tests. It does not call an
+external reward model, code runner, dataset oracle, or upstream FTTT module.
 
 ## Feedback-Conditioned Edits
 
@@ -44,6 +52,25 @@ The adapter can be queried without another training step:
 The implementation is intentionally local and lightweight: feedback text affects
 the edit through stable text feature hashing, not through an upstream tokenizer,
 reward model, or external service.
+
+## Trace Judge Toy Loop
+
+`FTTTConsumer` declares a consumer flow that reads completed generation traces
+and writes completed reward outcomes. The runtime port storage remains owned by
+the runtime; the consumer-side helper only builds the batch:
+
+- `FTTTJudgeResult(is_correct=False, reward=0.0, feedback_text=...)` marks a
+  failed completion, emits a `RewardOutcomeEntry`, and queues feedback.
+- `FTTTJudgeResult(is_correct=True, reward=1.0, ...)` emits a
+  `RewardOutcomeEntry` with `skip_reason="correct-output"` and skips feedback
+  queueing.
+- identity fields (`request_id`, `prompt_idx`, `sample_idx`, `output_index`)
+  are passed through to `RewardOutcomeEntry` without implicit coercion, so the
+  runtime outcome type checks remain strict.
+
+This closes the local trace -> judge -> feedback/outcome mechanism needed for a
+toy FTTT loop. It still does not train on feedback tokens or attach PEFT LoRA
+modules to the model.
 
 ## Instance State
 

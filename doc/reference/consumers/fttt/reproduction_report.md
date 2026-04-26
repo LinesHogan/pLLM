@@ -24,21 +24,30 @@ The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
   let the learned edit affect later hidden rows or logits.
 - Per-instance retry state, stop-on-correct handling, and explicit reset.
 - Stats for queued, dropped, consumed feedback, update count, loss count, and last loss.
+- A lightweight trace judge toy loop:
+  - completed generation trace entries are passed to an injectable local judge;
+  - failed completions produce `RewardOutcomeEntry` records and queued
+    `FeedbackRecord` items;
+  - correct completions produce reward outcomes with `skip_reason="correct-output"`
+    and are not queued for adaptation;
+  - identity fields are handed to the strict reward outcome runtime types without
+    consumer-side coercion.
 - No import of external feedback APIs or heavy upstream modules.
 
 This maps to a local feedback-conditioned edit primitive. It is closer than a
 scalar reward head because feedback text can change the learned edit and the
-edit can be applied to hidden/logit tensors. It still does not map to the
-upstream FTTT loop's full runtime behavior:
+edit can be applied to hidden/logit tensors. The trace judge toy loop also
+aligns the consumer with the upstream generate -> judge/feedback bookkeeping at
+a lightweight data-contract level. It still does not map to the upstream FTTT
+loop's full runtime behavior:
 
 - The `feedback` text is feature-hashed, not tokenized or trained with an LM
   feedback-token loss.
 - The scalar reward is used as an edit input/training signal; the update does
   not train on feedback tokens or the failed completion context.
 - The adapter output can be applied to hidden/logit tensors, but tLLM does not
-  yet own an integrated generate/check/retry loop that applies it during vLLM
-  decoding.
-- There is no dataset judge or runtime retry orchestrator.
+  yet own an integrated runtime retry loop that applies it during vLLM decoding.
+- There is no bundled dataset judge or runtime retry orchestrator.
 - There is no equivalent of upstream LoRA test-time optimization or OpTune's activation/gradient transform.
 - Positive/negative feedback is reduced to numeric regression targets, not the upstream target construction around incorrect feedback, correct completions, and ground-truth solutions.
 
@@ -63,7 +72,7 @@ Therefore, I did not treat upstream execution failure as evidence against the al
 Commands are summarized with placeholders to avoid machine-local paths:
 
 - `<repo>/.venv/bin/python -m pytest -q test/consumers/fttt/test_fttt_consumer_unit.py`
-  - Result: `10 passed in 1.17s`.
+  - Result: `13 passed`.
 - Dependency probe in `<repo>/.venv/bin/python`
   - `torch`, `transformers`, `fastapi`, `requests`, and `sentencepiece` present.
   - `peft` and `adapters` missing.
@@ -108,13 +117,14 @@ reproduction.
 
 The implementation is a clean, local, dependency-light feedback consumer. Its
 tests demonstrate bounded queue behavior, feedback-conditioned edits,
-hidden/logit edit application, stop-on-correct behavior, and per-instance reset.
-However, it omits the central runtime loop: failed-generation feedback is not
-converted into token-level LM training, no LoRA/named-delta path edits actual
-model target modules, and tLLM does not yet orchestrate retry generation from
-judge outcomes. As a result, the consumer should be described as an
-FTTT-inspired feedback edit primitive rather than a complete reproduction of the
-upstream method.
+hidden/logit edit application, stop-on-correct behavior, per-instance reset, and
+trace -> judge -> feedback/outcome conversion. However, it omits the central
+training mechanism: failed-generation feedback is not converted into token-level
+LM loss, no PEFT LoRA or named-delta path edits actual model target modules, and
+tLLM does not yet orchestrate retry generation from judge outcomes. As a result,
+the consumer should be described as an FTTT-inspired feedback edit primitive
+with a toy trace judge loop rather than a complete reproduction of the upstream
+method.
 
 ## Gaps and Risks
 
@@ -125,5 +135,6 @@ upstream method.
 - Positive feedback semantics are not aligned with upstream correct-trial handling.
 - No integration test shows that feedback changes final answers inside a real
   generate/retry loop.
-- No test covers judge-driven retry behavior across runtime generations.
+- No test covers judge-driven retry behavior across multiple runtime generation
+  rounds.
 - The existing no-external-API constraint is satisfied, but any future attempt to reproduce reward-model feedback should keep it optional and local unless explicitly allowed.

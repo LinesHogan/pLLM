@@ -6,8 +6,9 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import hashlib
+from numbers import Real
 import re
-from typing import Iterable, Sequence
+from typing import Iterable, Protocol, Sequence
 
 import torch
 from torch import nn
@@ -15,7 +16,29 @@ from torch.nn import functional as F
 
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers._common.alignment import LowRankAdapter
+from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.base import ConsumerFlow
+from tllm.ports.reward_outcome import RewardOutcome
+from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
+
+
+def _require_feedback_int(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
+    return value
+
+
+def _require_feedback_str(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str")
+    return value
+
+
+def _require_feedback_reward(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("reward must be real")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -23,6 +46,67 @@ class FeedbackRecord:
     prompt_idx: int
     feedback: str
     reward: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prompt_idx", _require_feedback_int(self.prompt_idx, field_name="prompt_idx"))
+        object.__setattr__(self, "feedback", _require_feedback_str(self.feedback, field_name="feedback"))
+        object.__setattr__(self, "reward", _require_feedback_reward(self.reward))
+
+
+@dataclass(frozen=True)
+class FTTTJudgeResult:
+    is_correct: bool
+    reward: float | None = None
+    feedback_text: str = ""
+    label: str = ""
+    judge: str = ""
+    skip_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.is_correct, bool):
+            raise TypeError("is_correct must be bool")
+        reward = 1.0 if self.reward is None and self.is_correct else self.reward
+        reward = 0.0 if reward is None else _require_feedback_reward(reward)
+        object.__setattr__(self, "reward", reward)
+        object.__setattr__(self, "feedback_text", _require_feedback_str(self.feedback_text, field_name="feedback_text"))
+        object.__setattr__(self, "label", _require_feedback_str(self.label, field_name="label"))
+        object.__setattr__(self, "judge", _require_feedback_str(self.judge, field_name="judge"))
+        object.__setattr__(self, "skip_reason", _require_feedback_str(self.skip_reason, field_name="skip_reason"))
+
+
+class FTTTJudge(Protocol):
+    def __call__(self, entry: CompletionTraceEntry) -> FTTTJudgeResult:
+        ...
+
+
+def _default_trace_judge(entry: CompletionTraceEntry) -> FTTTJudgeResult:
+    text = str(getattr(entry, "text", "") or "").strip().lower()
+    finish_reason = str(getattr(entry, "finish_reason", "") or "").strip().lower()
+    negative_markers = ("incorrect", "wrong", "failed", "failure", "error")
+    positive_markers = ("correct", "passed", "success", "solved")
+    is_negative = any(marker in text for marker in negative_markers)
+    is_positive = any(marker in text for marker in positive_markers) and not is_negative
+    if is_positive:
+        return FTTTJudgeResult(
+            is_correct=True,
+            reward=1.0,
+            feedback_text="correct",
+            judge="fttt-default-heuristic",
+            skip_reason="correct-output",
+        )
+    if finish_reason and finish_reason != "stop":
+        return FTTTJudgeResult(
+            is_correct=False,
+            reward=0.0,
+            feedback_text=f"Generation did not finish cleanly: {finish_reason}.",
+            judge="fttt-default-heuristic",
+        )
+    return FTTTJudgeResult(
+        is_correct=False,
+        reward=0.0,
+        feedback_text="Your answer is incorrect.",
+        judge="fttt-default-heuristic",
+    )
 
 
 @dataclass(frozen=True)
@@ -268,9 +352,16 @@ class FTTTEngine(nn.Module):
 class FTTTConsumer(BaseConsumer):
     """Feedback-conditioned local edit consumer."""
 
-    def __init__(self, config: FTTTConsumerConfig, *, engine: FTTTEngine | None = None) -> None:
+    def __init__(
+        self,
+        config: FTTTConsumerConfig,
+        *,
+        engine: FTTTEngine | None = None,
+        judge: FTTTJudge | None = None,
+    ) -> None:
         self.config = config
         self.engine = engine or FTTTEngine(config)
+        self._judge = judge or _default_trace_judge
         self._queue: deque[FeedbackRecord] = deque()
         self._dropped_feedback = 0
 
@@ -279,7 +370,13 @@ class FTTTConsumer(BaseConsumer):
         return self.config.consumer_id
 
     def flows(self) -> Sequence[ConsumerFlow]:
-        return ()
+        return (
+            ConsumerFlow(
+                reads=(GenerationTrace.read(),),
+                writes=(RewardOutcome.write(),),
+                window="out_of_band",
+            ),
+        )
 
     def enqueue_feedback(self, feedback: FeedbackRecord) -> bool:
         if len(self._queue) >= max(0, int(self.config.max_queue_size)):
@@ -291,6 +388,56 @@ class FTTTConsumer(BaseConsumer):
     def drain_feedback(self, *, limit: int = 0) -> list[FeedbackRecord]:
         max_items = len(self._queue) if int(limit) <= 0 else min(int(limit), len(self._queue))
         return [self._queue.popleft() for _ in range(max_items)]
+
+    def _outcome_for_trace_entry(
+        self,
+        entry: CompletionTraceEntry,
+        result: FTTTJudgeResult,
+    ) -> RewardOutcomeEntry:
+        feedback_text = result.feedback_text or ("correct" if result.is_correct else "Your answer is incorrect.")
+        skip_reason = result.skip_reason
+        if result.is_correct and not skip_reason:
+            skip_reason = "correct-output"
+        return RewardOutcomeEntry(
+            request_id=entry.request_id,
+            prompt_idx=entry.prompt_idx,
+            sample_idx=entry.sample_idx,
+            output_index=entry.output_index,
+            group_id=entry.group_id,
+            reward=result.reward,
+            judge=result.judge,
+            label=result.label,
+            feedback_text=feedback_text,
+            skip_reason=skip_reason,
+            is_correct=result.is_correct,
+        )
+
+    def process_generation_trace(
+        self,
+        trace: GenerationTraceBatch,
+        *,
+        judge: FTTTJudge | None = None,
+        enqueue_failures: bool = True,
+    ) -> RewardOutcomeBatch:
+        if not isinstance(trace, GenerationTraceBatch):
+            raise TypeError("trace must be GenerationTraceBatch")
+        judge_fn = judge or self._judge
+        outcomes: list[RewardOutcomeEntry] = []
+        for entry in trace.entries:
+            result = judge_fn(entry)
+            if not isinstance(result, FTTTJudgeResult):
+                raise TypeError("FTTT judge must return FTTTJudgeResult")
+            outcome = self._outcome_for_trace_entry(entry, result)
+            outcomes.append(outcome)
+            if enqueue_failures and result.is_correct is False:
+                self.enqueue_feedback(
+                    FeedbackRecord(
+                        prompt_idx=entry.prompt_idx,
+                        feedback=outcome.feedback_text,
+                        reward=outcome.reward if outcome.reward is not None else 0.0,
+                    )
+                )
+        return RewardOutcomeBatch(entries=tuple(outcomes))
 
     def apply_feedback_update(self, hidden: torch.Tensor, feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord]) -> None:
         records = list(feedback)
