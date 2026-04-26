@@ -21,6 +21,9 @@ A port is how a consumer declares the data it wants from runtime. Consumers do n
 | `update_barrier` | Write-only | post_generate | Consumer-produced update readiness barriers |
 | `prompt_context` | Write-only | pre_generate | Prompt text injected before generation |
 | `trajectory_event` | Write-only | post_step | Environment trajectory observations/actions |
+| `mlp_activation` | Read-only | prefill, decode | MLP activation before down projection |
+| `hidden_target` | Read-only | prefill, decode | Hidden target activation for update rules |
+| `module_weight_view` | Read-only | prefill, decode | Borrowed module weight view |
 
 ## `request_meta`
 
@@ -148,3 +151,20 @@ action, next observation, and optional reward.
 Runtime stores them in a dynamics store with task/state/action-separated query
 and deterministic text export helpers. The store is generic and has no browser
 or benchmark dependency.
+
+## `mlp_activation`
+
+MLP activations captured immediately before the down projection. This is the
+runtime-facing `h` input needed by exact In-Place TTT updates.
+
+## `hidden_target`
+
+Hidden target activations used as the `t` side of In-Place TTT update rules.
+
+## `module_weight_view`
+
+Borrowed module weights such as `down_proj.weight`.
+
+The current runtime exposes the contract and fast-weight state helpers. Full
+vLLM MLP wrapping for Qwen/Llama-style modules remains a separate integration
+step.
