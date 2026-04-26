@@ -5,7 +5,7 @@ Updated: 2026-04-27
 
 ## Scope
 
-This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. The 2026-04-27 update adds consumer-local exact toy math coverage. Runtime contracts for MLP activation, hidden target, module weight view, and fast-weight state now exist. A narrow runtime down-projection effective-weight overlay is now covered by fake-module tests and an opt-in cached Qwen smoke; full MLP target capture/update orchestration remains outside the completed scope.
+This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. The 2026-04-27 update adds consumer-local exact toy math coverage. Runtime contracts for MLP activation, hidden target, module weight view, and fast-weight state now exist. Runtime fast-weight support now includes both a narrow down-projection effective-weight overlay and a limited Qwen/Llama-style MLP wrapper for single-TP, non-quantized MLPs.
 
 ## Upstream mechanism summary
 
@@ -78,10 +78,18 @@ Commands were run with the repo virtual environment, summarized without machine-
   - Fake-module tests prove no-slot behavior matches the base module, a stored
     effective weight changes output, shape mismatches fail, and restore returns
     to base output.
+  - Fake Qwen-like MLP tests prove the wrapper captures the MLP input target
+    and down-projection activation, caches below-chunk prefill tails, updates
+    when tail plus current rows reaches a full chunk, restores the original
+    forward method, and applies decode without training by default.
 - Opt-in cached Qwen smoke:
   - With local cached `Qwen/Qwen2.5-0.5B-Instruct`, single TP, eager execution,
     and non-quantized `model.layers.0.mlp.down_proj`, installing an effective
     `past_w` overlay changes generated token ids.
+  - The same guarded smoke installs the MLP wrapper on
+    `model.layers.0.mlp`, proves below-chunk calls only cache tail rows,
+    a following call reaches a full chunk and increments update counters, and
+    the adapted MLP output differs from the restored base output.
   - The smoke is guarded by `TLLM_INPLACE_TTT_RUN_CACHED_MODEL_SMOKE=1` because
     it requires CUDA and a cached model.
 - Runtime binding sanity check:
@@ -96,7 +104,7 @@ has to be explicitly requested. The consumer also performs local online updates,
 complete-chunk training, tail carryover, and active decode row handling in the
 checks above.
 
-As an exact runtime reproduction of upstream In-Place TTT, it is still incomplete. The upstream core update is an in-place fast-weight update of the MLP down projection with chunkwise cumulative weights; tLLM now has the contract-level runtime surface for MLP activation, hidden target, module weight view, fast-weight state, and a narrow effective-weight down-projection overlay. The current completion covers exact chunk/tail/update math and model-output-changing overlay application, while the shipped consumer engine still uses a separate low-rank delta adapter for live bundle consumption and does not yet own a full vLLM MLP capture/update loop.
+As an exact runtime reproduction of upstream In-Place TTT, it is still incomplete. The upstream core update is an in-place fast-weight update of the MLP down projection with chunkwise cumulative weights; tLLM now has the contract-level runtime surface for MLP activation, hidden target, module weight view, fast-weight state, a narrow effective-weight down-projection overlay, and a limited runtime MLP wrapper that captures `h`/`t` inside Qwen/Llama-style MLPs. The current completion covers exact chunk/tail/update math and model-output-changing overlay application, while the shipped consumer engine still uses a separate low-rank delta adapter for live bundle consumption and does not yet automatically install per-request wrappers through the normal vLLM runner lifecycle.
 
 The largest practical gap is end-to-end prefill delivery. The consumer declares prefill flows, but the currently inspected generic residual flow/binding path is decode-oriented, while existing prefill support lives in a repro/capture path. I did not find evidence that the default prefill `ConsumerFlow` is fully wired through the normal runtime bundle dispatch. Until that is closed with an end-to-end test or smoke run, `update_count > 0` from direct bundle tests should not be treated as proof of integrated prefill runtime reproduction.
 
@@ -104,11 +112,10 @@ The largest practical gap is end-to-end prefill delivery. The consumer declares 
 
 - Add an end-to-end prefill `ConsumerFlow` dispatch test that drives real prefill hidden rows into `InPlaceTTTConsumer` through the normal runtime path.
 - Keep decode opt-in. Do not change the default to include `"decode"`.
-- Complete the vLLM MLP capture/update orchestration before claiming exact
-  integrated reproduction: MLP internal activation `h`, hidden target `t`,
-  `down_proj.weight` view, and per-request/per-sample/per-layer fast-weight
-  state now have contracts and an overlay primitive, but the update loop is not
-  yet wired into model execution.
+- Complete the vLLM runner orchestration before claiming exact integrated
+  reproduction: the MLP wrapper can capture `h`, target `t`, and the
+  `down_proj.weight` view, but it is not yet installed automatically per
+  request/sample/layer through the normal runtime lifecycle.
 - Once runtime support exists, replace or augment the low-rank delta adapter
   with a fast-weight `down_proj` update path matching upstream `ttt_conv`,
   `ttt_proj`, chunk accumulation, and cache-tail semantics.

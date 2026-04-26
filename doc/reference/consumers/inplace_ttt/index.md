@@ -33,6 +33,12 @@ it is a small PyTorch reference surface for the upstream-shaped exact math:
 `down_proj.weight`, and only complete chunks update the fast weight.
 Below-chunk calls only cache the tail.
 
+Runtime support now also includes a limited Qwen/Llama-style MLP wrapper for
+single-TP, non-quantized `gate_up_proj -> act_fn -> down_proj` blocks. The
+wrapper treats the MLP input as the hidden target `t`, the activation before
+`down_proj` as `h`, stores `past_w` as an effective weight, updates on prefill
+chunks by default, and keeps decode update opt-in.
+
 ## Delivery
 
 By default, the enabled consumer declares a prefill bundle flow:
