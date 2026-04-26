@@ -50,6 +50,10 @@ library API. Its main mechanism is in `OverRIDELogitsProcessor`:
 - Request ids encode the iteration index. The upstream logits processor groups
   rows by that parsed index, so different rows in one vLLM batch can use
   different reweighting heads.
+- Runtime row ids are treated as stable integer row identities across reweight
+  and sampled-token update calls. Tensor row-id inputs are accepted only at the
+  API boundary and immediately normalized to the canonical `tuple[int, ...]`
+  representation used by the pending cache.
 
 The intent is therefore not just to perturb logits once, but to iteratively
 train small residual heads from previously sampled tokens and then penalize
@@ -91,7 +95,7 @@ Commands are shown with placeholders to avoid local machine paths.
 Result:
 
 ```text
-7 passed
+11 passed
 ```
 
 Environment check:
@@ -209,15 +213,15 @@ The tLLM consumer correctly reproduces the core OverRIDE mechanism:
 - previous-iteration residual subtraction,
 - current-iteration `q_logits_next`,
 - sampled-token cross-entropy update,
+- canonical integer row ids resolving to the same cached update rows,
 - no upstream dependency.
 
 End-to-end diverse decoding verdict: **not yet fully integrated**.
 
-The consumer exposes the right primitive operations, but it does not itself
-implement the upstream runtime behavior of patching vLLM, parsing iteration ids
-from request ids, grouping batched rows by iteration, sampling, and immediately
-feeding sampled ids back into the update path. That integration would need to be
-provided by a sampler bridge or runtime hook.
+The consumer exposes the right primitive operations and now includes the
+batch-row bridge needed by a sampler/runtime hook: request-id iteration parsing,
+batched grouping by iteration, cached `q_logits_next`, and sampled-token update
+by row id. It still does not itself patch vLLM or perform sampling.
 
 ## Gaps And Risks
 

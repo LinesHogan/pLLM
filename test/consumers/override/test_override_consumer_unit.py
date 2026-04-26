@@ -147,6 +147,42 @@ class OverRIDEConsumerUnitTest(unittest.TestCase):
         self.assertGreater(stats.update_count, 0)
         self.assertGreater(stats.last_loss, 0.0)
 
+    def test_runtime_bridge_normalizes_tensor_row_ids_for_cached_update(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(
+            OverRIDEConsumerConfig(
+                hidden_size=2,
+                vocab_size=3,
+                rank=2,
+                num_iterations=3,
+                learning_rate=0.1,
+            )
+        )
+        hidden = torch.tensor([[1.0, -1.0], [0.5, 2.0], [2.0, 1.0]])
+        logits = torch.randn(3, 3)
+
+        consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3), row_ids=torch.tensor([10, 11, 12]))
+        before0 = consumer.engine.heads[0].up.weight.detach().clone()
+
+        consumer.update_from_sampled_tokens_batch(torch.tensor([0, 1, 2]), row_ids=torch.tensor([10, 11, 12]))
+
+        self.assertFalse(torch.allclose(before0, consumer.engine.heads[0].up.weight.detach()))
+        self.assertGreater(consumer.read_stats().update_count, 0)
+
+    def test_runtime_bridge_rejects_non_integral_row_ids(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(OverRIDEConsumerConfig(hidden_size=2, vocab_size=3, rank=2, num_iterations=3))
+        hidden = torch.randn(3, 2)
+        logits = torch.randn(3, 3)
+
+        with self.assertRaisesRegex(RuntimeError, "row ids must be integers"):
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3), row_ids=("10", "11", "12"))
+
+        with self.assertRaisesRegex(RuntimeError, "row id tensors must use an integer dtype"):
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3), row_ids=torch.tensor([10.0, 11.0, 12.0]))
+
     def test_sampled_token_update_changes_head_and_records_loss(self) -> None:
         from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
 
