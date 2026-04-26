@@ -5,8 +5,10 @@ test-time hidden-state signals to update a fast adaptation component during
 inference.
 
 The implementation does not import VeOmni, custom HuggingFace model classes, or
-reference repository code. It also does not patch vLLM. Engine interaction goes
-through tLLM `ConsumerFlow`s and hidden-row ports.
+reference repository code. The default consumer path interacts with the engine
+through tLLM `ConsumerFlow`s and hidden-row ports. An explicit runtime opt-in
+can additionally install a limited vLLM runner wrapper for Qwen/Llama-style
+MLPs.
 
 ## Supported Core
 
@@ -38,6 +40,13 @@ single-TP, non-quantized `gate_up_proj -> act_fn -> down_proj` blocks. The
 wrapper treats the MLP input as the hidden target `t`, the activation before
 `down_proj` as `h`, stores `past_w` as an effective weight, updates on prefill
 chunks by default, and keeps decode update opt-in.
+
+The runner lifecycle can install this wrapper at `load_model` time behind the
+explicit `inplace_ttt_fast_weight_enabled` runtime setting. The current runner
+integration uses a static single-request key, which is useful for exact
+small-model smokes and single-request experiments. It rejects multi-request
+runner batches in static-key mode; per-request/per-sample state separation for
+packed multi-request batches remains a later runtime extension.
 
 ## Delivery
 

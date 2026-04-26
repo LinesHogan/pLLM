@@ -308,6 +308,14 @@ class ResidualRuntimeConfig:
     distiller_beta: float = 0.0
     distiller_sampler_backend: SamplerBackend = "post_filter_exact"
     compact_capture_lane: bool = False
+    inplace_ttt_fast_weight_enabled: bool = False
+    inplace_ttt_fast_weight_layers: tuple[int, ...] = (0,)
+    inplace_ttt_fast_weight_chunk_size: int = 4096
+    inplace_ttt_fast_weight_lr: float = 1e-3
+    inplace_ttt_fast_weight_decode_update_enabled: bool = False
+    inplace_ttt_fast_weight_key_mode: str = "static"
+    inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__"
+    inplace_ttt_fast_weight_fail_on_unsupported: bool = False
 
 
 @dataclass
@@ -353,6 +361,12 @@ class ResidualRuntimeState:
     dispatch_plan: Optional[DispatchPlan] = None
     test_time_lora_enabled: bool = False
     test_time_lora_service: object | None = None
+    inplace_ttt_fast_weight_state: object | None = None
+    inplace_ttt_fast_weight_handles: dict[str, object] = field(default_factory=dict)
+    inplace_ttt_fast_weight_hook_spec: tuple[object, ...] | None = None
+    inplace_ttt_fast_weight_phase: str = "prefill"
+    inplace_ttt_fast_weight_installed_count: int = 0
+    inplace_ttt_fast_weight_skipped_count: int = 0
 
     def reset_step(self) -> None:
         self.decode_count = 0
@@ -548,6 +562,14 @@ def configure_runtime(
     distiller_beta: float = 0.0,
     distiller_sampler_backend: SamplerBackend = "post_filter_exact",
     compact_capture_lane: bool = False,
+    inplace_ttt_fast_weight_enabled: bool = False,
+    inplace_ttt_fast_weight_layers: Sequence[int] = (0,),
+    inplace_ttt_fast_weight_chunk_size: int = 4096,
+    inplace_ttt_fast_weight_lr: float = 1e-3,
+    inplace_ttt_fast_weight_decode_update_enabled: bool = False,
+    inplace_ttt_fast_weight_key_mode: str = "static",
+    inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__",
+    inplace_ttt_fast_weight_fail_on_unsupported: bool = False,
 ) -> None:
     cfg = RUNTIME.config
     cfg.graph_scratch_rows = max(0, int(graph_scratch_rows))
@@ -576,6 +598,21 @@ def configure_runtime(
     cfg.distiller_beta = float(distiller_beta)
     cfg.distiller_sampler_backend = normalize_sampler_backend(str(distiller_sampler_backend).strip() or "post_filter_exact")
     cfg.compact_capture_lane = bool(compact_capture_lane)
+    old_inplace_ttt_enabled = bool(cfg.inplace_ttt_fast_weight_enabled)
+    cfg.inplace_ttt_fast_weight_enabled = bool(inplace_ttt_fast_weight_enabled)
+    if old_inplace_ttt_enabled and not cfg.inplace_ttt_fast_weight_enabled:
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+
+        restore_inplace_ttt_fast_weight_wrappers(RUNTIME)
+    cfg.inplace_ttt_fast_weight_layers = tuple(int(layer) for layer in inplace_ttt_fast_weight_layers)
+    cfg.inplace_ttt_fast_weight_chunk_size = max(1, int(inplace_ttt_fast_weight_chunk_size))
+    cfg.inplace_ttt_fast_weight_lr = float(inplace_ttt_fast_weight_lr)
+    cfg.inplace_ttt_fast_weight_decode_update_enabled = bool(inplace_ttt_fast_weight_decode_update_enabled)
+    cfg.inplace_ttt_fast_weight_key_mode = str(inplace_ttt_fast_weight_key_mode).strip() or "static"
+    cfg.inplace_ttt_fast_weight_static_request_id = (
+        str(inplace_ttt_fast_weight_static_request_id).strip() or "__tllm_inplace_ttt_static__"
+    )
+    cfg.inplace_ttt_fast_weight_fail_on_unsupported = bool(inplace_ttt_fast_weight_fail_on_unsupported)
 
     if not cfg.source_layer_path:
         raise RuntimeError("source_layer_path must be non-empty")
@@ -607,6 +644,32 @@ def set_esamp_training_enabled(enabled: bool) -> None:
 
 def set_test_time_lora_enabled(enabled: bool) -> None:
     RUNTIME.test_time_lora_enabled = bool(enabled)
+
+
+def set_inplace_ttt_fast_weight_enabled(
+    enabled: bool,
+    *,
+    layers: Sequence[int] | None = None,
+    chunk_size: int | None = None,
+    learning_rate: float | None = None,
+    decode_update_enabled: bool | None = None,
+    fail_on_unsupported: bool | None = None,
+) -> None:
+    RUNTIME.config.inplace_ttt_fast_weight_enabled = bool(enabled)
+    if not bool(enabled):
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+
+        restore_inplace_ttt_fast_weight_wrappers(RUNTIME)
+    if layers is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_layers = tuple(int(layer) for layer in layers)
+    if chunk_size is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_chunk_size = max(1, int(chunk_size))
+    if learning_rate is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_lr = float(learning_rate)
+    if decode_update_enabled is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_decode_update_enabled = bool(decode_update_enabled)
+    if fail_on_unsupported is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_fail_on_unsupported = bool(fail_on_unsupported)
 
 
 def synchronize_esamp() -> None:
@@ -806,6 +869,7 @@ __all__ = [
     "runner_uses_compilation_or_cudagraph",
     "set_runtime_consumer",
     "set_esamp_training_enabled",
+    "set_inplace_ttt_fast_weight_enabled",
     "set_test_time_lora_enabled",
     "synchronize_esamp",
 ]

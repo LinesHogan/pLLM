@@ -26,6 +26,7 @@ from tllm.runtime.vllm_patch.adapters import (
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime import vllm_test_time_lora as _test_time_lora
+from tllm.runtime import inplace_ttt_fast_weight_runtime as _inplace_ttt_fast_weight
 
 RUNTIME_EVENT_POINTS = (
     "load_model.pre",
@@ -163,6 +164,10 @@ def _record_cpu_hotspot(core: object, name: str, start_s: float, end_s: float) -
 
 def _test_time_lora_enabled(runtime: object) -> bool:
     return bool(getattr(runtime, "test_time_lora_enabled", False) or getattr(runtime, "test_time_lora_service", None) is not None)
+
+
+def _check_inplace_ttt_static_key_request_count(*, core: Any, runner: Any) -> None:
+    _inplace_ttt_fast_weight.require_static_key_single_request(core.RUNTIME, runner)
 
 
 def prepare_decode_localization(
@@ -502,6 +507,7 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
         out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
         if _test_time_lora_enabled(core.RUNTIME):
             _test_time_lora.maybe_bind_test_time_lora_service(runtime=core.RUNTIME, runner=runner)
+        _inplace_ttt_fast_weight.maybe_install_inplace_ttt_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
         return out
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
@@ -514,6 +520,7 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
     out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
     _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
     _test_time_lora.maybe_bind_test_time_lora_service(runtime=core.RUNTIME, runner=runner)
+    _inplace_ttt_fast_weight.maybe_install_inplace_ttt_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
     setup_runtime_hooks_if_active(core=core, runner=runner)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
@@ -530,7 +537,9 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         if _test_time_lora_enabled(core.RUNTIME):
             _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
-        return core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
+        out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
+        _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_phase_from_runner(core.RUNTIME, runner)
+        return out
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
@@ -559,6 +568,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         )
         t2 = time.perf_counter() if trace_hotspots else 0.0
         prepare_decode_localization(core=core, runner=runner, out=out, prepare_inputs_view=view)
+        _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_phase_from_runner(core.RUNTIME, runner)
         t3 = time.perf_counter() if trace_hotspots else 0.0
         _record_cpu_hotspot(core, "prepare_inputs.decode_localization_cpu", t2, t3)
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
@@ -581,12 +591,14 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         core.RUNTIME.decode_sample_idx_tensor = None
         core.RUNTIME.decode_compact_count = 0
         core.RUNTIME.decode_compact_row_ids = ()
+        core.RUNTIME.inplace_ttt_fast_weight_phase = "prefill"
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
     return out
 
 
 def wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
+        _check_inplace_ttt_static_key_request_count(core=core, runner=runner)
         return core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
@@ -601,6 +613,7 @@ def wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) 
         core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         setup_runtime_hooks_if_active(core=core, runner=runner)
+    _check_inplace_ttt_static_key_request_count(core=core, runner=runner)
     trace_hotspots = _path_hotspots_enabled(core)
     t0 = time.perf_counter() if trace_hotspots else 0.0
     out = core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
