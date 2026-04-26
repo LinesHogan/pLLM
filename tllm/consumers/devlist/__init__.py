@@ -15,6 +15,14 @@ from tllm.consumers.devlist.override import (
     OverRIDEReweightEngine,
     OverRIDEStats,
 )
+from tllm.consumers.devlist.ttrl import (
+    TTRLConsumer,
+    TTRLConsumerConfig,
+    TTRLEngine,
+    TTRLSample,
+    TTRLStats,
+    majority_vote_rewards,
+)
 
 __all__ = [
     "InPlaceTTTConsumer",
@@ -27,4 +35,10 @@ __all__ = [
     "OverRIDELogitsResult",
     "OverRIDEReweightEngine",
     "OverRIDEStats",
+    "TTRLConsumer",
+    "TTRLConsumerConfig",
+    "TTRLEngine",
+    "TTRLSample",
+    "TTRLStats",
+    "majority_vote_rewards",
 ]
