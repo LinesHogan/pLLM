@@ -109,17 +109,17 @@ def run_exact_toy_down_proj_step(
     """Run a dependency-light exact toy step for MLP down-proj fast weights.
 
     The helper models the consumer-side math target for upstream-shaped
-    In-Place TTT alignment. ``past_w`` is a cumulative fast-weight delta for
-    ``down_proj.weight``. Full chunks update ``past_w`` with a local linear
-    least-squares gradient step, while below-chunk rows are cached as
-    ``past_h/past_t`` and do not update.
+    In-Place TTT alignment. ``past_w`` is the effective ``down_proj.weight``.
+    Full chunks update that effective weight with a local linear least-squares
+    gradient step, while below-chunk rows are cached as ``past_h/past_t`` and do
+    not update.
     """
 
     _validate_exact_toy_tensors(h, t, down_proj_weight)
     current_state = state or InPlaceTTTExactToyState()
     fast_w = current_state.past_w
     if fast_w is None:
-        fast_w = torch.zeros_like(down_proj_weight)
+        fast_w = down_proj_weight.detach().clone()
     else:
         fast_w = fast_w.to(device=down_proj_weight.device, dtype=down_proj_weight.dtype).clone()
     if tuple(fast_w.shape) != tuple(down_proj_weight.shape):
@@ -145,17 +145,16 @@ def run_exact_toy_down_proj_step(
         end = start + chunk
         h_chunk = h_work[start:end]
         t_chunk = t_work[start:end]
-        effective_before = down_proj_weight + fast_w
-        residual = t_chunk - h_chunk.matmul(effective_before.t())
+        residual = t_chunk - h_chunk.matmul(fast_w.t())
         fast_w = fast_w + float(learning_rate) * residual.t().matmul(h_chunk) / float(chunk)
-        outputs.append(h_chunk.matmul((down_proj_weight + fast_w).t()))
+        outputs.append(h_chunk.matmul(fast_w.t()))
         update_count += 1
 
     tail_h = h_work[full_rows:]
     tail_t = t_work[full_rows:]
     tail_rows = int(tail_h.shape[0])
     if tail_rows > 0:
-        outputs.append(tail_h.matmul((down_proj_weight + fast_w).t()))
+        outputs.append(tail_h.matmul(fast_w.t()))
     output = torch.cat(outputs, dim=0) if outputs else _empty_toy_output(h_work, down_proj_weight)
     next_state = InPlaceTTTExactToyState(
         past_h=tail_h.detach().clone() if tail_rows > 0 else None,

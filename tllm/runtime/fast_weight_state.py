@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MethodType
+from typing import Callable
 
 import torch
+from torch.nn import functional as F
 
 __test__ = False
 
@@ -76,8 +79,12 @@ class FastWeightState:
         h = _require_2d_tensor(past_h, field_name="past_h")
         t = _require_2d_tensor(past_t, field_name="past_t")
         w = _require_2d_tensor(past_w, field_name="past_w")
-        if tuple(h.shape) != tuple(t.shape):
-            raise RuntimeError("past_h and past_t must have matching shape")
+        if int(h.shape[0]) != int(t.shape[0]):
+            raise RuntimeError("past_h and past_t must have matching row count")
+        if int(h.shape[1]) != int(w.shape[1]):
+            raise RuntimeError("past_h width must match past_w input width")
+        if int(t.shape[1]) != int(w.shape[0]):
+            raise RuntimeError("past_t width must match past_w output width")
         self._slots[key] = FastWeightSlot(
             past_h=h.detach().clone(),
             past_t=t.detach().clone(),
@@ -114,6 +121,84 @@ class FastWeightState:
         self._slots.pop(key, None)
 
 
+@dataclass(frozen=True)
+class DownProjFastWeightOverlayHandle:
+    module: object
+    original_forward: Callable[..., object]
+
+    def restore(self) -> None:
+        setattr(self.module, "forward", self.original_forward)
+
+
+def module_weight_view(module: object) -> torch.Tensor:
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        base_layer = getattr(module, "base_layer", None)
+        weight = getattr(base_layer, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError("module does not expose a tensor weight view")
+    if weight.ndim != 2:
+        raise RuntimeError("module weight view must be 2D")
+    return weight
+
+
+def _require_single_tensor_parallel() -> None:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_world_size
+    except Exception:
+        return
+    try:
+        tp_size = int(get_tensor_model_parallel_world_size())
+    except Exception:
+        return
+    if tp_size != 1:
+        raise RuntimeError("In-Place TTT fast-weight overlay currently requires tensor_parallel_size=1")
+
+
+def _replace_forward_output(base_output: object, replacement: torch.Tensor) -> object:
+    if isinstance(base_output, torch.Tensor):
+        return replacement.to(device=base_output.device, dtype=base_output.dtype)
+    if isinstance(base_output, tuple) and base_output and isinstance(base_output[0], torch.Tensor):
+        first = replacement.to(device=base_output[0].device, dtype=base_output[0].dtype)
+        return (first, *base_output[1:])
+    raise RuntimeError("down_proj forward output must be a tensor or tuple starting with a tensor")
+
+
+def install_down_proj_fast_weight_overlay(
+    *,
+    module: object,
+    state: FastWeightState,
+    key: FastWeightKey,
+    require_single_tp: bool = True,
+) -> DownProjFastWeightOverlayHandle:
+    if not isinstance(state, FastWeightState):
+        raise TypeError("state must be FastWeightState")
+    if not isinstance(key, FastWeightKey):
+        raise TypeError("key must be FastWeightKey")
+    if require_single_tp:
+        _require_single_tensor_parallel()
+    weight = module_weight_view(module)
+    original_forward = getattr(module, "forward", None)
+    if not callable(original_forward):
+        raise RuntimeError("module must expose callable forward")
+
+    def _forward(self, hidden: torch.Tensor, *args: object, **kwargs: object) -> object:
+        if not isinstance(hidden, torch.Tensor):
+            raise TypeError("down_proj hidden input must be torch.Tensor")
+        base_output = original_forward(hidden, *args, **kwargs)
+        slot = state.get(key)
+        if slot is None:
+            return base_output
+        if tuple(slot.past_w.shape) != tuple(weight.shape):
+            raise RuntimeError("fast-weight overlay shape must match module weight")
+        replacement = F.linear(hidden, slot.past_w.to(device=hidden.device, dtype=hidden.dtype))
+        return _replace_forward_output(base_output, replacement)
+
+    bound_forward = MethodType(_forward, module)
+    setattr(module, "forward", bound_forward)
+    return DownProjFastWeightOverlayHandle(module=module, original_forward=original_forward)
+
+
 def apply_down_proj_fast_weight(
     *,
     hidden: torch.Tensor,
@@ -130,5 +215,5 @@ def apply_down_proj_fast_weight(
     if slot is not None:
         if tuple(slot.past_w.shape) != tuple(w.shape):
             raise RuntimeError("fast-weight overlay shape must match base_weight")
-        effective_weight = w + slot.past_w.to(device=w.device, dtype=w.dtype)
+        effective_weight = slot.past_w.to(device=w.device, dtype=w.dtype)
     return torch.nn.functional.linear(h, effective_weight)

@@ -29,9 +29,9 @@ fast-weight state across calls.
 The package also exposes `run_exact_toy_down_proj_step()` for dependency-light
 consumer-side alignment tests. That helper is not wired to runtime execution;
 it is a small PyTorch reference surface for the upstream-shaped exact math:
-`past_h` and `past_t` cache incomplete rows, `past_w` stores the cumulative
-fast-weight delta for `down_proj.weight`, and only complete chunks update the
-fast weight. Below-chunk calls only cache the tail.
+`past_h` and `past_t` cache incomplete rows, `past_w` stores the effective
+`down_proj.weight`, and only complete chunks update the fast weight.
+Below-chunk calls only cache the tail.
 
 ## Delivery
 

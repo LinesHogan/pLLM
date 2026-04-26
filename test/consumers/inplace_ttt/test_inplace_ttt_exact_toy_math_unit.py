@@ -23,7 +23,7 @@ def _reference_exact_step(
         assert past_t is not None
         h = torch.cat([past_h, h], dim=0)
         t = torch.cat([past_t, t], dim=0)
-    fast_w = torch.zeros_like(down_weight) if past_w is None else past_w.clone()
+    fast_w = down_weight.clone() if past_w is None else past_w.clone()
     chunk = max(1, int(chunk_size))
     full_rows = (int(h.shape[0]) // chunk) * chunk
     outputs: list[torch.Tensor] = []
@@ -31,15 +31,14 @@ def _reference_exact_step(
     for start in range(0, full_rows, chunk):
         h_chunk = h[start : start + chunk]
         t_chunk = t[start : start + chunk]
-        effective_before = down_weight + fast_w
-        residual = t_chunk - h_chunk.matmul(effective_before.t())
+        residual = t_chunk - h_chunk.matmul(fast_w.t())
         fast_w = fast_w + float(learning_rate) * residual.t().matmul(h_chunk) / float(chunk)
-        outputs.append(h_chunk.matmul((down_weight + fast_w).t()))
+        outputs.append(h_chunk.matmul(fast_w.t()))
         updates += 1
     tail_h = h[full_rows:]
     tail_t = t[full_rows:]
     if int(tail_h.shape[0]) > 0:
-        outputs.append(tail_h.matmul((down_weight + fast_w).t()))
+        outputs.append(tail_h.matmul(fast_w.t()))
     output = torch.cat(outputs, dim=0) if outputs else h.new_empty((0, down_weight.shape[0]))
     return (
         output,
@@ -122,7 +121,7 @@ class InPlaceTTTExactToyMathUnitTest(unittest.TestCase):
         self.assertTrue(torch.allclose(result.output, h.matmul(down_weight.t())))
         self.assertTrue(torch.equal(result.state.past_h, h))
         self.assertTrue(torch.equal(result.state.past_t, t))
-        self.assertTrue(torch.equal(result.state.past_w, torch.zeros_like(down_weight)))
+        self.assertTrue(torch.equal(result.state.past_w, down_weight))
         self.assertEqual(result.update_count, 0)
         self.assertEqual(result.trained_rows, 0)
         self.assertEqual(result.tail_rows, 3)
@@ -170,7 +169,7 @@ class InPlaceTTTExactToyMathUnitTest(unittest.TestCase):
             down_weight,
             past_h=first_h,
             past_t=first_t,
-            past_w=torch.zeros_like(down_weight),
+            past_w=down_weight,
             chunk_size=chunk_size,
             learning_rate=learning_rate,
         )
