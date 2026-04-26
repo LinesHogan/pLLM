@@ -9,6 +9,13 @@ from tllm.consumers.devlist.fttt import (
     FTTTStats,
     FeedbackRecord,
 )
+from tllm.consumers.devlist.gtta import (
+    GTTAConsumer,
+    GTTAConsumerConfig,
+    GTTAStats,
+    TrajectoryFeedback,
+    parse_reward,
+)
 from tllm.consumers.devlist.inplace_ttt import (
     InPlaceTTTConsumer,
     InPlaceTTTConsumerConfig,
@@ -37,6 +44,10 @@ __all__ = [
     "FTTTEngine",
     "FTTTStats",
     "FeedbackRecord",
+    "GTTAConsumer",
+    "GTTAConsumerConfig",
+    "GTTAStats",
+    "TrajectoryFeedback",
     "InPlaceTTTConsumer",
     "InPlaceTTTConsumerConfig",
     "InPlaceTTTEngine",
@@ -53,4 +64,5 @@ __all__ = [
     "TTRLSample",
     "TTRLStats",
     "majority_vote_rewards",
+    "parse_reward",
 ]
