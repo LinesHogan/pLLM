@@ -18,6 +18,9 @@ The important mechanics are:
 - The per-sample coefficient is `lamb * exp(sentence_ce - threshold)`.
 - The training loss is a weighted sentence-level KL-style loss between model
   logits and one-hot labels, averaged over selected samples.
+- Upstream causal language-model scoring shifts the tensors before computing
+  CE/KL: raw LM logits are sliced as `logits[:, :-1, :]` and labels as
+  `labels[:, 1:]`. Raw unshifted logits are not an aligned TTL selection input.
 - Offline CE is computed with the adapter disabled, so selection reflects the
   base model before the adapter update. Online CE is computed from the model
   currently being trained.
@@ -44,6 +47,8 @@ What maps reasonably:
   weights change.
 - It intentionally avoids importing LLaMA-Factory or upstream training
   dependencies.
+- Its CE/KL helpers assume logits and labels are already aligned. For raw
+  causal-LM outputs, the caller must pass shifted logits and shifted labels.
 
 What does not map to the upstream core:
 
@@ -52,6 +57,9 @@ What does not map to the upstream core:
   be used as the primary aligned path.
 - tLLM adapts a local hidden-to-vocab low-rank head, not the model's LoRA target
   modules such as `q_proj,v_proj`.
+- Because of that target-module difference, local adapter-weight changes prove
+  that the tLLM toy objective trains, but they do not prove parity with an
+  upstream LoRA runtime update inside attention or MLP modules.
 - `adapter_slots` is allocated but only slot 0 is trained.
 - `flows()` is empty, so this consumer is not wired to collect hidden states,
   logits, labels, request metadata, or generation events from the tLLM runtime.
@@ -80,8 +88,8 @@ tensors.
 
 All Python checks used the repo virtual environment as `<repo>/.venv/bin/python`.
 
-- `pytest -q -p no:cacheprovider test/consumers/tlm/test_tlm_consumer_unit.py`
-  - Result: `13 passed`.
+- `pytest -q test/consumers/tlm/test_tlm_consumer_unit.py`
+  - Result: `15 passed`.
 - Checked availability of local packages:
   - `torch`, `transformers`, and `vllm` are available.
   - `datasets`, `peft`, and installed `llamafactory` are not available.
@@ -92,6 +100,20 @@ All Python checks used the repo virtual environment as `<repo>/.venv/bin/python`
 - Ran a synthetic online/offline tLLM state-machine check.
 
 ## Local Model / Toycase Results
+
+Synthetic causal-shift toy check:
+
+- Raw causal-LM logits were built so that direct unshifted CE selects row `[1]`
+  while upstream-shifted CE selects row `[0]`.
+- The shifted toy path computes CE from `logits[:, :-1, :]` and `labels[:, 1:]`
+  and matches the local shared `sentence_cross_entropy` helper once those
+  tensors are pre-aligned.
+- This establishes the tLLM contract: helper and consumer logits inputs are
+  already-aligned tensors. Runtime callers must perform causal-LM shifting
+  before passing raw generation logits into TLM selection or training.
+- The offline toy check also passes shifted `base_logits` separately from
+  shifted training logits. Selection uses the caller-supplied base logits, while
+  the loss trains against the training logits.
 
 Cached tiny model check:
 
@@ -125,10 +147,11 @@ The current tLLM TLM consumer is a partial formula-level reproduction of the
 upstream TTL objective, but not a full runtime reproduction.
 
 It now captures online/offline test-time adaptation APIs, CE-threshold sample
-filtering, selected-row exponential weighting, and a local logits/label loss. It
-still does not reproduce the upstream model-LoRA update target or integration
-into an actual predict/train runtime loop. Offline base-model selection is
-available only when the caller supplies base logits.
+filtering, selected-row exponential weighting, causal-shifted toy parity, and a
+local logits/label loss when the caller supplies aligned tensors. It still does
+not reproduce the upstream model-LoRA update target or integration into an
+actual predict/train runtime loop. Offline base-model selection is available
+only when the caller supplies already-aligned base logits.
 
 ## Gaps And Risks
 
@@ -136,6 +159,8 @@ available only when the caller supplies base logits.
   as a legacy fallback, not the aligned TTL path.
 - Adaptation gap: training a local hidden-to-vocab adapter cannot reproduce LoRA
   updates to model attention projections.
+- Causal-shift gap: the tLLM helper does not infer or apply causal-LM shifting;
+  passing raw unshifted logits and labels can select the wrong samples.
 - Runtime gap: no declared flows means the consumer cannot run autonomously in
   tLLM's producer-consumer path.
 - Offline gap: tLLM does not yet disable runtime adapters itself to compute base
