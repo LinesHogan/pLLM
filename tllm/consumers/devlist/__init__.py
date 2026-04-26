@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Shared primitives for devlist-inspired consumers."""
+"""Compatibility package for devlist-inspired consumers."""
 
-from tllm.consumers.devlist.common import LowRankAdapter
-from tllm.consumers.devlist.fttt import (
+from tllm.consumers._common.alignment import LowRankAdapter
+from tllm.consumers.fttt import (
     FTTTConsumer,
     FTTTConsumerConfig,
     FTTTEngine,
@@ -10,20 +10,20 @@ from tllm.consumers.devlist.fttt import (
     FTTTStats,
     FeedbackRecord,
 )
-from tllm.consumers.devlist.gtta import (
+from tllm.consumers.gtta import (
     GTTAConsumer,
     GTTAConsumerConfig,
     GTTAStats,
     TrajectoryFeedback,
     parse_reward,
 )
-from tllm.consumers.devlist.inplace_ttt import (
+from tllm.consumers.inplace_ttt import (
     InPlaceTTTConsumer,
     InPlaceTTTConsumerConfig,
     InPlaceTTTEngine,
     InPlaceTTTStats,
 )
-from tllm.consumers.devlist.override import (
+from tllm.consumers.override import (
     OverRIDEBatchLogitsResult,
     OverRIDEConsumer,
     OverRIDEConsumerConfig,
@@ -31,7 +31,7 @@ from tllm.consumers.devlist.override import (
     OverRIDEReweightEngine,
     OverRIDEStats,
 )
-from tllm.consumers.devlist.ttrl import (
+from tllm.consumers.ttrl import (
     TTRLMajorityResult,
     TTRLRewardResult,
     TTRLSampleReward,
@@ -44,7 +44,7 @@ from tllm.consumers.devlist.ttrl import (
     majority_vote_rewards,
     select_ttrl_training_indices,
 )
-from tllm.consumers.devlist.tlm import (
+from tllm.consumers.tlm import (
     TLMConsumer,
     TLMConsumerConfig,
     TLMEngine,

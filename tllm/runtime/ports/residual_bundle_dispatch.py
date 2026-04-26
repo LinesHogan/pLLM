@@ -126,28 +126,6 @@ def _request_meta_view(core: PortDispatchCoreLike, active: int) -> RowBatchMeta:
     )
 
 
-def _compact_first_per_prompt(view: RowBatchMeta) -> tuple[RowBatchMeta, tuple[int, ...]]:
-    seen: set[int] = set()
-    keep: list[int] = []
-    for row_i, prompt_idx in enumerate(view.prompt_idxs):
-        prompt_key = int(prompt_idx)
-        if prompt_key < 0 or prompt_key in seen:
-            continue
-        seen.add(prompt_key)
-        keep.append(int(row_i))
-    row_ids = tuple(keep)
-    compact = RowBatchMeta(
-        request_ids=tuple(view.request_ids[row_i] for row_i in row_ids),
-        prompt_idxs=tuple(view.prompt_idxs[row_i] for row_i in row_ids),
-        sample_idxs=tuple(view.sample_idxs[row_i] for row_i in row_ids),
-        phase=view.phase,
-        engine_step_id=int(view.engine_step_id),
-        row_compaction="first_per_prompt",
-        row_ids=tuple(view.row_ids[row_i] for row_i in row_ids) if view.row_ids else row_ids,
-    )
-    return compact, row_ids
-
-
 def _compact_first_per_prompt_from_runtime(core: PortDispatchCoreLike, active: int) -> tuple[RowBatchMeta, tuple[int, ...]]:
     runtime = core.RUNTIME
     request_ids = runtime.decode_request_ids
