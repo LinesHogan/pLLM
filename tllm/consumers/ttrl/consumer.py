@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+import re
 from typing import Iterable, Sequence
 
 import torch
@@ -18,6 +19,13 @@ from tllm.consumers._common.alignment import (
     select_top_k_per_prompt,
 )
 from tllm.ports.base import ConsumerFlow
+from tllm.ports.generation_trace import GenerationTrace
+from tllm.ports.reward_outcome import RewardOutcome
+
+
+_BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\s*\{([^{}]*)\}")
+_MISSING_BOXED_ANSWER = "missing-boxed-answer"
+_TTRL_BOXED_MAJORITY_JUDGE = "ttrl_boxed_majority"
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,7 @@ class TTRLSampleReward:
     majority_label: str
     majority_ratio: float
     reward: float
+    skip_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -72,9 +81,11 @@ class TTRLStats:
     last_loss: float = 0.0
 
 
-def _normalize_completion(text: str) -> str:
-    label = normalize_answer_text(text)
-    return label if label else "None"
+def _extract_boxed_answer_label(text: str) -> str:
+    matches = _BOXED_ANSWER_PATTERN.findall(str(text))
+    if not matches:
+        return ""
+    return normalize_answer_text(matches[-1])
 
 
 def select_ttrl_training_indices(
@@ -96,21 +107,23 @@ def build_ttrl_reward_result(
     n_votes_per_prompt: int | None = None,
     n_samples_per_prompt: int | None = None,
 ) -> TTRLRewardResult:
-    grouped: dict[int, list[tuple[int, TTRLSample, str]]] = defaultdict(list)
+    grouped: dict[int, list[tuple[int, TTRLSample, str, str]]] = defaultdict(list)
     for idx, sample in enumerate(samples):
-        grouped[int(sample.prompt_idx)].append((idx, sample, _normalize_completion(sample.completion)))
+        label = _extract_boxed_answer_label(sample.completion)
+        skip_reason = "" if label else _MISSING_BOXED_ANSWER
+        grouped[int(sample.prompt_idx)].append((idx, sample, label, skip_reason))
 
     majority_by_prompt: dict[int, TTRLMajorityResult] = {}
     result_by_input_idx: dict[int, TTRLSampleReward] = {}
     for prompt_idx, group in grouped.items():
-        counts = Counter(label for _, _, label in group)
+        counts = Counter(label for _, _, label, skip_reason in group if not skip_reason)
         best_count = max(counts.values()) if counts else 0
-        majority_label = "None"
-        for _, _, label in group:
-            if counts[label] == best_count:
+        majority_label = ""
+        for _, _, label, skip_reason in group:
+            if not skip_reason and counts[label] == best_count:
                 majority_label = label
                 break
-        total = len(group)
+        total = sum(1 for _, _, _, skip_reason in group if not skip_reason)
         majority_ratio = (float(best_count) / float(total)) if total else 0.0
         majority_by_prompt[int(prompt_idx)] = TTRLMajorityResult(
             prompt_idx=int(prompt_idx),
@@ -119,8 +132,8 @@ def build_ttrl_reward_result(
             count=int(best_count),
             total=int(total),
         )
-        for idx, sample, label in group:
-            reward = 1.0 if label == majority_label else 0.0
+        for idx, sample, label, skip_reason in group:
+            reward = 1.0 if label and label == majority_label else 0.0
             sample_result = TTRLSampleReward(
                 prompt_idx=int(sample.prompt_idx),
                 sample_idx=int(sample.sample_idx),
@@ -129,6 +142,7 @@ def build_ttrl_reward_result(
                 majority_label=majority_label,
                 majority_ratio=majority_ratio,
                 reward=reward,
+                skip_reason=skip_reason,
             )
             result_by_input_idx[int(idx)] = sample_result
 
@@ -155,6 +169,41 @@ def build_ttrl_reward_result(
         sample_results=sample_results,
         selected_indices=selected_indices,
     )
+
+
+def build_ttrl_reward_outcome_batch(trace: object) -> object:
+    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
+    from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
+
+    if not isinstance(trace, GenerationTraceBatch):
+        raise TypeError("trace must be GenerationTraceBatch")
+    samples = [
+        TTRLSample(
+            prompt_idx=int(entry.prompt_idx),
+            sample_idx=int(entry.sample_idx),
+            completion=str(entry.text),
+        )
+        for entry in trace.entries
+    ]
+    result = build_ttrl_reward_result(samples)
+    outcome_entries = []
+    for trace_entry, sample_result in zip(trace.entries, result.sample_results, strict=True):
+        skipped = bool(sample_result.skip_reason)
+        outcome_entries.append(
+            RewardOutcomeEntry(
+                request_id=str(trace_entry.request_id),
+                prompt_idx=int(trace_entry.prompt_idx),
+                sample_idx=int(trace_entry.sample_idx),
+                output_index=int(trace_entry.output_index),
+                group_id=str(trace_entry.group_id),
+                reward=None if skipped else float(sample_result.reward),
+                judge=_TTRL_BOXED_MAJORITY_JUDGE,
+                label="" if skipped else str(sample_result.label),
+                skip_reason=str(sample_result.skip_reason),
+                is_correct=None if skipped else bool(sample_result.reward == 1.0),
+            )
+        )
+    return RewardOutcomeBatch(entries=tuple(outcome_entries))
 
 
 def majority_vote_rewards(samples: Sequence[TTRLSample]) -> list[float]:
@@ -242,7 +291,15 @@ class TTRLConsumer(BaseConsumer):
         return self.config.consumer_id
 
     def flows(self) -> Sequence[ConsumerFlow]:
-        return ()
+        if not bool(self.config.enabled):
+            return ()
+        return (
+            ConsumerFlow(
+                reads=(GenerationTrace.read(scope="completed"),),
+                writes=(RewardOutcome.write(scope="completed", mode="append"),),
+                window="out_of_band",
+            ),
+        )
 
     def rewards_for_samples(self, samples: Sequence[TTRLSample]) -> torch.Tensor:
         rewards = majority_vote_rewards(samples)
@@ -260,6 +317,14 @@ class TTRLConsumer(BaseConsumer):
             n_votes_per_prompt=n_votes_per_prompt,
             n_samples_per_prompt=n_samples_per_prompt,
         )
+
+    def reward_outcome_batch_for_trace(self, trace: object) -> object:
+        return build_ttrl_reward_outcome_batch(trace)
+
+    def write_reward_outcomes_for_trace(self, runtime: object, trace: object) -> int:
+        from tllm.runtime.reward_outcome_runtime import write_reward_outcomes
+
+        return write_reward_outcomes(runtime, build_ttrl_reward_outcome_batch(trace))
 
     def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
         reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)

@@ -7,25 +7,41 @@ idea. It does not import verl or the reference training stack.
 
 The first version implements two local pieces:
 
-- majority-vote reward construction over multiple completions for the same
-  prompt,
+- boxed-answer-only majority-vote reward construction over multiple completions
+  for the same prompt,
 - upstream-style vote/sample separation: vote over `n_votes_per_prompt`
   completions, then keep the first `n_samples_per_prompt` indices per prompt
   for training,
 - structured vote results with majority label, majority ratio, per-sample
   normalized label, and scalar reward,
+- a toy generation trace to reward outcome loop that turns completed generation
+  traces into `RewardOutcomeBatch` entries,
 - a small low-rank score adapter trained from hidden rows and scalar rewards.
 
-Majority voting uses `normalize_answer_text`, which prefers the last boxed
-answer before normalizing. This means different reasoning traces with the same
-boxed answer vote together. Tie handling is deterministic: if labels tie, the
-first normalized label seen for that prompt is treated as the winner.
+Majority voting is boxed-only. The consumer extracts the last `\boxed{...}`
+answer, normalizes that boxed content, and ignores unboxed completions for
+judging. Unboxed completions are marked with `missing-boxed-answer` in
+structured results and reward outcomes; they are not treated as bare-text
+answers. Tie handling is deterministic: if boxed labels tie, the first boxed
+label seen for that prompt is treated as the winner.
+
+The trace-to-outcome path is intentionally light. It maps
+`GenerationTraceBatch` identity fields (`request_id`, `prompt_idx`,
+`sample_idx`, `output_index`, `group_id`) into `RewardOutcomeBatch`, assigns
+`reward=1.0` to samples matching the boxed majority, `reward=0.0` to boxed
+minority samples, and `reward=None` plus `skip_reason=missing-boxed-answer` to
+unboxed samples.
+
+This remains a toy alignment path. It does not implement the full TTRL LoRA
+actor loop, PPO/GRPO updates, policy feedback into generation, or a full
+math-equivalence grader.
 
 ## Usage
 
 ```python
 from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig, TTRLSample
-from tllm.consumers.ttrl import build_ttrl_reward_result
+from tllm.consumers.ttrl import build_ttrl_reward_outcome_batch, build_ttrl_reward_result
+from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 
 consumer = TTRLConsumer(TTRLConsumerConfig(hidden_size=896, rank=16))
 samples = [
@@ -40,6 +56,23 @@ result = build_ttrl_reward_result(samples)
 assert result.majority_by_prompt[0].label == "4"
 assert result.majority_by_prompt[0].ratio == 2 / 3
 assert result.rewards == [1.0, 1.0, 0.0]
+
+trace = GenerationTraceBatch(
+    entries=(
+        CompletionTraceEntry(
+            request_id="req-a",
+            prompt_idx=0,
+            sample_idx=0,
+            output_index=0,
+            token_ids=(),
+            text=r"Trace A. \boxed{4}",
+            finish_reason="stop",
+            group_id="round-a",
+        ),
+    )
+)
+outcomes = build_ttrl_reward_outcome_batch(trace)
+assert outcomes.entries[0].judge == "ttrl_boxed_majority"
 ```
 
 For upstream-style vote/sample separation:

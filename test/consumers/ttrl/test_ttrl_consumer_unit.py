@@ -17,18 +17,35 @@ class TTRLConsumerUnitTest(unittest.TestCase):
 
         self.assertEqual(consumer.consumer_id, "ttrl")
 
-    def test_majority_rewards_assign_one_to_winning_completion(self) -> None:
-        from tllm.consumers.ttrl import TTRLSample, majority_vote_rewards
+    def test_consumer_declares_trace_to_reward_outcome_flow(self) -> None:
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
+        from tllm.ports.base import PortKind
+
+        consumer = TTRLConsumer(TTRLConsumerConfig())
+
+        flows = consumer.flows()
+
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0].window, "out_of_band")
+        self.assertEqual(flows[0].reads[0].kind, PortKind.GENERATION_TRACE)
+        self.assertEqual(flows[0].writes[0].kind, PortKind.REWARD_OUTCOME)
+
+    def test_majority_rewards_ignore_unboxed_completions(self) -> None:
+        from tllm.consumers.ttrl import TTRLSample, build_ttrl_reward_result
 
         samples = [
             TTRLSample(prompt_idx=0, sample_idx=0, completion="Answer: 4"),
-            TTRLSample(prompt_idx=0, sample_idx=1, completion="answer: 4 "),
-            TTRLSample(prompt_idx=0, sample_idx=2, completion="Answer: 5"),
+            TTRLSample(prompt_idx=0, sample_idx=1, completion=r"Therefore \boxed{5}"),
+            TTRLSample(prompt_idx=0, sample_idx=2, completion="Answer: 4"),
         ]
 
-        rewards = majority_vote_rewards(samples)
+        result = build_ttrl_reward_result(samples)
 
-        self.assertEqual(rewards, [1.0, 1.0, 0.0])
+        self.assertEqual(result.rewards, [0.0, 1.0, 0.0])
+        self.assertEqual(result.majority_by_prompt[0].label, "5")
+        self.assertEqual(result.majority_by_prompt[0].count, 1)
+        self.assertEqual(result.sample_results[0].skip_reason, "missing-boxed-answer")
+        self.assertEqual(result.sample_results[2].skip_reason, "missing-boxed-answer")
 
     def test_majority_rewards_vote_on_normalized_extracted_answers(self) -> None:
         from tllm.consumers.ttrl import TTRLSample, majority_vote_rewards
@@ -47,8 +64,8 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         from tllm.consumers.ttrl import TTRLSample, majority_vote_rewards
 
         samples = [
-            TTRLSample(prompt_idx=0, sample_idx=0, completion="A"),
-            TTRLSample(prompt_idx=0, sample_idx=1, completion="B"),
+            TTRLSample(prompt_idx=0, sample_idx=0, completion=r"\boxed{A}"),
+            TTRLSample(prompt_idx=0, sample_idx=1, completion=r"\boxed{B}"),
         ]
 
         rewards = majority_vote_rewards(samples)
@@ -81,6 +98,99 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         self.assertEqual(result.majority_by_prompt[0].ratio, 2 / 3)
         self.assertEqual(result.sample_results[0].label, "4")
         self.assertEqual([item.reward for item in result.sample_results], [1.0, 1.0, 0.0])
+
+    def test_trace_to_reward_outcome_batch_uses_boxed_majority_and_preserves_identity(self) -> None:
+        from tllm.consumers.ttrl import build_ttrl_reward_outcome_batch
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=7,
+                    sample_idx=0,
+                    output_index=2,
+                    token_ids=(1, 2),
+                    text=r"Path A. \boxed{4}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=7,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(3,),
+                    text=r"Path B. \boxed{4}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-c",
+                    prompt_idx=7,
+                    sample_idx=2,
+                    output_index=0,
+                    token_ids=(4,),
+                    text=r"Path C. \boxed{5}",
+                    finish_reason="length",
+                    group_id="vote-a",
+                ),
+            )
+        )
+
+        batch = build_ttrl_reward_outcome_batch(trace)
+
+        self.assertEqual(len(batch.entries), 3)
+        self.assertEqual(batch.entries[0].request_id, "req-a")
+        self.assertEqual(batch.entries[0].prompt_idx, 7)
+        self.assertEqual(batch.entries[0].sample_idx, 0)
+        self.assertEqual(batch.entries[0].output_index, 2)
+        self.assertEqual(batch.entries[0].group_id, "vote-a")
+        self.assertEqual(batch.entries[0].judge, "ttrl_boxed_majority")
+        self.assertEqual(batch.entries[0].label, "4")
+        self.assertEqual(batch.entries[0].reward, 1.0)
+        self.assertIs(batch.entries[0].is_correct, True)
+        self.assertEqual(batch.entries[2].label, "5")
+        self.assertEqual(batch.entries[2].reward, 0.0)
+        self.assertIs(batch.entries[2].is_correct, False)
+
+    def test_trace_to_reward_outcome_batch_marks_unboxed_as_skip(self) -> None:
+        from tllm.consumers.ttrl import build_ttrl_reward_outcome_batch
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="Answer: 4",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=0,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(),
+                    text=r"Therefore \boxed{5}",
+                    finish_reason="stop",
+                    group_id="vote-a",
+                ),
+            )
+        )
+
+        batch = build_ttrl_reward_outcome_batch(trace)
+
+        self.assertIsNone(batch.entries[0].reward)
+        self.assertIsNone(batch.entries[0].is_correct)
+        self.assertEqual(batch.entries[0].label, "")
+        self.assertEqual(batch.entries[0].skip_reason, "missing-boxed-answer")
+        self.assertEqual(batch.entries[1].reward, 1.0)
+        self.assertEqual(batch.entries[1].label, "5")
 
     def test_ttrl_module_does_not_import_verl(self) -> None:
         before = set(sys.modules)
