@@ -6,6 +6,7 @@ from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.contracts.subscription import ConsumerSubscription
+from tllm.contracts.test_time_lora import TestTimeLoRATarget, TestTimeLoRAUpdate, TestTimeLoRAWeights
 
 __all__ = [
     "ConsumerSubscription",
@@ -13,4 +14,7 @@ __all__ = [
     "HiddenBatch",
     "RowBatchMeta",
     "RuntimeContext",
+    "TestTimeLoRATarget",
+    "TestTimeLoRAUpdate",
+    "TestTimeLoRAWeights",
 ]
