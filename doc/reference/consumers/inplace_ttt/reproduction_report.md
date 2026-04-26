@@ -1,10 +1,11 @@
 # In-Place TTT reproduction assessment
 
 Date: 2026-04-26
+Updated: 2026-04-27
 
 ## Scope
 
-This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. Only this report file was written.
+This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. The 2026-04-27 update adds consumer-local exact toy math coverage. Runtime contracts for MLP activation, hidden target, module weight view, and fast-weight state now exist, but vLLM MLP capture and in-model overlay execution are still outside the completed scope.
 
 ## Upstream mechanism summary
 
@@ -27,8 +28,13 @@ The local consumer is a tLLM-native, In-Place-TTT-inspired consumer rather than 
 - The local engine trains a `LowRankAdapter(source_hidden)` to predict `target_hidden - source_hidden` using MSE and Adam.
 - The engine trains only complete chunks and carries incomplete tail rows across
   calls. It does not pad tail rows into training examples.
+- The package now includes a dependency-light exact toy helper,
+  `run_exact_toy_down_proj_step()`, that models the upstream-shaped
+  `past_h`, `past_t`, and `past_w` cache contract for `down_proj.weight`.
+  This helper is for consumer math alignment tests and is not connected to
+  runtime model execution.
 
-This maps the broad online/local hidden-state adaptation idea, but it does not reproduce the exact upstream in-place MLP `down_proj` fast-weight update. It also does not implement upstream `ttt_conv`, optional `ttt_proj`, cumulative per-chunk fast weights, or per-layer cache tails.
+The live consumer maps the broad online/local hidden-state adaptation idea, but it does not reproduce the exact upstream in-place MLP `down_proj` fast-weight update. The exact toy helper covers cumulative per-chunk `past_w` and tail-cache math in isolation, but runtime execution still does not implement upstream `ttt_conv`, optional `ttt_proj`, integrated fast-weight overlay, or per-layer cache ownership.
 
 ## Checks run
 
@@ -58,6 +64,12 @@ Commands were run with the repo virtual environment, summarized without machine-
   - Sequence length below chunk: zero updates.
   - Sequence length equal to chunk: one update.
   - Four single-token calls with chunk size four: no update for the first three calls, one update on the fourth accumulated call.
+- Consumer exact toy math tests:
+  - Full chunks match a direct PyTorch reference implementation of cumulative
+    `down_proj.weight + past_w` updates.
+  - Below-chunk rows produce no update and are cached only in `past_h/past_t`.
+  - Cached tail rows combine with later rows to form the next full chunk, then
+    the new incomplete remainder is retained as tail.
 - Runtime binding sanity check:
   - The default consumer declares required residual layers with phase `prefill`.
   - Current generic residual binding helper returned no raw tap paths for those prefill locators when given the existing decode-only raw locator map.
@@ -70,7 +82,7 @@ has to be explicitly requested. The consumer also performs local online updates,
 complete-chunk training, tail carryover, and active decode row handling in the
 checks above.
 
-As an exact reproduction of upstream In-Place TTT, it is incomplete. The upstream core update is an in-place fast-weight update of the MLP down projection with chunkwise cumulative weights; the tLLM consumer trains a separate low-rank delta adapter from source to target hidden states. This is a reasonable tLLM-native approximation, but it should be described as inspired/approximate, not exact.
+As an exact runtime reproduction of upstream In-Place TTT, it is incomplete. The upstream core update is an in-place fast-weight update of the MLP down projection with chunkwise cumulative weights; tLLM now has the contract-level runtime surface for MLP activation, hidden target, module weight view, and fast-weight state, but it does not yet capture those tensors from vLLM MLP modules or apply the overlay inside model execution. The current completion is consumer math toy alignment plus runtime contract scaffolding: the exact chunk/tail/update contract is covered by local PyTorch tests, while the shipped consumer engine still uses a separate low-rank delta adapter for live bundle consumption.
 
 The largest practical gap is end-to-end prefill delivery. The consumer declares prefill flows, but the currently inspected generic residual flow/binding path is decode-oriented, while existing prefill support lives in a repro/capture path. I did not find evidence that the default prefill `ConsumerFlow` is fully wired through the normal runtime bundle dispatch. Until that is closed with an end-to-end test or smoke run, `update_count > 0` from direct bundle tests should not be treated as proof of integrated prefill runtime reproduction.
 
@@ -78,5 +90,11 @@ The largest practical gap is end-to-end prefill delivery. The consumer declares 
 
 - Add an end-to-end prefill `ConsumerFlow` dispatch test that drives real prefill hidden rows into `InPlaceTTTConsumer` through the normal runtime path.
 - Keep decode opt-in. Do not change the default to include `"decode"`.
-- If exact upstream reproduction is required, replace or augment the low-rank delta adapter with a fast-weight `down_proj` update path matching upstream `ttt_conv`, `ttt_proj`, chunk accumulation, and cache-tail semantics.
+- Complete the vLLM MLP capture/overlay work before claiming exact integrated
+  reproduction: MLP internal activation `h`, hidden target `t`,
+  `down_proj.weight` view, and per-request/per-sample/per-layer fast-weight
+  state now have contracts, but are not yet wired into model execution.
+- Once runtime support exists, replace or augment the low-rank delta adapter
+  with a fast-weight `down_proj` update path matching upstream `ttt_conv`,
+  `ttt_proj`, chunk accumulation, and cache-tail semantics.
 - Add a small regression test that verifies default `InPlaceTTTConsumerConfig()` does not cause decode residual bindings or decode bundle dispatch.

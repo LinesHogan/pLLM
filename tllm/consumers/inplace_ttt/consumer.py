@@ -53,6 +53,24 @@ class InPlaceTTTStats:
     last_loss: float = 0.0
 
 
+@dataclass(frozen=True)
+class InPlaceTTTExactToyState:
+    """Toy exact cache matching upstream-shaped ``past_h/past_t/past_w``."""
+
+    past_h: torch.Tensor | None = None
+    past_t: torch.Tensor | None = None
+    past_w: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class InPlaceTTTExactToyStep:
+    output: torch.Tensor
+    state: InPlaceTTTExactToyState
+    update_count: int = 0
+    trained_rows: int = 0
+    tail_rows: int = 0
+
+
 def pad_rows_to_chunk(rows: torch.Tensor, *, chunk_size: int) -> tuple[torch.Tensor, int]:
     valid_rows = int(rows.shape[0])
     chunk = max(1, int(chunk_size))
@@ -62,6 +80,95 @@ def pad_rows_to_chunk(rows: torch.Tensor, *, chunk_size: int) -> tuple[torch.Ten
     pad_rows = chunk - remainder
     padding = torch.zeros((pad_rows, *rows.shape[1:]), dtype=rows.dtype, device=rows.device)
     return torch.cat([rows, padding], dim=0), valid_rows
+
+
+def _empty_toy_output(h: torch.Tensor, down_proj_weight: torch.Tensor) -> torch.Tensor:
+    return h.new_empty((0, int(down_proj_weight.shape[0])))
+
+
+def _validate_exact_toy_tensors(h: torch.Tensor, t: torch.Tensor, down_proj_weight: torch.Tensor) -> None:
+    if h.ndim != 2 or t.ndim != 2 or down_proj_weight.ndim != 2:
+        raise RuntimeError("In-Place TTT exact toy math expects 2D h, t, and down_proj weight")
+    if int(h.shape[0]) != int(t.shape[0]):
+        raise RuntimeError("In-Place TTT exact toy h and t must have matching rows")
+    if int(h.shape[1]) != int(down_proj_weight.shape[1]):
+        raise RuntimeError("In-Place TTT exact toy h width must match down_proj input width")
+    if int(t.shape[1]) != int(down_proj_weight.shape[0]):
+        raise RuntimeError("In-Place TTT exact toy t width must match down_proj output width")
+
+
+def run_exact_toy_down_proj_step(
+    h: torch.Tensor,
+    t: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    *,
+    state: InPlaceTTTExactToyState | None = None,
+    chunk_size: int,
+    learning_rate: float,
+) -> InPlaceTTTExactToyStep:
+    """Run a dependency-light exact toy step for MLP down-proj fast weights.
+
+    The helper models the consumer-side math target for upstream-shaped
+    In-Place TTT alignment. ``past_w`` is a cumulative fast-weight delta for
+    ``down_proj.weight``. Full chunks update ``past_w`` with a local linear
+    least-squares gradient step, while below-chunk rows are cached as
+    ``past_h/past_t`` and do not update.
+    """
+
+    _validate_exact_toy_tensors(h, t, down_proj_weight)
+    current_state = state or InPlaceTTTExactToyState()
+    fast_w = current_state.past_w
+    if fast_w is None:
+        fast_w = torch.zeros_like(down_proj_weight)
+    else:
+        fast_w = fast_w.to(device=down_proj_weight.device, dtype=down_proj_weight.dtype).clone()
+    if tuple(fast_w.shape) != tuple(down_proj_weight.shape):
+        raise RuntimeError("In-Place TTT exact toy past_w must match down_proj weight shape")
+
+    h_work = h
+    t_work = t
+    if current_state.past_h is not None or current_state.past_t is not None:
+        if current_state.past_h is None or current_state.past_t is None:
+            raise RuntimeError("In-Place TTT exact toy past_h and past_t must be present together")
+        past_h = current_state.past_h.to(device=h.device, dtype=h.dtype)
+        past_t = current_state.past_t.to(device=t.device, dtype=t.dtype)
+        _validate_exact_toy_tensors(past_h, past_t, down_proj_weight)
+        h_work = torch.cat([past_h, h], dim=0)
+        t_work = torch.cat([past_t, t], dim=0)
+
+    chunk = max(1, int(chunk_size))
+    total_rows = int(h_work.shape[0])
+    full_rows = (total_rows // chunk) * chunk
+    outputs: list[torch.Tensor] = []
+    update_count = 0
+    for start in range(0, full_rows, chunk):
+        end = start + chunk
+        h_chunk = h_work[start:end]
+        t_chunk = t_work[start:end]
+        effective_before = down_proj_weight + fast_w
+        residual = t_chunk - h_chunk.matmul(effective_before.t())
+        fast_w = fast_w + float(learning_rate) * residual.t().matmul(h_chunk) / float(chunk)
+        outputs.append(h_chunk.matmul((down_proj_weight + fast_w).t()))
+        update_count += 1
+
+    tail_h = h_work[full_rows:]
+    tail_t = t_work[full_rows:]
+    tail_rows = int(tail_h.shape[0])
+    if tail_rows > 0:
+        outputs.append(tail_h.matmul((down_proj_weight + fast_w).t()))
+    output = torch.cat(outputs, dim=0) if outputs else _empty_toy_output(h_work, down_proj_weight)
+    next_state = InPlaceTTTExactToyState(
+        past_h=tail_h.detach().clone() if tail_rows > 0 else None,
+        past_t=tail_t.detach().clone() if tail_rows > 0 else None,
+        past_w=fast_w.detach().clone(),
+    )
+    return InPlaceTTTExactToyStep(
+        output=output,
+        state=next_state,
+        update_count=update_count,
+        trained_rows=full_rows,
+        tail_rows=tail_rows,
+    )
 
 
 class InPlaceTTTEngine(nn.Module):
