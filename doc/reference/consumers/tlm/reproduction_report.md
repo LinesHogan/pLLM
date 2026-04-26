@@ -27,6 +27,18 @@ The important mechanics are:
 - The actual upstream adaptation is LoRA fine-tuning of target model modules
   such as `q_proj,v_proj`; it is not a detached reward head over hidden rows.
 
+Source files checked for this update:
+
+- Upstream TTL trainer: `<upstream>/src/llamafactory/train/ttl/trainer.py`.
+- Upstream online/offline wrapper:
+  `<upstream>/src/llamafactory/train/ttl/workflow.py`.
+- Upstream LoRA target examples:
+  `<upstream>/examples/train_lora/online_ttl.yaml` and
+  `<upstream>/examples/train_lora/offline_ttl.yaml`.
+- tLLM runtime contract/service:
+  `tllm/contracts/test_time_lora.py`, `tllm/runtime/test_time_lora.py`, and
+  `tllm/runtime/vllm_test_time_lora.py`.
+
 ## tLLM Mapping
 
 The tLLM implementation reviewed is `tllm/consumers/tlm/consumer.py`, with unit
@@ -45,6 +57,9 @@ What maps reasonably:
   selection before the local adapter update.
 - It has a local low-rank hidden-to-vocab adapter and verifies that adapter
   weights change.
+- It can export the trained local toy adapter as a strict
+  `TestTimeLoRAUpdate` when the caller supplies an explicit runtime target
+  module name, positive LoRA id, rank, scope, request ids, and step id.
 - It intentionally avoids importing LLaMA-Factory or upstream training
   dependencies.
 - Its CE/KL helpers assume logits and labels are already aligned. For raw
@@ -60,6 +75,10 @@ What does not map to the upstream core:
 - Because of that target-module difference, local adapter-weight changes prove
   that the tLLM toy objective trains, but they do not prove parity with an
   upstream LoRA runtime update inside attention or MLP modules.
+- The `TestTimeLoRAUpdate` export is consumer-side packaging only. It transposes
+  the local toy adapter factors into the runtime contract shape, but it does not
+  validate that the named module exists in a concrete vLLM model or that vLLM
+  applies the update during decoding.
 - `adapter_slots` is allocated but only slot 0 is trained.
 - `flows()` is empty, so this consumer is not wired to collect hidden states,
   logits, labels, request metadata, or generation events from the tLLM runtime.
@@ -89,7 +108,7 @@ tensors.
 All Python checks used the repo virtual environment as `<repo>/.venv/bin/python`.
 
 - `pytest -q test/consumers/tlm/test_tlm_consumer_unit.py`
-  - Result: `15 passed`.
+  - Result: `17 passed`.
 - Checked availability of local packages:
   - `torch`, `transformers`, and `vllm` are available.
   - `datasets`, `peft`, and installed `llamafactory` are not available.
@@ -98,6 +117,9 @@ All Python checks used the repo virtual environment as `<repo>/.venv/bin/python`
 - Ran a cached `sshleifer/tiny-gpt2` local-only check to compute upstream-style
   CE/KL and compare threshold selection with the tLLM CE path.
 - Ran a synthetic online/offline tLLM state-machine check.
+- Ran a toy export handoff check where a nonzero TLM adapter is converted into
+  `TestTimeLoRAUpdate`, staged in `TestTimeLoRAService`, and committed into a
+  fake LoRA module with request assignment.
 
 ## Local Model / Toycase Results
 
@@ -137,6 +159,20 @@ Synthetic state-machine check:
   before flush `update_count=0`, `buffered_count=4`;
   after flush `update_count=1`, `loss_count=1`, `selected_count=2`.
 
+Test-time LoRA export toy check:
+
+- A TLM hidden-to-vocab adapter was trained with the logits/labels path before
+  export, so the exported `lora_b` factor was nonzero.
+- The exported contract used explicit request scope:
+  `adapter_key="tlm-req-1"`, `lora_int_id=17`, `rank=2`,
+  `request_ids=("req-1",)`, `step_id=5`, and a caller-supplied target module
+  name.
+- Contract tensor shapes were `lora_a=(4, 2)` and `lora_b=(2, 3)`, matching the
+  local toy adapter's input width, rank, and output width.
+- A fake `TestTimeLoRAService` commit called `set_lora` on the named module and
+  assigned request `req-1` to LoRA id `17`. This proves the consumer export is
+  service-consumable without requiring vLLM or a downloaded model.
+
 These checks confirm that the tLLM logits path now matches the upstream CE
 selection direction and weighted one-hot KL/CE formula at the local objective
 level.
@@ -148,10 +184,12 @@ upstream TTL objective, but not a full runtime reproduction.
 
 It now captures online/offline test-time adaptation APIs, CE-threshold sample
 filtering, selected-row exponential weighting, causal-shifted toy parity, and a
-local logits/label loss when the caller supplies aligned tensors. It still does
-not reproduce the upstream model-LoRA update target or integration into an
-actual predict/train runtime loop. Offline base-model selection is available
-only when the caller supplies already-aligned base logits.
+local logits/label loss when the caller supplies aligned tensors. It also now
+has a consumer-side export path that returns a strict `TestTimeLoRAUpdate` for a
+caller-named target module. It still does not reproduce the upstream model-LoRA
+update target or integration into an actual predict/train runtime loop. Offline
+base-model selection is available only when the caller supplies already-aligned
+base logits.
 
 ## Gaps And Risks
 
@@ -159,6 +197,9 @@ only when the caller supplies already-aligned base logits.
   as a legacy fallback, not the aligned TTL path.
 - Adaptation gap: training a local hidden-to-vocab adapter cannot reproduce LoRA
   updates to model attention projections.
+- Runtime apply gap: no smoke test has staged and applied the exported
+  `TestTimeLoRAUpdate` through the real runtime/vLLM LoRA service. The current
+  evidence stops at the dependency-light fake `TestTimeLoRAService` commit.
 - Causal-shift gap: the tLLM helper does not infer or apply causal-LM shifting;
   passing raw unshifted logits and labels can select the wrong samples.
 - Runtime gap: no declared flows means the consumer cannot run autonomously in

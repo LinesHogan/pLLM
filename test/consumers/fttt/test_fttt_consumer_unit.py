@@ -319,6 +319,130 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "request_id must be str"):
             consumer.process_generation_trace(GenerationTraceBatch(entries=(trace_entry,)))  # type: ignore[arg-type]
 
+    def test_exports_feedback_adapter_as_strict_test_time_lora_update(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig
+        from tllm.consumers.fttt import FeedbackRecord
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+
+        class _FakeLoRAModule:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, torch.Tensor, torch.Tensor, float]] = []
+
+            def set_lora(
+                self,
+                adapter_id: int,
+                lora_a: torch.Tensor,
+                lora_b: torch.Tensor,
+                *,
+                bias: torch.Tensor | None,
+                scaling: float,
+            ) -> None:
+                self.calls.append((adapter_id, lora_a.detach().clone(), lora_b.detach().clone(), float(scaling)))
+
+        class _FakeManager:
+            def __init__(self, module: _FakeLoRAModule) -> None:
+                self.modules = {"model.layers.1.mlp.down_proj": module}
+
+        torch.manual_seed(13)
+        consumer = FTTTConsumer(FTTTConsumerConfig(hidden_size=4, feedback_feature_size=3, rank=2, learning_rate=0.2))
+        consumer.apply_feedback_update(
+            torch.eye(2, 4),
+            [
+                FeedbackRecord(prompt_idx=0, feedback="incorrect arithmetic", reward=0.0),
+                FeedbackRecord(prompt_idx=1, feedback="wrong final sign", reward=0.0),
+            ],
+        )
+
+        update = consumer.export_test_time_lora_update(
+            adapter_key="fttt-req-7",
+            lora_int_id=23,
+            target_module_name="model.layers.1.mlp.down_proj",
+            rank=2,
+            scope="request",
+            request_ids=("req-7", "req-8"),
+            step_id=9,
+            alpha=2.5,
+        )
+
+        self.assertIsInstance(update, TestTimeLoRAUpdate)
+        self.assertEqual(update.adapter_key, "fttt-req-7")
+        self.assertEqual(update.lora_int_id, 23)
+        self.assertEqual(update.rank, 2)
+        self.assertEqual(update.scope, "request")
+        self.assertEqual(update.request_ids, ("req-7", "req-8"))
+        self.assertEqual(update.step_id, 9)
+        self.assertEqual(tuple(update.target_modules), ("model.layers.1.mlp.down_proj",))
+        weights = update.target_modules["model.layers.1.mlp.down_proj"]
+        self.assertIsInstance(weights, TestTimeLoRAWeights)
+        self.assertEqual(tuple(weights.lora_a.shape), (8, 2))
+        self.assertEqual(tuple(weights.lora_b.shape), (2, 4))
+        self.assertEqual(weights.alpha, 2.5)
+        self.assertGreater(float(weights.lora_b.abs().sum()), 0.0)
+
+        module = _FakeLoRAModule()
+        service = TestTimeLoRAService(manager=_FakeManager(module), max_rank=2)
+        service.stage_update(update)
+
+        self.assertEqual(service.commit_staged_updates(), 1)
+        self.assertEqual(service.adapter_for_request("req-7"), 23)
+        self.assertEqual(service.adapter_for_request("req-8"), 23)
+        self.assertEqual(len(module.calls), 1)
+        adapter_id, committed_lora_a, committed_lora_b, scaling = module.calls[0]
+        self.assertEqual(adapter_id, 23)
+        self.assertTrue(torch.equal(committed_lora_a, weights.lora_a))
+        self.assertTrue(torch.equal(committed_lora_b, weights.lora_b))
+        self.assertEqual(scaling, 1.25)
+
+    def test_feedback_lora_export_rejects_rank_target_and_request_boundary_mistakes(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig
+
+        consumer = FTTTConsumer(FTTTConsumerConfig(hidden_size=4, feedback_feature_size=3, rank=2))
+
+        with self.assertRaisesRegex(ValueError, "adapter rank"):
+            consumer.export_test_time_lora_update(
+                adapter_key="fttt-rank",
+                lora_int_id=1,
+                target_module_name="model.layers.1.mlp.down_proj",
+                rank=4,
+            )
+
+        with self.assertRaisesRegex(TypeError, "request_ids must be tuple"):
+            consumer.export_test_time_lora_update(
+                adapter_key="fttt-ids",
+                lora_int_id=2,
+                target_module_name="model.layers.1.mlp.down_proj",
+                rank=2,
+                scope="request",
+                request_ids=["req-7"],  # type: ignore[arg-type]
+            )
+
+        with self.assertRaisesRegex(TypeError, "request_ids must contain str"):
+            consumer.export_test_time_lora_update(
+                adapter_key="fttt-id-member",
+                lora_int_id=2,
+                target_module_name="model.layers.1.mlp.down_proj",
+                rank=2,
+                scope="request",
+                request_ids=(7,),  # type: ignore[arg-type]
+            )
+
+        with self.assertRaisesRegex(TypeError, "lora_int_id must be int"):
+            consumer.export_test_time_lora_update(
+                adapter_key="fttt-bool-id",
+                lora_int_id=True,  # type: ignore[arg-type]
+                target_module_name="model.layers.1.mlp.down_proj",
+                rank=2,
+            )
+
+        with self.assertRaisesRegex(ValueError, "target module name"):
+            consumer.export_test_time_lora_update(
+                adapter_key="fttt-target",
+                lora_int_id=4,
+                target_module_name="",
+                rank=2,
+            )
+
     def test_fttt_module_does_not_import_external_feedback_apis(self) -> None:
         before = set(sys.modules)
 

@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from tllm.contracts.test_time_lora import LoRAScope, TestTimeLoRAUpdate, TestTimeLoRAWeights
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers._common.alignment import LowRankAdapter
 from tllm.ports.generation_trace import GenerationTrace
@@ -39,6 +40,24 @@ def _require_feedback_reward(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError("reward must be real")
     return float(value)
+
+
+def _require_lora_export_int(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
+    return value
+
+
+def _require_lora_export_real(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{field_name} must be real")
+    return float(value)
+
+
+def _require_lora_export_request_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("request_ids must be tuple")
+    return value
 
 
 @dataclass(frozen=True)
@@ -348,6 +367,42 @@ class FTTTEngine(nn.Module):
             stopped_instances=sum(1 for state in self._instances.values() if state.stopped),
         )
 
+    def export_test_time_lora_update(
+        self,
+        *,
+        adapter_key: str,
+        lora_int_id: int,
+        target_module_name: str,
+        rank: int,
+        scope: LoRAScope = "global",
+        request_ids: tuple[str, ...] = (),
+        step_id: int = -1,
+        alpha: float = 1.0,
+    ) -> TestTimeLoRAUpdate:
+        update_rank = _require_lora_export_int(rank, field_name="rank")
+        _require_lora_export_int(lora_int_id, field_name="lora_int_id")
+        _require_lora_export_int(step_id, field_name="step_id")
+        export_request_ids = _require_lora_export_request_ids(request_ids)
+        export_alpha = _require_lora_export_real(alpha, field_name="alpha")
+        if self.adapter is None:
+            raise RuntimeError("FTTT adapter is not initialized")
+        if int(self.adapter.rank) != update_rank:
+            raise ValueError("FTTT adapter rank does not match requested update rank")
+        weights = TestTimeLoRAWeights(
+            lora_a=self.adapter.down.weight.detach().transpose(0, 1).contiguous().clone(),
+            lora_b=self.adapter.up.weight.detach().transpose(0, 1).contiguous().clone(),
+            alpha=export_alpha,
+        )
+        return TestTimeLoRAUpdate(
+            adapter_key=adapter_key,
+            lora_int_id=lora_int_id,
+            rank=update_rank,
+            scope=scope,
+            target_modules={target_module_name: weights},
+            request_ids=export_request_ids,
+            step_id=step_id,
+        )
+
 
 class FTTTConsumer(BaseConsumer):
     """Feedback-conditioned local edit consumer."""
@@ -485,3 +540,26 @@ class FTTTConsumer(BaseConsumer):
 
     def read_stats(self) -> FTTTStats:
         return self.engine.read_stats(queued_feedback=len(self._queue), dropped_feedback=self._dropped_feedback)
+
+    def export_test_time_lora_update(
+        self,
+        *,
+        adapter_key: str,
+        lora_int_id: int,
+        target_module_name: str,
+        rank: int,
+        scope: LoRAScope = "global",
+        request_ids: tuple[str, ...] = (),
+        step_id: int = -1,
+        alpha: float = 1.0,
+    ) -> TestTimeLoRAUpdate:
+        return self.engine.export_test_time_lora_update(
+            adapter_key=adapter_key,
+            lora_int_id=lora_int_id,
+            target_module_name=target_module_name,
+            rank=rank,
+            scope=scope,
+            request_ids=request_ids,
+            step_id=step_id,
+            alpha=alpha,
+        )

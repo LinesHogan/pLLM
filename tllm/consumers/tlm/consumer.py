@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Real
 from typing import Callable, Literal, Sequence, TypeVar
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from tllm.contracts.test_time_lora import LoRAScope, TestTimeLoRAUpdate, TestTimeLoRAWeights
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers._common.alignment import (
     LowRankAdapter,
@@ -23,6 +25,24 @@ from tllm.ports.base import ConsumerFlow
 
 TLMMode = Literal["online", "offline"]
 _T = TypeVar("_T")
+
+
+def _require_lora_export_int(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be int")
+    return value
+
+
+def _require_lora_export_real(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{field_name} must be real")
+    return float(value)
+
+
+def _require_lora_export_request_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("request_ids must be tuple")
+    return value
 
 
 @dataclass
@@ -276,6 +296,45 @@ class TLMEngine(nn.Module):
             last_loss=float(self._last_loss),
         )
 
+    def export_test_time_lora_update(
+        self,
+        *,
+        adapter_key: str,
+        lora_int_id: int,
+        target_module_name: str,
+        rank: int,
+        scope: LoRAScope = "global",
+        request_ids: tuple[str, ...] = (),
+        step_id: int = -1,
+        adapter_slot: int = 0,
+        alpha: float = 1.0,
+    ) -> TestTimeLoRAUpdate:
+        slot = _require_lora_export_int(adapter_slot, field_name="adapter_slot")
+        update_rank = _require_lora_export_int(rank, field_name="rank")
+        _require_lora_export_int(lora_int_id, field_name="lora_int_id")
+        _require_lora_export_int(step_id, field_name="step_id")
+        export_request_ids = _require_lora_export_request_ids(request_ids)
+        export_alpha = _require_lora_export_real(alpha, field_name="alpha")
+        if slot < 0 or slot >= len(self.adapters):
+            raise RuntimeError("TLM adapter slot is not initialized")
+        adapter = self.adapters[slot]
+        if int(adapter.rank) != update_rank:
+            raise ValueError("TLM adapter rank does not match requested update rank")
+        weights = TestTimeLoRAWeights(
+            lora_a=adapter.down.weight.detach().transpose(0, 1).contiguous().clone(),
+            lora_b=adapter.up.weight.detach().transpose(0, 1).contiguous().clone(),
+            alpha=export_alpha,
+        )
+        return TestTimeLoRAUpdate(
+            adapter_key=adapter_key,
+            lora_int_id=lora_int_id,
+            rank=update_rank,
+            scope=scope,
+            target_modules={target_module_name: weights},
+            request_ids=export_request_ids,
+            step_id=step_id,
+        )
+
 
 class TLMConsumer(BaseConsumer):
     """Local online/offline test-time learning consumer."""
@@ -334,3 +393,28 @@ class TLMConsumer(BaseConsumer):
 
     def read_stats(self) -> TLMStats:
         return self.engine.read_stats()
+
+    def export_test_time_lora_update(
+        self,
+        *,
+        adapter_key: str,
+        lora_int_id: int,
+        target_module_name: str,
+        rank: int,
+        scope: LoRAScope = "global",
+        request_ids: tuple[str, ...] = (),
+        step_id: int = -1,
+        adapter_slot: int = 0,
+        alpha: float = 1.0,
+    ) -> TestTimeLoRAUpdate:
+        return self.engine.export_test_time_lora_update(
+            adapter_key=adapter_key,
+            lora_int_id=lora_int_id,
+            target_module_name=target_module_name,
+            rank=rank,
+            scope=scope,
+            request_ids=request_ids,
+            step_id=step_id,
+            adapter_slot=adapter_slot,
+            alpha=alpha,
+        )
