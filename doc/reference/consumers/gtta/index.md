@@ -16,6 +16,7 @@ agent evaluation stacks.
 - local action-score updates keyed by `task_id`, state signature, and action,
 - candidate action ranking for a matching task/state,
 - export of retained observation and dynamics text,
+- query of retained dynamics records by task, state, and action,
 - disabled no-op processing.
 
 The first version expects callers to provide environment observations and
@@ -79,7 +80,7 @@ consumer.rank_candidate_actions(
 The ranking API returns `(action, score)` pairs sorted from highest to lowest
 score. Unknown actions score `0.0`, and tied scores preserve candidate order.
 
-## Dynamics Export
+## Dynamics Store, Export, And Query
 
 `export_dynamics_records()` returns processed records as dictionaries containing:
 
@@ -90,6 +91,13 @@ score. Unknown actions score `0.0`, and tied scores preserve candidate order.
 - `next_observation`
 - `environmental_dynamics`
 - `reward`
+
+`query_dynamics_records()` returns copied records filtered by any combination of:
+
+- `task_id`
+- `action`
+- `observation`, normalized with `state_signature()`
+- `state_signature`, when the caller already has a normalized signature
 
 This is intentionally a local data export only; the consumer does not import
 WebArena, BFCL, browsergym, or browser automation frameworks.

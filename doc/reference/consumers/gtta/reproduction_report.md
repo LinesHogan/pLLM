@@ -36,10 +36,19 @@ candidate-ranking ingester:
 - `GTTAConsumer.score_action()` exposes the local score table.
 - `GTTAConsumer.rank_candidate_actions()` ranks candidate actions for a given
   task and state signature.
+- `GTTAConsumer.export_dynamics_records()` exports copied processed dynamics
+  records.
+- `GTTAConsumer.query_dynamics_records()` filters copied dynamics records by
+  task, state signature or observation, and action.
 - `GTTAConsumer.read_stats()` reports queued, dropped, processed, and updated counts.
 - The module imports only stdlib plus tLLM consumer contracts; it does not import WebArena, browsergym, bgym, agentlab, or BFCL.
 
 This matches the narrow tLLM design target from the devlist docs: accept external action/observation/reward records and keep a local action or rerank score table without vendoring the benchmark stack.
+
+The consumer-local toy coverage now fixes three pieces of the narrow subset:
+trajectory ranking, processed dynamics accumulation/export, and filtered
+dynamics lookup. The lookup is deliberately an in-process helper over already
+ingested feedback; it is not a new runtime port.
 
 ## Reproduction Feasibility
 
@@ -57,15 +66,31 @@ Because installing or launching those stacks would be heavier than this evaluati
 
 Commands are summarized with placeholders to avoid machine-specific paths.
 
-1. GTTA unit tests:
+1. GTTA consumer target tests:
 
    ```bash
-   PYTHONDONTWRITEBYTECODE=1 <repo-venv>/bin/python -m pytest -q -p no:cacheprovider test/consumers/gtta/test_gtta_consumer_unit.py
+   PYTHONDONTWRITEBYTECODE=1 <repo-venv>/bin/python -m pytest -q -p no:cacheprovider test/consumers/gtta
    ```
 
-   Result: `10 passed`.
+   Result: `12 passed`.
 
-2. Toy trajectory check:
+2. Consumer-local dynamics toy coverage:
+
+   ```bash
+   PYTHONDONTWRITEBYTECODE=1 <repo-venv>/bin/python -m pytest -q -p no:cacheprovider test/consumers/gtta/test_gtta_dynamics_toy_unit.py
+   ```
+
+   Result: `2 passed`.
+
+   The toy case ingests three feedback transitions sharing an action string
+   across different tasks and states. The consumer then:
+
+   - returns only the matching dynamics record for a requested
+     task/state/action;
+   - returns copied query results so callers cannot mutate the retained store;
+   - keeps candidate ranking scoped to the requested task and state.
+
+3. Toy trajectory check:
 
    - Config: `max_queue_size=3`, `score_momentum=0.25`.
    - Inputs: positive reward for `click search`, zero reward for `click ad`, another positive reward for `click search`, and one overflow record.
@@ -77,7 +102,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
        string can have different values in different states/tasks.
      - selected score order placed `click search` first.
 
-3. Dependency probe:
+4. Dependency probe:
 
    ```bash
    PYTHONDONTWRITEBYTECODE=1 <repo-venv>/bin/python - <<'PY'
@@ -89,7 +114,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 
    Result: environment/evaluation dependencies were missing; `vllm` was available.
 
-4. Upstream WebArena import probe:
+5. Upstream WebArena import probe:
 
    ```bash
    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=<upstream>/WebArena/src <repo-venv>/bin/python - <<'PY'
@@ -121,14 +146,23 @@ So the correct classification is: **tLLM GTTA is a dependency-light trajectory f
 - State/task-aware dynamics records and candidate ranking exist locally, but they
   are not connected to tLLM prompt injection, sampler/reranker integration, or
   policy intervention; callers must manually use `score_action()` or
-  `rank_candidate_actions()`.
+  `rank_candidate_actions()`, and must manually query dynamics records when
+  constructing prompts outside this consumer.
 - The reward update is scalar exponential smoothing, not upstream DG prompt grounding, q-judge preference learning, or SA parameter adaptation.
 - There is no real-model comparison because the current implementation has no model path to compare against upstream GTTA's prompt or vLLM adaptation behavior.
 
 ## Recommendation
 
 Keep the current implementation documented as **GTTA-inspired**. If the goal is
-closer reproduction, the next minimum step is framework integration: DG prompt
-injection, trajectory/dynamics store plumbing, sampler or policy-facing use of
-the ranking API, and a separate SA hidden-state adaptation design. A faithful
-full reproduction should not be hidden inside this simple score-table consumer.
+closer reproduction, the next minimum runtime ports are:
+
+- trajectory/event ingest from environment or generation loops into the consumer;
+- a dynamics store/query port that can be shared outside this consumer-local
+  helper;
+- DG prompt-injection plumbing that can append selected dynamics records to a
+  task prompt;
+- sampler, reranker, or policy-facing use of the ranking API;
+- a separate SA hidden prompt-adapter or hidden-state update design.
+
+A faithful full reproduction should not be hidden inside this simple score-table
+consumer.

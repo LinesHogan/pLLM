@@ -169,6 +169,31 @@ class GTTAConsumer(BaseConsumer):
     def export_dynamics_records(self) -> list[dict[str, Any]]:
         return [dict(record) for record in self._dynamics_records]
 
+    def query_dynamics_records(
+        self,
+        *,
+        task_id: str | None = None,
+        action: str | None = None,
+        observation: str | None = None,
+        state_signature: str | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_task_id = None if task_id is None else str(task_id).strip()
+        normalized_action = None if action is None else str(action).strip()
+        normalized_signature = state_signature
+        if normalized_signature is None and observation is not None:
+            normalized_signature = self.state_signature(str(observation))
+
+        records: list[dict[str, Any]] = []
+        for record in self._dynamics_records:
+            if normalized_task_id is not None and record["task_id"] != normalized_task_id:
+                continue
+            if normalized_action is not None and record["action"] != normalized_action:
+                continue
+            if normalized_signature is not None and record["state_signature"] != str(normalized_signature):
+                continue
+            records.append(dict(record))
+        return records
+
     def score_global_action(self, action: str) -> float:
         return float(self._action_scores.get(str(action).strip(), 0.0))
 
