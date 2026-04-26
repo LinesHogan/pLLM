@@ -17,6 +17,8 @@ A port is how a consumer declares the data it wants from runtime. Consumers do n
 | `sampler` | Read/provider modifier | decode | Sampler logits, metadata, candidates |
 | `generation_trace` | Read-only | post_generate | Completed request/sample text and token ids |
 | `reward_outcome` | Write-only | post_generate | Consumer-produced reward or judge outcomes |
+| `retry_control` | Write-only | post_generate | Consumer-produced retry, stop, or accept intents |
+| `update_barrier` | Write-only | post_generate | Consumer-produced update readiness barriers |
 
 ## `request_meta`
 
@@ -110,3 +112,21 @@ the runtime does not coerce numeric request IDs or trim surrounding whitespace.
 For `post_generate` flows, runtime exposes this port as a write-only sink in the
 bundle. Consumers append a `RewardOutcomeBatch`; the sink rejects other payload
 types and stores accepted entries in the runtime outcome store.
+
+## `retry_control`
+
+Consumer-produced retry decisions aligned with completed generation traces.
+
+Entries carry strict completion identity plus an action from `retry`, `stop`, or
+`accept`. The runtime stores these intents as append-only batches until a caller
+reads or drains them. The first implementation records decisions; scheduling a
+new vLLM request from these intents is a higher-level loop responsibility.
+
+## `update_barrier`
+
+Consumer-produced update readiness records.
+
+Entries identify a barrier, generation group, consumer, request ids, and a state
+from `pending`, `ready`, or `blocked`. This lets closed-loop consumers publish
+that reward/judge work is ready before an adapter update or retry is applied.
+The runtime stores these records; it does not yet enforce scheduler ordering.

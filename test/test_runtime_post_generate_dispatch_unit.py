@@ -14,9 +14,13 @@ from tllm.ports.base import ConsumerFlow
 from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.reward_outcome import RewardOutcome
+from tllm.ports.retry_control import RetryControl
+from tllm.ports.update_barrier import UpdateBarrier
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry, read_reward_outcomes
+from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry, read_retry_controls
+from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry, read_update_barriers
 from tllm.runtime.vllm_patch import port_runtime_hooks
 
 
@@ -65,6 +69,57 @@ class _PostGenerateConsumer(BaseConsumer):
     def on_step_end(self, ctx) -> None:
         _ = ctx
         self.feedback_calls += 1
+
+
+class _RetryBarrierConsumer(BaseConsumer):
+    @property
+    def consumer_id(self) -> str:
+        return "retry_barrier_consumer"
+
+    def flows(self):
+        return (
+            ConsumerFlow(
+                reads=(GenerationTrace.read(),),
+                writes=(RetryControl.write(), UpdateBarrier.write()),
+                window="out_of_band",
+                bundle_key=("generation_group_id", "phase"),
+            ),
+        )
+
+    def consume_bundle(self, bundle, ctx) -> None:
+        _ = ctx
+        trace = bundle.entries["generation_trace"]
+        first = trace.entries[0]
+        bundle.entries["retry_control"].append(
+            RetryControlBatch(
+                entries=(
+                    RetryControlEntry(
+                        request_id=first.request_id,
+                        prompt_idx=first.prompt_idx,
+                        sample_idx=first.sample_idx,
+                        output_index=first.output_index,
+                        group_id=first.group_id,
+                        action="retry",
+                        reason="toy retry",
+                        retry_after_update=True,
+                    ),
+                )
+            )
+        )
+        bundle.entries["update_barrier"].append(
+            UpdateBarrierBatch(
+                entries=(
+                    UpdateBarrierEntry(
+                        barrier_id="barrier-round-a",
+                        group_id=first.group_id,
+                        consumer_id=self.consumer_id,
+                        state="ready",
+                        request_ids=(first.request_id,),
+                        ready_count=1,
+                    ),
+                )
+            )
+        )
 
 
 class PostGenerateDispatchUnitTest(unittest.TestCase):
@@ -119,6 +174,39 @@ class PostGenerateDispatchUnitTest(unittest.TestCase):
         bundle = port_runtime_hooks.build_post_generate_port_bundle(runtime=runtime, flow=flow)
         with self.assertRaisesRegex(TypeError, "batch must be RewardOutcomeBatch"):
             bundle.entries["reward_outcome"].append("bad")  # type: ignore[attr-defined]
+
+    def test_post_generate_flow_writes_retry_control_and_update_barrier(self) -> None:
+        runtime = self._runtime()
+        consumer = _RetryBarrierConsumer()
+        runtime.dispatch_plan = DispatchPlan.build([consumer])
+        runner = SimpleNamespace(device=torch.device("cpu"), model=None, use_cuda_graph=False, compilation_config=None)
+
+        dispatched = port_runtime_hooks.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner)
+
+        self.assertEqual(dispatched, 1)
+        retry_entries = read_retry_controls(runtime).entries
+        barrier_entries = read_update_barriers(runtime).entries
+        self.assertEqual(len(retry_entries), 1)
+        self.assertEqual(retry_entries[0].action, "retry")
+        self.assertTrue(retry_entries[0].retry_after_update)
+        self.assertEqual(len(barrier_entries), 1)
+        self.assertEqual(barrier_entries[0].state, "ready")
+        self.assertEqual(barrier_entries[0].request_ids, ("req-a",))
+
+    def test_retry_and_barrier_sinks_reject_wrong_payload_types(self) -> None:
+        runtime = self._runtime()
+        flow = ConsumerFlow(
+            reads=(GenerationTrace.read(),),
+            writes=(RetryControl.write(), UpdateBarrier.write()),
+            window="out_of_band",
+            bundle_key=("generation_group_id", "phase"),
+        )
+
+        bundle = port_runtime_hooks.build_post_generate_port_bundle(runtime=runtime, flow=flow)
+        with self.assertRaisesRegex(TypeError, "batch must be RetryControlBatch"):
+            bundle.entries["retry_control"].append("bad")  # type: ignore[attr-defined]
+        with self.assertRaisesRegex(TypeError, "batch must be UpdateBarrierBatch"):
+            bundle.entries["update_barrier"].append("bad")  # type: ignore[attr-defined]
 
     def test_post_generate_reward_write_mode_must_be_explicit_string(self) -> None:
         from tllm.ports.base import PortKind, PortWrite

@@ -27,6 +27,8 @@ class PortKind(str, Enum):
     CPU_EXPORT = "cpu_export"
     GENERATION_TRACE = "generation_trace"
     REWARD_OUTCOME = "reward_outcome"
+    RETRY_CONTROL = "retry_control"
+    UPDATE_BARRIER = "update_barrier"
 
 
 class FlowWindow(StrEnum):
