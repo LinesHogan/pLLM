@@ -24,6 +24,7 @@ from tllm.runtime.vllm_patch.adapters import (
 )
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
+from tllm.runtime import vllm_test_time_lora as _test_time_lora
 
 RUNTIME_EVENT_POINTS = (
     "load_model.pre",
@@ -157,6 +158,10 @@ def _record_cpu_hotspot(core: object, name: str, start_s: float, end_s: float) -
         return
     record = getattr(core, "record_path_hotspot_cpu")
     record(name, float((end_s - start_s) * 1000.0))
+
+
+def _test_time_lora_enabled(runtime: object) -> bool:
+    return bool(getattr(runtime, "test_time_lora_enabled", False) or getattr(runtime, "test_time_lora_service", None) is not None)
 
 
 def prepare_decode_localization(
@@ -485,7 +490,10 @@ def install_input_batch_min_p_patch() -> None:
 
 def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
-        return core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
+        out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
+        if _test_time_lora_enabled(core.RUNTIME):
+            _test_time_lora.maybe_bind_test_time_lora_service(runtime=core.RUNTIME, runner=runner)
+        return out
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
@@ -496,6 +504,7 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
     )
     out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
     _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
+    _test_time_lora.maybe_bind_test_time_lora_service(runtime=core.RUNTIME, runner=runner)
     setup_runtime_hooks_if_active(core=core, runner=runner)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
@@ -510,6 +519,8 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
 
 def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
+        if _test_time_lora_enabled(core.RUNTIME):
+            _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
         return core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
@@ -524,6 +535,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         setup_runtime_hooks_if_active(core=core, runner=runner)
+    _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
     trace_hotspots = _path_hotspots_enabled(core)
     t0 = time.perf_counter() if trace_hotspots else 0.0
     out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)

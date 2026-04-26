@@ -51,6 +51,7 @@ class TestTimeLoRATarget:
 class TestTimeLoRAWeights:
     lora_a: torch.Tensor
     lora_b: torch.Tensor
+    embeddings_tensor: torch.Tensor | None = None
     bias: torch.Tensor | None = None
     alpha: float = 1.0
 
@@ -61,6 +62,8 @@ class TestTimeLoRAWeights:
             raise ValueError("TestTimeLoRAWeights expects rank-2 LoRA tensors")
         if int(self.lora_a.shape[1]) != int(self.lora_b.shape[0]):
             raise ValueError("TestTimeLoRAWeights rank dimension mismatch")
+        if self.embeddings_tensor is not None and not isinstance(self.embeddings_tensor, torch.Tensor):
+            raise ValueError("TestTimeLoRAWeights embeddings_tensor must be a tensor when provided")
         if self.bias is not None and not isinstance(self.bias, torch.Tensor):
             raise ValueError("TestTimeLoRAWeights bias must be a tensor when provided")
         if isinstance(self.alpha, bool) or not isinstance(self.alpha, Real):
@@ -91,8 +94,8 @@ class TestTimeLoRAUpdate:
         lora_int_id = _require_int(self.lora_int_id, field_name="lora_int_id")
         rank = _require_int(self.rank, field_name="rank")
         step_id = _require_int(self.step_id, field_name="step_id")
-        if lora_int_id < 0:
-            raise ValueError("TestTimeLoRAUpdate requires non-negative lora_int_id")
+        if lora_int_id <= 0:
+            raise ValueError("TestTimeLoRAUpdate requires positive lora_int_id")
         if rank <= 0:
             raise ValueError("TestTimeLoRAUpdate requires positive rank")
         if self.scope not in ("global", "request"):

@@ -351,6 +351,8 @@ class ResidualRuntimeState:
     consumer: Optional[RuntimeConsumer] = None
     consumer_registry: Optional[ConsumerRegistry] = None
     dispatch_plan: Optional[DispatchPlan] = None
+    test_time_lora_enabled: bool = False
+    test_time_lora_service: object | None = None
 
     def reset_step(self) -> None:
         self.decode_count = 0
@@ -603,6 +605,10 @@ def set_esamp_training_enabled(enabled: bool) -> None:
         RUNTIME.consumer.set_enabled(enabled)
 
 
+def set_test_time_lora_enabled(enabled: bool) -> None:
+    RUNTIME.test_time_lora_enabled = bool(enabled)
+
+
 def synchronize_esamp() -> None:
     if RUNTIME.consumer is not None:
         synchronize_consumer(RUNTIME.consumer)
@@ -800,5 +806,6 @@ __all__ = [
     "runner_uses_compilation_or_cudagraph",
     "set_runtime_consumer",
     "set_esamp_training_enabled",
+    "set_test_time_lora_enabled",
     "synchronize_esamp",
 ]

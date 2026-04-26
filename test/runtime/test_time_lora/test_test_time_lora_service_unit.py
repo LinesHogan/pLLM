@@ -49,7 +49,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
         from tllm.runtime.test_time_lora import TestTimeLoRAService
 
         manager = _FakeLoRAManager()
-        service = TestTimeLoRAService(manager=manager, max_rank=4, max_adapters=2)
+        service = TestTimeLoRAService(manager=manager, max_rank=4)
         update = TestTimeLoRAUpdate(
             adapter_key="req-7",
             lora_int_id=1,
@@ -82,7 +82,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
         from tllm.runtime.test_time_lora import TestTimeLoRAService
 
-        service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1, max_adapters=2)
+        service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         update = TestTimeLoRAUpdate(
             adapter_key="bad",
             lora_int_id=1,
@@ -149,6 +149,16 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
             TestTimeLoRAUpdate(
                 adapter_key="bad",
                 lora_int_id=1.2,  # type: ignore[arg-type]
+                rank=1,
+                scope="request",
+                request_ids=("request-a",),
+                target_modules={"model.layers.0.self_attn.q_proj": weights},
+            )
+
+        with self.assertRaisesRegex(ValueError, "positive lora_int_id"):
+            TestTimeLoRAUpdate(
+                adapter_key="bad",
+                lora_int_id=0,
                 rank=1,
                 scope="request",
                 request_ids=("request-a",),
@@ -240,21 +250,46 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
             )
 
         with self.assertRaisesRegex(TypeError, "request_id must be str"):
-            TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1, max_adapters=2).adapter_for_request(7)  # type: ignore[arg-type]
+            TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1).adapter_for_request(7)  # type: ignore[arg-type]
 
         with self.assertRaisesRegex(TypeError, "max_rank must be int"):
-            TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1.5, max_adapters=2)  # type: ignore[arg-type]
-
-        with self.assertRaisesRegex(TypeError, "max_adapters must be int"):
-            TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1, max_adapters=True)  # type: ignore[arg-type]
+            TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1.5)  # type: ignore[arg-type]
 
     def test_rejects_duck_typed_updates_at_service_boundary(self) -> None:
         from tllm.runtime.test_time_lora import TestTimeLoRAService
 
-        service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1, max_adapters=2)
+        service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
 
         with self.assertRaisesRegex(TypeError, "update must be TestTimeLoRAUpdate"):
             service.stage_update(_DuckUpdate())  # type: ignore[arg-type]
+
+    def test_request_assignment_can_be_explicitly_unbound(self) -> None:
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+
+        service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
+        update = TestTimeLoRAUpdate(
+            adapter_key="adapter-a",
+            lora_int_id=1,
+            rank=1,
+            scope="request",
+            request_ids=("request-a",),
+            target_modules={
+                "model.layers.0.self_attn.q_proj": TestTimeLoRAWeights(
+                    lora_a=torch.ones(3, 1),
+                    lora_b=torch.ones(1, 4),
+                )
+            },
+        )
+        service.stage_update(update)
+        service.commit_staged_updates()
+
+        self.assertEqual(service.adapter_for_request("request-a"), 1)
+        self.assertTrue(service.unbind_request("request-a"))
+        self.assertIsNone(service.adapter_for_request("request-a"))
+        self.assertFalse(service.unbind_request("request-a"))
+        with self.assertRaisesRegex(TypeError, "request_id must be str"):
+            service.unbind_request(7)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

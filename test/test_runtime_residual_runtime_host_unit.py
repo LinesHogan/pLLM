@@ -17,6 +17,18 @@ class RuntimeResidualRuntimeHostUnitTest(unittest.TestCase):
         self.assertTrue(callable(host.register_dispatch_consumer))
         self.assertTrue(callable(host.replace_dispatch_consumers))
         self.assertTrue(callable(host.clear_dispatch_consumers))
+        self.assertTrue(callable(host.set_test_time_lora_enabled))
+
+    def test_residual_runtime_host_exposes_test_time_lora_enable_switch(self) -> None:
+        host = importlib.import_module("tllm.runtime.residual_runtime")
+        old_value = host.RUNTIME.test_time_lora_enabled
+        try:
+            host.set_test_time_lora_enabled(True)
+            self.assertTrue(host.RUNTIME.test_time_lora_enabled)
+            host.set_test_time_lora_enabled(False)
+            self.assertFalse(host.RUNTIME.test_time_lora_enabled)
+        finally:
+            host.RUNTIME.test_time_lora_enabled = old_value
 
     def test_public_tllm_make_llm_is_runtime_hook_installing_entrypoint(self) -> None:
         tllm = importlib.import_module("tllm")
