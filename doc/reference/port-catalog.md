@@ -15,6 +15,8 @@ A port is how a consumer declares the data it wants from runtime. Consumers do n
 | `kv_cache` | Read/write | decode | Layer-local KV cache |
 | `token_target` | Read-only | prefill, decode | Training or guidance target token |
 | `sampler` | Read/provider modifier | decode | Sampler logits, metadata, candidates |
+| `generation_trace` | Read-only | post_generate | Completed request/sample text and token ids |
+| `reward_outcome` | Write-only | post_generate | Consumer-produced reward or judge outcomes |
 
 ## `request_meta`
 
@@ -74,3 +76,20 @@ Consumer responsibilities:
 - Return candidate-level logits deltas with the expected shape.
 
 ESamp's provider lives in `tllm/consumers/esamp/sampler_provider.py`, but the runtime layer does not depend on ESamp.
+
+## `generation_trace`
+
+Completed generation records after vLLM returns outputs.
+
+Each trace entry normalizes request id, prompt index, sample index, output index,
+completion token ids, completion text, finish reason, and optional generation
+group id. This is intended for closed-loop consumers such as TTRL and FTTT that
+need whole-completion outcomes rather than only decode-step tensors.
+
+## `reward_outcome`
+
+Consumer-produced reward, judge, or label outcomes aligned with completed
+generation traces.
+
+The runtime owns the timing and grouping contract; each consumer owns the
+algorithm-specific reward or judge semantics.

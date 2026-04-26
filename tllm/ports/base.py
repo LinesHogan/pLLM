@@ -25,6 +25,8 @@ class PortKind(str, Enum):
     TOKEN_TARGET = "token_target"
     REQUEST_META = "request_meta"
     CPU_EXPORT = "cpu_export"
+    GENERATION_TRACE = "generation_trace"
+    REWARD_OUTCOME = "reward_outcome"
 
 
 class FlowWindow(StrEnum):

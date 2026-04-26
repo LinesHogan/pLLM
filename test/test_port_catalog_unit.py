@@ -19,6 +19,8 @@ class PortCatalogUnitTest(unittest.TestCase):
             "token_target",
             "request_meta",
             "cpu_export",
+            "generation_trace",
+            "reward_outcome",
         ]
 
         self.assertEqual([kind.value for kind in PortKind], expected)

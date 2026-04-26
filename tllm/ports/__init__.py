@@ -2,8 +2,10 @@
 """Public consumer port contracts."""
 
 from tllm.ports.cpu_export import CpuExport, CpuExportLocator
+from tllm.ports.generation_trace import GenerationTrace, GenerationTraceLocator
 from tllm.ports.kv_cache import KVCache, KVLocator
 from tllm.ports.logits import Logits, LogitsLocator
+from tllm.ports.reward_outcome import RewardOutcome, RewardOutcomeLocator
 from tllm.ports.sampler import Sampler, SamplerLocator
 from tllm.ports.base import ConsumerFlow, Locator, PortKind, PortRead, PortWrite
 from tllm.ports.token_target import TokenTarget, TokenTargetLocator
@@ -15,6 +17,8 @@ __all__ = [
     "ConsumerFlow",
     "KVCache",
     "KVLocator",
+    "GenerationTrace",
+    "GenerationTraceLocator",
     "Locator",
     "Logits",
     "LogitsLocator",
@@ -22,6 +26,8 @@ __all__ = [
     "PortRead",
     "PortWrite",
     "PUBLIC_PORT_KINDS",
+    "RewardOutcome",
+    "RewardOutcomeLocator",
     "Sampler",
     "SamplerLocator",
     "TokenTarget",
