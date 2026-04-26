@@ -19,6 +19,8 @@ A port is how a consumer declares the data it wants from runtime. Consumers do n
 | `reward_outcome` | Write-only | post_generate | Consumer-produced reward or judge outcomes |
 | `retry_control` | Write-only | post_generate | Consumer-produced retry, stop, or accept intents |
 | `update_barrier` | Write-only | post_generate | Consumer-produced update readiness barriers |
+| `prompt_context` | Write-only | pre_generate | Prompt text injected before generation |
+| `trajectory_event` | Write-only | post_step | Environment trajectory observations/actions |
 
 ## `request_meta`
 
@@ -130,3 +132,19 @@ Entries identify a barrier, generation group, consumer, request ids, and a state
 from `pending`, `ready`, or `blocked`. This lets closed-loop consumers publish
 that reward/judge work is ready before an adapter update or retry is applied.
 The runtime stores these records; it does not yet enforce scheduler ordering.
+
+## `prompt_context`
+
+Prompt-context entries are indexed by prompt index and applied before generation
+is handed to vLLM. Context can be inserted as a prefix or suffix. This is the
+first runtime surface for GTTA-style dynamics prompts; callers must manage
+prefix-cache assumptions when injected text changes.
+
+## `trajectory_event`
+
+Trajectory events describe task id, state signature, previous observation,
+action, next observation, and optional reward.
+
+Runtime stores them in a dynamics store with task/state/action-separated query
+and deterministic text export helpers. The store is generic and has no browser
+or benchmark dependency.

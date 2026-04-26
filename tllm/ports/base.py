@@ -29,6 +29,8 @@ class PortKind(str, Enum):
     REWARD_OUTCOME = "reward_outcome"
     RETRY_CONTROL = "retry_control"
     UPDATE_BARRIER = "update_barrier"
+    PROMPT_CONTEXT = "prompt_context"
+    TRAJECTORY_EVENT = "trajectory_event"
 
 
 class FlowWindow(StrEnum):

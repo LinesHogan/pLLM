@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from tllm.runtime.dynamics_store import apply_prompt_contexts
 from tllm.runtime.generation_trace_runtime import build_generation_trace_from_outputs
 from tllm.runtime.vllm_patch.port_runtime_hooks import dispatch_post_generate_port_bundles
 
@@ -56,9 +57,15 @@ def run_generate_with_request_mapping(
         counter["i"] += 1
         return orig_add_request(request_id, prompt, p, *args, **kwargs)
 
+    effective_prompts = apply_prompt_contexts(
+        runtime,
+        prompts,
+        request_prompt_indices=request_prompt_indices,
+    )
+
     llm.llm_engine.add_request = _wrapped_add_request  # type: ignore[assignment]
     try:
-        outputs = llm.generate(prompts, params)
+        outputs = llm.generate(effective_prompts, params)
     finally:
         llm.llm_engine.add_request = orig_add_request  # type: ignore[assignment]
     runtime.last_generation_trace = build_generation_trace_from_outputs(

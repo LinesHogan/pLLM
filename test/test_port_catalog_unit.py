@@ -23,6 +23,8 @@ class PortCatalogUnitTest(unittest.TestCase):
             "reward_outcome",
             "retry_control",
             "update_barrier",
+            "prompt_context",
+            "trajectory_event",
         ]
 
         self.assertEqual([kind.value for kind in PortKind], expected)
