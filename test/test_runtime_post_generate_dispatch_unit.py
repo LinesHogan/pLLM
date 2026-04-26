@@ -193,6 +193,94 @@ class PostGenerateDispatchUnitTest(unittest.TestCase):
         self.assertEqual(barrier_entries[0].state, "ready")
         self.assertEqual(barrier_entries[0].request_ids, ("req-a",))
 
+    def test_post_generate_dispatches_trace_to_ttrl_and_fttt_closed_loop_consumers(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
+
+        runner = SimpleNamespace(device=torch.device("cpu"), model=None, use_cuda_graph=False, compilation_config=None)
+
+        with self.subTest("ttrl"):
+            runtime = SimpleNamespace(event_step_id=21)
+            runtime.last_generation_trace = GenerationTraceBatch(
+                entries=(
+                    CompletionTraceEntry(
+                        request_id="req-ttrl-a",
+                        prompt_idx=8,
+                        sample_idx=0,
+                        output_index=0,
+                        token_ids=(),
+                        text=r"\boxed{4}",
+                        finish_reason="stop",
+                        group_id="vote-runtime",
+                    ),
+                    CompletionTraceEntry(
+                        request_id="req-ttrl-b",
+                        prompt_idx=8,
+                        sample_idx=1,
+                        output_index=0,
+                        token_ids=(),
+                        text=r"\boxed{5}",
+                        finish_reason="stop",
+                        group_id="vote-runtime",
+                    ),
+                )
+            )
+            runtime.dispatch_plan = DispatchPlan.build([TTRLConsumer(TTRLConsumerConfig())])
+
+            self.assertEqual(port_runtime_hooks.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner), 1)
+
+            reward_entries = read_reward_outcomes(runtime).entries
+            retry_entries = read_retry_controls(runtime).entries
+            barrier_entries = read_update_barriers(runtime).entries
+            self.assertEqual([entry.reward for entry in reward_entries], [1.0, 0.0])
+            self.assertEqual([entry.action for entry in retry_entries], ["accept", "retry"])
+            self.assertTrue(retry_entries[1].retry_after_update)
+            self.assertEqual(len(barrier_entries), 1)
+            self.assertEqual(barrier_entries[0].consumer_id, "ttrl")
+            self.assertEqual(barrier_entries[0].state, "ready")
+            self.assertEqual(barrier_entries[0].ready_count, 2)
+
+        with self.subTest("fttt"):
+            runtime = SimpleNamespace(event_step_id=22)
+            runtime.last_generation_trace = GenerationTraceBatch(
+                entries=(
+                    CompletionTraceEntry(
+                        request_id="req-fttt-fail",
+                        prompt_idx=9,
+                        sample_idx=0,
+                        output_index=0,
+                        token_ids=(),
+                        text="5",
+                        finish_reason="stop",
+                        group_id="feedback-runtime",
+                    ),
+                )
+            )
+            consumer = FTTTConsumer(
+                FTTTConsumerConfig(max_retries=2),
+                judge=lambda entry: FTTTJudgeResult(
+                    is_correct=False,
+                    reward=0.0,
+                    feedback_text=f"fix {entry.text}",
+                    label="expected=4",
+                    judge="toy",
+                ),
+            )
+            runtime.dispatch_plan = DispatchPlan.build([consumer])
+
+            self.assertEqual(port_runtime_hooks.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner), 1)
+
+            reward_entries = read_reward_outcomes(runtime).entries
+            retry_entries = read_retry_controls(runtime).entries
+            barrier_entries = read_update_barriers(runtime).entries
+            self.assertEqual(reward_entries[0].feedback_text, "fix 5")
+            self.assertEqual(retry_entries[0].action, "retry")
+            self.assertTrue(retry_entries[0].retry_after_update)
+            self.assertEqual(barrier_entries[0].consumer_id, "fttt")
+            self.assertEqual(barrier_entries[0].state, "ready")
+            self.assertEqual(barrier_entries[0].ready_count, 1)
+            self.assertEqual(consumer.read_stats().queued_feedback, 1)
+
     def test_retry_and_barrier_sinks_reject_wrong_payload_types(self) -> None:
         runtime = self._runtime()
         flow = ConsumerFlow(

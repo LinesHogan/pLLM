@@ -73,13 +73,15 @@
 
 使用 repo virtualenv 运行：
 
-- `python -m pytest -q test/consumers/ttrl/test_ttrl_consumer_unit.py`
+- `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl/test_ttrl_consumer_unit.py`
   - 早期更新结果：`12 passed`
   - 当前 closed-loop adoption 结果：`17 passed`
-- `python -m pytest -q test/consumers/ttrl test/test_runtime_generation_trace_unit.py test/test_runtime_reward_outcome_unit.py`
+- `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/test_runtime_generation_trace_unit.py test/test_runtime_reward_outcome_unit.py`
   - 更新后结果：`21 passed`
-- `python -m pytest -q test/consumers/ttrl test/consumers/fttt`
-  - 当前结果：`34 passed`
+- `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/consumers/fttt`
+  - 当前结果：`36 passed`
+- `<repo-venv>/bin/python -m pytest -q test/test_runtime_post_generate_dispatch_unit.py`
+  - 当前结果：`8 passed, 2 subtests passed`
 - 依赖探测：
   - `torch`、`transformers`、`vllm`、`sympy`、`ray` 可用。
   - `latex2sympy2_extended`、`omegaconf` 不可用。
@@ -139,6 +141,9 @@ closed-loop intent toycase：
 - non-majority completion 的 retry action 为 `retry`，并带 `retry_after_update=True`。
 - update barrier 的 `ready_count` 只统计上游式 selected training rows。
 - `consume_bundle()` 在可选 sinks 存在时会写入 reward、retry 和 update barrier 三类 batch。
+- post-generate fake runtime dispatch smoke 使用真实 `TTRLConsumer`，从
+  `runtime.last_generation_trace` 构造 bundle 后写入 runtime reward、retry 和
+  update barrier sinks，不需要 vLLM、GPU 或模型下载。
 
 样本选择对照：
 

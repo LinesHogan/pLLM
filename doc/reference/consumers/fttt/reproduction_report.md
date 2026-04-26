@@ -97,18 +97,22 @@ Therefore, I did not treat upstream execution failure as evidence against the al
 
 Commands are summarized with placeholders to avoid machine-local paths:
 
-- `<repo>/.venv/bin/python -m pytest -q test/consumers/fttt/test_fttt_consumer_unit.py`
+- `<repo-venv>/bin/python -m pytest -q test/consumers/fttt/test_fttt_consumer_unit.py`
   - Earlier result before LoRA export coverage: `13 passed`.
   - Result after LoRA export coverage: `16 passed`.
-  - Current result after closed-loop adoption coverage: `17 passed`.
-- Dependency probe in `<repo>/.venv/bin/python`
+  - Current result after closed-loop adoption and LoRA boundary coverage: `19 passed`.
+- `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/consumers/fttt`
+  - Current result: `36 passed`.
+- `<repo-venv>/bin/python -m pytest -q test/test_runtime_post_generate_dispatch_unit.py`
+  - Current result: `8 passed, 2 subtests passed`.
+- Dependency probe in `<repo-venv>/bin/python`
   - `torch`, `transformers`, `fastapi`, `requests`, and `sentencepiece` present.
   - `peft` and `adapters` missing.
 - Local model cache probe
   - Confirmed small cached models such as `sshleifer/tiny-gpt2`, `gpt2`, and several Qwen models.
-- Upstream preliminary import with `<repo>/.venv/bin/python`
+- Upstream preliminary import with `<repo-venv>/bin/python`
   - Result: blocked by f-string syntax under Python 3.11.
-- Upstream OpTune entry with `<repo>/.venv/bin/python <upstream>/optim/run.py --help`
+- Upstream OpTune entry with `<repo-venv>/bin/python <upstream>/optim/run.py --help`
   - Result: blocked by missing `datasets`.
 - Static dependency scan of the tLLM FTTT consumer
   - No `requests`, `fastapi`, `uvicorn`, `datasets`, `peft`, `transformers`, HTTP, socket, or subprocess usage in the consumer.
@@ -166,6 +170,9 @@ The current consumer branch adds toy coverage for the runtime-facing loop shape:
   reaches the configured limit;
 - `consume_bundle()` writes reward, retry, and update-barrier sinks when those
   ports are present;
+- post-generate fake runtime dispatch smoke uses the real `FTTTConsumer` to
+  turn `runtime.last_generation_trace` into runtime reward, retry, and update
+  barrier sink writes without vLLM, GPU, or model downloads;
 - the local adapter update path consumes the emitted feedback records and reports
   nonzero update/loss counts.
 
