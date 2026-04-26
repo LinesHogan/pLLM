@@ -93,3 +93,10 @@ generation traces.
 
 The runtime owns the timing and grouping contract; each consumer owns the
 algorithm-specific reward or judge semantics.
+
+Runtime reward outcomes are stored as append-only batches until a caller reads
+or drains them. Each entry carries stable completion identity
+(`request_id`, `prompt_idx`, `sample_idx`, `output_index`, and `group_id`) plus
+optional algorithm-owned fields such as `reward`, `judge`, `label`,
+`feedback_text`, `skip_reason`, and `is_correct`. Identity fields are strict:
+the runtime does not coerce numeric request IDs or trim surrounding whitespace.
