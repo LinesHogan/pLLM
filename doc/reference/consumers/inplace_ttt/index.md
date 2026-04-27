@@ -32,14 +32,19 @@ The package also exposes `run_exact_toy_down_proj_step()` for dependency-light
 consumer-side alignment tests. That helper is not wired to runtime execution;
 it is a small PyTorch reference surface for the upstream-shaped exact math:
 `past_h` and `past_t` cache incomplete rows, `past_w` stores the effective
-`down_proj.weight`, and only complete chunks update the fast weight.
-Below-chunk calls only cache the tail.
+`down_proj.weight`, output rows are emitted with the pre-update weight for
+their chunk, and only complete chunks update the fast weight. Below-chunk calls
+only cache the tail. The helper supports the upstream optional `ttt_proj`
+projection formula.
 
 Runtime support now also includes a limited Qwen/Llama-style MLP wrapper for
 single-TP, non-quantized `gate_up_proj -> act_fn -> down_proj` blocks. The
 wrapper treats the MLP input as the hidden target `t`, the activation before
-`down_proj` as `h`, stores `past_w` as an effective weight, updates on prefill
-chunks by default, and keeps decode update opt-in.
+`down_proj` as `h`, stores `past_w` as an effective weight, emits each chunk
+with its pre-update weight, updates on prefill chunks by default, and keeps
+decode update opt-in. If the wrapped module exposes upstream-style `ttt_proj`
+or `ttt_conv` modules, their weights are used in the update formula; ordinary
+vLLM MLPs without those modules run the no-projection/no-convolution subset.
 
 The runner lifecycle can install this wrapper at `load_model` time behind the
 explicit `inplace_ttt_fast_weight_enabled` runtime setting. The current runner

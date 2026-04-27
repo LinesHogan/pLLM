@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
+from opt_einsum import contract
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -97,6 +98,16 @@ def _validate_exact_toy_tensors(h: torch.Tensor, t: torch.Tensor, down_proj_weig
         raise RuntimeError("In-Place TTT exact toy t width must match down_proj output width")
 
 
+def _validate_ttt_proj_weight(ttt_proj_weight: torch.Tensor | None, down_proj_weight: torch.Tensor) -> None:
+    if ttt_proj_weight is None:
+        return
+    if ttt_proj_weight.ndim != 2:
+        raise RuntimeError("In-Place TTT exact toy ttt_proj weight must be 2D")
+    hidden = int(down_proj_weight.shape[0])
+    if tuple(ttt_proj_weight.shape) != (hidden, hidden):
+        raise RuntimeError("In-Place TTT exact toy ttt_proj weight must be hidden_size x hidden_size")
+
+
 def run_exact_toy_down_proj_step(
     h: torch.Tensor,
     t: torch.Tensor,
@@ -105,6 +116,7 @@ def run_exact_toy_down_proj_step(
     state: InPlaceTTTExactToyState | None = None,
     chunk_size: int,
     learning_rate: float,
+    ttt_proj_weight: torch.Tensor | None = None,
 ) -> InPlaceTTTExactToyStep:
     """Run a dependency-light exact toy step for MLP down-proj fast weights.
 
@@ -116,6 +128,7 @@ def run_exact_toy_down_proj_step(
     """
 
     _validate_exact_toy_tensors(h, t, down_proj_weight)
+    _validate_ttt_proj_weight(ttt_proj_weight, down_proj_weight)
     current_state = state or InPlaceTTTExactToyState()
     fast_w = current_state.past_w
     if fast_w is None:
@@ -145,9 +158,13 @@ def run_exact_toy_down_proj_step(
         end = start + chunk
         h_chunk = h_work[start:end]
         t_chunk = t_work[start:end]
-        residual = t_chunk - h_chunk.matmul(fast_w.t())
-        fast_w = fast_w + float(learning_rate) * residual.t().matmul(h_chunk) / float(chunk)
         outputs.append(h_chunk.matmul(fast_w.t()))
+        if ttt_proj_weight is None:
+            dw = contract("c h, c d -> d h", h_chunk, t_chunk)
+        else:
+            proj = ttt_proj_weight.to(device=t_chunk.device, dtype=t_chunk.dtype)
+            dw = contract("c h, c d, d e -> e h", h_chunk, t_chunk, proj)
+        fast_w = fast_w + (dw * float(learning_rate)).to(device=fast_w.device, dtype=fast_w.dtype)
         update_count += 1
 
     tail_h = h_work[full_rows:]

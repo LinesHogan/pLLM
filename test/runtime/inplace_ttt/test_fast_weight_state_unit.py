@@ -266,6 +266,33 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertEqual(stats.tail_rows, 0)
         handle.restore()
 
+    def test_fast_weight_step_uses_upstream_output_before_update_with_projection(self) -> None:
+        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState, run_down_proj_fast_weight_step
+
+        state = FastWeightState()
+        key = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
+        base_weight = torch.tensor([[0.2, -0.3, 0.5], [0.4, 0.1, -0.2]], dtype=torch.float64)
+        hidden = torch.tensor([[1.0, -0.5, 0.25], [0.2, 0.4, -0.3]], dtype=torch.float64)
+        target = torch.tensor([[0.5, -0.25], [0.1, 0.75]], dtype=torch.float64)
+        proj = torch.tensor([[0.9, -0.1], [0.2, 0.7]], dtype=torch.float64)
+
+        result = run_down_proj_fast_weight_step(
+            hidden=hidden,
+            target=target,
+            base_weight=base_weight,
+            state=state,
+            key=key,
+            chunk_size=2,
+            learning_rate=0.3,
+            ttt_proj_weight=proj,
+        )
+
+        expected_output = hidden.matmul(base_weight.t())
+        expected_dw = torch.einsum("ch,cd,de->eh", hidden, target, proj) * 0.3
+        self.assertTrue(torch.allclose(result.output, expected_output))
+        self.assertTrue(torch.allclose(state.read(key).past_w, base_weight + expected_dw))
+        self.assertEqual(result.update_count, 1)
+
     def test_mlp_wrapper_groups_flattened_rows_by_explicit_per_row_keys(self) -> None:
         from tllm.runtime.fast_weight_state import (
             FastWeightKey,

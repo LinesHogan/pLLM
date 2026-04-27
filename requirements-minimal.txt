@@ -1,0 +1,13 @@
+# Minimal known-good dependencies for local tLLM development and tests.
+#
+# vLLM pulls the matching PyTorch, Transformers, tokenizers, and CUDA-side
+# packages for its release. Install a platform-specific PyTorch wheel first if
+# your CUDA/PyTorch environment needs manual control.
+vllm==0.10.1.1
+
+# Test runner used by the repository verification commands.
+pytest==9.0.3
+
+# Lightweight tensor-expression helpers used by upstream-aligned consumers.
+einops==0.8.2
+opt-einsum>=3.4,<4
