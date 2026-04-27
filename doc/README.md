@@ -72,7 +72,7 @@ git clone <repo-url>
 cd tLLM
 python -m venv .venv
 source .venv/bin/activate
-pip install vllm
+pip install -r requirements-minimal.txt
 pip install -e .
 
 # Run the ESamp starter.

@@ -61,7 +61,7 @@ Representative run:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install vllm
+pip install -r requirements-minimal.txt
 pip install -e .
 
 python starter.py --max-new-tokens 32

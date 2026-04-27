@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import Callable
 
+from opt_einsum import contract
 import torch
 from torch.nn import functional as F
 
@@ -254,6 +255,48 @@ def _first_forward_tensor(output: object, *, field_name: str) -> torch.Tensor:
     raise RuntimeError(f"{field_name} output must be a tensor or tuple starting with a tensor")
 
 
+def _validate_ttt_proj_weight(ttt_proj_weight: torch.Tensor | None, base_weight: torch.Tensor) -> None:
+    if ttt_proj_weight is None:
+        return
+    if not isinstance(ttt_proj_weight, torch.Tensor):
+        raise TypeError("ttt_proj_weight must be torch.Tensor")
+    if ttt_proj_weight.ndim != 2:
+        raise RuntimeError("ttt_proj_weight must be 2D")
+    hidden = int(base_weight.shape[0])
+    if tuple(ttt_proj_weight.shape) != (hidden, hidden):
+        raise RuntimeError("ttt_proj_weight must be hidden_size x hidden_size")
+
+
+def _validate_ttt_conv_weight(ttt_conv_weight: torch.Tensor | None, base_weight: torch.Tensor) -> None:
+    if ttt_conv_weight is None:
+        return
+    if not isinstance(ttt_conv_weight, torch.Tensor):
+        raise TypeError("ttt_conv_weight must be torch.Tensor")
+    if ttt_conv_weight.ndim != 3:
+        raise RuntimeError("ttt_conv_weight must be 3D")
+    hidden = int(base_weight.shape[0])
+    if int(ttt_conv_weight.shape[0]) != hidden or int(ttt_conv_weight.shape[1]) != 1:
+        raise RuntimeError("ttt_conv_weight must be depthwise hidden_size x 1 x kernel")
+
+
+def _apply_ttt_conv_to_rows(target: torch.Tensor, *, conv_weight: torch.Tensor | None, chunk_size: int) -> torch.Tensor:
+    if conv_weight is None:
+        return target
+    if int(target.shape[0]) <= 0:
+        return target
+    hidden = int(target.shape[1])
+    weight = conv_weight.to(device=target.device, dtype=target.dtype)
+    kernel = int(weight.shape[2])
+    padding = kernel // 2
+    conv_input = target.view(1, int(target.shape[0]), hidden).transpose(1, 2)
+    conv = F.conv1d(conv_input, weight, bias=None, stride=1, padding=padding, groups=hidden).transpose(1, 2).reshape(
+        int(target.shape[0]), hidden
+    )
+    if int(conv.shape[0]) != int(target.shape[0]):
+        conv = conv[: int(target.shape[0])]
+    return conv
+
+
 def _require_fast_weight_row_keys(row_keys: object, *, rows: int) -> tuple[FastWeightKey, ...]:
     if not isinstance(row_keys, Sequence):
         raise TypeError("row_key_provider must return a sequence of FastWeightKey")
@@ -277,6 +320,8 @@ def _run_grouped_down_proj_fast_weight_step(
     learning_rate: float,
     update_enabled: bool,
     cache_tail: bool,
+    ttt_proj_weight: torch.Tensor | None = None,
+    ttt_conv_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if int(hidden.shape[0]) != len(row_keys):
         raise RuntimeError("row key count must match hidden row count")
@@ -296,6 +341,8 @@ def _run_grouped_down_proj_fast_weight_step(
             learning_rate=learning_rate,
             update_enabled=update_enabled,
             cache_tail=cache_tail,
+            ttt_proj_weight=ttt_proj_weight,
+            ttt_conv_weight=ttt_conv_weight,
         )
         output.index_copy_(0, row_tensor, step.output.to(device=output.device, dtype=output.dtype))
     return output
@@ -312,6 +359,8 @@ def run_down_proj_fast_weight_step(
     learning_rate: float,
     update_enabled: bool = True,
     cache_tail: bool = True,
+    ttt_proj_weight: torch.Tensor | None = None,
+    ttt_conv_weight: torch.Tensor | None = None,
 ) -> FastWeightStepResult:
     h = _require_2d_tensor(hidden, field_name="hidden")
     t = _require_2d_tensor(target, field_name="target")
@@ -326,6 +375,8 @@ def run_down_proj_fast_weight_step(
         raise RuntimeError("hidden width must match base_weight input width")
     if int(t.shape[1]) != int(w.shape[0]):
         raise RuntimeError("target width must match base_weight output width")
+    _validate_ttt_proj_weight(ttt_proj_weight, w)
+    _validate_ttt_conv_weight(ttt_conv_weight, w)
 
     slot = state.get(key)
     fast_w = w.detach().clone()
@@ -365,11 +416,14 @@ def run_down_proj_fast_weight_step(
     for start in range(0, full_rows, chunk):
         end = start + chunk
         h_chunk = h_work[start:end]
-        t_chunk = t_work[start:end]
-        residual = t_chunk - h_chunk.matmul(fast_w.to(device=h_chunk.device, dtype=h_chunk.dtype).t())
-        step_w = float(learning_rate) * residual.t().matmul(h_chunk) / float(chunk)
-        fast_w = fast_w + step_w.to(device=fast_w.device, dtype=fast_w.dtype)
         outputs.append(h_chunk.matmul(fast_w.to(device=h_chunk.device, dtype=h_chunk.dtype).t()))
+        t_chunk = _apply_ttt_conv_to_rows(t_work[start:end], conv_weight=ttt_conv_weight, chunk_size=chunk)
+        if ttt_proj_weight is None:
+            step_w = contract("c h, c d -> d h", h_chunk, t_chunk)
+        else:
+            proj = ttt_proj_weight.to(device=t_chunk.device, dtype=t_chunk.dtype)
+            step_w = contract("c h, c d, d e -> e h", h_chunk, t_chunk, proj)
+        fast_w = fast_w + (step_w * float(learning_rate)).to(device=fast_w.device, dtype=fast_w.dtype)
         update_count += 1
 
     tail_h = h_work[full_rows:]
@@ -455,6 +509,8 @@ def install_mlp_fast_weight_wrapper(
     gate_up_proj = getattr(module, "gate_up_proj", None)
     act_fn = getattr(module, "act_fn", None)
     down_proj = getattr(module, "down_proj", None)
+    ttt_proj = getattr(module, "ttt_proj", None)
+    ttt_conv = getattr(module, "ttt_conv", None)
     if gate_up_proj is None or not callable(getattr(gate_up_proj, "forward", None)):
         raise RuntimeError("MLP fast-weight wrapper requires gate_up_proj.forward")
     if not callable(act_fn):
@@ -463,6 +519,10 @@ def install_mlp_fast_weight_wrapper(
         raise RuntimeError("MLP fast-weight wrapper requires down_proj.forward")
     _require_supported_down_proj(down_proj, require_single_tp=require_single_tp)
     weight = module_weight_view(down_proj)
+    ttt_proj_weight = module_weight_view(ttt_proj) if ttt_proj is not None else None
+    ttt_conv_weight = getattr(ttt_conv, "weight", None) if ttt_conv is not None else None
+    _validate_ttt_proj_weight(ttt_proj_weight, weight)
+    _validate_ttt_conv_weight(ttt_conv_weight, weight)
     original_forward = getattr(module, "forward", None)
     if not callable(original_forward):
         raise RuntimeError("module must expose callable forward")
@@ -493,6 +553,8 @@ def install_mlp_fast_weight_wrapper(
                 learning_rate=learning_rate,
                 update_enabled=update_enabled,
                 cache_tail=update_enabled,
+                ttt_proj_weight=ttt_proj_weight,
+                ttt_conv_weight=ttt_conv_weight,
             )
         step = run_down_proj_fast_weight_step(
             hidden=activated,
@@ -504,6 +566,8 @@ def install_mlp_fast_weight_wrapper(
             learning_rate=learning_rate,
             update_enabled=update_enabled,
             cache_tail=update_enabled,
+            ttt_proj_weight=ttt_proj_weight,
+            ttt_conv_weight=ttt_conv_weight,
         )
         return step.output
 
