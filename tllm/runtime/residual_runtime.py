@@ -315,6 +315,8 @@ class ResidualRuntimeConfig:
     inplace_ttt_fast_weight_decode_update_enabled: bool = False
     inplace_ttt_fast_weight_key_mode: str = "static"
     inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__"
+    inplace_ttt_fast_weight_max_slots: int = 64
+    inplace_ttt_fast_weight_max_bytes: int = 0
     inplace_ttt_fast_weight_fail_on_unsupported: bool = False
 
 
@@ -365,6 +367,7 @@ class ResidualRuntimeState:
     inplace_ttt_fast_weight_handles: dict[str, object] = field(default_factory=dict)
     inplace_ttt_fast_weight_hook_spec: tuple[object, ...] | None = None
     inplace_ttt_fast_weight_phase: str = "prefill"
+    inplace_ttt_current_token_batch_meta: object | None = None
     inplace_ttt_fast_weight_installed_count: int = 0
     inplace_ttt_fast_weight_skipped_count: int = 0
 
@@ -379,6 +382,7 @@ class ResidualRuntimeState:
         self.decode_sample_idx_tensor = None
         self.decode_compact_count = 0
         self.decode_compact_row_ids = ()
+        self.inplace_ttt_current_token_batch_meta = None
         self.decode_post_logits_launched_step_id = -1
         self.sampler_precompute.reset_step()
 
@@ -569,6 +573,8 @@ def configure_runtime(
     inplace_ttt_fast_weight_decode_update_enabled: bool = False,
     inplace_ttt_fast_weight_key_mode: str = "static",
     inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__",
+    inplace_ttt_fast_weight_max_slots: int = 64,
+    inplace_ttt_fast_weight_max_bytes: int = 0,
     inplace_ttt_fast_weight_fail_on_unsupported: bool = False,
 ) -> None:
     cfg = RUNTIME.config
@@ -612,6 +618,8 @@ def configure_runtime(
     cfg.inplace_ttt_fast_weight_static_request_id = (
         str(inplace_ttt_fast_weight_static_request_id).strip() or "__tllm_inplace_ttt_static__"
     )
+    cfg.inplace_ttt_fast_weight_max_slots = max(0, int(inplace_ttt_fast_weight_max_slots))
+    cfg.inplace_ttt_fast_weight_max_bytes = max(0, int(inplace_ttt_fast_weight_max_bytes))
     cfg.inplace_ttt_fast_weight_fail_on_unsupported = bool(inplace_ttt_fast_weight_fail_on_unsupported)
 
     if not cfg.source_layer_path:
@@ -653,6 +661,9 @@ def set_inplace_ttt_fast_weight_enabled(
     chunk_size: int | None = None,
     learning_rate: float | None = None,
     decode_update_enabled: bool | None = None,
+    key_mode: str | None = None,
+    max_slots: int | None = None,
+    max_bytes: int | None = None,
     fail_on_unsupported: bool | None = None,
 ) -> None:
     RUNTIME.config.inplace_ttt_fast_weight_enabled = bool(enabled)
@@ -668,6 +679,12 @@ def set_inplace_ttt_fast_weight_enabled(
         RUNTIME.config.inplace_ttt_fast_weight_lr = float(learning_rate)
     if decode_update_enabled is not None:
         RUNTIME.config.inplace_ttt_fast_weight_decode_update_enabled = bool(decode_update_enabled)
+    if key_mode is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_key_mode = str(key_mode).strip() or "static"
+    if max_slots is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_max_slots = max(0, int(max_slots))
+    if max_bytes is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_max_bytes = max(0, int(max_bytes))
     if fail_on_unsupported is not None:
         RUNTIME.config.inplace_ttt_fast_weight_fail_on_unsupported = bool(fail_on_unsupported)
 

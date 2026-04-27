@@ -538,7 +538,19 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         if _test_time_lora_enabled(core.RUNTIME):
             _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
         out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
-        _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_phase_from_runner(core.RUNTIME, runner)
+        if isinstance(out, tuple):
+            view = _prepare_inputs_adapter().unpack_prepare_inputs_output(
+                runner=runner,
+                scheduler_output=scheduler_output,
+                out=out,
+            )
+            _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_metadata_from_runner(
+                core.RUNTIME,
+                runner,
+                num_scheduled_tokens_np=view.num_scheduled_tokens_np,
+            )
+        else:
+            _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_phase_from_runner(core.RUNTIME, runner)
         return out
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
@@ -568,7 +580,11 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         )
         t2 = time.perf_counter() if trace_hotspots else 0.0
         prepare_decode_localization(core=core, runner=runner, out=out, prepare_inputs_view=view)
-        _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_phase_from_runner(core.RUNTIME, runner)
+        _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_metadata_from_runner(
+            core.RUNTIME,
+            runner,
+            num_scheduled_tokens_np=view.num_scheduled_tokens_np,
+        )
         t3 = time.perf_counter() if trace_hotspots else 0.0
         _record_cpu_hotspot(core, "prepare_inputs.decode_localization_cpu", t2, t3)
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)

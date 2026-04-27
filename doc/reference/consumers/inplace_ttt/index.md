@@ -43,10 +43,21 @@ chunks by default, and keeps decode update opt-in.
 
 The runner lifecycle can install this wrapper at `load_model` time behind the
 explicit `inplace_ttt_fast_weight_enabled` runtime setting. The current runner
-integration uses a static single-request key, which is useful for exact
-small-model smokes and single-request experiments. It rejects multi-request
-runner batches in static-key mode; per-request/per-sample state separation for
-packed multi-request batches remains a later runtime extension.
+integration supports two key modes:
+
+- `static`: one fixed request key for single-request experiments. This mode
+  still rejects multi-request runner batches.
+- `request_sample`: a bounded multi-request mode. The runtime builds typed
+  packed-token metadata after `_prepare_inputs`; each hidden row is mapped to
+  an explicit `(request_id, sample_idx, layer, target_module)` fast-weight key.
+  Rows are grouped by key, updated independently, and scattered back to packed
+  order.
+
+`request_sample` is intentionally bounded. `inplace_ttt_fast_weight_max_slots`
+limits the number of live per-request fast-weight slots, and
+`inplace_ttt_fast_weight_max_bytes` can enforce an approximate tensor byte
+limit. Profile and warmup forwards that happen before request metadata exists
+fall through to the original MLP and do not create synthetic slots.
 
 ## Delivery
 
