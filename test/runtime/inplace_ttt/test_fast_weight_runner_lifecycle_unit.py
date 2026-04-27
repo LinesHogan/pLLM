@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import os
 import unittest
 
+import numpy as np
 import torch
 
 
@@ -145,6 +146,59 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         runner.input_batch = _FakeInputBatch(computed=8, prompt=8)
         self.assertEqual(update_inplace_ttt_fast_weight_phase_from_runner(runtime, runner), "decode")
 
+    def test_current_token_metadata_tracks_packed_prefill_rows_for_batch_requests(self) -> None:
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import update_inplace_ttt_fast_weight_metadata_from_runner
+
+        runtime = self._runtime()
+        runtime.event_step_id = 7
+        runtime.reqid_to_promptidx = {"req-a": 10, "req-b": 11}
+        runtime.reqid_to_sampleidx = {"req-a": 0, "req-b": 1}
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                req_ids=["req-a", "req-b"],
+                num_reqs=2,
+                req_id_to_index={"req-a": 0, "req-b": 1},
+                num_prompt_tokens=[4, 5],
+                num_computed_tokens_cpu=[1, 2],
+            )
+        )
+
+        phase = update_inplace_ttt_fast_weight_metadata_from_runner(
+            runtime,
+            runner,
+            num_scheduled_tokens_np=[3, 3],
+        )
+        meta = runtime.inplace_ttt_current_token_batch_meta
+
+        self.assertEqual(phase, "prefill")
+        self.assertEqual([row.key.request_id for row in meta.rows], ["req-a", "req-a", "req-a", "req-b", "req-b", "req-b"])
+        self.assertEqual([row.key.prompt_idx for row in meta.rows], [10, 10, 10, 11, 11, 11])
+        self.assertEqual([row.key.sample_idx for row in meta.rows], [0, 0, 0, 1, 1, 1])
+        self.assertEqual([row.row.packed_row_idx for row in meta.rows], [0, 1, 2, 3, 4, 5])
+        self.assertEqual([row.row.token_offset for row in meta.rows], [1, 2, 3, 2, 3, 4])
+
+    def test_current_token_metadata_accepts_numpy_count_arrays_from_vllm(self) -> None:
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import update_inplace_ttt_fast_weight_metadata_from_runner
+
+        runtime = self._runtime()
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                req_ids=[0, 1],
+                num_reqs=2,
+                req_id_to_index={0: 0, 1: 1},
+                num_prompt_tokens=np.asarray([4, 4]),
+                num_computed_tokens_cpu=np.asarray([0, 0]),
+            )
+        )
+
+        update_inplace_ttt_fast_weight_metadata_from_runner(
+            runtime,
+            runner,
+            num_scheduled_tokens_np=np.asarray([4, 4]),
+        )
+
+        self.assertEqual(len(runtime.inplace_ttt_current_token_batch_meta.rows), 8)
+
     def test_static_key_mode_rejects_multi_request_runner_batch(self) -> None:
         from tllm.runtime.inplace_ttt_fast_weight_runtime import require_static_key_single_request
 
@@ -158,6 +212,66 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "requires a single active request"):
             require_static_key_single_request(runtime, runner)
+
+    def test_request_sample_key_mode_groups_rows_by_current_runtime_metadata(self) -> None:
+        from tllm.runtime.fast_weight_state import FastWeightKey
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import (
+            maybe_install_inplace_ttt_fast_weight_wrappers,
+            require_static_key_single_request,
+        )
+        from tllm.runtime.token_batch_metadata import (
+            PackedTokenRow,
+            RequestSampleKey,
+            RuntimeTokenBatchMeta,
+            RuntimeTokenRow,
+        )
+
+        runtime = self._runtime()
+        runtime.config.inplace_ttt_fast_weight_key_mode = "request_sample"
+        runtime.inplace_ttt_current_token_batch_meta = RuntimeTokenBatchMeta(
+            rows=(
+                RuntimeTokenRow(
+                    key=RequestSampleKey(request_id="req-a", prompt_idx=0, sample_idx=0),
+                    row=PackedTokenRow(packed_row_idx=0, logical_row_idx=0, token_offset=0),
+                    phase="prefill",
+                    engine_step_id=1,
+                ),
+                RuntimeTokenRow(
+                    key=RequestSampleKey(request_id="req-a", prompt_idx=0, sample_idx=0),
+                    row=PackedTokenRow(packed_row_idx=1, logical_row_idx=1, token_offset=1),
+                    phase="prefill",
+                    engine_step_id=1,
+                ),
+                RuntimeTokenRow(
+                    key=RequestSampleKey(request_id="req-b", prompt_idx=1, sample_idx=0),
+                    row=PackedTokenRow(packed_row_idx=2, logical_row_idx=2, token_offset=0),
+                    phase="prefill",
+                    engine_step_id=1,
+                ),
+                RuntimeTokenRow(
+                    key=RequestSampleKey(request_id="req-b", prompt_idx=1, sample_idx=0),
+                    row=PackedTokenRow(packed_row_idx=3, logical_row_idx=3, token_offset=1),
+                    phase="prefill",
+                    engine_step_id=1,
+                ),
+            )
+        )
+        runner = SimpleNamespace(model=_FakeModel(), input_batch=SimpleNamespace(req_ids=["req-a", "req-b"], num_reqs=2))
+
+        require_static_key_single_request(runtime, runner)
+        installed = maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        runner.model.model.layers[0].mlp.forward(
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]])
+        )
+
+        state = runtime.inplace_ttt_fast_weight_state
+        key_a = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
+        key_b = FastWeightKey(request_id="req-b", sample_idx=0, layer=0)
+        self.assertEqual(installed, 1)
+        self.assertEqual(state.stats(key_a).update_count, 0)
+        self.assertEqual(state.stats(key_b).update_count, 0)
+        self.assertEqual(state.stats(key_a).tail_rows, 2)
+        self.assertEqual(state.stats(key_b).tail_rows, 2)
 
     def test_runtime_disable_restores_installed_wrapper(self) -> None:
         from tllm.runtime import residual_runtime
@@ -269,6 +383,57 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
             self.assertEqual(stats.tail_rows, 0)
         finally:
             restore_inplace_ttt_fast_weight_wrappers(runtime)
+            residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+
+    @unittest.skipUnless(
+        os.getenv("TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE") == "1" and torch.cuda.is_available(),
+        "set TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE=1 and provide CUDA to run request-sample batch smoke",
+    )
+    def test_request_sample_key_mode_runs_cached_qwen_batch8(self) -> None:
+        from vllm import LLM, SamplingParams
+
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        residual_runtime.set_runtime_consumer(None)
+        residual_runtime.clear_dispatch_consumers()
+        residual_runtime.set_inplace_ttt_fast_weight_enabled(
+            True,
+            layers=(0,),
+            chunk_size=2,
+            learning_rate=0.5,
+            key_mode="request_sample",
+            max_slots=8,
+            fail_on_unsupported=True,
+        )
+        residual_runtime.install_runner_patch()
+        llm = LLM(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dtype="bfloat16",
+            gpu_memory_utilization=0.45,
+            max_model_len=64,
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            trust_remote_code=True,
+        )
+        params = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
+        prompts = [f"Q: {i}+{i}=\nA:" for i in range(8)]
+        try:
+            outputs = llm.generate(prompts, params)
+            runtime = residual_runtime.RUNTIME
+            state = runtime.inplace_ttt_fast_weight_state
+            stats = [state.stats(key) for key in list(state._stats)]
+
+            self.assertEqual(len(outputs), 8)
+            self.assertEqual(runtime.inplace_ttt_fast_weight_installed_count, 1)
+            self.assertEqual(state.slot_count, 8)
+            self.assertGreater(state.estimated_bytes, 0)
+            self.assertEqual(sum(1 for item in stats if item.update_count > 0), 8)
+            self.assertGreaterEqual(sum(item.trained_rows for item in stats), 64)
+        finally:
+            restore_inplace_ttt_fast_weight_wrappers(residual_runtime.RUNTIME)
             residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
 
 

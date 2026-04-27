@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from types import MethodType
 from typing import Callable
@@ -80,9 +81,33 @@ class FastWeightStepResult:
 
 
 class FastWeightState:
-    def __init__(self) -> None:
+    def __init__(self, *, max_slots: int | None = None, max_bytes: int | None = None) -> None:
         self._slots: dict[FastWeightKey, FastWeightSlot] = {}
         self._stats: dict[FastWeightKey, FastWeightStats] = {}
+        self._max_slots = None if max_slots is None else max(0, int(max_slots))
+        self._max_bytes = None if max_bytes is None else max(0, int(max_bytes))
+
+    def set_limits(self, *, max_slots: int | None = None, max_bytes: int | None = None) -> None:
+        self._max_slots = None if max_slots is None else max(0, int(max_slots))
+        self._max_bytes = None if max_bytes is None else max(0, int(max_bytes))
+
+    @staticmethod
+    def _slot_bytes(slot: FastWeightSlot) -> int:
+        return int(slot.past_h.numel() * slot.past_h.element_size()) + int(
+            slot.past_t.numel() * slot.past_t.element_size()
+        ) + int(slot.past_w.numel() * slot.past_w.element_size())
+
+    @staticmethod
+    def _tensor_bytes(*tensors: torch.Tensor) -> int:
+        return sum(int(tensor.numel() * tensor.element_size()) for tensor in tensors)
+
+    @property
+    def slot_count(self) -> int:
+        return len(self._slots)
+
+    @property
+    def estimated_bytes(self) -> int:
+        return sum(self._slot_bytes(slot) for slot in self._slots.values())
 
     def write(
         self,
@@ -103,6 +128,15 @@ class FastWeightState:
             raise RuntimeError("past_h width must match past_w input width")
         if int(t.shape[1]) != int(w.shape[0]):
             raise RuntimeError("past_t width must match past_w output width")
+        is_new_slot = key not in self._slots
+        if is_new_slot and self._max_slots is not None and len(self._slots) >= int(self._max_slots):
+            raise RuntimeError(
+                f"fast-weight slot limit exceeded: slots={len(self._slots) + 1} max_slots={int(self._max_slots)}"
+            )
+        old_bytes = self._slot_bytes(self._slots[key]) if key in self._slots else 0
+        next_bytes = self.estimated_bytes - old_bytes + self._tensor_bytes(h, t, w)
+        if self._max_bytes is not None and next_bytes > int(self._max_bytes):
+            raise RuntimeError(f"fast-weight byte limit exceeded: bytes={next_bytes} max_bytes={int(self._max_bytes)}")
         self._slots[key] = FastWeightSlot(
             past_h=h.detach().clone(),
             past_t=t.detach().clone(),
@@ -218,6 +252,53 @@ def _first_forward_tensor(output: object, *, field_name: str) -> torch.Tensor:
     if isinstance(output, tuple) and output and isinstance(output[0], torch.Tensor):
         return output[0]
     raise RuntimeError(f"{field_name} output must be a tensor or tuple starting with a tensor")
+
+
+def _require_fast_weight_row_keys(row_keys: object, *, rows: int) -> tuple[FastWeightKey, ...]:
+    if not isinstance(row_keys, Sequence):
+        raise TypeError("row_key_provider must return a sequence of FastWeightKey")
+    normalized = tuple(row_keys)
+    if len(normalized) != int(rows):
+        raise RuntimeError(f"row_key_provider returned {len(normalized)} keys for {int(rows)} rows")
+    for key in normalized:
+        if not isinstance(key, FastWeightKey):
+            raise TypeError("row_key_provider must return only FastWeightKey values")
+    return normalized
+
+
+def _run_grouped_down_proj_fast_weight_step(
+    *,
+    hidden: torch.Tensor,
+    target: torch.Tensor,
+    base_weight: torch.Tensor,
+    state: FastWeightState,
+    row_keys: tuple[FastWeightKey, ...],
+    chunk_size: int,
+    learning_rate: float,
+    update_enabled: bool,
+    cache_tail: bool,
+) -> torch.Tensor:
+    if int(hidden.shape[0]) != len(row_keys):
+        raise RuntimeError("row key count must match hidden row count")
+    output = hidden.new_empty((int(hidden.shape[0]), int(base_weight.shape[0])))
+    grouped_rows: dict[FastWeightKey, list[int]] = {}
+    for row_idx, key in enumerate(row_keys):
+        grouped_rows.setdefault(key, []).append(int(row_idx))
+    for group_key, rows in grouped_rows.items():
+        row_tensor = torch.as_tensor(rows, device=hidden.device, dtype=torch.long)
+        step = run_down_proj_fast_weight_step(
+            hidden=hidden.index_select(0, row_tensor),
+            target=target.index_select(0, row_tensor),
+            base_weight=base_weight,
+            state=state,
+            key=group_key,
+            chunk_size=chunk_size,
+            learning_rate=learning_rate,
+            update_enabled=update_enabled,
+            cache_tail=cache_tail,
+        )
+        output.index_copy_(0, row_tensor, step.output.to(device=output.device, dtype=output.dtype))
+    return output
 
 
 def run_down_proj_fast_weight_step(
@@ -358,6 +439,7 @@ def install_mlp_fast_weight_wrapper(
     module: object,
     state: FastWeightState,
     key: FastWeightKey,
+    row_key_provider: Callable[[int], Sequence[FastWeightKey] | None] | None = None,
     chunk_size: int,
     learning_rate: float,
     phase_getter: Callable[[], str] | None = None,
@@ -396,6 +478,22 @@ def install_mlp_fast_weight_wrapper(
             raise RuntimeError("MLP act_fn output must be torch.Tensor")
         phase = phase_getter() if phase_getter is not None else "prefill"
         update_enabled = str(phase) != "decode" or bool(decode_update_enabled)
+        if row_key_provider is not None:
+            provided_row_keys = row_key_provider(int(activated.shape[0]))
+            if provided_row_keys is None:
+                return original_forward(hidden)
+            row_keys = _require_fast_weight_row_keys(provided_row_keys, rows=int(activated.shape[0]))
+            return _run_grouped_down_proj_fast_weight_step(
+                hidden=activated,
+                target=hidden,
+                base_weight=weight,
+                state=state,
+                row_keys=row_keys,
+                chunk_size=chunk_size,
+                learning_rate=learning_rate,
+                update_enabled=update_enabled,
+                cache_tail=update_enabled,
+            )
         step = run_down_proj_fast_weight_step(
             hidden=activated,
             target=hidden,

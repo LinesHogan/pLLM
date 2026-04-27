@@ -97,6 +97,21 @@ class FastWeightStateUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "past_w must be 2D"):
             state.write(key=key, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=torch.zeros(2))
 
+    def test_fast_weight_state_enforces_slot_and_byte_limits(self) -> None:
+        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+
+        state = FastWeightState(max_slots=1)
+        key_a = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
+        key_b = FastWeightKey(request_id="req-b", sample_idx=0, layer=0)
+        state.write(key=key_a, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=torch.zeros(2, 2))
+
+        with self.assertRaisesRegex(RuntimeError, "fast-weight slot limit exceeded"):
+            state.write(key=key_b, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=torch.zeros(2, 2))
+
+        state.set_limits(max_slots=2, max_bytes=4)
+        with self.assertRaisesRegex(RuntimeError, "fast-weight byte limit exceeded"):
+            state.write(key=key_b, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=torch.zeros(2, 2))
+
     def test_apply_down_proj_fast_weight_uses_effective_past_weight(self) -> None:
         from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState, apply_down_proj_fast_weight
 
@@ -249,6 +264,47 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertEqual(stats.update_count, 1)
         self.assertEqual(stats.trained_rows, 4)
         self.assertEqual(stats.tail_rows, 0)
+        handle.restore()
+
+    def test_mlp_wrapper_groups_flattened_rows_by_explicit_per_row_keys(self) -> None:
+        from tllm.runtime.fast_weight_state import (
+            FastWeightKey,
+            FastWeightState,
+            install_mlp_fast_weight_wrapper,
+        )
+
+        mlp = _FakeQwenLikeMLP()
+        mlp.down_proj.weight.zero_()
+        state = FastWeightState()
+        key_a = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
+        key_b = FastWeightKey(request_id="req-b", sample_idx=0, layer=0)
+        row_keys = (key_a, key_a, key_b, key_b)
+        handle = install_mlp_fast_weight_wrapper(
+            module=mlp,
+            state=state,
+            key=key_a,
+            row_key_provider=lambda rows: row_keys[:rows],
+            chunk_size=2,
+            learning_rate=0.5,
+            require_single_tp=False,
+        )
+
+        hidden = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [2.0, 0.0],
+                [0.0, 2.0],
+            ]
+        )
+        output = mlp.forward(hidden)
+
+        self.assertEqual(tuple(output.shape), tuple(hidden.shape))
+        self.assertEqual(state.stats(key_a).update_count, 1)
+        self.assertEqual(state.stats(key_b).update_count, 1)
+        self.assertEqual(state.stats(key_a).trained_rows, 2)
+        self.assertEqual(state.stats(key_b).trained_rows, 2)
+        self.assertFalse(torch.equal(state.read(key_a).past_w, state.read(key_b).past_w))
         handle.restore()
 
     def test_mlp_wrapper_decode_default_applies_without_training_or_tail_cache(self) -> None:
