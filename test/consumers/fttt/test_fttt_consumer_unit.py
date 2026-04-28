@@ -432,6 +432,291 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         self.assertEqual(stats.update_count, 1)
         self.assertEqual(stats.feedback_count, 1)
 
+    def test_trace_derived_retry_lifecycle_is_scoped_by_request_id(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(hidden_size=4, rank=2, learning_rate=0.1, max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(is_correct=False, reward=0.0, feedback_text=f"fix {entry.request_id}"),
+        )
+
+        first_trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="bad-a",
+                    finish_reason="stop",
+                    group_id="round-a",
+                ),
+            )
+        )
+        first_intent = consumer.closed_loop_intent_for_trace(first_trace)
+        consumer.apply_feedback_update(torch.randn(first_intent.update_count, 4), first_intent.feedback_records)
+
+        second_trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="bad-b",
+                    finish_reason="stop",
+                    group_id="round-b",
+                ),
+            )
+        )
+
+        second_intent = consumer.closed_loop_intent_for_trace(second_trace)
+
+        self.assertEqual(first_intent.retry_controls.entries[0].action, "retry")
+        self.assertEqual(second_intent.retry_controls.entries[0].action, "retry")
+        self.assertTrue(second_intent.retry_controls.entries[0].retry_after_update)
+        self.assertEqual(second_intent.update_barriers.entries[0].state, "ready")
+        self.assertEqual(second_intent.update_count, 1)
+
+    def test_closed_loop_intent_simulates_batch_retry_progression_per_instance(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(is_correct=False, reward=0.0, feedback_text=f"fix {entry.output_index}"),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-same",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="bad-0",
+                    finish_reason="stop",
+                    group_id="round-same",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-same",
+                    prompt_idx=0,
+                    sample_idx=1,
+                    output_index=1,
+                    token_ids=(),
+                    text="bad-1",
+                    finish_reason="stop",
+                    group_id="round-same",
+                ),
+            )
+        )
+
+        intent = consumer.closed_loop_intent_for_trace(trace)
+
+        self.assertEqual([entry.action for entry in intent.retry_controls.entries], ["retry", "stop"])
+        self.assertEqual([entry.retry_after_update for entry in intent.retry_controls.entries], [True, False])
+        self.assertEqual([entry.state for entry in intent.update_barriers.entries], ["ready", "ready"])
+        self.assertEqual(intent.update_count, 2)
+
+    def test_closed_loop_intent_blocks_barrier_for_stopped_instance(self) -> None:
+        from tllm.consumers.fttt import FeedbackRecord, FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(hidden_size=4, rank=2, learning_rate=0.1, max_retries=3),
+            judge=lambda entry: FTTTJudgeResult(is_correct=False, reward=0.0, feedback_text="fix stopped"),
+        )
+        consumer.apply_feedback_update(
+            torch.randn(1, 4),
+            [FeedbackRecord(prompt_idx=2, feedback="correct", reward=1.0, request_id="req-stopped")],
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-stopped",
+                    prompt_idx=2,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(),
+                    text="bad",
+                    finish_reason="stop",
+                    group_id="round-stopped",
+                ),
+            )
+        )
+
+        intent = consumer.closed_loop_intent_for_trace(trace)
+
+        self.assertEqual(intent.feedback_records, ())
+        self.assertEqual(intent.update_count, 0)
+        self.assertEqual(intent.retry_controls.entries[0].action, "stop")
+        self.assertFalse(intent.retry_controls.entries[0].retry_after_update)
+        barrier = intent.update_barriers.entries[0]
+        self.assertEqual(barrier.state, "blocked")
+        self.assertEqual(barrier.ready_count, 0)
+
+    def test_toy_closed_loop_uses_failed_completion_context_in_adapter_update(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        def run_once(failed_text: str) -> torch.Tensor:
+            torch.manual_seed(31)
+            consumer = FTTTConsumer(
+                FTTTConsumerConfig(hidden_size=4, feedback_feature_size=5, rank=2, learning_rate=0.2, max_retries=3),
+                judge=lambda entry: FTTTJudgeResult(
+                    is_correct=False,
+                    reward=0.0,
+                    feedback_text="Your answer is incorrect. Recheck the arithmetic.",
+                    feedback_token_ids=(101, 202, 303),
+                ),
+            )
+            trace = GenerationTraceBatch(
+                entries=(
+                    CompletionTraceEntry(
+                        request_id="req-fail",
+                        prompt_idx=4,
+                        sample_idx=0,
+                        output_index=0,
+                        token_ids=(9, 9),
+                        text=failed_text,
+                        finish_reason="stop",
+                        group_id="round-context",
+                    ),
+                )
+            )
+
+            result = consumer.run_toy_closed_loop_step(trace, torch.eye(1, 4))
+
+            self.assertEqual(result.feedback_records[0].failed_text, failed_text)
+            self.assertEqual(result.feedback_records[0].failed_token_ids, (9, 9))
+            self.assertEqual(result.feedback_records[0].feedback_token_ids, (101, 202, 303))
+            self.assertEqual(result.adapter_version, 1)
+            self.assertEqual(result.instance_states[4].retries, 1)
+            self.assertEqual(result.retry_controls.entries[0].action, "retry")
+            self.assertIn("adapter-version=1", result.retry_controls.entries[0].reason)
+            self.assertEqual(consumer.read_stats().update_count, 1)
+            return consumer.engine.adapter.up.weight.detach().clone()
+
+        update_from_5 = run_once("5")
+        update_from_7 = run_once("7")
+
+        self.assertFalse(torch.allclose(update_from_5, update_from_7))
+
+    def test_toy_closed_loop_feedback_token_ids_drive_adapter_update(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        def run_once(feedback_token_ids: tuple[int, ...]) -> torch.Tensor:
+            torch.manual_seed(41)
+            consumer = FTTTConsumer(
+                FTTTConsumerConfig(hidden_size=4, feedback_feature_size=5, rank=2, learning_rate=0.2),
+                judge=lambda entry: FTTTJudgeResult(
+                    is_correct=False,
+                    reward=0.0,
+                    feedback_text="Your answer is incorrect. Recheck the arithmetic.",
+                    feedback_token_ids=feedback_token_ids,
+                ),
+            )
+            trace = GenerationTraceBatch(
+                entries=(
+                    CompletionTraceEntry(
+                        request_id="req-fail",
+                        prompt_idx=6,
+                        sample_idx=0,
+                        output_index=0,
+                        token_ids=(8, 8),
+                        text="5",
+                        finish_reason="stop",
+                        group_id="round-tokens",
+                    ),
+                )
+            )
+
+            consumer.run_toy_closed_loop_step(trace, torch.eye(1, 4))
+
+            return consumer.engine.adapter.up.weight.detach().clone()
+
+        update_from_first_tokens = run_once((11, 12, 13))
+        update_from_second_tokens = run_once((31, 32, 33))
+
+        self.assertFalse(torch.allclose(update_from_first_tokens, update_from_second_tokens))
+
+    def test_toy_closed_loop_exports_request_scoped_lora_update_after_adapter_update(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+
+        class _FakeLoRAModule:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, torch.Tensor, torch.Tensor, float]] = []
+
+            def set_lora(
+                self,
+                adapter_id: int,
+                lora_a: torch.Tensor,
+                lora_b: torch.Tensor,
+                *,
+                bias: torch.Tensor | None,
+                scaling: float,
+            ) -> None:
+                self.calls.append((adapter_id, lora_a.detach().clone(), lora_b.detach().clone(), float(scaling)))
+
+        class _FakeManager:
+            def __init__(self, module: _FakeLoRAModule) -> None:
+                self.modules = {"model.layers.2.mlp.down_proj": module}
+
+        module = _FakeLoRAModule()
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(hidden_size=4, feedback_feature_size=4, rank=2, learning_rate=0.2, max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text="Your answer is incorrect. Fix the sign.",
+                feedback_token_ids=(44, 45),
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-lora",
+                    prompt_idx=8,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(3, 5),
+                    text="-4",
+                    finish_reason="stop",
+                    group_id="round-lora",
+                ),
+            )
+        )
+
+        result = consumer.run_toy_closed_loop_step(
+            trace,
+            torch.eye(1, 4),
+            target_module_name="model.layers.2.mlp.down_proj",
+            lora_int_id=29,
+            adapter_key_prefix="fttt",
+            alpha=2.0,
+            step_id=12,
+        )
+
+        self.assertIsNotNone(result.lora_update)
+        assert result.lora_update is not None
+        self.assertEqual(result.lora_update.scope, "request")
+        self.assertEqual(result.lora_update.request_ids, ("req-lora",))
+        self.assertEqual(result.lora_update.adapter_key, "fttt:round-lora:8:v1")
+        self.assertGreater(float(result.lora_update.target_modules["model.layers.2.mlp.down_proj"].lora_b.abs().sum()), 0.0)
+
+        service = TestTimeLoRAService(manager=_FakeManager(module), max_rank=2)
+        service.stage_update(result.lora_update)
+
+        self.assertEqual(service.commit_staged_updates(), 1)
+        self.assertEqual(service.adapter_for_request("req-lora"), 29)
+        self.assertEqual(len(module.calls), 1)
+
     def test_trace_judge_loop_rejects_non_strict_identity_fields(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.runtime.generation_trace_runtime import GenerationTraceBatch

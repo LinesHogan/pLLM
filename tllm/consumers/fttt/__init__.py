@@ -9,6 +9,7 @@ from tllm.consumers.fttt.consumer import (
     FTTTInstanceState,
     FTTTJudgeResult,
     FTTTStats,
+    FTTTToyClosedLoopResult,
     FeedbackRecord,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "FTTTInstanceState",
     "FTTTJudgeResult",
     "FTTTStats",
+    "FTTTToyClosedLoopResult",
     "FeedbackRecord",
 ]

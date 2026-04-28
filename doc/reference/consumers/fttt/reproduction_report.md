@@ -28,9 +28,12 @@ Source files checked for this update:
 The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
 
 - `FeedbackRecord(prompt_idx, feedback, reward)`.
+  Feedback records may also carry request id, sample/output index, group id,
+  failed completion text, failed completion token ids, and feedback token ids.
 - A bounded feedback queue and drain method.
 - A small zero-output low-rank edit adapter that maps
-  `hidden + hashed feedback text features + reward` to a hidden-space delta.
+  `hidden + hashed feedback text/context/token features + reward` to a
+  hidden-space delta.
 - MSE training of the hidden delta toward the feedback-conditioned edit target.
 - `edit_delta`, `apply_edit_to_hidden`, and `apply_edit_to_logits` helpers that
   let the learned edit affect later hidden rows or logits.
@@ -38,11 +41,17 @@ The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
   as a strict `TestTimeLoRAUpdate` after the caller provides an explicit runtime
   target module name, positive LoRA id, rank, scope, request ids, and step id.
 - Per-instance retry state, stop-on-correct handling, and explicit reset.
+  Trace-derived feedback uses a `request_id + prompt_idx`
+  lifecycle key; hand-written records without `request_id` keep the legacy
+  prompt-only key.
+  Successful updates increment an adapter version and store the version on each
+  updated instance state.
 - Stats for queued, dropped, consumed feedback, update count, loss count, and last loss.
 - A lightweight trace judge toy loop:
   - completed generation trace entries are passed to an injectable local judge;
   - failed completions produce `RewardOutcomeEntry` records and queued
-    `FeedbackRecord` items;
+    `FeedbackRecord` items that retain failed completion context and feedback
+    token ids;
   - correct completions produce reward outcomes with `skip_reason="correct-output"`
     and are not queued for adaptation;
   - identity fields are handed to the strict reward outcome runtime types without
@@ -51,9 +60,23 @@ The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
   - `RewardOutcomeBatch` records the judge result and feedback text;
   - `RetryControlBatch` retries failed completions below the configured retry
     limit, stops at the limit, and accepts correct outputs;
-  - `UpdateBarrierBatch` marks failed-completion feedback rows ready for update;
+  - retry and barrier intent uses the same lifecycle decision as update
+    application, including request-scoped instance state and batch-local retry
+    progression;
+  - `UpdateBarrierBatch` marks adaptable failed-completion feedback rows ready
+    for update and blocks stopped instances instead of promising an update;
   - `FTTTClosedLoopIntent.feedback_records` feeds the local low-rank edit
     adapter so tests can observe nonzero update counts.
+- A toy closed-loop helper:
+  - `run_toy_closed_loop_step(trace, hidden, ...)` runs judge, feedback record
+    construction, local adapter update, updated retry-control construction, and
+    optional request-scoped LoRA export in one consumer-layer step;
+  - failed completion text/token ids and feedback token ids are part of the
+    hashed adapter input, so changing either can change the resulting adapter
+    update even when the scalar reward is unchanged;
+  - retry intent is returned after the update and includes the updated adapter
+    version in the retry reason, while updated instance state exposes retry
+    count and adapter version.
 - No import of external feedback APIs or heavy upstream modules.
 
 This maps to a local feedback-conditioned edit primitive. It is closer than a
@@ -63,10 +86,10 @@ aligns the consumer with the upstream generate -> judge/feedback bookkeeping at
 a lightweight data-contract level. It still does not map to the upstream FTTT
 loop's full runtime behavior:
 
-- The `feedback` text is feature-hashed, not tokenized or trained with an LM
-  feedback-token loss.
+- The feedback text, feedback token ids, and failed completion context are
+  feature-hashed, not tokenized or trained with an LM feedback-token loss.
 - The scalar reward is used as an edit input/training signal; the update does
-  not train on feedback tokens or the failed completion context.
+  not reproduce upstream loss over feedback tokens with generation cache reuse.
 - The adapter output can be applied to hidden/logit tensors, but tLLM does not
   yet own an integrated runtime retry loop that applies it during vLLM decoding.
 - There is no bundled dataset judge or runtime retry orchestrator.
@@ -101,8 +124,15 @@ Commands are summarized with placeholders to avoid machine-local paths:
   - Earlier result before LoRA export coverage: `13 passed`.
   - Result after LoRA export coverage: `16 passed`.
   - Current result after closed-loop adoption and LoRA boundary coverage: `19 passed`.
+  - Current result after toy closed-loop helper and context/token coverage:
+    `22 passed`.
+  - Current result after request-scoped lifecycle and retry-barrier fixes:
+    `25 passed`.
 - `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/consumers/fttt`
-  - Current result: `36 passed`.
+  - Reviewer-observed result after TTRL and FTTT combination coverage:
+    `42 passed`.
+  - Current result after FTTT lifecycle/retry regression coverage:
+    `45 passed`.
 - `<repo-venv>/bin/python -m pytest -q test/test_runtime_post_generate_dispatch_unit.py`
   - Current result: `8 passed, 2 subtests passed`.
 - Dependency probe in `<repo-venv>/bin/python`
@@ -154,6 +184,22 @@ Test-time LoRA export toy check:
   assigned both request ids to LoRA id `23`. This proves the consumer export is
   service-consumable without requiring vLLM, PEFT, or a downloaded model.
 
+Toy closed-loop helper check:
+
+- A failed `GenerationTraceBatch` entry with text and token ids was judged into
+  a feedback record carrying failed completion context and feedback token ids.
+- `run_toy_closed_loop_step()` applied a local adapter update and returned
+  `adapter_version=1`, updated instance retry state, and retry control whose
+  reason references the updated adapter version.
+- With fixed random seed, hidden row, scalar reward, and feedback text, changing
+  only the failed completion text produced different adapter weights.
+- With fixed random seed, hidden row, scalar reward, failed completion, and
+  feedback text, changing only the feedback token ids produced different adapter
+  weights.
+- The same helper exported a request-scoped `TestTimeLoRAUpdate` after the
+  update. A fake `TestTimeLoRAService` committed it into a fake target module
+  and assigned the request id to the exported LoRA id.
+
 These checks validate that the tLLM adapter can consume feedback records, change
 parameters, reduce a local edit objective, apply feedback-conditioned hidden or
 logit deltas, and update counters. They do not validate upstream-equivalent FTTT
@@ -166,8 +212,19 @@ The current consumer branch adds toy coverage for the runtime-facing loop shape:
 
 - a failed `GenerationTraceBatch` entry becomes a reward outcome, a feedback
   record, a retry intent, and an update-barrier entry;
+- failed completion text/token ids and feedback token ids are retained in the
+  feedback record and participate in the local adapter update;
 - retry control switches from `retry` to `stop` when the instance retry lifecycle
   reaches the configured limit;
+- two trace-derived requests with the same prompt index keep separate lifecycle
+  state, while records without request ids retain prompt-only compatibility;
+- closed-loop intent simulates multiple failed completions for the same
+  request-scoped instance in one batch, so later failures see earlier in-batch
+  retry decisions;
+- stopped instances no longer emit ready update barriers or feedback records in
+  closed-loop intent;
+- the consumer-side toy helper returns retry intent after the adapter update and
+  references the updated adapter version;
 - `consume_bundle()` writes reward, retry, and update-barrier sinks when those
   ports are present;
 - post-generate fake runtime dispatch smoke uses the real `FTTTConsumer` to
