@@ -182,10 +182,13 @@ class OverRIDEToyParityUnitTest(unittest.TestCase):
         hidden = torch.tensor([[1.0, -1.0], [0.5, 2.0]], dtype=torch.float32)
         logits = torch.randn(2, 3)
 
-        for bad_row_ids in ((True, 2), (1.0, 2.0), b"12"):
+        for bad_row_ids in ((True, 2), (1.0, 2.0)):
             with self.subTest(row_ids=bad_row_ids):
                 with self.assertRaisesRegex(RuntimeError, "row ids must be integers"):
                     consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2), row_ids=bad_row_ids)
+
+        with self.assertRaisesRegex(RuntimeError, "row ids must be a tuple of integers"):
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2), row_ids=b"12")
 
         for bad_tensor in (
             torch.tensor([[1, 2]], dtype=torch.long),

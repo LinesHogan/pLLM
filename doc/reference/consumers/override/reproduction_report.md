@@ -58,7 +58,10 @@ library API. Its main mechanism is in `OverRIDELogitsProcessor`:
 - Runtime row ids are treated as stable integer row identities across reweight
   and sampled-token update calls. Tensor row-id inputs are accepted only at the
   API boundary and immediately normalized to the canonical `tuple[int, ...]`
-  representation used by the pending cache.
+  representation used by the pending cache. Python row ids must already be
+  provided as `tuple[int, ...]`, and canonical row ids must be unique; mutable,
+  ambiguous, or duplicate identities fail at the boundary instead of being
+  interpreted internally.
 
 The intent is therefore not just to perturb logits once, but to iteratively
 train small residual heads from previously sampled tokens and then penalize
@@ -109,7 +112,7 @@ Commands are shown with placeholders to avoid local machine paths.
 Result:
 
 ```text
-19 passed, 6 subtests passed
+22 passed, 7 subtests passed
 ```
 
 Sampler patch callback check:
@@ -189,8 +192,9 @@ The fixed toy tests cover:
   difference from the toy reference;
 - one sampled-token cross-entropy update with 0.0 max absolute difference in the
   low-rank head weights after the optimizer step;
-- row id boundaries: non-integer Python ids, bool/float tensor ids, and
-  non-1D tensor ids are rejected;
+- row id boundaries: non-integer Python ids, non-canonical Python containers,
+  duplicate tuple/tensor ids, bool/float tensor ids, and non-1D tensor ids are
+  rejected;
 - row id lifecycle: tensor row ids are normalized to stable integer cache keys,
   so mutating the original tensor after `reweight_logits_batch()` does not alter
   which cached rows are updated.
@@ -245,7 +249,8 @@ The tLLM consumer correctly reproduces the core OverRIDE mechanism:
 - previous-iteration residual subtraction,
 - current-iteration `q_logits_next`,
 - sampled-token cross-entropy update,
-- canonical integer row ids resolving to the same cached update rows,
+- unique canonical `tuple[int, ...]` row ids resolving to the same cached update
+  rows,
 - no upstream dependency.
 
 End-to-end diverse decoding verdict: **not yet fully integrated**.

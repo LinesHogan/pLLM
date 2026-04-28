@@ -157,7 +157,7 @@ class OverRIDEReweightEngine(nn.Module):
         return tuple(range(int(row_count)))
 
     @staticmethod
-    def _validate_row_ids(row_ids: Sequence[int] | torch.Tensor, row_count: int) -> tuple[int, ...]:
+    def _normalize_row_ids(row_ids: tuple[int, ...] | torch.Tensor, row_count: int) -> tuple[int, ...]:
         if isinstance(row_ids, torch.Tensor):
             if row_ids.ndim != 1:
                 raise RuntimeError("OverRIDE runtime bridge row id tensors must be 1D")
@@ -172,13 +172,15 @@ class OverRIDEReweightEngine(nn.Module):
                 raise RuntimeError("OverRIDE runtime bridge row id tensors must use an integer dtype")
             normalized = tuple(int(row_id) for row_id in row_ids.detach().cpu().tolist())
         else:
-            if isinstance(row_ids, (str, bytes)):
-                raise RuntimeError("OverRIDE runtime bridge row ids must be integers")
-            normalized = tuple(row_ids)
-            if any(type(row_id) is not int for row_id in normalized):
+            if not isinstance(row_ids, tuple):
+                raise RuntimeError("OverRIDE runtime bridge row ids must be a tuple of integers")
+            normalized = row_ids
+            if any(type(row_id) is not int for row_id in row_ids):
                 raise RuntimeError("OverRIDE runtime bridge row ids must be integers")
         if len(normalized) != int(row_count):
             raise RuntimeError("OverRIDE runtime bridge requires one row id per logits row")
+        if len(set(normalized)) != len(normalized):
+            raise RuntimeError("OverRIDE runtime bridge row ids must be unique")
         return normalized
 
     def _resolve_iterations(
@@ -207,7 +209,7 @@ class OverRIDEReweightEngine(nn.Module):
         *,
         request_ids: Sequence[str] | None = None,
         iterations: Sequence[int] | None = None,
-        row_ids: Sequence[int] | torch.Tensor | None = None,
+        row_ids: tuple[int, ...] | torch.Tensor | None = None,
     ) -> OverRIDEBatchLogitsResult:
         if hidden.ndim != 2 or logits.ndim != 2:
             raise RuntimeError("OverRIDE runtime bridge expects 2D hidden and logits tensors")
@@ -220,7 +222,7 @@ class OverRIDEReweightEngine(nn.Module):
             request_ids=request_ids,
             iterations=iterations,
         )
-        normalized_row_ids = self._validate_row_ids(
+        normalized_row_ids = self._normalize_row_ids(
             self._default_row_ids(row_count) if row_ids is None else row_ids,
             row_count,
         )
@@ -277,13 +279,13 @@ class OverRIDEReweightEngine(nn.Module):
         self,
         sampled_token_ids: torch.Tensor,
         *,
-        row_ids: Sequence[int] | torch.Tensor | None = None,
+        row_ids: tuple[int, ...] | torch.Tensor | None = None,
     ) -> None:
         if not bool(self.config.enabled) or not self._pending_q_logits_next:
             return
         targets = sampled_token_ids.reshape(-1)
         target_count = int(targets.numel())
-        normalized_row_ids = self._validate_row_ids(
+        normalized_row_ids = self._normalize_row_ids(
             self._default_row_ids(target_count) if row_ids is None else row_ids,
             target_count,
         )
@@ -343,7 +345,7 @@ class OverRIDEConsumer(BaseConsumer):
         *,
         request_ids: Sequence[str] | None = None,
         iterations: Sequence[int] | None = None,
-        row_ids: Sequence[int] | torch.Tensor | None = None,
+        row_ids: tuple[int, ...] | torch.Tensor | None = None,
     ) -> OverRIDEBatchLogitsResult:
         return self.engine.reweight_logits_batch(
             hidden,
@@ -360,7 +362,7 @@ class OverRIDEConsumer(BaseConsumer):
         self,
         sampled_token_ids: torch.Tensor,
         *,
-        row_ids: Sequence[int] | torch.Tensor | None = None,
+        row_ids: tuple[int, ...] | torch.Tensor | None = None,
     ) -> None:
         self.engine.update_from_sampled_tokens_batch(sampled_token_ids, row_ids=row_ids)
 

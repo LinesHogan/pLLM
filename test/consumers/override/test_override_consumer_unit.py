@@ -183,6 +183,38 @@ class OverRIDEConsumerUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "row id tensors must use an integer dtype"):
             consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3), row_ids=torch.tensor([10.0, 11.0, 12.0]))
 
+    def test_runtime_bridge_rejects_non_canonical_python_row_id_containers(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(OverRIDEConsumerConfig(hidden_size=2, vocab_size=3, rank=2, num_iterations=3))
+        hidden = torch.randn(3, 2)
+        logits = torch.randn(3, 3)
+
+        for row_ids in ([10, 11, 12], range(10, 13)):
+            with self.subTest(row_ids=type(row_ids).__name__):
+                with self.assertRaisesRegex(RuntimeError, "row ids must be a tuple of integers"):
+                    consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3), row_ids=row_ids)
+
+    def test_runtime_bridge_rejects_duplicate_tuple_row_ids(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(OverRIDEConsumerConfig(hidden_size=2, vocab_size=3, rank=2, num_iterations=3))
+        hidden = torch.randn(2, 2)
+        logits = torch.randn(2, 3)
+
+        with self.assertRaisesRegex(RuntimeError, "row ids must be unique"):
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2), row_ids=(7, 7))
+
+    def test_runtime_bridge_rejects_duplicate_tensor_row_ids(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(OverRIDEConsumerConfig(hidden_size=2, vocab_size=3, rank=2, num_iterations=3))
+        hidden = torch.randn(2, 2)
+        logits = torch.randn(2, 3)
+
+        with self.assertRaisesRegex(RuntimeError, "row ids must be unique"):
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2), row_ids=torch.tensor([7, 7]))
+
     def test_sampled_token_update_changes_head_and_records_loss(self) -> None:
         from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
 

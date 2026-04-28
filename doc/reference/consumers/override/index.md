@@ -108,7 +108,10 @@ by the tLLM sampler patch. On each decode sampler step, the provider:
   `q_logits_next` rows for the same decode rows.
 
 The provider intentionally keeps row identity internal to the decode step as
-plain integer row ids. Request ids are used only to resolve OverRIDE iteration
-heads, which avoids the older polymorphic row-id cache behavior. The post-sample
-callback is bound to the prepared `engine_step_id` and row count, so stale or
-shape-mismatched sampler callbacks fail before any update is applied.
+unique plain integer row ids. Runtime tensors are accepted only at the bridge
+boundary and normalized immediately to `tuple[int, ...]`; Python callers must
+provide that canonical tuple form rather than mutable or ambiguous containers.
+Request ids are used only to resolve OverRIDE iteration heads, which avoids the
+older polymorphic row-id cache behavior. The post-sample callback is bound to
+the prepared `engine_step_id` and row count, so stale or shape-mismatched sampler
+callbacks fail before any update is applied.
