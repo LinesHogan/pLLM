@@ -44,6 +44,12 @@ def build_sampler_step_view(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def _notify_after_sample(*, provider: Any, view: Any, sampled_token_ids: torch.Tensor) -> None:
+    after_sample = getattr(provider, "after_sample", None)
+    if callable(after_sample):
+        after_sample(view, sampled_token_ids)
+
+
 def bind_runner_sampler(*, runtime: Any, runner: Any) -> None:
     sampler = getattr(runner, "sampler", None)
     if sampler is None:
@@ -209,7 +215,10 @@ def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metad
         greedy_sampled=greedy_sampled,
     )
     if sampled is not None:
-        return sampled.to(dtype=torch.long)
+        sampled = sampled.to(dtype=torch.long)
+        if view is not None:
+            _notify_after_sample(provider=provider, view=view, sampled_token_ids=sampled)
+        return sampled
     if _ORIG_VLLM_SAMPLER_SAMPLE is not None:
         return _ORIG_VLLM_SAMPLER_SAMPLE(sampler, logits, sampling_metadata)
     return _vanilla_sample(sampler=sampler, logits=logits, sampling_metadata=sampling_metadata)

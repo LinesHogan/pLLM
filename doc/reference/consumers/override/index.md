@@ -93,3 +93,22 @@ Useful counters:
 
 For throughput checks, treat an enabled run with `loss_count == 0` as a signal
 that the update path did not execute.
+
+## Sampler Provider
+
+`OverRIDEConsumer.sampler_modifier_provider()` exposes the runtime adapter used
+by the tLLM sampler patch. On each decode sampler step, the provider:
+
+- reads aligned `logits`, final-token `source_hidden`, and `request_ids` from
+  `SamplerStepView`;
+- calls `reweight_logits_batch()` with explicit internal decode-row ids;
+- returns a dense pre-filter sampler state that samples from the reweighted
+  logits without adding an OverRIDE-specific sampler dependency;
+- receives sampled token ids through `after_sample()` and updates the cached
+  `q_logits_next` rows for the same decode rows.
+
+The provider intentionally keeps row identity internal to the decode step as
+plain integer row ids. Request ids are used only to resolve OverRIDE iteration
+heads, which avoids the older polymorphic row-id cache behavior. The post-sample
+callback is bound to the prepared `engine_step_id` and row count, so stale or
+shape-mismatched sampler callbacks fail before any update is applied.

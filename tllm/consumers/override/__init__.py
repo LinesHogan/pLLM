@@ -9,6 +9,7 @@ from tllm.consumers.override.consumer import (
     OverRIDEReweightEngine,
     OverRIDEStats,
 )
+from tllm.consumers.override.sampler_provider import OverRIDESamplerModifierProvider
 
 __all__ = [
     "OverRIDEBatchLogitsResult",
@@ -16,5 +17,6 @@ __all__ = [
     "OverRIDEConsumerConfig",
     "OverRIDELogitsResult",
     "OverRIDEReweightEngine",
+    "OverRIDESamplerModifierProvider",
     "OverRIDEStats",
 ]

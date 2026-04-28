@@ -316,6 +316,9 @@ class OverRIDEConsumer(BaseConsumer):
     def __init__(self, config: OverRIDEConsumerConfig, *, engine: OverRIDEReweightEngine | None = None) -> None:
         self.config = config
         self.engine = engine or OverRIDEReweightEngine(config)
+        from tllm.consumers.override.sampler_provider import OverRIDESamplerModifierProvider
+
+        self._sampler_provider = OverRIDESamplerModifierProvider(engine=self.engine)
 
     @property
     def consumer_id(self) -> str:
@@ -323,6 +326,9 @@ class OverRIDEConsumer(BaseConsumer):
 
     def flows(self) -> Sequence[ConsumerFlow]:
         return ()
+
+    def sampler_modifier_provider(self):
+        return self._sampler_provider
 
     def reweight_logits(self, hidden: torch.Tensor, logits: torch.Tensor, *, iteration: int) -> OverRIDELogitsResult:
         return self.engine.reweight_logits(hidden, logits, iteration=iteration)

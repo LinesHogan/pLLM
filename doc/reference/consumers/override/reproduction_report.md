@@ -9,8 +9,12 @@ vendoring or depending on the upstream repository.
 Reviewed local files:
 
 - `tllm/consumers/override/consumer.py`
+- `tllm/consumers/override/sampler_provider.py`
 - `test/consumers/override/test_override_consumer_unit.py`
+- `test/consumers/override/test_override_sampler_provider_unit.py`
 - `test/consumers/override/test_override_toy_parity_unit.py`
+- `test/test_sampler_runtime_view_unit.py`
+- `test/test_sampler_patch_unit.py`
 - `doc/reference/consumers/override/index.md`
 - `docs/devlist.md`
 - `docs/plans/2026-04-26-devlist-consumers-design.md`
@@ -80,6 +84,15 @@ The local consumer captures the mechanism-level core:
   OverRIDE code.
 - The disabled path returns the original logits unchanged.
 - Stats track reweighting, modified rows, losses, updates, and last loss.
+- `OverRIDESamplerModifierProvider` connects the batch primitive to the tLLM
+  sampler patch. It receives `SamplerStepView` logits, source hidden states, and
+  request ids before sampling; returns a dense pre-filter sampler state for the
+  reweighted logits; and receives sampled token ids after sampling to train the
+  cached `q_logits_next` rows for the same decode rows.
+- The sampler view keeps `request_ids` even when prompt/sample metadata is
+  provided as device tensors, so OverRIDE can still resolve iteration heads.
+- The provider binds post-sample updates to the prepared engine step and row
+  count, rejecting stale-step or shape-mismatched callbacks before updating.
 
 This is a faithful reproduction of the purpose and central algorithmic formula.
 It is not an end-to-end vLLM patch reproduction, and that appears intentional
@@ -96,7 +109,19 @@ Commands are shown with placeholders to avoid local machine paths.
 Result:
 
 ```text
-15 passed, 6 subtests passed
+19 passed, 6 subtests passed
+```
+
+Sampler patch callback check:
+
+```bash
+<repo-env-python> -m pytest -q test/test_sampler_patch_unit.py
+```
+
+Result:
+
+```text
+6 passed
 ```
 
 Environment check:
@@ -225,24 +250,24 @@ The tLLM consumer correctly reproduces the core OverRIDE mechanism:
 
 End-to-end diverse decoding verdict: **not yet fully integrated**.
 
-The consumer exposes the right primitive operations and now includes the
-batch-row bridge needed by a sampler/runtime hook: request-id iteration parsing,
-batched grouping by iteration, cached `q_logits_next`, and sampled-token update
-by row id. It still does not itself patch vLLM or perform sampling.
+The consumer now exposes the right primitive operations and a minimal tLLM
+sampler-provider loop: request-id iteration parsing, batched grouping by
+iteration, cached `q_logits_next`, pre-sample reweighting, and post-sample
+sampled-token update by the same internal decode-row ids. This closes the local
+sampler adapter gap for fake sampler tests.
 
-Runtime sampler integration remains the main gap. A complete runtime path still
-needs to feed final-token hidden states and logits into
-`reweight_logits_batch()`, sample from the returned reweighted logits, pass the
-sampled token ids back through `update_from_sampled_tokens_batch()`, and provide
-stable row ids for the same decode rows across those two calls.
+Full end-to-end model decoding remains unverified here. The current evidence is
+unit-level and tensor-level; a cached vLLM smoke should still verify that real
+decode metadata supplies one request id per sampler row and that enabled runs
+produce nonzero `loss_count`.
 
 ## Gaps And Risks
 
 - `flows()` returns empty, so the current consumer is a manual logits/sampler
-  primitive rather than an automatically wired runtime consumer.
-- The batch bridge can parse iteration groups from request ids or accept
-  explicit iteration ids, but tLLM still lacks an automatic vLLM sampler/runtime
-  hook that feeds those groups through decoding.
+  primitive plus sampler provider rather than a hidden-row bundle consumer.
+- The sampler provider requires one request id per decode row. The fake sampler
+  tests cover this contract, but a real vLLM smoke should confirm decode
+  metadata shape under the active runtime configuration.
 - The local update path does not use `ignore_index=-100`; upstream does. This
   should not matter for ordinary sampled token ids, but it matters if masked
   targets are ever passed through the same API.

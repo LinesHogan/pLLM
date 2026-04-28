@@ -52,7 +52,7 @@ class SamplerPatchUnitTest(unittest.TestCase):
             tap_decode_hidden={"layers.0": torch.ones((1, 2), dtype=torch.float32)},
             sampler_precompute=SamplerPrecomputeState(),
         )
-        runner = SimpleNamespace(model=SimpleNamespace(lm_head=SimpleNamespace(weight=torch.ones((3, 2)), bias=None)))
+        runner = SimpleNamespace(sampler=sampler, model=SimpleNamespace(lm_head=SimpleNamespace(weight=torch.ones((3, 2)), bias=None)))
         sampler_patch.bind_runner_sampler(runtime=runtime, runner=runner)
         sampler._tllm_runtime = runtime
         sampler._tllm_runner = runner
@@ -79,6 +79,50 @@ class SamplerPatchUnitTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(sampled, torch.tensor([2], dtype=torch.long)))
         p_bridge.assert_called_once()
+
+    def test_wrapped_sampler_sample_notifies_provider_after_bridge_sampling(self) -> None:
+        sampler = _FakeSampler()
+        callback = mock.Mock()
+        provider = SimpleNamespace(is_active=lambda: True, after_sample=callback)
+        runtime = SimpleNamespace(
+            consumer=SimpleNamespace(sampler_modifier_provider=lambda: provider),
+            event_step_id=1,
+            decode_count=1,
+            decode_request_ids=["reqA"],
+            decode_prompt_idxs=[3],
+            decode_sample_idxs=[0],
+            source_resolved_path="layers.0",
+            tap_decode_hidden={"layers.0": torch.ones((1, 2), dtype=torch.float32)},
+            sampler_precompute=SamplerPrecomputeState(),
+        )
+        runner = SimpleNamespace(sampler=sampler, model=SimpleNamespace(lm_head=SimpleNamespace(weight=torch.ones((3, 2)), bias=None)))
+        sampler_patch.bind_runner_sampler(runtime=runtime, runner=runner)
+        sampling_metadata = SimpleNamespace(
+            all_random=True,
+            all_greedy=False,
+            temperature=torch.tensor([1.0], dtype=torch.float32),
+            logitsprocs=SimpleNamespace(argmax_invariant=[]),
+            top_k=torch.tensor([1], dtype=torch.int64),
+            top_p=None,
+            generators={},
+        )
+
+        with mock.patch.object(
+            sampler_patch,
+            "sample_with_optional_modifier",
+            return_value=torch.tensor([2], dtype=torch.long),
+        ):
+            sampled = sampler_patch.wrapped_sampler_sample(
+                sampler=sampler,
+                logits=torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
+                sampling_metadata=sampling_metadata,
+            )
+
+        self.assertTrue(torch.equal(sampled, torch.tensor([2], dtype=torch.long)))
+        callback.assert_called_once()
+        callback_view, callback_tokens = callback.call_args.args
+        self.assertEqual(callback_view.request_ids, ("reqA",))
+        self.assertTrue(torch.equal(callback_tokens, torch.tensor([2], dtype=torch.long)))
 
     def test_wrapped_sampler_sample_falls_back_to_original_when_provider_is_inactive(self) -> None:
         sampler = _FakeSampler()

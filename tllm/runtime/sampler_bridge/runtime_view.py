@@ -46,8 +46,9 @@ def build_sampler_step_view(
         prompt_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_prompt_idxs", []))[:decode_count])
     if sample_idx_tensor is None:
         sample_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_sample_idxs", []))[:decode_count])
-    if prompt_idx_tensor is None or sample_idx_tensor is None:
-        request_ids = tuple(str(x) for x in list(getattr(runtime, "decode_request_ids", []))[:decode_count])
+    raw_request_ids = list(getattr(runtime, "decode_request_ids", []))
+    if len(raw_request_ids) >= decode_count:
+        request_ids = tuple(str(x) for x in raw_request_ids[:decode_count])
     if prompt_idx_tensor is None and len(prompt_idxs) != decode_count:
         return None
     if sample_idx_tensor is None and len(sample_idxs) != decode_count:
