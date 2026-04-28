@@ -60,6 +60,13 @@ What maps reasonably:
 - It can export the trained local toy adapter as a strict
   `TestTimeLoRAUpdate` when the caller supplies an explicit runtime target
   module name, positive LoRA id, rank, scope, request ids, and step id.
+- It now exposes `run_lora_learning_step()`, a small closed-loop helper that
+  preserves upstream online/offline ordering while staging the exported
+  `TestTimeLoRAUpdate` into a runtime LoRA service and invoking an explicit
+  commit/apply barrier when one is available.
+- When the LoRA service exposes ordinary target modules with 2D weights, the
+  helper rejects updates whose exported LoRA factors do not match the target
+  module input/output shape.
 - It intentionally avoids importing LLaMA-Factory or upstream training
   dependencies.
 - Its CE/KL helpers assume logits and labels are already aligned. For raw
@@ -76,18 +83,20 @@ What does not map to the upstream core:
   that the tLLM toy objective trains, but they do not prove parity with an
   upstream LoRA runtime update inside attention or MLP modules.
 - The `TestTimeLoRAUpdate` export is consumer-side packaging only. It transposes
-  the local toy adapter factors into the runtime contract shape, but it does not
-  validate that the named module exists in a concrete vLLM model or that vLLM
-  applies the update during decoding.
-- `adapter_slots` is allocated but only slot 0 is trained.
+  the local toy adapter factors into the runtime contract shape, and the
+  closed-loop helper can validate ordinary exposed target-module shapes, but it
+  still does not prove vLLM applies the update during decoding.
+- `adapter_slots` is allocated but only slot 0 is trained by the closed-loop
+  helper.
 - `flows()` is empty, so this consumer is not wired to collect hidden states,
   logits, labels, request metadata, or generation events from the tLLM runtime.
 - Offline base-logit selection is caller supplied. tLLM does not yet
   autonomously disable a runtime LoRA adapter and compute base logits inside the
   engine.
-- Online/offline ordering is a local API convention only. It does not enforce
-  upstream's "predict then train" online loop or "train then predict" offline
-  loop inside decode/runtime execution.
+- Online/offline ordering is enforced by `run_lora_learning_step()` for callers
+  using that helper. Offline predict can be made to see the staged update by
+  supplying `apply_lora_update` or a service with `commit_staged_updates()`, but
+  the helper is not yet automatically invoked by decode/runtime execution.
 
 ## Upstream Reproduction Feasibility
 
@@ -108,7 +117,12 @@ tensors.
 All Python checks used the repo virtual environment as `<repo>/.venv/bin/python`.
 
 - `pytest -q test/consumers/tlm/test_tlm_consumer_unit.py`
-  - Result: `17 passed`.
+  - Result: `21 passed`.
+- `pytest -q test/consumers/tlm test/runtime/test_time_lora`
+  - Result: `38 passed, 2 skipped`.
+- `TLLM_TLM_RUN_CACHED_MODEL_SMOKE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  pytest -q test/consumers/tlm/test_tlm_cached_model_smoke.py`
+  - Result: `1 passed`.
 - Checked availability of local packages:
   - `torch`, `transformers`, and `vllm` are available.
   - `datasets`, `peft`, and installed `llamafactory` are not available.
@@ -173,6 +187,27 @@ Test-time LoRA export toy check:
   assigned request `req-1` to LoRA id `17`. This proves the consumer export is
   service-consumable without requiring vLLM or a downloaded model.
 
+Closed-loop LoRA staging toy check:
+
+- Online mode called `predict()` before training and staged the request-scoped
+  LoRA update afterward, then committed staged updates when the service exposed
+  a commit method.
+- Offline mode trained, flushed, staged the request-scoped LoRA update, applied
+  the commit/update barrier, and only then called `predict()`.
+- A separate toy service without `commit_staged_updates()` used an explicit
+  `apply_lora_update` callback, modeling the fuller vLLM commit/materialize and
+  request-mapping barrier.
+- Both paths used the same strict `TestTimeLoRAUpdate` contract as the runtime
+  service tests.
+
+Cached-model closed-loop smoke:
+
+- A local-files-only tiny causal LM produced real hidden states and raw logits.
+- The smoke shifted logits to `[:, :-1, :]` and labels to `[:, 1:]`, then ran one
+  online `run_lora_learning_step()` call.
+- The consumer reported a nonzero update and selected samples, and a request
+  scoped `TestTimeLoRAUpdate` for the model's logits head was staged.
+
 These checks confirm that the tLLM logits path now matches the upstream CE
 selection direction and weighted one-hot KL/CE formula at the local objective
 level.
@@ -185,11 +220,12 @@ upstream TTL objective, but not a full runtime reproduction.
 It now captures online/offline test-time adaptation APIs, CE-threshold sample
 filtering, selected-row exponential weighting, causal-shifted toy parity, and a
 local logits/label loss when the caller supplies aligned tensors. It also now
-has a consumer-side export path that returns a strict `TestTimeLoRAUpdate` for a
-caller-named target module. It still does not reproduce the upstream model-LoRA
-update target or integration into an actual predict/train runtime loop. Offline
-base-model selection is available only when the caller supplies already-aligned
-base logits.
+has a consumer-side closed-loop helper that stages a strict
+`TestTimeLoRAUpdate` for a caller-named target module after the ordered training
+step. It still does not reproduce the upstream model-LoRA update target or
+autonomously capture hidden/logit tensors from vLLM. Offline base-model
+selection is available only when the caller supplies already-aligned base
+logits.
 
 ## Gaps And Risks
 
@@ -202,11 +238,12 @@ base logits.
   evidence stops at the dependency-light fake `TestTimeLoRAService` commit.
 - Causal-shift gap: the tLLM helper does not infer or apply causal-LM shifting;
   passing raw unshifted logits and labels can select the wrong samples.
-- Runtime gap: no declared flows means the consumer cannot run autonomously in
-  tLLM's producer-consumer path.
+- Runtime gap: no declared flows means the consumer cannot yet collect tensors
+  autonomously in tLLM's producer-consumer path.
 - Offline gap: tLLM does not yet disable runtime adapters itself to compute base
   CE before selecting samples.
-- Online/offline loop gap: tLLM exposes update calls but does not own the
-  upstream predict/train ordering.
+- Online/offline loop gap: `run_lora_learning_step()` owns ordering and an
+  optional commit/apply barrier only for explicit callers; the runtime does not
+  yet call it automatically.
 - Coverage gap: tests verify local CE/KL formulas and counters, but not a real
   vLLM LoRA target-module update.

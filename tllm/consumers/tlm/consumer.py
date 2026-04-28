@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Real
 from typing import Callable, Literal, Sequence, TypeVar
@@ -103,6 +104,27 @@ def run_tlm_ordered_step(mode: TLMMode, *, predict: Callable[[], _T], train: Cal
         train()
         return predict()
     raise ValueError("TLM ordered step mode must be 'online' or 'offline'")
+
+
+def _validate_lora_update_against_known_target(*, lora_service: object, update: TestTimeLoRAUpdate) -> None:
+    modules = getattr(lora_service, "modules", None)
+    if not isinstance(modules, Mapping):
+        return
+    for module_name, weights in update.target_modules.items():
+        module = modules.get(module_name)
+        target_weight = getattr(module, "weight", None)
+        if not isinstance(target_weight, torch.Tensor) or target_weight.ndim != 2:
+            continue
+        expected_out_dim = int(target_weight.shape[0])
+        expected_in_dim = int(target_weight.shape[1])
+        actual_in_dim = int(weights.lora_a.shape[0])
+        actual_out_dim = int(weights.lora_b.shape[1])
+        if actual_in_dim != expected_in_dim or actual_out_dim != expected_out_dim:
+            raise RuntimeError(
+                "target module shape does not match TLM LoRA update: "
+                f"{module_name} expects ({expected_out_dim}, {expected_in_dim}) "
+                f"but update is ({actual_out_dim}, {actual_in_dim})"
+            )
 
 
 class TLMEngine(nn.Module):
@@ -418,3 +440,86 @@ class TLMConsumer(BaseConsumer):
             adapter_slot=adapter_slot,
             alpha=alpha,
         )
+
+    def run_lora_learning_step(
+        self,
+        *,
+        predict: Callable[[], _T],
+        hidden: torch.Tensor,
+        lora_service: object,
+        adapter_key: str,
+        lora_int_id: int,
+        target_module_name: str,
+        rank: int | None = None,
+        request_ids: tuple[str, ...] = (),
+        step_id: int = -1,
+        adapter_slot: int = 0,
+        alpha: float = 1.0,
+        apply_lora_update: Callable[[], object] | None = None,
+        scores: torch.Tensor | None = None,
+        logits: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        base_logits: torch.Tensor | None = None,
+        allow_scalar_fallback: bool = False,
+    ) -> _T:
+        """Run one upstream-ordered predict/train step and stage the LoRA update."""
+
+        stage_update = getattr(lora_service, "stage_update", None)
+        if not callable(stage_update):
+            raise TypeError("lora_service must provide stage_update")
+        update_rank = int(self.config.rank) if rank is None else rank
+
+        def apply_staged_update() -> None:
+            if apply_lora_update is not None:
+                apply_lora_update()
+                return
+            commit_staged_updates = getattr(lora_service, "commit_staged_updates", None)
+            if callable(commit_staged_updates):
+                commit_staged_updates()
+
+        def train_and_stage() -> None:
+            if self.config.mode == "online":
+                self.update_online(
+                    hidden,
+                    scores,
+                    logits=logits,
+                    labels=labels,
+                    base_logits=base_logits,
+                    allow_scalar_fallback=allow_scalar_fallback,
+                )
+            elif self.config.mode == "offline":
+                self.update_offline(
+                    hidden,
+                    scores,
+                    logits=logits,
+                    labels=labels,
+                    base_logits=base_logits,
+                    allow_scalar_fallback=allow_scalar_fallback,
+                )
+                self.flush_offline()
+            else:
+                raise ValueError("TLM ordered step mode must be 'online' or 'offline'")
+
+            update = self.export_test_time_lora_update(
+                adapter_key=adapter_key,
+                lora_int_id=lora_int_id,
+                target_module_name=target_module_name,
+                rank=update_rank,
+                scope="request" if request_ids else "global",
+                request_ids=request_ids,
+                step_id=step_id,
+                adapter_slot=adapter_slot,
+                alpha=alpha,
+            )
+            _validate_lora_update_against_known_target(lora_service=lora_service, update=update)
+            stage_update(update)
+            apply_staged_update()
+
+        if self.config.mode == "online":
+            result = predict()
+            train_and_stage()
+            return result
+        if self.config.mode == "offline":
+            train_and_stage()
+            return predict()
+        raise ValueError("TLM ordered step mode must be 'online' or 'offline'")

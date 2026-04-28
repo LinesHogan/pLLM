@@ -436,6 +436,173 @@ class TLMConsumerUnitTest(unittest.TestCase):
                 rank=2,
             )
 
+    def test_closed_loop_online_predicts_before_training_and_stages_request_lora(self) -> None:
+        from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate
+
+        class _StageOnlyService:
+            def __init__(self) -> None:
+                self.updates: list[TestTimeLoRAUpdate] = []
+
+            def stage_update(self, update: TestTimeLoRAUpdate) -> None:
+                calls.append("stage")
+                self.updates.append(update)
+
+            def commit_staged_updates(self) -> int:
+                calls.append("commit")
+                return len(self.updates)
+
+        calls: list[str] = []
+        consumer = TLMConsumer(TLMConsumerConfig(mode="online", hidden_size=4, rank=2, learning_rate=0.2, threshold=1.0))
+        hidden = torch.eye(3, 4)
+        logits = torch.tensor(
+            [
+                [4.0, 0.0, 0.0],
+                [0.0, 0.0, 4.0],
+                [0.0, 4.0, 0.0],
+            ]
+        )
+        labels = torch.tensor([0, 1, 1])
+        service = _StageOnlyService()
+
+        result = consumer.run_lora_learning_step(
+            predict=lambda: calls.append("predict") or "prediction",
+            hidden=hidden,
+            logits=logits,
+            labels=labels,
+            lora_service=service,
+            adapter_key="tlm-online-req-1",
+            lora_int_id=41,
+            target_module_name="model.layers.0.self_attn.q_proj",
+            request_ids=("req-1",),
+            step_id=7,
+        )
+
+        self.assertEqual(result, "prediction")
+        self.assertEqual(calls, ["predict", "stage", "commit"])
+        self.assertEqual(consumer.read_stats().update_count, 1)
+        self.assertEqual(len(service.updates), 1)
+        self.assertEqual(service.updates[0].request_ids, ("req-1",))
+        self.assertEqual(service.updates[0].step_id, 7)
+
+    def test_closed_loop_offline_applies_update_before_predict(self) -> None:
+        from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate
+
+        class _StageOnlyService:
+            def __init__(self) -> None:
+                self.updates: list[TestTimeLoRAUpdate] = []
+
+            def stage_update(self, update: TestTimeLoRAUpdate) -> None:
+                calls.append("stage")
+                self.updates.append(update)
+
+            def commit_staged_updates(self) -> int:
+                calls.append("commit")
+                return len(self.updates)
+
+        calls: list[str] = []
+        consumer = TLMConsumer(
+            TLMConsumerConfig(mode="offline", hidden_size=4, rank=2, learning_rate=0.2, threshold=1.0)
+        )
+        hidden = torch.eye(3, 4)
+        logits = torch.tensor(
+            [
+                [4.0, 0.0, 0.0],
+                [0.0, 0.0, 4.0],
+                [0.0, 4.0, 0.0],
+            ]
+        )
+        labels = torch.tensor([0, 1, 1])
+        service = _StageOnlyService()
+
+        result = consumer.run_lora_learning_step(
+            predict=lambda: calls.append("predict") or "prediction",
+            hidden=hidden,
+            logits=logits,
+            labels=labels,
+            lora_service=service,
+            adapter_key="tlm-offline-req-1",
+            lora_int_id=42,
+            target_module_name="model.layers.0.self_attn.q_proj",
+            request_ids=("req-1",),
+            step_id=8,
+        )
+
+        self.assertEqual(result, "prediction")
+        self.assertEqual(calls, ["stage", "commit", "predict"])
+        self.assertEqual(consumer.read_stats().update_count, 1)
+        self.assertEqual(consumer.read_stats().buffered_count, 0)
+        self.assertEqual(len(service.updates), 1)
+        self.assertEqual(service.updates[0].lora_int_id, 42)
+
+    def test_closed_loop_can_use_explicit_lora_apply_barrier(self) -> None:
+        from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
+
+        calls: list[str] = []
+        consumer = TLMConsumer(
+            TLMConsumerConfig(mode="offline", hidden_size=4, rank=2, learning_rate=0.2, threshold=1.0)
+        )
+
+        class _StageOnlyService:
+            def stage_update(self, update) -> None:
+                calls.append(f"stage:{update.lora_int_id}")
+
+        result = consumer.run_lora_learning_step(
+            predict=lambda: calls.append("predict") or "prediction",
+            hidden=torch.eye(3, 4),
+            logits=torch.tensor(
+                [
+                    [4.0, 0.0, 0.0],
+                    [0.0, 0.0, 4.0],
+                    [0.0, 4.0, 0.0],
+                ]
+            ),
+            labels=torch.tensor([0, 1, 1]),
+            lora_service=_StageOnlyService(),
+            apply_lora_update=lambda: calls.append("apply"),
+            adapter_key="tlm-offline-apply",
+            lora_int_id=43,
+            target_module_name="model.layers.0.self_attn.q_proj",
+            request_ids=("req-1",),
+        )
+
+        self.assertEqual(result, "prediction")
+        self.assertEqual(calls, ["stage:43", "apply", "predict"])
+
+    def test_closed_loop_rejects_known_lora_target_shape_mismatch(self) -> None:
+        from torch import nn
+
+        from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
+
+        class _ShapeAwareService:
+            def __init__(self) -> None:
+                self.modules = {"bad": nn.Linear(5, 3, bias=False)}
+
+            def stage_update(self, update) -> None:
+                raise AssertionError("shape-mismatched update must not be staged")
+
+        consumer = TLMConsumer(TLMConsumerConfig(mode="online", hidden_size=4, rank=2, learning_rate=0.2, threshold=1.0))
+
+        with self.assertRaisesRegex(RuntimeError, "target module shape"):
+            consumer.run_lora_learning_step(
+                predict=lambda: "prediction",
+                hidden=torch.eye(3, 4),
+                logits=torch.tensor(
+                    [
+                        [4.0, 0.0, 0.0],
+                        [0.0, 0.0, 4.0],
+                        [0.0, 4.0, 0.0],
+                    ]
+                ),
+                labels=torch.tensor([0, 1, 1]),
+                lora_service=_ShapeAwareService(),
+                adapter_key="tlm-bad-shape",
+                lora_int_id=44,
+                target_module_name="bad",
+                request_ids=("req-1",),
+            )
+
     def test_tlm_module_does_not_import_llamafactory(self) -> None:
         before = set(sys.modules)
 
