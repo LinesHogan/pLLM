@@ -22,6 +22,8 @@ agent evaluation stacks.
   injection,
 - upstream-shaped environment-dynamics JSONL context for DG-style prompt
   grounding,
+- BFCL-shaped toy JSONL loading and ToyFileSystem action execution through
+  `tllm.consumers.gtta.bfcl_toy`,
 - disabled no-op processing.
 
 The first version expects callers to provide environment observations and
@@ -182,6 +184,30 @@ The runtime prompt-context port and trajectory-event port exist, but this
 consumer still does not wire itself into a vLLM generation loop or closed-loop
 policy. Callers must decide when to write events, when to build prompt context,
 and how to apply ranked snippets.
+
+## BFCL Toy Fixture
+
+`tllm.consumers.gtta.bfcl_toy` provides a tiny BFCL-shaped fixture path for
+local development:
+
+- `load_bfcl_toy_tasks(path)` reads newline-delimited task JSON,
+- `execute_bfcl_toy_action(task, action)` executes the limited ToyFileSystem
+  actions `touch(path='...')` and `ls()`,
+- the result includes a `TrajectoryFeedback` object that can be enqueued into
+  `GTTAConsumer`.
+
+The expected artifact layout is:
+
+```text
+<bfcl-toy-root>/
+  data/tasks.jsonl
+  data/expected_actions.jsonl
+  data/seed_dynamics.json
+  schemas/task.schema.json
+```
+
+The toy fixture is only for validating function-call action, observation/reward,
+and prompt-context adaptation mechanics. It is not a BFCL benchmark runner.
 
 ## Counters
 
