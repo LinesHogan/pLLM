@@ -7,6 +7,8 @@ idea. It does not import verl or the reference training stack.
 
 The first version implements two local pieces:
 
+- a lightweight verifier interface, with a default boxed normalized exact
+  verifier,
 - boxed-answer-only majority-vote reward construction over multiple completions
   for the same prompt,
 - upstream-style vote/sample separation: vote over `n_votes_per_prompt`
@@ -16,6 +18,8 @@ The first version implements two local pieces:
   normalized label, and scalar reward,
 - a toy generation trace to reward outcome loop that turns completed generation
   traces into `RewardOutcomeBatch` entries,
+- a no-model closed-loop helper that builds rewards, runs the local toy update,
+  and produces retry scheduling metadata tied to the updated adapter version,
 - a small low-rank score adapter trained from hidden rows and scalar rewards.
 
 Majority voting is boxed-only. The consumer extracts the last `\boxed{...}`
@@ -32,6 +36,19 @@ The trace-to-outcome path is intentionally light. It maps
 minority samples, and `reward=None` plus `skip_reason=missing-boxed-answer` to
 unboxed samples.
 
+The verifier is intentionally small and replaceable. `BoxedNormalizedVerifier`
+is the default and does not import `math_verify`, sympy latex plugins, verl,
+Ray, Hydra, or a full math grader. A future math-equivalence verifier can plug
+into the same `label_for_completion()` contract, but it is not a runtime
+dependency of this toy path.
+
+The toy closed-loop helper is meant for local evidence, not policy training:
+`run_ttrl_toy_closed_loop()` maps `GenerationTraceBatch` to rewards, selects
+training rewards, calls `update_from_rewards()`, and returns a
+`TTRLClosedLoopIntent` whose retry schedule carries the updated
+`adapter_version_id`. A fake scheduler can use that version id to prove that a
+minority retry would be issued against the post-update adapter state.
+
 This remains a toy alignment path. It does not implement the full TTRL LoRA
 actor loop, PPO/GRPO updates, policy feedback into generation, or a full
 math-equivalence grader.
@@ -41,6 +58,7 @@ math-equivalence grader.
 ```python
 from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig, TTRLSample
 from tllm.consumers.ttrl import build_ttrl_reward_outcome_batch, build_ttrl_reward_result
+from tllm.consumers.ttrl import run_ttrl_toy_closed_loop
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 
 consumer = TTRLConsumer(TTRLConsumerConfig(hidden_size=896, rank=16))
@@ -72,7 +90,20 @@ trace = GenerationTraceBatch(
     )
 )
 outcomes = build_ttrl_reward_outcome_batch(trace)
-assert outcomes.entries[0].judge == "ttrl_boxed_majority"
+assert outcomes.entries[0].judge == "ttrl_majority:boxed_normalized_exact"
+```
+
+For a no-model closed-loop toy:
+
+```python
+import torch
+from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig, run_ttrl_toy_closed_loop
+
+consumer = TTRLConsumer(TTRLConsumerConfig(hidden_size=4, rank=2))
+intent = run_ttrl_toy_closed_loop(consumer, trace, torch.randn(len(trace.entries), 4))
+assert intent.training_rewards() == [1.0]
+assert intent.training_row_count == 1
+assert intent.adapter_version_id == "ttrl:update:1"
 ```
 
 For upstream-style vote/sample separation:

@@ -2,7 +2,7 @@
 
 ## 结论
 
-当前 tLLM TTRL consumer 是一个无 verl 依赖的 TTRL-inspired 最小原语实现，不是端到端 TTRL 复现。它保留了“同一 prompt 多样本多数投票生成伪奖励”和“用伪奖励做一次轻量 test-time 更新”的方向，并补齐了数学 toycase 需要的 boxed answer 抽取/normalize、多数标签/比例结构化结果、vote/sample 分离索引、以及 toy `GenerationTraceBatch -> RewardOutcomeBatch` 输出；但没有复现上游的完整 test-time RL 训练闭环：伪 ground truth 写回 verl batch、PPO/GRPO actor 更新和指标回填。
+当前 tLLM TTRL consumer 是一个无 verl 依赖的 TTRL-inspired 最小原语实现，不是端到端 TTRL 复现。它保留了“同一 prompt 多样本多数投票生成伪奖励”和“用伪奖励做一次轻量 test-time 更新”的方向，并补齐了数学 toycase 需要的 boxed answer 抽取/normalize、多数标签/比例结构化结果、vote/sample 分离索引、toy `GenerationTraceBatch -> RewardOutcomeBatch` 输出、可替换 lightweight verifier、以及 no-model closed-loop helper；但没有复现上游的完整 test-time RL 训练闭环：伪 ground truth 写回 verl batch、PPO/GRPO actor 更新和指标回填。
 
 因此，评估结论是：核心思想部分对齐，工程实现刻意脱离 verl；若目标是可运行的 TTRL 算法复现，当前实现仍有关键差距。
 
@@ -25,11 +25,14 @@
 本仓库实现位于 `tllm/consumers/ttrl/consumer.py`：
 
 - `TTRLSample` 保存 `prompt_idx`、`sample_idx`、`completion`。
-- `majority_vote_rewards` 按 `prompt_idx` 分组，只对最后一个 `\boxed{...}` answer 抽取/normalize 后计数，并给 majority label 匹配样本 reward=1，其余 boxed 样本 reward=0。
+- `BoxedNormalizedVerifier` 是默认 lightweight verifier：只抽取最后一个 `\boxed{...}` answer 并做本仓库 answer normalize，不导入 full math grader。
+- `TTRLVerifier` 是可替换协议；math-equivalence grader 可以作为后续插件接入 `label_for_completion()`，但不是当前运行依赖。
+- `majority_vote_rewards` 按 `prompt_idx` 分组，使用 verifier label 计数，并给 majority label 匹配样本 reward=1，其余 boxed 样本 reward=0。
 - unboxed completion 不作为可判定答案参与投票；结构化结果和 reward outcome 会标记 `missing-boxed-answer`。
 - `build_ttrl_reward_result` 返回 majority label、majority ratio、每个样本的 normalized boxed label、reward、skip reason、以及被选中的训练索引。
 - `build_ttrl_reward_outcome_batch` 将完成的 `GenerationTraceBatch` 转换为 `RewardOutcomeBatch`，保留 `request_id`、`prompt_idx`、`sample_idx`、`output_index`、`group_id` 等 identity 字段。
 - `build_ttrl_closed_loop_intent` 将同一 trace 转换为 reward、retry control、update barrier 三类 runtime-native intent batch；多数派样本被 accept，非多数派或缺失答案样本走 retry/skip 路径。
+- `run_ttrl_toy_closed_loop` 是 no-model evidence helper：从 trace 构造 rewards，调用本地 `update_from_rewards`，并把 retry schedule 绑定到更新后的 `adapter_version_id`，例如 `ttrl:update:1`。
 - `select_ttrl_training_indices` 对齐上游 `select_top_k_per_prompt`，支持从 `n_votes_per_prompt` 个投票样本中选择前 `n_samples_per_prompt` 个训练样本。
 - `TTRLClosedLoopIntent.training_rewards()` 只暴露被上游式 selection 选中的训练 reward，因此 toy adapter 更新计数不会把纯投票样本误当成训练样本。
 - `TTRLEngine` 用一个 `LowRankAdapter(in_dim=hidden_size, out_dim=1)` 预测 scalar reward，并以 MSE 训练。
@@ -51,10 +54,11 @@
 - 支持 `n_votes_per_prompt` / `n_samples_per_prompt` 的上游式下采样索引。
 - 不依赖 verl。
 - 支持轻量本地更新，并记录 `update_count`、`loss_count`、`reward_count`。
+- retry schedule 可携带更新后的 adapter/version id，fake scheduler 可以证明少数派 retry 会使用 post-update 版本信息。
 
 未对齐或仅弱对齐的部分：
 
-- 上游 reward 是“模型响应 vs majority pseudo ground truth”的 task reward；tLLM 现在只对 boxed/math toycase 做 toy 对齐，仍缺少完整 latex/sympy/mathd grader/self-check。
+- 上游 reward 是“模型响应 vs majority pseudo ground truth”的 task reward；tLLM 现在默认只对 boxed/math toycase 做 toy 对齐。完整 latex/sympy/mathd 或 `math_verify` 等数学等价判断应作为可选 verifier 插件，而不是当前 lightweight path 的硬依赖。
 - 上游更新 actor policy；tLLM 只训练一个本地低秩 scalar score adapter。当前 trace-to-outcome flow 只产出 reward outcome，adapter 更新本身不会自动改变后续 generation。
 - 上游保留 original gt 做诊断指标；tLLM 只有 majority ratio，没有 label accuracy、reward accuracy、pass@n 等完整指标。
 
@@ -129,7 +133,7 @@ trace-to-outcome toycase：
 - 输入为 `GenerationTraceBatch` 的 completed entries。
 - 输出为 `RewardOutcomeBatch`。
 - `request_id`、`prompt_idx`、`sample_idx`、`output_index`、`group_id` 保持 trace identity。
-- boxed majority 样本写入 `judge=ttrl_boxed_majority`、`reward=1.0`、`is_correct=True`。
+- boxed majority 样本写入 `judge=ttrl_majority:<verifier_name>`、`reward=1.0`、`is_correct=True`。
 - boxed minority 样本写入 `reward=0.0`、`is_correct=False`。
 - unboxed 样本写入 `reward=None`、`is_correct=None`、`skip_reason=missing-boxed-answer`。
 
@@ -140,6 +144,8 @@ closed-loop intent toycase：
 - majority completion 的 retry action 为 `accept`。
 - non-majority completion 的 retry action 为 `retry`，并带 `retry_after_update=True`。
 - update barrier 的 `ready_count` 只统计上游式 selected training rows。
+- toy closed-loop helper 会在本地 adapter update 后返回 `adapter_version_id`，并把少数派 retry schedule 指向该更新后版本。
+- intent 里的训练规模使用 `training_row_count` / `selected_reward_count` 表示，避免和 `TTRLEngine` 的 `stats.update_count` 更新步数混淆。
 - `consume_bundle()` 在可选 sinks 存在时会写入 reward、retry 和 update barrier 三类 batch。
 - post-generate fake runtime dispatch smoke 使用真实 `TTRLConsumer`，从
   `runtime.last_generation_trace` 构造 bundle 后写入 runtime reward、retry 和
@@ -184,4 +190,4 @@ adapter update：
 
 - 增加可插拔 grader/self-check，覆盖上游 mathd/sympy/latex 等数学等价。
 - 明确 adapter 如何影响后续 generation；否则把它定位为诊断/score head，而不是 test-time RL policy update。
-- 增加端到端小模型 smoke，将结构化 reward 结果传入轻量 adapter update 并验证统计计数。
+- 增加端到端小模型 smoke，将结构化 reward 结果传入轻量 adapter update、把 adapter/version id 交给真实 retry scheduler，并验证统计计数。

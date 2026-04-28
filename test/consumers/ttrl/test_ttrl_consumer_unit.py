@@ -162,7 +162,7 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         self.assertEqual(batch.entries[0].sample_idx, 0)
         self.assertEqual(batch.entries[0].output_index, 2)
         self.assertEqual(batch.entries[0].group_id, "vote-a")
-        self.assertEqual(batch.entries[0].judge, "ttrl_boxed_majority")
+        self.assertEqual(batch.entries[0].judge, "ttrl_majority:boxed_normalized_exact")
         self.assertEqual(batch.entries[0].label, "4")
         self.assertEqual(batch.entries[0].reward, 1.0)
         self.assertIs(batch.entries[0].is_correct, True)
@@ -369,9 +369,11 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         self.assertEqual(barrier.state, "ready")
         self.assertEqual(barrier.ready_count, 2)
         self.assertEqual(barrier.request_ids, ("req-a", "req-b", "req-c"))
-        self.assertEqual(intent.update_count, 2)
+        self.assertFalse(hasattr(intent, "update_count"))
+        self.assertEqual(intent.training_row_count, 2)
+        self.assertEqual(intent.selected_reward_count, 2)
 
-    def test_closed_loop_intent_exposes_nonzero_toy_update_count_for_adapter_path(self) -> None:
+    def test_closed_loop_intent_exposes_nonzero_training_row_count_for_adapter_path(self) -> None:
         from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 
@@ -402,10 +404,11 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         )
 
         intent = consumer.closed_loop_intent_for_trace(trace)
-        consumer.update_from_rewards(torch.randn(intent.update_count, 4), intent.training_rewards())
+        consumer.update_from_rewards(torch.randn(intent.training_row_count, 4), intent.training_rewards())
 
         stats = consumer.read_stats()
-        self.assertEqual(intent.update_count, 2)
+        self.assertEqual(intent.training_row_count, 2)
+        self.assertEqual(intent.selected_reward_count, 2)
         self.assertEqual(stats.update_count, 1)
         self.assertEqual(stats.reward_count, 2)
 

@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-import re
-from typing import Iterable, Sequence
+from dataclasses import replace
+from typing import Iterable, Protocol, Sequence
 
 import torch
 from torch import nn
@@ -25,9 +25,8 @@ from tllm.ports.retry_control import RetryControl
 from tllm.ports.update_barrier import UpdateBarrier
 
 
-_BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\s*\{([^{}]*)\}")
 _MISSING_BOXED_ANSWER = "missing-boxed-answer"
-_TTRL_BOXED_MAJORITY_JUDGE = "ttrl_boxed_majority"
+_TTRL_DEFAULT_VERIFIER_JUDGE = "boxed_normalized_exact"
 
 
 @dataclass(frozen=True)
@@ -35,6 +34,22 @@ class TTRLSample:
     prompt_idx: int
     sample_idx: int
     completion: str
+
+
+class TTRLVerifier(Protocol):
+    def label_for_completion(self, completion: str) -> str:
+        """Return a normalized label, or an empty string when unverifiable."""
+
+
+@dataclass(frozen=True)
+class BoxedNormalizedVerifier:
+    """Dependency-light verifier for exact matches on normalized boxed answers."""
+
+    judge_name: str = _TTRL_DEFAULT_VERIFIER_JUDGE
+    missing_reason: str = _MISSING_BOXED_ANSWER
+
+    def label_for_completion(self, completion: str) -> str:
+        return _extract_boxed_answer_label(completion)
 
 
 @dataclass(frozen=True)
@@ -64,6 +79,16 @@ class TTRLRewardResult:
     majority_by_prompt: dict[int, TTRLMajorityResult]
     sample_results: list[TTRLSampleReward]
     selected_indices: list[int]
+    verifier_name: str = _TTRL_DEFAULT_VERIFIER_JUDGE
+
+
+@dataclass(frozen=True)
+class TTRLRetryScheduleEntry:
+    request_id: str
+    prompt_idx: int
+    sample_idx: int
+    group_id: str
+    adapter_version_id: str
 
 
 @dataclass(frozen=True)
@@ -71,8 +96,12 @@ class TTRLClosedLoopIntent:
     reward_outcomes: object
     retry_controls: object
     update_barriers: object
-    update_count: int
+    training_row_count: int
+    selected_reward_count: int = 0
+    adapter_version_id: str = ""
+    training_indices: tuple[int, ...] = ()
     training_reward_values: tuple[float, ...] = ()
+    retry_schedule: tuple[TTRLRetryScheduleEntry, ...] = ()
 
     def training_rewards(self) -> list[float]:
         return [float(reward) for reward in self.training_reward_values]
@@ -124,6 +153,10 @@ def _extract_boxed_answer_label(text: str) -> str:
     return normalize_answer_text(answer)
 
 
+def _default_ttrl_verifier() -> TTRLVerifier:
+    return BoxedNormalizedVerifier()
+
+
 def select_ttrl_training_indices(
     *,
     num_prompts: int,
@@ -142,11 +175,15 @@ def build_ttrl_reward_result(
     *,
     n_votes_per_prompt: int | None = None,
     n_samples_per_prompt: int | None = None,
+    verifier: TTRLVerifier | None = None,
 ) -> TTRLRewardResult:
+    resolved_verifier = verifier or _default_ttrl_verifier()
+    judge_name = str(getattr(resolved_verifier, "judge_name", _TTRL_DEFAULT_VERIFIER_JUDGE))
+    missing_reason = str(getattr(resolved_verifier, "missing_reason", _MISSING_BOXED_ANSWER))
     grouped: dict[int, list[tuple[int, TTRLSample, str, str]]] = defaultdict(list)
     for idx, sample in enumerate(samples):
-        label = _extract_boxed_answer_label(sample.completion)
-        skip_reason = "" if label else _MISSING_BOXED_ANSWER
+        label = str(resolved_verifier.label_for_completion(sample.completion))
+        skip_reason = "" if label else missing_reason
         grouped[int(sample.prompt_idx)].append((idx, sample, label, skip_reason))
 
     majority_by_prompt: dict[int, TTRLMajorityResult] = {}
@@ -204,15 +241,17 @@ def build_ttrl_reward_result(
         majority_by_prompt=majority_by_prompt,
         sample_results=sample_results,
         selected_indices=selected_indices,
+        verifier_name=judge_name,
     )
 
 
-def build_ttrl_reward_outcome_batch(trace: object) -> object:
+def build_ttrl_reward_outcome_batch(trace: object, *, verifier: TTRLVerifier | None = None) -> object:
     from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
     from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
 
     if not isinstance(trace, GenerationTraceBatch):
         raise TypeError("trace must be GenerationTraceBatch")
+    resolved_verifier = verifier or _default_ttrl_verifier()
     samples = [
         TTRLSample(
             prompt_idx=int(entry.prompt_idx),
@@ -221,7 +260,7 @@ def build_ttrl_reward_outcome_batch(trace: object) -> object:
         )
         for entry in trace.entries
     ]
-    result = build_ttrl_reward_result(samples)
+    result = build_ttrl_reward_result(samples, verifier=resolved_verifier)
     outcome_entries = []
     for trace_entry, sample_result in zip(trace.entries, result.sample_results, strict=True):
         skipped = bool(sample_result.skip_reason)
@@ -233,7 +272,7 @@ def build_ttrl_reward_outcome_batch(trace: object) -> object:
                 output_index=int(trace_entry.output_index),
                 group_id=str(trace_entry.group_id),
                 reward=None if skipped else float(sample_result.reward),
-                judge=_TTRL_BOXED_MAJORITY_JUDGE,
+                judge=f"ttrl_majority:{result.verifier_name}",
                 label="" if skipped else str(sample_result.label),
                 skip_reason=str(sample_result.skip_reason),
                 is_correct=None if skipped else bool(sample_result.reward == 1.0),
@@ -252,6 +291,8 @@ def build_ttrl_closed_loop_intent(
     consumer_id: str = "ttrl",
     n_votes_per_prompt: int | None = None,
     n_samples_per_prompt: int | None = None,
+    verifier: TTRLVerifier | None = None,
+    adapter_version_id: str = "",
 ) -> TTRLClosedLoopIntent:
     from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
     from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
@@ -260,7 +301,8 @@ def build_ttrl_closed_loop_intent(
     if not isinstance(trace, GenerationTraceBatch):
         raise TypeError("trace must be GenerationTraceBatch")
 
-    reward_outcomes = build_ttrl_reward_outcome_batch(trace)
+    resolved_verifier = verifier or _default_ttrl_verifier()
+    reward_outcomes = build_ttrl_reward_outcome_batch(trace, verifier=resolved_verifier)
     samples = [
         TTRLSample(
             prompt_idx=int(entry.prompt_idx),
@@ -273,6 +315,7 @@ def build_ttrl_closed_loop_intent(
         samples,
         n_votes_per_prompt=n_votes_per_prompt,
         n_samples_per_prompt=n_samples_per_prompt,
+        verifier=resolved_verifier,
     )
     selected_train_indices = {
         int(idx)
@@ -283,6 +326,7 @@ def build_ttrl_closed_loop_intent(
     grouped: dict[tuple[str, int], list[object]] = defaultdict(list)
     grouped_indices: dict[tuple[str, int], list[int]] = defaultdict(list)
     training_reward_values: list[float] = []
+    training_indices: list[int] = []
     for entry_idx, (trace_entry, outcome) in enumerate(zip(trace.entries, reward_outcomes.entries, strict=True)):
         grouped[(str(trace_entry.group_id), int(trace_entry.prompt_idx))].append(outcome)
         grouped_indices[(str(trace_entry.group_id), int(trace_entry.prompt_idx))].append(int(entry_idx))
@@ -296,12 +340,14 @@ def build_ttrl_closed_loop_intent(
             retry_after_update = False
             if int(entry_idx) in selected_train_indices:
                 training_reward_values.append(float(outcome.reward))
+                training_indices.append(int(entry_idx))
         else:
             action = "retry"
             reason = "non-majority-answer"
             retry_after_update = True
             if int(entry_idx) in selected_train_indices:
                 training_reward_values.append(float(outcome.reward))
+                training_indices.append(int(entry_idx))
         retry_entries.append(
             RetryControlEntry(
                 request_id=str(outcome.request_id),
@@ -330,17 +376,33 @@ def build_ttrl_closed_loop_intent(
             )
         )
 
+    retry_schedule = tuple(
+        TTRLRetryScheduleEntry(
+            request_id=str(entry.request_id),
+            prompt_idx=int(entry.prompt_idx),
+            sample_idx=int(entry.sample_idx),
+            group_id=str(entry.group_id),
+            adapter_version_id=str(adapter_version_id),
+        )
+        for entry in retry_entries
+        if bool(entry.retry_after_update)
+    )
+
     return TTRLClosedLoopIntent(
         reward_outcomes=reward_outcomes,
         retry_controls=RetryControlBatch(entries=tuple(retry_entries)),
         update_barriers=UpdateBarrierBatch(entries=tuple(barrier_entries)),
-        update_count=len(training_reward_values),
+        training_row_count=len(training_reward_values),
+        selected_reward_count=len(training_reward_values),
+        adapter_version_id=str(adapter_version_id),
+        training_indices=tuple(training_indices),
         training_reward_values=tuple(training_reward_values),
+        retry_schedule=retry_schedule,
     )
 
 
-def majority_vote_rewards(samples: Sequence[TTRLSample]) -> list[float]:
-    return build_ttrl_reward_result(samples).rewards
+def majority_vote_rewards(samples: Sequence[TTRLSample], *, verifier: TTRLVerifier | None = None) -> list[float]:
+    return build_ttrl_reward_result(samples, verifier=verifier).rewards
 
 
 class TTRLEngine(nn.Module):
@@ -411,13 +473,25 @@ class TTRLEngine(nn.Module):
             last_loss=float(self._last_loss),
         )
 
+    def adapter_version_id(self, *, consumer_id: str = "ttrl") -> str:
+        if int(self._update_count) <= 0:
+            return f"{consumer_id}:base"
+        return f"{consumer_id}:update:{int(self._update_count)}"
+
 
 class TTRLConsumer(BaseConsumer):
     """Post-generation TTRL-style consumer with local majority rewards."""
 
-    def __init__(self, config: TTRLConsumerConfig, *, engine: TTRLEngine | None = None) -> None:
+    def __init__(
+        self,
+        config: TTRLConsumerConfig,
+        *,
+        engine: TTRLEngine | None = None,
+        verifier: TTRLVerifier | None = None,
+    ) -> None:
         self.config = config
         self.engine = engine or TTRLEngine(config)
+        self.verifier = verifier or _default_ttrl_verifier()
 
     @property
     def consumer_id(self) -> str:
@@ -439,7 +513,7 @@ class TTRLConsumer(BaseConsumer):
         )
 
     def rewards_for_samples(self, samples: Sequence[TTRLSample]) -> torch.Tensor:
-        rewards = majority_vote_rewards(samples)
+        rewards = majority_vote_rewards(samples, verifier=self.verifier)
         return torch.tensor(rewards, dtype=torch.float32)
 
     def reward_result_for_samples(
@@ -453,10 +527,11 @@ class TTRLConsumer(BaseConsumer):
             samples,
             n_votes_per_prompt=n_votes_per_prompt,
             n_samples_per_prompt=n_samples_per_prompt,
+            verifier=self.verifier,
         )
 
     def reward_outcome_batch_for_trace(self, trace: object) -> object:
-        return build_ttrl_reward_outcome_batch(trace)
+        return build_ttrl_reward_outcome_batch(trace, verifier=self.verifier)
 
     def closed_loop_intent_for_trace(
         self,
@@ -470,12 +545,14 @@ class TTRLConsumer(BaseConsumer):
             consumer_id=self.consumer_id,
             n_votes_per_prompt=n_votes_per_prompt,
             n_samples_per_prompt=n_samples_per_prompt,
+            verifier=self.verifier,
+            adapter_version_id=self.engine.adapter_version_id(consumer_id=self.consumer_id),
         )
 
     def write_reward_outcomes_for_trace(self, runtime: object, trace: object) -> int:
         from tllm.runtime.reward_outcome_runtime import write_reward_outcomes
 
-        return write_reward_outcomes(runtime, build_ttrl_reward_outcome_batch(trace))
+        return write_reward_outcomes(runtime, build_ttrl_reward_outcome_batch(trace, verifier=self.verifier))
 
     def consume_bundle(self, bundle, ctx) -> None:
         _ = ctx
@@ -509,3 +586,33 @@ class TTRLConsumer(BaseConsumer):
 
     def read_stats(self) -> TTRLStats:
         return self.engine.read_stats()
+
+
+def run_ttrl_toy_closed_loop(
+    consumer: TTRLConsumer,
+    trace: object,
+    hidden_rows: torch.Tensor,
+    *,
+    n_votes_per_prompt: int | None = None,
+    n_samples_per_prompt: int | None = None,
+) -> TTRLClosedLoopIntent:
+    intent = consumer.closed_loop_intent_for_trace(
+        trace,
+        n_votes_per_prompt=n_votes_per_prompt,
+        n_samples_per_prompt=n_samples_per_prompt,
+    )
+    rewards = intent.training_rewards()
+    if rewards:
+        if int(hidden_rows.shape[0]) == len(rewards):
+            train_hidden = hidden_rows
+        elif intent.training_indices and int(hidden_rows.shape[0]) > max(intent.training_indices):
+            train_hidden = hidden_rows[list(intent.training_indices)]
+        else:
+            raise RuntimeError("hidden rows must align with selected TTRL rewards")
+        consumer.update_from_rewards(train_hidden, rewards)
+    adapter_version_id = consumer.engine.adapter_version_id(consumer_id=consumer.consumer_id)
+    retry_schedule = tuple(
+        replace(entry, adapter_version_id=adapter_version_id)
+        for entry in intent.retry_schedule
+    )
+    return replace(intent, adapter_version_id=adapter_version_id, retry_schedule=retry_schedule)
