@@ -2,9 +2,9 @@
 
 ## Scope
 
-- tLLM revision inspected: local `consumer-gtta-bfcl-toy-loop` branch after
-  BFCL toy fixture coverage, cached prompt-context smoke, and fake
-  capture-runner verification
+- tLLM revision inspected: local `consumer-gtta-bfcl-minimal-alignment` branch
+  after deterministic BFCL-shaped minimal fixture coverage, cached
+  prompt-context smoke, and fake capture-runner verification
 - Upstream GTTA revision inspected: `24ba304`
 - tLLM files inspected: `tllm/consumers/gtta/consumer.py`,
   `test/consumers/gtta/test_gtta_consumer_unit.py`,
@@ -25,6 +25,21 @@
   `BFCLv3/berkeley-function-call-leaderboard/bfcl/model_handler/utils.py`,
   `BFCLv3/berkeley-function-call-leaderboard/bfcl/constants/env_dynamics_prompt.py`,
   and `vllm/model_runner.py`.
+
+## BFCL Minimal Deterministic Subset
+
+This report covers a dependency-light, deterministic BFCL-shaped subset for
+consumer alignment. It is not the upstream BFCL package, not a BFCL
+leaderboard runner, and not a replacement for the official generation or
+evaluation scripts.
+
+The subset uses small local JSON/JSONL fixtures with the BFCL task shape:
+`question`, `function`, initial toy state, candidate function-call strings,
+expected action records, and seed environment-dynamics records. The toy
+environment is intentionally limited to `touch(path=...)`, `ls()`, and
+`read(path=...)` over an in-memory file state so unit tests can deterministically
+verify function-call execution, observations, rewards, and GTTA ranking changes
+without importing BFCL.
 
 ## Upstream Mechanism Summary
 
@@ -78,10 +93,10 @@ candidate-ranking ingester:
   and `environmental_dynamics` fields, plus task/state/reward metadata.
 - `GTTAConsumer.build_environment_dynamics_prompt_context_entry()` wraps that
   JSONL context in the runtime `PromptContextEntry` contract.
-- `tllm.consumers.gtta.bfcl_toy` adds a dependency-light BFCL-shaped toy loader
-  and ToyFileSystem executor. It reads small JSONL tasks, executes limited
-  function-call candidate actions, and returns `TrajectoryFeedback` for the
-  existing consumer path.
+- `tllm.consumers.gtta.bfcl_toy` adds a dependency-light BFCL-shaped minimal
+  loader and ToyFileSystem executor. It reads small JSONL tasks, executes
+  limited `touch`, `ls`, and `read` function-call candidate actions, and
+  returns `TrajectoryFeedback` for the existing consumer path.
 - `GTTAConsumer.read_stats()` reports queued, dropped, processed, and updated counts.
 - The module imports only stdlib plus tLLM consumer/runtime contracts; it does
   not import WebArena, browsergym, bgym, agentlab, or BFCL.
@@ -92,7 +107,7 @@ The consumer-local toy coverage now fixes the narrow adoption subset:
 trajectory ranking, processed dynamics accumulation/export, filtered dynamics
 lookup, explicit runtime event ingestion, copy-safe query/export,
 deterministic snippet generation, upstream-shaped environment-dynamics JSONL,
-BFCL-shaped toy function-call execution,
+BFCL-shaped minimal function-call execution,
 fake capture-runner prompt-context injection, and opt-in cached-model evidence
 that prompt context changes real logits. The lookup is deliberately an
 in-process helper over already ingested feedback; it uses the existing runtime
@@ -128,19 +143,19 @@ I did not run an upstream WebArena or BFCL mini task. The current environment is
 
 Because installing or launching those stacks would be heavier than this evaluation target, I used tLLM unit tests plus a toy trajectory case to validate the implemented subset.
 
-I also created a tiny BFCL-shaped local artifact with this documented layout:
+I also created deterministic BFCL-shaped local fixtures with this documented
+layout:
 
 ```text
-<bfcl-toy-root>/
-  data/tasks.jsonl
-  data/expected_actions.jsonl
-  data/seed_dynamics.json
-  schemas/task.schema.json
+test/consumers/gtta/fixtures/bfcl_minimal/
+  tasks.jsonl
+  expected_actions.jsonl
+  seed_dynamics.json
 ```
 
-The artifact contains a `ToyFileSystem` task with `touch(path='note.txt')` and
-`ls()` candidate actions. It is intentionally an evaluation fixture, not an
-upstream BFCL checkout or leaderboard dataset.
+The fixtures contain three `ToyFileSystem` tasks covering `touch`, `ls`, and
+`read` candidate actions. They are intentionally unit-test fixtures, not an
+upstream BFCL checkout, package import, or leaderboard dataset.
 
 ## Checks Run
 
@@ -154,13 +169,15 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 
    Result: `12 passed`.
 
-   Current result after BFCL toy refresh: `21 passed, 1 skipped`.
+   Current result after BFCL minimal refresh: `26 passed, 1 skipped`.
 
-   The BFCL toy unit coverage verifies:
+   The BFCL toy and minimal alignment unit coverage verifies:
 
    - JSONL loading preserves BFCL-style task/function/action fields;
-   - `touch(path='note.txt')` and `ls()` produce observations, rewards, and
-     `TrajectoryFeedback`;
+   - `touch(path=...)`, `ls()`, and `read(path=...)` produce observations,
+     rewards, and `TrajectoryFeedback`;
+   - baseline ranking is deterministic under zero scores;
+   - seed dynamics shift selected actions toward expected fixture actions;
    - positive/negative toy trajectories update candidate ranking and prompt
      context;
    - unknown function-call actions are rejected.
@@ -242,7 +259,7 @@ Commands are summarized with placeholders to avoid machine-specific paths.
 **Against Task 6 runtime contracts:** the consumer side is now aligned at the
 contract boundary. It can ingest runtime `TrajectoryEvent` records and can
 format ranked dynamics or upstream-shaped environment-dynamics JSONL as runtime
-`PromptContextEntry` text. It also has a BFCL-shaped toy loader/executor to
+`PromptContextEntry` text. It also has a BFCL-shaped minimal loader/executor to
 exercise function-call action, observation/reward, and prompt-context mechanics
 without the full BFCL stack. The runtime prompt-context and trajectory-event
 ports already exist, so the remaining work is integration, not a new

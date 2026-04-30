@@ -74,9 +74,20 @@ def execute_bfcl_toy_action(task: BFCLToyTask, action: str) -> BFCLToyStepResult
         if path not in files:
             files.append(path)
         state["files"] = files
+        contents = dict(state.get("contents", {}))
+        contents.setdefault(path, "")
+        state["contents"] = contents
         tool_result = f"created {path}"
     elif normalized_action == "ls()":
         tool_result = _format_files_observation(state)
+    elif normalized_action.startswith("read("):
+        path = _parse_single_string_kwarg(normalized_action, function_name="read", kwarg_name="path")
+        files = list(state.get("files", ()))
+        if path not in files:
+            tool_result = f"missing {path}"
+        else:
+            contents = dict(state.get("contents", {}))
+            tool_result = f"content {path}: {contents.get(path, '')}"
     else:
         raise ValueError(f"unsupported BFCL toy action `{normalized_action}`")
 
@@ -151,7 +162,13 @@ def _copy_toy_state(state: Mapping[str, Any]) -> dict[str, Any]:
     files = state.get("files", ())
     if not isinstance(files, Sequence) or isinstance(files, (str, bytes, bytearray)):
         raise ValueError("ToyFileSystem state files must be a sequence")
-    return {"files": [str(item) for item in files]}
+    contents = state.get("contents", {})
+    if not isinstance(contents, Mapping):
+        raise ValueError("ToyFileSystem state contents must be an object")
+    return {
+        "files": [str(item) for item in files],
+        "contents": {str(path): str(content) for path, content in contents.items()},
+    }
 
 
 def _format_files_observation(state: Mapping[str, Any]) -> str:
