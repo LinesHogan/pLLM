@@ -14,6 +14,59 @@ from torch.nn import functional as F
 
 __test__ = False
 
+FastWeightMode = str
+
+
+def normalize_fast_weight_mode(mode: object) -> FastWeightMode:
+    normalized = _require_str(mode, field_name="mode")
+    if normalized not in {"exact", "low_rank"}:
+        raise ValueError("inplace_ttt_fast_weight_mode must be one of: exact, low_rank")
+    return normalized
+
+
+def _require_non_negative_int(value: object, *, field_name: str) -> int:
+    parsed = _require_int(value, field_name=field_name)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return parsed
+
+
+def estimate_exact_fast_weight_bytes(
+    *,
+    slots: int,
+    layers: int,
+    hidden_size: int,
+    intermediate_size: int,
+    tail_rows: int,
+    bytes_per_element: int,
+) -> int:
+    slot_count = _require_non_negative_int(slots, field_name="slots")
+    layer_count = _require_non_negative_int(layers, field_name="layers")
+    hidden = _require_non_negative_int(hidden_size, field_name="hidden_size")
+    intermediate = _require_non_negative_int(intermediate_size, field_name="intermediate_size")
+    tail = _require_non_negative_int(tail_rows, field_name="tail_rows")
+    element_bytes = _require_non_negative_int(bytes_per_element, field_name="bytes_per_element")
+    per_layer_slot = (hidden * intermediate * element_bytes) + (tail * (hidden + intermediate) * element_bytes)
+    return int(slot_count * layer_count * per_layer_slot)
+
+
+def estimate_low_rank_fast_weight_bytes(
+    *,
+    slots: int,
+    layers: int,
+    hidden_size: int,
+    intermediate_size: int,
+    rank: int,
+    bytes_per_element: int,
+) -> int:
+    slot_count = _require_non_negative_int(slots, field_name="slots")
+    layer_count = _require_non_negative_int(layers, field_name="layers")
+    hidden = _require_non_negative_int(hidden_size, field_name="hidden_size")
+    intermediate = _require_non_negative_int(intermediate_size, field_name="intermediate_size")
+    low_rank = _require_non_negative_int(rank, field_name="rank")
+    element_bytes = _require_non_negative_int(bytes_per_element, field_name="bytes_per_element")
+    return int(slot_count * layer_count * low_rank * (hidden + intermediate) * element_bytes)
+
 
 def _require_str(value: object, *, field_name: str) -> str:
     if not isinstance(value, str):
@@ -82,7 +135,13 @@ class FastWeightStepResult:
 
 
 class FastWeightState:
-    def __init__(self, *, max_slots: int | None = None, max_bytes: int | None = None) -> None:
+    def __init__(self, *, max_slots: int | None = None, max_bytes: int | None = None, mode: str = "exact") -> None:
+        self.mode = normalize_fast_weight_mode(mode)
+        if self.mode == "low_rank":
+            raise NotImplementedError(
+                "In-Place TTT fast-weight low_rank mode is not implemented yet; "
+                "exact mode keeps the past_h/past_t/past_w state contract."
+            )
         self._slots: dict[FastWeightKey, FastWeightSlot] = {}
         self._stats: dict[FastWeightKey, FastWeightStats] = {}
         self._max_slots = None if max_slots is None else max(0, int(max_slots))

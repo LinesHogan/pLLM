@@ -52,6 +52,53 @@ class _FakeBiasedQwenLikeMLP(_FakeQwenLikeMLP):
 
 
 class FastWeightStateUnitTest(unittest.TestCase):
+    def test_fast_weight_memory_estimates_match_documented_formulas(self) -> None:
+        from tllm.runtime.fast_weight_state import (
+            estimate_exact_fast_weight_bytes,
+            estimate_low_rank_fast_weight_bytes,
+        )
+
+        self.assertEqual(
+            estimate_exact_fast_weight_bytes(
+                slots=3,
+                layers=2,
+                hidden_size=5,
+                intermediate_size=7,
+                tail_rows=4,
+                bytes_per_element=2,
+            ),
+            3 * 2 * ((5 * 7 * 2) + (4 * (5 + 7) * 2)),
+        )
+        self.assertEqual(
+            estimate_low_rank_fast_weight_bytes(
+                slots=3,
+                layers=2,
+                hidden_size=5,
+                intermediate_size=7,
+                rank=4,
+                bytes_per_element=2,
+            ),
+            3 * 2 * 4 * (5 + 7) * 2,
+        )
+
+    def test_exact_mode_keeps_past_weight_state_contract(self) -> None:
+        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+
+        state = FastWeightState(mode="exact")
+        key = FastWeightKey(request_id="req-a", sample_idx=2, layer=3)
+        w = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+
+        state.write(key=key, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=w)
+
+        self.assertTrue(torch.equal(state.read(key).past_w, w))
+        self.assertEqual(state.slot_count, 1)
+
+    def test_low_rank_state_mode_fails_fast_until_semantics_are_defined(self) -> None:
+        from tllm.runtime.fast_weight_state import FastWeightState
+
+        with self.assertRaisesRegex(NotImplementedError, "low_rank"):
+            FastWeightState(mode="low_rank")
+
     def test_fast_weight_key_rejects_implicit_identity_coercion(self) -> None:
         from tllm.runtime.fast_weight_state import FastWeightKey
 

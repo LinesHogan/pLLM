@@ -65,6 +65,7 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
                 inplace_ttt_fast_weight_layers=(0,),
                 inplace_ttt_fast_weight_chunk_size=4,
                 inplace_ttt_fast_weight_lr=0.5,
+                inplace_ttt_fast_weight_mode="exact",
                 inplace_ttt_fast_weight_decode_update_enabled=False,
                 inplace_ttt_fast_weight_key_mode="static",
                 inplace_ttt_fast_weight_static_request_id="static-req",
@@ -104,6 +105,51 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         self.assertEqual(restore_inplace_ttt_fast_weight_wrappers(runtime), 1)
         restored_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
         self.assertTrue(torch.equal(restored_probe, base_probe))
+
+    def test_low_rank_runtime_mode_fails_fast_before_installing_wrapper(self) -> None:
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+
+        runtime = self._runtime()
+        runtime.config.inplace_ttt_fast_weight_mode = "low_rank"
+        runner = SimpleNamespace(model=_FakeModel())
+
+        with self.assertRaisesRegex(NotImplementedError, "low_rank"):
+            maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
+
+    def test_low_rank_runtime_mode_restores_existing_exact_wrapper_before_failing(self) -> None:
+        from tllm.runtime.fast_weight_state import FastWeightKey
+        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+
+        runtime = self._runtime()
+        runner = SimpleNamespace(model=_FakeModel())
+        mlp = runner.model.model.layers[0].mlp
+
+        self.assertEqual(maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner), 1)
+        mlp.forward(torch.ones(4, 2))
+        key = FastWeightKey(request_id="static-req", sample_idx=0, layer=0)
+        self.assertEqual(runtime.inplace_ttt_fast_weight_state.stats(key).update_count, 1)
+
+        runtime.config.inplace_ttt_fast_weight_mode = "low_rank"
+        with self.assertRaisesRegex(NotImplementedError, "low_rank"):
+            maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+
+        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
+        self.assertIsNone(runtime.inplace_ttt_fast_weight_hook_spec)
+        mlp.forward(torch.ones(4, 2))
+        self.assertEqual(runtime.inplace_ttt_fast_weight_state.stats(key).update_count, 1)
+
+    def test_runtime_configuration_rejects_unknown_fast_weight_mode(self) -> None:
+        from tllm.runtime import residual_runtime
+
+        runtime = residual_runtime.ResidualRuntimeState()
+        old_runtime = residual_runtime.RUNTIME
+        try:
+            residual_runtime.RUNTIME = runtime
+            with self.assertRaisesRegex(ValueError, "exact.*low_rank"):
+                residual_runtime.set_inplace_ttt_fast_weight_enabled(True, mode="compressed")
+        finally:
+            residual_runtime.RUNTIME = old_runtime
 
     def test_configured_layers_are_isolated_by_layer_key(self) -> None:
         from tllm.runtime.fast_weight_state import FastWeightKey

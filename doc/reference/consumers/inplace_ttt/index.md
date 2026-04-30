@@ -64,6 +64,44 @@ limits the number of live per-request fast-weight slots, and
 limit. Profile and warmup forwards that happen before request metadata exists
 fall through to the original MLP and do not create synthetic slots.
 
+The runtime fast-weight state has an explicit
+`inplace_ttt_fast_weight_mode` surface:
+
+- `exact` is the default and the only executable runtime mode today. It keeps
+  the upstream-shaped state contract: `past_h` and `past_t` cache incomplete
+  tail rows, and `past_w` stores the full effective `down_proj.weight`.
+- `low_rank` is accepted as a public configuration value for budgeting and
+  future compatibility, but runtime state creation fails fast with
+  `NotImplementedError`. tLLM does not currently define a clear low-rank
+  recurrence that is equivalent to the upstream cumulative `past_w` contract,
+  so it does not silently approximate exact mode.
+
+Use these formulas for budget planning, where `H` is hidden size, `I` is the
+MLP intermediate/down-projection input width, `bytes` is bytes per element, and
+`slots` counts live request/sample streams per configured layer:
+
+```text
+exact_bytes = slots * layers * (H * I * bytes + tail_rows * (H + I) * bytes)
+low_rank_bytes = slots * layers * rank * (H + I) * bytes
+```
+
+For example, bfloat16 exact state with `slots=8`, `layers=1`, `H=896`,
+`I=4864`, and no cached tail uses about 69.8 MB, or 66.5 MiB:
+
+```text
+8 * 1 * (896 * 4864 * 2) = 69,763,072 bytes
+```
+
+A hypothetical bfloat16 low-rank state with the same dimensions and
+`rank=64` would use about 5.9 MB, or 5.6 MiB:
+
+```text
+8 * 1 * 64 * (896 + 4864) * 2 = 5,898,240 bytes
+```
+
+That low-rank number is only a sizing estimate until the low-rank recurrence
+semantics are implemented and covered by parity tests.
+
 ## Delivery
 
 By default, the enabled consumer declares a prefill bundle flow:

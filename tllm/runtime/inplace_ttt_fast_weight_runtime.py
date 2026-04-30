@@ -11,6 +11,7 @@ from tllm.runtime.fast_weight_state import (
     FastWeightKey,
     FastWeightState,
     install_mlp_fast_weight_wrapper,
+    normalize_fast_weight_mode,
 )
 from tllm.runtime.token_batch_metadata import PackedTokenRow, RequestSampleKey, RuntimeTokenBatchMeta, RuntimeTokenRow
 
@@ -84,6 +85,7 @@ def _hook_spec(runtime: object, runner: object, layers: tuple[int, ...]) -> tupl
     return (
         id(model),
         layers,
+        normalize_fast_weight_mode(getattr(cfg, "inplace_ttt_fast_weight_mode", "exact")),
         int(getattr(cfg, "inplace_ttt_fast_weight_chunk_size", 4096)),
         float(getattr(cfg, "inplace_ttt_fast_weight_lr", 1e-3)),
         bool(getattr(cfg, "inplace_ttt_fast_weight_decode_update_enabled", False)),
@@ -222,6 +224,13 @@ def maybe_install_inplace_ttt_fast_weight_wrappers(runtime: object, runner: obje
     if not fast_weight_runtime_enabled(runtime):
         return 0
     cfg = getattr(runtime, "config", None)
+    mode = normalize_fast_weight_mode(getattr(cfg, "inplace_ttt_fast_weight_mode", "exact"))
+    if mode == "low_rank":
+        restore_inplace_ttt_fast_weight_wrappers(runtime)
+        raise NotImplementedError(
+            "In-Place TTT fast-weight low_rank mode is not implemented yet; "
+            "exact mode is the only runtime state representation available."
+        )
     key_mode = str(getattr(cfg, "inplace_ttt_fast_weight_key_mode", "static") or "static")
     if key_mode not in {"static", "request_sample"}:
         raise RuntimeError("In-Place TTT fast-weight key_mode must be 'static' or 'request_sample'")
@@ -240,7 +249,7 @@ def maybe_install_inplace_ttt_fast_weight_wrappers(runtime: object, runner: obje
     restore_inplace_ttt_fast_weight_wrappers(runtime)
     state = getattr(runtime, "inplace_ttt_fast_weight_state", None)
     if not isinstance(state, FastWeightState):
-        state = FastWeightState()
+        state = FastWeightState(mode=mode)
         setattr(runtime, "inplace_ttt_fast_weight_state", state)
     max_slots = int(getattr(cfg, "inplace_ttt_fast_weight_max_slots", 64) or 0)
     max_bytes = int(getattr(cfg, "inplace_ttt_fast_weight_max_bytes", 0) or 0)

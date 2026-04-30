@@ -312,6 +312,7 @@ class ResidualRuntimeConfig:
     inplace_ttt_fast_weight_layers: tuple[int, ...] = (0,)
     inplace_ttt_fast_weight_chunk_size: int = 4096
     inplace_ttt_fast_weight_lr: float = 1e-3
+    inplace_ttt_fast_weight_mode: str = "exact"
     inplace_ttt_fast_weight_decode_update_enabled: bool = False
     inplace_ttt_fast_weight_key_mode: str = "static"
     inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__"
@@ -570,6 +571,7 @@ def configure_runtime(
     inplace_ttt_fast_weight_layers: Sequence[int] = (0,),
     inplace_ttt_fast_weight_chunk_size: int = 4096,
     inplace_ttt_fast_weight_lr: float = 1e-3,
+    inplace_ttt_fast_weight_mode: str = "exact",
     inplace_ttt_fast_weight_decode_update_enabled: bool = False,
     inplace_ttt_fast_weight_key_mode: str = "static",
     inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__",
@@ -613,6 +615,9 @@ def configure_runtime(
     cfg.inplace_ttt_fast_weight_layers = tuple(int(layer) for layer in inplace_ttt_fast_weight_layers)
     cfg.inplace_ttt_fast_weight_chunk_size = max(1, int(inplace_ttt_fast_weight_chunk_size))
     cfg.inplace_ttt_fast_weight_lr = float(inplace_ttt_fast_weight_lr)
+    from tllm.runtime.fast_weight_state import normalize_fast_weight_mode
+
+    cfg.inplace_ttt_fast_weight_mode = normalize_fast_weight_mode(inplace_ttt_fast_weight_mode)
     cfg.inplace_ttt_fast_weight_decode_update_enabled = bool(inplace_ttt_fast_weight_decode_update_enabled)
     cfg.inplace_ttt_fast_weight_key_mode = str(inplace_ttt_fast_weight_key_mode).strip() or "static"
     cfg.inplace_ttt_fast_weight_static_request_id = (
@@ -660,12 +665,18 @@ def set_inplace_ttt_fast_weight_enabled(
     layers: Sequence[int] | None = None,
     chunk_size: int | None = None,
     learning_rate: float | None = None,
+    mode: str | None = None,
     decode_update_enabled: bool | None = None,
     key_mode: str | None = None,
     max_slots: int | None = None,
     max_bytes: int | None = None,
     fail_on_unsupported: bool | None = None,
 ) -> None:
+    normalized_mode = None
+    if mode is not None:
+        from tllm.runtime.fast_weight_state import normalize_fast_weight_mode
+
+        normalized_mode = normalize_fast_weight_mode(mode)
     RUNTIME.config.inplace_ttt_fast_weight_enabled = bool(enabled)
     if not bool(enabled):
         from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
@@ -677,6 +688,8 @@ def set_inplace_ttt_fast_weight_enabled(
         RUNTIME.config.inplace_ttt_fast_weight_chunk_size = max(1, int(chunk_size))
     if learning_rate is not None:
         RUNTIME.config.inplace_ttt_fast_weight_lr = float(learning_rate)
+    if normalized_mode is not None:
+        RUNTIME.config.inplace_ttt_fast_weight_mode = normalized_mode
     if decode_update_enabled is not None:
         RUNTIME.config.inplace_ttt_fast_weight_decode_update_enabled = bool(decode_update_enabled)
     if key_mode is not None:

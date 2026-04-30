@@ -8,6 +8,14 @@ Updated: 2026-05-01
 
 This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. The 2026-04-27 update adds consumer-local exact toy math coverage. The 2026-05-01 update adds an official-shaped parity harness for the runtime fast-weight step using a toy Qwen-style MLP with `gate_proj`, `up_proj`, `down_proj`, optional random-normal `ttt_proj`, and depthwise `ttt_conv`. Runtime contracts for MLP activation, hidden target, module weight view, and fast-weight state now exist. Runtime fast-weight support now includes both a narrow down-projection effective-weight overlay and a limited Qwen/Llama-style MLP wrapper for single-TP, non-quantized MLPs. The wrapper can be installed from the vLLM runner lifecycle behind an explicit runtime opt-in using either a static single-request key or a bounded request/sample key mode for small multi-request batches.
 
+The runtime fast-weight configuration now exposes
+`inplace_ttt_fast_weight_mode` with allowed values `exact` and `low_rank`.
+`exact` is the default and preserves the existing `past_h`, `past_t`, and full
+effective `past_w` behavior. `low_rank` has memory-estimate helpers, but it is
+not an executable runtime representation yet; selecting it fails fast with a
+documented `NotImplementedError` instead of pretending to match the upstream
+fast-weight recurrence.
+
 ## Upstream mechanism summary
 
 The upstream implementation modifies standard Transformer MLP blocks rather than adding an external adapter. TTT-enabled layers keep the usual `gate_proj`, `up_proj`, and `down_proj`, then add a depthwise `ttt_conv`, optional projection `ttt_proj`, a fast-weight learning rate, and a chunk size.
@@ -121,6 +129,13 @@ Commands were run with the repo virtual environment, summarized without machine-
     mode, and grouped rows update independent fast-weight slots.
   - `FastWeightState` now reports live slot count and estimated tensor bytes,
     and can enforce max-slot and max-byte limits before accepting a new slot.
+  - Fast-weight mode tests prove that explicit `exact` mode keeps storing
+    `past_w` as the full effective down-projection weight, that `low_rank`
+    state/runtime creation raises `NotImplementedError`, and that invalid mode
+    names are rejected.
+  - Memory budgeting helpers cover the documented formulas:
+    `exact = slots * layers * (H * I * bytes + tail_rows * (H + I) * bytes)`
+    and `low_rank = slots * layers * rank * (H + I) * bytes`.
 - Opt-in cached Qwen smoke:
   - With local cached `Qwen/Qwen2.5-0.5B-Instruct`, single TP, eager execution,
     and non-quantized `model.layers.0.mlp.down_proj`, installing an effective
@@ -145,6 +160,15 @@ Commands were run with the repo virtual environment, summarized without machine-
 - Runtime binding sanity check:
   - The default consumer declares required residual layers with phase `prefill`.
   - Current generic residual binding helper returned no raw tap paths for those prefill locators when given the existing decode-only raw locator map.
+
+Practical memory examples:
+
+- Exact bfloat16 Qwen-style state with `slots=8`, `layers=1`, `H=896`,
+  `I=4864`, and no cached tail is
+  `8 * 1 * (896 * 4864 * 2) = 69,763,072` bytes, about 66.5 MiB.
+- The same dimensions with a hypothetical low-rank rank-64 state would be
+  `8 * 1 * 64 * (896 + 4864) * 2 = 5,898,240` bytes, about 5.6 MiB, but that
+  is only a planning estimate until low-rank update semantics are implemented.
 
 ## Alignment conclusion
 
