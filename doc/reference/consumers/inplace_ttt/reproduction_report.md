@@ -2,14 +2,17 @@
 
 Date: 2026-04-26
 Updated: 2026-04-27
+Updated: 2026-05-01
 
 ## Scope
 
-This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. The 2026-04-27 update adds consumer-local exact toy math coverage. Runtime contracts for MLP activation, hidden target, module weight view, and fast-weight state now exist. Runtime fast-weight support now includes both a narrow down-projection effective-weight overlay and a limited Qwen/Llama-style MLP wrapper for single-TP, non-quantized MLPs. The wrapper can be installed from the vLLM runner lifecycle behind an explicit runtime opt-in using either a static single-request key or a bounded request/sample key mode for small multi-request batches.
+This assessment read the local In-Place TTT consumer, its tests and reference doc, then compared it with the upstream implementation. The 2026-04-27 update adds consumer-local exact toy math coverage. The 2026-05-01 update adds an official-shaped parity harness for the runtime fast-weight step using a toy Qwen-style MLP with `gate_proj`, `up_proj`, `down_proj`, optional random-normal `ttt_proj`, and depthwise `ttt_conv`. Runtime contracts for MLP activation, hidden target, module weight view, and fast-weight state now exist. Runtime fast-weight support now includes both a narrow down-projection effective-weight overlay and a limited Qwen/Llama-style MLP wrapper for single-TP, non-quantized MLPs. The wrapper can be installed from the vLLM runner lifecycle behind an explicit runtime opt-in using either a static single-request key or a bounded request/sample key mode for small multi-request batches.
 
 ## Upstream mechanism summary
 
 The upstream implementation modifies standard Transformer MLP blocks rather than adding an external adapter. TTT-enabled layers keep the usual `gate_proj`, `up_proj`, and `down_proj`, then add a depthwise `ttt_conv`, optional projection `ttt_proj`, a fast-weight learning rate, and a chunk size.
+
+The upstream inference initialization path initializes `ttt_proj` with the model's normal linear initializer and zero-initializes `ttt_conv`. The local parity harness uses a fixed random seed for `ttt_proj` so the toy case is deterministic, and it keeps the official zero-init `ttt_conv` as the default. A separate nonzero-convolution ablation copies deterministic depthwise weights only to prove that tLLM and the upstream-shaped reference agree when the convolution path actually contributes a nonzero fast-weight update.
 
 In the training model path, the MLP computes normal intermediate activations `h`, chunks both `h` and the target tensor `t`, derives per-chunk `down_proj` fast-weight increments, cumulatively applies those increments, and produces the MLP output with the updated down-projection weight. The update direction is LM-aligned fast-weight update on the MLP down projection, not a generic hidden reconstruction loss.
 
@@ -46,6 +49,10 @@ Commands were run with the repo virtual environment, summarized without machine-
 
 - `<repo>/.venv/bin/python -m pytest -q test/consumers/inplace_ttt/test_inplace_ttt_consumer_unit.py`
   - Result: `10 passed`.
+- `<repo>/.venv/bin/python -m pytest -q test/consumers/inplace_ttt/test_inplace_ttt_official_parity_unit.py`
+  - Result: `5 passed`.
+- `<repo>/.venv/bin/python -m pytest -q test/consumers/inplace_ttt test/runtime/inplace_ttt`
+  - Result: `45 passed, 4 skipped`.
 - Upstream import smoke with `PYTHONPATH=<upstream>`:
   - Result: failed because `opt_einsum` is not installed in the current virtual environment.
 - Upstream import with a temporary in-memory `opt_einsum.contract` shim:
@@ -90,6 +97,18 @@ Commands were run with the repo virtual environment, summarized without machine-
   - Runtime step tests cover the upstream projection formula
     `contract("c h, c d, d e -> e h", h, t, ttt_proj.weight)` and verify that
     `past_w` is updated after output emission.
+  - Official-shaped parity tests:
+    - use a Qwen-style toy MLP with separate `gate_proj`, `up_proj`,
+      `down_proj`, optional `ttt_proj`, and depthwise `ttt_conv`;
+    - initialize `ttt_proj` with fixed-seed random normal weights and
+      `ttt_conv` with official zero weights unless an explicit nonzero
+      convolution ablation is under test;
+    - compare runtime `run_down_proj_fast_weight_step()` output, updated
+      effective `past_w`, and cached activated tail rows against an
+      upstream-shaped inference reference;
+    - cover no-projection/no-effective-convolution, random `ttt_proj` with
+      zero-init `ttt_conv`, copied nonzero-convolution ablation, below-chunk
+      tail-only behavior, and tail plus next rows forming a full chunk.
   - Runner lifecycle tests prove the explicit opt-in path installs wrappers
     at model load, stores handles and state on the runtime, avoids duplicate
     installs, isolates configured layer keys, skips unsupported modules when
@@ -134,6 +153,14 @@ avoids making decode the default. Its default flow is prefill-only, and decode
 has to be explicitly requested. The consumer also performs local online updates,
 complete-chunk training, tail carryover, and active decode row handling in the
 checks above.
+
+The 2026-05-01 official-shaped random-init parity harness did not expose a
+runtime math bug in `run_down_proj_fast_weight_step()`. The runtime step matches
+the upstream-shaped reference for output emission before each chunk update,
+effective `past_w` updates, official random `ttt_proj` plus zero-init
+`ttt_conv`, nonzero-convolution ablation, below-chunk tail cache, and tail plus
+next rows forming a later chunk. No runtime or consumer math change was required
+for this parity slice.
 
 As an exact runtime reproduction of upstream In-Place TTT, it is still incomplete. The upstream core update is an in-place fast-weight update of the MLP down projection with chunkwise cumulative weights; tLLM now has the contract-level runtime surface for MLP activation, hidden target, module weight view, fast-weight state, a narrow effective-weight down-projection overlay, a limited runtime MLP wrapper that captures `h`/`t` inside Qwen/Llama-style MLPs, an explicit runner lifecycle install path, bounded per-request/per-sample packed-row separation for small batched workloads, and the upstream-style pre-update/`ttt_proj` fast-weight update formula. The shipped consumer engine still uses a separate low-rank delta adapter for live bundle consumption, and ordinary vLLM model classes do not expose upstream-trained `ttt_conv`/`ttt_proj` weights unless a compatible module or checkpoint provides them.
 
