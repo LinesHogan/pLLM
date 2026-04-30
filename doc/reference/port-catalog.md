@@ -24,6 +24,7 @@ A port is how a consumer declares the data it wants from runtime. Consumers do n
 | `mlp_activation` | Read-only | prefill, decode | MLP activation before down projection |
 | `hidden_target` | Read-only | prefill, decode | Hidden target activation for update rules |
 | `module_weight_view` | Read-only | prefill, decode | Borrowed module weight view |
+| `test_time_trainer` | Bridge | post_generate or caller-owned loop | Optional trainer handoff returning test-time LoRA updates |
 
 ## `request_meta`
 
@@ -168,3 +169,18 @@ Borrowed module weights such as `down_proj.weight`.
 The current runtime exposes the contract and fast-weight state helpers. Full
 vLLM MLP wrapping for Qwen/Llama-style modules remains a separate integration
 step.
+
+## `test_time_trainer`
+
+The shared trainer bridge is a runtime contract, not a dependency on a trainer
+stack. `TestTimeTrainingExample`, `TestTimeTrainingBatch`,
+`TestTimeTrainerRequest`, and `TestTimeTrainerResult` describe strict
+request/sample/output identity, objective kind, token ids, optional labels,
+rewards, logprobs, adapter target modules, rank, scope, request ids, returned
+`TestTimeLoRAUpdate` values, and scalar metrics.
+
+Core tLLM may call an in-process bridge or an optional external integration, but
+core imports must not import verl, PEFT, or LLaMA-Factory. External trainer
+packages belong behind optional integration modules that translate their result
+back into `TestTimeTrainerResult`, after which runtime can stage updates through
+`TestTimeLoRAService`.

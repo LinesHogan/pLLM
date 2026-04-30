@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Protocol
 
@@ -70,8 +70,16 @@ class TestTimeLoRAService:
     def stage_update(self, update: TestTimeLoRAUpdate) -> None:
         if not isinstance(update, TestTimeLoRAUpdate):
             raise TypeError("update must be TestTimeLoRAUpdate")
-        self._validate_update(update)
-        self._staged_updates.append(update)
+        self.stage_updates((update,))
+
+    def stage_updates(self, updates: Iterable[TestTimeLoRAUpdate]) -> int:
+        staged_updates = tuple(updates)
+        for update in staged_updates:
+            if not isinstance(update, TestTimeLoRAUpdate):
+                raise TypeError("updates must contain TestTimeLoRAUpdate")
+            self.validate_update(update)
+        self._staged_updates.extend(staged_updates)
+        return len(staged_updates)
 
     def commit_staged_updates(self) -> int:
         committed = 0
@@ -81,7 +89,9 @@ class TestTimeLoRAService:
             committed += 1
         return committed
 
-    def _validate_update(self, update: TestTimeLoRAUpdate) -> None:
+    def validate_update(self, update: TestTimeLoRAUpdate) -> None:
+        if not isinstance(update, TestTimeLoRAUpdate):
+            raise TypeError("update must be TestTimeLoRAUpdate")
         if update.rank > self.max_rank:
             raise RuntimeError("test-time LoRA update rank exceeds service max_rank")
         modules = self.modules
