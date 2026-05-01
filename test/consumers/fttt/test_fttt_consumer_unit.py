@@ -717,6 +717,180 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         self.assertEqual(service.adapter_for_request("req-lora"), 29)
         self.assertEqual(len(module.calls), 1)
 
+    def test_failed_completion_builds_feedback_lm_training_batch(self) -> None:
+        from tllm.consumers.fttt import FeedbackRecord, FTTTConsumer, FTTTConsumerConfig
+
+        consumer = FTTTConsumer(FTTTConsumerConfig())
+        batch = consumer.feedback_training_batch(
+            (
+                FeedbackRecord(
+                    prompt_idx=8,
+                    feedback="Your answer is incorrect. Fix the sign.",
+                    reward=0.0,
+                    request_id="req-train",
+                    sample_idx=2,
+                    output_index=1,
+                    group_id="round-train",
+                    failed_text="-4",
+                    failed_token_ids=(31, 32),
+                    feedback_token_ids=(41, 42, 43),
+                ),
+            )
+        )
+
+        self.assertEqual(batch.request_ids, ("req-train",))
+        self.assertEqual(batch.metadata["consumer_id"], "fttt")
+        example = batch.examples[0]
+        self.assertEqual(example.request_id, "req-train")
+        self.assertEqual(example.prompt_id, "8")
+        self.assertEqual(example.sample_id, "2")
+        self.assertEqual(example.output_id, "1")
+        self.assertEqual(example.objective_kind, "feedback_lm")
+        self.assertEqual(example.token_ids, (31, 32, 41, 42, 43))
+        self.assertEqual(example.labels, (-100, -100, 41, 42, 43))
+        self.assertEqual(example.rewards, (0.0,))
+        self.assertEqual(example.metadata["failed_text"], "-4")
+        self.assertEqual(example.metadata["failed_token_ids"], (31, 32))
+        self.assertEqual(example.metadata["feedback_token_ids"], (41, 42, 43))
+        self.assertEqual(example.metadata["group_id"], "round-train")
+        self.assertEqual(example.metadata["feedback_text"], "Your answer is incorrect. Fix the sign.")
+
+    def test_trainer_bridge_result_stages_lora_update_and_retry_references_adapter(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
+        from tllm.contracts.test_time_training import TestTimeTrainerResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+
+        class _FakeLoRAModule:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, torch.Tensor, torch.Tensor, float]] = []
+
+            def set_lora(
+                self,
+                adapter_id: int,
+                lora_a: torch.Tensor,
+                lora_b: torch.Tensor,
+                *,
+                bias: torch.Tensor | None,
+                scaling: float,
+            ) -> None:
+                self.calls.append((adapter_id, lora_a.detach().clone(), lora_b.detach().clone(), float(scaling)))
+
+        class _FakeManager:
+            def __init__(self, module: _FakeLoRAModule) -> None:
+                self.modules = {"model.layers.0.self_attn.q_proj": module}
+
+        update = TestTimeLoRAUpdate(
+            adapter_key="fttt:round-bridge:8:v7",
+            lora_int_id=37,
+            rank=1,
+            scope="request",
+            request_ids=("req-bridge",),
+            target_modules={
+                "model.layers.0.self_attn.q_proj": TestTimeLoRAWeights(
+                    lora_a=torch.ones(3, 1),
+                    lora_b=torch.ones(1, 4),
+                    alpha=2.0,
+                )
+            },
+            step_id=7,
+        )
+        module = _FakeLoRAModule()
+        service = TestTimeLoRAService(manager=_FakeManager(module), max_rank=1)
+        bridge = FakeTestTimeTrainerBridge(result=TestTimeTrainerResult(updates=(update,)), stage_updates=False)
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text="Your answer is incorrect. Fix the sign.",
+                feedback_token_ids=(51, 52),
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-bridge",
+                    prompt_idx=8,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(31, 32),
+                    text="-4",
+                    finish_reason="stop",
+                    group_id="round-bridge",
+                ),
+            )
+        )
+
+        result = consumer.run_trainer_bridge_closed_loop_step(
+            trace,
+            trainer_bridge=bridge,
+            lora_service=service,
+            adapter_key_prefix="fttt",
+            target_modules=("model.layers.0.self_attn.q_proj",),
+            rank=1,
+            step_id=7,
+        )
+
+        self.assertEqual(len(bridge.requests), 1)
+        self.assertEqual(bridge.requests[0].examples.examples[0].metadata["feedback_token_ids"], (51, 52))
+        self.assertEqual(result.staged_update_count, 1)
+        self.assertEqual(service.commit_staged_updates(), 1)
+        self.assertEqual(service.adapter_for_request("req-bridge"), 37)
+        self.assertEqual(len(module.calls), 1)
+        retry = result.retry_controls.entries[0]
+        self.assertTrue(retry.retry_after_update)
+        self.assertIn("adapter-key=fttt:round-bridge:8:v7", retry.reason)
+        self.assertIn("adapter-version=7", retry.reason)
+
+    def test_no_trainer_update_blocks_retry_after_update(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
+        from tllm.contracts.test_time_training import TestTimeTrainerResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+
+        bridge = FakeTestTimeTrainerBridge(result=TestTimeTrainerResult(), stage_updates=False)
+        consumer = FTTTConsumer(
+            FTTTConsumerConfig(max_retries=2),
+            judge=lambda entry: FTTTJudgeResult(
+                is_correct=False,
+                reward=0.0,
+                feedback_text="Your answer is incorrect.",
+                feedback_token_ids=(61,),
+            ),
+        )
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-no-update",
+                    prompt_idx=3,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(9,),
+                    text="bad",
+                    finish_reason="stop",
+                    group_id="round-empty",
+                ),
+            )
+        )
+
+        result = consumer.run_trainer_bridge_closed_loop_step(
+            trace,
+            trainer_bridge=bridge,
+            adapter_key_prefix="fttt",
+            target_modules=("model.layers.0.self_attn.q_proj",),
+            rank=1,
+            step_id=3,
+        )
+
+        self.assertEqual(result.staged_update_count, 0)
+        retry = result.retry_controls.entries[0]
+        self.assertEqual(retry.action, "retry")
+        self.assertFalse(retry.retry_after_update)
+        self.assertIn("trainer-no-update", retry.reason)
+
     def test_trace_judge_loop_rejects_non_strict_identity_fields(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.runtime.generation_trace_runtime import GenerationTraceBatch

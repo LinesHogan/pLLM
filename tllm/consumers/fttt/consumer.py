@@ -15,6 +15,12 @@ from torch import nn
 from torch.nn import functional as F
 
 from tllm.contracts.test_time_lora import LoRAScope, TestTimeLoRAUpdate, TestTimeLoRAWeights
+from tllm.contracts.test_time_training import (
+    TestTimeTrainerRequest,
+    TestTimeTrainerResult,
+    TestTimeTrainingBatch,
+    TestTimeTrainingExample,
+)
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers._common.alignment import LowRankAdapter
 from tllm.ports.generation_trace import GenerationTrace
@@ -25,6 +31,8 @@ from tllm.ports.update_barrier import UpdateBarrier
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
+from tllm.runtime.test_time_lora import TestTimeLoRAService
+from tllm.runtime.test_time_trainer import TestTimeTrainerBridge, stage_trainer_result_updates
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry
 
 
@@ -242,6 +250,19 @@ class FTTTToyClosedLoopResult:
     adapter_version: int
     instance_states: dict[int, FTTTInstanceState]
     lora_update: TestTimeLoRAUpdate | None = None
+
+
+@dataclass(frozen=True)
+class FTTTTrainerBridgeClosedLoopResult:
+    reward_outcomes: RewardOutcomeBatch
+    retry_controls: RetryControlBatch
+    update_barriers: UpdateBarrierBatch
+    feedback_records: tuple[FeedbackRecord, ...]
+    update_count: int
+    training_batch: TestTimeTrainingBatch | None = None
+    trainer_request: TestTimeTrainerRequest | None = None
+    trainer_result: TestTimeTrainerResult | None = None
+    staged_update_count: int = 0
 
 
 class FTTTEngine(nn.Module):
@@ -827,6 +848,226 @@ class FTTTConsumer(BaseConsumer):
                 )
             )
         return RetryControlBatch(entries=tuple(entries))
+
+    def feedback_training_batch(
+        self,
+        feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord],
+    ) -> TestTimeTrainingBatch:
+        records = tuple(feedback)
+        examples: list[TestTimeTrainingExample] = []
+        for record in records:
+            if not isinstance(record, FeedbackRecord):
+                raise TypeError("feedback must contain FeedbackRecord")
+            if not record.request_id:
+                raise ValueError("feedback training batch requires request_id")
+            feedback_token_ids = record.feedback_token_ids or self._toy_feedback_token_ids(record.feedback)
+            token_ids = tuple(record.failed_token_ids) + tuple(feedback_token_ids)
+            labels = tuple(-100 for _ in record.failed_token_ids) + tuple(feedback_token_ids)
+            examples.append(
+                TestTimeTrainingExample(
+                    request_id=record.request_id,
+                    prompt_id=str(int(record.prompt_idx)),
+                    sample_id=str(int(record.sample_idx)),
+                    output_id=str(int(record.output_index)),
+                    objective_kind="feedback_lm",
+                    token_ids=token_ids,
+                    labels=labels,
+                    rewards=(float(record.reward),),
+                    metadata={
+                        "consumer_id": self.consumer_id,
+                        "feedback_text": record.feedback,
+                        "failed_text": record.failed_text,
+                        "failed_token_ids": tuple(record.failed_token_ids),
+                        "feedback_token_ids": tuple(feedback_token_ids),
+                        "group_id": record.group_id,
+                    },
+                )
+            )
+        return TestTimeTrainingBatch(
+            examples=tuple(examples),
+            metadata={
+                "consumer_id": self.consumer_id,
+                "objective_kind": "feedback_lm",
+            },
+        )
+
+    def submit_feedback_training_batch(
+        self,
+        batch: TestTimeTrainingBatch,
+        *,
+        trainer_bridge: TestTimeTrainerBridge,
+        adapter_key: str,
+        target_modules: tuple[str, ...],
+        rank: int,
+        scope: LoRAScope = "request",
+        request_ids: tuple[str, ...] | None = None,
+        lora_service: TestTimeLoRAService | None = None,
+        algorithm_id: str = "fttt",
+        metadata: dict[str, object] | None = None,
+    ) -> tuple[TestTimeTrainerRequest, TestTimeTrainerResult, int]:
+        if not isinstance(batch, TestTimeTrainingBatch):
+            raise TypeError("batch must be TestTimeTrainingBatch")
+        train = getattr(trainer_bridge, "train", None)
+        if not callable(train):
+            raise TypeError("trainer_bridge must provide train")
+        if request_ids is None:
+            request_ids = batch.request_ids if scope == "request" else ()
+        request = TestTimeTrainerRequest(
+            algorithm_id=algorithm_id,
+            adapter_key=adapter_key,
+            target_modules=target_modules,
+            rank=rank,
+            scope=scope,
+            request_ids=tuple(request_ids),
+            examples=batch,
+            metadata=metadata or {},
+        )
+        result = train(request)
+        if not isinstance(result, TestTimeTrainerResult):
+            raise TypeError("trainer bridge must return TestTimeTrainerResult")
+        staged_count = 0
+        if lora_service is not None:
+            staged_count = stage_trainer_result_updates(request, result, lora_service)
+        return request, result, staged_count
+
+    def _adapter_key_for_feedback_training(
+        self,
+        feedback_records: Sequence[FeedbackRecord],
+        *,
+        adapter_key_prefix: str,
+        step_id: int,
+    ) -> str:
+        first_record = feedback_records[0]
+        group_id = first_record.group_id or "ungrouped"
+        version = int(step_id) if int(step_id) >= 0 else int(self.engine.adapter_version) + 1
+        return f"{adapter_key_prefix}:{group_id}:{int(first_record.prompt_idx)}:v{version}"
+
+    def _retry_controls_after_trainer_update(
+        self,
+        batch: RetryControlBatch,
+        result: TestTimeTrainerResult | None,
+        *,
+        staged_update_count: int,
+    ) -> RetryControlBatch:
+        updates = () if result is None else result.updates
+        first_update = updates[0] if updates else None
+        entries: list[RetryControlEntry] = []
+        for entry in batch.entries:
+            reason = entry.reason
+            retry_after_update = bool(entry.retry_after_update)
+            if entry.retry_after_update:
+                if staged_update_count > 0 and first_update is not None:
+                    suffix = (
+                        f"adapter-key={first_update.adapter_key};"
+                        f"adapter-version={int(first_update.step_id)}"
+                    )
+                    reason = f"{reason};{suffix}" if reason else suffix
+                else:
+                    retry_after_update = False
+                    suffix = "trainer-no-update"
+                    reason = f"{reason};{suffix}" if reason else suffix
+            entries.append(
+                RetryControlEntry(
+                    request_id=entry.request_id,
+                    prompt_idx=entry.prompt_idx,
+                    sample_idx=entry.sample_idx,
+                    output_index=entry.output_index,
+                    group_id=entry.group_id,
+                    action=entry.action,
+                    reason=reason,
+                    retry_after_update=retry_after_update,
+                )
+            )
+        return RetryControlBatch(entries=tuple(entries))
+
+    def _update_barriers_after_trainer_update(
+        self,
+        batch: UpdateBarrierBatch,
+        *,
+        staged_update_count: int,
+    ) -> UpdateBarrierBatch:
+        if staged_update_count > 0:
+            return batch
+        entries: list[UpdateBarrierEntry] = []
+        for entry in batch.entries:
+            if entry.state == "ready":
+                reason = f"{entry.reason};trainer-no-update" if entry.reason else "trainer-no-update"
+                entries.append(
+                    UpdateBarrierEntry(
+                        barrier_id=entry.barrier_id,
+                        group_id=entry.group_id,
+                        consumer_id=entry.consumer_id,
+                        state="blocked",
+                        request_ids=entry.request_ids,
+                        ready_count=0,
+                        reason=reason,
+                    )
+                )
+            else:
+                entries.append(entry)
+        return UpdateBarrierBatch(entries=tuple(entries))
+
+    def run_trainer_bridge_closed_loop_step(
+        self,
+        trace: GenerationTraceBatch,
+        *,
+        trainer_bridge: TestTimeTrainerBridge,
+        target_modules: tuple[str, ...],
+        rank: int,
+        lora_service: TestTimeLoRAService | None = None,
+        adapter_key_prefix: str = "fttt",
+        step_id: int = -1,
+        algorithm_id: str = "fttt",
+    ) -> FTTTTrainerBridgeClosedLoopResult:
+        intent = self.closed_loop_intent_for_trace(trace)
+        if not intent.feedback_records:
+            return FTTTTrainerBridgeClosedLoopResult(
+                reward_outcomes=intent.reward_outcomes,
+                retry_controls=intent.retry_controls,
+                update_barriers=intent.update_barriers,
+                feedback_records=intent.feedback_records,
+                update_count=intent.update_count,
+            )
+        training_batch = self.feedback_training_batch(intent.feedback_records)
+        adapter_key = self._adapter_key_for_feedback_training(
+            intent.feedback_records,
+            adapter_key_prefix=adapter_key_prefix,
+            step_id=step_id,
+        )
+        trainer_request, trainer_result, staged_count = self.submit_feedback_training_batch(
+            training_batch,
+            trainer_bridge=trainer_bridge,
+            adapter_key=adapter_key,
+            target_modules=target_modules,
+            rank=rank,
+            scope="request",
+            lora_service=lora_service,
+            algorithm_id=algorithm_id,
+            metadata={
+                "consumer_id": self.consumer_id,
+                "step_id": int(step_id),
+            },
+        )
+        retry_controls = self._retry_controls_after_trainer_update(
+            intent.retry_controls,
+            trainer_result,
+            staged_update_count=staged_count,
+        )
+        update_barriers = self._update_barriers_after_trainer_update(
+            intent.update_barriers,
+            staged_update_count=staged_count,
+        )
+        return FTTTTrainerBridgeClosedLoopResult(
+            reward_outcomes=intent.reward_outcomes,
+            retry_controls=retry_controls,
+            update_barriers=update_barriers,
+            feedback_records=intent.feedback_records,
+            update_count=intent.update_count,
+            training_batch=training_batch,
+            trainer_request=trainer_request,
+            trainer_result=trainer_result,
+            staged_update_count=staged_count,
+        )
 
     def run_toy_closed_loop_step(
         self,

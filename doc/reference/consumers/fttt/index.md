@@ -24,6 +24,9 @@ reference repository modules.
 - completed-generation trace judging into reward outcomes and queued feedback.
 - consumer-side toy closed-loop execution from trace to local update to retry
   intent.
+- feedback-token training batch construction for optional trainer bridges.
+- trainer-bridge handoff that can stage returned `TestTimeLoRAUpdate` values
+  through the runtime LoRA service.
 
 The trace judge path is intentionally lightweight. Callers may inject a local
 judge callable that receives each completed generation trace entry and returns
@@ -90,6 +93,31 @@ helper for tests. It:
 This closes a consumer-side trace -> judge -> feedback -> local update -> retry
 intent loop. It still does not train a full LM feedback-token loss or schedule a
 real vLLM regenerate step.
+
+## Optional Trainer Bridge
+
+Full FTTT-style feedback-token training is external and optional. The core
+consumer provides the runtime-facing handoff pieces without importing PEFT,
+verl, LLaMA-Factory, dataset runners, or reward-model services:
+
+- `feedback_training_batch(feedback_records)` converts failed-completion
+  `FeedbackRecord` values into a strict `TestTimeTrainingBatch` whose examples
+  use objective kind `feedback_lm`.
+- Each example preserves the failed completion text, failed token ids, feedback
+  token ids, request id, sample id, output id, group id, and feedback text in
+  the contract fields and metadata.
+- `run_trainer_bridge_closed_loop_step(...)` builds closed-loop intent,
+  submits the batch to a `TestTimeTrainerBridge`, stages returned
+  `TestTimeLoRAUpdate` values when a `TestTimeLoRAService` is supplied, and
+  returns retry controls after the update decision.
+- Retry control keeps `retry_after_update=True` only when a trainer returned an
+  update that was staged. If the trainer returns no LoRA update, retry-after-
+  update is blocked and the ready barrier is converted to blocked.
+
+This means tLLM core owns trace capture, feedback batch construction, update
+barrier intent, and LoRA apply/staging support. A full feedback-LM optimizer may
+live in a separate integration and call back through the dependency-light
+trainer bridge.
 
 ## Instance State
 

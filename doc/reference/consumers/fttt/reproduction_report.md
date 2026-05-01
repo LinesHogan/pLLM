@@ -77,6 +77,19 @@ The tLLM implementation in `tllm/consumers/fttt/consumer.py` provides:
   - retry intent is returned after the update and includes the updated adapter
     version in the retry reason, while updated instance state exposes retry
     count and adapter version.
+- An optional trainer-bridge handoff:
+  - `feedback_training_batch(feedback_records)` converts failed-completion
+    feedback records into `feedback_lm` examples with failed tokens masked and
+    feedback token ids used as the label tokens;
+  - failed completion text, failed token ids, feedback token ids, request id,
+    sample id, output id, and group id are preserved in strict contract fields
+    and example metadata;
+  - `run_trainer_bridge_closed_loop_step(...)` submits the feedback batch to a
+    dependency-light `TestTimeTrainerBridge` and stages returned
+    `TestTimeLoRAUpdate` values through `TestTimeLoRAService` when supplied;
+  - retry control references the staged adapter key and version only after an
+    update is returned, and blocks retry-after-update when the trainer returns
+    no LoRA update.
 - No import of external feedback APIs or heavy upstream modules.
 
 This maps to a local feedback-conditioned edit primitive. It is closer than a
@@ -93,7 +106,9 @@ loop's full runtime behavior:
 - The adapter output can be applied to hidden/logit tensors, but tLLM does not
   yet own an integrated runtime retry loop that applies it during vLLM decoding.
 - There is no bundled dataset judge or runtime retry orchestrator.
-- There is no equivalent of upstream LoRA test-time optimization or OpTune's activation/gradient transform.
+- There is no bundled equivalent of upstream LoRA test-time optimization or
+  OpTune's activation/gradient transform. Full feedback-LM training is expected
+  to live behind an optional external trainer bridge.
 - The `TestTimeLoRAUpdate` export is consumer-side packaging only. It transposes
   the local feedback adapter factors into the runtime contract shape, but it
   does not prove that a concrete vLLM target module accepts or applies the
@@ -150,6 +165,13 @@ Commands are summarized with placeholders to avoid machine-local paths:
   - Result: a trained feedback adapter exported a nonzero
     `TestTimeLoRAUpdate`, committed into a fake LoRA module, and assigned two
     request ids to the LoRA id.
+- Trainer-bridge handoff through fake `TestTimeTrainerBridge` and fake
+  `TestTimeLoRAService`
+  - Result: failed-completion feedback became a `feedback_lm`
+    `TestTimeTrainingBatch`, the fake bridge returned a request-scoped
+    `TestTimeLoRAUpdate`, the update staged and committed through the fake LoRA
+    service, retry control referenced the staged adapter key/version, and an
+    empty trainer result blocked retry-after-update.
 
 ## Lightweight Model/Toy Results
 
@@ -232,10 +254,14 @@ The current consumer branch adds toy coverage for the runtime-facing loop shape:
   barrier sink writes without vLLM, GPU, or model downloads;
 - the local adapter update path consumes the emitted feedback records and reports
   nonzero update/loss counts.
+- optional external training receives a `feedback_lm` batch without importing
+  heavy trainer dependencies, and returned LoRA updates can be staged through the
+  shared runtime LoRA service before retry intent is released.
 
 This remains a consumer-side closed-loop intent, not full upstream FTTT. The
-runtime still needs to schedule an actual regenerate-after-update loop and apply
-feedback-token or LoRA updates to the model path.
+runtime still needs to schedule an actual regenerate-after-update loop. Full
+feedback-token optimization is intentionally outside tLLM core and should be
+provided by an optional trainer integration.
 
 ## Alignment Conclusion
 
@@ -246,14 +272,15 @@ The implementation is a clean, local, dependency-light feedback consumer. Its
 tests demonstrate bounded queue behavior, feedback-conditioned edits,
 hidden/logit edit application, stop-on-correct behavior, per-instance reset, and
 trace -> judge -> feedback/outcome conversion. However, it omits the central
-training mechanism: failed-generation feedback is not converted into token-level
-LM loss, no PEFT LoRA path trains actual model target modules, and tLLM does not
-yet orchestrate retry generation from judge outcomes. The new
-`TestTimeLoRAUpdate` export gives the runtime team a strict handoff object for
-the toy adapter factors, but runtime/vLLM apply smoke remains unverified. As a
-result, the consumer should be described as an FTTT-inspired feedback edit
-primitive with a toy trace judge loop rather than a complete reproduction of the
-upstream method.
+training mechanism inside core: failed-generation feedback can be converted into
+`feedback_lm` training batches, but no PEFT LoRA path trains actual model target
+modules in the consumer itself, and tLLM does not yet orchestrate retry
+generation from judge outcomes. The `TestTimeLoRAUpdate` export and trainer
+bridge give integrations strict handoff objects, but runtime/vLLM apply smoke
+remains unverified. As a result, the consumer should be described as an
+FTTT-inspired feedback edit primitive with a toy trace judge loop and optional
+external trainer bridge rather than a complete reproduction of the upstream
+method.
 
 ## Gaps and Risks
 
@@ -269,4 +296,6 @@ upstream method.
   generate/retry loop.
 - No test covers judge-driven retry behavior across multiple runtime generation
   rounds.
-- The existing no-external-API constraint is satisfied, but any future attempt to reproduce reward-model feedback should keep it optional and local unless explicitly allowed.
+- The existing no-external-API constraint is satisfied, but any future attempt
+  to reproduce reward-model feedback or full feedback-LM training should keep it
+  optional and local unless explicitly allowed.
