@@ -412,6 +412,167 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         self.assertEqual(stats.update_count, 1)
         self.assertEqual(stats.reward_count, 2)
 
+    def test_majority_rewards_feed_grpo_training_examples_with_logprobs_and_selection(self) -> None:
+        from tllm.consumers.ttrl import build_ttrl_grpo_training_batch
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(10, 11),
+                    text=r"Path A. \boxed{4}",
+                    finish_reason="stop",
+                    group_id="round-0",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=0,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(12, 13),
+                    text=r"Path B. \boxed{4}",
+                    finish_reason="stop",
+                    group_id="round-0",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-c",
+                    prompt_idx=0,
+                    sample_idx=2,
+                    output_index=0,
+                    token_ids=(14, 15),
+                    text=r"Path C. \boxed{5}",
+                    finish_reason="stop",
+                    group_id="round-0",
+                ),
+            )
+        )
+
+        batch = build_ttrl_grpo_training_batch(
+            trace,
+            n_votes_per_prompt=3,
+            n_samples_per_prompt=2,
+            current_logprobs_by_index={0: (-0.2, -0.3), 1: (-0.4, -0.5)},
+            reference_logprobs_by_index={0: (-0.1, -0.2), 1: (-0.3, -0.6)},
+        )
+
+        self.assertEqual(len(batch.examples), 2)
+        self.assertEqual(batch.metadata["algorithm_id"], "ttrl_grpo")
+        self.assertEqual(batch.metadata["selected_training_indices"], (0, 1))
+        self.assertEqual([example.request_id for example in batch.examples], ["req-a", "req-b"])
+        self.assertEqual([example.rewards for example in batch.examples], [(1.0,), (1.0,)])
+        self.assertEqual(batch.examples[0].objective_kind, "grpo")
+        self.assertEqual(batch.examples[0].logprobs, (-0.2, -0.3))
+        self.assertEqual(batch.examples[0].metadata["reference_logprobs"], (-0.1, -0.2))
+        self.assertEqual(batch.examples[0].metadata["group_id"], "round-0")
+        self.assertEqual(batch.examples[0].metadata["training_index"], 0)
+        self.assertEqual(batch.examples[0].metadata["majority_label"], "4")
+
+    def test_grpo_group_advantages_and_clipped_ratio_loss_on_toy_logprobs(self) -> None:
+        from tllm.consumers.ttrl import ttrl_grpo_clipped_ratio_loss, ttrl_grpo_group_normalized_advantages
+
+        rewards = torch.tensor([1.0, 0.0, 0.5, 0.5])
+
+        advantages = ttrl_grpo_group_normalized_advantages(rewards, ("g0", "g0", "g1", "g1"))
+
+        self.assertTrue(torch.allclose(advantages, torch.tensor([1.0, -1.0, 0.0, 0.0]), atol=1e-6))
+
+        current = torch.log(torch.tensor([[1.30], [0.90], [1.00], [1.00]], dtype=torch.float32))
+        old = torch.zeros_like(current)
+        loss = ttrl_grpo_clipped_ratio_loss(
+            current_logprobs=current,
+            old_logprobs=old,
+            advantages=advantages,
+            clip_epsilon=0.2,
+        )
+
+        expected_surrogate = torch.tensor([1.2, -0.9, 0.0, 0.0]).mean().neg()
+        self.assertTrue(torch.allclose(loss, expected_surrogate, atol=1e-6))
+
+    def test_fake_grpo_trainer_bridge_returns_request_scoped_lora_update(self) -> None:
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig, build_ttrl_grpo_training_batch
+        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
+        from tllm.contracts.test_time_training import TestTimeTrainerResult
+        from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+
+        class _Manager:
+            def __init__(self) -> None:
+                self.modules = {"layers.0.mlp.down_proj": object()}
+                self.committed: list[TestTimeLoRAUpdate] = []
+
+            def commit_update(self, update: TestTimeLoRAUpdate) -> None:
+                self.committed.append(update)
+
+        trace = GenerationTraceBatch(
+            entries=(
+                CompletionTraceEntry(
+                    request_id="req-a",
+                    prompt_idx=0,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(1, 2),
+                    text=r"\boxed{4}",
+                    finish_reason="stop",
+                    group_id="round-0",
+                ),
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=0,
+                    sample_idx=1,
+                    output_index=0,
+                    token_ids=(3, 4),
+                    text=r"\boxed{5}",
+                    finish_reason="stop",
+                    group_id="round-0",
+                ),
+            )
+        )
+        batch = build_ttrl_grpo_training_batch(trace)
+        weights = TestTimeLoRAWeights(lora_a=torch.ones(2, 1), lora_b=torch.ones(1, 2))
+        update = TestTimeLoRAUpdate(
+            adapter_key="ttrl-grpo",
+            lora_int_id=7,
+            rank=1,
+            scope="request",
+            target_modules={"layers.0.mlp.down_proj": weights},
+            request_ids=("req-a", "req-b"),
+        )
+        service = TestTimeLoRAService(manager=_Manager(), max_rank=4)
+        bridge = FakeTestTimeTrainerBridge(result=TestTimeTrainerResult(updates=(update,)))
+        consumer = TTRLConsumer(TTRLConsumerConfig(rank=1))
+
+        result = consumer.submit_grpo_training_batch(
+            batch,
+            trainer_bridge=bridge,
+            lora_service=service,
+            adapter_key="ttrl-grpo",
+            target_modules=("layers.0.mlp.down_proj",),
+            scope="request",
+            request_ids=("req-a", "req-b"),
+        )
+
+        self.assertEqual(result.updates, (update,))
+        self.assertEqual(len(bridge.requests), 1)
+        self.assertEqual(bridge.requests[0].algorithm_id, "ttrl_grpo")
+        self.assertEqual(bridge.requests[0].examples, batch)
+        self.assertEqual(service.commit_staged_updates(), 1)
+        self.assertEqual(service.adapter_for_request("req-a"), 7)
+
+    def test_optional_verl_grpo_bridge_is_unavailable_without_dependency(self) -> None:
+        from tllm.consumers.ttrl import create_optional_verl_grpo_bridge
+
+        before = set(sys.modules)
+        with self.assertRaisesRegex(RuntimeError, "optional verl integration is unavailable"):
+            create_optional_verl_grpo_bridge()
+        after = set(sys.modules)
+
+        self.assertNotIn("verl", after - before)
+
     def test_ttrl_module_does_not_import_verl(self) -> None:
         before = set(sys.modules)
 

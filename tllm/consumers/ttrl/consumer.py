@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Iterable, Protocol, Sequence
@@ -80,6 +81,13 @@ class TTRLRewardResult:
     sample_results: list[TTRLSampleReward]
     selected_indices: list[int]
     verifier_name: str = _TTRL_DEFAULT_VERIFIER_JUDGE
+
+
+@dataclass(frozen=True)
+class TTRLGRPOTrainerBridgeUnavailable:
+    """Placeholder for optional external GRPO trainer integrations."""
+
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -405,6 +413,205 @@ def majority_vote_rewards(samples: Sequence[TTRLSample], *, verifier: TTRLVerifi
     return build_ttrl_reward_result(samples, verifier=verifier).rewards
 
 
+def _tuple_float_values(values: object, *, field_name: str) -> tuple[float, ...]:
+    if values is None:
+        return ()
+    if hasattr(values, "detach") and callable(getattr(values, "detach")):
+        values = values.detach().cpu().reshape(-1).tolist()
+    try:
+        return tuple(float(value) for value in values)  # type: ignore[union-attr]
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of real values") from exc
+
+
+def _logprobs_for_index(
+    trace_entry: object,
+    index: int,
+    mapping: Mapping[int, Sequence[float]] | None,
+    *,
+    attr_name: str,
+    field_name: str,
+) -> tuple[float, ...] | None:
+    values: object | None = None
+    if mapping is not None and int(index) in mapping:
+        values = mapping[int(index)]
+    elif hasattr(trace_entry, attr_name):
+        values = getattr(trace_entry, attr_name)
+    if values is None:
+        return None
+    normalized = _tuple_float_values(values, field_name=field_name)
+    if not normalized:
+        raise ValueError(f"{field_name} must be non-empty when provided")
+    return normalized
+
+
+def build_ttrl_grpo_training_batch(
+    trace: object,
+    *,
+    n_votes_per_prompt: int | None = None,
+    n_samples_per_prompt: int | None = None,
+    verifier: TTRLVerifier | None = None,
+    current_logprobs_by_index: Mapping[int, Sequence[float]] | None = None,
+    reference_logprobs_by_index: Mapping[int, Sequence[float]] | None = None,
+) -> object:
+    """Build dependency-light GRPO examples from a completed generation trace."""
+
+    from tllm.contracts.test_time_training import TestTimeTrainingBatch, TestTimeTrainingExample
+    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
+
+    if not isinstance(trace, GenerationTraceBatch):
+        raise TypeError("trace must be GenerationTraceBatch")
+
+    samples = [
+        TTRLSample(
+            prompt_idx=int(entry.prompt_idx),
+            sample_idx=int(entry.sample_idx),
+            completion=str(entry.text),
+        )
+        for entry in trace.entries
+    ]
+    reward_result = build_ttrl_reward_result(
+        samples,
+        n_votes_per_prompt=n_votes_per_prompt,
+        n_samples_per_prompt=n_samples_per_prompt,
+        verifier=verifier,
+    )
+
+    examples: list[TestTimeTrainingExample] = []
+    selected_training_indices: list[int] = []
+    for training_order, sample_index in enumerate(reward_result.selected_indices):
+        trace_entry = trace.entries[int(sample_index)]
+        token_ids = tuple(int(token_id) for token_id in trace_entry.token_ids)
+        if not token_ids:
+            raise ValueError("GRPO training examples require non-empty token_ids")
+        sample_result = reward_result.sample_results[int(training_order)]
+        current_logprobs = _logprobs_for_index(
+            trace_entry,
+            int(sample_index),
+            current_logprobs_by_index,
+            attr_name="logprobs",
+            field_name="current_logprobs",
+        )
+        reference_logprobs = _logprobs_for_index(
+            trace_entry,
+            int(sample_index),
+            reference_logprobs_by_index,
+            attr_name="reference_logprobs",
+            field_name="reference_logprobs",
+        )
+        if current_logprobs is not None and len(current_logprobs) != len(token_ids):
+            raise ValueError("current_logprobs length must match token_ids")
+        if reference_logprobs is not None and len(reference_logprobs) != len(token_ids):
+            raise ValueError("reference_logprobs length must match token_ids")
+        metadata: dict[str, object] = {
+            "group_id": str(trace_entry.group_id),
+            "training_index": int(sample_index),
+            "prompt_idx": int(trace_entry.prompt_idx),
+            "sample_idx": int(trace_entry.sample_idx),
+            "output_index": int(trace_entry.output_index),
+            "majority_label": str(sample_result.majority_label),
+            "sample_label": str(sample_result.label),
+            "majority_ratio": float(sample_result.majority_ratio),
+            "finish_reason": str(trace_entry.finish_reason),
+        }
+        if reference_logprobs is not None:
+            metadata["reference_logprobs"] = reference_logprobs
+        examples.append(
+            TestTimeTrainingExample(
+                request_id=str(trace_entry.request_id),
+                prompt_id=str(trace_entry.prompt_idx),
+                sample_id=str(trace_entry.sample_idx),
+                output_id=str(trace_entry.output_index),
+                objective_kind="grpo",
+                token_ids=token_ids,
+                rewards=(float(sample_result.reward),),
+                logprobs=current_logprobs,
+                metadata=metadata,
+            )
+        )
+        selected_training_indices.append(int(sample_index))
+
+    return TestTimeTrainingBatch(
+        examples=tuple(examples),
+        metadata={
+            "algorithm_id": "ttrl_grpo",
+            "selected_training_indices": tuple(selected_training_indices),
+            "verifier_name": str(reward_result.verifier_name),
+        },
+    )
+
+
+def ttrl_grpo_group_normalized_advantages(
+    rewards: torch.Tensor,
+    group_ids: Sequence[object],
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Normalize scalar rewards within each group for toy GRPO tests."""
+
+    reward_values = rewards.reshape(-1)
+    if not torch.is_floating_point(reward_values):
+        reward_values = reward_values.to(dtype=torch.float32)
+    if len(group_ids) != int(reward_values.shape[0]):
+        raise ValueError("group_ids length must match rewards")
+    advantages = torch.zeros_like(reward_values)
+    grouped_indices: dict[object, list[int]] = defaultdict(list)
+    for idx, group_id in enumerate(group_ids):
+        grouped_indices[group_id].append(int(idx))
+    for indices in grouped_indices.values():
+        index_tensor = torch.tensor(indices, device=reward_values.device)
+        group_rewards = reward_values.index_select(0, index_tensor)
+        centered = group_rewards - group_rewards.mean()
+        std = group_rewards.std(unbiased=False)
+        if float(std.detach().cpu()) <= float(eps):
+            group_advantages = torch.zeros_like(group_rewards)
+        else:
+            group_advantages = centered / (std + float(eps))
+        advantages.index_copy_(0, index_tensor, group_advantages)
+    return advantages.reshape_as(rewards)
+
+
+def ttrl_grpo_clipped_ratio_loss(
+    *,
+    current_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_epsilon: float = 0.2,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return a PPO/GRPO-style clipped ratio loss for small logprob tensors."""
+
+    if current_logprobs.shape != old_logprobs.shape:
+        raise ValueError("current_logprobs and old_logprobs must have the same shape")
+    if current_logprobs.ndim == 0:
+        raise ValueError("logprob tensors must have at least one dimension")
+    token_delta = current_logprobs - old_logprobs
+    if mask is not None:
+        if mask.shape != current_logprobs.shape:
+            raise ValueError("mask shape must match logprob tensors")
+        token_delta = token_delta * mask.to(device=current_logprobs.device, dtype=current_logprobs.dtype)
+    sample_log_ratio = token_delta.reshape(int(token_delta.shape[0]), -1).sum(dim=1)
+    flat_advantages = advantages.reshape(-1).to(device=current_logprobs.device, dtype=current_logprobs.dtype)
+    if int(flat_advantages.shape[0]) != int(sample_log_ratio.shape[0]):
+        raise ValueError("advantages length must match logprob batch size")
+    ratio = torch.exp(sample_log_ratio)
+    clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_epsilon), 1.0 + float(clip_epsilon))
+    surrogate = torch.minimum(ratio * flat_advantages, clipped_ratio * flat_advantages)
+    return -surrogate.mean()
+
+
+def create_optional_verl_grpo_bridge(*args: object, **kwargs: object) -> TTRLGRPOTrainerBridgeUnavailable:
+    """Placeholder factory for optional verl-backed GRPO training.
+
+    Core TTRL code intentionally does not import verl. A real integration should
+    live in an optional package and supply the shared TestTimeTrainerBridge
+    protocol.
+    """
+
+    _ = args, kwargs
+    raise RuntimeError("optional verl integration is unavailable; install and load an external trainer bridge")
+
+
 class TTRLEngine(nn.Module):
     def __init__(self, config: TTRLConsumerConfig) -> None:
         super().__init__()
@@ -583,6 +790,46 @@ class TTRLConsumer(BaseConsumer):
     def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
         reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)
         self.engine.update(hidden, reward_tensor)
+
+    def submit_grpo_training_batch(
+        self,
+        batch: object,
+        *,
+        trainer_bridge: object,
+        lora_service: object | None = None,
+        adapter_key: str = "ttrl-grpo",
+        target_modules: tuple[str, ...] = (),
+        scope: str = "request",
+        request_ids: tuple[str, ...] | None = None,
+    ) -> object:
+        from tllm.contracts.test_time_training import TestTimeTrainerRequest, TestTimeTrainingBatch
+        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time_trainer import stage_trainer_result_updates
+
+        if not isinstance(batch, TestTimeTrainingBatch):
+            raise TypeError("batch must be TestTimeTrainingBatch")
+        if not target_modules:
+            raise ValueError("target_modules must be non-empty")
+        train = getattr(trainer_bridge, "train", None)
+        if not callable(train):
+            raise TypeError("trainer_bridge must provide train")
+        resolved_request_ids = tuple(batch.request_ids if request_ids is None else request_ids)
+        request = TestTimeTrainerRequest(
+            algorithm_id="ttrl_grpo",
+            adapter_key=str(adapter_key),
+            target_modules=tuple(str(module_name) for module_name in target_modules),
+            rank=int(self.config.rank),
+            scope=scope,  # type: ignore[arg-type]
+            request_ids=resolved_request_ids,
+            examples=batch,
+            metadata={"consumer_id": self.consumer_id},
+        )
+        result = train(request)
+        if lora_service is not None:
+            if not isinstance(lora_service, TestTimeLoRAService):
+                raise TypeError("lora_service must be TestTimeLoRAService")
+            stage_trainer_result_updates(request, result, lora_service)
+        return result
 
     def read_stats(self) -> TTRLStats:
         return self.engine.read_stats()

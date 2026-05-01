@@ -20,7 +20,12 @@ The first version implements two local pieces:
   traces into `RewardOutcomeBatch` entries,
 - a no-model closed-loop helper that builds rewards, runs the local toy update,
   and produces retry scheduling metadata tied to the updated adapter version,
-- a small low-rank score adapter trained from hidden rows and scalar rewards.
+- a small low-rank score adapter trained from hidden rows and scalar rewards,
+- a lightweight GRPO batch builder that packages majority rewards, selected
+  training indices, group ids, optional current logprobs, and optional reference
+  logprobs into the shared test-time trainer contract,
+- pure PyTorch toy helpers for per-group reward normalization and clipped-ratio
+  loss on small logprob tensors.
 
 Majority voting is boxed-only. The consumer extracts the last `\boxed{...}`
 answer, normalizes that boxed content, and ignores unboxed completions for
@@ -53,11 +58,33 @@ This remains a toy alignment path. It does not implement the full TTRL LoRA
 actor loop, PPO/GRPO updates, policy feedback into generation, or a full
 math-equivalence grader.
 
+## Lightweight GRPO Bridge
+
+`build_ttrl_grpo_training_batch()` converts a completed `GenerationTraceBatch`
+into a `TestTimeTrainingBatch` with `objective_kind="grpo"`. Each example keeps
+the request, prompt, sample, output, token ids, scalar majority reward, group id,
+and selected training index. Current policy logprobs can be stored in the
+contract `logprobs` field; reference policy logprobs are optional metadata.
+
+`TTRLConsumer.submit_grpo_training_batch()` submits that batch through the shared
+`TestTimeTrainerBridge` protocol and can stage returned request-scoped
+`TestTimeLoRAUpdate` values through `TestTimeLoRAService`. This is only a bridge
+surface: tLLM core does not ship a distributed GRPO actor trainer.
+
+`ttrl_grpo_group_normalized_advantages()` and
+`ttrl_grpo_clipped_ratio_loss()` are small PyTorch helpers for unit-testable toy
+math. They do not claim parity with verl, Ray, FSDP, or a production RL trainer.
+
+verl integration is optional. Core TTRL imports do not import `verl`; a future
+integration should live outside the core package and provide the trainer bridge
+protocol. `create_optional_verl_grpo_bridge()` is a placeholder that reports the
+external bridge is unavailable instead of importing heavy dependencies.
+
 ## Usage
 
 ```python
 from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig, TTRLSample
-from tllm.consumers.ttrl import build_ttrl_reward_outcome_batch, build_ttrl_reward_result
+from tllm.consumers.ttrl import build_ttrl_grpo_training_batch, build_ttrl_reward_outcome_batch, build_ttrl_reward_result
 from tllm.consumers.ttrl import run_ttrl_toy_closed_loop
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 
@@ -82,7 +109,7 @@ trace = GenerationTraceBatch(
             prompt_idx=0,
             sample_idx=0,
             output_index=0,
-            token_ids=(),
+            token_ids=(101, 102),
             text=r"Trace A. \boxed{4}",
             finish_reason="stop",
             group_id="round-a",
@@ -91,6 +118,9 @@ trace = GenerationTraceBatch(
 )
 outcomes = build_ttrl_reward_outcome_batch(trace)
 assert outcomes.entries[0].judge == "ttrl_majority:boxed_normalized_exact"
+
+grpo_batch = build_ttrl_grpo_training_batch(trace)
+assert grpo_batch.examples[0].objective_kind == "grpo"
 ```
 
 For a no-model closed-loop toy:
