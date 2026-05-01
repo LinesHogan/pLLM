@@ -253,7 +253,7 @@ The tLLM consumer correctly reproduces the core OverRIDE mechanism:
   rows,
 - no upstream dependency.
 
-End-to-end diverse decoding verdict: **not yet fully integrated**.
+Runtime decode verdict: **guarded tLLM smoke available**.
 
 The consumer now exposes the right primitive operations and a minimal tLLM
 sampler-provider loop: request-id iteration parsing, batched grouping by
@@ -261,18 +261,20 @@ iteration, cached `q_logits_next`, pre-sample reweighting, and post-sample
 sampled-token update by the same internal decode-row ids. This closes the local
 sampler adapter gap for fake sampler tests.
 
-Full end-to-end model decoding remains unverified here. The current evidence is
-unit-level and tensor-level; a cached vLLM smoke should still verify that real
-decode metadata supplies one request id per sampler row and that enabled runs
-produce nonzero `loss_count`.
+The closure update adds `test_override_real_decode_smoke.py`, guarded by
+`TLLM_OVERRIDE_RUN_CACHED_MODEL_SMOKE=1`, to run cached Qwen vLLM decode with
+OverRIDE disabled and enabled on the same workload. The smoke asserts real
+decode outputs, nonzero `loss_count` and `update_count`, and records a same-run
+throughput ratio. Routine unit coverage remains dependency-light; the guarded
+smoke is the evidence path for CUDA/local-cache sessions.
 
 ## Gaps And Risks
 
 - `flows()` returns empty, so the current consumer is a manual logits/sampler
   primitive plus sampler provider rather than a hidden-row bundle consumer.
 - The sampler provider requires one request id per decode row. The fake sampler
-  tests cover this contract, but a real vLLM smoke should confirm decode
-  metadata shape under the active runtime configuration.
+  tests cover this contract, and the guarded cached-model smoke is the opt-in
+  check for active runtime metadata shape.
 - The local update path does not use `ignore_index=-100`; upstream does. This
   should not matter for ordinary sampled token ids, but it matters if masked
   targets are ever passed through the same API.

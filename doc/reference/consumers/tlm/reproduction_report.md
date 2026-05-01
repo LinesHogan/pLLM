@@ -214,8 +214,8 @@ level.
 
 ## Alignment Conclusion
 
-The current tLLM TLM consumer is a partial formula-level reproduction of the
-upstream TTL objective, but not a full runtime reproduction.
+The current tLLM TLM consumer is scoped formula and handoff alignment for the
+upstream TTL objective, with full trainer-module optimization kept outside core.
 
 It now captures online/offline test-time adaptation APIs, CE-threshold sample
 filtering, selected-row exponential weighting, causal-shifted toy parity, and a

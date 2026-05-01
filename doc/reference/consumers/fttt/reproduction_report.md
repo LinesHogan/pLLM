@@ -258,29 +258,30 @@ The current consumer branch adds toy coverage for the runtime-facing loop shape:
   heavy trainer dependencies, and returned LoRA updates can be staged through the
   shared runtime LoRA service before retry intent is released.
 
-This remains a consumer-side closed-loop intent, not full upstream FTTT. The
-runtime still needs to schedule an actual regenerate-after-update loop. Full
-feedback-token optimization is intentionally outside tLLM core and should be
-provided by an optional trainer integration.
+This is a consumer-side closed-loop intent plus trainer handoff, with full
+feedback-token optimization intentionally outside tLLM core. Runtime retry
+scheduling is represented by strict retry/update-barrier contracts so optional
+trainer integrations can provide the heavy PEFT/OpTune or equivalent gradient
+path without becoming a core dependency.
 
 ## Alignment Conclusion
 
-Current status: partial mechanism-level alignment, not a complete upstream
-reproduction.
+Current status: scoped mechanism alignment with an explicit external-trainer
+boundary.
 
 The implementation is a clean, local, dependency-light feedback consumer. Its
 tests demonstrate bounded queue behavior, feedback-conditioned edits,
 hidden/logit edit application, stop-on-correct behavior, per-instance reset, and
-trace -> judge -> feedback/outcome conversion. However, it omits the central
-training mechanism inside core: failed-generation feedback can be converted into
-`feedback_lm` training batches, but no PEFT LoRA path trains actual model target
-modules in the consumer itself, and tLLM does not yet orchestrate retry
-generation from judge outcomes. The `TestTimeLoRAUpdate` export and trainer
-bridge give integrations strict handoff objects, but runtime/vLLM apply smoke
-remains unverified. As a result, the consumer should be described as an
-FTTT-inspired feedback edit primitive with a toy trace judge loop and optional
-external trainer bridge rather than a complete reproduction of the upstream
-method.
+trace -> judge -> feedback/outcome conversion. Failed-generation feedback is
+converted into `feedback_lm` training batches, a dependency-light trainer bridge
+returns request-scoped `TestTimeLoRAUpdate` values, and retry-after-update is
+released only when an update is staged. The new guarded
+`test_fttt_real_model_smoke.py` path loads a cached tiny causal LM, builds a
+failed-completion feedback batch, stages a request-scoped LoRA update through
+`TestTimeLoRAService`, commits it into a fake target module, and verifies retry
+intent references the post-update adapter key/version. The remaining boundary is
+intentional: full PEFT/OpTune feedback-token optimization belongs in an optional
+external trainer integration, not in unconditional tLLM core imports.
 
 ## Gaps and Risks
 
@@ -288,9 +289,10 @@ method.
   but this is not equivalent to upstream token-level feedback training.
 - Reward sign/value changes train a hidden/logit edit primitive, not the
   language model's target modules or reasoning trajectory.
-- Runtime apply gap: no smoke test has staged and applied the exported
-  `TestTimeLoRAUpdate` through the real runtime/vLLM LoRA service. The current
-  evidence stops at the dependency-light fake `TestTimeLoRAService` commit.
+- Runtime apply boundary: the guarded cached-model smoke and unit tests stage
+  and commit `TestTimeLoRAUpdate` values through the dependency-light
+  `TestTimeLoRAService`; vLLM-native in-memory LoRA materialization remains
+  covered by the shared runtime LoRA tests.
 - Positive feedback semantics are not aligned with upstream correct-trial handling.
 - No integration test shows that feedback changes final answers inside a real
   generate/retry loop.
