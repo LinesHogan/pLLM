@@ -112,7 +112,7 @@ Commands are shown with placeholders to avoid local machine paths.
 Result:
 
 ```text
-22 passed, 7 subtests passed
+25 passed, 1 skipped, 7 subtests passed
 ```
 
 Sampler patch callback check:
@@ -267,6 +267,22 @@ OverRIDE disabled and enabled on the same workload. The smoke asserts real
 decode outputs, nonzero `loss_count` and `update_count`, and records a same-run
 throughput ratio. Routine unit coverage remains dependency-light; the guarded
 smoke is the evidence path for CUDA/local-cache sessions.
+
+2026-05-01 guarded cached-Qwen smoke result, using the repo virtualenv with
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`:
+
+```text
+baseline_tok_s=984.102
+enabled_tok_s=845.930
+ratio=0.860
+loss_count=15
+update_count=15
+provider_counts={'prepare': 15, 'after': 15}
+```
+
+The default smoke threshold remains `TLLM_OVERRIDE_SMOKE_MIN_THROUGHPUT_RATIO=0.80`.
+The run above used `TLLM_OVERRIDE_SMOKE_MAX_TOKENS=16` via the test default so
+the same-step training overhead is measured on a less noisy short decode.
 
 ## Gaps And Risks
 

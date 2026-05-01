@@ -73,12 +73,36 @@ class DevlistFinalAlignmentClosureUnitTest(unittest.TestCase):
     def test_plan_named_smoke_files_exist(self) -> None:
         expected = (
             "test/consumers/override/test_override_real_decode_smoke.py",
+            "test/consumers/ttrl/test_ttrl_cached_model_smoke.py",
             "test/consumers/fttt/test_fttt_real_model_smoke.py",
         )
 
         for relative in expected:
             with self.subTest(relative=relative):
                 self.assertTrue((REPO_ROOT / relative).is_file())
+
+    def test_runtime_hot_reports_record_throughput_targets_and_batch_coverage(self) -> None:
+        override_report = (REPO_ROOT / "doc/reference/consumers/override/reproduction_report.md").read_text(
+            encoding="utf-8"
+        )
+        override_smoke = (REPO_ROOT / "test/consumers/override/test_override_real_decode_smoke.py").read_text(
+            encoding="utf-8"
+        )
+        inplace_report = (REPO_ROOT / "doc/reference/consumers/inplace_ttt/reproduction_report.md").read_text(
+            encoding="utf-8"
+        )
+        inplace_smoke = (
+            REPO_ROOT / "test/runtime/inplace_ttt/test_fast_weight_runner_lifecycle_unit.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("baseline_tok_s", override_report)
+        self.assertIn("enabled_tok_s", override_report)
+        self.assertIn("ratio", override_report)
+        self.assertIn("0.80", override_smoke)
+        self.assertIn("batch 4", inplace_report)
+        self.assertIn("batch 8", inplace_report)
+        self.assertIn("test_request_sample_key_mode_runs_cached_qwen_batch4", inplace_smoke)
+        self.assertIn("test_request_sample_key_mode_runs_cached_qwen_batch8", inplace_smoke)
 
     def test_user_facing_reports_do_not_claim_stale_partial_status(self) -> None:
         report_dir = REPO_ROOT / "doc/reference/consumers"

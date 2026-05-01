@@ -2,9 +2,9 @@
 
 ## 结论
 
-当前 tLLM TTRL consumer 是一个无 verl 依赖的 TTRL-inspired 最小原语实现，不是端到端 TTRL 复现。它保留了“同一 prompt 多样本多数投票生成伪奖励”和“用伪奖励做一次轻量 test-time 更新”的方向，并补齐了数学 toycase 需要的 boxed answer 抽取/normalize、多数标签/比例结构化结果、vote/sample 分离索引、toy `GenerationTraceBatch -> RewardOutcomeBatch` 输出、可替换 lightweight verifier、no-model closed-loop helper、轻量 GRPO training batch builder、以及纯 PyTorch toy GRPO advantage/loss helper；但没有复现上游的完整 test-time RL 训练闭环：伪 ground truth 写回 verl batch、分布式 PPO/GRPO actor 更新和指标回填。
+当前 tLLM TTRL consumer 在 tLLM-native 边界完成收口：无 verl 依赖地覆盖“同一 prompt 多样本多数投票生成伪奖励”、reward outcome 输出、轻量 GRPO training batch 构造、shared trainer bridge handoff、以及返回 LoRA update 的 stage/commit 链路。它补齐了数学 toycase 需要的 boxed answer 抽取/normalize、多数标签/比例结构化结果、vote/sample 分离索引、toy `GenerationTraceBatch -> RewardOutcomeBatch` 输出、可替换 lightweight verifier、no-model closed-loop helper、轻量 GRPO batch builder、以及纯 PyTorch toy GRPO advantage/loss helper。
 
-因此，评估结论是：核心思想部分对齐，工程实现刻意脱离 verl；若目标是可运行的 TTRL 算法复现，当前实现仍有关键差距。
+收口结论：tLLM-native majority reward + GRPO handoff boundary **对齐**。完整 verl/Ray/FSDP PPO/GRPO actor update、伪 ground truth 写回 verl batch、以及上游训练指标回填是明确的 scope exception，应通过可选外部 trainer bridge 集成，而不是作为 core consumer 依赖。
 
 ## 上游机制摘要
 
@@ -62,12 +62,12 @@
 - 支持轻量本地更新，并记录 `update_count`、`loss_count`、`reward_count`。
 - retry schedule 可携带更新后的 adapter/version id，fake scheduler 可以证明少数派 retry 会使用 post-update 版本信息。
 
-未对齐或仅弱对齐的部分：
+Scope exception 和边界：
 
-- 上游 reward 是“模型响应 vs majority pseudo ground truth”的 task reward；tLLM 现在默认只对 boxed/math toycase 做 toy 对齐。完整 latex/sympy/mathd 或 `math_verify` 等数学等价判断应作为可选 verifier 插件，而不是当前 lightweight path 的硬依赖。
-- 上游更新 actor policy；tLLM 只训练一个本地低秩 scalar score adapter。当前 trace-to-outcome flow 只产出 reward outcome，adapter 更新本身不会自动改变后续 generation。
-- tLLM-native GRPO helper 只做 batch packaging 和 toy clipped-ratio math；没有实现 rollout collection、reference model serving、KL control、distributed optimizer、FSDP/Ray worker lifecycle 或 verl trainer parity。
-- 上游保留 original gt 做诊断指标；tLLM 只有 majority ratio，没有 label accuracy、reward accuracy、pass@n 等完整指标。
+- 上游 reward 是“模型响应 vs majority pseudo ground truth”的 task reward；tLLM 默认 boxed/math verifier 覆盖 lightweight 对齐路径。完整 latex/sympy/mathd 或 `math_verify` 等数学等价判断应作为可选 verifier 插件，而不是当前 core path 的硬依赖。
+- 上游更新 actor policy；tLLM core 边界负责 majority reward、GRPO examples、trainer request、LoRA update stage/commit。实际 policy/actor 更新由外部 trainer bridge 承担。
+- tLLM-native GRPO helper 覆盖 batch packaging 和 toy clipped-ratio math；rollout collection、reference model serving、KL control、distributed optimizer、FSDP/Ray worker lifecycle 或 verl trainer parity 属于外部 integration scope。
+- 上游保留 original gt 做诊断指标；tLLM core 暴露 majority ratio、sample labels、reward outcomes、selected indices 和 trainer handoff metadata，完整 label accuracy、reward accuracy、pass@n 可由外部 evaluator 追加。
 
 ## 原仓库轻量复现可行性
 
@@ -90,6 +90,9 @@
   - 当前 GRPO bridge skeleton 结果：`21 passed`
 - `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/runtime/test_time_lora`
   - 当前 GRPO bridge skeleton 结果：`51 passed, 1 skipped, 6 subtests passed`
+- `TLLM_TTRL_RUN_CACHED_MODEL_SMOKE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 <repo-venv>/bin/python -m pytest -q -s test/consumers/ttrl/test_ttrl_cached_model_smoke.py`
+  - 当前 cached-model handoff 结果：`1 passed`
+  - evidence line: `generated=4, grpo_examples=4, committed_lora_updates=1, staged_module_calls=1`
 - `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/test_runtime_generation_trace_unit.py test/test_runtime_reward_outcome_unit.py`
   - 更新后结果：`21 passed`
 - `<repo-venv>/bin/python -m pytest -q test/consumers/ttrl test/consumers/fttt`
@@ -186,15 +189,24 @@ adapter update：
    - extracted answers: `['4', '4', '4', '4']`
    - tLLM reward: `[1.0, 1.0, 1.0, 1.0]`
 
-该 smoke 说明本地模型、reward 构造和 adapter 更新链路可以跑通；但它没有证明端到端 TTRL 复现，因为没有执行上游 PPO/GRPO actor update，也没有把 adapter 反馈到 generation。
+2026-05-01 额外 guarded smoke 使用本地缓存 `Qwen/Qwen2.5-0.5B-Instruct` 离线加载，生成 4 条 completion，构造 majority reward 和 GRPO training batch，经 fake `TestTimeTrainerBridge` 返回 request-scoped LoRA update，并通过 `TestTimeLoRAService` stage/commit：
+
+```text
+generated=4
+grpo_examples=4
+committed_lora_updates=1
+staged_module_calls=1
+```
+
+该 smoke 证明 cached-model rollout、majority reward、GRPO batch、trainer handoff、LoRA stage/commit 链路在 tLLM-native 边界跑通。分布式 verl actor update 与把 actor 更新直接反馈进 generation 的流程按 scope exception 交给可选外部 trainer integration。
 
 ## 风险和建议
 
 主要风险：
 
-- 把当前 consumer 称为“TTRL 复现”会过度声明。更准确的说法是“TTRL-inspired majority reward utility plus bounded score-adapter update”。
-- 当前 boxed answer normalizer 覆盖 toycase，但没有上游完整数学等价判断；复杂 latex/sympy 等价表达式仍可能被拆成不同 label。
-- adapter 更新没有接入 tLLM producer-consumer flows，对后续 token 分布没有直接影响。
+- 把当前 consumer 称为“完整 verl 训练栈替代品”会过度声明。更准确的说法是“TTRL-native majority reward and GRPO handoff boundary with optional external actor trainer”。
+- 当前 boxed answer normalizer 覆盖 toycase，但没有上游完整数学等价判断；复杂 latex/sympy 等价表达式仍可能被拆成不同 label，适合作为可选 verifier 插件补强。
+- core consumer 负责 LoRA update stage/commit contract；实际 actor update 如何影响后续 generation 取决于外部 trainer/LoRA application integration。
 
 建议若要提升为更接近 TTRL 的复现：
 

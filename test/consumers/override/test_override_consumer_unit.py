@@ -147,6 +147,95 @@ class OverRIDEConsumerUnitTest(unittest.TestCase):
         self.assertGreater(stats.update_count, 0)
         self.assertGreater(stats.last_loss, 0.0)
 
+    def test_runtime_bridge_updates_cached_q_logits_created_inside_no_grad_decode(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(
+            OverRIDEConsumerConfig(
+                hidden_size=2,
+                vocab_size=3,
+                rank=2,
+                num_iterations=3,
+                learning_rate=0.1,
+            )
+        )
+        hidden = torch.tensor([[1.0, -1.0], [0.5, 2.0], [2.0, 1.0]])
+        logits = torch.randn(3, 3)
+
+        with torch.no_grad():
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3))
+        consumer.update_from_sampled_tokens_batch(torch.tensor([0, 1, 2]))
+
+        self.assertGreater(consumer.read_stats().update_count, 0)
+        self.assertGreater(consumer.read_stats().last_loss, 0.0)
+
+    def test_runtime_bridge_updates_cached_q_logits_created_inside_inference_mode_decode(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(
+            OverRIDEConsumerConfig(
+                hidden_size=2,
+                vocab_size=3,
+                rank=2,
+                num_iterations=3,
+                learning_rate=0.1,
+            )
+        )
+        hidden = torch.tensor([[1.0, -1.0], [0.5, 2.0], [2.0, 1.0]])
+        logits = torch.randn(3, 3)
+
+        with torch.inference_mode():
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3))
+        consumer.update_from_sampled_tokens_batch(torch.tensor([0, 1, 2]))
+
+        self.assertGreater(consumer.read_stats().update_count, 0)
+        self.assertGreater(consumer.read_stats().last_loss, 0.0)
+
+    def test_runtime_bridge_updates_cached_q_logits_from_inference_mode_sampler_callback(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(
+            OverRIDEConsumerConfig(
+                hidden_size=2,
+                vocab_size=3,
+                rank=2,
+                num_iterations=3,
+                learning_rate=0.1,
+            )
+        )
+        hidden = torch.tensor([[1.0, -1.0], [0.5, 2.0], [2.0, 1.0]])
+        logits = torch.randn(3, 3)
+
+        with torch.inference_mode():
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3))
+            consumer.update_from_sampled_tokens_batch(torch.tensor([0, 1, 2]))
+
+        self.assertGreater(consumer.read_stats().update_count, 0)
+        self.assertGreater(consumer.read_stats().last_loss, 0.0)
+
+    def test_runtime_bridge_lazily_builds_trainable_heads_inside_inference_mode_decode(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        consumer = OverRIDEConsumer(
+            OverRIDEConsumerConfig(
+                hidden_size=0,
+                vocab_size=0,
+                rank=2,
+                num_iterations=3,
+                learning_rate=0.1,
+            )
+        )
+        hidden = torch.tensor([[1.0, -1.0], [0.5, 2.0], [2.0, 1.0]])
+        logits = torch.randn(3, 3)
+
+        with torch.inference_mode():
+            consumer.reweight_logits_batch(hidden, logits, iterations=(1, 2, 3))
+            consumer.update_from_sampled_tokens_batch(torch.tensor([0, 1, 2]))
+
+        self.assertFalse(any(torch.is_inference(param) for param in consumer.engine.heads.parameters()))
+        self.assertGreater(consumer.read_stats().update_count, 0)
+        self.assertGreater(consumer.read_stats().last_loss, 0.0)
+
     def test_runtime_bridge_normalizes_tensor_row_ids_for_cached_update(self) -> None:
         from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
 

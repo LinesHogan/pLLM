@@ -89,12 +89,14 @@ class OverRIDEReweightEngine(nn.Module):
         if self._has_shape and self.heads:
             first_param = next(self.heads.parameters(), None)
             if first_param is not None and (first_param.device != device or first_param.dtype != dtype):
-                self.to(device=device, dtype=dtype)
+                with torch.inference_mode(False):
+                    self.to(device=device, dtype=dtype)
             return
         self.config.hidden_size = int(hidden_size)
         self.config.vocab_size = int(vocab_size)
-        self._build_heads()
-        self.to(device=device, dtype=dtype)
+        with torch.inference_mode(False):
+            self._build_heads()
+            self.to(device=device, dtype=dtype)
 
     def _head_for_iteration(self, iteration: int) -> LowRankAdapter | None:
         idx = int(iteration) - 1
@@ -120,7 +122,8 @@ class OverRIDEReweightEngine(nn.Module):
     def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
         out = tensor.detach()
         if torch.is_inference(out):
-            out = out.clone()
+            with torch.inference_mode(False):
+                out = out.clone()
         return out
 
     def reweight_logits(self, hidden: torch.Tensor, logits: torch.Tensor, *, iteration: int) -> OverRIDELogitsResult:
@@ -149,7 +152,8 @@ class OverRIDEReweightEngine(nn.Module):
 
         q_logits_next = None
         if current_head is not None:
-            q_logits_next = logits_for_update + current_head(hidden_for_head).to(dtype=logits.dtype)
+            with torch.inference_mode(False), torch.enable_grad():
+                q_logits_next = logits_for_update + current_head(hidden_for_head).to(dtype=logits.dtype)
         return OverRIDELogitsResult(logits=reweighted, q_logits_next=q_logits_next)
 
     @staticmethod
@@ -263,14 +267,15 @@ class OverRIDEReweightEngine(nn.Module):
             return
         if self.optimizer is None:
             raise RuntimeError("OverRIDE update requires initialized reweighting heads")
-        targets = sampled_token_ids.reshape(-1).to(device=q_logits_next.device, dtype=torch.long)
-        q_logits = q_logits_next.reshape(-1, int(q_logits_next.shape[-1]))
-        if int(targets.numel()) != int(q_logits.shape[0]):
-            raise RuntimeError("OverRIDE update requires one sampled token per q-logits row")
-        loss = F.cross_entropy(q_logits, targets)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        with torch.inference_mode(False), torch.enable_grad():
+            targets = sampled_token_ids.reshape(-1).to(device=q_logits_next.device, dtype=torch.long)
+            q_logits = q_logits_next.reshape(-1, int(q_logits_next.shape[-1]))
+            if int(targets.numel()) != int(q_logits.shape[0]):
+                raise RuntimeError("OverRIDE update requires one sampled token per q-logits row")
+            loss = F.cross_entropy(q_logits, targets)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
         self._loss_count += 1
         self._update_count += 1
         self._last_loss = float(loss.detach().cpu())
@@ -300,7 +305,10 @@ class OverRIDEReweightEngine(nn.Module):
             selected_targets.append(targets[token_idx : token_idx + 1])
         if not selected_q_logits:
             return
-        self.update_from_sampled_tokens(torch.cat(selected_q_logits, dim=0), torch.cat(selected_targets, dim=0))
+        with torch.inference_mode(False), torch.enable_grad():
+            q_logits_batch = torch.cat(selected_q_logits, dim=0)
+            target_batch = torch.cat(selected_targets, dim=0)
+        self.update_from_sampled_tokens(q_logits_batch, target_batch)
 
     def read_stats(self) -> OverRIDEStats:
         return OverRIDEStats(

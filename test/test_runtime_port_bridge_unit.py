@@ -963,6 +963,44 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
         self.assertEqual(core.RUNTIME.tap_layers, {})
         self.assertEqual(core.RUNTIME.tap_decode_hidden, {})
 
+    def test_setup_runtime_hooks_if_active_binds_sampler_for_sampler_only_consumer(self) -> None:
+        model = type("Model", (), {})()
+        provider = SimpleNamespace(is_active=lambda: True)
+        consumer = SimpleNamespace(sampler_modifier_provider=lambda: provider)
+        runtime = type("Runtime", (), {})()
+        runtime.config = SimpleNamespace()
+        runtime.consumer = consumer
+        runtime.dispatch_plan = None
+        runtime.launch_consumer_from_hooks = True
+        core = type(
+            "Core",
+            (),
+            {
+                "RUNTIME": runtime,
+                "MODEL_HOOK_FLAG": "esamp_hook_installed",
+                "MODEL_HOOK_SPEC_ATTR": "esamp_hook_spec",
+                "_runner_uses_compilation_or_cudagraph": staticmethod(lambda runner: False),
+            },
+        )()
+        runner = type("Runner", (), {"model": model, "device": torch.device("cpu"), "max_num_reqs": 8})()
+
+        with mock.patch.object(port_runtime_hooks._residual_runtime_setup, "resolve_runtime_setup") as p_setup, mock.patch.object(
+            port_runtime_hooks._residual_runtime_setup,
+            "apply_runtime_setup",
+        ) as p_apply, mock.patch.object(port_runtime_hooks._sampler_patch, "bind_runner_sampler") as p_bind, mock.patch.object(
+            port_runtime_hooks._sampler_patch,
+            "ensure_sampler_precompute_buffers",
+        ):
+            p_setup.return_value = SimpleNamespace(
+                resolved_layers={},
+                target_resolved="",
+                hook_spec=("hook",),
+            )
+            port_runtime_hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
+
+        p_apply.assert_called_once()
+        p_bind.assert_called_once_with(runtime=runtime, runner=runner)
+
     def test_setup_runtime_hooks_if_active_does_not_reensure_resources_when_hooks_already_installed(self) -> None:
         model = type("Model", (), {})()
         setattr(model, "esamp_hook_installed", True)

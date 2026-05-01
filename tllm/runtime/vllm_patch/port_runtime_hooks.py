@@ -399,6 +399,7 @@ def setup_runtime_hooks_if_active(*, core: Any, runner: Any) -> None:
         return
 
     _residual_runtime_setup.apply_runtime_setup(core=core, runner=runner, setup=setup)
+    _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
     consumer = getattr(core.RUNTIME, "consumer", None)
     ensure_consumer_resources = getattr(consumer, "_ensure_runtime_resources", None)
     if callable(ensure_consumer_resources):

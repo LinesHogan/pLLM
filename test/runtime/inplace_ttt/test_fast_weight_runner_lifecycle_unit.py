@@ -151,6 +151,33 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         finally:
             residual_runtime.RUNTIME = old_runtime
 
+    def test_disabling_fast_weight_runtime_clears_request_sample_token_metadata(self) -> None:
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.token_batch_metadata import PackedTokenRow, RequestSampleKey, RuntimeTokenBatchMeta, RuntimeTokenRow
+
+        runtime = residual_runtime.ResidualRuntimeState()
+        old_runtime = residual_runtime.RUNTIME
+        runtime.inplace_ttt_current_token_batch_meta = RuntimeTokenBatchMeta(
+            rows=(
+                RuntimeTokenRow(
+                    key=RequestSampleKey(request_id="stale-req", prompt_idx=0, sample_idx=0),
+                    row=PackedTokenRow(packed_row_idx=0, logical_row_idx=0, token_offset=0),
+                    phase="prefill",
+                    engine_step_id=1,
+                ),
+            ),
+            row_layout="packed",
+        )
+        runtime.inplace_ttt_fast_weight_phase = "decode"
+        try:
+            residual_runtime.RUNTIME = runtime
+            residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+        finally:
+            residual_runtime.RUNTIME = old_runtime
+
+        self.assertIsNone(runtime.inplace_ttt_current_token_batch_meta)
+        self.assertEqual(runtime.inplace_ttt_fast_weight_phase, "prefill")
+
     def test_configured_layers_are_isolated_by_layer_key(self) -> None:
         from tllm.runtime.fast_weight_state import FastWeightKey
         from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
@@ -431,11 +458,7 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
             restore_inplace_ttt_fast_weight_wrappers(runtime)
             residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
 
-    @unittest.skipUnless(
-        os.getenv("TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE") == "1" and torch.cuda.is_available(),
-        "set TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE=1 and provide CUDA to run request-sample batch smoke",
-    )
-    def test_request_sample_key_mode_runs_cached_qwen_batch8(self) -> None:
+    def _run_request_sample_key_mode_cached_qwen_batch(self, batch_size: int) -> None:
         from vllm import LLM, SamplingParams
 
         from tllm.runtime import residual_runtime
@@ -451,7 +474,7 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
             chunk_size=2,
             learning_rate=0.5,
             key_mode="request_sample",
-            max_slots=8,
+            max_slots=max(8, int(batch_size)),
             fail_on_unsupported=True,
         )
         residual_runtime.install_runner_patch()
@@ -465,22 +488,36 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
             trust_remote_code=True,
         )
         params = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
-        prompts = [f"Q: {i}+{i}=\nA:" for i in range(8)]
+        prompts = [f"Q: {i}+{i}=\nA:" for i in range(int(batch_size))]
         try:
             outputs = llm.generate(prompts, params)
             runtime = residual_runtime.RUNTIME
             state = runtime.inplace_ttt_fast_weight_state
             stats = [state.stats(key) for key in list(state._stats)]
 
-            self.assertEqual(len(outputs), 8)
+            self.assertEqual(len(outputs), int(batch_size))
             self.assertEqual(runtime.inplace_ttt_fast_weight_installed_count, 1)
-            self.assertEqual(state.slot_count, 8)
+            self.assertEqual(state.slot_count, int(batch_size))
             self.assertGreater(state.estimated_bytes, 0)
-            self.assertEqual(sum(1 for item in stats if item.update_count > 0), 8)
-            self.assertGreaterEqual(sum(item.trained_rows for item in stats), 64)
+            self.assertEqual(sum(1 for item in stats if item.update_count > 0), int(batch_size))
+            self.assertGreaterEqual(sum(item.trained_rows for item in stats), int(batch_size) * 8)
         finally:
             restore_inplace_ttt_fast_weight_wrappers(residual_runtime.RUNTIME)
             residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+
+    @unittest.skipUnless(
+        os.getenv("TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE") == "1" and torch.cuda.is_available(),
+        "set TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE=1 and provide CUDA to run request-sample batch smoke",
+    )
+    def test_request_sample_key_mode_runs_cached_qwen_batch4(self) -> None:
+        self._run_request_sample_key_mode_cached_qwen_batch(4)
+
+    @unittest.skipUnless(
+        os.getenv("TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE") == "1" and torch.cuda.is_available(),
+        "set TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE=1 and provide CUDA to run request-sample batch smoke",
+    )
+    def test_request_sample_key_mode_runs_cached_qwen_batch8(self) -> None:
+        self._run_request_sample_key_mode_cached_qwen_batch(8)
 
 
 if __name__ == "__main__":

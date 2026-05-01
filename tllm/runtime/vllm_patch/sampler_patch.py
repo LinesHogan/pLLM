@@ -183,8 +183,8 @@ def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metad
     else:
         greedy_sampled = sampler.greedy_sample(logits)
 
-    assert sampling_metadata.temperature is not None
-    logits_for_sampling = sampler.apply_temperature(logits, sampling_metadata.temperature)
+    temperature = getattr(sampling_metadata, "temperature", None)
+    logits_for_sampling = logits if temperature is None else sampler.apply_temperature(logits, temperature)
     for processor in sampling_metadata.logitsprocs.argmax_invariant:
         logits_for_sampling = processor.apply(logits_for_sampling)
 

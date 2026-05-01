@@ -682,6 +682,8 @@ def set_inplace_ttt_fast_weight_enabled(
         from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
 
         restore_inplace_ttt_fast_weight_wrappers(RUNTIME)
+        RUNTIME.inplace_ttt_current_token_batch_meta = None
+        RUNTIME.inplace_ttt_fast_weight_phase = "prefill"
     if layers is not None:
         RUNTIME.config.inplace_ttt_fast_weight_layers = tuple(int(layer) for layer in layers)
     if chunk_size is not None:

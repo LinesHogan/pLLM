@@ -34,6 +34,13 @@ class RuntimeActiveTargetsUnitTest(unittest.TestCase):
 
         self.assertTrue(active_targets.runtime_has_active_targets(runtime))
 
+    def test_returns_true_when_sampler_provider_is_active_without_flow_targets(self) -> None:
+        provider = type("Provider", (), {"is_active": staticmethod(lambda: True)})()
+        consumer = type("Consumer", (), {"sampler_modifier_provider": staticmethod(lambda: provider)})()
+        runtime = type("Runtime", (), {"dispatch_plan": None, "consumer": consumer})()
+
+        self.assertTrue(active_targets.runtime_has_active_targets(runtime))
+
 
 if __name__ == "__main__":
     unittest.main()

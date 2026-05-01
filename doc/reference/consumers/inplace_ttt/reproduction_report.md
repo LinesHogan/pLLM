@@ -150,11 +150,11 @@ Commands were run with the repo virtual environment, summarized without machine-
   - The smoke is guarded by `TLLM_INPLACE_TTT_RUN_CACHED_MODEL_SMOKE=1` because
     it requires CUDA and a cached model.
 - Opt-in cached Qwen request/sample smoke:
-  - Batch 4 with one wrapped layer, `chunk_size=2`, and max slots 8 completed
+  - batch 4 with one wrapped layer, `chunk_size=2`, and max slots 8 completed
     generation, installed one wrapper, created four request slots, recorded
     nonzero updates for all four slots, trained 32 rows, and estimated about
     34.9 MB of fast-weight tensors.
-  - Batch 8 with the same setup completed generation, created eight request
+  - batch 8 with the same setup completed generation, created eight request
     slots, recorded nonzero updates for all eight slots, trained 64 rows, and
     estimated about 69.8 MB of fast-weight tensors.
 - Runtime binding sanity check:
