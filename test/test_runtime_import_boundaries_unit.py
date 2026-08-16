@@ -31,9 +31,22 @@ class RuntimeImportBoundariesUnitTest(unittest.TestCase):
                 sys.modules.pop(name, None)
 
     def test_importing_port_contracts_does_not_import_vllm(self) -> None:
-        self._drop_modules("tllm.ports", "vllm")
-        importlib.import_module("tllm.ports.base")
-        self.assertNotIn("vllm", sys.modules)
+        # Checked in a subprocess: dropping "vllm" from this process'
+        # sys.modules would force a re-import later, and vLLM 0.25+ registers
+        # process-global torch opaque types at import time (re-registration
+        # raises), which would poison the rest of the suite.
+        code = (
+            "import importlib, json, sys; "
+            "importlib.import_module('tllm.ports.base'); "
+            "print(json.dumps({'vllm': 'vllm' in sys.modules}))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(completed.stdout.strip().splitlines()[-1], '{"vllm": false}')
 
     def test_runtime_package_no_longer_exposes_esamp_runtime_adapter_module(self) -> None:
         self._drop_modules("tllm.consumers.esamp.runtime_adapter")
@@ -60,10 +73,22 @@ class RuntimeImportBoundariesUnitTest(unittest.TestCase):
             importlib.import_module("tllm.runtime.esamp_runtime")
 
     def test_importing_port_runtime_hooks_uses_neutral_runtime_module(self) -> None:
-        self._drop_modules("tllm.runtime.vllm_patch.port_runtime_hooks", "vllm")
-        mod = importlib.import_module("tllm.runtime.vllm_patch.port_runtime_hooks")
-        self.assertEqual(mod.__name__, "tllm.runtime.vllm_patch.port_runtime_hooks")
-        self.assertNotIn("vllm", sys.modules)
+        # Subprocess for the same reason as the port-contracts check above.
+        code = (
+            "import importlib, json, sys; "
+            "mod = importlib.import_module('tllm.runtime.vllm_patch.port_runtime_hooks'); "
+            "print(json.dumps({'name': mod.__name__, 'vllm': 'vllm' in sys.modules}))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            completed.stdout.strip().splitlines()[-1],
+            '{"name": "tllm.runtime.vllm_patch.port_runtime_hooks", "vllm": false}',
+        )
 
     def test_importing_verification_harness_uses_verification_namespace(self) -> None:
         self._drop_modules("tllm.verification.automated_tests")

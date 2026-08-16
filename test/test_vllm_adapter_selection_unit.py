@@ -30,11 +30,42 @@ class VllmAdapterSelectionUnitTest(unittest.TestCase):
             ("0.10.2", "V010PrepareInputsAdapter"),
             ("0.11.0", "V011PlusPrepareInputsAdapter"),
             ("0.12.0", "V011PlusPrepareInputsAdapter"),
+            ("0.25.0", "V027PrepareInputsAdapter"),
+            ("0.27.1", "V027PrepareInputsAdapter"),
         ]
 
         for version, expected in cases:
             adapter = select_prepare_inputs_adapter(version)
             self.assertEqual(type(adapter).__name__, expected, msg=version)
+
+    def test_unknown_major_fails_fast(self) -> None:
+        from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter
+
+        with self.assertRaises(RuntimeError):
+            select_prepare_inputs_adapter("1.0.0")
+
+    def test_v027_adapter_parses_logits_indices_first_tuple(self) -> None:
+        from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter
+
+        adapter = select_prepare_inputs_adapter("0.27.1")
+        runner = _Runner()
+        logits_indices = torch.tensor([1, 3], dtype=torch.long)
+        spec_decode_metadata = SimpleNamespace(kind="spec")
+        out = (logits_indices, spec_decode_metadata)
+
+        import numpy as np
+
+        view = adapter.unpack_prepare_inputs_output(
+            runner=runner,
+            scheduler_output=SimpleNamespace(num_scheduled_tokens={"reqA": 1, "reqB": 2}),
+            out=out,
+            num_scheduled_tokens=np.array([1, 2], dtype=np.int32),
+        )
+
+        self.assertIsNone(view.attn_metadata)
+        self.assertTrue(torch.equal(view.logits_indices, logits_indices))
+        self.assertIsNone(view.spec_decode_common)
+        self.assertEqual(view.num_actual_tokens, 3)
 
     def test_adapter_parses_two_tuple_output(self) -> None:
         from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter

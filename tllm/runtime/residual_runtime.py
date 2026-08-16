@@ -862,8 +862,11 @@ def _wrapped_execute_model(self: object, *args: object, **kwargs: object) -> obj
 
 
 def install_runner_patch() -> None:
-    _ensure_runner_binding()
-    _hooks.install_runner_patch(core=sys.modules[__name__])
+    if _PATCH_INSTALLED:
+        return
+    from tllm.backends.vllm import install_backend
+
+    install_backend(core=sys.modules[__name__])
 
 
 def make_llm(*args: object, **kwargs: object) -> object:

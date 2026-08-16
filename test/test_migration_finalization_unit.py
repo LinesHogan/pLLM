@@ -27,6 +27,8 @@ class MigrationFinalizationUnitTest(unittest.TestCase):
             "stack.end",
             "execute_model.pre",
             "execute_model.post",
+            "sample_tokens.pre",
+            "sample_tokens.post",
         )
         self.assertEqual(port_runtime_hooks.RUNTIME_EVENT_POINTS, expected)
 

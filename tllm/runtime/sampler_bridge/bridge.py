@@ -28,6 +28,13 @@ def _maybe_record_function(name: str):
     return record_function(name) if _ENABLE_DISTILLER_RECORD_FUNCTION else nullcontext()
 
 
+def _unwrap_sampled(result: Any) -> torch.Tensor:
+    """Accept both legacy tensor returns and vLLM >= 0.25 tuple returns."""
+    if isinstance(result, tuple):
+        return result[0]
+    return result
+
+
 def _sample_rows_vanilla(
     *,
     sampler: Any,
@@ -50,8 +57,8 @@ def _sample_rows_vanilla(
             if generator is not None:
                 generators[int(new_i)] = generator
     if subset_logits.device.type != "cuda":
-        return sampler.topk_topp_sampler.forward_native(subset_logits, generators, top_k, top_p).to(dtype=torch.long)
-    return sampler.topk_topp_sampler(subset_logits, generators, top_k, top_p).to(dtype=torch.long)
+        return _unwrap_sampled(sampler.topk_topp_sampler.forward_native(subset_logits, generators, top_k, top_p)).to(dtype=torch.long)
+    return _unwrap_sampled(sampler.topk_topp_sampler(subset_logits, generators, top_k, top_p)).to(dtype=torch.long)
 
 
 def _sample_full_vanilla(
@@ -61,18 +68,18 @@ def _sample_full_vanilla(
     sampling_metadata: Any,
 ) -> torch.Tensor:
     if logits.device.type != "cuda":
-        return sampler.topk_topp_sampler.forward_native(
+        return _unwrap_sampled(sampler.topk_topp_sampler.forward_native(
             logits,
             getattr(sampling_metadata, "generators", {}),
             getattr(sampling_metadata, "top_k", None),
             getattr(sampling_metadata, "top_p", None),
-        ).to(dtype=torch.long)
-    return sampler.topk_topp_sampler(
+        )).to(dtype=torch.long)
+    return _unwrap_sampled(sampler.topk_topp_sampler(
         logits,
         getattr(sampling_metadata, "generators", {}),
         getattr(sampling_metadata, "top_k", None),
         getattr(sampling_metadata, "top_p", None),
-    ).to(dtype=torch.long)
+    )).to(dtype=torch.long)
 
 
 def _sample_rows_dense(

@@ -39,6 +39,8 @@ RUNTIME_EVENT_POINTS = (
     "stack.end",
     "execute_model.pre",
     "execute_model.post",
+    "sample_tokens.pre",
+    "sample_tokens.post",
 )
 
 _COMPUTE_LOGITS_HOOK_FLAG = "_tllm_compute_logits_wrapped"
@@ -170,28 +172,19 @@ def _check_inplace_ttt_static_key_request_count(*, core: Any, runner: Any) -> No
     _inplace_ttt_fast_weight.require_static_key_single_request(core.RUNTIME, runner)
 
 
-def prepare_decode_localization(
+def store_decode_localization(
     *,
     core: DecodeHookCoreLike,
-    runner: DecodeRunnerLike,
-    out: tuple,
-    prepare_inputs_view: PrepareInputsView | None = None,
+    row_idx: torch.Tensor,
+    prompt_idxs: list[int],
+    sample_idxs: list[int],
+    request_ids: list[str],
 ) -> None:
-    if len(out) < 2:
-        return
-    view = prepare_inputs_view
-    if view is None:
-        view = _prepare_inputs_adapter().unpack_prepare_inputs_output(
-            runner=runner,
-            scheduler_output=getattr(runner, "_scheduler_output", None),
-            out=out,
-        )
-    if view.logits_indices is None:
-        return
-    attn_metadata = view.attn_metadata
-    logits_indices = view.logits_indices
-    spec_decode_common = view.spec_decode_common
+    """Write computed decode-row localization into the runtime scratch buffers.
 
+    Shared by the MRv1 (`_prepare_inputs` view) and MRv2 (persistent
+    InputBatch) localization paths.
+    """
     decode_row_idx = core.RUNTIME.decode_row_idx
     decode_valid_mask = core.RUNTIME.decode_valid_mask
     decode_prompt_idx_buf = getattr(core.RUNTIME, "decode_prompt_idx_buf", None)
@@ -201,44 +194,6 @@ def prepare_decode_localization(
             "Active runtime requires decode scratch buffers decode_row_idx/decode_valid_mask/decode_prompt_idx_buf/decode_sample_idx_buf"
         )
 
-    common = core.pick_common_attn_metadata(attn_metadata, spec_decode_common)
-    num_actual_tokens = int(getattr(common, "num_actual_tokens", 0) or 0) if common else 0
-    if num_actual_tokens <= 0:
-        core.RUNTIME.decode_count = 0
-        core.RUNTIME.decode_prompt_idxs = []
-        core.RUNTIME.decode_sample_idxs = []
-        core.RUNTIME.decode_request_ids = []
-        core.RUNTIME.decode_prompt_idx_tensor = None
-        core.RUNTIME.decode_sample_idx_tensor = None
-        core.RUNTIME.decode_compact_count = 0
-        core.RUNTIME.decode_compact_row_ids = ()
-        return
-
-    raw_req_ids = runner.input_batch.req_ids[: runner.input_batch.num_reqs]
-    req_id_to_index = runner.input_batch.req_id_to_index
-    num_prompt_tokens = runner.input_batch.num_prompt_tokens
-    num_computed_tokens = runner.input_batch.num_computed_tokens_cpu
-    req_ids: List[object] = []
-    is_decode_req: List[bool] = []
-    for req_id in raw_req_ids:
-        if req_id is None:
-            continue
-        req_ids.append(req_id)
-        req_idx = req_id_to_index.get(req_id)
-        if req_idx is None:
-            is_decode_req.append(False)
-            continue
-        is_decode = int(num_computed_tokens[req_idx]) >= int(num_prompt_tokens[req_idx])
-        is_decode_req.append(is_decode)
-
-    row_idx, prompt_idxs, sample_idxs, decode_positions = core.compute_decode_localization(
-        req_ids=req_ids,
-        is_decode_req=is_decode_req,
-        logits_indices=logits_indices,
-        num_actual_tokens=num_actual_tokens,
-        resolve_prompt_sample_fn=core._resolve_prompt_sample_for_req_id,
-        max_decode_rows=0,
-    )
     if row_idx.numel() == 0:
         core.RUNTIME.decode_count = 0
         core.RUNTIME.decode_prompt_idxs = []
@@ -271,7 +226,7 @@ def prepare_decode_localization(
     core.RUNTIME.decode_count = k
     core.RUNTIME.decode_prompt_idxs = [int(x) for x in prompt_idxs]
     core.RUNTIME.decode_sample_idxs = [int(x) for x in sample_idxs]
-    core.RUNTIME.decode_request_ids = [str(req_ids[pos]) for pos in decode_positions[:k]]
+    core.RUNTIME.decode_request_ids = [str(x) for x in request_ids]
     if needs_device_metadata:
         core.RUNTIME.decode_prompt_idx_tensor = decode_prompt_idx_buf[:k]
         core.RUNTIME.decode_sample_idx_tensor = decode_sample_idx_buf[:k]
@@ -305,6 +260,91 @@ def prepare_decode_localization(
                 compact_row_idx[:compact_count].copy_(compact_rows)
         core.RUNTIME.decode_compact_count = compact_count
         core.RUNTIME.decode_compact_row_ids = tuple(compact_positions)
+
+
+def _clear_decode_localization(core: DecodeHookCoreLike) -> None:
+    core.RUNTIME.decode_count = 0
+    core.RUNTIME.decode_prompt_idxs = []
+    core.RUNTIME.decode_sample_idxs = []
+    core.RUNTIME.decode_request_ids = []
+    core.RUNTIME.decode_prompt_idx_tensor = None
+    core.RUNTIME.decode_sample_idx_tensor = None
+    core.RUNTIME.decode_compact_count = 0
+    core.RUNTIME.decode_compact_row_ids = ()
+
+
+def prepare_decode_localization(
+    *,
+    core: DecodeHookCoreLike,
+    runner: DecodeRunnerLike,
+    out: tuple,
+    prepare_inputs_view: PrepareInputsView | None = None,
+) -> None:
+    if len(out) < 2:
+        return
+    view = prepare_inputs_view
+    if view is None:
+        view = _prepare_inputs_adapter().unpack_prepare_inputs_output(
+            runner=runner,
+            scheduler_output=getattr(runner, "_scheduler_output", None),
+            out=out,
+        )
+    if view.logits_indices is None:
+        return
+    attn_metadata = view.attn_metadata
+    logits_indices = view.logits_indices
+    spec_decode_common = view.spec_decode_common
+
+    decode_row_idx = core.RUNTIME.decode_row_idx
+    decode_valid_mask = core.RUNTIME.decode_valid_mask
+    decode_prompt_idx_buf = getattr(core.RUNTIME, "decode_prompt_idx_buf", None)
+    decode_sample_idx_buf = getattr(core.RUNTIME, "decode_sample_idx_buf", None)
+    if decode_row_idx is None or decode_valid_mask is None or decode_prompt_idx_buf is None or decode_sample_idx_buf is None:
+        raise RuntimeError(
+            "Active runtime requires decode scratch buffers decode_row_idx/decode_valid_mask/decode_prompt_idx_buf/decode_sample_idx_buf"
+        )
+
+    common = core.pick_common_attn_metadata(attn_metadata, spec_decode_common)
+    num_actual_tokens = getattr(view, "num_actual_tokens", None)
+    if num_actual_tokens is None:
+        num_actual_tokens = int(getattr(common, "num_actual_tokens", 0) or 0) if common else 0
+    num_actual_tokens = int(num_actual_tokens)
+    if num_actual_tokens <= 0:
+        _clear_decode_localization(core)
+        return
+
+    raw_req_ids = runner.input_batch.req_ids[: runner.input_batch.num_reqs]
+    req_id_to_index = runner.input_batch.req_id_to_index
+    num_prompt_tokens = runner.input_batch.num_prompt_tokens
+    num_computed_tokens = runner.input_batch.num_computed_tokens_cpu
+    req_ids: List[object] = []
+    is_decode_req: List[bool] = []
+    for req_id in raw_req_ids:
+        if req_id is None:
+            continue
+        req_ids.append(req_id)
+        req_idx = req_id_to_index.get(req_id)
+        if req_idx is None:
+            is_decode_req.append(False)
+            continue
+        is_decode = int(num_computed_tokens[req_idx]) >= int(num_prompt_tokens[req_idx])
+        is_decode_req.append(is_decode)
+
+    row_idx, prompt_idxs, sample_idxs, decode_positions = core.compute_decode_localization(
+        req_ids=req_ids,
+        is_decode_req=is_decode_req,
+        logits_indices=logits_indices,
+        num_actual_tokens=num_actual_tokens,
+        resolve_prompt_sample_fn=core._resolve_prompt_sample_for_req_id,
+        max_decode_rows=0,
+    )
+    store_decode_localization(
+        core=core,
+        row_idx=row_idx,
+        prompt_idxs=prompt_idxs,
+        sample_idxs=sample_idxs,
+        request_ids=[str(req_ids[pos]) for pos in decode_positions[: int(row_idx.numel())]],
+    )
 
 
 def build_tap_path_list(*, core: PortDispatchCoreLike) -> List[str]:

@@ -12,6 +12,7 @@ from tllm.runtime.vllm_patch.adapters.base import (
 )
 from tllm.runtime.vllm_patch.adapters.v010 import V010PrepareInputsAdapter
 from tllm.runtime.vllm_patch.adapters.v011_plus import V011PlusPrepareInputsAdapter
+from tllm.runtime.vllm_patch.adapters.v027 import V027PrepareInputsAdapter
 from tllm.runtime.vllm_patch.adapters.v072 import V072PrepareInputsAdapter
 
 
@@ -48,7 +49,14 @@ def select_prepare_inputs_adapter(version: Optional[str] = None) -> BasePrepareI
         return V072PrepareInputsAdapter()
     if major == 0 and minor == 10:
         return V010PrepareInputsAdapter()
-    return V011PlusPrepareInputsAdapter()
+    if major == 0 and 11 <= minor < 25:
+        return V011PlusPrepareInputsAdapter()
+    if major == 0 and minor >= 25:
+        return V027PrepareInputsAdapter()
+    raise RuntimeError(
+        f"unsupported vLLM version {resolved!r}: no prepare-inputs adapter family matches. "
+        "Add an explicit adapter instead of falling through to a catch-all branch."
+    )
 
 
 @lru_cache(maxsize=1)
@@ -61,6 +69,7 @@ __all__ = [
     "PrepareInputsView",
     "V010PrepareInputsAdapter",
     "V011PlusPrepareInputsAdapter",
+    "V027PrepareInputsAdapter",
     "V072PrepareInputsAdapter",
     "get_prepare_inputs_adapter",
     "select_prepare_inputs_adapter",

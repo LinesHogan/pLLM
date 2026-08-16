@@ -16,6 +16,7 @@ class PrepareInputsView:
     logits_indices: torch.Tensor
     spec_decode_common: Any
     num_scheduled_tokens_np: Any
+    num_actual_tokens: int | None = None
 
 
 class BasePrepareInputsAdapter(ABC):
