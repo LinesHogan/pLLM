@@ -34,7 +34,14 @@ class RuntimeResidualRuntimeHostUnitTest(unittest.TestCase):
         tllm = importlib.import_module("tllm")
         host = importlib.import_module("tllm.runtime.residual_runtime")
 
-        self.assertIs(tllm.make_llm, host.make_llm)
+        # The public façade routes through the default TllmRuntime, whose
+        # make_llm delegates to the hook-installing residual_runtime host.
+        self.assertEqual(tllm.default_runtime().make_llm.__func__.__qualname__, "TllmRuntime.make_llm")
+        from unittest import mock
+
+        with mock.patch.object(host, "make_llm", return_value="sentinel") as host_make:
+            self.assertEqual(tllm.make_llm(model_name="m"), "sentinel")
+        host_make.assert_called_once()
 
     def test_util_tools_exposes_only_explicit_plain_llm_constructor(self) -> None:
         tools = importlib.import_module("tllm.util.tools")
