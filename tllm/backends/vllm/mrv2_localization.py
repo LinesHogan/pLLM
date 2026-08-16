@@ -11,10 +11,16 @@ For every logits row we know the owning request (``idx_mapping_np`` /
 Under speculative decoding a request contributes multiple logits rows; the
 first row (the position of the first sampled token) is used for hidden
 capture until the strict multi-row mapping lands with the spec-decode work.
+
+MRv2 additionally runs *real* engine steps during kernel warmup
+(``vllm.v1.worker.gpu.warmup``) with synthetic requests named
+``_warmup_{i}_``; those must never enter the decode scratch (there is no
+matching prompt state and the batch is padded to ``max_num_reqs``).
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -23,6 +29,8 @@ from tllm.runtime.vllm_patch.port_runtime_hooks import (
     _clear_decode_localization,
     store_decode_localization,
 )
+
+_WARMUP_REQ_PREFIX = "_warmup_"
 
 
 def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any) -> None:
@@ -57,16 +65,27 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
         end = int(cu_num_logits[batch_idx + 1])
         if end <= start:
             continue
+        req_id = str(req_ids_raw[batch_idx])
+        if req_id.startswith(_WARMUP_REQ_PREFIX):
+            continue
         # First logits row of the request = position of the first sampled
         # token. Additional spec-decode rows are handled in the spec-decode
         # mapping work; the hidden row for training is the first one.
         logit_rows.append(start)
-        req_id = str(req_ids_raw[batch_idx])
         prompt_idx, sample_idx = core._resolve_prompt_sample_for_req_id(req_id)
         prompt_idxs.append(int(prompt_idx))
         sample_idxs.append(int(sample_idx))
         request_ids.append(req_id)
 
+    if os.environ.get("TLLM_DEBUG_MRV2_LOC"):
+        import sys as _sys
+
+        print(
+            f"[mrv2_loc] num_reqs={num_reqs} req_ids[:6]={req_ids_raw[:6]} "
+            f"prefilling={int(sum(bool(x) for x in is_prefilling[:num_reqs]))} "
+            f"cu_logits={list(cu_num_logits[: min(8, len(cu_num_logits))])}",
+            file=_sys.stderr,
+        )
     if not logit_rows:
         _clear_decode_localization(core)
         return
