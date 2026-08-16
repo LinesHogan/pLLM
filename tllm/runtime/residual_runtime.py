@@ -362,6 +362,7 @@ class ResidualRuntimeState:
     consumer: Optional[RuntimeConsumer] = None
     consumer_registry: Optional[ConsumerRegistry] = None
     dispatch_plan: Optional[DispatchPlan] = None
+    execution_plan: object = None  # tllm.producers.registry.ExecutionPlan once compiled
     test_time_lora_enabled: bool = False
     test_time_lora_service: object | None = None
     inplace_ttt_fast_weight_state: object | None = None
@@ -422,9 +423,16 @@ def _refresh_dispatch_plan() -> None:
         consumers = consumers + [RUNTIME.consumer]
     if not consumers:
         RUNTIME.dispatch_plan = None
+        RUNTIME.execution_plan = None
         return
     plan = DispatchPlan.build(consumers)
     RUNTIME.dispatch_plan = None if plan.is_empty() else plan
+    # Fail fast at startup when a consumer reads a migrated port kind that no
+    # registered producer can serve (kinds still served by legacy hardcoded
+    # producers are not enforced yet).
+    from tllm.runtime.execution_plan import compile_default_plan
+
+    RUNTIME.execution_plan = compile_default_plan(consumers=consumers)
 
 
 def register_dispatch_consumer(consumer: BaseConsumer) -> None:
