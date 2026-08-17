@@ -24,3 +24,6 @@ class PortFrame:
     payload: Any
     ownership: Ownership
     ready_window: Window
+    #: Version of the payload at capture time; flows with movable timing
+    #: contracts compare (port, version) instead of relying on placement.
+    version: int = 0

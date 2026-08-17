@@ -26,3 +26,7 @@ class BundleKey:
 class PortBundle:
     key: BundleKey
     entries: Mapping[str, PortPayload] = field(default_factory=dict[str, PortPayload])
+    #: Monotonic version of the port values carried here. Consumers with a
+    #: movable TimingContract observe identical (port, version) values
+    #: regardless of placement; 0 means "no versioning" (legacy producers).
+    version: int = 0

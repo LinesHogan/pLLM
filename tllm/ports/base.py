@@ -73,11 +73,85 @@ class WriteRows(StrEnum):
     PROVIDER_SELECTED = "provider_selected"
 
 
+class TimingMobility(StrEnum):
+    """Whether a flow's work may be placed at a different point than declared.
+
+    Consumers declare mobility; the placement compiler (Rust core) decides
+    actual placement. The correctness invariant: a consumer observes
+    identical (port, version) values regardless of where it is placed.
+    """
+
+    PINNED = "pinned"  # must run at the declared hook point
+    DEFERRABLE = "deferrable"  # may run later, bounded by deadline/max_defer_steps
+    ADVANCEABLE = "advanceable"  # may run earlier (e.g. precompute at prepare time)
+    FREE = "free"  # any point satisfying the deadline
+
+
+class TimingDeadline(StrEnum):
+    """The latest point a movable flow's work must complete."""
+
+    STEP_END = "step_end"
+    NEXT_PREPARE = "next_prepare"
+    GENERATE_END = "generate_end"
+
+
+class VersionObservation(StrEnum):
+    """Which port version a flow observes when placed away from its window."""
+
+    AT_DECLARED_WINDOW = "at_declared_window"  # the version at the declared hook (runtime snapshots when moved)
+    LATEST_AT_EXECUTION = "latest_at_execution"  # whatever version is current when the flow runs
+    STALE_OK = "stale_ok"  # any version within max_defer_steps of current
+
+
+@dataclass(frozen=True)
+class TimingContract:
+    """A flow's declared timing semantics. Defaults preserve pinned behavior."""
+
+    mobility: TimingMobility = TimingMobility.PINNED
+    deadline: TimingDeadline = TimingDeadline.STEP_END
+    max_defer_steps: int = 0
+    observes_version: VersionObservation = VersionObservation.AT_DECLARED_WINDOW
+
+    def __post_init__(self) -> None:
+        try:
+            mobility = TimingMobility(str(self.mobility))
+        except ValueError as exc:
+            raise ValueError(f"unsupported timing mobility `{self.mobility}`") from exc
+        try:
+            deadline = TimingDeadline(str(self.deadline))
+        except ValueError as exc:
+            raise ValueError(f"unsupported timing deadline `{self.deadline}`") from exc
+        try:
+            observes_version = VersionObservation(str(self.observes_version))
+        except ValueError as exc:
+            raise ValueError(f"unsupported version observation `{self.observes_version}`") from exc
+        object.__setattr__(self, "mobility", mobility)
+        object.__setattr__(self, "deadline", deadline)
+        object.__setattr__(self, "observes_version", observes_version)
+        if not isinstance(self.max_defer_steps, int) or self.max_defer_steps < 0:  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
+            raise ValueError("TimingContract.max_defer_steps must be a non-negative int")
+        if mobility == TimingMobility.PINNED:
+            if self.max_defer_steps != 0:
+                raise ValueError("pinned mobility requires max_defer_steps=0")
+            if observes_version != VersionObservation.AT_DECLARED_WINDOW:
+                raise ValueError("pinned mobility requires observes_version='at_declared_window'")
+        if mobility in (TimingMobility.DEFERRABLE, TimingMobility.FREE) and self.max_defer_steps < 1:
+            raise ValueError(f"{mobility} mobility requires max_defer_steps>=1")
+        if mobility == TimingMobility.ADVANCEABLE and observes_version == VersionObservation.AT_DECLARED_WINDOW:
+            # Running earlier than the declared window can never observe the
+            # version that window will produce.
+            raise ValueError("advanceable mobility cannot observe 'at_declared_window'")
+        if mobility in (TimingMobility.DEFERRABLE, TimingMobility.FREE) and deadline == TimingDeadline.STEP_END:
+            # Deferral is across steps; a step_end deadline admits no movement.
+            raise ValueError(f"{mobility} mobility is contradictory with deadline='step_end'")
+
+
 Window = FlowWindow | Literal["background", "same_step", "next_step", "out_of_band"]
 DeliveryMode = FlowDelivery | Literal["bundle", "device_lease"]
 RowCompaction = RowSelection | Literal["none", "first_per_prompt"]
 WriteModeName = WriteMode | Literal["replace", "add", "append", "wrapper"]
 WriteRowSelection = WriteRows | Literal["all", "decode_only", "first_per_prompt", "provider_selected"]
+Timing = TimingContract | Literal["pinned", "deferrable", "advanceable", "free"]
 
 
 @dataclass(frozen=True)
@@ -127,6 +201,7 @@ class ConsumerFlow:
     delivery: DeliveryMode = "bundle"
     ownership: BufferOwnership = BufferOwnership.BORROWED
     row_compaction: RowCompaction = "none"
+    timing: Timing = TimingContract()
 
     def __post_init__(self) -> None:
         try:
@@ -145,6 +220,8 @@ class ConsumerFlow:
             row_compaction = RowSelection(str(self.row_compaction))
         except ValueError as exc:
             raise ValueError(f"unsupported row_compaction mode `{self.row_compaction}`") from exc
+        timing = self.timing if isinstance(self.timing, TimingContract) else TimingContract(mobility=TimingMobility(str(self.timing)))
+        object.__setattr__(self, "timing", timing)
         bundle_key = tuple(self.bundle_key)
         object.__setattr__(self, "window", window)
         object.__setattr__(self, "delivery", delivery)
@@ -158,3 +235,7 @@ class ConsumerFlow:
                 raise ValueError("device_lease delivery currently requires bundle_key=('engine_step_id', 'phase')")
         if row_compaction == RowSelection.FIRST_PER_PROMPT and bundle_key != step_scope_key:
             raise ValueError("first_per_prompt row compaction currently requires bundle_key=('engine_step_id', 'phase')")
+        if timing.mobility != TimingMobility.PINNED and delivery == FlowDelivery.DEVICE_LEASE:
+            # A device lease is bound to the buffers valid at its declared
+            # point; movable work must be batch-presentable (bundle delivery).
+            raise ValueError("device_lease delivery cannot be timing-movable")

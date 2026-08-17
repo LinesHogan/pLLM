@@ -15,11 +15,13 @@ from __future__ import annotations
 try:
     from tllm._core import (  # noqa: F401
         CompiledPlan,
+        PlacementSchedule,
         DecodeLocalization,
         DecodePositions,
         RowPartition,
         SamplerPlan,
         compile_execution_plan,
+        compile_placement_schedule,
         localize_decode_positions,
         localize_decode_rows,
         partition_rows,
@@ -34,11 +36,13 @@ except ImportError as exc:  # pragma: no cover - build guard
 
 __all__ = [
     "CompiledPlan",
+    "PlacementSchedule",
     "DecodeLocalization",
     "DecodePositions",
     "RowPartition",
     "SamplerPlan",
     "compile_execution_plan",
+    "compile_placement_schedule",
     "localize_decode_positions",
     "localize_decode_rows",
     "partition_rows",

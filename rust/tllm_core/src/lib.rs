@@ -704,6 +704,191 @@ fn compile_execution_plan(
 }
 
 // ---------------------------------------------------------------------------
+// compile_placement_schedule
+// ---------------------------------------------------------------------------
+
+const HOOK_POINTS: [&str; 12] = [
+    "load_model.pre",
+    "load_model.post",
+    "prepare_inputs.pre",
+    "prepare_inputs.post",
+    "layer.pre",
+    "layer.post",
+    "block.end",
+    "stack.end",
+    "execute_model.pre",
+    "execute_model.post",
+    "sample_tokens.pre",
+    "sample_tokens.post",
+];
+
+/// Hooks inside the model-forward region that CUDA graph capture covers.
+const IN_CAPTURE_HOOKS: [&str; 4] = ["layer.pre", "layer.post", "block.end", "stack.end"];
+
+const MOBILITIES: [&str; 4] = ["pinned", "deferrable", "advanceable", "free"];
+const DEADLINES: [&str; 3] = ["step_end", "next_prepare", "generate_end"];
+const OBSERVATIONS: [&str; 3] = ["at_declared_window", "latest_at_execution", "stale_ok"];
+const GRAPH_MODES: [&str; 3] = ["eager", "piecewise", "full"];
+
+#[derive(Clone, FromPyObject)]
+#[pyo3(from_item_all)]
+struct FlowTimingDesc {
+    flow_id: String,
+    declared_hook: String,
+    mobility: Option<String>,
+    deadline: Option<String>,
+    max_defer_steps: Option<i64>,
+    observes_version: Option<String>,
+}
+
+impl FlowTimingDesc {
+    fn mobility(&self) -> &str {
+        self.mobility.as_deref().unwrap_or("pinned")
+    }
+    fn deadline(&self) -> &str {
+        self.deadline.as_deref().unwrap_or("step_end")
+    }
+    fn max_defer_steps(&self) -> i64 {
+        self.max_defer_steps.unwrap_or(0)
+    }
+    fn observes_version(&self) -> &str {
+        self.observes_version.as_deref().unwrap_or("at_declared_window")
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+struct PlacementSchedule {
+    /// (flow_id, hook_point) — the identity schedule places every flow at
+    /// its declared hook; the full compiler (B5) computes real placements.
+    #[pyo3(get)]
+    placements: Vec<(String, String)>,
+}
+
+/// Validate flow timing contracts and emit the identity placement schedule.
+///
+/// B1 scope: no movement is computed. The compiler's job here is to be the
+/// single validation authority for timing contracts at plan-compile time —
+/// combinations the Python layer accepts are re-checked here (defense in
+/// depth), and graph-mode legality is enforced: moving work across a CUDA
+/// graph capture boundary needs the full compiler, so a movable flow pinned
+/// inside the captured region under non-eager graph mode fast-fails here
+/// instead of silently degrading at runtime.
+#[pyfunction]
+#[pyo3(signature = (flows, graph_mode))]
+fn compile_placement_schedule(
+    flows: Vec<FlowTimingDesc>,
+    graph_mode: &str,
+) -> PyResult<PlacementSchedule> {
+    if !GRAPH_MODES.contains(&graph_mode) {
+        return Err(plan_err(format!(
+            "unsupported graph mode {}; expected one of {}",
+            qr(graph_mode),
+            qr_list_str(&GRAPH_MODES)
+        )));
+    }
+    let mut placements: Vec<(String, String)> = Vec::with_capacity(flows.len());
+    for flow in &flows {
+        if !HOOK_POINTS.contains(&flow.declared_hook.as_str()) {
+            return Err(plan_err(format!(
+                "flow {} declares unknown hook point {}; expected one of {}",
+                qr(&flow.flow_id),
+                qr(&flow.declared_hook),
+                qr_list_str(&HOOK_POINTS)
+            )));
+        }
+        let mobility = flow.mobility();
+        if !MOBILITIES.contains(&mobility) {
+            return Err(plan_err(format!(
+                "flow {} declares unsupported timing mobility {}; expected one of {}",
+                qr(&flow.flow_id),
+                qr(mobility),
+                qr_list_str(&MOBILITIES)
+            )));
+        }
+        let deadline = flow.deadline();
+        if !DEADLINES.contains(&deadline) {
+            return Err(plan_err(format!(
+                "flow {} declares unsupported timing deadline {}; expected one of {}",
+                qr(&flow.flow_id),
+                qr(deadline),
+                qr_list_str(&DEADLINES)
+            )));
+        }
+        let observes = flow.observes_version();
+        if !OBSERVATIONS.contains(&observes) {
+            return Err(plan_err(format!(
+                "flow {} declares unsupported version observation {}; expected one of {}",
+                qr(&flow.flow_id),
+                qr(observes),
+                qr_list_str(&OBSERVATIONS)
+            )));
+        }
+        let max_defer = flow.max_defer_steps();
+        if max_defer < 0 {
+            return Err(plan_err(format!(
+                "flow {} declares negative max_defer_steps {}",
+                qr(&flow.flow_id),
+                max_defer
+            )));
+        }
+        if mobility == "pinned" {
+            if max_defer != 0 {
+                return Err(plan_err(format!(
+                    "flow {} is pinned but declares max_defer_steps={}",
+                    qr(&flow.flow_id),
+                    max_defer
+                )));
+            }
+            if observes != "at_declared_window" {
+                return Err(plan_err(format!(
+                    "flow {} is pinned but declares observes_version={}",
+                    qr(&flow.flow_id),
+                    qr(observes)
+                )));
+            }
+        }
+        if (mobility == "deferrable" || mobility == "free") && max_defer < 1 {
+            return Err(plan_err(format!(
+                "flow {} is {} but declares max_defer_steps={} (must be >=1)",
+                qr(&flow.flow_id),
+                mobility,
+                max_defer
+            )));
+        }
+        if (mobility == "deferrable" || mobility == "free") && deadline == "step_end" {
+            return Err(plan_err(format!(
+                "flow {} is {} with deadline 'step_end'; deferral is across steps, so this admits no movement",
+                qr(&flow.flow_id),
+                mobility
+            )));
+        }
+        if mobility == "advanceable" && observes == "at_declared_window" {
+            return Err(plan_err(format!(
+                "flow {} is advanceable but observes 'at_declared_window'; running earlier can never observe that version",
+                qr(&flow.flow_id)
+            )));
+        }
+        if graph_mode != "eager"
+            && mobility != "pinned"
+            && IN_CAPTURE_HOOKS.contains(&flow.declared_hook.as_str())
+        {
+            return Err(plan_err(format!(
+                "flow {} declares mobility {} at in-capture hook {} under graph mode {}; \
+                 timing movement across the capture boundary requires the full placement compiler — \
+                 pin the flow or use graph mode 'eager'",
+                qr(&flow.flow_id),
+                qr(mobility),
+                qr(&flow.declared_hook),
+                qr(graph_mode)
+            )));
+        }
+        placements.push((flow.flow_id.clone(), flow.declared_hook.clone()));
+    }
+    Ok(PlacementSchedule { placements })
+}
+
+// ---------------------------------------------------------------------------
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -712,10 +897,12 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(plan_sampler_step, m)?)?;
     m.add_function(wrap_pyfunction!(partition_rows, m)?)?;
     m.add_function(wrap_pyfunction!(compile_execution_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_placement_schedule, m)?)?;
     m.add_class::<DecodeLocalization>()?;
     m.add_class::<DecodePositions>()?;
     m.add_class::<RowPartition>()?;
     m.add_class::<SamplerPlan>()?;
     m.add_class::<CompiledPlan>()?;
+    m.add_class::<PlacementSchedule>()?;
     Ok(())
 }

@@ -27,6 +27,14 @@ class CompiledPlan:
     ordered_producer_ids: list[str]
     port_sources: list[tuple[str, str]]
 
+class PlacementSchedule:
+    placements: list[tuple[str, str]]
+
+def compile_placement_schedule(
+    flows: list[dict[str, object]],
+    graph_mode: str,
+) -> PlacementSchedule: ...
+
 def localize_decode_rows(
     is_decode: list[bool],
     logits_indices: list[int],

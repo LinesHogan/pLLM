@@ -34,15 +34,23 @@ class DispatchPlan:
     def build(cls, consumers: Iterable[BaseConsumer]) -> "DispatchPlan":
         by_event: Dict[str, List[DispatchTarget]] = {}
         flow_targets: List[FlowDispatchTarget] = []
+        timed_flows: List[tuple[str, ConsumerFlow]] = []
         for consumer in consumers:
             flows = list(consumer.flows())
-            for flow in flows:
+            for flow_i, flow in enumerate(flows):
                 flow_targets.append(FlowDispatchTarget(consumer=consumer, flow=flow))
+                timed_flows.append((f"{consumer.consumer_id}#{flow_i}", flow))
             if flows:
                 continue
             for sub in consumer_subscriptions(consumer):
                 by_event.setdefault(sub.event_name, []).append(DispatchTarget(consumer=consumer, subscription=sub))
         plan = cls(by_event=by_event, flow_targets=flow_targets)
+        # Timing-contract validation is owned by the Rust placement compiler;
+        # graph-mode-aware checks join when the plan meets the runner (B5).
+        from tllm.runtime.placement import validate_flow_timing
+        from tllm.runtime.ports.post_generate_dispatch import is_post_generate_flow
+
+        validate_flow_timing([(fid, f) for fid, f in timed_flows if not is_post_generate_flow(f)])
         plan.write_conflict_check()
         return plan
 
