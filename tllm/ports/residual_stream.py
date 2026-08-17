@@ -27,7 +27,7 @@ class ResidualLocator(Locator):
     phase: ResidualPhase
 
     def __post_init__(self) -> None:
-        if not isinstance(self.layer, int):
+        if not isinstance(self.layer, int):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("ResidualLocator.layer must be an int")
         if self.site not in ResidualStream.SUPPORTED_SITES:
             raise ValueError(f"unsupported residual stream site: {self.site}")

@@ -15,7 +15,7 @@ test — never edits to backend drivers or the runtime core.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, Sequence, cast, runtime_checkable
 
 from tllm.backends.protocol import GraphSafety
 from tllm.ports.port_id import PortId
@@ -100,10 +100,11 @@ def validate_producer(producer: Any) -> None:
     outputs = getattr(producer, "outputs", None)
     if not isinstance(outputs, tuple) or not outputs:
         raise TypeError(f"producer {producer_id!r} must declare a non-empty outputs tuple")
-    ids = [spec.id for spec in outputs]
+    output_specs = cast("tuple[PortSpec, ...]", outputs)
+    ids = [spec.id for spec in output_specs]
     if len(set(ids)) != len(ids):
         raise TypeError(f"producer {producer_id!r} declares duplicate port ids: {ids}")
-    hook_points = getattr(producer, "hook_points", frozenset())
+    hook_points = cast("frozenset[HookPoint]", getattr(producer, "hook_points", frozenset[HookPoint]()))
     unknown = set(hook_points) - set(HookPoint.all())
     if unknown:
         raise TypeError(f"producer {producer_id!r} declares unknown hook points: {unknown}")

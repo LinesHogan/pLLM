@@ -19,7 +19,7 @@ class KVLocator(Locator):
     step_scope: KVStepScope
 
     def __post_init__(self) -> None:
-        if not isinstance(self.layer, int):
+        if not isinstance(self.layer, int):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("KVLocator.layer must be an int")
         if self.phase != "decode":
             raise ValueError(f"unsupported KV phase: {self.phase}")

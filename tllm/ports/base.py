@@ -4,16 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-try:
-    from enum import StrEnum
-except ImportError:
-    from enum import Enum
-
-    class StrEnum(str, Enum):
-        def __str__(self) -> str:
-            return str(self.value)
-
 from enum import Enum
+from enum import StrEnum
 from typing import Literal, Sequence
 
 
@@ -110,7 +102,7 @@ class PortWrite:
 
     def __post_init__(self) -> None:
         if self.mode:
-            if not isinstance(self.mode, (str, WriteMode)):
+            if not isinstance(self.mode, (str, WriteMode)):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise TypeError("write mode must be str")
             try:
                 object.__setattr__(self, "mode", str(WriteMode(str(self.mode))))
@@ -120,7 +112,7 @@ class PortWrite:
             object.__setattr__(self, "rows", WriteRows(str(self.rows)))
         except ValueError as exc:
             raise ValueError(f"unsupported write rows `{self.rows}`") from exc
-        if not isinstance(self.order, int):
+        if not isinstance(self.order, int):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("PortWrite.order must be an int")
 
 
@@ -133,7 +125,7 @@ class ConsumerFlow:
     dispatch_every_n_steps: int = 1
     max_bundle_rows: int = 0
     delivery: DeliveryMode = "bundle"
-    ownership: BufferOwnership = "borrowed"
+    ownership: BufferOwnership = BufferOwnership.BORROWED
     row_compaction: RowCompaction = "none"
 
     def __post_init__(self) -> None:

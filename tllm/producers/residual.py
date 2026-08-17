@@ -58,7 +58,7 @@ class DecodeResidualProducer:
             write_modes=("replace", "add"),
         ),
     )
-    requires: tuple = ()
+    requires: tuple[PortId, ...] = ()
     hook_points = frozenset(
         {HookPoint.PREPARE_INPUTS_POST, HookPoint.EXECUTE_MODEL_POST}
     )
@@ -80,7 +80,7 @@ class PrefillResidualProducer:
             description="prefill-step capture-layer hidden rows localized per request",
         ),
     )
-    requires: tuple = ()
+    requires: tuple[PortId, ...] = ()
     hook_points = frozenset(
         {HookPoint.PREPARE_INPUTS_POST, HookPoint.EXECUTE_MODEL_POST}
     )

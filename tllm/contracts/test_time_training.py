@@ -40,7 +40,7 @@ def _require_real(value: object, *, field_name: str) -> float:
 
 
 def _metadata_proxy(metadata: Mapping[str, object], *, field_name: str) -> Mapping[str, object]:
-    if not isinstance(metadata, Mapping):
+    if not isinstance(metadata, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
         raise TypeError(f"{field_name} must be a mapping")
     normalized: dict[str, object] = {}
     for key, value in metadata.items():
@@ -76,7 +76,7 @@ class TestTimeTrainingExample:
     labels: tuple[int, ...] | None = None
     rewards: tuple[float, ...] | None = None
     logprobs: tuple[float, ...] | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict[str, object])
 
     def __post_init__(self) -> None:
         request_id = _require_str(self.request_id, field_name="request_id")
@@ -138,7 +138,7 @@ class TestTimeTrainingBatch:
     """A strict collection of training examples for one trainer request."""
 
     examples: tuple[TestTimeTrainingExample, ...]
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict[str, object])
 
     def __post_init__(self) -> None:
         if not self.examples:
@@ -146,7 +146,7 @@ class TestTimeTrainingBatch:
         examples: list[TestTimeTrainingExample] = []
         identities: set[tuple[str, str, str, str]] = set()
         for example in self.examples:
-            if not isinstance(example, TestTimeTrainingExample):
+            if not isinstance(example, TestTimeTrainingExample):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise TypeError("examples must contain TestTimeTrainingExample")
             if example.identity in identities:
                 raise ValueError("duplicate training example identity")
@@ -178,7 +178,7 @@ class TestTimeTrainerRequest:
     scope: LoRAScope
     request_ids: tuple[str, ...]
     examples: TestTimeTrainingBatch
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict[str, object])
 
     def __post_init__(self) -> None:
         algorithm_id = _require_str(self.algorithm_id, field_name="algorithm_id")
@@ -197,7 +197,7 @@ class TestTimeTrainerRequest:
             raise ValueError("request-scoped trainer request requires request_ids")
         if self.scope == "global" and request_ids:
             raise ValueError("global trainer request must not include request_ids")
-        if not isinstance(self.examples, TestTimeTrainingBatch):
+        if not isinstance(self.examples, TestTimeTrainingBatch):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise TypeError("examples must be TestTimeTrainingBatch")
         if self.scope == "request" and tuple(self.examples.request_ids) != tuple(request_ids):
             raise ValueError("examples request_ids must match trainer request_ids")
@@ -215,16 +215,16 @@ class TestTimeTrainerResult:
     """Trainer output containing staged LoRA updates and scalar metrics."""
 
     updates: tuple[TestTimeLoRAUpdate, ...] = field(default_factory=tuple)
-    metrics: Mapping[str, float] = field(default_factory=dict)
+    metrics: Mapping[str, float] = field(default_factory=dict[str, float])
 
     def __post_init__(self) -> None:
         updates: list[TestTimeLoRAUpdate] = []
         for update in self.updates:
-            if not isinstance(update, TestTimeLoRAUpdate):
+            if not isinstance(update, TestTimeLoRAUpdate):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise TypeError("updates must contain TestTimeLoRAUpdate")
             updates.append(update)
         metrics: dict[str, float] = {}
-        if not isinstance(self.metrics, Mapping):
+        if not isinstance(self.metrics, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise TypeError("metrics must be a mapping")
         for name, value in self.metrics.items():
             metrics[_require_str(name, field_name="metrics key")] = _require_real(value, field_name="metrics")

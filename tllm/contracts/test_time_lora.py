@@ -40,7 +40,7 @@ class TestTimeLoRATarget:
         module_name = _require_str(self.module_name, field_name="module_name")
         packed_members: list[str] = []
         for member in self.packed_members:
-            if not isinstance(member, str):
+            if not isinstance(member, str):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise TypeError("packed_members must contain str")
             packed_members.append(_require_str(member, field_name="packed_members member"))
         object.__setattr__(self, "module_name", module_name)
@@ -56,15 +56,15 @@ class TestTimeLoRAWeights:
     alpha: float = 1.0
 
     def __post_init__(self) -> None:
-        if not isinstance(self.lora_a, torch.Tensor) or not isinstance(self.lora_b, torch.Tensor):
+        if not isinstance(self.lora_a, torch.Tensor) or not isinstance(self.lora_b, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("TestTimeLoRAWeights requires tensor lora_a and lora_b")
         if self.lora_a.ndim != 2 or self.lora_b.ndim != 2:
             raise ValueError("TestTimeLoRAWeights expects rank-2 LoRA tensors")
         if int(self.lora_a.shape[1]) != int(self.lora_b.shape[0]):
             raise ValueError("TestTimeLoRAWeights rank dimension mismatch")
-        if self.embeddings_tensor is not None and not isinstance(self.embeddings_tensor, torch.Tensor):
+        if self.embeddings_tensor is not None and not isinstance(self.embeddings_tensor, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("TestTimeLoRAWeights embeddings_tensor must be a tensor when provided")
-        if self.bias is not None and not isinstance(self.bias, torch.Tensor):
+        if self.bias is not None and not isinstance(self.bias, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("TestTimeLoRAWeights bias must be a tensor when provided")
         if isinstance(self.alpha, bool) or not isinstance(self.alpha, Real):
             raise TypeError("TestTimeLoRAWeights alpha must be real")
@@ -102,7 +102,7 @@ class TestTimeLoRAUpdate:
             raise ValueError("TestTimeLoRAUpdate scope must be 'global' or 'request'")
         request_ids: list[str] = []
         for request_id in self.request_ids:
-            if not isinstance(request_id, str):
+            if not isinstance(request_id, str):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise TypeError("request_ids must contain str")
             request_ids.append(_require_str(request_id, field_name="request_id"))
         if self.scope == "request" and not request_ids:
@@ -112,7 +112,7 @@ class TestTimeLoRAUpdate:
         target_modules: dict[str, TestTimeLoRAWeights] = {}
         for module_name, weights in self.target_modules.items():
             module_key = _require_str(module_name, field_name="target module name")
-            if not isinstance(weights, TestTimeLoRAWeights):
+            if not isinstance(weights, TestTimeLoRAWeights):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise ValueError("target_modules values must be TestTimeLoRAWeights")
             if int(weights.rank) != rank:
                 raise ValueError("target module LoRA rank does not match update rank")

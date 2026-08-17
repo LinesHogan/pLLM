@@ -16,7 +16,7 @@ LeaseLifetime = Literal["consume_call"]
 class DeviceTensorLease:
     entries: Mapping[str, torch.Tensor]
     active_rows: int
-    ownership: BufferOwnership = "runtime_lease"
+    ownership: BufferOwnership = BufferOwnership.RUNTIME_LEASE
     lifetime: LeaseLifetime = "consume_call"
 
     def __post_init__(self) -> None:
@@ -27,7 +27,7 @@ class DeviceTensorLease:
         if str(self.lifetime) != "consume_call":
             raise ValueError("DeviceTensorLease currently supports only lifetime='consume_call'")
         for name, tensor in self.entries.items():
-            if not isinstance(tensor, torch.Tensor):
+            if not isinstance(tensor, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise ValueError(f"DeviceTensorLease entry `{name}` must be a torch.Tensor")
             if tensor.ndim < 1:
                 raise ValueError(f"DeviceTensorLease entry `{name}` must have a row dimension")

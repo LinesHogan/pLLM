@@ -1,0 +1,16 @@
+{
+  "typeCheckingMode": "basic",
+  "include": ["tllm"],
+  "exclude": [
+    "tllm/runtime/vllm_patch",
+    "tllm/backends",
+    "tllm/contracts",
+    "tllm/ports",
+    "tllm/producers",
+    "tllm/core",
+    "**/__pycache__"
+  ],
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "pythonVersion": "3.11"
+}

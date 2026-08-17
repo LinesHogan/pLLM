@@ -15,15 +15,14 @@ declarations into an ordered DAG at startup and fails fast on:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Sequence
 
-from tllm.backends.protocol import BackendCapabilities, GraphSafety
+from tllm.backends.protocol import BackendCapabilities
 from tllm.ports.base import PortKind
 from tllm.ports.port_id import PortId
 from tllm.producers.base import (
     HookPoint,
-    Producer,
     producer_graph_safety,
     producer_hook_points,
     producer_output_specs,
@@ -118,7 +117,7 @@ def compile_execution_plan(
     """
     from tllm import core as _core
 
-    producers = [
+    producers: list[dict[str, object]] = [
         {
             "id": entry.producer_id,
             "priority": entry.priority,
@@ -137,12 +136,12 @@ def compile_execution_plan(
         }
         for entry in registry.entries()
     ]
-    consumer_descs = []
+    consumer_descs: list[dict[str, object]] = []
     for consumer in consumers:
         consumer_id = str(getattr(consumer, "consumer_id", repr(consumer)))
         flows = consumer.flows() if callable(getattr(consumer, "flows", None)) else ()
         reads: list[str] = []
-        writes: list[dict] = []
+        writes: list[dict[str, str]] = []
         for flow in flows or ():
             for read in getattr(flow, "reads", ()) or ():
                 kind = getattr(read, "kind", None)
@@ -158,10 +157,9 @@ def compile_execution_plan(
 
     backend = None
     if backend_capabilities is not None:
-        safety = backend_capabilities.graph_safety
         backend = (
             str(backend_capabilities.backend_id),
-            safety.name if isinstance(safety, GraphSafety) else str(safety),
+            backend_capabilities.graph_safety.name,
         )
     try:
         compiled = _core.compile_execution_plan(
