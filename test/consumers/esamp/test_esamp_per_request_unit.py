@@ -25,6 +25,35 @@ from tllm.runtime import residual_runtime as esamp_runtime
 from tllm.runtime.vllm_patch import port_runtime_hooks
 
 
+def _graph_buffers(
+    *,
+    device: torch.device,
+    rows: int,
+    hidden: int,
+    slots: int | None = None,
+    valid: torch.Tensor | None = None,
+    loss_value: float = 0.0,
+    src: torch.Tensor | None = None,
+    tgt: torch.Tensor | None = None,
+) -> engine_module._GraphBuffers:
+    slot_buffers = None
+    if slots is not None:
+        slot_buffers = engine_module._GraphSlotBuffers(
+            slot_ids=torch.zeros((rows,), device=device, dtype=torch.long),
+            slot_sum=torch.zeros((slots,), device=device, dtype=torch.float32),
+            slot_cnt=torch.zeros((slots,), device=device, dtype=torch.float32),
+        )
+    return engine_module._GraphBuffers(
+        pair=engine_module.GraphCopyPair(
+            src=src if src is not None else torch.zeros((rows, hidden), device=device, dtype=torch.float32),
+            tgt=tgt if tgt is not None else torch.zeros((rows, hidden), device=device, dtype=torch.float32),
+        ),
+        valid=valid if valid is not None else torch.zeros((rows,), device=device, dtype=torch.float32),
+        loss=torch.full((1,), loss_value, device=device, dtype=torch.float32),
+        slots=slot_buffers,
+    )
+
+
 class ESampPerRequestUnitTest(unittest.TestCase):
     class _ReplayFailGraph:
         def replay(self) -> None:
@@ -150,7 +179,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
                 ]
 
             def consume(self, batch: HiddenBatch, ctx: RuntimeContext) -> None:
-                observed.append((ctx.event_name, batch.layer_path, int(batch.rows_hidden.shape[0]), batch.metadata["prompt_idxs"]))
+                observed.append((ctx.event_name, batch.layer_path, int(batch.rows_hidden.shape[0]), list(batch.prompt_idxs)))
 
             def on_tick(self, event_name: str, ctx: RuntimeContext) -> None:
                 _ = ctx
@@ -920,12 +949,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         shared_graph.capture_state = "captured"
         shared_graph.replay_graph = self._ReplayFailGraph()
         shared_graph.rows = rows
-        shared_graph.buffers = {
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-        }
+        shared_graph.buffers = _graph_buffers(device=device, rows=rows, hidden=hidden)
         consumer.state.stats = engine_module._StatsBuffers(
             loss_sum=torch.zeros((1,), device=device, dtype=torch.float32),
             loss_count=torch.zeros((1,), device=device, dtype=torch.int64),
@@ -955,15 +979,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         bank_graph.capture_state = "captured"
         bank_graph.replay_graph = self._ReplayFailGraph()
         bank_graph.rows = rows
-        bank_graph.buffers = {
-            "slot_ids": torch.zeros((rows,), device=device, dtype=torch.long),
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "slot_sum": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "slot_cnt": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-        }
+        bank_graph.buffers = _graph_buffers(device=device, rows=rows, hidden=hidden, slots=slots)
         consumer.state.slot_to_prompt = {0: 0}
         consumer.state.stats = engine_module._StatsBuffers(
             loss_sum=torch.zeros((1,), device=device, dtype=torch.float32),
@@ -995,15 +1011,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         bank_graph.capture_state = "captured"
         bank_graph.replay_graph = self._ReplayNoopGraph()
         bank_graph.rows = rows
-        bank_graph.buffers = {
-            "slot_ids": torch.zeros((rows,), device=device, dtype=torch.long),
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "slot_sum": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "slot_cnt": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "loss": torch.ones((1,), device=device, dtype=torch.float32),
-        }
+        bank_graph.buffers = _graph_buffers(device=device, rows=rows, hidden=hidden, slots=slots, loss_value=1.0)
         consumer.state.slot_to_prompt = {0: 0, 1: 1, 2: 2, 3: 3}
         consumer.state.stats = engine_module._StatsBuffers(
             loss_sum=torch.zeros((1,), device=device, dtype=torch.float32),
@@ -1035,15 +1043,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         bank_graph.capture_state = "captured"
         bank_graph.replay_graph = self._ReplayNoopGraph()
         bank_graph.rows = rows
-        bank_graph.buffers = {
-            "slot_ids": torch.zeros((rows,), device=device, dtype=torch.long),
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "slot_sum": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "slot_cnt": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "loss": torch.ones((1,), device=device, dtype=torch.float32),
-        }
+        bank_graph.buffers = _graph_buffers(device=device, rows=rows, hidden=hidden, slots=slots, loss_value=1.0)
         consumer.state.slot_to_prompt = {0: 0, 1: 1, 2: 2, 3: 3}
         consumer.state.stats = engine_module._StatsBuffers(
             loss_sum=torch.zeros((1,), device=device, dtype=torch.float32),
@@ -1077,12 +1077,12 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         graph = consumer.state.graphs["shared"]
         graph.rows = rows
         graph.active_rows = 2
-        graph.buffers = {
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.tensor([1.0, 1.0, 9.0, 9.0, 9.0], device=device, dtype=torch.float32),
-            "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-        }
+        graph.buffers = _graph_buffers(
+            device=device,
+            rows=rows,
+            hidden=hidden,
+            valid=torch.tensor([1.0, 1.0, 9.0, 9.0, 9.0], device=device, dtype=torch.float32),
+        )
         src = torch.ones((1, hidden), device=device, dtype=dtype)
         tgt = torch.full((1, hidden), 2.0, device=device, dtype=dtype)
 
@@ -1090,7 +1090,9 @@ class ESampPerRequestUnitTest(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(graph.active_rows, 1)
-        self.assertTrue(torch.equal(graph.buffers["valid"], torch.tensor([1.0, 0.0, 9.0, 9.0, 9.0])))
+        buffers = graph.buffers
+        assert buffers is not None
+        self.assertTrue(torch.equal(buffers.valid, torch.tensor([1.0, 0.0, 9.0, 9.0, 9.0])))
 
     def test_external_graph_input_staging_keeps_source_target_aliases(self) -> None:
         device = torch.device("cpu")
@@ -1104,15 +1106,14 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         graph.external_inputs = True
         external_src = torch.full((rows, hidden), 5.0, device=device, dtype=dtype)
         external_tgt = torch.full((rows, hidden), 6.0, device=device, dtype=dtype)
-        graph.buffers = {
-            "slot_ids": torch.zeros((rows,), device=device, dtype=torch.long),
-            "src": external_src,
-            "tgt": external_tgt,
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "slot_sum": torch.zeros((2,), device=device, dtype=torch.float32),
-            "slot_cnt": torch.zeros((2,), device=device, dtype=torch.float32),
-            "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-        }
+        graph.buffers = _graph_buffers(
+            device=device,
+            rows=rows,
+            hidden=hidden,
+            slots=2,
+            src=external_src,
+            tgt=external_tgt,
+        )
         src = torch.ones((rows, hidden), device=device, dtype=dtype)
         tgt = torch.ones((rows, hidden), device=device, dtype=dtype)
         slot_ids = torch.tensor([0, 1], device=device, dtype=torch.long)
@@ -1127,10 +1128,12 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         )
 
         self.assertTrue(ok)
-        self.assertTrue(torch.equal(graph.buffers["src"], external_src))
-        self.assertTrue(torch.equal(graph.buffers["tgt"], external_tgt))
-        self.assertTrue(torch.equal(graph.buffers["slot_ids"][:2], slot_ids))
-        self.assertTrue(torch.equal(graph.buffers["valid"], torch.tensor([1.0, 1.0, 0.0])))
+        buffers = graph.buffers
+        assert buffers is not None and buffers.slots is not None
+        self.assertTrue(torch.equal(buffers.pair.src, external_src))
+        self.assertTrue(torch.equal(buffers.pair.tgt, external_tgt))
+        self.assertTrue(torch.equal(buffers.slots.slot_ids[:2], slot_ids))
+        self.assertTrue(torch.equal(buffers.valid, torch.tensor([1.0, 1.0, 0.0])))
 
     def test_read_and_reset_stats_handles_inference_mode_buffers(self) -> None:
         device = torch.device("cpu")
@@ -1743,12 +1746,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         shared_graph.capture_state = "captured"
         shared_graph.replay_graph = self._ReplayFailGraph()
         shared_graph.rows = rows
-        shared_graph.buffers = {
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-        }
+        shared_graph.buffers = _graph_buffers(device=device, rows=rows, hidden=hidden)
         src = torch.randn((rows, hidden), device=device, dtype=dtype)
         tgt = torch.randn((rows, hidden), device=device, dtype=dtype)
 
@@ -1820,15 +1818,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         bank_graph.capture_state = "captured"
         bank_graph.replay_graph = self._ReplayFailGraph()
         bank_graph.rows = rows
-        bank_graph.buffers = {
-            "slot_ids": torch.zeros((rows,), device=device, dtype=torch.long),
-            "src": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "tgt": torch.zeros((rows, hidden), device=device, dtype=dtype),
-            "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-            "slot_sum": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "slot_cnt": torch.zeros((slots,), device=device, dtype=torch.float32),
-            "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-        }
+        bank_graph.buffers = _graph_buffers(device=device, rows=rows, hidden=hidden, slots=slots)
         src = torch.randn((rows, hidden), device=device, dtype=dtype)
         tgt = src + 0.1
 

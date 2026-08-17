@@ -141,6 +141,29 @@ class _PerRequestTrainer:
 
 
 @dataclass(slots=True)
+class GraphCopyPair:
+    """Persistent src/tgt staging pair feeding a captured training graph."""
+
+    src: torch.Tensor
+    tgt: torch.Tensor
+
+
+@dataclass(slots=True)
+class _GraphSlotBuffers:
+    slot_ids: torch.Tensor
+    slot_sum: torch.Tensor
+    slot_cnt: torch.Tensor
+
+
+@dataclass(slots=True)
+class _GraphBuffers:
+    pair: GraphCopyPair
+    valid: torch.Tensor
+    loss: torch.Tensor
+    slots: _GraphSlotBuffers | None = None
+
+
+@dataclass(slots=True)
 class _GraphState:
     rows: int = 0
     slots: int = 0
@@ -157,7 +180,7 @@ class _GraphState:
     replay_hit_count: int = 0
     replay_stage_miss_count: int = 0
     kernel_fallback_count: int = 0
-    buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+    buffers: _GraphBuffers | None = None
 
 
 @dataclass(slots=True)
@@ -469,7 +492,7 @@ class _ESampEngineCore:
         graph.replay_hit_count = 0
         graph.replay_stage_miss_count = 0
         graph.kernel_fallback_count = 0
-        graph.buffers.clear()
+        graph.buffers = None
 
     def _reset_pipeline_runtime_state(self, *, reset_streams: bool) -> None:
         s = self.state
@@ -852,16 +875,19 @@ class _ESampEngineCore:
                 assert tgt_input is not None
                 src_buffer = src_input[:rows]
                 tgt_buffer = tgt_input[:rows]
-            graph.buffers = {
-                "src": src_buffer,
-                "tgt": tgt_buffer,
-                "valid": torch.zeros((rows,), device=device, dtype=torch.float32),
-                "loss": torch.zeros((1,), device=device, dtype=torch.float32),
-            }
+            slot_buffers: _GraphSlotBuffers | None = None
             if mode == "model_bank":
-                graph.buffers["slot_ids"] = torch.zeros((rows,), device=device, dtype=torch.long)
-                graph.buffers["slot_sum"] = torch.zeros((slots,), device=device, dtype=torch.float32)
-                graph.buffers["slot_cnt"] = torch.zeros((slots,), device=device, dtype=torch.float32)
+                slot_buffers = _GraphSlotBuffers(
+                    slot_ids=torch.zeros((rows,), device=device, dtype=torch.long),
+                    slot_sum=torch.zeros((slots,), device=device, dtype=torch.float32),
+                    slot_cnt=torch.zeros((slots,), device=device, dtype=torch.float32),
+                )
+            graph.buffers = _GraphBuffers(
+                pair=GraphCopyPair(src=src_buffer, tgt=tgt_buffer),
+                valid=torch.zeros((rows,), device=device, dtype=torch.float32),
+                loss=torch.zeros((1,), device=device, dtype=torch.float32),
+                slots=slot_buffers,
+            )
         return graph
 
     def _capture_graph(
@@ -918,32 +944,37 @@ class _ESampEngineCore:
             )
         try:
             graph_obj = torch.cuda.CUDAGraph()
+            buffers = graph.buffers
+            assert buffers is not None  # _ensure_graph_storage just populated them
+            pair = buffers.pair
             with torch.inference_mode():
                 with torch.cuda.graph(graph_obj, stream=train_stream):
                     with _grad_context():
                         if mode == "shared":
                             shared.optimizer.zero_grad(set_to_none=False)
-                            pred = shared.train_model(graph.buffers["src"])
-                            row_mse = ((pred.float() - graph.buffers["tgt"].float()) ** 2).mean(dim=1)
-                            loss = (row_mse * graph.buffers["valid"]).sum() / torch.clamp(graph.buffers["valid"].sum(), min=1.0)
+                            pred = shared.train_model(pair.src)
+                            row_mse = ((pred.float() - pair.tgt.float()) ** 2).mean(dim=1)
+                            loss = (row_mse * buffers.valid).sum() / torch.clamp(buffers.valid.sum(), min=1.0)
                             loss.backward()
                             shared.optimizer.step()
                             _copy_parameters(shared.forward_model, shared.train_model)
                         else:
+                            slot_buffers = buffers.slots
+                            assert slot_buffers is not None  # model_bank graphs always carry slot buffers
                             model_bank_optimizer.zero_grad(set_to_none=False)
-                            pred = self._model_bank_forward(graph.buffers["slot_ids"], graph.buffers["src"])
-                            row_mse = ((pred.float() - graph.buffers["tgt"].float()) ** 2).mean(dim=1)
-                            weighted = row_mse * graph.buffers["valid"]
-                            graph.buffers["slot_sum"].zero_()
-                            graph.buffers["slot_cnt"].zero_()
-                            graph.buffers["slot_sum"].scatter_add_(0, graph.buffers["slot_ids"], weighted)
-                            graph.buffers["slot_cnt"].scatter_add_(0, graph.buffers["slot_ids"], graph.buffers["valid"])
-                            slot_mean = graph.buffers["slot_sum"] / torch.clamp(graph.buffers["slot_cnt"], min=1.0)
-                            active = (graph.buffers["slot_cnt"] > 0).to(dtype=slot_mean.dtype)
+                            pred = self._model_bank_forward(slot_buffers.slot_ids, pair.src)
+                            row_mse = ((pred.float() - pair.tgt.float()) ** 2).mean(dim=1)
+                            weighted = row_mse * buffers.valid
+                            slot_buffers.slot_sum.zero_()
+                            slot_buffers.slot_cnt.zero_()
+                            slot_buffers.slot_sum.scatter_add_(0, slot_buffers.slot_ids, weighted)
+                            slot_buffers.slot_cnt.scatter_add_(0, slot_buffers.slot_ids, buffers.valid)
+                            slot_mean = slot_buffers.slot_sum / torch.clamp(slot_buffers.slot_cnt, min=1.0)
+                            active = (slot_buffers.slot_cnt > 0).to(dtype=slot_mean.dtype)
                             loss = (slot_mean * active).sum()
                             loss.backward()
                             model_bank_optimizer.step()
-                        graph.buffers["loss"].copy_(loss.detach())
+                        buffers.loss.copy_(loss.detach())
             graph.capture_state = "captured"
             graph.replay_graph = graph_obj
             graph.disable_reason = ""
@@ -965,22 +996,24 @@ class _ESampEngineCore:
         graph: _GraphState | None = None,
     ) -> bool:
         graph = graph or self._graph(mode)
-        if not graph.buffers:
+        buffers = graph.buffers
+        if buffers is None:
             return False
         n = int(active_rows)
         if n <= 0 or n > graph.rows:
             return False
-        previous_active = max(0, min(int(graph.active_rows), int(graph.buffers["valid"].numel())))
+        previous_active = max(0, min(int(graph.active_rows), int(buffers.valid.numel())))
         if previous_active > 0:
-            graph.buffers["valid"][:previous_active].zero_()
+            buffers.valid[:previous_active].zero_()
         if not graph.external_inputs:
-            graph.buffers["src"][:n].copy_(src[:n])
-            graph.buffers["tgt"][:n].copy_(tgt[:n])
-        graph.buffers["valid"][:n].fill_(1.0)
+            buffers.pair.src[:n].copy_(src[:n])
+            buffers.pair.tgt[:n].copy_(tgt[:n])
+        buffers.valid[:n].fill_(1.0)
         if mode == "model_bank":
-            if slot_ids is None or "slot_ids" not in graph.buffers:
+            slot_buffers = buffers.slots
+            if slot_ids is None or slot_buffers is None:
                 return False
-            graph.buffers["slot_ids"][:n].copy_(slot_ids[:n])
+            slot_buffers.slot_ids[:n].copy_(slot_ids[:n])
         graph.active_rows = n
         return True
 
@@ -1781,7 +1814,9 @@ class ESampTrainEngine(_ESampEngineCore):
             graph.replay_graph = _MISSING_REPLAY_GRAPH
             graph.disable_reason = str(exc)
             return False
-        stats.loss_sum.add_(graph.buffers["loss"].detach())
+        buffers = graph.buffers
+        assert buffers is not None  # _stage_graph_inputs succeeded above
+        stats.loss_sum.add_(buffers.loss.detach())
         stats.loss_count.add_(count_delta)
         graph.replay_hit_count += 1
         return True
