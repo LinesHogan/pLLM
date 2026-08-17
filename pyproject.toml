@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tllm"
+version = "0.1.0"
+description = "Runtime layer for producer/consumer extensions on top of the vLLM v1 inference engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "einops==0.8.2",
+    "opt-einsum>=3.4,<4",
+]
+
+[project.optional-dependencies]
+# vLLM 0.27 backend drivers (MRv1 + MRv2). For CUDA 12.x drivers, install
+# the cu129 wheels instead of the default cu130 builds — see
+# docs/environment.md.
+vllm027 = ["vllm>=0.27.1,<0.28"]
+test = ["pytest==9.0.3"]
+
+[tool.setuptools.packages.find]
+include = ["tllm*"]
