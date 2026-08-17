@@ -24,6 +24,7 @@ sampler instance owned by the bound runner.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -33,6 +34,12 @@ from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerSte
 from tllm.runtime.vllm_patch.sampler_patch import _notify_after_sample, _resolve_provider
 
 _MARK_ATTR = "_tllm_mrv2_sampler_wrapped"
+_SAMPLING_EPS = 1e-5
+# Fixed capacity for the sync-free survivor-compaction path. Rows with more
+# surviving (post-filter) tokens than the cap are reweighted only on the first
+# `cap` survivors found; "0" disables the candidate path and forces the dense
+# full-vocab fallback.
+_INTERVENTION_CANDIDATE_CAP = int(os.getenv("TLLM_MRV2_INTERVENTION_CANDIDATE_CAP", "256") or "0")
 
 
 def _build_mrv2_step_view(*, runtime: Any, runner: Any, logits: torch.Tensor) -> SamplerStepView | None:
@@ -108,6 +115,18 @@ def _apply_intervention(
         pred_rows = affected
 
     dense = state.precomputed_dense_logits
+    if _INTERVENTION_CANDIDATE_CAP > 0:
+        compacted = _reweight_candidates_syncfree(
+            filtered_logits=filtered_logits,
+            affected=affected,
+            pred_rows=pred_rows,
+            state=state,
+            beta=beta,
+            cap=_INTERVENTION_CANDIDATE_CAP,
+        )
+        if compacted is not None:
+            return compacted
+
     if dense is not None:
         dense_rows = dense.to(device=filtered_logits.device, dtype=torch.float32).index_select(0, pred_rows)
     else:
@@ -121,6 +140,262 @@ def _apply_intervention(
     out = filtered_logits.clone()
     out[affected] = reweighted.to(dtype=filtered_logits.dtype)
     return out
+
+
+def _reweight_candidates_syncfree(
+    *,
+    filtered_logits: torch.Tensor,
+    affected: torch.Tensor,
+    pred_rows: torch.Tensor,
+    state: CandidateModifierState,
+    beta: float,
+    cap: int,
+) -> torch.Tensor | None:
+    """Reweight post-filter survivors without any host sync.
+
+    Survivors (finite logits) are compacted on-device into a fixed-capacity
+    buffer; only those positions receive the ``(1+beta)*x - beta*d`` update,
+    applied as an additive correction ``beta*(x - d)``. Returns None when the
+    compaction kernel is unavailable (caller falls back to the dense path).
+    """
+    from tllm.runtime.sampler_bridge.kernels.finite_compact_triton import compact_finite_ids
+
+    result = compact_finite_ids(filtered_logits, affected, cap=cap)
+    if result is None:
+        return None
+    ids, _counts = result
+    valid = ids >= 0
+    safe_ids = ids.clamp_min(0).to(torch.long)
+
+    llm_vals = filtered_logits[affected.unsqueeze(1), safe_ids].to(torch.float32)
+    distiller_vals = _candidate_distiller_logits(
+        state=state,
+        pred_rows=pred_rows,
+        safe_ids=safe_ids,
+        device=filtered_logits.device,
+    )
+    correction = torch.where(
+        valid,
+        beta * (llm_vals - distiller_vals.to(device=filtered_logits.device)),
+        torch.zeros((), device=filtered_logits.device, dtype=torch.float32),
+    )
+    # Additive index_put is safe for duplicate padded positions: they carry a
+    # zero correction, and -inf entries stay -inf under +0.
+    filtered_logits.index_put_(
+        (affected.unsqueeze(1).expand(-1, int(ids.shape[1])), safe_ids),
+        correction.to(dtype=filtered_logits.dtype),
+        accumulate=True,
+    )
+    return filtered_logits
+
+
+def _candidate_distiller_logits(
+    *,
+    state: CandidateModifierState,
+    pred_rows: torch.Tensor,
+    safe_ids: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Project distiller logits for ``[rows, cap]`` candidate token ids."""
+    rows = int(safe_ids.shape[0])
+    cap = int(safe_ids.shape[1])
+    dense = state.precomputed_dense_logits
+    if dense is not None:
+        dense_dev = dense.to(device=device, dtype=torch.float32)
+        return dense_dev[
+            pred_rows.to(device=dense_dev.device, dtype=torch.long).unsqueeze(1),
+            safe_ids.to(device=dense_dev.device),
+        ]
+    weight = state.lm_head_weight
+    token_rows = weight.index_select(0, safe_ids.reshape(-1).to(device=weight.device, dtype=torch.long))
+    token_rows = token_rows.view(rows, cap, -1)
+    pred = state.pred_hidden.to(device=device).index_select(
+        0, pred_rows.to(device=state.pred_hidden.device, dtype=torch.long)
+    )
+    distiller_vals = torch.bmm(token_rows, pred.to(dtype=token_rows.dtype).unsqueeze(-1)).squeeze(-1)
+    if state.lm_head_bias is not None:
+        distiller_vals = distiller_vals + state.lm_head_bias.index_select(
+            0, safe_ids.reshape(-1).to(device=state.lm_head_bias.device, dtype=torch.long)
+        ).view(rows, cap)
+    return distiller_vals.to(torch.float32)
+
+
+def _gumbel_over_candidates(
+    *,
+    candidate_logits: torch.Tensor,
+    valid: torch.Tensor,
+    safe_ids: torch.Tensor,
+    sampler: Any,
+    affected: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    row_count: int,
+) -> torch.Tensor:
+    """Draw one token per affected row from ``[rows, cap]`` candidates.
+
+    Gumbel-max over the survivors is distributionally identical to sampling
+    the reweighted full-vocab distribution; greedy rows (temperature == 0)
+    take the reweighted argmax, mirroring upstream.
+    """
+    candidate_logits = torch.where(valid, candidate_logits, float("-inf"))
+    temp_rows = sampler.sampling_states.temperature.gpu.index_select(
+        0,
+        expanded_idx_mapping.to(device=candidate_logits.device, dtype=torch.long).index_select(0, affected),
+    )
+    random_mask = (temp_rows >= _SAMPLING_EPS).unsqueeze(1)
+    noise = torch.empty_like(candidate_logits)
+    noise.exponential_()
+    gumbel = -noise.clamp_min(torch.finfo(torch.float32).tiny).log_()
+    scores = torch.where(random_mask, candidate_logits + gumbel, candidate_logits)
+    winners = scores.argmax(dim=-1)
+    sampled_candidates = safe_ids.gather(1, winners.unsqueeze(1)).view(-1)
+    sampled = torch.empty((int(row_count),), device=candidate_logits.device, dtype=torch.long)
+    sampled[affected] = sampled_candidates
+    return sampled
+
+
+def _sample_post_filter_minp_fused(
+    *,
+    sampler: Any,
+    logits: torch.Tensor,
+    state: CandidateModifierState,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping_np: Any,
+    pos: torch.Tensor,
+) -> torch.Tensor | None:
+    """Fused min-p + compaction + candidate draw, skipping all full-vocab fp32
+    work (the upcast copy, the in-place mask write, and the sampling read).
+
+    Only valid when min-p is the sole active logits transform for every row:
+    penalties/bias/bad-words mutate logits outside this kernel, and top-k/top-p
+    need their own filter. Those steps fall back to the generic paths.
+    """
+    if _INTERVENTION_CANDIDATE_CAP <= 0:
+        return None
+    beta = float(state.beta)
+    if beta == 0.0:
+        return None
+    affected = state.affected_row_ids.to(device=logits.device, dtype=torch.long)
+    if int(affected.numel()) <= 0 or int(affected.numel()) != int(logits.shape[0]):
+        return None
+    import numpy as np
+
+    states = sampler.sampling_states
+    if bool(np.any(sampler.logit_bias_state.use_logit_bias[idx_mapping_np])):
+        return None
+    if bool(np.any(sampler.penalties_state.use_penalty[idx_mapping_np])):
+        return None
+    if bool(np.any(sampler.bad_words_state.num_bad_words.np[idx_mapping_np] > 0)):
+        return None
+    if not bool(np.all(states.min_p.np[idx_mapping_np] > 0.0)):
+        return None
+    top_k, top_p = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+    if top_k is not None or top_p is not None:
+        return None
+
+    from tllm.runtime.sampler_bridge.kernels.minp_compact_triton import (
+        gumbel_argmax_candidates,
+        minp_compact_candidates,
+    )
+
+    result = minp_compact_candidates(
+        logits,
+        expanded_idx_mapping,
+        states.temperature.gpu,
+        states.min_p.gpu,
+        cap=_INTERVENTION_CANDIDATE_CAP,
+    )
+    if result is None:
+        return None
+    ids, vals, _counts = result
+    safe_ids = ids.clamp_min(0).to(torch.long)
+
+    if state.pred_hidden_row_map is not None:
+        pred_rows = state.pred_hidden_row_map.to(device=logits.device, dtype=torch.long).index_select(0, affected)
+    else:
+        pred_rows = affected
+    distiller_vals = _candidate_distiller_logits(
+        state=state,
+        pred_rows=pred_rows,
+        safe_ids=safe_ids,
+        device=logits.device,
+    )
+    return gumbel_argmax_candidates(
+        vals,
+        distiller_vals,
+        ids,
+        beta=beta,
+        temperature=states.temperature.gpu,
+        seeds=states.seeds.gpu,
+        pos=pos,
+        affected=affected,
+        expanded_idx_mapping=expanded_idx_mapping,
+        row_count=int(logits.shape[0]),
+    )
+
+
+def _sample_post_filter_candidates(
+    *,
+    sampler: Any,
+    filtered_logits: torch.Tensor,
+    state: CandidateModifierState,
+    expanded_idx_mapping: torch.Tensor,
+) -> torch.Tensor | None:
+    """Sample directly from the compacted survivor set (no full-vocab writes).
+
+    Returns None when the fast path does not apply (cap disabled, compaction
+    kernel unavailable, or the step has rows outside ``affected_row_ids``).
+    Sampling among the survivors with fresh gumbel noise is distributionally
+    identical to sampling the reweighted full-vocab distribution, because
+    filtered-out positions carry -inf either way. Greedy (temperature == 0)
+    rows take the argmax of the reweighted candidates, mirroring upstream.
+    """
+    if _INTERVENTION_CANDIDATE_CAP <= 0:
+        return None
+    affected = state.affected_row_ids.to(device=filtered_logits.device, dtype=torch.long)
+    if int(affected.numel()) != int(filtered_logits.shape[0]):
+        # Mixed prefill/decode steps still need the full-vocab path for the
+        # unaffected rows; use the in-place reweight fallback instead.
+        return None
+    if int(affected.numel()) <= 0:
+        return None
+    beta = float(state.beta)
+    if beta == 0.0:
+        return None
+
+    from tllm.runtime.sampler_bridge.kernels.finite_compact_triton import compact_finite_ids
+
+    result = compact_finite_ids(filtered_logits, affected, cap=_INTERVENTION_CANDIDATE_CAP)
+    if result is None:
+        return None
+    ids, _counts = result
+    cap = int(ids.shape[1])
+    valid = ids >= 0
+    safe_ids = ids.clamp_min(0).to(torch.long)
+
+    if state.pred_hidden_row_map is not None:
+        pred_rows = state.pred_hidden_row_map.to(device=filtered_logits.device, dtype=torch.long).index_select(
+            0, affected
+        )
+    else:
+        pred_rows = affected
+
+    llm_vals = filtered_logits[affected.unsqueeze(1), safe_ids].to(torch.float32)
+    distiller_vals = _candidate_distiller_logits(
+        state=state,
+        pred_rows=pred_rows,
+        safe_ids=safe_ids,
+        device=filtered_logits.device,
+    )
+    candidate_logits = (1.0 + beta) * llm_vals - beta * distiller_vals
+    return _gumbel_over_candidates(
+        candidate_logits=candidate_logits,
+        valid=valid,
+        safe_ids=safe_ids,
+        sampler=sampler,
+        affected=affected,
+        expanded_idx_mapping=expanded_idx_mapping,
+        row_count=int(filtered_logits.shape[0]),
+    )
 
 
 def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sample: Any):
@@ -145,8 +420,17 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
                 return_logprobs=return_logprobs,
             )
 
+        import os as _os
+        import time as _time
+
+        _trace = _os.getenv("TLLM_TRACE_MRV2_SAMPLER", "") == "1"
+        _tp0 = _time.perf_counter() if _trace else 0.0
         view = _build_mrv2_step_view(runtime=runtime, runner=runner, logits=logits)
         state = provider.prepare_step(view) if view is not None else None
+        if _trace:
+            from tllm.runtime.residual_runtime import record_path_hotspot_cpu
+
+            record_path_hotspot_cpu("mrv2_sampler.prepare_step_cpu", (_time.perf_counter() - _tp0) * 1000.0)
         if state is None or int(state.affected_row_ids.numel()) <= 0 or view is None:
             return orig_sample(
                 logits,
@@ -162,6 +446,33 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
         from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
+        _t0 = _time.perf_counter() if _trace else 0.0
+
+        def _hotspot(name: str, t0: float) -> float:
+            if not _trace:
+                return 0.0
+            from tllm.runtime.residual_runtime import record_path_hotspot_cpu
+
+            t1 = _time.perf_counter()
+            record_path_hotspot_cpu(name, (t1 - t0) * 1000.0)
+            return t1
+
+        needs_processed = return_logprobs and sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+        if state.backend != "pre_filter_dense" and not needs_processed:
+            sampled = _sample_post_filter_minp_fused(
+                sampler=sampler,
+                logits=logits,
+                state=state,
+                expanded_idx_mapping=expanded_idx_mapping,
+                idx_mapping_np=idx_mapping_np,
+                pos=pos,
+            )
+            if sampled is not None:
+                _t3 = _hotspot("mrv2_sampler.filter_intervene_cpu", _t0)
+                _hotspot("mrv2_sampler.gumbel_cpu", _t3)
+                _notify_after_sample(provider=provider, view=view, sampled_token_ids=sampled)
+                return sampled, logits
+
         processed_logits = sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -171,7 +482,9 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
             expanded_local_pos,
             skip_top_k_top_p=True,
         )
+        _t1 = _hotspot("mrv2_sampler.apply_sampling_params_cpu", _t0)
         top_k, top_p = sampler.sampling_states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+        _t2 = _hotspot("mrv2_sampler.get_top_k_top_p_cpu", _t1)
 
         if state.backend == "pre_filter_dense":
             dense = state.precomputed_dense_logits
@@ -183,6 +496,10 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
                     state.lm_head_bias,
                 ).to(torch.float32)
             dense = dense.to(device=processed_logits.device, dtype=processed_logits.dtype)
+            if processed_logits is logits:
+                # No upstream logits processing: this aliases the runner's
+                # logits, which must not be mutated in place.
+                processed_logits = processed_logits.clone()
             affected = state.affected_row_ids.to(device=processed_logits.device, dtype=torch.long)
             sub = processed_logits[affected]
             sub.mul_(1.0 + float(state.beta))
@@ -195,7 +512,22 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
             # no hook point between them, so this step always takes the
             # explicit path.
             filtered = apply_top_k_top_p(processed_logits, top_k, top_p)
+            if not needs_processed:
+                sampled = _sample_post_filter_candidates(
+                    sampler=sampler,
+                    filtered_logits=filtered,
+                    state=state,
+                    expanded_idx_mapping=expanded_idx_mapping,
+                )
+                if sampled is not None:
+                    _t3 = _hotspot("mrv2_sampler.filter_intervene_cpu", _t2)
+                    _hotspot("mrv2_sampler.gumbel_cpu", _t3)
+                    _notify_after_sample(provider=provider, view=view, sampled_token_ids=sampled)
+                    return sampled, processed_logits
+            if filtered is logits:
+                filtered = filtered.clone()
             filtered = _apply_intervention(filtered_logits=filtered, state=state)
+        _t3 = _hotspot("mrv2_sampler.filter_intervene_cpu", _t2)
 
         sampled = gumbel_sample(
             filtered,
@@ -206,6 +538,7 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
             apply_temperature=False,
             use_fp64=sampler.use_fp64_gumbel,
         )
+        _hotspot("mrv2_sampler.gumbel_cpu", _t3)
         _notify_after_sample(provider=provider, view=view, sampled_token_ids=sampled)
         if return_logprobs and sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES:
             return sampled, filtered

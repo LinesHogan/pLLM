@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -10,6 +11,68 @@ import torch
 from tllm.runtime.sampler_bridge.min_p import apply_min_p, min_p_keep_mask
 from tllm.runtime.sampler_bridge.truth import project_candidate_logits, select_candidate_pairs
 from tllm.runtime.sampler_bridge.types import CandidateModifierState
+
+# Fixed capacity for the sync-free compaction path used when min-p is applied
+# natively upstream (vLLM >= 0.25). Rows with more survivors than the cap keep
+# only the first `cap` found; "0" falls back to the exact `.nonzero()` path.
+_COMPACT_CAP = int(os.getenv("TLLM_EXACT_COMPACT_CAP", "256") or "0")
+
+
+def _sample_compacted_candidates(
+    *,
+    filtered: torch.Tensor,
+    state: CandidateModifierState,
+    cap: int,
+) -> torch.Tensor | None:
+    """Sync-free candidate sampling over the finite (post-filter) positions.
+
+    Survivors are compacted on-device into fixed ``[rows, cap]`` buffers, the
+    distiller is projected only on those candidates (batched bmm), and the
+    draw is a gumbel argmax over the reweighted candidates — distributionally
+    identical to sampling the reweighted full-vocab distribution.
+    """
+    from tllm.runtime.sampler_bridge.kernels.finite_compact_triton import compact_finite_ids
+
+    rows = int(filtered.shape[0])
+    row_ids = torch.arange(rows, device=filtered.device, dtype=torch.int32)
+    result = compact_finite_ids(filtered, row_ids, cap=cap)
+    if result is None:
+        return None
+    ids, _counts = result
+    cap = int(ids.shape[1])
+    valid = ids >= 0
+    safe_ids = ids.clamp_min(0).to(torch.long)
+    # Padded slot count, not the true survivor total (reading ``counts`` would
+    # sync); diagnostics only.
+    llm_vals = filtered.gather(1, safe_ids).to(torch.float32)
+    if state.backend == "post_filter_dense_cache" and state.precomputed_dense_logits is not None:
+        dense = state.precomputed_dense_logits.to(device=filtered.device, dtype=torch.float32)
+        if state.pred_hidden_row_map is not None:
+            dense_rows = state.pred_hidden_row_map.to(device=dense.device, dtype=torch.long)
+        else:
+            dense_rows = torch.arange(rows, device=dense.device, dtype=torch.long)
+        distiller_vals = dense[dense_rows.unsqueeze(1), safe_ids.to(device=dense.device)]
+    else:
+        weight = state.lm_head_weight
+        token_rows = weight.index_select(0, safe_ids.reshape(-1).to(device=weight.device, dtype=torch.long))
+        token_rows = token_rows.view(rows, cap, -1)
+        pred = state.pred_hidden
+        if state.pred_hidden_row_map is not None:
+            pred = pred.index_select(0, state.pred_hidden_row_map.to(device=pred.device, dtype=torch.long))
+        distiller_vals = torch.bmm(token_rows, pred.to(device=filtered.device, dtype=token_rows.dtype).unsqueeze(-1)).squeeze(-1)
+        if state.lm_head_bias is not None:
+            distiller_vals = distiller_vals + state.lm_head_bias.index_select(
+                0, safe_ids.reshape(-1).to(device=state.lm_head_bias.device, dtype=torch.long)
+            ).view(rows, cap)
+        distiller_vals = distiller_vals.to(torch.float32)
+    beta = float(state.beta)
+    candidate_logits = (1.0 + beta) * llm_vals - beta * distiller_vals.to(device=filtered.device)
+    candidate_logits = torch.where(valid, candidate_logits, float("-inf"))
+    noise = torch.empty_like(candidate_logits)
+    noise.exponential_()
+    scores = candidate_logits - noise.clamp_min(torch.finfo(torch.float32).tiny).log_()
+    winners = scores.argmax(dim=-1)
+    return safe_ids.gather(1, winners.unsqueeze(1)).view(-1)
 
 
 def sample_rows_exact_candidates(
@@ -34,14 +97,28 @@ def sample_rows_exact_candidates(
         all_rows=all_rows,
         clone_logits=not pure_min_p,
     )
-    if generators or min_p is None:
+    if generators:
         return None
 
     filtered = exact_backend.apply_top_k_top_p(subset_logits, top_k, top_p)
-    if top_k is None and top_p is None:
+    if min_p is None and _COMPACT_CAP > 0:
+        # vLLM >= 0.25: min-p was applied natively upstream as an
+        # argmax-invariant logits processor, so survivors are exactly the
+        # finite logits. The compacted path avoids the `.nonzero()` host
+        # sync that stalls the decode launch pipeline every step.
+        sampled = _sample_compacted_candidates(filtered=filtered, state=subset_state, cap=_COMPACT_CAP)
+        if sampled is not None:
+            exact_backend._record_candidate_stats(
+                candidate_count=int(subset_logits.shape[0]) * _COMPACT_CAP,
+                row_count=int(filtered.shape[0]),
+            )
+            return sampled
+    if top_k is None and top_p is None and min_p is not None:
         candidate_row_ids, token_ids = min_p_keep_mask(filtered, min_p).nonzero(as_tuple=True)
     else:
-        filtered = apply_min_p(filtered, min_p)
+        # Older versions pass ``min_p`` through the metadata; apply it here.
+        if min_p is not None:
+            filtered = apply_min_p(filtered, min_p)
         candidate_row_ids, token_ids = select_candidate_pairs(filtered)
     if candidate_row_ids.numel() <= 0:
         return filtered.argmax(dim=-1).to(dtype=torch.long)
