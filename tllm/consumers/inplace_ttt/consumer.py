@@ -22,6 +22,7 @@ from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.ports.base import ConsumerFlow
+from tllm.ports.module_weight_view import ModuleWeightView
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
 
@@ -62,7 +63,17 @@ class InPlaceTTTConsumer(BaseConsumer):
                         ),
                         RequestMeta.read(),
                     ),
-                    writes=(),
+                    writes=(
+                        # The fast-weight overlay installs its own forward
+                        # wrapper through shared runtime infra; declaring it
+                        # here gives the plan write-conflict visibility.
+                        ModuleWeightView.write(
+                            layer=int(self.config.target_layer),
+                            module="mlp",
+                            phase=phase,
+                            mode="wrapper",
+                        ),
+                    ),
                     window=window,
                     delivery=delivery,
                     ownership=ownership,
