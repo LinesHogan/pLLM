@@ -77,10 +77,13 @@ def make_plain_llm(
     enable_prefix_caching: bool,
     enforce_eager: bool = False,
     seed: int | None = None,
+    worker_extension_cls: str | None = None,
 ) -> LLM:
     kwargs = {}
     if seed is not None:
         kwargs["seed"] = int(seed)
+    if worker_extension_cls:
+        kwargs["worker_extension_cls"] = str(worker_extension_cls)
     return LLM(
         model=model_name,
         tensor_parallel_size=1,

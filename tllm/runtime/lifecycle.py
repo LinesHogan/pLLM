@@ -43,8 +43,13 @@ def make_llm(core: Any, *args: object, **kwargs: object) -> object:
     # Snapshot the runtime for the EngineCore child (multiprocess mode); the
     # tllm general plugin rehydrates from it there. Harmless in-process.
     from tllm.runtime.mp.bootstrap import export_bootstrap_spec_env
+    from tllm.runtime.mp.control import TLLM_WORKER_EXTENSION_QUALNAME
 
     export_bootstrap_spec_env()
+    # Mix the tLLM control-plane extension into every worker, in both
+    # multiprocess modes, so ControlPlane str-method RPCs resolve identically
+    # (in-process under mp=0, EngineCore child under mp=1).
+    kwargs.setdefault("worker_extension_cls", TLLM_WORKER_EXTENSION_QUALNAME)
     from tllm.util import tools as _tool_helpers
 
-    return _tool_helpers.make_plain_llm(*args, **kwargs)
+    return _tool_helpers.make_plain_llm(*args, **kwargs)  # pyright: ignore[reportArgumentType] — untyped passthrough by design

@@ -93,6 +93,19 @@ def main() -> int:
             SamplingParams(temperature=0.0, max_tokens=int(args.max_new_tokens)),
         )
         tokens = [len(o.outputs[0].token_ids) for o in outputs]
+
+        from tllm.runtime.mp.control import ControlPlane
+
+        ping_replies = ControlPlane(llm).ping(timeout=60.0)
+        worker_pids = [int(reply["pid"]) for reply in ping_replies]
+        print(f"tllm_ping worker pids: {worker_pids} (parent={parent_pid})")
+        if args.mp == "1":
+            if not worker_pids or any(pid == parent_pid for pid in worker_pids):
+                print("FAIL: tllm_ping did not reach a non-parent worker process")
+                return 1
+        elif any(pid != parent_pid for pid in worker_pids):
+            print("FAIL: tllm_ping reached an unexpected process under mp=0")
+            return 1
     finally:
         shutdown_llm_instance(llm, cooldown_s=1.0)
 

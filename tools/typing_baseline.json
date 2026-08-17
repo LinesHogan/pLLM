@@ -1,6 +1,6 @@
 {
-  "comment": "Basic-tier pyright baseline (only-decrease). Recorded 2026-08-17, pyright 1.1.411, config pyrightconfig.json. Buckets are tllm/<dir-or-file> prefixes; strict tier (pyrightconfig.strict.json) must stay at 0 errors.",
-  "total": 329,
+  "comment": "Basic-tier pyright baseline (only-decrease). Regenerate with `python tools/check_typing.py --rebase`.",
+  "total": 322,
   "buckets": {
     "tllm/common/state.py": 1,
     "tllm/consumers/dummy": 1,
@@ -16,7 +16,6 @@
     "tllm/runtime/fast_weight": 1,
     "tllm/runtime/graph_policy.py": 2,
     "tllm/runtime/hidden_event_bridge.py": 7,
-    "tllm/runtime/lifecycle.py": 7,
     "tllm/runtime/ports": 8,
     "tllm/runtime/residual_runtime.py": 6,
     "tllm/runtime/sampler_bridge": 102,
