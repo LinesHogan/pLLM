@@ -227,3 +227,7 @@ docs
 # accidental npm artifacts
 package.json
 package-lock.json
+
+# Rust core build artifacts
+tllm/_core*.so
+rust/target/
