@@ -27,36 +27,36 @@ class ESampModuleSplitUnitTest(unittest.TestCase):
             self.assertFalse(hasattr(engine, name), msg=name)
 
     def test_engine_module_no_longer_uses_post_class_method_grafting(self) -> None:
-        text = Path(__file__).resolve().parents[1].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
+        text = Path(__file__).resolve().parents[3].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("ESampTrainEngine._using_model_bank =", text)
 
     def test_engine_module_does_not_reintroduce_zero_like_stat_helper(self) -> None:
-        text = Path(__file__).resolve().parents[1].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
+        text = Path(__file__).resolve().parents[3].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("def _fresh_zero_like_stat(", text)
 
     def test_engine_module_no_longer_embeds_svd_initializer_logic(self) -> None:
-        text = Path(__file__).resolve().parents[1].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
+        text = Path(__file__).resolve().parents[3].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
             encoding="utf-8"
         )
         for pattern in ("ridge_svd", "ffn_fast_svd", "svd_lowrank", "torch.linalg.svd"):
             self.assertNotIn(pattern, text)
 
     def test_engine_surface_no_longer_exposes_dead_compat_aliases(self) -> None:
-        text = Path(__file__).resolve().parents[1].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
+        text = Path(__file__).resolve().parents[3].joinpath("tllm", "consumers", "esamp", "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("model_bank_prompt_to_slot", text)
 
     def test_optional_svd_initializer_module_exists(self) -> None:
-        root = Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "initializers"
+        root = Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "initializers"
         self.assertTrue((root / "svd.py").is_file())
 
     def test_esamp_package_no_longer_keeps_structural_compare_file(self) -> None:
-        root = Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp"
+        root = Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp"
         self.assertFalse((root / "engine_structural_compare.py").exists())
 
     def test_engine_surface_exports_real_esamp_train_engine(self) -> None:
@@ -68,12 +68,12 @@ class ESampModuleSplitUnitTest(unittest.TestCase):
     def test_esamp_engine_is_flat_module_not_package(self) -> None:
         from pathlib import Path
 
-        root = Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp"
+        root = Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp"
         self.assertTrue((root / "engine.py").is_file())
         self.assertFalse((root / "engine").exists())
 
     def test_esamp_package_does_not_keep_invalid_plan_c_compare_file(self) -> None:
-        root = Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp"
+        root = Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp"
         self.assertFalse((root / "engine_option_c.py").exists())
 
     def test_grouping_matches_expected_rows(self) -> None:

@@ -142,7 +142,7 @@ class ESampConsumerContractUnitTest(unittest.TestCase):
         engine.launch_target.assert_not_called()
 
     def test_esamp_workflows_no_longer_import_consumer_runtime_adapter(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[3]
         for rel in (
             "tllm/workflows/benchmarks/esamp_benchmark.py",
             "tllm/workflows/benchmarks/per_request_esamp_benchmark.py",
@@ -490,7 +490,7 @@ class ESampConsumerContractUnitTest(unittest.TestCase):
         p_prepare.assert_called_once()
 
     def test_consumer_sync_config_no_longer_mutates_engine_state_directly(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "consumer.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "consumer.py").read_text(
             encoding="utf-8"
         )
 

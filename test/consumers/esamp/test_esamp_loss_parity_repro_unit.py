@@ -44,7 +44,7 @@ class ESampLossParityReproUnitTest(unittest.TestCase):
         self.assertIn("esamp_loss_parity_qwen2p5_0p5b", ids)
 
     def test_loss_parity_repro_no_longer_depends_on_esamp_runtime_adapter(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[3]
         text = (repo_root / "tllm" / "workflows" / "repro" / "repro_esamp_loss_parity.py").read_text(encoding="utf-8")
         self.assertNotIn("tllm.consumers.esamp.runtime_adapter", text)
         self.assertIn("residual_runtime", text)

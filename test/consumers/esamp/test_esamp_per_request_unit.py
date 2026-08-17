@@ -1359,7 +1359,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertFalse(hasattr(pipeline, "pred"))
 
     def test_engine_hot_path_no_longer_uses_redundant_none_guards_for_ready_buffers(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("not s.enabled or s.forward_stream is None or s.src_buf is None or s.pred_buf is None", text)
@@ -1987,7 +1987,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
             consumer.read_and_reset_per_request_stats(sync=False)
 
     def test_engine_no_longer_uses_silent_fallbacks_in_model_bank_and_stats_paths(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("return src", text)
@@ -2003,17 +2003,17 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("graph.graph is None or self.loss_sum is None or self.loss_count is None", text)
 
     def test_engine_uses_torch_layer_norm_for_model_bank_output_normalization(self) -> None:
-        engine_text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        engine_text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         backend_text = (
-            Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "model_bank_backend.py"
+            Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "model_bank_backend.py"
         ).read_text(encoding="utf-8")
         self.assertNotIn("def _layernorm_rows", engine_text)
         self.assertIn("F.layer_norm(", backend_text)
 
     def test_graph_state_uses_single_capture_state_not_disabled_plus_none(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         start = text.index("class _GraphState:")
@@ -2025,13 +2025,13 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("graph: torch.cuda.CUDAGraph | None", block)
 
     def test_engine_no_longer_exposes_graph_compat_alias_map(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("_GRAPH_RENAMES = {", text)
 
     def test_engine_no_longer_exposes_param_or_queue_compat_alias_maps(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("_PARAM_RENAMES = {", text)
@@ -2040,7 +2040,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("_REJECTED_COMPAT_ATTRS = {", text)
 
     def test_engine_state_uses_resource_objects_for_shared_pipeline_and_stats(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("class _SharedTrainResources:", text)
@@ -2067,7 +2067,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("def loss_count(self)", block)
 
     def test_engine_uses_require_helpers_for_concrete_resource_boundaries(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("def _require_shared(self) -> _SharedTrainResources:", text)
@@ -2075,7 +2075,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertIn("def _require_stats(self) -> _StatsBuffers:", text)
 
     def test_engine_drops_proxy_attrs_duplicate_replay_and_low_value_require_wrappers(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("_STATE_ATTRS = {", text)
@@ -2088,7 +2088,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("def _require_current_step_slot(self) -> int:", text)
 
     def test_engine_hot_paths_no_longer_close_with_nullable_resource_asserts(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("assert s.train_model is not None and s.forward_model is not None and s.optimizer is not None", text)
@@ -2101,7 +2101,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("assert self.loss_sum is not None and self.loss_count is not None", text)
 
     def test_engine_algorithm_paths_delegate_to_kernel_helpers(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("def _train_shared_kernel(", text)
@@ -2131,7 +2131,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
             tuple(inspect.signature(ESampTrainEngine.launch_step).parameters),
             ("self", "source_hidden", "target_hidden"),
         )
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "consumer.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "consumer.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("source_device=", text)
@@ -2172,14 +2172,14 @@ class ESampPerRequestUnitTest(unittest.TestCase):
                 consumer.launch_forward(rows)
 
     def test_engine_no_longer_tracks_unused_model_bank_queue_state(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("model_bank_queue:", text)
         self.assertNotIn("model_bank_steps_since_flush:", text)
 
     def test_model_bank_mode_keeps_per_request_stats_but_not_per_request_trainers(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         stats_block = text[text.index("class _PerRequestEntry:") : text.index("class _PerRequestTrainer:")]
@@ -2190,7 +2190,7 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertIn("per_request_trainers:", text)
 
     def test_engine_no_longer_materializes_unused_prediction_scratch(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         pipeline_block = text[text.index("class _PipelineBuffers:") : text.index("class _StatsBuffers:")]
@@ -2198,21 +2198,21 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         self.assertNotIn("pred_ready_events", text)
 
     def test_engine_uses_typed_model_bank_storage_instead_of_dict_gets(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("class _ModelBankParams", text)
         self.assertNotIn("model_bank_params.get(", text)
 
     def test_typed_model_bank_storage_does_not_use_internal_optional_fields(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("out_ln_weight: torch.nn.Parameter | None", text)
         self.assertNotIn("out_ln_bias: torch.nn.Parameter | None", text)
 
     def test_per_request_entries_are_not_partial_optional_shells(self) -> None:
-        text = (Path(__file__).resolve().parents[1] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
+        text = (Path(__file__).resolve().parents[3] / "tllm" / "consumers" / "esamp" / "engine.py").read_text(
             encoding="utf-8"
         )
         start = text.index("class _PerRequestEntry:")
