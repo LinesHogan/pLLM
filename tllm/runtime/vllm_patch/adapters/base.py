@@ -17,6 +17,8 @@ class PrepareInputsView:
     spec_decode_common: Any
     num_scheduled_tokens_np: Any
     num_actual_tokens: int | None = None
+    # Full SpecDecodeMetadata on 0.25+ MRv1 (out[1]); None elsewhere.
+    spec_decode_metadata: Any = None
 
 
 class BasePrepareInputsAdapter(ABC):

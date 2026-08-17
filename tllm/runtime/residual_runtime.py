@@ -456,6 +456,16 @@ def set_runtime_consumer(consumer: BaseConsumer | None) -> None:
 
 
 def runner_uses_compilation_or_cudagraph(runner: RunnerLike) -> bool:
+    """Legacy predicate kept for call sites; semantics now live in
+    ``tllm.runtime.graph_policy.resolve_graph_mode`` (PIECEWISE/FULL ->
+    True)."""
+    from tllm.runtime import graph_policy as _graph_policy
+
+    mode = _graph_policy.resolve_graph_mode(runner)
+    if mode != _graph_policy.GraphMode.EAGER:
+        return True
+
+    # Structural fallback for runners that only expose the legacy flags.
     use_cuda_graph = getattr(runner, "use_cuda_graph", None)
     if use_cuda_graph is True:
         return True
@@ -465,16 +475,11 @@ def runner_uses_compilation_or_cudagraph(runner: RunnerLike) -> bool:
         return False
 
     level_raw = getattr(cfg, "level", 0)
-    mode_raw = getattr(cfg, "cudagraph_mode", 0)
     try:
         level = int(level_raw)
     except Exception:
         level = 0
-    try:
-        cg_mode = int(mode_raw)
-    except Exception:
-        cg_mode = 0
-    return (level > 0) or (cg_mode > 0)
+    return level > 0
 
 
 def infer_hidden_dtype(layer: torch.nn.Module) -> torch.dtype:

@@ -47,17 +47,17 @@ def _test_time_lora_enabled(runtime: Any) -> bool:
     )
 
 
-def _decode_localization_from_mrv2(*, core: Any, runner: Any, input_batch: Any) -> None:
+def _decode_localization_from_mrv2(*, core: Any, runner: Any, input_batch: Any) -> tuple:
     """Fill decode scratch buffers from the MRv2 persistent InputBatch.
 
     MRv2 keeps one logits row per scheduled request (more under spec
     decode); ``input_batch.logits_indices`` maps packed hidden rows to the
     token positions that produce logits and ``idx_mapping_np`` maps logits
-    rows to request slots.
+    rows to request slots. Returns the strict spec-decode row mapping.
     """
     from tllm.backends.vllm.mrv2_localization import prepare_decode_localization_mrv2
 
-    prepare_decode_localization_mrv2(core=core, runner=runner, input_batch=input_batch)
+    return prepare_decode_localization_mrv2(core=core, runner=runner, input_batch=input_batch)
 
 
 def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict, orig: Any) -> Any:
@@ -66,7 +66,7 @@ def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict
     if not active_targets.runtime_has_active_targets(runtime):
         return input_batch
     session = get_step_session(runner)
-    _decode_localization_from_mrv2(core=core, runner=runner, input_batch=input_batch)
+    spec_rows = _decode_localization_from_mrv2(core=core, runner=runner, input_batch=input_batch)
     _sampler_patch.maybe_prepare_sampler_decode_step(runtime=runtime, runner=runner)
     if session is not None and session.state == StepState.CREATED:
         request_ids = tuple(str(x) for x in getattr(runtime, "decode_request_ids", ()))
@@ -74,6 +74,10 @@ def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict
         session.request_index = {req_id: i for i, req_id in enumerate(request_ids)}
         session.num_scheduled_tokens = getattr(input_batch, "num_scheduled_tokens", None)
         session.logits_indices = getattr(input_batch, "logits_indices", None)
+        session.spec_rows = tuple(spec_rows)
+        from tllm.runtime import graph_policy as _graph_policy
+
+        session.graph_mode = _graph_policy.resolve_graph_mode(runner)
         session.transition(StepState.INPUTS_READY)
     return input_batch
 

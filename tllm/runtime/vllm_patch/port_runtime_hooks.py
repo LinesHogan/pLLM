@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Dict, List, Mapping, Protocol, Sequence
 
@@ -338,6 +339,15 @@ def prepare_decode_localization(
         resolve_prompt_sample_fn=core._resolve_prompt_sample_for_req_id,
         max_decode_rows=0,
     )
+    if os.environ.get("TLLM_DEBUG_DECODE_LOC"):
+        import sys as _sys
+
+        print(
+            f"[decode_loc] reqs={list(req_ids)} is_decode={list(is_decode_req)} "
+            f"num_actual={num_actual_tokens} logits_rows={int(logits_indices.numel())} "
+            f"decode_positions={list(decode_positions)} row_idx={row_idx.tolist()}",
+            file=_sys.stderr,
+        )
     store_decode_localization(
         core=core,
         row_idx=row_idx,

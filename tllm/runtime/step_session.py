@@ -41,6 +41,24 @@ class StepSessionError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class SpecRowMapping:
+    """Strict mapping of one logits row under speculative decoding.
+
+    ``sampled_index`` is 0 for the target (first sampled) position and
+    1..k for the draft/bonus positions of the same request in this step.
+    ``hidden_row`` is the packed hidden-state row that produced the logits
+    row; consumers must use it (not request order) to index hidden taps.
+    """
+
+    request_id: str
+    prompt_idx: int
+    sample_idx: int
+    sampled_index: int
+    logit_row: int
+    hidden_row: int
+
+
 @dataclass
 class StepSession:
     step_id: int
@@ -59,6 +77,13 @@ class StepSession:
     sample_hidden_states: torch.Tensor | None = None
     logits: torch.Tensor | None = None
     sampled_tokens: torch.Tensor | None = None
+
+    # Strict per-logits-row mapping under speculative decoding (empty when
+    # no request produced more than one logits row this step).
+    spec_rows: tuple[SpecRowMapping, ...] = ()
+    # Effective CUDA-graph mode of the runner for this step, resolved via
+    # tllm.runtime.graph_policy (None when not yet resolved).
+    graph_mode: Any = None
 
     state: StepState = StepState.CREATED
     error: str = ""

@@ -49,4 +49,5 @@ class V027PrepareInputsAdapter(BasePrepareInputsAdapter):
             spec_decode_common=None,
             num_scheduled_tokens_np=num_scheduled_tokens,
             num_actual_tokens=num_actual_tokens,
+            spec_decode_metadata=out[1],
         )

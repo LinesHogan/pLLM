@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from tllm.backends.protocol import (
     BackendCapabilities,
     GraphSafety,
@@ -60,9 +62,104 @@ def _new_step_session(*, core: Any, runner: Any, view: Any, num_scheduled_tokens
         num_scheduled_tokens=num_scheduled_tokens,
         logits_indices=view.logits_indices,
     )
+    from tllm.runtime import graph_policy as _graph_policy
+
+    session.graph_mode = _graph_policy.resolve_graph_mode(runner)
     session.transition(StepState.INPUTS_READY)
     set_step_session(runner, session)
     return session
+
+
+def _build_spec_rows_mrv1(*, core: Any, view: Any, session: StepSession) -> tuple:
+    """Strict per-logits-row mapping when MRv1 ran speculative decoding.
+
+    MRv1's ``SpecDecodeMetadata`` carries ``num_draft_tokens`` per sampled
+    request (batch order); request i contributes ``1 + num_draft_tokens[i]``
+    logits rows, delimited by ``cu_num_sampled_tokens`` and mapped to packed
+    hidden rows through ``logits_indices``.
+    """
+    metadata = getattr(view, "spec_decode_metadata", None)
+    if metadata is None:
+        return ()
+    num_draft = list(getattr(metadata, "num_draft_tokens", ()) or ())
+    request_ids = list(session.request_ids)
+    logits_indices = view.logits_indices
+    if (
+        not num_draft
+        or len(num_draft) != len(request_ids)
+        or logits_indices is None
+        or max(num_draft) == 0
+    ):
+        return ()
+    from tllm.runtime.step_session import SpecRowMapping
+
+    rows: list = []
+    logit_row = 0
+    for req_id, drafts in zip(request_ids, num_draft):
+        # Consistent with the MRv2 mapping: only requests contributing more
+        # than one logits row appear in the strict mapping.
+        if int(drafts) > 0:
+            prompt_idx, sample_idx = core._resolve_prompt_sample_for_req_id(req_id)
+            for sampled_index in range(int(drafts) + 1):
+                rows.append(
+                    SpecRowMapping(
+                        request_id=req_id,
+                        prompt_idx=int(prompt_idx),
+                        sample_idx=int(sample_idx),
+                        sampled_index=sampled_index,
+                        logit_row=logit_row + sampled_index,
+                        hidden_row=int(logits_indices[logit_row + sampled_index].item()),
+                    )
+                )
+        logit_row += int(drafts) + 1
+    return tuple(rows)
+
+
+def _restore_first_row_localization_mrv1(*, core: Any, view: Any, session: StepSession) -> None:
+    """Rebuild decode scratch with correct first-row indices under spec decode.
+
+    The legacy ``compute_decode_localization`` indexes ``logits_indices`` by
+    request ordinal, which is only valid when every request contributes one
+    logits row. With draft tokens present, request i owns rows
+    ``[start_i, start_i + 1 + num_draft_tokens[i])``; the first row is the
+    target position used for training. No-op when the batch has no drafts.
+    """
+    metadata = getattr(view, "spec_decode_metadata", None)
+    if metadata is None:
+        return
+    num_draft = list(getattr(metadata, "num_draft_tokens", ()) or ())
+    if not num_draft or max(num_draft) == 0:
+        return
+    runtime = core.RUNTIME
+    request_ids = list(getattr(runtime, "decode_request_ids", ()) or ())
+    logits_indices = view.logits_indices
+    if len(num_draft) != len(request_ids) or logits_indices is None:
+        import warnings
+
+        warnings.warn(
+            "tllm: spec-decode draft counts do not align with localized decode "
+            "requests; keeping legacy first-row localization (training rows may "
+            "be misaligned under speculative decoding)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    first_rows: list[int] = []
+    row = 0
+    for drafts in num_draft:
+        first_rows.append(row)
+        row += int(drafts) + 1
+    selector = torch.as_tensor(first_rows, dtype=torch.long, device=logits_indices.device)
+    row_idx = logits_indices.index_select(0, selector)
+    from tllm.runtime.vllm_patch.port_runtime_hooks import store_decode_localization
+
+    store_decode_localization(
+        core=core,
+        row_idx=row_idx,
+        prompt_idxs=list(getattr(runtime, "decode_prompt_idxs", ()) or ()),
+        sample_idxs=list(getattr(runtime, "decode_sample_idxs", ()) or ()),
+        request_ids=request_ids,
+    )
 
 
 def _wrapped_prepare_inputs(
@@ -127,7 +224,9 @@ def _wrapped_prepare_inputs(
         num_scheduled_tokens_np=view.num_scheduled_tokens_np,
     )
     _sampler_patch.maybe_prepare_sampler_decode_step(runtime=runtime, runner=runner)
-    _new_step_session(core=core, runner=runner, view=view, num_scheduled_tokens=num_scheduled_tokens)
+    session = _new_step_session(core=core, runner=runner, view=view, num_scheduled_tokens=num_scheduled_tokens)
+    session.spec_rows = _build_spec_rows_mrv1(core=core, view=view, session=session)
+    _restore_first_row_localization_mrv1(core=core, view=view, session=session)
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,

@@ -33,11 +33,20 @@ from tllm.runtime.vllm_patch.port_runtime_hooks import (
 _WARMUP_REQ_PREFIX = "_warmup_"
 
 
-def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any) -> None:
+def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any) -> tuple:
+    """Fill decode scratch from the persistent InputBatch.
+
+    Returns the strict spec-decode row mapping (empty when every decode
+    request contributes exactly one logits row). The training scratch keeps
+    the first-row-per-request view; the full mapping is attached to the
+    StepSession by the driver for spec-decode-aware consumers.
+    """
+    from tllm.runtime.step_session import SpecRowMapping
+
     runtime = core.RUNTIME
     if input_batch is None:
         _clear_decode_localization(core)
-        return
+        return ()
 
     num_reqs = int(getattr(input_batch, "num_reqs", 0) or 0)
     logits_indices = getattr(input_batch, "logits_indices", None)
@@ -52,12 +61,14 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
         or len(req_ids_raw) < num_reqs
     ):
         _clear_decode_localization(core)
-        return
+        return ()
 
     logit_rows: list[int] = []
     prompt_idxs: list[int] = []
     sample_idxs: list[int] = []
     request_ids: list[str] = []
+    spec_rows: list = []
+    multi_row = False
     for batch_idx in range(num_reqs):
         if bool(is_prefilling[batch_idx]):
             continue
@@ -68,11 +79,23 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
         req_id = str(req_ids_raw[batch_idx])
         if req_id.startswith(_WARMUP_REQ_PREFIX):
             continue
-        # First logits row of the request = position of the first sampled
-        # token. Additional spec-decode rows are handled in the spec-decode
-        # mapping work; the hidden row for training is the first one.
-        logit_rows.append(start)
         prompt_idx, sample_idx = core._resolve_prompt_sample_for_req_id(req_id)
+        if end - start > 1:
+            multi_row = True
+            for offset, logit_row in enumerate(range(start, end)):
+                spec_rows.append(
+                    SpecRowMapping(
+                        request_id=req_id,
+                        prompt_idx=int(prompt_idx),
+                        sample_idx=int(sample_idx),
+                        sampled_index=offset,
+                        logit_row=logit_row,
+                        hidden_row=int(logits_indices[logit_row].item()),
+                    )
+                )
+        # First logits row of the request = position of the first sampled
+        # token; the training scratch keeps this first-row view.
+        logit_rows.append(start)
         prompt_idxs.append(int(prompt_idx))
         sample_idxs.append(int(sample_idx))
         request_ids.append(req_id)
@@ -88,7 +111,7 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
         )
     if not logit_rows:
         _clear_decode_localization(core)
-        return
+        return ()
 
     row_selector = torch.as_tensor(logit_rows, dtype=torch.long, device=logits_indices.device)
     row_idx = logits_indices.index_select(0, row_selector)
@@ -99,3 +122,4 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
         sample_idxs=sample_idxs,
         request_ids=request_ids,
     )
+    return tuple(spec_rows) if multi_row else ()
