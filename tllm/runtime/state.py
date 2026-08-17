@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Residual-runtime configuration and per-process state.
+
+This module owns the shared mutable state object (``RUNTIME``) that hooks,
+producers, and consumers read during a step. It deliberately contains no
+hook installation, dispatch, or lifecycle logic — see
+``tllm.runtime.lifecycle`` and ``tllm.runtime.residual_runtime`` for those.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+import torch
+
+from tllm.consumers.base import BaseConsumer
+from tllm.consumers.esamp.config import AdaptationStreamMode
+from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
+from tllm.consumers.esamp.model_bank_backend import ModelBankForwardBackendName
+from tllm.ports.residual_stream import ResidualLocator
+from tllm.runtime.consumer_registry import ConsumerRegistry
+from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.runtime.resources import SamplerPrecomputeState
+from tllm.runtime.ports.residual_bindings import ResidualPathBinding
+
+RuntimeConsumer = BaseConsumer
+
+
+@dataclass
+class ResidualRuntimeConfig:
+    graph_scratch_rows: int = 0
+    tap_layer_paths: list[str] = field(default_factory=list)
+    source_layer_path: str = "model.model.layers[0].input_layernorm"
+    target_layer_path: str = "model.model.layers[-1].input_layernorm"
+    enable_esamp_training: bool = True
+    distiller_hidden_dim: int = 128
+    distiller_lr: float = 1e-3
+    per_request_models: bool = False
+    per_request_model_bank: bool = False
+    model_bank_slots: int = 0
+    model_bank_flush_interval: int = 1
+    model_bank_rank: int = 64
+    model_bank_use_output_layernorm: bool = True
+    model_bank_initializer: SVDModelBankInitializerConfig | None = None
+    model_bank_train_cudagraph: bool = False
+    model_bank_forward_backend: ModelBankForwardBackendName = "torch"
+    adaptation_pipeline_slots: int = 4
+    adaptation_stream_mode: AdaptationStreamMode = "dual"
+    adaptation_stream_priority: int = 0
+    trace_per_request_losses: bool = False
+    trace_interval: int = 1
+    trace_max_points: int = 0
+    enable_distiller_intervention: bool = False
+    distiller_beta: float = 0.0
+    distiller_sampler_backend: str = "post_filter_exact"
+    compact_capture_lane: bool = False
+    inplace_ttt_fast_weight_enabled: bool = False
+    inplace_ttt_fast_weight_layers: tuple[int, ...] = (0,)
+    inplace_ttt_fast_weight_chunk_size: int = 4096
+    inplace_ttt_fast_weight_lr: float = 1e-3
+    inplace_ttt_fast_weight_mode: str = "exact"
+    inplace_ttt_fast_weight_decode_update_enabled: bool = False
+    inplace_ttt_fast_weight_key_mode: str = "static"
+    inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__"
+    inplace_ttt_fast_weight_max_slots: int = 64
+    inplace_ttt_fast_weight_max_bytes: int = 0
+    inplace_ttt_fast_weight_fail_on_unsupported: bool = False
+
+
+@dataclass
+class ResidualRuntimeState:
+    config: ResidualRuntimeConfig = field(default_factory=ResidualRuntimeConfig)
+
+    decode_row_idx: Optional[torch.Tensor] = None
+    decode_valid_mask: Optional[torch.Tensor] = None
+    decode_count: int = 0
+    decode_prompt_idxs: list[int] = field(default_factory=list)
+    decode_sample_idxs: list[int] = field(default_factory=list)
+    decode_request_ids: list[str] = field(default_factory=list)
+    decode_prompt_idx_buf: torch.Tensor | None = None
+    decode_sample_idx_buf: torch.Tensor | None = None
+    decode_prompt_idx_tensor: torch.Tensor | None = None
+    decode_sample_idx_tensor: torch.Tensor | None = None
+    decode_compact_row_idx: Optional[torch.Tensor] = None
+    decode_compact_count: int = 0
+    decode_compact_row_ids: tuple[int, ...] = ()
+
+    tap_layers: Dict[str, torch.nn.Module] = field(default_factory=dict)
+    tap_scratch: Dict[str, torch.Tensor] = field(default_factory=dict)
+    tap_decode_hidden: Dict[str, torch.Tensor] = field(default_factory=dict)
+    tap_decode_hidden_compact: Dict[str, torch.Tensor] = field(default_factory=dict)
+    capture_full_residual_rows: bool = True
+    residual_raw_paths: Dict[ResidualLocator, str] = field(default_factory=dict)
+    residual_bindings: Dict[str, ResidualPathBinding] = field(default_factory=dict)
+
+    source_resolved_path: str = ""
+    target_resolved_path: str = ""
+    launch_consumer_from_hooks: bool = True
+    reqid_to_promptidx: Dict[str, int] = field(default_factory=dict)
+    reqid_to_sampleidx: Dict[str, int] = field(default_factory=dict)
+    event_step_id: int = 0
+    decode_post_logits_launched_step_id: int = -1
+    sampler_precompute: SamplerPrecomputeState = field(default_factory=SamplerPrecomputeState)
+    path_hotspot_enabled: bool = False
+    path_hotspot_cpu_ms: dict[str, float] = field(default_factory=dict)
+    path_hotspot_counts: dict[str, int] = field(default_factory=dict)
+
+    consumer: Optional[RuntimeConsumer] = None
+    consumer_registry: Optional[ConsumerRegistry] = None
+    dispatch_plan: Optional[DispatchPlan] = None
+    execution_plan: object = None  # tllm.producers.registry.ExecutionPlan once compiled
+    test_time_lora_enabled: bool = False
+    test_time_lora_service: object | None = None
+    inplace_ttt_fast_weight_state: object | None = None
+    inplace_ttt_fast_weight_handles: dict[str, object] = field(default_factory=dict)
+    inplace_ttt_fast_weight_hook_spec: tuple[object, ...] | None = None
+    inplace_ttt_fast_weight_phase: str = "prefill"
+    inplace_ttt_current_token_batch_meta: object | None = None
+    inplace_ttt_fast_weight_installed_count: int = 0
+    inplace_ttt_fast_weight_skipped_count: int = 0
+
+    def reset_step(self) -> None:
+        self.decode_count = 0
+        self.decode_prompt_idxs = []
+        self.decode_sample_idxs = []
+        self.decode_request_ids = []
+        self.decode_prompt_idx_buf = self.decode_prompt_idx_buf
+        self.decode_sample_idx_buf = self.decode_sample_idx_buf
+        self.decode_prompt_idx_tensor = None
+        self.decode_sample_idx_tensor = None
+        self.decode_compact_count = 0
+        self.decode_compact_row_ids = ()
+        self.inplace_ttt_current_token_batch_meta = None
+        self.decode_post_logits_launched_step_id = -1
+        self.sampler_precompute.reset_step()
+
+
+RUNTIME = ResidualRuntimeState()

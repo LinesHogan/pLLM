@@ -14,7 +14,7 @@ from torch.autograd.profiler import record_function
 
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine
-from tllm.runtime.residual_runtime import SamplerPrecomputeCache
+from tllm.runtime.resources import SamplerPrecomputeCache
 from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 
