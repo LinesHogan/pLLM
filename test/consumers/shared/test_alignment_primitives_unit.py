@@ -9,7 +9,7 @@ import unittest
 import torch
 
 
-class DevlistAlignmentPrimitivesUnitTest(unittest.TestCase):
+class SharedAlignmentPrimitivesUnitTest(unittest.TestCase):
     def test_sentence_cross_entropy_selects_high_ce_rows(self) -> None:
         from tllm.consumers._common.alignment import select_rows_above_threshold, sentence_cross_entropy
 

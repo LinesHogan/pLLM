@@ -8,7 +8,7 @@ import unittest
 import torch
 
 
-class DevlistConsumerSurfaceUnitTest(unittest.TestCase):
+class ConsumerSurfaceUnitTest(unittest.TestCase):
     def test_package_exports_low_rank_adapter(self) -> None:
         from tllm.consumers._common.alignment import LowRankAdapter
 
