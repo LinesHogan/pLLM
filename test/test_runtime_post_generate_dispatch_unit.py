@@ -300,16 +300,8 @@ class PostGenerateDispatchUnitTest(unittest.TestCase):
         from tllm.ports.base import PortKind, PortWrite
         from tllm.ports.reward_outcome import RewardOutcomeLocator
 
-        runtime = self._runtime()
-        flow = ConsumerFlow(
-            reads=(GenerationTrace.read(),),
-            writes=(PortWrite(kind=PortKind.REWARD_OUTCOME, locator=RewardOutcomeLocator(), mode=object()),),  # type: ignore[arg-type]
-            window="out_of_band",
-            bundle_key=("generation_group_id", "phase"),
-        )
-
-        with self.assertRaisesRegex(TypeError, "reward outcome write mode must be str"):
-            port_runtime_hooks.build_post_generate_port_bundle(runtime=runtime, flow=flow)
+        with self.assertRaisesRegex(TypeError, "write mode must be str"):
+            PortWrite(kind=PortKind.REWARD_OUTCOME, locator=RewardOutcomeLocator(), mode=object())  # type: ignore[arg-type]
 
     def test_decode_dispatch_ignores_post_generate_only_flows(self) -> None:
         runtime = SimpleNamespace()

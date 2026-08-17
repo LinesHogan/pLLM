@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from tllm.ports.base import Locator, PortKind, PortRead
+from tllm.ports.base import Locator, PortKind, PortRead, PortWrite, WriteMode
 
 ModuleWeightPhase = Literal["prefill", "decode"]
 
@@ -29,8 +29,9 @@ class ModuleWeightViewLocator(Locator):
 class ModuleWeightView:
     KIND = PortKind.MODULE_WEIGHT_VIEW
     READABLE = True
-    WRITABLE = False
+    WRITABLE = True
     SUPPORTED_PHASES = ("prefill", "decode")
+    SUPPORTED_WRITE_MODES = (WriteMode.WRAPPER,)
     BACKING_VLLM_STRUCT = "A borrowed view of a module weight such as MLP down_proj.weight."
 
     @staticmethod
@@ -39,4 +40,26 @@ class ModuleWeightView:
             kind=ModuleWeightView.KIND,
             locator=ModuleWeightViewLocator(layer=int(layer), module=module, phase=phase),
             role=role,
+        )
+
+    @staticmethod
+    def write(
+        *,
+        layer: int,
+        module: str,
+        phase: ModuleWeightPhase = "prefill",
+        mode: WriteMode = WriteMode.WRAPPER,
+        order: int = 0,
+    ) -> PortWrite:
+        write_mode = WriteMode(str(mode))
+        if write_mode not in ModuleWeightView.SUPPORTED_WRITE_MODES:
+            supported = ", ".join(m.value for m in ModuleWeightView.SUPPORTED_WRITE_MODES)
+            raise ValueError(
+                f"unsupported module weight view write mode `{write_mode}`; supported: {supported}"
+            )
+        return PortWrite(
+            kind=ModuleWeightView.KIND,
+            locator=ModuleWeightViewLocator(layer=int(layer), module=module, phase=phase),
+            mode=write_mode.value,
+            order=int(order),
         )

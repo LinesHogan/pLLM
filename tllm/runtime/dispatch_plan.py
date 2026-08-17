@@ -42,7 +42,9 @@ class DispatchPlan:
                 continue
             for sub in consumer_subscriptions(consumer):
                 by_event.setdefault(sub.event_name, []).append(DispatchTarget(consumer=consumer, subscription=sub))
-        return cls(by_event=by_event, flow_targets=flow_targets)
+        plan = cls(by_event=by_event, flow_targets=flow_targets)
+        plan.write_conflict_check()
+        return plan
 
     def select(
         self,
@@ -103,6 +105,61 @@ class DispatchPlan:
                 phase = str(getattr(read.locator, "phase"))
                 required.add((layer, site, phase))
         return required
+
+    def residual_writes(self) -> List[tuple[str, ConsumerFlow, object]]:
+        """All declared residual-stream writes as (consumer_id, flow, write)."""
+        writes: List[tuple[str, ConsumerFlow, object]] = []
+        for target in self._flow_targets:
+            for write in target.flow.writes:
+                if getattr(write, "kind", None) != PortKind.RESIDUAL_STREAM:
+                    continue
+                if getattr(write, "locator", None) is None:
+                    continue
+                writes.append((str(target.consumer.consumer_id), target.flow, write))
+        return writes
+
+    def required_residual_writes(self) -> set[tuple[int, str, str]]:
+        required: set[tuple[int, str, str]] = set()
+        for _consumer_id, _flow, write in self.residual_writes():
+            locator = getattr(write, "locator")
+            required.add(
+                (
+                    int(getattr(locator, "layer")),
+                    str(getattr(locator, "site")),
+                    str(getattr(locator, "phase")),
+                )
+            )
+        return required
+
+    def write_conflict_check(self) -> None:
+        """Writers on one residual locator must be disambiguated by ``order``.
+
+        ``append`` writes are post-generate sinks and never conflict; every
+        other pair of writers on the same (layer, site, phase) must carry
+        distinct ``order`` values so the runtime applies them deterministically.
+        """
+        by_locator: Dict[tuple[int, str, str], List[tuple[str, int, str]]] = {}
+        for consumer_id, _flow, write in self.residual_writes():
+            mode = str(getattr(write, "mode", "") or "")
+            if mode == "append":
+                continue
+            locator = getattr(write, "locator")
+            key = (
+                int(getattr(locator, "layer")),
+                str(getattr(locator, "site")),
+                str(getattr(locator, "phase")),
+            )
+            by_locator.setdefault(key, []).append((consumer_id, int(getattr(write, "order", 0)), mode))
+        for locator, writers in by_locator.items():
+            if len(writers) < 2:
+                continue
+            orders = [order for _cid, order, _mode in writers]
+            if len(set(orders)) != len(orders):
+                detail = ", ".join(f"{cid}(order={order}, mode={mode})" for cid, order, mode in writers)
+                raise ValueError(
+                    f"conflicting residual writes on locator {locator}: {detail}; "
+                    "assign distinct `order` values to same-site writers"
+                )
 
     def has_residual_row_compaction(self, mode: str) -> bool:
         expected = str(mode)

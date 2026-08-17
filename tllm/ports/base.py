@@ -58,9 +58,34 @@ class RowSelection(StrEnum):
     FIRST_PER_PROMPT = "first_per_prompt"
 
 
+class WriteMode(StrEnum):
+    """How a consumer write mutates its target port.
+
+    ``WRAPPER`` is the escape hatch: the consumer installs its own forward
+    wrapper through shared runtime infra (e.g. fast-weight overlays) instead
+    of staging a value through the write channel.
+    """
+
+    REPLACE = "replace"
+    ADD = "add"
+    APPEND = "append"
+    WRAPPER = "wrapper"
+
+
+class WriteRows(StrEnum):
+    """Which rows of a structured port a write touches."""
+
+    ALL = "all"
+    DECODE_ONLY = "decode_only"
+    FIRST_PER_PROMPT = "first_per_prompt"
+    PROVIDER_SELECTED = "provider_selected"
+
+
 Window = FlowWindow | Literal["background", "same_step", "next_step", "out_of_band"]
 DeliveryMode = FlowDelivery | Literal["bundle", "device_lease"]
 RowCompaction = RowSelection | Literal["none", "first_per_prompt"]
+WriteModeName = WriteMode | Literal["replace", "add", "append", "wrapper"]
+WriteRowSelection = WriteRows | Literal["all", "decode_only", "first_per_prompt", "provider_selected"]
 
 
 @dataclass(frozen=True)
@@ -80,6 +105,23 @@ class PortWrite:
     kind: PortKind
     locator: Locator | None = None
     mode: str = ""
+    rows: WriteRowSelection = WriteRows.ALL
+    order: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode:
+            if not isinstance(self.mode, (str, WriteMode)):
+                raise TypeError("write mode must be str")
+            try:
+                object.__setattr__(self, "mode", str(WriteMode(str(self.mode))))
+            except ValueError as exc:
+                raise ValueError(f"unsupported write mode `{self.mode}`") from exc
+        try:
+            object.__setattr__(self, "rows", WriteRows(str(self.rows)))
+        except ValueError as exc:
+            raise ValueError(f"unsupported write rows `{self.rows}`") from exc
+        if not isinstance(self.order, int):
+            raise ValueError("PortWrite.order must be an int")
 
 
 @dataclass(frozen=True)

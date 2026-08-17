@@ -21,3 +21,5 @@ class PortSpec:
     kind: PortKind
     payload_type: str = ""
     description: str = ""
+    writable: bool = False
+    write_modes: tuple[str, ...] = ()

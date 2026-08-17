@@ -54,6 +54,8 @@ class DecodeResidualProducer:
             kind=PortKind.RESIDUAL_STREAM,
             payload_type="HiddenBatch",
             description="decode-step capture-layer hidden rows localized per request",
+            writable=True,
+            write_modes=("replace", "add"),
         ),
     )
     requires: tuple = ()

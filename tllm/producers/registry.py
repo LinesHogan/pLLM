@@ -114,6 +114,56 @@ def _consumer_required_kinds(consumers: Iterable[Any]) -> list[tuple[str, PortKi
     return required
 
 
+def _consumer_written_ports(consumers: Iterable[Any]) -> list[tuple[str, PortKind, str]]:
+    written: list[tuple[str, PortKind, str]] = []
+    for consumer in consumers:
+        consumer_id = str(getattr(consumer, "consumer_id", repr(consumer)))
+        flows = consumer.flows() if callable(getattr(consumer, "flows", None)) else ()
+        for flow in flows or ():
+            for write in getattr(flow, "writes", ()) or ():
+                kind = getattr(write, "kind", None)
+                if isinstance(kind, PortKind):
+                    written.append((consumer_id, kind, str(getattr(write, "mode", "") or "")))
+    return written
+
+
+def _validate_consumer_writes(
+    *,
+    registry: ProducerRegistry,
+    consumers: Sequence[Any],
+    enforced_kinds: frozenset[PortKind] | None,
+) -> None:
+    """Fail fast on writes no registered producer declared writable."""
+    for consumer_id, kind, mode in _consumer_written_ports(consumers):
+        if enforced_kinds is not None and kind not in enforced_kinds:
+            continue
+        candidates = registry.candidates_for_kind(kind)
+        if not candidates:
+            raise ExecutionPlanError(
+                f"consumer {consumer_id!r} writes port kind {kind.value!r} "
+                "but no registered producer offers it"
+            )
+        specs = [
+            spec
+            for entry in candidates
+            for spec in producer_output_specs(entry.producer)
+            if spec.kind == kind
+        ]
+        writable = [spec for spec in specs if bool(getattr(spec, "writable", False))]
+        if not writable:
+            raise ExecutionPlanError(
+                f"consumer {consumer_id!r} writes port kind {kind.value!r} "
+                "but no producer for that kind declares it writable"
+            )
+        if mode:
+            supported = sorted({m for spec in writable for m in getattr(spec, "write_modes", ())})
+            if mode not in supported:
+                raise ExecutionPlanError(
+                    f"consumer {consumer_id!r} writes port kind {kind.value!r} "
+                    f"with mode {mode!r} but producers only support: {supported}"
+                )
+
+
 def compile_execution_plan(
     *,
     registry: ProducerRegistry,
@@ -131,6 +181,11 @@ def compile_execution_plan(
     """
     entries = list(registry.entries())
     supported = HookPoint.all() if supported_hooks is None else supported_hooks
+    _validate_consumer_writes(
+        registry=registry,
+        consumers=consumers,
+        enforced_kinds=enforced_kinds,
+    )
 
     # 1. Every consumer-read port kind must have at least one producer; each
     # PortId must resolve to exactly one producer (priority breaks ties; a

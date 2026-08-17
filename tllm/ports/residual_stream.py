@@ -6,7 +6,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from tllm.ports.base import Locator, PortKind, PortRead, PortWrite
+from tllm.ports.base import (
+    Locator,
+    PortKind,
+    PortRead,
+    PortWrite,
+    WriteMode,
+    WriteModeName,
+    WriteRows,
+    WriteRowSelection,
+)
 
 ResidualPhase = Literal["prefill", "decode"]
 
@@ -38,6 +47,7 @@ class ResidualStream:
         "mlp_input",
         "block_output",
     )
+    SUPPORTED_WRITE_MODES = (WriteMode.REPLACE, WriteMode.ADD)
     BACKING_VLLM_STRUCT = (
         "per-layer residual hidden views captured from runtime tap points and "
         "mapped onto logical layer/site locators."
@@ -52,9 +62,25 @@ class ResidualStream:
         )
 
     @staticmethod
-    def write(*, layer: int, site: str, phase: ResidualPhase, mode: str = "") -> PortWrite:
+    def write(
+        *,
+        layer: int,
+        site: str,
+        phase: ResidualPhase,
+        mode: WriteModeName = WriteMode.REPLACE,
+        rows: WriteRowSelection = WriteRows.DECODE_ONLY,
+        order: int = 0,
+    ) -> PortWrite:
+        write_mode = WriteMode(str(mode))
+        if write_mode not in ResidualStream.SUPPORTED_WRITE_MODES:
+            supported = ", ".join(m.value for m in ResidualStream.SUPPORTED_WRITE_MODES)
+            raise ValueError(
+                f"unsupported residual stream write mode `{write_mode}`; supported: {supported}"
+            )
         return PortWrite(
             kind=ResidualStream.KIND,
             locator=ResidualLocator(layer=layer, site=site, phase=phase),
-            mode=mode,
+            mode=write_mode.value,
+            rows=rows,
+            order=int(order),
         )
