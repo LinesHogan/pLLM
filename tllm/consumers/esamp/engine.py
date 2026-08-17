@@ -25,6 +25,7 @@ from tllm.consumers.esamp.model_bank_backend import (
     select_model_bank_forward_backend,
 )
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.contracts.consumer_stats import TrainingStats
 
 _Mode = Literal["shared", "model_bank"]
 _AdaptationStreamMode = Literal["dual", "single", "serial"]
@@ -41,11 +42,9 @@ _ReplayGraphRef = torch.cuda.CUDAGraph | _ReplayGraphMissing
 _DEFAULT_ADAPTATION_STREAM_PRIORITY = 0
 
 
-@dataclass(slots=True, frozen=True)
-class ESampStats:
-    loss_avg: float
-    loss_count: int
-    trace_losses: tuple[float, ...] = ()
+# Canonical home is tllm.contracts.consumer_stats.TrainingStats; the alias
+# keeps the ESamp-facing name without a second type.
+ESampStats = TrainingStats
 
 
 def _group_rows(prompt_idxs: Sequence[int], active_rows: int) -> dict[int, list[int]]:

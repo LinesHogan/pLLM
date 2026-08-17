@@ -27,13 +27,15 @@ import torch
 
 from tllm.common.state import ensure_v1_env, pick_common_attn_metadata, resolve_object_by_path
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers.esamp.config import normalize_adaptation_stream_mode
-from tllm.consumers.esamp.engine import ESampStats
-from tllm.consumers.esamp.model_bank_backend import normalize_model_bank_forward_backend
+from tllm.contracts.consumer_stats import TrainingStats
+
+# Backward-compatible alias: ESamp's stats name, canonical type is TrainingStats.
+ESampStats = TrainingStats
 from tllm.contracts.runtime_context import RunnerLike
 from tllm.producer.decode import compute_decode_localization
 from tllm.runtime import lifecycle as _lifecycle
 from tllm.runtime import stats as _stats
+from tllm.runtime.config import normalize_adaptation_stream_mode, normalize_model_bank_forward_backend
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.consumer_compat import synchronize as synchronize_consumer
@@ -382,13 +384,13 @@ def synchronize_esamp() -> None:
         synchronize_consumer(consumer)
 
 
-def read_and_reset_esamp_stats(sync: bool = True) -> ESampStats:
+def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
     if RUNTIME.consumer is None:
-        return ESampStats(loss_avg=0.0, loss_count=0)
+        return TrainingStats(loss_avg=0.0, loss_count=0)
     return RUNTIME.consumer.read_and_reset_stats(sync=sync)
 
 
-def read_and_reset_esamp_per_request_stats(sync: bool = True) -> Dict[int, ESampStats]:
+def read_and_reset_esamp_per_request_stats(sync: bool = True) -> Dict[int, TrainingStats]:
     if RUNTIME.consumer is None:
         return {}
     return RUNTIME.consumer.read_and_reset_per_request_stats(sync=sync)
@@ -444,6 +446,8 @@ def make_llm(*args: object, **kwargs: object) -> object:
 
 __all__ = [
     "DistillerTimingStats",
+    "ESampStats",
+    "TrainingStats",
     "GraphDebugStats",
     "PathHotspotStats",
     "MODEL_HOOK_FLAG",

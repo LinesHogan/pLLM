@@ -122,3 +122,39 @@ class RuntimeImportBoundariesUnitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeConsumerImportDirectionUnitTest(unittest.TestCase):
+    """The runtime must not depend on concrete consumer packages.
+
+    Only ``tllm.consumers.base`` (the abstract BaseConsumer) may be imported
+    from ``tllm/runtime`` and ``tllm/ports``; everything consumer-specific
+    flows the other way (consumers import runtime infrastructure).
+    """
+
+    def _consumer_imports(self, root: Path) -> list[str]:
+        import ast
+
+        violations: list[str] = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                target: str | None = None
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        target = alias.name
+                        if target.startswith("tllm.consumers") and target != "tllm.consumers.base":
+                            violations.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno} import {target}")
+                elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                    target = node.module
+                    if target.startswith("tllm.consumers") and target != "tllm.consumers.base":
+                        violations.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno} from {target}")
+        return violations
+
+    def test_runtime_does_not_import_concrete_consumers(self) -> None:
+        violations = self._consumer_imports(REPO_ROOT / "tllm" / "runtime")
+        self.assertEqual(violations, [])
+
+    def test_ports_do_not_import_concrete_consumers(self) -> None:
+        violations = self._consumer_imports(REPO_ROOT / "tllm" / "ports")
+        self.assertEqual(violations, [])

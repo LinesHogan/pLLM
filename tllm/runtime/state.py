@@ -15,10 +15,8 @@ from typing import Dict, Optional
 import torch
 
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers.esamp.config import AdaptationStreamMode
-from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
-from tllm.consumers.esamp.model_bank_backend import ModelBankForwardBackendName
 from tllm.ports.residual_stream import ResidualLocator
+from tllm.runtime.config import AdaptationStreamMode, ModelBankForwardBackendName
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.resources import SamplerPrecomputeState
@@ -42,7 +40,7 @@ class ResidualRuntimeConfig:
     model_bank_flush_interval: int = 1
     model_bank_rank: int = 64
     model_bank_use_output_layernorm: bool = True
-    model_bank_initializer: SVDModelBankInitializerConfig | None = None
+    model_bank_initializer: object | None = None  # consumer-owned initializer config; opaque to the runtime
     model_bank_train_cudagraph: bool = False
     model_bank_forward_backend: ModelBankForwardBackendName = "torch"
     adaptation_pipeline_slots: int = 4

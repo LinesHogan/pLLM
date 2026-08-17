@@ -4,24 +4,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-try:
-    from enum import StrEnum
-except ImportError:
-    from enum import Enum
-
-    class StrEnum(str, Enum):
-        def __str__(self) -> str:
-            return str(self.value)
 
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
-from tllm.consumers.esamp.model_bank_backend import ModelBankForwardBackendName, normalize_model_bank_forward_backend
+from tllm.runtime.config import (
+    AdaptationStreamMode,
+    ModelBankForwardBackendName,
+    normalize_adaptation_stream_mode,
+    normalize_model_bank_forward_backend,
+)
 from tllm.runtime.sampler_bridge.types import SamplerBackend, normalize_sampler_backend
 
-
-class AdaptationStreamMode(StrEnum):
-    DUAL = "dual"
-    SINGLE = "single"
-    SERIAL = "serial"
+__all__ = [
+    "AdaptationStreamMode",
+    "ESampConsumerConfig",
+    "ModelBankForwardBackendName",
+    "normalize_adaptation_stream_mode",
+    "normalize_model_bank_forward_backend",
+]
 
 
 @dataclass
@@ -58,12 +57,3 @@ class ESampConsumerConfig:
         self.model_bank_forward_backend = normalize_model_bank_forward_backend(self.model_bank_forward_backend)
         self.adaptation_stream_mode = normalize_adaptation_stream_mode(self.adaptation_stream_mode)
         self.adaptation_stream_priority = int(self.adaptation_stream_priority)
-
-
-def normalize_adaptation_stream_mode(value: str) -> AdaptationStreamMode:
-    mode = str(value).strip().lower()
-    try:
-        return AdaptationStreamMode(mode)
-    except ValueError as exc:
-        choices = ", ".join(("dual", "single", "serial"))
-        raise ValueError(f"unknown ESamp adaptation_stream_mode={value!r}; expected one of: {choices}") from exc
