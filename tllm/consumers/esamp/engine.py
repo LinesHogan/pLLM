@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -26,9 +24,18 @@ from tllm.consumers.esamp.model_bank_backend import (
 )
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.contracts.consumer_stats import TrainingStats
+from tllm.runtime.config import AdaptationStreamMode
+from tllm.runtime.scheduling.streams import (
+    PipelineBuffers,
+    PipelineLane,
+    StreamPool,
+    copy_rows_into_buffer,
+)
+from tllm.runtime.scheduling.streams import (
+    train_grad_context as _grad_context,
+)
 
 _Mode = Literal["shared", "model_bank"]
-_AdaptationStreamMode = Literal["dual", "single", "serial"]
 _ResidualModel = LowRankGatedResidualModel
 _CaptureState = Literal["uncaptured", "captured", "disabled"]
 
@@ -55,27 +62,10 @@ def _group_rows(prompt_idxs: Sequence[int], active_rows: int) -> dict[int, list[
     return groups
 
 
-def _copy_rows(dst: torch.Tensor, src: torch.Tensor) -> int:
-    if dst.ndim != 2 or src.ndim != 2 or int(dst.shape[1]) != int(src.shape[1]):
-        raise ValueError("ESamp engine expects rank-2 hidden batches with matching width")
-    copied = min(int(dst.shape[0]), int(src.shape[0]))
-    if copied > 0:
-        dst[:copied].copy_(src[:copied])
-    return copied
-
-
-def _ensure_events(events: list[torch.cuda.Event], size: int) -> list[torch.cuda.Event]:
-    return events if len(events) == size else [torch.cuda.Event(blocking=False) for _ in range(size)]
-
-
 def _copy_parameters(dst: torch.nn.Module, src: torch.nn.Module) -> None:
     with torch.no_grad():
         for p_dst, p_src in zip(dst.parameters(), src.parameters()):
             p_dst.copy_(p_src)
-
-
-def _make_esamp_stream(device: torch.device, *, priority: int) -> torch.cuda.Stream:
-    return torch.cuda.Stream(device=device, priority=int(priority))
 
 
 def _sampling_lookup_capacity(*, slots: int, rows: int) -> int:
@@ -116,12 +106,6 @@ def _record_trace_sample(entry: "_PerRequestEntry", loss: torch.Tensor, *, inter
     if len(entry.trace_losses) >= max_points:
         return
     entry.trace_losses.append(float(loss.detach().item()))
-
-
-@contextmanager
-def _grad_context() -> Iterator[None]:
-    with torch.inference_mode(False), torch.enable_grad():
-        yield
 
 
 @dataclass(slots=True)
@@ -211,12 +195,6 @@ class _SharedTrainResources:
 
 
 @dataclass(slots=True)
-class _PipelineBuffers:
-    src: torch.Tensor
-    tgt: torch.Tensor
-
-
-@dataclass(slots=True)
 class _StatsBuffers:
     loss_sum: torch.Tensor
     loss_count: torch.Tensor
@@ -241,14 +219,12 @@ class _EngineState:
     trace_max_points: int = 0
     model_bank_rank_effective: int = 0
     pipeline_slots: int = 4
-    adaptation_stream_mode: _AdaptationStreamMode = "dual"
+    adaptation_stream_mode: AdaptationStreamMode = AdaptationStreamMode.DUAL
     adaptation_stream_priority: int = _DEFAULT_ADAPTATION_STREAM_PRIORITY
 
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
     hidden_dtype: torch.dtype = torch.float32
     hidden_size: int = 0
-    forward_stream: torch.cuda.Stream | None = None
-    train_stream: torch.cuda.Stream | None = None
 
     shared: _SharedTrainResources | None = None
 
@@ -267,22 +243,18 @@ class _EngineState:
     model_bank_optimizer: torch.optim.Optimizer | None = None
     model_bank_next_slot: int = 0
 
-    current_step_slot: int | None = None
-    ready_step_slot: int | None = None
-    next_pipeline_slot: int = 0
-    pending_train_queue: deque[tuple[int, int, tuple[int, ...]]] = field(default_factory=deque)
-    src_ready_events: list[torch.cuda.Event] = field(default_factory=list)
-    tgt_ready_events: list[torch.cuda.Event] = field(default_factory=list)
-    src_staged_events: list[torch.cuda.Event] = field(default_factory=list)
-    tgt_done_events: list[torch.cuda.Event] = field(default_factory=list)
-    slot_train_done_events: list[torch.cuda.Event] = field(default_factory=list)
+    streams: StreamPool = field(init=False)
+    lane: PipelineLane = field(init=False)
 
-    pipeline: _PipelineBuffers | None = None
     stats: _StatsBuffers | None = None
     graphs: dict[_Mode, _GraphState] = field(
         default_factory=lambda: {"shared": _GraphState(), "model_bank": _GraphState()}
     )
     model_bank_slot_graphs: dict[int, _GraphState] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.streams = StreamPool(mode=self.adaptation_stream_mode, priority=self.adaptation_stream_priority)
+        self.lane = PipelineLane(streams=self.streams, slots=self.pipeline_slots, label="ESamp")
 
 
 class _ESampEngineCore:
@@ -384,10 +356,7 @@ class _ESampEngineCore:
         self._reset_runtime_cache()
 
     def _clear_in_flight_step_state(self) -> None:
-        s = self.state
-        s.pending_train_queue.clear()
-        s.current_step_slot = None
-        s.ready_step_slot = None
+        self.state.lane.clear_in_flight()
 
     def configure(self, config: ESampConsumerConfig) -> None:
         s = self.state
@@ -415,6 +384,9 @@ class _ESampEngineCore:
         s.pipeline_slots = max(1, int(getattr(config, "adaptation_pipeline_slots", 4)))
         s.adaptation_stream_mode = normalize_adaptation_stream_mode(getattr(config, "adaptation_stream_mode", "dual"))
         s.adaptation_stream_priority = int(getattr(config, "adaptation_stream_priority", _DEFAULT_ADAPTATION_STREAM_PRIORITY))
+        s.streams.mode = s.adaptation_stream_mode
+        s.streams.priority = s.adaptation_stream_priority
+        s.lane.slots = s.pipeline_slots
         s.trace_per_request_losses = bool(config.trace_per_request_losses)
         s.trace_interval = max(1, int(config.trace_interval))
         s.trace_max_points = max(0, int(config.trace_max_points))
@@ -497,18 +469,8 @@ class _ESampEngineCore:
     def _reset_pipeline_runtime_state(self, *, reset_streams: bool) -> None:
         s = self.state
         if reset_streams:
-            s.forward_stream = None
-            s.train_stream = None
-        s.src_ready_events = []
-        s.tgt_ready_events = []
-        s.src_staged_events = []
-        s.tgt_done_events = []
-        s.slot_train_done_events = []
-        s.pending_train_queue.clear()
-        s.current_step_slot = None
-        s.ready_step_slot = None
-        s.next_pipeline_slot = 0
-        s.pipeline = None
+            s.streams.reset()
+        s.lane.reset_runtime_state()
         s.stats = None
 
     def _ensure_stats(self) -> None:
@@ -533,10 +495,8 @@ class _ESampEngineCore:
             raise RuntimeError("ESamp shared resources are unavailable before ensure_resources initializes them")
         return shared
 
-    def _require_pipeline(self) -> _PipelineBuffers:
-        if (pipeline := self.state.pipeline) is None:
-            raise RuntimeError("ESamp pipeline buffers are unavailable before ensure_resources initializes them")
-        return pipeline
+    def _require_pipeline(self) -> PipelineBuffers:
+        return self.state.lane.require_buffers()
 
     def _require_stats(self) -> _StatsBuffers:
         if (stats := self.state.stats) is None:
@@ -552,12 +512,6 @@ class _ESampEngineCore:
         if optimizer is None:
             raise RuntimeError("ESamp model bank optimizer is unavailable before ensure_resources initializes it")
         return params, optimizer
-
-    def _require_launch_device(self, hidden: torch.Tensor, *, expected: torch.device) -> None:
-        if hidden.device != expected:
-            raise RuntimeError(
-                f"ESamp launch device mismatch: hidden rows are on {hidden.device}, but runtime resources are on {expected}"
-            )
 
     def _require_prompt_rows(self, prompt_idxs: Sequence[int], active_rows: int) -> list[tuple[int, int]]:
         rows: list[tuple[int, int]] = []
@@ -719,55 +673,16 @@ class _ESampEngineCore:
             use_output_layernorm=bool(s.model_bank_use_output_layernorm),
         )
 
-    def _ensure_adaptation_streams(self, device: torch.device) -> None:
-        s = self.state
-        mode = normalize_adaptation_stream_mode(s.adaptation_stream_mode)
-        if mode == "serial":
-            s.forward_stream = None
-            s.train_stream = None
-            return
-        priority = int(s.adaptation_stream_priority)
-        if mode == "single":
-            stream = s.forward_stream or s.train_stream or _make_esamp_stream(device, priority=priority)
-            s.forward_stream = stream
-            s.train_stream = stream
-            return
-        if s.forward_stream is None or s.forward_stream is s.train_stream:
-            s.forward_stream = _make_esamp_stream(device, priority=priority)
-        if s.train_stream is None or s.train_stream is s.forward_stream:
-            s.train_stream = _make_esamp_stream(device, priority=priority)
-
     def _ensure_pipeline(self, *, rows: int, hidden_size: int, device: torch.device, hidden_dtype: torch.dtype) -> None:
         s = self.state
-        slots = int(s.pipeline_slots)
-        want_shape = (slots, rows, hidden_size)
-        pipeline = s.pipeline
-        if (
-            pipeline is None
-            or tuple(pipeline.src.shape) != want_shape
-            or pipeline.src.device != device
-            or pipeline.src.dtype != hidden_dtype
+        if s.lane.ensure_buffers(
+            rows=rows,
+            hidden_size=hidden_size,
+            device=device,
+            dtype=hidden_dtype,
+            on_reallocated=self._reset_runtime_cache,
         ):
-            self._reset_pipeline_runtime_state(reset_streams=False)
-            self._ensure_adaptation_streams(device)
-            s.src_ready_events = _ensure_events([], slots)
-            s.tgt_ready_events = _ensure_events([], slots)
-            s.src_staged_events = _ensure_events([], slots)
-            s.tgt_done_events = _ensure_events([], slots)
-            s.slot_train_done_events = _ensure_events([], slots)
-            with torch.inference_mode(False):
-                s.pipeline = _PipelineBuffers(
-                    src=torch.empty(want_shape, device=device, dtype=hidden_dtype),
-                    tgt=torch.empty(want_shape, device=device, dtype=hidden_dtype),
-                )
-            self._reset_runtime_cache()
-            return
-        self._ensure_adaptation_streams(device)
-        s.src_ready_events = _ensure_events(s.src_ready_events, slots)
-        s.tgt_ready_events = _ensure_events(s.tgt_ready_events, slots)
-        s.src_staged_events = _ensure_events(s.src_staged_events, slots)
-        s.tgt_done_events = _ensure_events(s.tgt_done_events, slots)
-        s.slot_train_done_events = _ensure_events(s.slot_train_done_events, slots)
+            s.stats = None
 
     def ensure_resources(
         self,
@@ -817,7 +732,7 @@ class _ESampEngineCore:
     def _graph_enabled(self, mode: _Mode) -> bool:
         s = self.state
         graph = self._graph(mode)
-        stream_ok = normalize_adaptation_stream_mode(s.adaptation_stream_mode) == "serial" or s.train_stream is not None
+        stream_ok = s.streams.serial or s.streams.train_stream is not None
         shared_ok = (
             mode == "shared"
             and not s.per_request_models
@@ -909,7 +824,7 @@ class _ESampEngineCore:
             graph.skip_wrong_device_count += 1
             return False
         pipeline = self._require_pipeline()
-        train_stream = s.train_stream or torch.cuda.current_stream(device=s.device)
+        train_stream = s.streams.train_stream or torch.cuda.current_stream(device=s.device)
         if graph.capture_state == "captured":
             return True
         if mode == "shared":
@@ -1399,167 +1314,29 @@ class _ESampEngineCore:
         else:
             self._train_shared(src_view, tgt_view, k)
 
-    def _launch_forward_kernel(
-        self,
-        *,
-        pipeline: _PipelineBuffers,
-        forward_stream: torch.cuda.Stream | None,
-        slot: int,
-        source_hidden: torch.Tensor,
-    ) -> None:
-        s = self.state
-        src_ready = s.src_ready_events[slot]
-        src_staged = s.src_staged_events[slot]
-        done_event = s.slot_train_done_events[slot]
-        current_stream = torch.cuda.current_stream(device=source_hidden.device)
-        src_ready.record(current_stream)
-        if forward_stream is None:
-            current_stream.wait_event(done_event)
-            _copy_rows(pipeline.src[slot], source_hidden)
-            src_staged.record(current_stream)
-            return
-        with torch.cuda.stream(forward_stream):
-            forward_stream.wait_event(done_event)
-            forward_stream.wait_event(src_ready)
-            _copy_rows(pipeline.src[slot], source_hidden)
-            src_staged.record(forward_stream)
-
-    def _launch_step_kernel(
-        self,
-        *,
-        pipeline: _PipelineBuffers,
-        slot: int,
-        source_hidden: torch.Tensor,
-        target_hidden: torch.Tensor,
-    ) -> None:
-        s = self.state
-        if int(source_hidden.shape[0]) != int(target_hidden.shape[0]):
-            raise RuntimeError("ESamp step launch requires source and target batches with the same row count")
-        current_stream = torch.cuda.current_stream(device=source_hidden.device)
-        current_stream.wait_event(s.slot_train_done_events[slot])
-        _copy_rows(pipeline.src[slot], source_hidden)
-        _copy_rows(pipeline.tgt[slot], target_hidden)
-        s.src_staged_events[slot].record(current_stream)
-        s.tgt_done_events[slot].record(current_stream)
-
     def launch_forward(self, source_hidden: torch.Tensor) -> None:
         s = self.state
         if not s.enabled:
             return
-        if s.current_step_slot is not None or s.ready_step_slot is not None or s.pending_train_queue:
-            raise RuntimeError("ESamp launch order violation: previous step has not been flushed")
-        pipeline = self._require_pipeline()
-        self._require_launch_device(source_hidden, expected=pipeline.src.device)
-        forward_stream = s.forward_stream
-        if forward_stream is None and normalize_adaptation_stream_mode(s.adaptation_stream_mode) != "serial":
-            raise RuntimeError("ESamp forward stream is unavailable before ensure_resources initializes it")
-        slot = int(s.next_pipeline_slot % int(s.pipeline_slots))
-        s.next_pipeline_slot = (slot + 1) % int(s.pipeline_slots)
-        s.current_step_slot = slot
-        s.ready_step_slot = None
-        self._launch_forward_kernel(
-            pipeline=pipeline,
-            forward_stream=forward_stream,
-            slot=slot,
-            source_hidden=source_hidden,
-        )
-
-    def _launch_target_kernel(
-        self,
-        *,
-        pipeline: _PipelineBuffers,
-        forward_stream: torch.cuda.Stream | None,
-        slot: int,
-        target_hidden: torch.Tensor,
-    ) -> None:
-        s = self.state
-        tgt_ready = s.tgt_ready_events[slot]
-        tgt_done = s.tgt_done_events[slot]
-        current_stream = torch.cuda.current_stream(device=target_hidden.device)
-        tgt_ready.record(current_stream)
-        if forward_stream is None:
-            _copy_rows(pipeline.tgt[slot], target_hidden)
-            tgt_done.record(current_stream)
-            s.current_step_slot = None
-            s.ready_step_slot = slot
-            return
-        with torch.cuda.stream(forward_stream):
-            forward_stream.wait_event(tgt_ready)
-            _copy_rows(pipeline.tgt[slot], target_hidden)
-            tgt_done.record(forward_stream)
-        s.current_step_slot = None
-        s.ready_step_slot = slot
+        s.lane.launch_forward(source_hidden)
 
     def launch_target(self, target_hidden: torch.Tensor) -> None:
         s = self.state
         if not s.enabled:
             return
-        pipeline = self._require_pipeline()
-        self._require_launch_device(target_hidden, expected=pipeline.tgt.device)
-        forward_stream = s.forward_stream
-        if forward_stream is None and normalize_adaptation_stream_mode(s.adaptation_stream_mode) != "serial":
-            raise RuntimeError("ESamp forward stream is unavailable before ensure_resources initializes it")
-        slot = s.current_step_slot
-        if slot is None:
-            raise RuntimeError("ESamp target launch requires an active pipeline slot")
-        self._launch_target_kernel(
-            pipeline=pipeline,
-            forward_stream=forward_stream,
-            slot=int(slot),
-            target_hidden=target_hidden,
-        )
+        s.lane.launch_target(target_hidden)
 
     def launch_step(self, source_hidden: torch.Tensor, target_hidden: torch.Tensor) -> None:
         s = self.state
         if not s.enabled:
             return
-        if s.current_step_slot is not None or s.ready_step_slot is not None or s.pending_train_queue:
-            raise RuntimeError("ESamp launch order violation: previous step has not been flushed")
-        pipeline = self._require_pipeline()
-        self._require_launch_device(source_hidden, expected=pipeline.src.device)
-        self._require_launch_device(target_hidden, expected=pipeline.tgt.device)
-        slot = int(s.next_pipeline_slot % int(s.pipeline_slots))
-        s.next_pipeline_slot = (slot + 1) % int(s.pipeline_slots)
-        self._launch_step_kernel(
-            pipeline=pipeline,
-            slot=slot,
-            source_hidden=source_hidden,
-            target_hidden=target_hidden,
-        )
-        s.current_step_slot = None
-        s.ready_step_slot = slot
+        s.lane.launch_step(source_hidden, target_hidden)
 
     def launch_delayed_backward(self, active_rows: int, prompt_idxs: Sequence[int] | None = None) -> None:
         s = self.state
         if not s.enabled:
             return
-        pipeline = self._require_pipeline()
-        serial = normalize_adaptation_stream_mode(s.adaptation_stream_mode) == "serial"
-        train_stream = s.train_stream
-        if train_stream is None and not serial:
-            raise RuntimeError("ESamp train stream is unavailable before ensure_resources initializes it")
-        if (slot := s.ready_step_slot) is not None:
-            s.pending_train_queue.append((int(slot), int(active_rows), tuple(int(x) for x in (prompt_idxs or ()))))
-            s.ready_step_slot = None
-        if serial:
-            current_stream = torch.cuda.current_stream(device=pipeline.src.device)
-            while s.pending_train_queue:
-                queued_slot, queued_rows, queued_prompts = s.pending_train_queue.popleft()
-                current_stream.wait_event(s.src_staged_events[queued_slot])
-                current_stream.wait_event(s.tgt_done_events[queued_slot])
-                with _grad_context():
-                    self._train_slot(queued_slot, queued_rows, queued_prompts)
-                s.slot_train_done_events[queued_slot].record(current_stream)
-            return
-        assert train_stream is not None
-        with torch.cuda.stream(train_stream):
-            while s.pending_train_queue:
-                queued_slot, queued_rows, queued_prompts = s.pending_train_queue.popleft()
-                train_stream.wait_event(s.src_staged_events[queued_slot])
-                train_stream.wait_event(s.tgt_done_events[queued_slot])
-                with _grad_context():
-                    self._train_slot(queued_slot, queued_rows, queued_prompts)
-                s.slot_train_done_events[queued_slot].record(train_stream)
+        s.lane.enqueue_ready_and_drain(active_rows, prompt_idxs, self._train_slot)
 
     def launch_external_backward(
         self,
@@ -1576,8 +1353,8 @@ class _ESampEngineCore:
             return
         if int(source_hidden.shape[0]) != int(target_hidden.shape[0]):
             raise RuntimeError("ESamp external backward requires source/target hidden batches with the same row count")
-        serial = normalize_adaptation_stream_mode(s.adaptation_stream_mode) == "serial"
-        train_stream = s.train_stream
+        serial = s.streams.serial
+        train_stream = s.streams.train_stream
         if train_stream is None and not serial:
             raise RuntimeError("ESamp train stream is unavailable before ensure_resources initializes it")
         if serial:
@@ -1603,11 +1380,7 @@ class _ESampEngineCore:
                     release(train_stream)
 
     def synchronize(self) -> None:
-        s = self.state
-        if s.forward_stream is not None:
-            s.forward_stream.synchronize()
-        if s.train_stream is not None:
-            s.train_stream.synchronize()
+        self.state.streams.synchronize()
 
     def read_and_reset_stats(self, sync: bool = True) -> ESampStats:
         s = self.state
@@ -1652,7 +1425,7 @@ def group_row_indices_by_prompt(prompt_idxs: Sequence[int], active_rows: int) ->
 
 
 def copy_active_rows_into_buffer(dst: torch.Tensor, src: torch.Tensor) -> int:
-    return _copy_rows(dst, src)
+    return copy_rows_into_buffer(dst, src, label="ESamp engine")
 
 
 class ESampTrainEngine(_ESampEngineCore):

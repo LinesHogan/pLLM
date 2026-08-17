@@ -1,10 +1,10 @@
 {
   "comment": "Basic-tier pyright baseline (only-decrease). Regenerate with `python tools/check_typing.py --rebase`.",
-  "total": 322,
+  "total": 320,
   "buckets": {
     "tllm/common/state.py": 1,
     "tllm/consumers/dummy": 1,
-    "tllm/consumers/esamp": 24,
+    "tllm/consumers/esamp": 22,
     "tllm/consumers/fttt": 1,
     "tllm/consumers/gtta": 2,
     "tllm/consumers/inplace_ttt": 3,
