@@ -6,6 +6,9 @@ from __future__ import annotations
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
 from tllm.consumers.ttrl.consumer import TTRLConsumer
 
+CONSUMER_TYPE = TTRLConsumer
+CONFIG_TYPE = TTRLConsumerConfig
+
 
 def build(config: TTRLConsumerConfig | None = None) -> TTRLConsumer:
     return TTRLConsumer(config or TTRLConsumerConfig())

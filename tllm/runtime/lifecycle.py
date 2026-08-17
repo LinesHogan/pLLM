@@ -40,6 +40,11 @@ def install_runner_patch(core: Any) -> None:
 
 def make_llm(core: Any, *args: object, **kwargs: object) -> object:
     install_runner_patch(core)
+    # Snapshot the runtime for the EngineCore child (multiprocess mode); the
+    # tllm general plugin rehydrates from it there. Harmless in-process.
+    from tllm.runtime.mp.bootstrap import export_bootstrap_spec_env
+
+    export_bootstrap_spec_env()
     from tllm.util import tools as _tool_helpers
 
     return _tool_helpers.make_plain_llm(*args, **kwargs)

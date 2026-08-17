@@ -21,7 +21,7 @@ __all__ = [
 ]
 
 
-class GTTAConsumer(BaseConsumer):
+class GTTAConsumer(BaseConsumer[GTTAConsumerConfig]):
     """Local action-score updater for environment trajectory feedback."""
 
     def __init__(self, config: GTTAConsumerConfig, *, engine: GTTAEngine | None = None) -> None:

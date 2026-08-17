@@ -6,6 +6,9 @@ from __future__ import annotations
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
 
+CONSUMER_TYPE = ESampConsumer
+CONFIG_TYPE = ESampConsumerConfig
+
 
 def build(config: ESampConsumerConfig | None = None) -> ESampConsumer:
     return ESampConsumer(config or ESampConsumerConfig())

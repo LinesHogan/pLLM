@@ -29,7 +29,7 @@ from tllm.ports.retry_control import RetryControl
 from tllm.ports.update_barrier import UpdateBarrier
 
 
-class TTRLConsumer(BaseConsumer):
+class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
     """Post-generation TTRL-style consumer with local majority rewards."""
 
     def __init__(

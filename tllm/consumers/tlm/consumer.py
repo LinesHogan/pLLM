@@ -21,7 +21,7 @@ from tllm.ports.base import ConsumerFlow
 _T = TypeVar("_T")
 
 
-class TLMConsumer(BaseConsumer):
+class TLMConsumer(BaseConsumer[TLMConsumerConfig]):
     """Local online/offline test-time learning consumer."""
 
     def __init__(self, config: TLMConsumerConfig, *, engine: TLMEngine | None = None) -> None:

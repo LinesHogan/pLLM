@@ -32,7 +32,7 @@ class _TrainingRows:
     request_meta_is_first_per_prompt: bool
 
 
-class ESampConsumer(BaseConsumer):
+class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
     """Dispatch-plan friendly ESamp wrapper around the formal engine."""
 
     @staticmethod

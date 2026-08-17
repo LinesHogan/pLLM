@@ -6,6 +6,9 @@ from __future__ import annotations
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.consumer import DummyConsumer
 
+CONSUMER_TYPE = DummyConsumer
+CONFIG_TYPE = DummyConsumerConfig
+
 
 def build(config: DummyConsumerConfig | None = None) -> DummyConsumer:
     return DummyConsumer(config or DummyConsumerConfig())

@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Generic, Sequence, TypeVar
 
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.ports.base import ConsumerFlow
 
+ConfigT = TypeVar("ConfigT")
 
-class BaseConsumer(ABC):
+
+class BaseConsumer(ABC, Generic[ConfigT]):
+    #: Each consumer narrows this to its own config dataclass; declared here
+    #: so shared infra (registry spec snapshots) can reach it without probing.
+    config: ConfigT
+
     @property
     @abstractmethod
     def consumer_id(self) -> str:

@@ -6,6 +6,9 @@ from __future__ import annotations
 from tllm.consumers.inplace_ttt.config import InPlaceTTTConsumerConfig
 from tllm.consumers.inplace_ttt.consumer import InPlaceTTTConsumer
 
+CONSUMER_TYPE = InPlaceTTTConsumer
+CONFIG_TYPE = InPlaceTTTConsumerConfig
+
 
 def build(config: InPlaceTTTConsumerConfig | None = None) -> InPlaceTTTConsumer:
     return InPlaceTTTConsumer(config or InPlaceTTTConsumerConfig())

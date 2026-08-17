@@ -18,7 +18,7 @@ from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
 
 
-class DummyConsumer(BaseConsumer):
+class DummyConsumer(BaseConsumer[DummyConsumerConfig]):
     """Minimal consumer that stages hidden rows to CPU without hot-path drain."""
 
     def __init__(self, config: DummyConsumerConfig) -> None:

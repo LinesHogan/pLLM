@@ -6,6 +6,9 @@ from __future__ import annotations
 from tllm.consumers.override.config import OverRIDEConsumerConfig
 from tllm.consumers.override.consumer import OverRIDEConsumer
 
+CONSUMER_TYPE = OverRIDEConsumer
+CONFIG_TYPE = OverRIDEConsumerConfig
+
 
 def build(config: OverRIDEConsumerConfig | None = None) -> OverRIDEConsumer:
     return OverRIDEConsumer(config or OverRIDEConsumerConfig())

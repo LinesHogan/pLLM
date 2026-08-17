@@ -27,7 +27,7 @@ from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
 
 
-class InPlaceTTTConsumer(BaseConsumer):
+class InPlaceTTTConsumer(BaseConsumer[InPlaceTTTConsumerConfig]):
     """tLLM-native In-Place-TTT-inspired hidden-pair adaptation consumer."""
 
     def __init__(self, config: InPlaceTTTConsumerConfig, *, engine: InPlaceTTTEngine | None = None) -> None:

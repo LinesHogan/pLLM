@@ -6,6 +6,9 @@ from __future__ import annotations
 from tllm.consumers.fttt.config import FTTTConsumerConfig
 from tllm.consumers.fttt.consumer import FTTTConsumer
 
+CONSUMER_TYPE = FTTTConsumer
+CONFIG_TYPE = FTTTConsumerConfig
+
 
 def build(config: FTTTConsumerConfig | None = None) -> FTTTConsumer:
     return FTTTConsumer(config or FTTTConsumerConfig())

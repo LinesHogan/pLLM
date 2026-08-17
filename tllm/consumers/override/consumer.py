@@ -27,7 +27,7 @@ __all__ = [
 ]
 
 
-class OverRIDEConsumer(BaseConsumer):
+class OverRIDEConsumer(BaseConsumer[OverRIDEConsumerConfig]):
     """tLLM-native consumer shell for OverRIDE-style iterative reweighting."""
 
     def __init__(self, config: OverRIDEConsumerConfig, *, engine: OverRIDEReweightEngine | None = None) -> None:

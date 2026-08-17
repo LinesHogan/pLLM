@@ -78,7 +78,7 @@ class FTTTTrainerBridgeClosedLoopResult:
     staged_update_count: int = 0
 
 
-class FTTTConsumer(BaseConsumer):
+class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
     """Feedback-conditioned local edit consumer."""
 
     def __init__(
