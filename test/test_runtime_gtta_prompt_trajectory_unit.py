@@ -40,7 +40,7 @@ class _Output:
 
 class GTTAPromptTrajectoryRuntimeUnitTest(unittest.TestCase):
     def test_trajectory_event_rejects_implicit_coercion(self) -> None:
-        from tllm.runtime.dynamics_store import TrajectoryEvent
+        from tllm.runtime.trajectory_store import TrajectoryEvent
 
         with self.assertRaisesRegex(TypeError, "task_id must be str"):
             TrajectoryEvent(task_id=1, state_signature="s", previous_observation="", action="a", next_observation="")  # type: ignore[arg-type]
@@ -50,7 +50,7 @@ class GTTAPromptTrajectoryRuntimeUnitTest(unittest.TestCase):
             TrajectoryEvent(task_id="task", state_signature="s", previous_observation="", action="", next_observation="")
 
     def test_dynamics_store_keeps_task_state_action_separate_and_copy_safe(self) -> None:
-        from tllm.runtime.dynamics_store import DynamicsStore, TrajectoryEvent, TrajectoryEventBatch
+        from tllm.runtime.trajectory_store import DynamicsStore, TrajectoryEvent, TrajectoryEventBatch
 
         store = DynamicsStore()
         first = TrajectoryEvent(
@@ -79,7 +79,7 @@ class GTTAPromptTrajectoryRuntimeUnitTest(unittest.TestCase):
         self.assertEqual(store.query(task_id="task-a"), (first, second))
 
     def test_prompt_context_entries_apply_by_prompt_index(self) -> None:
-        from tllm.runtime.dynamics_store import (
+        from tllm.runtime.trajectory_store import (
             PromptContextBatch,
             PromptContextEntry,
             apply_prompt_contexts,
@@ -100,7 +100,7 @@ class GTTAPromptTrajectoryRuntimeUnitTest(unittest.TestCase):
         self.assertEqual(prompts, ("[ctx-a]\nprompt a", "prompt b\n[ctx-b]"))
 
     def test_prompt_context_rejects_implicit_types(self) -> None:
-        from tllm.runtime.dynamics_store import PromptContextEntry
+        from tllm.runtime.trajectory_store import PromptContextEntry
 
         with self.assertRaisesRegex(TypeError, "prompt_idx must be int"):
             PromptContextEntry(prompt_idx=True, text="ctx")  # type: ignore[arg-type]
@@ -110,7 +110,7 @@ class GTTAPromptTrajectoryRuntimeUnitTest(unittest.TestCase):
             PromptContextEntry(prompt_idx=0, text="ctx", position="middle")
 
     def test_generate_wrapper_applies_prompt_context_before_llm_generate(self) -> None:
-        from tllm.runtime.dynamics_store import PromptContextBatch, PromptContextEntry, write_prompt_contexts
+        from tllm.runtime.trajectory_store import PromptContextBatch, PromptContextEntry, write_prompt_contexts
         from tllm.runtime.vllm_patch.capture_runner import run_generate_with_request_mapping
 
         runtime = type("Runtime", (), {})()

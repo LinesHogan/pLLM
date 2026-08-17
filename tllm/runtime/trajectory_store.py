@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime stores for GTTA-style prompt context and trajectory dynamics."""
+"""Typed stores for prompt context and trajectory dynamics (port-runtime backing)."""
 
 from __future__ import annotations
 

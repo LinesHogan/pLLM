@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 
 from tllm.consumers.base import BaseConsumer
 from tllm.ports.base import ConsumerFlow
-from tllm.runtime.dynamics_store import PromptContextEntry, TrajectoryEvent
+from tllm.runtime.trajectory_store import PromptContextEntry, TrajectoryEvent
 
 
 def parse_reward(value: float | int | str | Mapping[str, Any]) -> float:

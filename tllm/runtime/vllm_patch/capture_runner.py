@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tllm.runtime.dynamics_store import apply_prompt_contexts
+from tllm.runtime.trajectory_store import apply_prompt_contexts
 from tllm.runtime.generation_trace_runtime import build_generation_trace_from_outputs
 from tllm.runtime.vllm_patch.port_runtime_hooks import dispatch_post_generate_port_bundles
 

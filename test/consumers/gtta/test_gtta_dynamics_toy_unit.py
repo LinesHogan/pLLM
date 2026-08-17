@@ -43,7 +43,7 @@ class _FakeCaptureLLM:
 class GTTADynamicsToyUnitTest(unittest.TestCase):
     def test_runtime_trajectory_event_uses_explicit_task_state_action_key(self) -> None:
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig
-        from tllm.runtime.dynamics_store import TrajectoryEvent
+        from tllm.runtime.trajectory_store import TrajectoryEvent
 
         consumer = GTTAConsumer(GTTAConsumerConfig())
         consumer.enqueue_trajectory_event(
@@ -201,7 +201,7 @@ class GTTADynamicsToyUnitTest(unittest.TestCase):
 
     def test_dynamics_snippets_and_prompt_context_entry_are_deterministic(self) -> None:
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig
-        from tllm.runtime.dynamics_store import PromptContextEntry, TrajectoryEvent
+        from tllm.runtime.trajectory_store import PromptContextEntry, TrajectoryEvent
 
         consumer = GTTAConsumer(GTTAConsumerConfig())
         consumer.enqueue_trajectory_event(
@@ -298,7 +298,7 @@ class GTTADynamicsToyUnitTest(unittest.TestCase):
 
     def test_prompt_context_entry_changes_prompt_seen_by_capture_runner(self) -> None:
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig
-        from tllm.runtime.dynamics_store import PromptContextBatch, TrajectoryEvent, write_prompt_contexts
+        from tllm.runtime.trajectory_store import PromptContextBatch, TrajectoryEvent, write_prompt_contexts
         from tllm.runtime.vllm_patch.capture_runner import run_generate_with_request_mapping
 
         consumer = GTTAConsumer(GTTAConsumerConfig())
@@ -355,7 +355,7 @@ class GTTACachedModelSmokeTest(unittest.TestCase):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig
-        from tllm.runtime.dynamics_store import TrajectoryEvent, apply_prompt_contexts
+        from tllm.runtime.trajectory_store import TrajectoryEvent, apply_prompt_contexts
 
         model_id = "sshleifer/tiny-gpt2"
         consumer = GTTAConsumer(GTTAConsumerConfig())
@@ -378,7 +378,7 @@ class GTTACachedModelSmokeTest(unittest.TestCase):
             state_signature="search-results",
             candidate_actions=("open directions",),
         )
-        from tllm.runtime.dynamics_store import PromptContextBatch, write_prompt_contexts
+        from tllm.runtime.trajectory_store import PromptContextBatch, write_prompt_contexts
 
         write_prompt_contexts(runtime, PromptContextBatch(entries=(context,)))
         prompt = "Task: choose the next browser action. Observation: map search results. Action:"
