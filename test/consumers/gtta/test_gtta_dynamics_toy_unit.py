@@ -97,8 +97,8 @@ class GTTADynamicsToyUnitTest(unittest.TestCase):
             action="click submit",
         )
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["previous_observation"], "same rendered page text")
-        self.assertEqual(records[0]["next_observation"], "order confirmation")
+        self.assertEqual(records[0].previous_observation, "same rendered page text")
+        self.assertEqual(records[0].next_observation, "order confirmation")
 
     def test_enqueue_trajectory_event_rejects_implicit_shapes(self) -> None:
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig
@@ -168,13 +168,15 @@ class GTTADynamicsToyUnitTest(unittest.TestCase):
 
         self.assertEqual(len(matching_records), 1)
         self.assertEqual(
-            matching_records[0]["environmental_dynamics"],
+            matching_records[0].environmental_dynamics,
             "The restaurant accepted the selected time.",
         )
-        self.assertEqual(matching_records[0]["reward"], 1.0)
+        self.assertEqual(matching_records[0].reward, 1.0)
         self.assertEqual([action for action, _score in ranked], ["click confirm", "go back"])
 
-    def test_query_dynamics_records_returns_copy(self) -> None:
+    def test_query_dynamics_records_returns_immutable_events(self) -> None:
+        import dataclasses
+
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig
         from tllm.consumers.gtta import TrajectoryFeedback
 
@@ -192,10 +194,12 @@ class GTTADynamicsToyUnitTest(unittest.TestCase):
         consumer.process_queued_trajectories()
 
         queried = consumer.query_dynamics_records(task_id="wishlist")
-        queried[0]["environmental_dynamics"] = "mutated by caller"
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            queried[0].environmental_dynamics = "mutated by caller"  # type: ignore[misc]
 
         self.assertEqual(
-            consumer.query_dynamics_records(task_id="wishlist")[0]["environmental_dynamics"],
+            consumer.query_dynamics_records(task_id="wishlist")[0].environmental_dynamics,
             "The item was added to the wishlist.",
         )
 

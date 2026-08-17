@@ -181,14 +181,14 @@ class GTTAConsumerUnitTest(unittest.TestCase):
 
         records = consumer.export_dynamics_records()
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["task_id"], "wishlist")
-        self.assertEqual(records[0]["previous_observation"], "product page with wishlist button")
-        self.assertEqual(records[0]["next_observation"], "wishlist page with confirmation alert")
+        self.assertEqual(records[0].task_id, "wishlist")
+        self.assertEqual(records[0].previous_observation, "product page with wishlist button")
+        self.assertEqual(records[0].next_observation, "wishlist page with confirmation alert")
         self.assertEqual(
-            records[0]["environmental_dynamics"],
+            records[0].environmental_dynamics,
             "A confirmation alert appeared and the wishlist count increased.",
         )
-        self.assertEqual(records[0]["reward"], 0.75)
+        self.assertEqual(records[0].reward, 0.75)
 
     def test_disabled_consumer_does_not_update_scores(self) -> None:
         from tllm.consumers.gtta import GTTAConsumer, GTTAConsumerConfig

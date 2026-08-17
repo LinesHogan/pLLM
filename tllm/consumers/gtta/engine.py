@@ -6,10 +6,23 @@ from __future__ import annotations
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 from tllm.consumers.gtta.config import GTTAConsumerConfig, TrajectoryFeedback
 from tllm.runtime.trajectory_store import PromptContextEntry, TrajectoryEvent
+
+
+@dataclass(frozen=True)
+class DynamicsEvent:
+    """One recorded environment transition used for dynamics recall."""
+
+    task_id: str
+    state_signature: str
+    action: str
+    previous_observation: str
+    next_observation: str
+    environmental_dynamics: str
+    reward: float
 
 
 @dataclass(frozen=True)
@@ -33,7 +46,7 @@ class GTTAEngine:
         self._action_counts: dict[str, int] = defaultdict(int)
         self._state_action_scores: dict[tuple[str, str, str], float] = defaultdict(float)
         self._state_action_counts: dict[tuple[str, str, str], int] = defaultdict(int)
-        self._dynamics_records: list[dict[str, Any]] = []
+        self._dynamics_records: list[DynamicsEvent] = []
 
     def enqueue_trajectory(self, feedback: TrajectoryFeedback) -> bool:
         if len(self._queue) >= max(0, int(self.config.max_queue_size)):
@@ -104,15 +117,15 @@ class GTTAEngine:
         self._state_action_scores[state_key] = new_state_score
         self._state_action_counts[state_key] += 1
         self._dynamics_records.append(
-            {
-                "task_id": task_id,
-                "state_signature": state_signature,
-                "action": action,
-                "previous_observation": previous_observation,
-                "next_observation": next_observation,
-                "environmental_dynamics": environmental_dynamics,
-                "reward": reward,
-            }
+            DynamicsEvent(
+                task_id=task_id,
+                state_signature=state_signature,
+                action=action,
+                previous_observation=previous_observation,
+                next_observation=next_observation,
+                environmental_dynamics=environmental_dynamics,
+                reward=reward,
+            )
         )
         self._processed_trajectories += 1
         self._update_count += 1
@@ -156,8 +169,8 @@ class GTTAEngine:
         scored.sort(key=lambda item: (-item[1], item[2]))
         return [(action, score) for action, score, _index in scored]
 
-    def export_dynamics_records(self) -> list[dict[str, Any]]:
-        return [dict(record) for record in self._dynamics_records]
+    def export_dynamics_records(self) -> tuple[DynamicsEvent, ...]:
+        return tuple(self._dynamics_records)
 
     def query_dynamics_records(
         self,
@@ -166,23 +179,23 @@ class GTTAEngine:
         action: str | None = None,
         observation: str | None = None,
         state_signature: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[DynamicsEvent, ...]:
         normalized_task_id = None if task_id is None else str(task_id).strip()
         normalized_action = None if action is None else str(action).strip()
         normalized_signature = state_signature
         if normalized_signature is None and observation is not None:
             normalized_signature = self.state_signature(str(observation))
 
-        records: list[dict[str, Any]] = []
+        records: list[DynamicsEvent] = []
         for record in self._dynamics_records:
-            if normalized_task_id is not None and record["task_id"] != normalized_task_id:
+            if normalized_task_id is not None and record.task_id != normalized_task_id:
                 continue
-            if normalized_action is not None and record["action"] != normalized_action:
+            if normalized_action is not None and record.action != normalized_action:
                 continue
-            if normalized_signature is not None and record["state_signature"] != str(normalized_signature):
+            if normalized_signature is not None and record.state_signature != str(normalized_signature):
                 continue
-            records.append(dict(record))
-        return records
+            records.append(record)
+        return tuple(records)
 
     def render_ranked_dynamics_snippets(
         self,
@@ -277,23 +290,25 @@ class GTTAEngine:
         state_signature: str | None = None,
         candidate_actions: Sequence[str] | None = None,
         max_records: int = 0,
-    ) -> list[dict[str, Any]]:
+    ) -> list[DynamicsEvent]:
         candidate_set = None if candidate_actions is None else {str(candidate).strip() for candidate in candidate_actions}
-        records = self.query_dynamics_records(
-            task_id=task_id,
-            action=action,
-            observation=observation,
-            state_signature=state_signature,
+        records = list(
+            self.query_dynamics_records(
+                task_id=task_id,
+                action=action,
+                observation=observation,
+                state_signature=state_signature,
+            )
         )
         if candidate_set is not None:
-            records = [record for record in records if record["action"] in candidate_set]
+            records = [record for record in records if record.action in candidate_set]
         ranked = sorted(
             enumerate(records),
             key=lambda item: (
-                -float(item[1]["reward"]),
-                str(item[1]["action"]),
-                str(item[1]["state_signature"]),
-                str(item[1]["next_observation"]),
+                -item[1].reward,
+                item[1].action,
+                item[1].state_signature,
+                item[1].next_observation,
                 item[0],
             ),
         )
@@ -305,24 +320,24 @@ class GTTAEngine:
         return [record for _index, record in ranked]
 
     @staticmethod
-    def _format_dynamics_snippet(record: Mapping[str, Any]) -> str:
+    def _format_dynamics_snippet(record: DynamicsEvent) -> str:
         return (
-            f"task={record['task_id']} state={record['state_signature']} action={record['action']} "
-            f"reward={float(record['reward']):.6g} next={record['next_observation']}"
+            f"task={record.task_id} state={record.state_signature} action={record.action} "
+            f"reward={record.reward:.6g} next={record.next_observation}"
         )
 
     @staticmethod
-    def _to_environment_dynamics_payload(record: Mapping[str, Any]) -> dict[str, object]:
-        environmental_dynamics = str(record["environmental_dynamics"])
+    def _to_environment_dynamics_payload(record: DynamicsEvent) -> dict[str, object]:
+        environmental_dynamics = record.environmental_dynamics
         if not environmental_dynamics:
-            environmental_dynamics = f"Next observation: {record['next_observation']}"
+            environmental_dynamics = f"Next observation: {record.next_observation}"
         return {
-            "initial_state": str(record["previous_observation"]),
-            "action_taken": str(record["action"]),
+            "initial_state": record.previous_observation,
+            "action_taken": record.action,
             "environmental_dynamics": environmental_dynamics,
-            "task_id": str(record["task_id"]),
-            "state_signature": str(record["state_signature"]),
-            "reward": float(record["reward"]),
+            "task_id": record.task_id,
+            "state_signature": record.state_signature,
+            "reward": record.reward,
         }
 
     def score_global_action(self, action: str) -> float:

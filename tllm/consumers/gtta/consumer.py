@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Sequence
 
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers.gtta.config import GTTAConsumerConfig, TrajectoryFeedback, parse_reward
-from tllm.consumers.gtta.engine import GTTAEngine, GTTAStats
+from tllm.consumers.gtta.engine import DynamicsEvent, GTTAEngine, GTTAStats
 from tllm.ports.base import ConsumerFlow
 from tllm.runtime.trajectory_store import PromptContextEntry, TrajectoryEvent
 
@@ -78,7 +78,7 @@ class GTTAConsumer(BaseConsumer):
             state_signature=state_signature,
         )
 
-    def export_dynamics_records(self) -> list[dict[str, Any]]:
+    def export_dynamics_records(self) -> tuple[DynamicsEvent, ...]:
         return self.engine.export_dynamics_records()
 
     def query_dynamics_records(
@@ -88,7 +88,7 @@ class GTTAConsumer(BaseConsumer):
         action: str | None = None,
         observation: str | None = None,
         state_signature: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[DynamicsEvent, ...]:
         return self.engine.query_dynamics_records(
             task_id=task_id,
             action=action,
