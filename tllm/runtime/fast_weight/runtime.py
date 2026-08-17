@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from typing import Iterable, Sequence
 
-from tllm.runtime.fast_weight_state import (
+from tllm.runtime.fast_weight.state import (
     DownProjFastWeightOverlayHandle,
     FastWeightKey,
     FastWeightState,
@@ -15,21 +15,21 @@ from tllm.runtime.fast_weight_state import (
 )
 from tllm.runtime.token_batch_metadata import PackedTokenRow, RequestSampleKey, RuntimeTokenBatchMeta, RuntimeTokenRow
 
-STATIC_REQUEST_ID = "__tllm_inplace_ttt_static__"
+STATIC_REQUEST_ID = "__tllm_fast_weight_static__"
 
 
 def fast_weight_runtime_enabled(runtime: object) -> bool:
     cfg = getattr(runtime, "config", None)
-    return bool(getattr(cfg, "inplace_ttt_fast_weight_enabled", False)) or os.getenv("TLLM_INPLACE_TTT_FAST_WEIGHT") == "1"
+    return bool(getattr(cfg, "fast_weight_enabled", False)) or os.getenv("TLLM_INPLACE_TTT_FAST_WEIGHT") == "1"
 
 
 def runtime_fast_weight_phase(runtime: object) -> str:
-    phase = str(getattr(runtime, "inplace_ttt_fast_weight_phase", "prefill") or "prefill")
+    phase = str(getattr(runtime, "fast_weight_phase", "prefill") or "prefill")
     return "decode" if phase == "decode" else "prefill"
 
 
-def restore_inplace_ttt_fast_weight_wrappers(runtime: object) -> int:
-    handles = getattr(runtime, "inplace_ttt_fast_weight_handles", None)
+def restore_fast_weight_wrappers(runtime: object) -> int:
+    handles = getattr(runtime, "fast_weight_handles", None)
     if not isinstance(handles, dict):
         return 0
     restored = 0
@@ -38,13 +38,13 @@ def restore_inplace_ttt_fast_weight_wrappers(runtime: object) -> int:
             handle.restore()
             restored += 1
     handles.clear()
-    setattr(runtime, "inplace_ttt_fast_weight_hook_spec", None)
+    setattr(runtime, "fast_weight_hook_spec", None)
     return restored
 
 
 def _configured_layers(runtime: object, layer_count: int) -> tuple[int, ...]:
     cfg = getattr(runtime, "config", None)
-    raw_layers = getattr(cfg, "inplace_ttt_fast_weight_layers", (0,))
+    raw_layers = getattr(cfg, "fast_weight_layers", (0,))
     if raw_layers is None:
         return tuple(range(int(layer_count)))
     layers: list[int] = []
@@ -85,14 +85,14 @@ def _hook_spec(runtime: object, runner: object, layers: tuple[int, ...]) -> tupl
     return (
         id(model),
         layers,
-        normalize_fast_weight_mode(getattr(cfg, "inplace_ttt_fast_weight_mode", "exact")),
-        int(getattr(cfg, "inplace_ttt_fast_weight_chunk_size", 4096)),
-        float(getattr(cfg, "inplace_ttt_fast_weight_lr", 1e-3)),
-        bool(getattr(cfg, "inplace_ttt_fast_weight_decode_update_enabled", False)),
-        str(getattr(cfg, "inplace_ttt_fast_weight_key_mode", "static") or "static"),
-        str(getattr(cfg, "inplace_ttt_fast_weight_static_request_id", STATIC_REQUEST_ID) or STATIC_REQUEST_ID),
-        int(getattr(cfg, "inplace_ttt_fast_weight_max_slots", 64) or 0),
-        int(getattr(cfg, "inplace_ttt_fast_weight_max_bytes", 0) or 0),
+        normalize_fast_weight_mode(getattr(cfg, "fast_weight_mode", "exact")),
+        int(getattr(cfg, "fast_weight_chunk_size", 4096)),
+        float(getattr(cfg, "fast_weight_lr", 1e-3)),
+        bool(getattr(cfg, "fast_weight_decode_update_enabled", False)),
+        str(getattr(cfg, "fast_weight_key_mode", "static") or "static"),
+        str(getattr(cfg, "fast_weight_static_request_id", STATIC_REQUEST_ID) or STATIC_REQUEST_ID),
+        int(getattr(cfg, "fast_weight_max_slots", 64) or 0),
+        int(getattr(cfg, "fast_weight_max_bytes", 0) or 0),
     )
 
 
@@ -126,7 +126,7 @@ def _index_int(values: object, idx: int, *, default: int = 0) -> int:
         return int(default)
 
 
-def update_inplace_ttt_fast_weight_metadata_from_runner(
+def update_fast_weight_metadata_from_runner(
     runtime: object,
     runner: object,
     *,
@@ -180,8 +180,8 @@ def update_inplace_ttt_fast_weight_metadata_from_runner(
                     )
                 )
             row_base += int(scheduled)
-    setattr(runtime, "inplace_ttt_current_token_batch_meta", RuntimeTokenBatchMeta(rows=tuple(rows), row_layout="packed"))
-    setattr(runtime, "inplace_ttt_fast_weight_phase", phase)
+    setattr(runtime, "fast_weight_current_token_batch_meta", RuntimeTokenBatchMeta(rows=tuple(rows), row_layout="packed"))
+    setattr(runtime, "fast_weight_phase", phase)
     return phase
 
 
@@ -189,7 +189,7 @@ def require_static_key_single_request(runtime: object, runner: object) -> None:
     if not fast_weight_runtime_enabled(runtime):
         return
     cfg = getattr(runtime, "config", None)
-    key_mode = str(getattr(cfg, "inplace_ttt_fast_weight_key_mode", "static") or "static")
+    key_mode = str(getattr(cfg, "fast_weight_key_mode", "static") or "static")
     if key_mode != "static":
         return
     active = _active_request_count(runner)
@@ -203,7 +203,7 @@ def current_token_batch_fast_weight_keys(
     layer: int,
     rows: int,
 ) -> tuple[FastWeightKey, ...] | None:
-    meta = getattr(runtime, "inplace_ttt_current_token_batch_meta", None)
+    meta = getattr(runtime, "fast_weight_current_token_batch_meta", None)
     if not isinstance(meta, RuntimeTokenBatchMeta):
         return None
     if meta.row_layout != "packed":
@@ -220,18 +220,18 @@ def current_token_batch_fast_weight_keys(
     )
 
 
-def maybe_install_inplace_ttt_fast_weight_wrappers(runtime: object, runner: object) -> int:
+def maybe_install_fast_weight_wrappers(runtime: object, runner: object) -> int:
     if not fast_weight_runtime_enabled(runtime):
         return 0
     cfg = getattr(runtime, "config", None)
-    mode = normalize_fast_weight_mode(getattr(cfg, "inplace_ttt_fast_weight_mode", "exact"))
+    mode = normalize_fast_weight_mode(getattr(cfg, "fast_weight_mode", "exact"))
     if mode == "low_rank":
-        restore_inplace_ttt_fast_weight_wrappers(runtime)
+        restore_fast_weight_wrappers(runtime)
         raise NotImplementedError(
             "In-Place TTT fast-weight low_rank mode is not implemented yet; "
             "exact mode is the only runtime state representation available."
         )
-    key_mode = str(getattr(cfg, "inplace_ttt_fast_weight_key_mode", "static") or "static")
+    key_mode = str(getattr(cfg, "fast_weight_key_mode", "static") or "static")
     if key_mode not in {"static", "request_sample"}:
         raise RuntimeError("In-Place TTT fast-weight key_mode must be 'static' or 'request_sample'")
 
@@ -241,27 +241,27 @@ def maybe_install_inplace_ttt_fast_weight_wrappers(runtime: object, runner: obje
     model_layers = _model_layers(model)
     layers = _configured_layers(runtime, len(model_layers))
     spec = _hook_spec(runtime, runner, layers)
-    if getattr(runtime, "inplace_ttt_fast_weight_hook_spec", None) == spec:
-        handles = getattr(runtime, "inplace_ttt_fast_weight_handles", None)
+    if getattr(runtime, "fast_weight_hook_spec", None) == spec:
+        handles = getattr(runtime, "fast_weight_handles", None)
         if isinstance(handles, dict) and handles:
             return 0
 
-    restore_inplace_ttt_fast_weight_wrappers(runtime)
-    state = getattr(runtime, "inplace_ttt_fast_weight_state", None)
+    restore_fast_weight_wrappers(runtime)
+    state = getattr(runtime, "fast_weight_state", None)
     if not isinstance(state, FastWeightState):
         state = FastWeightState(mode=mode)
-        setattr(runtime, "inplace_ttt_fast_weight_state", state)
-    max_slots = int(getattr(cfg, "inplace_ttt_fast_weight_max_slots", 64) or 0)
-    max_bytes = int(getattr(cfg, "inplace_ttt_fast_weight_max_bytes", 0) or 0)
+        setattr(runtime, "fast_weight_state", state)
+    max_slots = int(getattr(cfg, "fast_weight_max_slots", 64) or 0)
+    max_bytes = int(getattr(cfg, "fast_weight_max_bytes", 0) or 0)
     state.set_limits(
         max_slots=max_slots if max_slots > 0 else None,
         max_bytes=max_bytes if max_bytes > 0 else None,
     )
     handles: dict[str, DownProjFastWeightOverlayHandle] = {}
-    fail_on_unsupported = bool(getattr(cfg, "inplace_ttt_fast_weight_fail_on_unsupported", False))
+    fail_on_unsupported = bool(getattr(cfg, "fast_weight_fail_on_unsupported", False))
     installed = 0
     skipped = 0
-    static_request_id = str(getattr(cfg, "inplace_ttt_fast_weight_static_request_id", STATIC_REQUEST_ID) or STATIC_REQUEST_ID)
+    static_request_id = str(getattr(cfg, "fast_weight_static_request_id", STATIC_REQUEST_ID) or STATIC_REQUEST_ID)
 
     for layer_idx, mlp in iter_configured_mlps(model, layers):
         static_key = FastWeightKey(request_id=static_request_id, sample_idx=0, layer=layer_idx)
@@ -278,10 +278,10 @@ def maybe_install_inplace_ttt_fast_weight_wrappers(runtime: object, runner: obje
                 state=state,
                 key=static_key,
                 row_key_provider=row_key_provider,
-                chunk_size=int(getattr(cfg, "inplace_ttt_fast_weight_chunk_size", 4096)),
-                learning_rate=float(getattr(cfg, "inplace_ttt_fast_weight_lr", 1e-3)),
+                chunk_size=int(getattr(cfg, "fast_weight_chunk_size", 4096)),
+                learning_rate=float(getattr(cfg, "fast_weight_lr", 1e-3)),
                 phase_getter=lambda runtime=runtime: runtime_fast_weight_phase(runtime),
-                decode_update_enabled=bool(getattr(cfg, "inplace_ttt_fast_weight_decode_update_enabled", False)),
+                decode_update_enabled=bool(getattr(cfg, "fast_weight_decode_update_enabled", False)),
                 require_single_tp=True,
             )
         except Exception:
@@ -292,15 +292,15 @@ def maybe_install_inplace_ttt_fast_weight_wrappers(runtime: object, runner: obje
         handles[f"model.layers.{layer_idx}.mlp"] = handle
         installed += 1
 
-    setattr(runtime, "inplace_ttt_fast_weight_handles", handles)
-    setattr(runtime, "inplace_ttt_fast_weight_hook_spec", spec)
-    setattr(runtime, "inplace_ttt_fast_weight_installed_count", installed)
-    setattr(runtime, "inplace_ttt_fast_weight_skipped_count", skipped)
+    setattr(runtime, "fast_weight_handles", handles)
+    setattr(runtime, "fast_weight_hook_spec", spec)
+    setattr(runtime, "fast_weight_installed_count", installed)
+    setattr(runtime, "fast_weight_skipped_count", skipped)
     return installed
 
 
-def update_inplace_ttt_fast_weight_phase_from_runner(runtime: object, runner: object) -> str:
+def update_fast_weight_phase_from_runner(runtime: object, runner: object) -> str:
     if not fast_weight_runtime_enabled(runtime):
         return runtime_fast_weight_phase(runtime)
     require_static_key_single_request(runtime, runner)
-    return update_inplace_ttt_fast_weight_metadata_from_runner(runtime, runner)
+    return update_fast_weight_metadata_from_runner(runtime, runner)

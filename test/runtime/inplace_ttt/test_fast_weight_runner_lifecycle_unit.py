@@ -61,26 +61,26 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
     def _runtime(self) -> SimpleNamespace:
         return SimpleNamespace(
             config=SimpleNamespace(
-                inplace_ttt_fast_weight_enabled=True,
-                inplace_ttt_fast_weight_layers=(0,),
-                inplace_ttt_fast_weight_chunk_size=4,
-                inplace_ttt_fast_weight_lr=0.5,
-                inplace_ttt_fast_weight_mode="exact",
-                inplace_ttt_fast_weight_decode_update_enabled=False,
-                inplace_ttt_fast_weight_key_mode="static",
-                inplace_ttt_fast_weight_static_request_id="static-req",
-                inplace_ttt_fast_weight_fail_on_unsupported=True,
+                fast_weight_enabled=True,
+                fast_weight_layers=(0,),
+                fast_weight_chunk_size=4,
+                fast_weight_lr=0.5,
+                fast_weight_mode="exact",
+                fast_weight_decode_update_enabled=False,
+                fast_weight_key_mode="static",
+                fast_weight_static_request_id="static-req",
+                fast_weight_fail_on_unsupported=True,
             ),
-            inplace_ttt_fast_weight_phase="prefill",
-            inplace_ttt_fast_weight_handles={},
-            inplace_ttt_fast_weight_hook_spec=None,
+            fast_weight_phase="prefill",
+            fast_weight_handles={},
+            fast_weight_hook_spec=None,
         )
 
     def test_lifecycle_installs_static_key_wrapper_once_and_restores(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import (
-            maybe_install_inplace_ttt_fast_weight_wrappers,
-            restore_inplace_ttt_fast_weight_wrappers,
+        from tllm.runtime.fast_weight.state import FastWeightKey
+        from tllm.runtime.fast_weight.runtime import (
+            maybe_install_fast_weight_wrappers,
+            restore_fast_weight_wrappers,
         )
 
         runtime = self._runtime()
@@ -88,56 +88,56 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         mlp = runner.model.model.layers[0].mlp
         base_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
 
-        installed = maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
-        installed_again = maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        installed = maybe_install_fast_weight_wrappers(runtime, runner)
+        installed_again = maybe_install_fast_weight_wrappers(runtime, runner)
         first = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         second = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
         mlp.forward(first)
         mlp.forward(second)
         key = FastWeightKey(request_id="static-req", sample_idx=0, layer=0)
-        stats = runtime.inplace_ttt_fast_weight_state.stats(key)
+        stats = runtime.fast_weight_state.stats(key)
 
         self.assertEqual(installed, 1)
         self.assertEqual(installed_again, 0)
-        self.assertEqual(set(runtime.inplace_ttt_fast_weight_handles), {"model.layers.0.mlp"})
+        self.assertEqual(set(runtime.fast_weight_handles), {"model.layers.0.mlp"})
         self.assertEqual(stats.update_count, 1)
         self.assertEqual(stats.trained_rows, 4)
-        self.assertEqual(restore_inplace_ttt_fast_weight_wrappers(runtime), 1)
+        self.assertEqual(restore_fast_weight_wrappers(runtime), 1)
         restored_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
         self.assertTrue(torch.equal(restored_probe, base_probe))
 
     def test_low_rank_runtime_mode_fails_fast_before_installing_wrapper(self) -> None:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.runtime import maybe_install_fast_weight_wrappers
 
         runtime = self._runtime()
-        runtime.config.inplace_ttt_fast_weight_mode = "low_rank"
+        runtime.config.fast_weight_mode = "low_rank"
         runner = SimpleNamespace(model=_FakeModel())
 
         with self.assertRaisesRegex(NotImplementedError, "low_rank"):
-            maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
+            maybe_install_fast_weight_wrappers(runtime, runner)
+        self.assertEqual(runtime.fast_weight_handles, {})
 
     def test_low_rank_runtime_mode_restores_existing_exact_wrapper_before_failing(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.state import FastWeightKey
+        from tllm.runtime.fast_weight.runtime import maybe_install_fast_weight_wrappers
 
         runtime = self._runtime()
         runner = SimpleNamespace(model=_FakeModel())
         mlp = runner.model.model.layers[0].mlp
 
-        self.assertEqual(maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner), 1)
+        self.assertEqual(maybe_install_fast_weight_wrappers(runtime, runner), 1)
         mlp.forward(torch.ones(4, 2))
         key = FastWeightKey(request_id="static-req", sample_idx=0, layer=0)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_state.stats(key).update_count, 1)
+        self.assertEqual(runtime.fast_weight_state.stats(key).update_count, 1)
 
-        runtime.config.inplace_ttt_fast_weight_mode = "low_rank"
+        runtime.config.fast_weight_mode = "low_rank"
         with self.assertRaisesRegex(NotImplementedError, "low_rank"):
-            maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+            maybe_install_fast_weight_wrappers(runtime, runner)
 
-        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
-        self.assertIsNone(runtime.inplace_ttt_fast_weight_hook_spec)
+        self.assertEqual(runtime.fast_weight_handles, {})
+        self.assertIsNone(runtime.fast_weight_hook_spec)
         mlp.forward(torch.ones(4, 2))
-        self.assertEqual(runtime.inplace_ttt_fast_weight_state.stats(key).update_count, 1)
+        self.assertEqual(runtime.fast_weight_state.stats(key).update_count, 1)
 
     def test_runtime_configuration_rejects_unknown_fast_weight_mode(self) -> None:
         from tllm.runtime import residual_runtime
@@ -147,7 +147,7 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         try:
             residual_runtime.RUNTIME = runtime
             with self.assertRaisesRegex(ValueError, "exact.*low_rank"):
-                residual_runtime.set_inplace_ttt_fast_weight_enabled(True, mode="compressed")
+                residual_runtime.set_fast_weight_enabled(True, mode="compressed")
         finally:
             residual_runtime.RUNTIME = old_runtime
 
@@ -157,7 +157,7 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
 
         runtime = residual_runtime.ResidualRuntimeState()
         old_runtime = residual_runtime.RUNTIME
-        runtime.inplace_ttt_current_token_batch_meta = RuntimeTokenBatchMeta(
+        runtime.fast_weight_current_token_batch_meta = RuntimeTokenBatchMeta(
             rows=(
                 RuntimeTokenRow(
                     key=RequestSampleKey(request_id="stale-req", prompt_idx=0, sample_idx=0),
@@ -168,59 +168,59 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
             ),
             row_layout="packed",
         )
-        runtime.inplace_ttt_fast_weight_phase = "decode"
+        runtime.fast_weight_phase = "decode"
         try:
             residual_runtime.RUNTIME = runtime
-            residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+            residual_runtime.set_fast_weight_enabled(False)
         finally:
             residual_runtime.RUNTIME = old_runtime
 
-        self.assertIsNone(runtime.inplace_ttt_current_token_batch_meta)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_phase, "prefill")
+        self.assertIsNone(runtime.fast_weight_current_token_batch_meta)
+        self.assertEqual(runtime.fast_weight_phase, "prefill")
 
     def test_configured_layers_are_isolated_by_layer_key(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.state import FastWeightKey
+        from tllm.runtime.fast_weight.runtime import maybe_install_fast_weight_wrappers
 
         runtime = self._runtime()
-        runtime.config.inplace_ttt_fast_weight_layers = (1,)
+        runtime.config.fast_weight_layers = (1,)
         runner = SimpleNamespace(model=_FakeModel())
 
-        maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        maybe_install_fast_weight_wrappers(runtime, runner)
         runner.model.model.layers[0].mlp.forward(torch.ones(4, 2))
         runner.model.model.layers[1].mlp.forward(torch.ones(4, 2))
 
-        state = runtime.inplace_ttt_fast_weight_state
+        state = runtime.fast_weight_state
         self.assertEqual(state.stats(FastWeightKey(request_id="static-req", sample_idx=0, layer=0)).update_count, 0)
         self.assertEqual(state.stats(FastWeightKey(request_id="static-req", sample_idx=0, layer=1)).update_count, 1)
 
     def test_unsupported_mlp_can_be_skipped_without_installing_handles(self) -> None:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.runtime import maybe_install_fast_weight_wrappers
 
         runtime = self._runtime()
-        runtime.config.inplace_ttt_fast_weight_fail_on_unsupported = False
+        runtime.config.fast_weight_fail_on_unsupported = False
         runner = SimpleNamespace(model=_FakeModel())
         runner.model.model.layers[0].mlp.down_proj.bias = torch.ones(2)
 
-        installed = maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        installed = maybe_install_fast_weight_wrappers(runtime, runner)
 
         self.assertEqual(installed, 0)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_installed_count, 0)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_skipped_count, 1)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
+        self.assertEqual(runtime.fast_weight_installed_count, 0)
+        self.assertEqual(runtime.fast_weight_skipped_count, 1)
+        self.assertEqual(runtime.fast_weight_handles, {})
 
     def test_phase_updates_from_runner_input_batch(self) -> None:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import update_inplace_ttt_fast_weight_phase_from_runner
+        from tllm.runtime.fast_weight.runtime import update_fast_weight_phase_from_runner
 
         runtime = self._runtime()
         runner = SimpleNamespace(input_batch=_FakeInputBatch(computed=0, prompt=8))
-        self.assertEqual(update_inplace_ttt_fast_weight_phase_from_runner(runtime, runner), "prefill")
+        self.assertEqual(update_fast_weight_phase_from_runner(runtime, runner), "prefill")
 
         runner.input_batch = _FakeInputBatch(computed=8, prompt=8)
-        self.assertEqual(update_inplace_ttt_fast_weight_phase_from_runner(runtime, runner), "decode")
+        self.assertEqual(update_fast_weight_phase_from_runner(runtime, runner), "decode")
 
     def test_current_token_metadata_tracks_packed_prefill_rows_for_batch_requests(self) -> None:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import update_inplace_ttt_fast_weight_metadata_from_runner
+        from tllm.runtime.fast_weight.runtime import update_fast_weight_metadata_from_runner
 
         runtime = self._runtime()
         runtime.event_step_id = 7
@@ -236,12 +236,12 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
             )
         )
 
-        phase = update_inplace_ttt_fast_weight_metadata_from_runner(
+        phase = update_fast_weight_metadata_from_runner(
             runtime,
             runner,
             num_scheduled_tokens_np=[3, 3],
         )
-        meta = runtime.inplace_ttt_current_token_batch_meta
+        meta = runtime.fast_weight_current_token_batch_meta
 
         self.assertEqual(phase, "prefill")
         self.assertEqual([row.key.request_id for row in meta.rows], ["req-a", "req-a", "req-a", "req-b", "req-b", "req-b"])
@@ -251,7 +251,7 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         self.assertEqual([row.row.token_offset for row in meta.rows], [1, 2, 3, 2, 3, 4])
 
     def test_current_token_metadata_accepts_numpy_count_arrays_from_vllm(self) -> None:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import update_inplace_ttt_fast_weight_metadata_from_runner
+        from tllm.runtime.fast_weight.runtime import update_fast_weight_metadata_from_runner
 
         runtime = self._runtime()
         runner = SimpleNamespace(
@@ -264,16 +264,16 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
             )
         )
 
-        update_inplace_ttt_fast_weight_metadata_from_runner(
+        update_fast_weight_metadata_from_runner(
             runtime,
             runner,
             num_scheduled_tokens_np=np.asarray([4, 4]),
         )
 
-        self.assertEqual(len(runtime.inplace_ttt_current_token_batch_meta.rows), 8)
+        self.assertEqual(len(runtime.fast_weight_current_token_batch_meta.rows), 8)
 
     def test_static_key_mode_rejects_multi_request_runner_batch(self) -> None:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import require_static_key_single_request
+        from tllm.runtime.fast_weight.runtime import require_static_key_single_request
 
         runtime = self._runtime()
         runner = SimpleNamespace(
@@ -287,9 +287,9 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
             require_static_key_single_request(runtime, runner)
 
     def test_request_sample_key_mode_groups_rows_by_current_runtime_metadata(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import (
-            maybe_install_inplace_ttt_fast_weight_wrappers,
+        from tllm.runtime.fast_weight.state import FastWeightKey
+        from tllm.runtime.fast_weight.runtime import (
+            maybe_install_fast_weight_wrappers,
             require_static_key_single_request,
         )
         from tllm.runtime.token_batch_metadata import (
@@ -300,8 +300,8 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         )
 
         runtime = self._runtime()
-        runtime.config.inplace_ttt_fast_weight_key_mode = "request_sample"
-        runtime.inplace_ttt_current_token_batch_meta = RuntimeTokenBatchMeta(
+        runtime.config.fast_weight_key_mode = "request_sample"
+        runtime.fast_weight_current_token_batch_meta = RuntimeTokenBatchMeta(
             rows=(
                 RuntimeTokenRow(
                     key=RequestSampleKey(request_id="req-a", prompt_idx=0, sample_idx=0),
@@ -332,12 +332,12 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
         runner = SimpleNamespace(model=_FakeModel(), input_batch=SimpleNamespace(req_ids=["req-a", "req-b"], num_reqs=2))
 
         require_static_key_single_request(runtime, runner)
-        installed = maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        installed = maybe_install_fast_weight_wrappers(runtime, runner)
         runner.model.model.layers[0].mlp.forward(
             torch.tensor([[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]])
         )
 
-        state = runtime.inplace_ttt_fast_weight_state
+        state = runtime.fast_weight_state
         key_a = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
         key_b = FastWeightKey(request_id="req-b", sample_idx=0, layer=0)
         self.assertEqual(installed, 1)
@@ -348,41 +348,41 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
 
     def test_runtime_disable_restores_installed_wrapper(self) -> None:
         from tllm.runtime import residual_runtime
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.runtime import maybe_install_fast_weight_wrappers
 
         runtime = residual_runtime.ResidualRuntimeState()
         runner = SimpleNamespace(model=_FakeModel())
-        runtime.config.inplace_ttt_fast_weight_enabled = True
-        runtime.config.inplace_ttt_fast_weight_layers = (0,)
-        runtime.config.inplace_ttt_fast_weight_chunk_size = 4
-        runtime.config.inplace_ttt_fast_weight_lr = 0.5
+        runtime.config.fast_weight_enabled = True
+        runtime.config.fast_weight_layers = (0,)
+        runtime.config.fast_weight_chunk_size = 4
+        runtime.config.fast_weight_lr = 0.5
         mlp = runner.model.model.layers[0].mlp
         base_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
 
-        maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        maybe_install_fast_weight_wrappers(runtime, runner)
         old_runtime = residual_runtime.RUNTIME
         try:
             residual_runtime.RUNTIME = runtime
-            residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+            residual_runtime.set_fast_weight_enabled(False)
         finally:
             residual_runtime.RUNTIME = old_runtime
         restored_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
 
-        self.assertFalse(runtime.config.inplace_ttt_fast_weight_enabled)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
+        self.assertFalse(runtime.config.fast_weight_enabled)
+        self.assertEqual(runtime.fast_weight_handles, {})
         self.assertTrue(torch.equal(restored_probe, base_probe))
 
     def test_configure_runtime_disable_restores_installed_wrapper(self) -> None:
         from tllm.runtime import residual_runtime
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import maybe_install_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.runtime import maybe_install_fast_weight_wrappers
 
         runtime = residual_runtime.ResidualRuntimeState()
         runner = SimpleNamespace(model=_FakeModel())
-        runtime.config.inplace_ttt_fast_weight_enabled = True
-        runtime.config.inplace_ttt_fast_weight_layers = (0,)
+        runtime.config.fast_weight_enabled = True
+        runtime.config.fast_weight_layers = (0,)
         mlp = runner.model.model.layers[0].mlp
         base_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
-        maybe_install_inplace_ttt_fast_weight_wrappers(runtime, runner)
+        maybe_install_fast_weight_wrappers(runtime, runner)
         old_runtime = residual_runtime.RUNTIME
         try:
             residual_runtime.RUNTIME = runtime
@@ -391,14 +391,14 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
                 tap_layer_paths=(),
                 source_layer_path="model.model.layers[0].input_layernorm",
                 target_layer_path="model.model.layers[-1].input_layernorm",
-                inplace_ttt_fast_weight_enabled=False,
+                fast_weight_enabled=False,
             )
         finally:
             residual_runtime.RUNTIME = old_runtime
         restored_probe = mlp.forward(torch.tensor([[3.0, 0.0]]))
 
-        self.assertFalse(runtime.config.inplace_ttt_fast_weight_enabled)
-        self.assertEqual(runtime.inplace_ttt_fast_weight_handles, {})
+        self.assertFalse(runtime.config.fast_weight_enabled)
+        self.assertEqual(runtime.fast_weight_handles, {})
         self.assertTrue(torch.equal(restored_probe, base_probe))
 
 
@@ -411,14 +411,14 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
         from vllm import LLM
 
         from tllm.runtime import residual_runtime
-        from tllm.runtime.fast_weight_state import FastWeightKey, module_weight_view
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.state import FastWeightKey, module_weight_view
+        from tllm.runtime.fast_weight.runtime import restore_fast_weight_wrappers
 
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         residual_runtime.set_runtime_consumer(None)
         residual_runtime.clear_dispatch_consumers()
-        residual_runtime.set_inplace_ttt_fast_weight_enabled(
+        residual_runtime.set_fast_weight_enabled(
             True,
             layers=(0,),
             chunk_size=4,
@@ -444,28 +444,28 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
         first = torch.randn((2, hidden_size), device=weight.device, dtype=weight.dtype)
         second = torch.randn((2, hidden_size), device=weight.device, dtype=weight.dtype)
         try:
-            self.assertEqual(runtime.inplace_ttt_fast_weight_installed_count, 1)
+            self.assertEqual(runtime.fast_weight_installed_count, 1)
             mlp.forward(first)
             mlp.forward(second)
-            key = FastWeightKey(request_id="__tllm_inplace_ttt_static__", sample_idx=0, layer=0)
-            stats = runtime.inplace_ttt_fast_weight_state.stats(key)
+            key = FastWeightKey(request_id="__tllm_fast_weight_static__", sample_idx=0, layer=0)
+            stats = runtime.fast_weight_state.stats(key)
             self.assertGreater(stats.update_count, 0)
             self.assertEqual(stats.tail_rows, 0)
         finally:
-            restore_inplace_ttt_fast_weight_wrappers(runtime)
-            residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+            restore_fast_weight_wrappers(runtime)
+            residual_runtime.set_fast_weight_enabled(False)
 
     def _run_request_sample_key_mode_cached_qwen_batch(self, batch_size: int) -> None:
         from vllm import LLM, SamplingParams
 
         from tllm.runtime import residual_runtime
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.runtime import restore_fast_weight_wrappers
 
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         residual_runtime.set_runtime_consumer(None)
         residual_runtime.clear_dispatch_consumers()
-        residual_runtime.set_inplace_ttt_fast_weight_enabled(
+        residual_runtime.set_fast_weight_enabled(
             True,
             layers=(0,),
             chunk_size=2,
@@ -489,18 +489,18 @@ class InPlaceTTTFastWeightRunnerCachedModelSmokeTest(unittest.TestCase):
         try:
             outputs = llm.generate(prompts, params)
             runtime = residual_runtime.RUNTIME
-            state = runtime.inplace_ttt_fast_weight_state
+            state = runtime.fast_weight_state
             stats = [state.stats(key) for key in list(state._stats)]
 
             self.assertEqual(len(outputs), int(batch_size))
-            self.assertEqual(runtime.inplace_ttt_fast_weight_installed_count, 1)
+            self.assertEqual(runtime.fast_weight_installed_count, 1)
             self.assertEqual(state.slot_count, int(batch_size))
             self.assertGreater(state.estimated_bytes, 0)
             self.assertEqual(sum(1 for item in stats if item.update_count > 0), int(batch_size))
             self.assertGreaterEqual(sum(item.trained_rows for item in stats), int(batch_size) * 8)
         finally:
-            restore_inplace_ttt_fast_weight_wrappers(residual_runtime.RUNTIME)
-            residual_runtime.set_inplace_ttt_fast_weight_enabled(False)
+            restore_fast_weight_wrappers(residual_runtime.RUNTIME)
+            residual_runtime.set_fast_weight_enabled(False)
 
     @unittest.skipUnless(
         os.getenv("TLLM_INPLACE_TTT_RUN_REQUEST_SAMPLE_BATCH_SMOKE") == "1" and torch.cuda.is_available(),

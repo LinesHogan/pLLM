@@ -216,17 +216,17 @@ def configure_runtime(
     adaptation_stream_mode: str = "dual",
     adaptation_stream_priority: int = 0,
     compact_capture_lane: bool = False,
-    inplace_ttt_fast_weight_enabled: bool = False,
-    inplace_ttt_fast_weight_layers: Sequence[int] = (0,),
-    inplace_ttt_fast_weight_chunk_size: int = 4096,
-    inplace_ttt_fast_weight_lr: float = 1e-3,
-    inplace_ttt_fast_weight_mode: str = "exact",
-    inplace_ttt_fast_weight_decode_update_enabled: bool = False,
-    inplace_ttt_fast_weight_key_mode: str = "static",
-    inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__",
-    inplace_ttt_fast_weight_max_slots: int = 64,
-    inplace_ttt_fast_weight_max_bytes: int = 0,
-    inplace_ttt_fast_weight_fail_on_unsupported: bool = False,
+    fast_weight_enabled: bool = False,
+    fast_weight_layers: Sequence[int] = (0,),
+    fast_weight_chunk_size: int = 4096,
+    fast_weight_lr: float = 1e-3,
+    fast_weight_mode: str = "exact",
+    fast_weight_decode_update_enabled: bool = False,
+    fast_weight_key_mode: str = "static",
+    fast_weight_static_request_id: str = "__tllm_fast_weight_static__",
+    fast_weight_max_slots: int = 64,
+    fast_weight_max_bytes: int = 0,
+    fast_weight_fail_on_unsupported: bool = False,
 ) -> None:
     """Configure runtime-owned mechanisms (tap topology, streams, capture lanes).
 
@@ -244,26 +244,26 @@ def configure_runtime(
     cfg.adaptation_stream_mode = normalize_adaptation_stream_mode(adaptation_stream_mode)
     cfg.adaptation_stream_priority = int(adaptation_stream_priority)
     cfg.compact_capture_lane = bool(compact_capture_lane)
-    old_inplace_ttt_enabled = bool(cfg.inplace_ttt_fast_weight_enabled)
-    cfg.inplace_ttt_fast_weight_enabled = bool(inplace_ttt_fast_weight_enabled)
-    if old_inplace_ttt_enabled and not cfg.inplace_ttt_fast_weight_enabled:
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+    old_fast_weight_enabled = bool(cfg.fast_weight_enabled)
+    cfg.fast_weight_enabled = bool(fast_weight_enabled)
+    if old_fast_weight_enabled and not cfg.fast_weight_enabled:
+        from tllm.runtime.fast_weight.runtime import restore_fast_weight_wrappers
 
-        restore_inplace_ttt_fast_weight_wrappers(RUNTIME)
-    cfg.inplace_ttt_fast_weight_layers = tuple(int(layer) for layer in inplace_ttt_fast_weight_layers)
-    cfg.inplace_ttt_fast_weight_chunk_size = max(1, int(inplace_ttt_fast_weight_chunk_size))
-    cfg.inplace_ttt_fast_weight_lr = float(inplace_ttt_fast_weight_lr)
-    from tllm.runtime.fast_weight_state import normalize_fast_weight_mode
+        restore_fast_weight_wrappers(RUNTIME)
+    cfg.fast_weight_layers = tuple(int(layer) for layer in fast_weight_layers)
+    cfg.fast_weight_chunk_size = max(1, int(fast_weight_chunk_size))
+    cfg.fast_weight_lr = float(fast_weight_lr)
+    from tllm.runtime.fast_weight.state import normalize_fast_weight_mode
 
-    cfg.inplace_ttt_fast_weight_mode = normalize_fast_weight_mode(inplace_ttt_fast_weight_mode)
-    cfg.inplace_ttt_fast_weight_decode_update_enabled = bool(inplace_ttt_fast_weight_decode_update_enabled)
-    cfg.inplace_ttt_fast_weight_key_mode = str(inplace_ttt_fast_weight_key_mode).strip() or "static"
-    cfg.inplace_ttt_fast_weight_static_request_id = (
-        str(inplace_ttt_fast_weight_static_request_id).strip() or "__tllm_inplace_ttt_static__"
+    cfg.fast_weight_mode = normalize_fast_weight_mode(fast_weight_mode)
+    cfg.fast_weight_decode_update_enabled = bool(fast_weight_decode_update_enabled)
+    cfg.fast_weight_key_mode = str(fast_weight_key_mode).strip() or "static"
+    cfg.fast_weight_static_request_id = (
+        str(fast_weight_static_request_id).strip() or "__tllm_fast_weight_static__"
     )
-    cfg.inplace_ttt_fast_weight_max_slots = max(0, int(inplace_ttt_fast_weight_max_slots))
-    cfg.inplace_ttt_fast_weight_max_bytes = max(0, int(inplace_ttt_fast_weight_max_bytes))
-    cfg.inplace_ttt_fast_weight_fail_on_unsupported = bool(inplace_ttt_fast_weight_fail_on_unsupported)
+    cfg.fast_weight_max_slots = max(0, int(fast_weight_max_slots))
+    cfg.fast_weight_max_bytes = max(0, int(fast_weight_max_bytes))
+    cfg.fast_weight_fail_on_unsupported = bool(fast_weight_fail_on_unsupported)
 
     if not cfg.source_layer_path:
         raise RuntimeError("source_layer_path must be non-empty")
@@ -299,7 +299,7 @@ def set_test_time_lora_enabled(enabled: bool) -> None:
     RUNTIME.test_time_lora_enabled = bool(enabled)
 
 
-def set_inplace_ttt_fast_weight_enabled(
+def set_fast_weight_enabled(
     enabled: bool,
     *,
     layers: Sequence[int] | None = None,
@@ -314,34 +314,34 @@ def set_inplace_ttt_fast_weight_enabled(
 ) -> None:
     normalized_mode = None
     if mode is not None:
-        from tllm.runtime.fast_weight_state import normalize_fast_weight_mode
+        from tllm.runtime.fast_weight.state import normalize_fast_weight_mode
 
         normalized_mode = normalize_fast_weight_mode(mode)
-    RUNTIME.config.inplace_ttt_fast_weight_enabled = bool(enabled)
+    RUNTIME.config.fast_weight_enabled = bool(enabled)
     if not bool(enabled):
-        from tllm.runtime.inplace_ttt_fast_weight_runtime import restore_inplace_ttt_fast_weight_wrappers
+        from tllm.runtime.fast_weight.runtime import restore_fast_weight_wrappers
 
-        restore_inplace_ttt_fast_weight_wrappers(RUNTIME)
-        RUNTIME.inplace_ttt_current_token_batch_meta = None
-        RUNTIME.inplace_ttt_fast_weight_phase = "prefill"
+        restore_fast_weight_wrappers(RUNTIME)
+        RUNTIME.fast_weight_current_token_batch_meta = None
+        RUNTIME.fast_weight_phase = "prefill"
     if layers is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_layers = tuple(int(layer) for layer in layers)
+        RUNTIME.config.fast_weight_layers = tuple(int(layer) for layer in layers)
     if chunk_size is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_chunk_size = max(1, int(chunk_size))
+        RUNTIME.config.fast_weight_chunk_size = max(1, int(chunk_size))
     if learning_rate is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_lr = float(learning_rate)
+        RUNTIME.config.fast_weight_lr = float(learning_rate)
     if normalized_mode is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_mode = normalized_mode
+        RUNTIME.config.fast_weight_mode = normalized_mode
     if decode_update_enabled is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_decode_update_enabled = bool(decode_update_enabled)
+        RUNTIME.config.fast_weight_decode_update_enabled = bool(decode_update_enabled)
     if key_mode is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_key_mode = str(key_mode).strip() or "static"
+        RUNTIME.config.fast_weight_key_mode = str(key_mode).strip() or "static"
     if max_slots is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_max_slots = max(0, int(max_slots))
+        RUNTIME.config.fast_weight_max_slots = max(0, int(max_slots))
     if max_bytes is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_max_bytes = max(0, int(max_bytes))
+        RUNTIME.config.fast_weight_max_bytes = max(0, int(max_bytes))
     if fail_on_unsupported is not None:
-        RUNTIME.config.inplace_ttt_fast_weight_fail_on_unsupported = bool(fail_on_unsupported)
+        RUNTIME.config.fast_weight_fail_on_unsupported = bool(fail_on_unsupported)
 
 
 def synchronize_esamp() -> None:
@@ -447,7 +447,7 @@ __all__ = [
     "runner_uses_compilation_or_cudagraph",
     "set_runtime_consumer",
     "set_esamp_training_enabled",
-    "set_inplace_ttt_fast_weight_enabled",
+    "set_fast_weight_enabled",
     "set_test_time_lora_enabled",
     "synchronize_esamp",
 ]

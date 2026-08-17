@@ -43,17 +43,17 @@ class ResidualRuntimeConfig:
     adaptation_stream_mode: AdaptationStreamMode = "dual"
     adaptation_stream_priority: int = 0
     compact_capture_lane: bool = False
-    inplace_ttt_fast_weight_enabled: bool = False
-    inplace_ttt_fast_weight_layers: tuple[int, ...] = (0,)
-    inplace_ttt_fast_weight_chunk_size: int = 4096
-    inplace_ttt_fast_weight_lr: float = 1e-3
-    inplace_ttt_fast_weight_mode: str = "exact"
-    inplace_ttt_fast_weight_decode_update_enabled: bool = False
-    inplace_ttt_fast_weight_key_mode: str = "static"
-    inplace_ttt_fast_weight_static_request_id: str = "__tllm_inplace_ttt_static__"
-    inplace_ttt_fast_weight_max_slots: int = 64
-    inplace_ttt_fast_weight_max_bytes: int = 0
-    inplace_ttt_fast_weight_fail_on_unsupported: bool = False
+    fast_weight_enabled: bool = False
+    fast_weight_layers: tuple[int, ...] = (0,)
+    fast_weight_chunk_size: int = 4096
+    fast_weight_lr: float = 1e-3
+    fast_weight_mode: str = "exact"
+    fast_weight_decode_update_enabled: bool = False
+    fast_weight_key_mode: str = "static"
+    fast_weight_static_request_id: str = "__tllm_fast_weight_static__"
+    fast_weight_max_slots: int = 64
+    fast_weight_max_bytes: int = 0
+    fast_weight_fail_on_unsupported: bool = False
 
 
 @dataclass
@@ -100,13 +100,13 @@ class ResidualRuntimeState:
     execution_plan: object = None  # tllm.producers.registry.ExecutionPlan once compiled
     test_time_lora_enabled: bool = False
     test_time_lora_service: object | None = None
-    inplace_ttt_fast_weight_state: object | None = None
-    inplace_ttt_fast_weight_handles: dict[str, object] = field(default_factory=dict)
-    inplace_ttt_fast_weight_hook_spec: tuple[object, ...] | None = None
-    inplace_ttt_fast_weight_phase: str = "prefill"
-    inplace_ttt_current_token_batch_meta: object | None = None
-    inplace_ttt_fast_weight_installed_count: int = 0
-    inplace_ttt_fast_weight_skipped_count: int = 0
+    fast_weight_state: object | None = None
+    fast_weight_handles: dict[str, object] = field(default_factory=dict)
+    fast_weight_hook_spec: tuple[object, ...] | None = None
+    fast_weight_phase: str = "prefill"
+    fast_weight_current_token_batch_meta: object | None = None
+    fast_weight_installed_count: int = 0
+    fast_weight_skipped_count: int = 0
 
     def reset_step(self) -> None:
         self.decode_count = 0
@@ -119,7 +119,7 @@ class ResidualRuntimeState:
         self.decode_sample_idx_tensor = None
         self.decode_compact_count = 0
         self.decode_compact_row_ids = ()
-        self.inplace_ttt_current_token_batch_meta = None
+        self.fast_weight_current_token_batch_meta = None
         self.decode_post_logits_launched_step_id = -1
         self.sampler_precompute.reset_step()
 

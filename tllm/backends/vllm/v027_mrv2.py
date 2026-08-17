@@ -27,7 +27,7 @@ from tllm.backends.protocol import (
 )
 from tllm.backends.vllm import sampler_mrv2 as _sampler_mrv2
 from tllm.runtime import active_targets
-from tllm.runtime import inplace_ttt_fast_weight_runtime as _inplace_ttt_fast_weight
+from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime import vllm_test_time_lora as _test_time_lora
 from tllm.runtime.step_session import (
     StepSession,
@@ -186,7 +186,7 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
         out = orig(runner, *args, **kwargs)
         if _test_time_lora_enabled(runtime):
             _test_time_lora.maybe_bind_test_time_lora_service(runtime=runtime, runner=runner)
-        _inplace_ttt_fast_weight.maybe_install_inplace_ttt_fast_weight_wrappers(runtime=runtime, runner=runner)
+        _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
         _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
         return out
     _common_hooks.dispatch_runtime_event(
@@ -200,7 +200,7 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
     out = orig(runner, *args, **kwargs)
     _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
     _test_time_lora.maybe_bind_test_time_lora_service(runtime=runtime, runner=runner)
-    _inplace_ttt_fast_weight.maybe_install_inplace_ttt_fast_weight_wrappers(runtime=runtime, runner=runner)
+    _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
     _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,

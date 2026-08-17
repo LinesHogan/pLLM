@@ -215,7 +215,7 @@ class InPlaceTTTOfficialParityUnitTest(unittest.TestCase):
         learning_rate: float,
         use_effective_conv: bool,
     ):
-        from tllm.runtime.fast_weight_state import run_down_proj_fast_weight_step
+        from tllm.runtime.fast_weight.state import run_down_proj_fast_weight_step
 
         return run_down_proj_fast_weight_step(
             hidden=toy.activated(x),
@@ -271,7 +271,7 @@ class InPlaceTTTOfficialParityUnitTest(unittest.TestCase):
         return ref_step
 
     def test_no_projection_without_effective_conv_matches_upstream_shape(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         toy = _UpstreamShapedToyMLP(use_ttt_proj=False)
         state = FastWeightState()
@@ -308,7 +308,7 @@ class InPlaceTTTOfficialParityUnitTest(unittest.TestCase):
         )
 
     def test_official_random_projection_and_zero_conv_matches_no_weight_change(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         toy = _UpstreamShapedToyMLP(use_ttt_proj=True, zero_ttt_conv=True)
         state = FastWeightState()
@@ -347,7 +347,7 @@ class InPlaceTTTOfficialParityUnitTest(unittest.TestCase):
         self.assertTrue(torch.allclose(ref_step.state.past_w, toy.down_proj.weight, atol=1e-12, rtol=1e-12))
 
     def test_nonzero_conv_ablation_matches_upstream_projection_update(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         toy = _UpstreamShapedToyMLP(use_ttt_proj=True, zero_ttt_conv=False)
         state = FastWeightState()
@@ -386,7 +386,7 @@ class InPlaceTTTOfficialParityUnitTest(unittest.TestCase):
         self.assertFalse(torch.allclose(ref_step.state.past_w, toy.down_proj.weight, atol=1e-12, rtol=1e-12))
 
     def test_below_chunk_rows_only_update_tail_cache(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         toy = _UpstreamShapedToyMLP(use_ttt_proj=False)
         state = FastWeightState()
@@ -411,7 +411,7 @@ class InPlaceTTTOfficialParityUnitTest(unittest.TestCase):
         self.assertEqual(int(state.read(key).past_h.shape[0]), 3)
 
     def test_tail_plus_next_rows_form_chunk_and_leave_new_tail(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         toy = _UpstreamShapedToyMLP(use_ttt_proj=False)
         state = FastWeightState()

@@ -28,7 +28,7 @@ from tllm.backends.protocol import (
 )
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
 from tllm.runtime import active_targets
-from tllm.runtime import inplace_ttt_fast_weight_runtime as _inplace_ttt_fast_weight
+from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime import vllm_test_time_lora as _test_time_lora
 from tllm.runtime.step_session import (
     StepSession,
@@ -187,7 +187,7 @@ def _wrapped_prepare_inputs(
             out=out,
             num_scheduled_tokens=num_scheduled_tokens,
         )
-        _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_metadata_from_runner(
+        _fast_weight.update_fast_weight_metadata_from_runner(
             runtime,
             runner,
             num_scheduled_tokens_np=view.num_scheduled_tokens_np,
@@ -218,7 +218,7 @@ def _wrapped_prepare_inputs(
         num_scheduled_tokens=num_scheduled_tokens,
     )
     _hooks.prepare_decode_localization(core=core, runner=runner, out=out, prepare_inputs_view=view)
-    _inplace_ttt_fast_weight.update_inplace_ttt_fast_weight_metadata_from_runner(
+    _fast_weight.update_fast_weight_metadata_from_runner(
         runtime,
         runner,
         num_scheduled_tokens_np=view.num_scheduled_tokens_np,

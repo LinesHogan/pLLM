@@ -53,7 +53,7 @@ class _FakeBiasedQwenLikeMLP(_FakeQwenLikeMLP):
 
 class FastWeightStateUnitTest(unittest.TestCase):
     def test_fast_weight_memory_estimates_match_documented_formulas(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             estimate_exact_fast_weight_bytes,
             estimate_low_rank_fast_weight_bytes,
         )
@@ -82,7 +82,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         )
 
     def test_exact_mode_keeps_past_weight_state_contract(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         state = FastWeightState(mode="exact")
         key = FastWeightKey(request_id="req-a", sample_idx=2, layer=3)
@@ -94,13 +94,13 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertEqual(state.slot_count, 1)
 
     def test_low_rank_state_mode_fails_fast_until_semantics_are_defined(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightState
 
         with self.assertRaisesRegex(NotImplementedError, "low_rank"):
             FastWeightState(mode="low_rank")
 
     def test_fast_weight_key_rejects_implicit_identity_coercion(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey
+        from tllm.runtime.fast_weight.state import FastWeightKey
 
         with self.assertRaisesRegex(TypeError, "request_id must be str"):
             FastWeightKey(request_id=1, sample_idx=0, layer=0)  # type: ignore[arg-type]
@@ -110,7 +110,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
             FastWeightKey(request_id="req-a", sample_idx=0, layer=0, target_module="")
 
     def test_fast_weight_state_stores_tail_and_weight_clone_safely(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         state = FastWeightState()
         key = FastWeightKey(request_id="req-a", sample_idx=2, layer=3)
@@ -130,7 +130,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertTrue(torch.equal(slot.past_w, torch.tensor([[0.1, 0.2], [0.3, 0.4]])))
 
     def test_fast_weight_state_rejects_shape_mismatch(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         state = FastWeightState()
         key = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
@@ -145,7 +145,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
             state.write(key=key, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=torch.zeros(2))
 
     def test_fast_weight_state_enforces_slot_and_byte_limits(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState
 
         state = FastWeightState(max_slots=1)
         key_a = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
@@ -160,7 +160,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
             state.write(key=key_b, past_h=torch.zeros(1, 2), past_t=torch.zeros(1, 2), past_w=torch.zeros(2, 2))
 
     def test_apply_down_proj_fast_weight_uses_effective_past_weight(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState, apply_down_proj_fast_weight
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState, apply_down_proj_fast_weight
 
         state = FastWeightState()
         key = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
@@ -174,7 +174,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertTrue(torch.equal(projected, torch.tensor([[3.0, 1.5]])))
 
     def test_apply_down_proj_without_slot_uses_base_weight(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState, apply_down_proj_fast_weight
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState, apply_down_proj_fast_weight
 
         projected = apply_down_proj_fast_weight(
             hidden=torch.tensor([[2.0, 3.0]]),
@@ -186,7 +186,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertTrue(torch.equal(projected, torch.tensor([[2.0, 3.0]])))
 
     def test_down_proj_overlay_wrapper_changes_output_and_restores_forward(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_down_proj_fast_weight_overlay,
@@ -220,7 +220,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertTrue(torch.equal(restored, torch.tensor([[2.0, 3.0]])))
 
     def test_down_proj_overlay_rejects_shape_mismatch(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_down_proj_fast_weight_overlay,
@@ -247,7 +247,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         handle.restore()
 
     def test_mlp_wrapper_caches_prefill_tail_without_update(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_mlp_fast_weight_wrapper,
@@ -279,7 +279,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         handle.restore()
 
     def test_mlp_wrapper_updates_when_cached_tail_reaches_full_chunk(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_mlp_fast_weight_wrapper,
@@ -314,7 +314,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         handle.restore()
 
     def test_fast_weight_step_uses_upstream_output_before_update_with_projection(self) -> None:
-        from tllm.runtime.fast_weight_state import FastWeightKey, FastWeightState, run_down_proj_fast_weight_step
+        from tllm.runtime.fast_weight.state import FastWeightKey, FastWeightState, run_down_proj_fast_weight_step
 
         state = FastWeightState()
         key = FastWeightKey(request_id="req-a", sample_idx=0, layer=0)
@@ -341,7 +341,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         self.assertEqual(result.update_count, 1)
 
     def test_mlp_wrapper_groups_flattened_rows_by_explicit_per_row_keys(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_mlp_fast_weight_wrapper,
@@ -382,7 +382,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         handle.restore()
 
     def test_mlp_wrapper_decode_default_applies_without_training_or_tail_cache(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_mlp_fast_weight_wrapper,
@@ -421,7 +421,7 @@ class FastWeightStateUnitTest(unittest.TestCase):
         handle.restore()
 
     def test_mlp_wrapper_rejects_biased_down_proj_in_limited_scope(self) -> None:
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_mlp_fast_weight_wrapper,
@@ -447,7 +447,7 @@ class InPlaceTTTCachedModelSmokeTest(unittest.TestCase):
         from vllm import LLM, SamplingParams
 
         from tllm.runtime import residual_runtime
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_down_proj_fast_weight_overlay,
@@ -505,7 +505,7 @@ class InPlaceTTTCachedModelSmokeTest(unittest.TestCase):
         from vllm import LLM
 
         from tllm.runtime import residual_runtime
-        from tllm.runtime.fast_weight_state import (
+        from tllm.runtime.fast_weight.state import (
             FastWeightKey,
             FastWeightState,
             install_mlp_fast_weight_wrapper,

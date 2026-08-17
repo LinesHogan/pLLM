@@ -20,7 +20,7 @@ FastWeightMode = str
 def normalize_fast_weight_mode(mode: object) -> FastWeightMode:
     normalized = _require_str(mode, field_name="mode")
     if normalized not in {"exact", "low_rank"}:
-        raise ValueError("inplace_ttt_fast_weight_mode must be one of: exact, low_rank")
+        raise ValueError("fast_weight_mode must be one of: exact, low_rank")
     return normalized
 
 
