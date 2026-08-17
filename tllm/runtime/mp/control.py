@@ -22,6 +22,21 @@ class ControlPlane:
     def __init__(self, llm: Any) -> None:
         self._llm = llm
 
+    @staticmethod
+    def try_bind(llm: Any) -> "ControlPlane | None":
+        """Bind when the LLM exposes a collective_rpc-capable engine core.
+
+        Test doubles and non-vLLM runners may lack one; callers then fall
+        back to process-local behavior (mp=0 semantics).
+        """
+        try:
+            core_client = llm.llm_engine.engine_core
+            if not callable(core_client.collective_rpc):
+                return None
+        except AttributeError:
+            return None
+        return ControlPlane(llm)
+
     def call(self, method: str, *args: Any, timeout: float | None = None) -> list[Any]:
         try:
             core_client = self._llm.llm_engine.engine_core

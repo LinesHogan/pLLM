@@ -29,6 +29,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", choices=["mrv1", "mrv2"], required=True)
     parser.add_argument("--mp", choices=["0", "1"], default="1")
+    parser.add_argument(
+        "--mapped",
+        action="store_true",
+        help="route generate through run_generate_with_request_mapping and assert the reqid mapping reaches the EngineCore child (A3 gate)",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=16)
     args = parser.parse_args()
 
@@ -88,23 +93,33 @@ def main() -> int:
     try:
         from vllm import SamplingParams
 
-        outputs = llm.generate(
-            ["Give me a short introduction to large language models."] * 4,
-            SamplingParams(temperature=0.0, max_tokens=int(args.max_new_tokens)),
-        )
+        prompts = ["Give me a short introduction to large language models."] * 4
+        sampling = SamplingParams(temperature=0.0, max_tokens=int(args.max_new_tokens))
+        if args.mapped:
+            from tllm.runtime.vllm_patch.capture_runner import run_generate_with_request_mapping
+
+            outputs = run_generate_with_request_mapping(
+                runtime=core.RUNTIME, llm=llm, prompts=prompts, params=sampling
+            )
+        else:
+            outputs = llm.generate(prompts, sampling)
         tokens = [len(o.outputs[0].token_ids) for o in outputs]
 
         from tllm.runtime.mp.control import ControlPlane
 
         ping_replies = ControlPlane(llm).ping(timeout=60.0)
         worker_pids = [int(reply["pid"]) for reply in ping_replies]
-        print(f"tllm_ping worker pids: {worker_pids} (parent={parent_pid})")
+        mapping_sizes = [int(reply["mapping_size"]) for reply in ping_replies]
+        print(f"tllm_ping worker pids: {worker_pids} (parent={parent_pid}) mapping_sizes={mapping_sizes}")
         if args.mp == "1":
             if not worker_pids or any(pid == parent_pid for pid in worker_pids):
                 print("FAIL: tllm_ping did not reach a non-parent worker process")
                 return 1
         elif any(pid != parent_pid for pid in worker_pids):
             print("FAIL: tllm_ping reached an unexpected process under mp=0")
+            return 1
+        if args.mapped and any(size != len(prompts) for size in mapping_sizes):
+            print(f"FAIL: mapped generate did not install {len(prompts)} reqid mappings in the worker(s)")
             return 1
     finally:
         shutdown_llm_instance(llm, cooldown_s=1.0)

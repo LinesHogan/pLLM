@@ -50,6 +50,7 @@ class TllmWorkerExtension:
             "pid": os.getpid(),
             "patch_installed": bool(core._PATCH_INSTALLED),
             "consumer": None if core.RUNTIME.consumer is None else str(core.RUNTIME.consumer.consumer_id),
+            "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
         }
 
     def tllm_push_request_mapping(self, mappings: list[list[Any]]) -> int:
