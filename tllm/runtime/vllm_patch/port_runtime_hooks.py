@@ -196,6 +196,12 @@ def store_decode_localization(
         )
 
     if row_idx.numel() == 0:
+        # The taps gather the FULL decode_row_idx buffer every step (static
+        # shapes for CUDA graphs), so the buffer must never hold indices that
+        # are out of bounds for the current step's token tensor: zero it.
+        with torch.no_grad():
+            decode_row_idx.zero_()
+            decode_valid_mask.zero_()
         core.RUNTIME.decode_count = 0
         core.RUNTIME.decode_prompt_idxs = []
         core.RUNTIME.decode_sample_idxs = []
@@ -219,8 +225,14 @@ def store_decode_localization(
     needs_device_metadata = _needs_device_decode_metadata(core.RUNTIME)
     with torch.no_grad():
         decode_row_idx[:k].copy_(row_idx)
+        if k < int(decode_row_idx.numel()):
+            # Stale tail entries from steps with more rows would be out of
+            # bounds for this step's token tensor in the full-buffer gather.
+            decode_row_idx[k:].zero_()
         if needs_device_metadata:
             decode_valid_mask[:k].fill_(1.0)
+            if k < int(decode_valid_mask.shape[0]):
+                decode_valid_mask[k:].zero_()
             decode_prompt_idx_buf[:k].copy_(torch.as_tensor(prompt_idxs, device=decode_row_idx.device, dtype=torch.long))
             decode_sample_idx_buf[:k].copy_(torch.as_tensor(sample_idxs, device=decode_row_idx.device, dtype=torch.long))
 
@@ -264,6 +276,16 @@ def store_decode_localization(
 
 
 def _clear_decode_localization(core: DecodeHookCoreLike) -> None:
+    # Taps gather the full decode_row_idx buffer even on steps with no decode
+    # rows (static shapes); stale indices from earlier steps can exceed the
+    # current token count, so clear the scratch buffers too.
+    decode_row_idx = core.RUNTIME.decode_row_idx
+    decode_valid_mask = core.RUNTIME.decode_valid_mask
+    with torch.no_grad():
+        if isinstance(decode_row_idx, torch.Tensor):
+            decode_row_idx.zero_()
+        if isinstance(decode_valid_mask, torch.Tensor):
+            decode_valid_mask.zero_()
     core.RUNTIME.decode_count = 0
     core.RUNTIME.decode_prompt_idxs = []
     core.RUNTIME.decode_sample_idxs = []
@@ -650,14 +672,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
             capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )
     else:
-        core.RUNTIME.decode_count = 0
-        core.RUNTIME.decode_prompt_idxs = []
-        core.RUNTIME.decode_sample_idxs = []
-        core.RUNTIME.decode_request_ids = []
-        core.RUNTIME.decode_prompt_idx_tensor = None
-        core.RUNTIME.decode_sample_idx_tensor = None
-        core.RUNTIME.decode_compact_count = 0
-        core.RUNTIME.decode_compact_row_ids = ()
+        _clear_decode_localization(core)
         core.RUNTIME.fast_weight_phase = "prefill"
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
     return out
