@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """In-Place TTT consumer package."""
 
-from tllm.consumers.inplace_ttt.consumer import (
-    InPlaceTTTConsumer,
-    InPlaceTTTConsumerConfig,
+from tllm.consumers.inplace_ttt.config import InPlaceTTTConsumerConfig
+from tllm.consumers.inplace_ttt.consumer import InPlaceTTTConsumer
+from tllm.consumers.inplace_ttt.engine import (
     InPlaceTTTEngine,
     InPlaceTTTExactToyState,
     InPlaceTTTExactToyStep,
