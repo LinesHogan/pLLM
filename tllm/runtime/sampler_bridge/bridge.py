@@ -284,7 +284,19 @@ def sample_with_optional_modifier(
             greedy_mask = None
             greedy_rows = affected_rows.new_empty((0,), dtype=torch.long)
 
-        if state.backend == "pre_filter_dense" and int(affected_rows.numel()) == rows:
+        from tllm import core as _core
+
+        plan = _core.plan_sampler_step(
+            state.backend,
+            temperature_mode,
+            rows,
+            int(affected_rows.numel()),
+            int(greedy_rows.numel()),
+            greedy_sampled is not None,
+            _ENABLE_EXACT_CANDIDATE_SAMPLING,
+        )
+
+        if plan.path in ("full_dense_greedy", "full_dense_random"):
             with _maybe_record_function("distiller.sample_with_optional_modifier.full_dense"):
                 modified = _build_dense_modified_logits(
                     logits=logits,
@@ -292,17 +304,17 @@ def sample_with_optional_modifier(
                     affected_rows=affected_rows,
                     in_place=True,
                 )
-                if temperature_mode == "all_greedy" or greedy_rows.numel() == rows:
+                if plan.path == "full_dense_greedy":
                     return modified.argmax(dim=-1).to(dtype=torch.long)
-                if temperature_mode == "all_random" or greedy_rows.numel() == 0:
-                    return _sample_full_vanilla(
-                        sampler=sampler,
-                        logits=modified,
-                        sampling_metadata=sampling_metadata,
-                    )
-        if state.backend in {"post_filter_exact", "post_filter_dense_cache"} and int(affected_rows.numel()) == rows:
+                return _sample_full_vanilla(
+                    sampler=sampler,
+                    logits=modified,
+                    sampling_metadata=sampling_metadata,
+                )
+
+        if plan.path in ("full_exact_greedy", "full_exact_random"):
             with _maybe_record_function("distiller.sample_with_optional_modifier.full_exact"):
-                if temperature_mode == "all_greedy" or greedy_rows.numel() == rows:
+                if plan.path == "full_exact_greedy":
                     return _sample_rows_exact_via_sampler(
                         sampler=sampler,
                         logits=logits,
@@ -312,86 +324,65 @@ def sample_with_optional_modifier(
                         greedy=True,
                         all_rows=True,
                     )
-                if temperature_mode == "all_random" or greedy_rows.numel() == 0:
-                    if _ENABLE_EXACT_CANDIDATE_SAMPLING:
-                        candidate_sampled = _sample_rows_exact_candidates(
-                            logits=logits,
-                            sampling_metadata=sampling_metadata,
-                            state=state,
-                            row_ids=affected_rows,
-                            all_rows=True,
-                        )
-                        if candidate_sampled is not None:
-                            return candidate_sampled
-                    return _sample_rows_exact_via_sampler(
-                        sampler=sampler,
+                if plan.use_candidate_kernel:
+                    candidate_sampled = _sample_rows_exact_candidates(
                         logits=logits,
                         sampling_metadata=sampling_metadata,
                         state=state,
                         row_ids=affected_rows,
-                        greedy=False,
                         all_rows=True,
                     )
+                    if candidate_sampled is not None:
+                        return candidate_sampled
+                return _sample_rows_exact_via_sampler(
+                    sampler=sampler,
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                    state=state,
+                    row_ids=affected_rows,
+                    greedy=False,
+                    all_rows=True,
+                )
 
-        if temperature_mode == "all_greedy":
-            if greedy_sampled is not None:
+        # Partitioned path. The Rust core owns the branch decision; row
+        # values stay on-device (mask/nonzero partitioning is executor work).
+        if plan.dense_inplace_applied:
+            # LEGACY quirk (pinned by the oracle): mixed mode after the
+            # full-row dense branch already modified logits in place.
+            _build_dense_modified_logits(
+                logits=logits,
+                state=state,
+                affected_rows=affected_rows,
+                in_place=True,
+            )
+
+        def _sample_affected(row_ids: torch.Tensor, *, greedy: bool) -> torch.Tensor:
+            if state.backend == "pre_filter_dense":
+                return _sample_rows_dense(
+                    sampler=sampler,
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                    state=state,
+                    row_ids=row_ids,
+                    greedy=greedy,
+                )
+            return _sample_rows_exact_via_sampler(
+                sampler=sampler,
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+                state=state,
+                row_ids=row_ids,
+                greedy=greedy,
+                all_rows=False,
+            )
+
+        if plan.base != "empty":
+            # all_greedy partitioned: only the affected (greedy) rows resample.
+            if plan.base == "greedy_sampled":
                 final = greedy_sampled.to(device=logits.device, dtype=torch.long).clone()
             else:
                 final = logits.argmax(dim=-1).to(dtype=torch.long)
-            if state.backend == "pre_filter_dense":
-                final[affected_rows] = _sample_rows_dense(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=affected_rows,
-                    greedy=True,
-                )
-            else:
-                final[affected_rows] = _sample_rows_exact_via_sampler(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=affected_rows,
-                    greedy=True,
-                    all_rows=False,
-                )
-            return final
-
-        if temperature_mode == "all_random":
-            final = torch.empty((rows,), device=logits.device, dtype=torch.long)
-            if int(affected_rows.numel()) < rows:
-                affected_mask = torch.zeros((rows,), device=logits.device, dtype=torch.bool)
-                affected_mask[affected_rows] = True
-                all_rows = torch.arange(rows, device=logits.device, dtype=torch.long)
-                unaffected_random_rows = all_rows[~affected_mask]
-                if unaffected_random_rows.numel() > 0:
-                    final[unaffected_random_rows] = _sample_rows_vanilla(
-                        sampler=sampler,
-                        logits=logits,
-                        sampling_metadata=sampling_metadata,
-                        row_ids=unaffected_random_rows,
-                    )
-            if state.backend == "pre_filter_dense":
-                final[affected_rows] = _sample_rows_dense(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=affected_rows,
-                    greedy=False,
-                )
-            else:
-                final[affected_rows] = _sample_rows_exact_via_sampler(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=affected_rows,
-                    greedy=False,
-                    all_rows=False,
-                )
+            final[affected_rows] = _sample_affected(affected_rows, greedy=True)
             return final
 
         final = torch.empty((rows,), device=logits.device, dtype=torch.long)
@@ -412,26 +403,7 @@ def sample_with_optional_modifier(
             affected_greedy = affected_mask & greedy_mask
             affected_greedy_rows = affected_greedy.nonzero(as_tuple=False).view(-1)
         if affected_greedy_rows.numel() > 0:
-            row_ids = affected_greedy_rows
-            if state.backend == "pre_filter_dense":
-                final[row_ids] = _sample_rows_dense(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=row_ids,
-                    greedy=True,
-                )
-            else:
-                final[row_ids] = _sample_rows_exact_via_sampler(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=row_ids,
-                    greedy=True,
-                    all_rows=False,
-                )
+            final[affected_greedy_rows] = _sample_affected(affected_greedy_rows, greedy=True)
 
         if greedy_mask is None:
             unaffected_random_rows = (~affected_mask).nonzero(as_tuple=False).view(-1)
@@ -439,12 +411,11 @@ def sample_with_optional_modifier(
             unaffected_random = (~affected_mask) & (~greedy_mask)
             unaffected_random_rows = unaffected_random.nonzero(as_tuple=False).view(-1)
         if unaffected_random_rows.numel() > 0:
-            row_ids = unaffected_random_rows
-            final[row_ids] = _sample_rows_vanilla(
+            final[unaffected_random_rows] = _sample_rows_vanilla(
                 sampler=sampler,
                 logits=logits,
                 sampling_metadata=sampling_metadata,
-                row_ids=row_ids,
+                row_ids=unaffected_random_rows,
             )
 
         if greedy_mask is None:
@@ -453,25 +424,6 @@ def sample_with_optional_modifier(
             affected_random = affected_mask & (~greedy_mask)
             affected_random_rows = affected_random.nonzero(as_tuple=False).view(-1)
         if affected_random_rows.numel() > 0:
-            row_ids = affected_random_rows
-            if state.backend == "pre_filter_dense":
-                final[row_ids] = _sample_rows_dense(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=row_ids,
-                    greedy=False,
-                )
-            else:
-                final[row_ids] = _sample_rows_exact_via_sampler(
-                    sampler=sampler,
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                    state=state,
-                    row_ids=row_ids,
-                    greedy=False,
-                    all_rows=False,
-                )
+            final[affected_random_rows] = _sample_affected(affected_random_rows, greedy=False)
 
         return final
