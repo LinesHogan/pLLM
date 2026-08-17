@@ -223,3 +223,7 @@ outputs
 .codex/
 AGENTS.md
 docs
+
+# accidental npm artifacts
+package.json
+package-lock.json
