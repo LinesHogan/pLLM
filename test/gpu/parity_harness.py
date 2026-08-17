@@ -43,6 +43,9 @@ def _runner_env(runner: str) -> None:
 
 def run(args: argparse.Namespace) -> None:
     _runner_env(args.runner)
+    # Pin the multiprocess mode BEFORE any tllm/vllm import so both modes of
+    # a compared pair run the same process topology.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = args.mp
     if args.flashinfer == "0":
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
 
@@ -99,15 +102,23 @@ def run(args: argparse.Namespace) -> None:
         logprobs.append(row)
 
     # Report which runner class actually served the engine (lives in the
-    # EngineCore subprocess, so query it via collective_rpc).
-    def _runner_name(worker: object) -> str:
-        runner = worker.model_runner
-        return f"{type(runner).__module__}.{type(runner).__name__}"
-
-    try:
-        runner_name = llm.llm_engine.collective_rpc(_runner_name)[0]
-    except Exception as exc:  # pragma: no cover - diagnostic only
-        runner_name = f"unknown ({exc})"
+    # EngineCore subprocess under mp=1, so query it via collective_rpc with a
+    # STRING method name — closures need VLLM_ALLOW_INSECURE_SERIALIZATION and
+    # cannot cross the process boundary. The tllm worker extension provides
+    # tllm_runner_name; raw-mode engines lack it and keep the local probe.
+    runner_name = "unknown"
+    if args.mode == "tllm":
+        try:
+            runner_name = llm.llm_engine.engine_core.collective_rpc("tllm_runner_name")[0]
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            runner_name = f"unknown ({exc})"
+    else:
+        try:
+            runner_name = llm.llm_engine.collective_rpc(
+                lambda worker: f"{type(worker.model_runner).__module__}.{type(worker.model_runner).__name__}"
+            )[0]
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            runner_name = f"unknown ({exc})"
 
     drivers: list[str] = []
     if args.mode == "tllm":
@@ -121,6 +132,7 @@ def run(args: argparse.Namespace) -> None:
         "sampling": args.sampling,
         "eager": args.eager,
         "flashinfer": args.flashinfer,
+        "mp": args.mp,
         "runner_name": runner_name,
         "drivers": drivers,
         "tokens": tokens,
@@ -136,8 +148,8 @@ def compare(args: argparse.Namespace) -> None:
         a = json.load(fh)
     with open(args.b, encoding="utf-8") as fh:
         b = json.load(fh)
-    print(f"A: {a['mode']}/{a['runner']} -> {a['runner_name']} drivers={a.get('drivers')}")
-    print(f"B: {b['mode']}/{b['runner']} -> {b['runner_name']} drivers={b.get('drivers')}")
+    print(f"A: {a['mode']}/{a['runner']} mp={a.get('mp', '?')} -> {a['runner_name']} drivers={a.get('drivers')}")
+    print(f"B: {b['mode']}/{b['runner']} mp={b.get('mp', '?')} -> {b['runner_name']} drivers={b.get('drivers')}")
     if a["tokens"] == b["tokens"]:
         print("PARITY OK: token ids bit-exact across", len(a["tokens"]), "prompts")
         return
@@ -167,6 +179,7 @@ def main() -> None:
     p_run.add_argument("--sampling", choices=["greedy", "random"], default="greedy")
     p_run.add_argument("--eager", choices=["0", "1"], default="1")
     p_run.add_argument("--flashinfer", choices=["0", "1"], default="1")
+    p_run.add_argument("--mp", choices=["0", "1"], default="0", help="VLLM_ENABLE_V1_MULTIPROCESSING")
     p_run.add_argument("--gpu-mem", default="0.4")
     p_run.set_defaults(func=run)
 

@@ -115,21 +115,23 @@ class TllmRuntime:
 
     def _bind_engine_runners(self, llm: Any) -> None:
         """Record runner -> runtime routing for every live worker runner."""
+        from tllm.runtime.mp.control import ControlPlane
 
+        plane = ControlPlane.try_bind(llm)
+        if plane is not None:
+            try:
+                plane.call("tllm_bind_runner_runtime")
+                return
+            except Exception:
+                pass
+        # Fallback for engines without a collective_rpc path (test doubles):
+        # walk the in-process executor directly.
         def _bind(worker: Any) -> None:
             runner = getattr(worker, "model_runner", None)
             if runner is not None:
                 bind_runner_runtime(runner, self)
 
         engine = getattr(llm, "llm_engine", None)
-        collective_rpc = getattr(engine, "collective_rpc", None)
-        if callable(collective_rpc):
-            try:
-                collective_rpc(_bind)
-                return
-            except Exception:
-                pass
-        # In-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0): walk directly.
         core = getattr(engine, "engine_core", None)
         executor = getattr(core, "model_executor", None)
         driver = getattr(executor, "driver_worker", None)

@@ -36,7 +36,9 @@ MAX_NEW_TOKENS = 128
 
 def run(args: argparse.Namespace) -> None:
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.runner == "mrv2" else "0"
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # Pin the process topology BEFORE any tllm/vllm import so compared pairs
+    # differ only in the tllm consumer, not in mp mode.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = args.mp
 
     from vllm import SamplingParams
 
@@ -79,7 +81,6 @@ def run(args: argparse.Namespace) -> None:
             seed=1234,
         )
     else:
-        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         from vllm import LLM
 
         llm = LLM(
@@ -117,6 +118,7 @@ def run(args: argparse.Namespace) -> None:
     payload = {
         "mode": args.mode,
         "runner": args.runner,
+        "mp": args.mp,
         "model": args.model,
         "elapsed_s": elapsed,
         "output_tokens": out_tokens,
@@ -156,8 +158,8 @@ def ratio(args: argparse.Namespace) -> None:
     with open(args.b, encoding="utf-8") as fh:
         b = json.load(fh)
     r = b["out_tok_per_s"] / a["out_tok_per_s"]
-    print(f"baseline({a['mode']}/{a['runner']}): {a['out_tok_per_s']:.3f} tok/s")
-    print(f"esamp   ({b['mode']}/{b['runner']}): {b['out_tok_per_s']:.3f} tok/s")
+    print(f"baseline({a['mode']}/{a['runner']}/mp{a.get('mp', '?')}): {a['out_tok_per_s']:.3f} tok/s")
+    print(f"esamp   ({b['mode']}/{b['runner']}/mp{b.get('mp', '?')}): {b['out_tok_per_s']:.3f} tok/s")
     print(f"ratio: {r:.4f}  (README old-version reference: 0.9878)")
     if r < 0.9878:
         print("REGRESSED below README ratio")
@@ -174,6 +176,7 @@ def main() -> None:
     p_run.add_argument("--gpu-mem", default="0.4")
     p_run.add_argument("--no-intervention", action="store_true")
     p_run.add_argument("--rounds", type=int, default=3)
+    p_run.add_argument("--mp", choices=["0", "1"], default="0", help="VLLM_ENABLE_V1_MULTIPROCESSING")
     p_run.add_argument("--out", required=True)
     p_run.set_defaults(func=run)
     p_ratio = sub.add_parser("ratio")

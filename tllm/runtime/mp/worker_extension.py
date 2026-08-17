@@ -18,7 +18,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, is_dataclass
-from typing import Any
+from typing import Any, Protocol, cast
+
+
+class _WorkerView(Protocol):
+    """The one vLLM Worker attribute this extension touches."""
+
+    model_runner: Any  # set in v1 Worker.__init__; None only mid-construction
+
+
+def _runner_of(worker: object) -> Any:
+    return cast(_WorkerView, worker).model_runner
 
 
 def _to_plain(value: Any, *, _depth: int = 0) -> Any:
@@ -107,3 +117,20 @@ class TllmWorkerExtension:
 
         consumer = consumer_registry.build_consumer_from_spec(ConsumerSpec(name=str(name), config=dict(config)))
         consumer_registry.activate_consumer(consumer, primary=bool(primary))
+
+    def tllm_bind_runner_runtime(self) -> None:
+        """Record this worker's runner in the runner->runtime routing table.
+
+        String-method replacement for the old closure RPC (closures need
+        VLLM_ALLOW_INSECURE_SERIALIZATION and cannot cross to the child).
+        """
+        from tllm.runtime.runtime import active_runtime, bind_runner_runtime
+
+        runner = _runner_of(self)
+        if runner is not None:
+            bind_runner_runtime(runner, active_runtime())
+
+    def tllm_runner_name(self) -> str:
+        """Report the model runner class actually serving this worker."""
+        runner = _runner_of(self)
+        return "unknown" if runner is None else f"{type(runner).__module__}.{type(runner).__name__}"
