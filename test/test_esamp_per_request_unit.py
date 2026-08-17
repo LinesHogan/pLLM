@@ -503,12 +503,32 @@ class ESampPerRequestUnitTest(unittest.TestCase):
             esamp_runtime.RUNTIME.consumer = old_consumer
             esamp_runtime.RUNTIME.dispatch_plan = old_plan
 
-    def test_configure_runtime_accepts_optional_model_bank_initializer(self) -> None:
+    def test_configure_runtime_keeps_only_runtime_owned_fields(self) -> None:
         esamp_runtime.configure_runtime(
             graph_scratch_rows=64,
             tap_layer_paths=["model.model.layers[0]", "model.model.layers[-1]"],
             source_layer_path="model.model.layers[0]",
             target_layer_path="model.model.layers[-1]",
+            adaptation_pipeline_slots=8,
+            adaptation_stream_mode="single",
+            adaptation_stream_priority=-1,
+        )
+        cfg = esamp_runtime.RUNTIME.config
+        self.assertEqual(cfg.adaptation_pipeline_slots, 8)
+        self.assertEqual(cfg.adaptation_stream_mode, "single")
+        self.assertEqual(cfg.adaptation_stream_priority, -1)
+        # Consumer-algorithm fields no longer live on the runtime config.
+        for removed in (
+            "enable_esamp_training",
+            "per_request_models",
+            "per_request_model_bank",
+            "model_bank_slots",
+            "distiller_beta",
+        ):
+            self.assertFalse(hasattr(cfg, removed), removed)
+
+    def test_consumer_config_accepts_optional_model_bank_initializer(self) -> None:
+        cfg = ESampConsumerConfig(
             enable_esamp_training=True,
             distiller_hidden_dim=256,
             distiller_lr=1e-3,
@@ -516,9 +536,6 @@ class ESampPerRequestUnitTest(unittest.TestCase):
             per_request_model_bank=True,
             model_bank_slots=16,
             model_bank_flush_interval=4,
-            adaptation_pipeline_slots=8,
-            adaptation_stream_mode="single",
-            adaptation_stream_priority=-1,
             model_bank_rank=32,
             model_bank_use_output_layernorm=False,
             model_bank_initializer=SVDModelBankInitializerConfig(
@@ -528,15 +545,17 @@ class ESampPerRequestUnitTest(unittest.TestCase):
                 max_wait_steps=3,
             ),
         )
-        cfg = esamp_runtime.RUNTIME.config
         self.assertTrue(cfg.per_request_models)
         self.assertTrue(cfg.per_request_model_bank)
         self.assertEqual(cfg.model_bank_slots, 16)
         self.assertEqual(cfg.model_bank_flush_interval, 4)
-        self.assertEqual(cfg.adaptation_pipeline_slots, 8)
-        self.assertEqual(cfg.adaptation_stream_mode, "single")
-        self.assertEqual(cfg.adaptation_stream_priority, -1)
         self.assertEqual(cfg.model_bank_rank, 32)
+        self.assertFalse(cfg.model_bank_use_output_layernorm)
+        assert cfg.model_bank_initializer is not None
+        self.assertEqual(cfg.model_bank_initializer.method, "ridge_svd")
+        self.assertAlmostEqual(cfg.model_bank_initializer.ridge_lambda, 5e-3)
+        self.assertEqual(cfg.model_bank_initializer.min_rows, 24)
+        self.assertEqual(cfg.model_bank_initializer.max_wait_steps, 3)
         self.assertFalse(cfg.model_bank_use_output_layernorm)
         assert cfg.model_bank_initializer is not None
         self.assertEqual(cfg.model_bank_initializer.method, "ridge_svd")

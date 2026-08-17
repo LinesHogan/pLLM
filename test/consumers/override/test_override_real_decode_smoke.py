@@ -54,9 +54,6 @@ class OverRIDERealDecodeSmokeTest(unittest.TestCase):
             tap_layer_paths=(source_path,),
             source_layer_path=source_path,
             target_layer_path=target_path,
-            enable_esamp_training=False,
-            distiller_hidden_dim=8,
-            distiller_lr=1e-4,
         )
         residual_runtime.install_runner_patch()
         llm = residual_runtime.make_llm(

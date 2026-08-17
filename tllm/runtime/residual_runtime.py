@@ -35,7 +35,7 @@ from tllm.contracts.runtime_context import RunnerLike
 from tllm.producer.decode import compute_decode_localization
 from tllm.runtime import lifecycle as _lifecycle
 from tllm.runtime import stats as _stats
-from tllm.runtime.config import normalize_adaptation_stream_mode, normalize_model_bank_forward_backend
+from tllm.runtime.config import normalize_adaptation_stream_mode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.consumer_compat import synchronize as synchronize_consumer
@@ -44,7 +44,6 @@ from tllm.runtime.resources import (
     SamplerPrecomputeCache,
     SamplerPrecomputeState,
 )
-from tllm.runtime.sampler_bridge.types import SamplerBackend, normalize_sampler_backend
 from tllm.runtime.state import RUNTIME, ResidualRuntimeConfig, ResidualRuntimeState, RuntimeConsumer
 from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspotStats
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
@@ -213,27 +212,9 @@ def configure_runtime(
     tap_layer_paths: Sequence[str],
     source_layer_path: str,
     target_layer_path: str,
-    enable_esamp_training: bool,
-    distiller_hidden_dim: int,
-    distiller_lr: float,
-    per_request_models: bool = False,
-    per_request_model_bank: bool = False,
-    model_bank_slots: int = 0,
-    model_bank_flush_interval: int = 1,
-    model_bank_rank: int = 64,
-    model_bank_use_output_layernorm: bool = True,
-    model_bank_initializer: object | None = None,
-    model_bank_train_cudagraph: bool = False,
-    model_bank_forward_backend: str = "torch",
     adaptation_pipeline_slots: int = 4,
     adaptation_stream_mode: str = "dual",
     adaptation_stream_priority: int = 0,
-    trace_per_request_losses: bool = False,
-    trace_interval: int = 1,
-    trace_max_points: int = 0,
-    enable_distiller_intervention: bool = False,
-    distiller_beta: float = 0.0,
-    distiller_sampler_backend: SamplerBackend = "post_filter_exact",
     compact_capture_lane: bool = False,
     inplace_ttt_fast_weight_enabled: bool = False,
     inplace_ttt_fast_weight_layers: Sequence[int] = (0,),
@@ -247,32 +228,21 @@ def configure_runtime(
     inplace_ttt_fast_weight_max_bytes: int = 0,
     inplace_ttt_fast_weight_fail_on_unsupported: bool = False,
 ) -> None:
+    """Configure runtime-owned mechanisms (tap topology, streams, capture lanes).
+
+    Consumer-algorithm settings (distiller dims/lr/beta, model bank policy,
+    training toggles, tracing) are NOT accepted here — they belong to each
+    consumer's own config (e.g. ``ESampConsumerConfig``), applied via the
+    consumer's support workflow.
+    """
     cfg = RUNTIME.config
     cfg.graph_scratch_rows = max(0, int(graph_scratch_rows))
     cfg.tap_layer_paths = [str(path).strip() for path in tap_layer_paths if str(path).strip()]
     cfg.source_layer_path = str(source_layer_path).strip()
     cfg.target_layer_path = str(target_layer_path).strip()
-    cfg.enable_esamp_training = bool(enable_esamp_training)
-    cfg.distiller_hidden_dim = max(1, int(distiller_hidden_dim))
-    cfg.distiller_lr = float(distiller_lr)
-    cfg.per_request_models = bool(per_request_models)
-    cfg.per_request_model_bank = bool(per_request_model_bank)
-    cfg.model_bank_slots = max(0, int(model_bank_slots))
-    cfg.model_bank_flush_interval = max(1, int(model_bank_flush_interval))
-    cfg.model_bank_rank = max(1, int(model_bank_rank))
-    cfg.model_bank_use_output_layernorm = bool(model_bank_use_output_layernorm)
-    cfg.model_bank_initializer = model_bank_initializer
-    cfg.model_bank_train_cudagraph = bool(model_bank_train_cudagraph)
-    cfg.model_bank_forward_backend = normalize_model_bank_forward_backend(model_bank_forward_backend)
     cfg.adaptation_pipeline_slots = max(1, int(adaptation_pipeline_slots))
     cfg.adaptation_stream_mode = normalize_adaptation_stream_mode(adaptation_stream_mode)
     cfg.adaptation_stream_priority = int(adaptation_stream_priority)
-    cfg.trace_per_request_losses = bool(trace_per_request_losses)
-    cfg.trace_interval = max(1, int(trace_interval))
-    cfg.trace_max_points = max(0, int(trace_max_points))
-    cfg.enable_distiller_intervention = bool(enable_distiller_intervention)
-    cfg.distiller_beta = float(distiller_beta)
-    cfg.distiller_sampler_backend = normalize_sampler_backend(str(distiller_sampler_backend).strip() or "post_filter_exact")
     cfg.compact_capture_lane = bool(compact_capture_lane)
     old_inplace_ttt_enabled = bool(cfg.inplace_ttt_fast_weight_enabled)
     cfg.inplace_ttt_fast_weight_enabled = bool(inplace_ttt_fast_weight_enabled)
@@ -320,7 +290,7 @@ def configure_runtime(
 
 
 def set_esamp_training_enabled(enabled: bool) -> None:
-    RUNTIME.config.enable_esamp_training = bool(enabled)
+    """Toggle training on the active consumer (config lives on the consumer)."""
     if RUNTIME.consumer is not None:
         RUNTIME.consumer.set_enabled(enabled)
 

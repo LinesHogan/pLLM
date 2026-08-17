@@ -16,7 +16,7 @@ import torch
 
 from tllm.consumers.base import BaseConsumer
 from tllm.ports.residual_stream import ResidualLocator
-from tllm.runtime.config import AdaptationStreamMode, ModelBankForwardBackendName
+from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.resources import SamplerPrecomputeState
@@ -27,31 +27,21 @@ RuntimeConsumer = BaseConsumer
 
 @dataclass
 class ResidualRuntimeConfig:
+    """Runtime-owned mechanism configuration only.
+
+    Consumer-algorithm settings (distiller dims/lr/beta, model bank policy,
+    training toggles, tracing) live in each consumer's own config — never
+    here. What remains is what the hook layer itself reads: tap topology,
+    scratch capacity, adaptation stream policy and capture-lane toggles.
+    """
+
     graph_scratch_rows: int = 0
     tap_layer_paths: list[str] = field(default_factory=list)
     source_layer_path: str = "model.model.layers[0].input_layernorm"
     target_layer_path: str = "model.model.layers[-1].input_layernorm"
-    enable_esamp_training: bool = True
-    distiller_hidden_dim: int = 128
-    distiller_lr: float = 1e-3
-    per_request_models: bool = False
-    per_request_model_bank: bool = False
-    model_bank_slots: int = 0
-    model_bank_flush_interval: int = 1
-    model_bank_rank: int = 64
-    model_bank_use_output_layernorm: bool = True
-    model_bank_initializer: object | None = None  # consumer-owned initializer config; opaque to the runtime
-    model_bank_train_cudagraph: bool = False
-    model_bank_forward_backend: ModelBankForwardBackendName = "torch"
     adaptation_pipeline_slots: int = 4
     adaptation_stream_mode: AdaptationStreamMode = "dual"
     adaptation_stream_priority: int = 0
-    trace_per_request_losses: bool = False
-    trace_interval: int = 1
-    trace_max_points: int = 0
-    enable_distiller_intervention: bool = False
-    distiller_beta: float = 0.0
-    distiller_sampler_backend: str = "post_filter_exact"
     compact_capture_lane: bool = False
     inplace_ttt_fast_weight_enabled: bool = False
     inplace_ttt_fast_weight_layers: tuple[int, ...] = (0,)

@@ -391,9 +391,6 @@ class InPlaceTTTFastWeightRunnerLifecycleUnitTest(unittest.TestCase):
                 tap_layer_paths=(),
                 source_layer_path="model.model.layers[0].input_layernorm",
                 target_layer_path="model.model.layers[-1].input_layernorm",
-                enable_esamp_training=False,
-                distiller_hidden_dim=2,
-                distiller_lr=1e-3,
                 inplace_ttt_fast_weight_enabled=False,
             )
         finally:
