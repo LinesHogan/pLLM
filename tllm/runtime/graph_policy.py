@@ -14,10 +14,13 @@ persistent buffers and be declared ``GraphSafety.CAPTURE_SAFE`` (or
 
 from __future__ import annotations
 
+import os
 from enum import Enum, auto
 from typing import Any
 
 from tllm.backends.protocol import GraphSafety
+
+DEBUG_GRAPH_MODE_ENV = "TLLM_DEBUG_GRAPH_MODE"
 
 
 class GraphMode(Enum):
@@ -30,8 +33,25 @@ class GraphPolicyError(RuntimeError):
     pass
 
 
+def _debug_forced_graph_mode() -> GraphMode | None:
+    """tLLM-developer-only override; never part of any consumer contract."""
+    raw = os.environ.get(DEBUG_GRAPH_MODE_ENV, "").strip().lower()
+    if not raw:
+        return None
+    mapping = {"eager": GraphMode.EAGER, "piecewise": GraphMode.PIECEWISE, "full": GraphMode.FULL}
+    try:
+        return mapping[raw]
+    except KeyError as exc:
+        raise GraphPolicyError(
+            f"{DEBUG_GRAPH_MODE_ENV} must be one of {sorted(mapping)}, got {raw!r}"
+        ) from exc
+
+
 def resolve_graph_mode(runner: Any) -> GraphMode:
     """Best-effort structural read of the runner's effective graph mode."""
+    forced = _debug_forced_graph_mode()
+    if forced is not None:
+        return forced
     if bool(getattr(runner, "enforce_eager", False)):
         return GraphMode.EAGER
     cfg = getattr(runner, "compilation_config", None)

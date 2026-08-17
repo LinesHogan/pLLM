@@ -8,12 +8,16 @@ from typing import Dict, Protocol
 
 import torch
 
+from tllm.ports.base import WriteMode, WriteRows
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.ports import residual_bindings as _residual_bindings
 from tllm.runtime.ports import residual_capture_buffers as _residual_capture_buffers
 from tllm.runtime.ports import residual_capture_hooks as _residual_capture_hooks
+from tllm.runtime.ports import residual_write as _residual_write
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
+from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
+from tllm.runtime.ports.tap_handle import TapHandle
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,8 @@ class RuntimeLike(Protocol):
     tap_decode_hidden_compact: dict[str, torch.Tensor]
     capture_full_residual_rows: bool
     residual_bindings: dict[str, ResidualPathBinding]
+    write_leases: Dict[WriteLeaseKey, ResidualWriteLease]
+    tap_handles: Dict[str, TapHandle]
     source_resolved_path: str
     target_resolved_path: str
     launch_consumer_from_hooks: bool
@@ -76,6 +82,10 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
     cfg = core.RUNTIME.config
     plan = getattr(core.RUNTIME, "dispatch_plan", None)
     required = set(plan.required_residual_layers()) if plan is not None and hasattr(plan, "required_residual_layers") else set()
+    if plan is not None and hasattr(plan, "required_residual_writes"):
+        # Written layers must be tapped too: the staged write applies inside
+        # the tapped forward, before capture.
+        required |= set(plan.required_residual_writes())
 
     raw_paths_by_locator = _residual_bindings.raw_paths_from_runtime(core.RUNTIME)
     tap_paths = _residual_bindings.build_raw_tap_paths(
@@ -191,8 +201,36 @@ def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntim
     core.RUNTIME.target_resolved_path = setup.target_resolved
     core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
 
-    _residual_capture_hooks.install_layer_forward_taps(
+    handles = _residual_capture_hooks.install_layer_forward_taps(
         core=core,
         runner=runner,
         resolved_layers=setup.resolved_layers,
+    )
+    core.RUNTIME.tap_handles = dict(handles)
+
+    plan = getattr(core.RUNTIME, "dispatch_plan", None)
+    write_specs = []
+    if plan is not None and hasattr(plan, "residual_writes"):
+        for consumer_id, _flow, write in plan.residual_writes():
+            locator = getattr(write, "locator")
+            if not isinstance(locator, ResidualLocator):
+                continue
+            write_specs.append(
+                (
+                    consumer_id,
+                    locator,
+                    WriteMode(str(getattr(write, "mode", "replace") or "replace")),
+                    WriteRows(str(getattr(write, "rows", "decode_only"))),
+                    int(getattr(write, "order", 0)),
+                )
+            )
+    core.RUNTIME.write_leases = _residual_write.build_write_leases(
+        writes=write_specs,
+        resolve_path=lambda locator: _residual_bindings.resolved_path_for_locator(
+            setup.runtime_bindings, locator
+        ),
+        device=getattr(runner, "device"),
+        max_rows=int(setup.rows),
+        hidden_size=int(setup.hidden_size),
+        dtype=setup.hidden_dtype,
     )

@@ -26,6 +26,8 @@ from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.test_time.lora import TestTimeLoRAService
 from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
+from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
+from tllm.runtime.ports.tap_handle import TapHandle
 
 
 RuntimeConsumer = BaseConsumer
@@ -87,6 +89,8 @@ class ResidualRuntimeState:
     capture_full_residual_rows: bool = True
     residual_raw_paths: Dict[ResidualLocator, str] = field(default_factory=dict)
     residual_bindings: Dict[str, ResidualPathBinding] = field(default_factory=dict)
+    write_leases: Dict[WriteLeaseKey, ResidualWriteLease] = field(default_factory=dict)
+    tap_handles: Dict[str, TapHandle] = field(default_factory=dict)
 
     source_resolved_path: str = ""
     target_resolved_path: str = ""

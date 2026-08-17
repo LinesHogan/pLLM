@@ -19,6 +19,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
 
         layer = _Layer()
         runtime = type("Runtime", (), {})()
+        runtime.write_leases = {}
         runtime.decode_row_idx = torch.tensor([2, 0], dtype=torch.long)
         runtime.decode_valid_mask = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
         runtime.decode_count = 2
@@ -83,6 +84,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
 
         layer = _Layer()
         runtime = type("Runtime", (), {})()
+        runtime.write_leases = {}
         runtime.decode_row_idx = torch.tensor([1, 0], dtype=torch.long)
         runtime.decode_valid_mask = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
         runtime.decode_count = 2
@@ -115,6 +117,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
 
         layer = _Layer()
         runtime = type("Runtime", (), {})()
+        runtime.write_leases = {}
         runtime.decode_row_idx = torch.tensor([2, 0, 1], dtype=torch.long)
         runtime.decode_valid_mask = torch.tensor([[1.0], [1.0], [0.0]], dtype=torch.float32)
         runtime.decode_count = 2
@@ -149,6 +152,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
 
         layer = _Layer()
         runtime = type("Runtime", (), {})()
+        runtime.write_leases = {}
         runtime.decode_row_idx = torch.tensor([2, 0, 1], dtype=torch.long)
         runtime.decode_valid_mask = torch.ones((3, 1), dtype=torch.float32)
         runtime.decode_compact_row_idx = torch.tensor([2, 1], dtype=torch.long)
@@ -196,6 +200,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
 
         layer = _Layer()
         runtime = type("Runtime", (), {})()
+        runtime.write_leases = {}
         runtime.decode_row_idx = torch.tensor([2, 0, 1], dtype=torch.long)
         runtime.decode_valid_mask = torch.ones((3, 1), dtype=torch.float32)
         runtime.decode_compact_row_idx = torch.tensor([2, 1], dtype=torch.long)
@@ -239,6 +244,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
 
         layer = _Layer()
         runtime = type("Runtime", (), {})()
+        runtime.write_leases = {}
         runtime.decode_row_idx = torch.tensor([0], dtype=torch.long)
         runtime.decode_valid_mask = torch.ones((1, 1), dtype=torch.float32)
         runtime.decode_compact_row_idx = torch.tensor([0, 99, 99], dtype=torch.long)

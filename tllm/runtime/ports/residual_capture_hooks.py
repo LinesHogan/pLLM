@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Dict, Protocol
 
 import torch
 
 from tllm.contracts.runtime_context import RunnerLike
 from tllm.runtime import active_targets
 from tllm.runtime import hidden_event_bridge as _hidden_bridge
+from tllm.runtime.ports import residual_write as _residual_write
+from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
+from tllm.runtime.ports.tap_handle import TapHandle
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 
 
@@ -20,6 +23,7 @@ class ResidualCaptureRuntimeLike(Protocol):
     decode_compact_count: int
     tap_decode_hidden: dict[str, torch.Tensor]
     tap_decode_hidden_compact: dict[str, torch.Tensor]
+    write_leases: Dict[WriteLeaseKey, ResidualWriteLease]
     launch_consumer_from_hooks: bool
     dispatch_plan: object | None
     consumer: object | None
@@ -36,7 +40,8 @@ def install_layer_forward_taps(
     core: ResidualCaptureCoreLike,
     runner: RunnerLike,
     resolved_layers: dict[str, torch.nn.Module],
-) -> None:
+) -> dict[str, TapHandle]:
+    handles: dict[str, TapHandle] = {}
     for resolved_path, layer in resolved_layers.items():
         orig_forward = layer.forward
 
@@ -45,6 +50,9 @@ def install_layer_forward_taps(
             tensor = out[0] if isinstance(out, (tuple, list)) else out
             if not isinstance(tensor, torch.Tensor):
                 return out
+            write_leases = core.RUNTIME.write_leases
+            if write_leases:
+                _residual_write.apply_pending_writes(write_leases, __path, tensor)
             if not active_targets.runtime_has_active_targets(core.RUNTIME):
                 return out
 
@@ -96,3 +104,16 @@ def install_layer_forward_taps(
             return out
 
         layer.forward = _forward_with_tap  # type: ignore[method-assign]
+        handles[resolved_path] = TapHandle(
+            layer_path=resolved_path,
+            layer=layer,
+            orig_forward=orig_forward,
+        )
+    return handles
+
+
+def restore_layer_forward_taps(handles: Dict[str, TapHandle]) -> None:
+    """Symmetric teardown for ``install_layer_forward_taps``."""
+    for handle in handles.values():
+        handle.restore()
+    handles.clear()
