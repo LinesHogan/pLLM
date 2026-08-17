@@ -68,11 +68,9 @@ def build_runtime_hidden_batch(*, core: EventCoreLike, layer_path: str) -> Hidde
         valid_mask=decode_valid_mask[:active, 0],
         prompt_idx=prompt_idx_tensor,
         sample_idx=sample_idx_tensor,
-        metadata={
-            "prompt_idxs": list(prompt_idx),
-            "sample_idxs": list(sample_idx),
-            "full_rows_hidden": decode_buf,
-        },
+        prompt_idxs=tuple(int(v) for v in prompt_idx),
+        sample_idxs=tuple(int(v) for v in sample_idx),
+        full_rows_hidden=decode_buf,
     )
 
 

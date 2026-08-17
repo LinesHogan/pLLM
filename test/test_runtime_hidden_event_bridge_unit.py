@@ -86,8 +86,8 @@ class RuntimeHiddenEventBridgeUnitTest(unittest.TestCase):
         self.assertEqual(batch.phase, "decode")
         self.assertEqual(batch.layer_path, "layers.0")
         self.assertTrue(torch.equal(batch.rows_hidden, torch.tensor([[1.0, 2.0], [3.0, 4.0]])))
-        self.assertEqual(batch.metadata["prompt_idxs"], [10, 11])
-        self.assertEqual(batch.metadata["sample_idxs"], [0, 1])
+        self.assertEqual(list(batch.prompt_idxs), [10, 11])
+        self.assertEqual(list(batch.sample_idxs), [0, 1])
 
     def test_build_runtime_hidden_batch_reuses_decode_metadata_tensors(self) -> None:
         core = self._core()

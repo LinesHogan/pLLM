@@ -84,12 +84,12 @@ class ConsumerDispatchContractsUnitTest(unittest.TestCase):
             valid_mask=torch.tensor([1.0, 0.0], dtype=torch.float32),
             prompt_idx=torch.tensor([7, -1], dtype=torch.long),
             sample_idx=torch.tensor([0, -1], dtype=torch.long),
-            metadata={"source": "unit"},
+            prompt_idxs=(7, -1),
         )
         self.assertEqual(batch.step_id, 3)
         self.assertEqual(batch.phase, "decode")
         self.assertEqual(tuple(batch.rows_hidden.shape), (2, 4))
-        self.assertEqual(batch.metadata.get("source"), "unit")
+        self.assertEqual(batch.prompt_idxs, (7, -1))
 
     def test_dispatch_plan_filters_event_phase_layer_and_capture_policy(self) -> None:
         c1 = _DummyConsumer(

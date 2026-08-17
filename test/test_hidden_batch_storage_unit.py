@@ -40,7 +40,6 @@ class HiddenBatchStorageUnitTest(unittest.TestCase):
             valid_mask=decode_valid_mask[:2, 0],
             prompt_idx=torch.tensor([7, 8], dtype=torch.long),
             sample_idx=torch.tensor([0, 0], dtype=torch.long),
-            metadata={},
         )
 
         self.assertEqual(batch.rows_hidden.data_ptr(), decode_buf.data_ptr())

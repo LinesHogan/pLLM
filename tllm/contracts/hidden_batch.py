@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -28,4 +28,6 @@ class HiddenBatch:
     valid_mask: torch.Tensor
     prompt_idx: torch.Tensor
     sample_idx: torch.Tensor
-    metadata: dict[str, Any] = field(default_factory=dict)
+    prompt_idxs: tuple[int, ...] = ()
+    sample_idxs: tuple[int, ...] = ()
+    full_rows_hidden: torch.Tensor | None = None
