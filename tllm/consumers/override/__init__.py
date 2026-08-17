@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """OverRIDE consumer package."""
 
-from tllm.consumers.override.consumer import (
+from tllm.consumers.override.config import OverRIDEConsumerConfig
+from tllm.consumers.override.consumer import OverRIDEConsumer
+from tllm.consumers.override.engine import (
     OverRIDEBatchLogitsResult,
-    OverRIDEConsumer,
-    OverRIDEConsumerConfig,
     OverRIDELogitsResult,
     OverRIDEReweightEngine,
     OverRIDEStats,
