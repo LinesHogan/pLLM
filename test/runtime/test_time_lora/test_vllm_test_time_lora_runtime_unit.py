@@ -156,8 +156,8 @@ def _fake_vllm_lora_modules():
 class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
     def test_vllm_manager_commits_in_memory_lora_without_disk_load(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager
 
         manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
         service = TestTimeLoRAService(manager=manager, max_rank=4)
@@ -188,7 +188,7 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
                 lora_id_to_lora_request={},
             )
             self.assertEqual(
-                __import__("tllm.runtime.vllm_test_time_lora", fromlist=["apply_request_lora_mapping"]).apply_request_lora_mapping(
+                __import__("tllm.runtime.vllm_patch.test_time_lora_hooks", fromlist=["apply_request_lora_mapping"]).apply_request_lora_mapping(
                     service=service,
                     input_batch=input_batch,
                 ),
@@ -218,7 +218,7 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_vllm_layer_weights_are_cpu_contiguous_snapshots(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAWeights
-        from tllm.runtime.vllm_test_time_lora import _to_vllm_layer_weights
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import _to_vllm_layer_weights
 
         lora_a_src = torch.arange(12, dtype=torch.float32).reshape(2, 6).t()
         lora_b_src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
@@ -245,8 +245,8 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_vllm_manager_defers_registration_until_request_is_active(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, apply_request_lora_mapping
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager, apply_request_lora_mapping
 
         manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
         service = TestTimeLoRAService(manager=manager, max_rank=4)
@@ -289,8 +289,8 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_vllm_repeated_update_replaces_registered_adapter_weights(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, apply_request_lora_mapping
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager, apply_request_lora_mapping
 
         manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
         service = TestTimeLoRAService(manager=manager, max_rank=4)
@@ -333,8 +333,8 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_vllm_materialize_does_not_preempt_full_active_slot_before_native_reconciliation(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, apply_request_lora_mapping
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager, apply_request_lora_mapping
 
         worker = _FakeWorkerManager()
         worker._adapter_manager.lora_index_to_id = [1]
@@ -374,8 +374,8 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_vllm_request_mapping_updates_existing_input_batch_rows(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, apply_request_lora_mapping
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager, apply_request_lora_mapping
 
         manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
         service = TestTimeLoRAService(manager=manager, max_rank=4)
@@ -411,8 +411,8 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_vllm_request_mapping_removes_stale_lora_registry_entries(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, apply_request_lora_mapping
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager, apply_request_lora_mapping
 
         manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
         service = TestTimeLoRAService(manager=manager, max_rank=4)
@@ -530,8 +530,8 @@ class VLLMTestTimeLoRARuntimeUnitTest(unittest.TestCase):
 
     def test_commit_apply_records_runtime_counts(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.vllm_test_time_lora import VLLMInMemoryLoRAManager, maybe_commit_and_apply_request_mapping
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.vllm_patch.test_time_lora_hooks import VLLMInMemoryLoRAManager, maybe_commit_and_apply_request_mapping
 
         manager = VLLMInMemoryLoRAManager(_FakeWorkerManager())
         service = TestTimeLoRAService(manager=manager, max_rank=4)

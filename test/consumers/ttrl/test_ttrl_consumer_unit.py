@@ -497,8 +497,8 @@ class TTRLConsumerUnitTest(unittest.TestCase):
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
         from tllm.contracts.test_time_training import TestTimeTrainerResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import FakeTestTimeTrainerBridge
 
         class _Manager:
             def __init__(self) -> None:

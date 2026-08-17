@@ -647,7 +647,7 @@ class FTTTConsumerUnitTest(unittest.TestCase):
     def test_toy_closed_loop_exports_request_scoped_lora_update_after_adapter_update(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         class _FakeLoRAModule:
             def __init__(self) -> None:
@@ -760,8 +760,8 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
         from tllm.contracts.test_time_training import TestTimeTrainerResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import FakeTestTimeTrainerBridge
 
         class _FakeLoRAModule:
             def __init__(self) -> None:
@@ -849,7 +849,7 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.contracts.test_time_training import TestTimeTrainerResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
-        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+        from tllm.runtime.test_time.trainer import FakeTestTimeTrainerBridge
 
         bridge = FakeTestTimeTrainerBridge(result=TestTimeTrainerResult(), stage_updates=False)
         consumer = FTTTConsumer(
@@ -919,7 +919,7 @@ class FTTTConsumerUnitTest(unittest.TestCase):
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig
         from tllm.consumers.fttt import FeedbackRecord
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         class _FakeLoRAModule:
             def __init__(self) -> None:

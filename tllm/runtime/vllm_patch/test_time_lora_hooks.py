@@ -8,7 +8,7 @@ from collections.abc import Mapping
 import torch
 
 from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-from tllm.runtime.test_time_lora import TestTimeLoRAService
+from tllm.runtime.test_time.lora import TestTimeLoRAService
 
 __test__ = False
 

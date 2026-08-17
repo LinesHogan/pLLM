@@ -29,7 +29,7 @@ from tllm.backends.protocol import (
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
-from tllm.runtime import vllm_test_time_lora as _test_time_lora
+from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.step_session import (
     StepSession,
     StepState,

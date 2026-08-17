@@ -31,8 +31,8 @@ from tllm.ports.update_barrier import UpdateBarrier
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
-from tllm.runtime.test_time_lora import TestTimeLoRAService
-from tllm.runtime.test_time_trainer import TestTimeTrainerBridge, stage_trainer_result_updates
+from tllm.runtime.test_time.lora import TestTimeLoRAService
+from tllm.runtime.test_time.trainer import TestTimeTrainerBridge, stage_trainer_result_updates
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry
 
 

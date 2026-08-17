@@ -16,11 +16,17 @@ import torch
 
 from tllm.consumers.base import BaseConsumer
 from tllm.ports.residual_stream import ResidualLocator
+from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.runtime.extensions import ExtensionRegistry
+from tllm.runtime.fast_weight.state import FastWeightState
 from tllm.runtime.resources import SamplerPrecomputeState
+from tllm.runtime.test_time.lora import TestTimeLoRAService
+from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
+
 
 RuntimeConsumer = BaseConsumer
 
@@ -97,14 +103,15 @@ class ResidualRuntimeState:
     consumer: Optional[RuntimeConsumer] = None
     consumer_registry: Optional[ConsumerRegistry] = None
     dispatch_plan: Optional[DispatchPlan] = None
-    execution_plan: object = None  # tllm.producers.registry.ExecutionPlan once compiled
+    execution_plan: Optional[ExecutionPlan] = None
+    extensions: ExtensionRegistry = field(default_factory=ExtensionRegistry)
     test_time_lora_enabled: bool = False
-    test_time_lora_service: object | None = None
-    fast_weight_state: object | None = None
+    test_time_lora_service: Optional[TestTimeLoRAService] = None
+    fast_weight_state: Optional[FastWeightState] = None
     fast_weight_handles: dict[str, object] = field(default_factory=dict)
-    fast_weight_hook_spec: tuple[object, ...] | None = None
+    fast_weight_hook_spec: Optional[tuple[object, ...]] = None
     fast_weight_phase: str = "prefill"
-    fast_weight_current_token_batch_meta: object | None = None
+    fast_weight_current_token_batch_meta: Optional[RuntimeTokenBatchMeta] = None
     fast_weight_installed_count: int = 0
     fast_weight_skipped_count: int = 0
 

@@ -46,7 +46,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
 
     def test_stages_adapter_slot_and_updates_target_module(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         manager = _FakeLoRAManager()
         service = TestTimeLoRAService(manager=manager, max_rank=4)
@@ -80,7 +80,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
 
     def test_rejects_unknown_target_and_rank_over_capacity(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         update = TestTimeLoRAUpdate(
@@ -135,7 +135,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
 
     def test_rejects_implicit_contract_type_coercions(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRATarget, TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         weights = TestTimeLoRAWeights(lora_a=torch.ones(3, 1), lora_b=torch.ones(1, 4))
 
@@ -256,7 +256,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
             TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1.5)  # type: ignore[arg-type]
 
     def test_rejects_duck_typed_updates_at_service_boundary(self) -> None:
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
 
@@ -265,7 +265,7 @@ class TestTimeLoRAServiceUnitTest(unittest.TestCase):
 
     def test_request_assignment_can_be_explicitly_unbound(self) -> None:
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         update = TestTimeLoRAUpdate(

@@ -26,7 +26,7 @@ from tllm.runtime.vllm_patch.adapters import (
 )
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
-from tllm.runtime import vllm_test_time_lora as _test_time_lora
+from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.fast_weight import runtime as _fast_weight
 
 RUNTIME_EVENT_POINTS = (

@@ -9,7 +9,7 @@ from typing import Protocol
 
 from tllm.contracts.test_time_lora import TestTimeLoRAUpdate
 from tllm.contracts.test_time_training import TestTimeTrainerRequest, TestTimeTrainerResult
-from tllm.runtime.test_time_lora import TestTimeLoRAService
+from tllm.runtime.test_time.lora import TestTimeLoRAService
 
 __test__ = False
 

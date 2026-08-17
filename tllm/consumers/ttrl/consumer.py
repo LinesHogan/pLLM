@@ -803,8 +803,8 @@ class TTRLConsumer(BaseConsumer):
         request_ids: tuple[str, ...] | None = None,
     ) -> object:
         from tllm.contracts.test_time_training import TestTimeTrainerRequest, TestTimeTrainingBatch
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import stage_trainer_result_updates
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import stage_trainer_result_updates
 
         if not isinstance(batch, TestTimeTrainingBatch):
             raise TypeError("batch must be TestTimeTrainingBatch")

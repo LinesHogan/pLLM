@@ -280,8 +280,8 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
     def test_fake_bridge_stages_returned_updates_to_lora_service(self) -> None:
         from tllm.contracts.test_time_training import TestTimeTrainerResult
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import FakeTestTimeTrainerBridge
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         result = TestTimeTrainerResult(updates=(_update(),), metrics={"loss": 0.25})
@@ -304,8 +304,8 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
     def test_stage_trainer_result_updates_rejects_updates_outside_original_request(self) -> None:
         from tllm.contracts.test_time_training import TestTimeTrainerResult
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import stage_trainer_result_updates
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import stage_trainer_result_updates
 
         request = _request()
 
@@ -329,8 +329,8 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
     def test_stage_trainer_result_updates_is_atomic_when_later_update_is_invalid(self) -> None:
         from tllm.contracts.test_time_training import TestTimeTrainerResult
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import stage_trainer_result_updates
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import stage_trainer_result_updates
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         result = TestTimeTrainerResult(
@@ -346,8 +346,8 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
     def test_stage_trainer_result_updates_is_atomic_when_service_validation_fails(self) -> None:
         from tllm.contracts.test_time_training import TestTimeTrainerResult
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import stage_trainer_result_updates
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import stage_trainer_result_updates
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         missing_service_module = "model.layers.1.self_attn.q_proj"
@@ -370,8 +370,8 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
     def test_in_process_bridge_validates_and_stages_callable_result(self) -> None:
         from tllm.contracts.test_time_training import TestTimeTrainerResult
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import InProcessTestTimeTrainerBridge
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import InProcessTestTimeTrainerBridge
 
         service = TestTimeLoRAService(manager=_FakeLoRAManager(), max_rank=1)
         seen_requests = []
@@ -393,8 +393,8 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
     def test_bridges_reject_incompatible_trainer_updates_before_staging(self) -> None:
         from tllm.contracts.test_time_training import TestTimeTrainerResult
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
-        from tllm.runtime.test_time_trainer import FakeTestTimeTrainerBridge, InProcessTestTimeTrainerBridge
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
+        from tllm.runtime.test_time.trainer import FakeTestTimeTrainerBridge, InProcessTestTimeTrainerBridge
 
         request = _request()
 
@@ -422,7 +422,7 @@ class TestTimeTrainerBridgeUnitTest(unittest.TestCase):
 
         import tllm.contracts  # noqa: F401
         import tllm.contracts.test_time_training  # noqa: F401
-        import tllm.runtime.test_time_trainer  # noqa: F401
+        import tllm.runtime.test_time.trainer  # noqa: F401
 
         newly_imported_heavy = {name for name in heavy_modules if name not in before and name in sys.modules}
         self.assertEqual(newly_imported_heavy, set())

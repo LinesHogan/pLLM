@@ -21,7 +21,7 @@ class FTTTRealModelSmokeTest(unittest.TestCase):
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
         from tllm.contracts.test_time_training import TestTimeTrainerRequest, TestTimeTrainerResult
         from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         class _FakeLoRAModule:
             def __init__(self) -> None:

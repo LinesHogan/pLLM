@@ -313,7 +313,7 @@ class TLMConsumerUnitTest(unittest.TestCase):
     def test_exports_local_adapter_as_strict_test_time_lora_update(self) -> None:
         from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
         from tllm.contracts.test_time_lora import TestTimeLoRAUpdate, TestTimeLoRAWeights
-        from tllm.runtime.test_time_lora import TestTimeLoRAService
+        from tllm.runtime.test_time.lora import TestTimeLoRAService
 
         class _FakeLoRAModule:
             def __init__(self) -> None:
