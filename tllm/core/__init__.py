@@ -16,9 +16,11 @@ try:
     from tllm._core import (  # noqa: F401
         CompiledPlan,
         DecodeLocalization,
+        DecodePositions,
         RowPartition,
         SamplerPlan,
         compile_execution_plan,
+        localize_decode_positions,
         localize_decode_rows,
         partition_rows,
         plan_sampler_step,
@@ -33,9 +35,11 @@ except ImportError as exc:  # pragma: no cover - build guard
 __all__ = [
     "CompiledPlan",
     "DecodeLocalization",
+    "DecodePositions",
     "RowPartition",
     "SamplerPlan",
     "compile_execution_plan",
+    "localize_decode_positions",
     "localize_decode_rows",
     "partition_rows",
     "plan_sampler_step",

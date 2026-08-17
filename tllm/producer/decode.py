@@ -29,6 +29,10 @@ def compute_decode_localization(
 ) -> Tuple[torch.Tensor, List[int], List[int], List[int]]:
     """Pure decode-localization function (no model/runner dependency).
 
+    Position selection (host-known integer math) is delegated to the Rust
+    core; the row gather and bounds diagnostics stay on the tensor side so
+    the CUDA hot path never gains a host sync.
+
     Returns:
     - row_idx: packed hidden row index for each decode request in current step.
     - prompt_idxs: prompt index per localized row.
@@ -38,19 +42,19 @@ def compute_decode_localization(
     if num_actual_tokens <= 0 or logits_indices is None or logits_indices.numel() == 0:
         return torch.empty((0,), dtype=torch.long), [], [], []
 
-    decode_positions = [
-        i
-        for i, is_decode in enumerate(is_decode_req)
-        if is_decode and i < int(logits_indices.numel()) and i < len(req_ids)
-    ]
-    row_cap = int(max_decode_rows)
-    if row_cap > 0:
-        decode_positions = decode_positions[:row_cap]
+    from tllm import core as _core
+
+    located = _core.localize_decode_positions(
+        [bool(x) for x in is_decode_req],
+        int(logits_indices.numel()),
+        len(req_ids),
+        int(max_decode_rows),
+    )
+    decode_positions = [int(p) for p in located.positions]
     if not decode_positions:
         return torch.empty((0,), device=logits_indices.device, dtype=torch.long), [], [], []
 
-    contiguous = decode_positions == list(range(int(decode_positions[0]), int(decode_positions[0]) + len(decode_positions)))
-    if contiguous:
+    if located.contiguous:
         row_idx = logits_indices.narrow(0, int(decode_positions[0]), len(decode_positions))
     else:
         decode_pos = torch.tensor(decode_positions, device=logits_indices.device, dtype=torch.long)

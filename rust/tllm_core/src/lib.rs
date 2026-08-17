@@ -84,6 +84,45 @@ fn localize_decode_rows(
     })
 }
 
+#[pyclass]
+#[derive(Clone)]
+struct DecodePositions {
+    #[pyo3(get)]
+    positions: Vec<i64>,
+    #[pyo3(get)]
+    contiguous: bool,
+}
+
+/// Position selection half of decode localization — the part that is always
+/// host-known (no logits values, so no GPU sync). The device-side gather and
+/// bounds diagnostics stay in Python.
+#[pyfunction]
+fn localize_decode_positions(
+    is_decode: Vec<bool>,
+    n_logits: i64,
+    req_count: i64,
+    max_decode_rows: i64,
+) -> DecodePositions {
+    let mut positions: Vec<i64> = Vec::new();
+    for (i, &d) in is_decode.iter().enumerate() {
+        if d && (i as i64) < n_logits && (i as i64) < req_count {
+            positions.push(i as i64);
+        }
+    }
+    if max_decode_rows > 0 {
+        positions.truncate(max_decode_rows as usize);
+    }
+    let contiguous = !positions.is_empty()
+        && positions
+            .iter()
+            .enumerate()
+            .all(|(k, &p)| p == positions[0] + k as i64);
+    DecodePositions {
+        positions,
+        contiguous,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // plan_sampler_step
 // ---------------------------------------------------------------------------
@@ -669,10 +708,12 @@ fn compile_execution_plan(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(localize_decode_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(localize_decode_positions, m)?)?;
     m.add_function(wrap_pyfunction!(plan_sampler_step, m)?)?;
     m.add_function(wrap_pyfunction!(partition_rows, m)?)?;
     m.add_function(wrap_pyfunction!(compile_execution_plan, m)?)?;
     m.add_class::<DecodeLocalization>()?;
+    m.add_class::<DecodePositions>()?;
     m.add_class::<RowPartition>()?;
     m.add_class::<SamplerPlan>()?;
     m.add_class::<CompiledPlan>()?;
