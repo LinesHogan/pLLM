@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the TLM-inspired devlist consumer."""
+"""Unit tests for the TLM-inspired consumer."""
 
 from __future__ import annotations
 

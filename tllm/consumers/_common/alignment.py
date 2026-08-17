@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Common building blocks for devlist-inspired consumers."""
+"""Common building blocks shared by the test-time-training consumers."""
 
 from __future__ import annotations
 

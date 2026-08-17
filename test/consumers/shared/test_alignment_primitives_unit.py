@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for shared devlist alignment helpers."""
+"""Unit tests for shared consumer alignment helpers."""
 
 from __future__ import annotations
 

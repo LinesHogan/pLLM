@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for devlist consumer shared primitives."""
+"""Unit tests for consumer shared primitives."""
 
 from __future__ import annotations
 

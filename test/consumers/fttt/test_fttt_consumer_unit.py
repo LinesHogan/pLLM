@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the FTTT-inspired devlist consumer."""
+"""Unit tests for the FTTT-inspired consumer."""
 
 from __future__ import annotations
 
