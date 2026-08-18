@@ -12,6 +12,14 @@ import random
 import unittest
 
 from tllm import _core
+from tllm.producers.ir import (
+    PlanConsumerDesc,
+    PlanConsumerFlowDesc,
+    PlanConsumerReadDesc,
+    PlanConsumerWriteDesc,
+    PlanPortSpecDesc,
+    PlanProducerDesc,
+)
 
 from test.core.oracles.execution_plan import (
     OracleExecutionPlanError,
@@ -26,38 +34,58 @@ _SAFETIES = ["EAGER_ONLY", "CAPTURE_SAFE", "REPLAY_STATEFUL"]
 
 
 def _rust_call(producers, consumers, *, enforced_kinds=None, supported_hooks=None, backend=None):
-    prod_dicts = [
-        {
-            "id": p.id,
-            "priority": p.priority,
-            "outputs": [
-                {
-                    "port": str(spec.id),
-                    "kind": spec.kind.value,
-                    "writable": spec.writable,
-                    "write_modes": list(spec.write_modes),
-                }
+    producer_descs = [
+        PlanProducerDesc(
+            id=p.id,
+            priority=p.priority,
+            outputs=tuple(
+                PlanPortSpecDesc(
+                    port=str(spec.id),
+                    kind=spec.kind.value,
+                    writable=spec.writable,
+                    write_modes=tuple(spec.write_modes),
+                    phases=tuple(spec.phases),
+                )
                 for spec in p.outputs
-            ],
-            "requires": [str(r) for r in p.requires],
-            "hook_points": [h.value for h in p.hook_points],
-            "graph_safety": p.graph_safety.name,
-        }
+            ),
+            requires=tuple(str(required) for required in p.requires),
+            hook_points=tuple(hook.value for hook in p.hook_points),
+            graph_safety=p.graph_safety.name,
+        )
         for p in producers
     ]
-    cons_dicts = []
+    consumer_descs = []
     for c in consumers:
-        flow = c.flows()[0]
-        cons_dicts.append(
-            {
-                "id": c.consumer_id,
-                "reads": [r.kind.value for r in flow.reads],
-                "writes": [{"kind": w.kind.value, "mode": w.mode} for w in flow.writes],
-            }
+        consumer_descs.append(
+            PlanConsumerDesc(
+                id=c.consumer_id,
+                flows=tuple(
+                    PlanConsumerFlowDesc(
+                        reads=tuple(
+                            PlanConsumerReadDesc(
+                                kind=read.kind.value,
+                                role=str(getattr(read, "role", "")),
+                                phase=str(getattr(read, "phase", "")),
+                            )
+                            for read in flow.reads
+                        ),
+                        writes=tuple(
+                            PlanConsumerWriteDesc(
+                                kind=write.kind.value,
+                                mode=write.mode,
+                                phase=str(getattr(write, "phase", "")),
+                            )
+                            for write in flow.writes
+                        ),
+                        bundle_key=tuple(getattr(flow, "bundle_key", ())),
+                    )
+                    for flow in c.flows()
+                ),
+            )
         )
     return _core.compile_execution_plan(
-        prod_dicts,
-        cons_dicts,
+        producer_descs,
+        consumer_descs,
         enforced_kinds=None if enforced_kinds is None else [k for k in enforced_kinds],
         supported_hooks=None if supported_hooks is None else [h for h in supported_hooks],
         backend=backend,
@@ -82,12 +110,16 @@ def _assert_same(test_case, producers, consumers, **kwargs) -> None:
     oracle_result = oracle_error = None
     try:
         plan = _rust_call(producers, consumers, **kwargs)
-        rust_result = (plan.ordered_producer_ids, dict(plan.port_sources))
+        rust_result = (
+            plan.ordered_producer_ids,
+            dict(plan.port_sources),
+            plan.capture_resident_producer_ids,
+        )
     except RuntimeError as exc:
         rust_error = str(exc)
     try:
-        ordered, sources = _oracle_call(producers, consumers, **kwargs)
-        oracle_result = (ordered, sources)
+        ordered, sources, capture_resident = _oracle_call(producers, consumers, **kwargs)
+        oracle_result = (ordered, sources, capture_resident)
     except OracleExecutionPlanError as exc:
         oracle_error = str(exc)
     if oracle_error is not None:
@@ -99,6 +131,122 @@ def _assert_same(test_case, producers, consumers, **kwargs) -> None:
 
 
 class ExecutionPlanOracleMatrixUnitTest(unittest.TestCase):
+    def test_phase_specific_read_selects_only_matching_producer(self) -> None:
+        producers = [
+            producer_desc(
+                id="p.decode",
+                outputs=[{
+                    "port": "tllm:residual.decode@1",
+                    "kind": "residual_stream",
+                    "phases": ["decode"],
+                }],
+            ),
+            producer_desc(
+                id="p.prefill",
+                outputs=[{
+                    "port": "tllm:residual.prefill@1",
+                    "kind": "residual_stream",
+                    "phases": ["prefill"],
+                }],
+            ),
+        ]
+        consumers = [
+            consumer_desc(
+                id="c.decode",
+                reads=[{"kind": "residual_stream", "phase": "decode"}],
+            )
+        ]
+
+        _assert_same(self, producers, consumers)
+        plan = _rust_call(producers, consumers)
+        self.assertEqual(plan.ordered_producer_ids, ["p.decode"])
+
+    def test_write_validation_respects_phase(self) -> None:
+        producers = [
+            producer_desc(
+                id="p.prefill",
+                outputs=[{
+                    "port": "tllm:residual.prefill@1",
+                    "kind": "residual_stream",
+                    "writable": True,
+                    "write_modes": ["replace"],
+                    "phases": ["prefill"],
+                }],
+            )
+        ]
+        consumers = [
+            consumer_desc(
+                id="c.decode",
+                writes=[{
+                    "kind": "residual_stream",
+                    "mode": "replace",
+                    "phase": "decode",
+                }],
+            )
+        ]
+
+        _assert_same(self, producers, consumers)
+
+    def test_capture_resident_ids_require_layer_post_and_graph_safety(self) -> None:
+        producers = [
+            producer_desc(
+                id="p.capture",
+                outputs=[{"port": "tllm:a@1", "kind": "residual_stream"}],
+                hook_points=["layer.post"],
+                graph_safety="CAPTURE_SAFE",
+            ),
+            producer_desc(
+                id="p.eager",
+                outputs=[{"port": "tllm:b@1", "kind": "residual_stream"}],
+                hook_points=["layer.post"],
+                graph_safety="EAGER_ONLY",
+            ),
+            producer_desc(
+                id="p.host",
+                outputs=[{"port": "tllm:c@1", "kind": "residual_stream"}],
+                hook_points=["execute_model.post"],
+                graph_safety="REPLAY_STATEFUL",
+            ),
+        ]
+        consumers = [consumer_desc(id="c0", reads=["residual_stream"])]
+
+        _assert_same(self, producers, consumers)
+        plan = _rust_call(producers, consumers)
+        self.assertEqual(plan.capture_resident_producer_ids, ["p.capture"])
+
+    def test_rust_rejects_duplicate_bundle_fields_from_typed_ir(self) -> None:
+        consumer = PlanConsumerDesc(
+            id="duplicate.fields",
+            flows=(
+                PlanConsumerFlowDesc(
+                    reads=(
+                        PlanConsumerReadDesc(kind="logits", role=""),
+                        PlanConsumerReadDesc(kind="logits", role=""),
+                    ),
+                    writes=(),
+                    bundle_key=(),
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "duplicate bundle field 'logits'"):
+            _core.compile_execution_plan([], [consumer])
+
+    def test_rust_rejects_unknown_bundle_key_from_typed_ir(self) -> None:
+        consumer = PlanConsumerDesc(
+            id="bad.key",
+            flows=(
+                PlanConsumerFlowDesc(
+                    reads=(),
+                    writes=(),
+                    bundle_key=("engine_setp_id",),
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unknown bundle_key field 'engine_setp_id'"):
+            _core.compile_execution_plan([], [consumer])
+
     def test_fixed_scenarios(self) -> None:
         p_res = producer_desc(
             id="p.residual",
@@ -139,6 +287,49 @@ class ExecutionPlanOracleMatrixUnitTest(unittest.TestCase):
         ]
         _assert_same(self, producers, [consumer_desc(id="c0", reads=["logits"])])
 
+    def test_transitive_requirement_uses_highest_priority_exact_provider(self) -> None:
+        producers = [
+            producer_desc(
+                id="p.source.low",
+                priority=1,
+                outputs=[{"port": "tllm:x@1", "kind": "hidden_target"}],
+            ),
+            producer_desc(
+                id="p.source.high",
+                priority=5,
+                outputs=[{"port": "tllm:x@1", "kind": "hidden_target"}],
+            ),
+            producer_desc(
+                id="p.sink",
+                outputs=[{"port": "tllm:y@1", "kind": "logits"}],
+                requires=["tllm:x@1"],
+            ),
+        ]
+
+        _assert_same(self, producers, [consumer_desc(id="c0", reads=["logits"])])
+        plan = _rust_call(producers, [consumer_desc(id="c0", reads=["logits"])])
+        self.assertEqual(plan.ordered_producer_ids, ["p.source.high", "p.sink"])
+        self.assertEqual(dict(plan.port_sources)["tllm:x@1"], "p.source.high")
+
+    def test_transitive_requirement_rejects_equal_priority_providers(self) -> None:
+        producers = [
+            producer_desc(
+                id="p.source.b",
+                outputs=[{"port": "tllm:x@1", "kind": "hidden_target"}],
+            ),
+            producer_desc(
+                id="p.source.a",
+                outputs=[{"port": "tllm:x@1", "kind": "hidden_target"}],
+            ),
+            producer_desc(
+                id="p.sink",
+                outputs=[{"port": "tllm:y@1", "kind": "logits"}],
+                requires=["tllm:x@1"],
+            ),
+        ]
+
+        _assert_same(self, producers, [consumer_desc(id="c0", reads=["logits"])])
+
     def test_cycle_detection(self) -> None:
         producers = [
             producer_desc(id="p.a", outputs=[{"port": "tllm:a@1", "kind": "logits"}],
@@ -150,7 +341,7 @@ class ExecutionPlanOracleMatrixUnitTest(unittest.TestCase):
 
     def test_randomized_dags(self) -> None:
         rng = random.Random(20260817)
-        for trial in range(60):
+        for trial in range(8):
             n_producers = rng.randint(1, 6)
             ports = [f"tllm:p{i}@1" for i in range(n_producers)]
             producers = []

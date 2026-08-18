@@ -4,13 +4,25 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Generic, Sequence, TypeVar
+from typing import Generic, Mapping, Protocol, Sequence, TypeVar
 
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.ports.base import ConsumerFlow
 
 ConfigT = TypeVar("ConfigT")
+
+
+class FusionGroupHandle(Protocol):
+    """One executable artifact for an exact compiler-selected flow group."""
+
+    def execute(
+        self,
+        bundles: Mapping[str, PortBundle],
+        ctx: RuntimeContext,
+    ) -> None: ...
+
+    def replay_count(self) -> int: ...
 
 
 class BaseConsumer(ABC, Generic[ConfigT]):
@@ -34,6 +46,22 @@ class BaseConsumer(ABC, Generic[ConfigT]):
     def on_step_end(self, ctx: RuntimeContext) -> None:
         """Optional hook called after the model step is complete."""
         _ = ctx
+
+    def retire_device_lease(self, ctx: RuntimeContext) -> None:
+        """Fence any step-lifetime device inputs before producer reuse."""
+        _ = ctx
+
+    def fusion_replay_count(self) -> int:
+        """Host-visible replay counter for a compiler-selected fused callable."""
+        return 0
+
+    def fusion_group_handle(
+        self,
+        flow_ids: tuple[str, ...],
+    ) -> FusionGroupHandle | None:
+        """Return the single executable artifact owning ``flow_ids``."""
+        _ = flow_ids
+        return None
 
     def synchronize(self) -> None:
         """Optional flush hook for async/background consumers."""

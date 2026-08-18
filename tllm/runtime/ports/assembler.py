@@ -26,13 +26,13 @@ class BundleAssembler:
         self._bindings = tuple(self._build_bindings(flow))
         self._pending: Dict[object, Dict[str, object]] = {}
         self._pending_keys: Dict[object, BundleKey] = {}
+        self._pending_versions: Dict[object, int] = {}
 
     def _build_bindings(self, flow: ConsumerFlow) -> List[_Binding]:
-        bindings: List[_Binding] = []
-        for read in flow.reads:
-            name = str(read.role).strip() or str(read.kind.value)
-            bindings.append(_Binding(name=name, spec=read))
-        return bindings
+        return [
+            _Binding(name=name, spec=read)
+            for name, read in zip(flow.bundle_fields, flow.reads)
+        ]
 
     def _match_binding(self, frame: PortFrame) -> _Binding | None:
         for binding in self._bindings:
@@ -76,6 +76,7 @@ class BundleAssembler:
             projected_values = tuple(getattr(key, field_name) for field_name in self._flow.bundle_key)
             normalized = {
                 "engine_step_id": key.engine_step_id,
+                "generation_group_id": key.generation_group_id,
                 "phase": key.phase,
                 "request_id": key.request_id,
                 "sample_idx": key.sample_idx,
@@ -87,8 +88,9 @@ class BundleAssembler:
                 phase=str(normalized["phase"]),
                 request_id=str(normalized["request_id"]),
                 sample_idx=int(normalized["sample_idx"]),
+                generation_group_id=str(normalized["generation_group_id"]),
             )
-        return PortBundle(key=key, entries=finalized)
+        return PortBundle(key=key, entries=finalized, version=self._pending_versions[group_key])
 
     def push(self, frame: PortFrame) -> List[PortBundle]:
         binding = self._match_binding(frame)
@@ -98,6 +100,11 @@ class BundleAssembler:
         group_key = self._project_group_key(frame.key)
         entries = self._pending.setdefault(group_key, {})
         self._pending_keys.setdefault(group_key, frame.key)
+        existing_version = self._pending_versions.setdefault(group_key, int(frame.version))
+        if existing_version != int(frame.version):
+            raise RuntimeError(
+                f"bundle group contains mixed port versions {existing_version} and {int(frame.version)}"
+            )
         entries[binding.name] = self._merge_entry(entries.get(binding.name), frame.payload)
         if len(entries) < len(self._bindings):
             return []
@@ -107,6 +114,7 @@ class BundleAssembler:
         bundle = self._build_bundle(group_key, entries)
         self._pending.pop(group_key, None)
         self._pending_keys.pop(group_key, None)
+        self._pending_versions.pop(group_key, None)
         return [bundle]
 
     def pending_bundle_count(self) -> int:
@@ -120,4 +128,5 @@ class BundleAssembler:
             bundles.append(self._build_bundle(group_key, entries))
             self._pending.pop(group_key, None)
             self._pending_keys.pop(group_key, None)
+            self._pending_versions.pop(group_key, None)
         return bundles

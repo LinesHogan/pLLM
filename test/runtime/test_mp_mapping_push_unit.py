@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from tllm.runtime.vllm_patch.capture_runner import make_mapping_add_request
+from tllm.runtime.vllm_patch.capture_runner import (
+    make_mapping_add_request,
+    run_generate_with_request_mapping,
+)
 
 
 class _RecordingPlane:
@@ -79,6 +83,36 @@ class MappingAddRequestUnitTest(unittest.TestCase):
         )
         wrapped("r0", "p", None)
         self.assertEqual(plane.pushes, [[("r0", 0, 3)]])
+
+    def test_generate_wrapper_forwards_progress_setting(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class Engine:
+            add_request = staticmethod(lambda *args, **kwargs: None)
+
+        class LLM:
+            llm_engine = Engine()
+
+            def generate(self, prompts, params, **kwargs):
+                calls.append(dict(kwargs))
+                return []
+
+        runtime = _RuntimeStub()
+        with (
+            patch("tllm.runtime.mp.control.ControlPlane.try_bind", return_value=None),
+            patch("tllm.runtime.vllm_patch.capture_runner.apply_prompt_contexts", side_effect=lambda _r, prompts, **_k: prompts),
+            patch("tllm.runtime.vllm_patch.capture_runner.build_generation_trace_from_outputs", return_value=None),
+            patch("tllm.runtime.vllm_patch.capture_runner.dispatch_post_generate_port_bundles"),
+        ):
+            run_generate_with_request_mapping(
+                runtime=runtime,
+                llm=LLM(),
+                prompts=["p"],
+                params=object(),
+                use_tqdm=False,
+            )
+
+        self.assertEqual(calls, [{"use_tqdm": False}])
 
 
 if __name__ == "__main__":

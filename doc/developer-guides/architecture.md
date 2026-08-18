@@ -40,6 +40,70 @@ ESamp follows this split:
 - `ESampTrainEngine` owns the training pipeline and model-bank mechanics.
 - Runtime does not know ESamp's training details.
 
+## Language and Compiler Boundary
+
+tLLM's declarative model is both a small dataflow language and a compiler
+pipeline. The useful boundary is not "Python versus Rust" by file count. It is
+the boundary between declarations, decisions, and execution:
+
+| Layer | Owns | Does not own |
+|------|------|--------------|
+| Python typed front-end | `ConsumerFlow`, producer descriptors, plugin specs, structural port addresses, typed consumer input views | Cross-flow scheduling decisions |
+| Rust compiler mid-end | startup validation, provider selection, dependency DAGs, legal hook placement, fusion eligibility metadata | Tensors, CUDA streams/events, vLLM objects, plugin instances |
+| Python runtime executor | vLLM adapters, Tensor/CUDA materialization, bundle assembly, deferred work, stream/event launch | Re-deciding the compiled plan on every token |
+
+The FFI carries frozen attribute-based descriptors. It does not carry nested
+magic dictionaries or Torch objects. Dynamic probing remains only at foreign
+API and plugin boundaries; after a boundary value is validated, downstream
+code uses typed attributes. `PortBundle.entries` remains a compatibility and
+extension API, while built-in consumers lower it once into typed input views.
+
+Producer objects are declarations, not miniature executors. They describe
+outputs, requirements, hooks, and graph safety. Backend drivers remain
+responsible for materializing those declarations from vLLM tensors.
+
+## DAG and Automatic Placement
+
+At startup, tLLM lowers flow reads and writes to tagged structural
+`PortAddress` values. The Rust core builds dependency edges for same-consumer
+state order, read-after-write/write-after-read hazards, and explicitly ordered
+write-after-write hazards. A stable Kahn topological sort rejects cycles and
+produces execution order.
+
+Placement then computes legal hook bounds from mobility, declared and earliest
+hooks, graph mode, backend-materialized hooks, and predecessor selections. The
+current scheduler is a constrained greedy list scheduler. For each flow in
+topological order it maximizes, in order:
+
+1. capture eligibility bonus;
+2. configured or default hook `bubble_score`;
+3. proximity to the declared hook;
+4. stable hook order as a deterministic tie-break.
+
+This is intentionally smaller than a resource-constrained project scheduler.
+The current cost model has no measured task duration, SM/HBM/copy-engine
+capacity, or transfer cost, so tLLM does not claim global optimality. Fusion
+output is eligibility metadata only: a group must be topologically contiguous,
+use the selected materialized fusion hook, have stable leased buffers and a
+static row bucket. Torch/vLLM compilation remains responsible for kernel and
+graph optimization.
+
+Future algorithms should follow the optimization opportunity and available
+cost data:
+
+| Opportunity | Appropriate algorithm |
+|-------------|-----------------------|
+| Dependency legality and stable ordering | Kahn; Tarjan only when richer SCC diagnostics are needed |
+| Earliest/latest legal hook windows | ASAP/ALAP constraint propagation |
+| Online deadlines after duration/resource profiling exists | critical-path or EDF-driven list scheduling with admission control |
+| Capture-safe fusion regions | topologically convex region formation |
+| Stable buffer reuse after order is fixed | liveness intervals plus linear scan/interval coloring |
+| Multiple alternative providers with shared dependencies | AND-OR selection; bounded search or ILP only when the graph warrants it |
+
+CP-SAT or exhaustive search can be useful as a small-graph oracle, but adding a
+solver before adding a real resource/cost model would only optimize invented
+numbers.
+
 ## Port: The Public Data Interface
 
 Consumers do not manipulate vLLM internals directly. They declare ports:

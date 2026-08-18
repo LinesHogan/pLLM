@@ -50,6 +50,11 @@ class RowSelection(StrEnum):
     FIRST_PER_PROMPT = "first_per_prompt"
 
 
+class FlowFusion(StrEnum):
+    NONE = "none"
+    SIDE_STREAM_CUDAGRAPH = "side_stream_cudagraph"
+
+
 class WriteMode(StrEnum):
     """How a consumer write mutates its target port.
 
@@ -148,7 +153,9 @@ class TimingContract:
 
 Window = FlowWindow | Literal["background", "same_step", "next_step", "out_of_band"]
 DeliveryMode = FlowDelivery | Literal["bundle", "device_lease"]
+LeaseLifetime = Literal["consume_call", "step"]
 RowCompaction = RowSelection | Literal["none", "first_per_prompt"]
+FusionKind = FlowFusion | Literal["none", "side_stream_cudagraph"]
 WriteModeName = WriteMode | Literal["replace", "add", "append", "wrapper"]
 WriteRowSelection = WriteRows | Literal["all", "decode_only", "first_per_prompt", "provider_selected"]
 Timing = TimingContract | Literal["pinned", "deferrable", "advanceable", "free"]
@@ -170,11 +177,16 @@ class PortRead:
 class PortWrite:
     kind: PortKind
     locator: Locator | None = None
+    role: str = ""
     mode: str = ""
     rows: WriteRowSelection = WriteRows.ALL
     order: int = 0
+    fusion_candidate: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.role, str):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard
+            raise TypeError("write role must be str")
+        object.__setattr__(self, "role", self.role.strip())
         if self.mode:
             if not isinstance(self.mode, (str, WriteMode)):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
                 raise TypeError("write mode must be str")
@@ -188,6 +200,10 @@ class PortWrite:
             raise ValueError(f"unsupported write rows `{self.rows}`") from exc
         if not isinstance(self.order, int):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
             raise ValueError("PortWrite.order must be an int")
+        if not isinstance(self.fusion_candidate, bool):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
+            raise ValueError("PortWrite.fusion_candidate must be a bool")
+        if self.fusion_candidate and self.mode not in (WriteMode.REPLACE, WriteMode.ADD):
+            raise ValueError("fusion_candidate writes require mode='replace' or mode='add'")
 
 
 @dataclass(frozen=True)
@@ -200,8 +216,18 @@ class ConsumerFlow:
     max_bundle_rows: int = 0
     delivery: DeliveryMode = "bundle"
     ownership: BufferOwnership = BufferOwnership.BORROWED
+    lease_lifetime: LeaseLifetime = "consume_call"
     row_compaction: RowCompaction = "none"
+    fusion: FusionKind = FlowFusion.NONE
     timing: Timing = TimingContract()
+
+    @property
+    def bundle_fields(self) -> tuple[str, ...]:
+        return tuple(read.role.strip() or read.kind.value for read in self.reads)
+
+    @property
+    def output_fields(self) -> tuple[str, ...]:
+        return tuple(write.role.strip() or f"{write.kind.value}_write" for write in self.writes)
 
     def __post_init__(self) -> None:
         try:
@@ -216,17 +242,64 @@ class ConsumerFlow:
             ownership = BufferOwnership(str(self.ownership))
         except ValueError as exc:
             raise ValueError(f"unsupported buffer ownership `{self.ownership}`") from exc
+        lease_lifetime = str(self.lease_lifetime)
+        if lease_lifetime not in ("consume_call", "step"):
+            raise ValueError(
+                f"unsupported lease_lifetime `{self.lease_lifetime}`; expected 'consume_call' or 'step'"
+            )
         try:
             row_compaction = RowSelection(str(self.row_compaction))
         except ValueError as exc:
             raise ValueError(f"unsupported row_compaction mode `{self.row_compaction}`") from exc
+        try:
+            fusion = FlowFusion(str(self.fusion))
+        except ValueError as exc:
+            raise ValueError(f"unsupported flow fusion kind `{self.fusion}`") from exc
         timing = self.timing if isinstance(self.timing, TimingContract) else TimingContract(mobility=TimingMobility(str(self.timing)))
         object.__setattr__(self, "timing", timing)
+        reads = tuple(self.reads)
+        writes = tuple(self.writes)
         bundle_key = tuple(self.bundle_key)
+        object.__setattr__(self, "reads", reads)
+        object.__setattr__(self, "writes", writes)
+        object.__setattr__(self, "bundle_key", bundle_key)
         object.__setattr__(self, "window", window)
         object.__setattr__(self, "delivery", delivery)
         object.__setattr__(self, "ownership", ownership)
+        object.__setattr__(self, "lease_lifetime", lease_lifetime)
         object.__setattr__(self, "row_compaction", row_compaction)
+        object.__setattr__(self, "fusion", fusion)
+        valid_bundle_key_fields = {
+            "engine_step_id",
+            "generation_group_id",
+            "phase",
+            "request_id",
+            "sample_idx",
+        }
+        seen_key_fields: set[str] = set()
+        for field_name in bundle_key:
+            if field_name not in valid_bundle_key_fields:
+                raise ValueError(f"unknown bundle_key field `{field_name}`")
+            if field_name in seen_key_fields:
+                raise ValueError(f"duplicate bundle_key field `{field_name}`")
+            seen_key_fields.add(field_name)
+        seen_bundle_fields: set[str] = set()
+        seen_read_addresses: list[PortRead] = []
+        for read, field_name in zip(reads, self.bundle_fields):
+            if field_name in seen_bundle_fields:
+                raise ValueError(f"duplicate bundle field `{field_name}`; assign distinct PortRead.role values")
+            seen_bundle_fields.add(field_name)
+            if any(
+                previous.kind == read.kind and previous.locator == read.locator
+                for previous in seen_read_addresses
+            ):
+                raise ValueError(
+                    f"duplicate flow read for port kind `{read.kind.value}` and locator {read.locator!r}"
+                )
+            seen_read_addresses.append(read)
+        output_fields = self.output_fields
+        if len(set(output_fields)) != len(output_fields):
+            raise ValueError("duplicate flow output role; assign distinct PortWrite.role values")
         step_scope_key = ("engine_step_id", "phase")
         if delivery == FlowDelivery.DEVICE_LEASE:
             if ownership != BufferOwnership.RUNTIME_LEASE:
@@ -236,6 +309,26 @@ class ConsumerFlow:
         if row_compaction == RowSelection.FIRST_PER_PROMPT and bundle_key != step_scope_key:
             raise ValueError("first_per_prompt row compaction currently requires bundle_key=('engine_step_id', 'phase')")
         if timing.mobility != TimingMobility.PINNED and delivery == FlowDelivery.DEVICE_LEASE:
-            # A device lease is bound to the buffers valid at its declared
-            # point; movable work must be batch-presentable (bundle delivery).
-            raise ValueError("device_lease delivery cannot be timing-movable")
+            if ownership != BufferOwnership.RUNTIME_LEASE or lease_lifetime != "step":
+                raise ValueError(
+                    "timing-movable device_lease delivery requires ownership='runtime_lease' "
+                    "and lease_lifetime='step'"
+                )
+        if timing.mobility != TimingMobility.PINNED and bundle_key != step_scope_key:
+            raise ValueError(
+                "timing-movable flow currently requires bundle_key=('engine_step_id', 'phase')"
+            )
+        if any(write.fusion_candidate for write in self.writes):
+            if delivery != FlowDelivery.DEVICE_LEASE or ownership != BufferOwnership.RUNTIME_LEASE:
+                raise ValueError(
+                    "fusion_candidate writes require stable device_lease delivery with ownership='runtime_lease'"
+                )
+            if self.max_bundle_rows <= 0:
+                raise ValueError("fusion_candidate writes require max_bundle_rows>0 for a static shape bucket")
+        if fusion != FlowFusion.NONE:
+            if delivery != FlowDelivery.DEVICE_LEASE or ownership != BufferOwnership.RUNTIME_LEASE:
+                raise ValueError(
+                    "flow fusion requires stable device_lease delivery with ownership='runtime_lease'"
+                )
+            if self.max_bundle_rows <= 0:
+                raise ValueError("flow fusion requires max_bundle_rows>0 for a static shape bucket")

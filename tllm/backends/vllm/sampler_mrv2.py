@@ -31,7 +31,11 @@ import torch
 import torch.nn.functional as F
 
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
-from tllm.runtime.vllm_patch.sampler_patch import _notify_after_sample, _resolve_provider
+from tllm.runtime.vllm_patch.sampler_patch import (
+    _notify_after_sample,
+    _resolve_provider,
+    dispatch_sampler_pre_draw,
+)
 
 _MARK_ATTR = "_tllm_mrv2_sampler_wrapped"
 _SAMPLING_EPS = 1e-5
@@ -253,8 +257,26 @@ def _gumbel_over_candidates(
     return sampled
 
 
+def _record_mrv2_candidate_stats(
+    runtime: Any,
+    *,
+    candidate_count: int,
+    row_count: int,
+) -> None:
+    precompute = runtime.sampler_precompute
+    precompute.candidate_sample_count += 1
+    precompute.candidate_token_count += int(candidate_count)
+    precompute.candidate_row_count += int(row_count)
+    precompute.candidate_max_count = max(
+        int(precompute.candidate_max_count),
+        int(candidate_count),
+    )
+    precompute.candidate_kernel_triton_count += 1
+
+
 def _sample_post_filter_minp_fused(
     *,
+    runtime: Any,
     sampler: Any,
     logits: torch.Tensor,
     state: CandidateModifierState,
@@ -319,7 +341,7 @@ def _sample_post_filter_minp_fused(
         safe_ids=safe_ids,
         device=logits.device,
     )
-    return gumbel_argmax_candidates(
+    sampled = gumbel_argmax_candidates(
         vals,
         distiller_vals,
         ids,
@@ -331,10 +353,17 @@ def _sample_post_filter_minp_fused(
         expanded_idx_mapping=expanded_idx_mapping,
         row_count=int(logits.shape[0]),
     )
+    _record_mrv2_candidate_stats(
+        runtime,
+        candidate_count=int(ids.numel()),
+        row_count=int(affected.numel()),
+    )
+    return sampled
 
 
 def _sample_post_filter_candidates(
     *,
+    runtime: Any,
     sampler: Any,
     filtered_logits: torch.Tensor,
     state: CandidateModifierState,
@@ -387,7 +416,7 @@ def _sample_post_filter_candidates(
         device=filtered_logits.device,
     )
     candidate_logits = (1.0 + beta) * llm_vals - beta * distiller_vals
-    return _gumbel_over_candidates(
+    sampled = _gumbel_over_candidates(
         candidate_logits=candidate_logits,
         valid=valid,
         safe_ids=safe_ids,
@@ -396,6 +425,12 @@ def _sample_post_filter_candidates(
         expanded_idx_mapping=expanded_idx_mapping,
         row_count=int(filtered_logits.shape[0]),
     )
+    _record_mrv2_candidate_stats(
+        runtime,
+        candidate_count=int(ids.numel()),
+        row_count=int(affected.numel()),
+    )
+    return sampled
 
 
 def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sample: Any):
@@ -427,6 +462,11 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
         _tp0 = _time.perf_counter() if _trace else 0.0
         view = _build_mrv2_step_view(runtime=runtime, runner=runner, logits=logits)
         state = provider.prepare_step(view) if view is not None else None
+        dispatch_sampler_pre_draw(
+            runtime=runtime,
+            runner=runner,
+            device=logits.device,
+        )
         if _trace:
             from tllm.runtime.residual_runtime import record_path_hotspot_cpu
 
@@ -460,6 +500,7 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
         needs_processed = return_logprobs and sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         if state.backend != "pre_filter_dense" and not needs_processed:
             sampled = _sample_post_filter_minp_fused(
+                runtime=runtime,
                 sampler=sampler,
                 logits=logits,
                 state=state,
@@ -514,6 +555,7 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
             filtered = apply_top_k_top_p(processed_logits, top_k, top_p)
             if not needs_processed:
                 sampled = _sample_post_filter_candidates(
+                    runtime=runtime,
                     sampler=sampler,
                     filtered_logits=filtered,
                     state=state,

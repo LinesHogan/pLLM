@@ -5,16 +5,18 @@ from __future__ import annotations
 
 from tllm.consumers.override.config import OverRIDEConsumerConfig
 from tllm.consumers.override.consumer import OverRIDEConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = OverRIDEConsumer
-CONFIG_TYPE = OverRIDEConsumerConfig
+PLUGIN = ConsumerPluginSpec(
+    "override", OverRIDEConsumer, OverRIDEConsumerConfig, OverRIDEConsumer
+)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: OverRIDEConsumerConfig | None = None) -> OverRIDEConsumer:
-    return OverRIDEConsumer(config or OverRIDEConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: OverRIDEConsumerConfig | None = None, *, primary: bool = False) -> OverRIDEConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

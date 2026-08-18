@@ -5,16 +5,16 @@ from __future__ import annotations
 
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = ESampConsumer
-CONFIG_TYPE = ESampConsumerConfig
+PLUGIN = ConsumerPluginSpec("esamp", ESampConsumer, ESampConsumerConfig, ESampConsumer)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: ESampConsumerConfig | None = None) -> ESampConsumer:
-    return ESampConsumer(config or ESampConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: ESampConsumerConfig | None = None, *, primary: bool = False) -> ESampConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

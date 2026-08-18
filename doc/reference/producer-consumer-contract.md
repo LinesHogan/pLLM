@@ -4,6 +4,18 @@ This document describes the data contract between Producer and Consumer.
 
 The Producer locates rows inside vLLM's packed tensors. The Consumer receives those rows and performs analysis, training, export, or feedback. Runtime connects the two by installing hooks, maintaining localization metadata, and assembling bundles.
 
+Producer plugins expose declarative descriptors: output `PortSpec` values,
+required `PortId` values, supported hook points, and graph safety. They do not
+implement a separate `bind/emit` execution path. The backend driver is the
+single owner of Tensor/CUDA materialization, while the Rust execution-plan
+compiler resolves and validates descriptor dependencies at startup.
+
+Consumer packages expose a typed `ConsumerPluginSpec`. Built-ins are imported
+lazily, and external packages may register through the
+`tllm.consumer_plugins` entry-point group or the programmatic registry. The
+plugin boundary validates the dynamic object once; the registry stores the
+narrowed typed spec afterward.
+
 ## Producer Output
 
 Producer extracts:
@@ -31,6 +43,10 @@ Modern consumers receive `PortBundle` objects through:
 ```python
 consume_bundle(bundle, ctx)
 ```
+
+The bundle key is a frozen typed record. It includes decode identity fields and
+`generation_group_id` for post-generate flows. A post-generate bundle cannot
+combine trace entries from different generation groups.
 
 Typical entries include:
 

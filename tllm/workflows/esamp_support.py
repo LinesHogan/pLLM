@@ -10,6 +10,7 @@ import torch
 
 from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
+from tllm.ports.base import RowSelection
 from tllm.runtime import residual_runtime as runtime
 from tllm.runtime.vllm_patch import capture_runner as _capture_runner
 
@@ -25,6 +26,7 @@ def configure_esamp_runtime(
     distiller_lr: float = 1e-3,
     per_request_models: bool = False,
     per_request_model_bank: bool = False,
+    training_row_selection: RowSelection | str = RowSelection.ALL,
     model_bank_slots: int = 0,
     model_bank_flush_interval: int = 1,
     model_bank_rank: int = 64,
@@ -53,6 +55,7 @@ def configure_esamp_runtime(
         distiller_lr=float(distiller_lr),
         per_request_models=bool(per_request_models),
         per_request_model_bank=bool(per_request_model_bank),
+        training_row_selection=RowSelection(str(training_row_selection)),
         model_bank_slots=int(model_bank_slots),
         model_bank_flush_interval=int(model_bank_flush_interval),
         model_bank_rank=int(model_bank_rank),
@@ -100,6 +103,8 @@ def run_generate_with_request_mapping(
     params: Sequence[object],
     request_prompt_indices: Sequence[int] | None = None,
     request_sample_indices: Sequence[int] | None = None,
+    use_tqdm: bool | None = None,
+    dispatch_post_generate: bool = True,
 ) -> object:
     return _capture_runner.run_generate_with_request_mapping(
         runtime=runtime.RUNTIME,
@@ -108,6 +113,8 @@ def run_generate_with_request_mapping(
         params=params,
         request_prompt_indices=request_prompt_indices,
         request_sample_indices=request_sample_indices,
+        use_tqdm=use_tqdm,
+        dispatch_post_generate=dispatch_post_generate,
     )
 
 

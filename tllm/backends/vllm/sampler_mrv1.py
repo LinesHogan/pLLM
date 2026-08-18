@@ -27,6 +27,7 @@ from typing import Any
 import torch
 
 from tllm.runtime.vllm_patch.sampler_patch import (
+    dispatch_sampler_pre_draw,
     _notify_after_sample,
     _resolve_provider,
 )
@@ -113,6 +114,7 @@ def _standard_completion(
 def _maybe_sample_precomputed_dense_fast(
     *,
     runtime: Any,
+    runner: Any,
     provider: Any,
     sampler: Any,
     logits: torch.Tensor,
@@ -135,6 +137,10 @@ def _maybe_sample_precomputed_dense_fast(
     backend = str(getattr(getattr(provider, "config", None), "distiller_sampler_backend", "") or "")
     if backend != "pre_filter_dense":
         return None
+    event = getattr(runtime.sampler_precompute, "event", None)
+    if event is not None and logits.device.type == "cuda":
+        torch.cuda.current_stream(device=logits.device).wait_event(event)
+    dispatch_sampler_pre_draw(runtime=runtime, runner=runner, device=logits.device)
     dense = dense.to(device=logits.device, dtype=logits.dtype)
     logits.mul_(1.0 + beta)
     logits.add_(dense, alpha=-beta)
@@ -179,6 +185,7 @@ def wrapped_sampler_sample_v027(
     modified_logits = logits
     sampled: torch.Tensor | None = _maybe_sample_precomputed_dense_fast(
         runtime=runtime,
+        runner=runner,
         provider=provider,
         sampler=sampler,
         logits=logits,
@@ -201,6 +208,11 @@ def wrapped_sampler_sample_v027(
             view=view,
             provider=provider,
             greedy_sampled=greedy_sampled,
+            before_draw=lambda: dispatch_sampler_pre_draw(
+                runtime=runtime,
+                runner=runner,
+                device=logits.device,
+            ),
         )
 
     if sampled is None:

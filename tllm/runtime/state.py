@@ -10,7 +10,7 @@ hook installation, dispatch, or lifecycle logic — see
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -20,14 +20,22 @@ from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.runtime.extensions import ExtensionRegistry
 from tllm.runtime.fast_weight.state import FastWeightState
 from tllm.runtime.resources import SamplerPrecomputeState
+from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeStore
+from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlStore
 from tllm.runtime.test_time.lora import TestTimeLoRAService
 from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
+from tllm.runtime.scheduling.deferred import DeferredWorkQueue
+from tllm.runtime.fusion import FusionExecutor
+from tllm.runtime.stats import PlacementStats
+from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
+
+if TYPE_CHECKING:
+    from tllm.runtime.producer_executor import ProducerExecutor
 
 
 RuntimeConsumer = BaseConsumer
@@ -108,7 +116,16 @@ class ResidualRuntimeState:
     consumer_registry: Optional[ConsumerRegistry] = None
     dispatch_plan: Optional[DispatchPlan] = None
     execution_plan: Optional[ExecutionPlan] = None
-    extensions: ExtensionRegistry = field(default_factory=ExtensionRegistry)
+    producer_executor: Optional["ProducerExecutor"] = None
+    deferred_work_queue: DeferredWorkQueue = field(default_factory=DeferredWorkQueue)
+    fusion_executor: FusionExecutor = field(default_factory=FusionExecutor)
+    placement_stats: PlacementStats = field(default_factory=PlacementStats)
+    reward_outcome_store: RewardOutcomeStore = field(default_factory=RewardOutcomeStore)
+    retry_control_store: RetryControlStore = field(default_factory=RetryControlStore)
+    update_barrier_store: UpdateBarrierStore = field(default_factory=UpdateBarrierStore)
+    last_reward_outcomes: RewardOutcomeBatch | None = None
+    last_retry_controls: RetryControlBatch | None = None
+    last_update_barriers: UpdateBarrierBatch | None = None
     test_time_lora_enabled: bool = False
     test_time_lora_service: Optional[TestTimeLoRAService] = None
     fast_weight_state: Optional[FastWeightState] = None

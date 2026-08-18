@@ -14,20 +14,25 @@ Common causes include CUDA/PyTorch mismatch and an unsupported compiler. Prefer 
 
 ### Which vLLM version is required?
 
-tLLM requires `vllm >= 0.7.2` and only supports the vLLM v1 engine.
+tLLM supports `vllm >= 0.27.1, < 0.28` and only supports the vLLM v1 engine.
 
-The repo-local development environment currently uses `vllm==0.10.1.1`, so day-to-day validation should prioritize 0.10.x behavior.
+The repo-local development environment currently uses `vllm==0.27.1`, with
+both Model Runner V1 and Model Runner V2 covered by the compatibility gates.
 
 ### What do the vLLM environment variables mean?
 
 | Variable | Meaning | Set automatically? |
 |----------|---------|--------------------|
 | `VLLM_USE_V1=1` | Use the vLLM v1 engine | Yes |
-| `VLLM_ENABLE_V1_MULTIPROCESSING=0` | Keep runtime state in one process | Yes |
+| `VLLM_ENABLE_V1_MULTIPROCESSING=1` | Run EngineCore in a child process | Yes |
 | `VLLM_USE_FLASHINFER_SAMPLER=1` | Enable FlashInfer sampler | No |
 | `VLLM_DISABLE_COMPILE_CACHE` | Disable compile cache | Usually leave unset |
 
-tLLM disables vLLM multiprocessing because Producer/Consumer state is stored in-process.
+tLLM defaults to vLLM multiprocessing. A general plugin rebuilds the runtime in
+the EngineCore process, and a worker extension carries request mappings, live
+control updates, synchronization, and statistics across the process boundary.
+Set the variable to `0` explicitly for in-process debugging; tLLM preserves the
+override.
 
 ## Running and Debugging
 

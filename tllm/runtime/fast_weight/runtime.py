@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from typing import Iterable, Sequence
 
+from tllm.contracts.request_identity import resolve_prompt_sample
 from tllm.runtime.fast_weight.state import (
     DownProjFastWeightOverlayHandle,
     FastWeightKey,
@@ -104,19 +105,13 @@ def _active_request_count(runner: object) -> int:
 
 
 def _resolve_prompt_sample(runtime: object, req_id: object) -> tuple[int, int]:
-    request_id = str(req_id)
     prompt_map = getattr(runtime, "reqid_to_promptidx", {}) or {}
     sample_map = getattr(runtime, "reqid_to_sampleidx", {}) or {}
-    prompt_idx = prompt_map.get(request_id)
-    if prompt_idx is not None:
-        return int(prompt_idx), int(sample_map.get(request_id, 0))
-    if "_" in request_id:
-        maybe_sample_idx, parent_req_id = request_id.split("_", 1)
-        if maybe_sample_idx.isdigit():
-            parent_prompt_idx = prompt_map.get(parent_req_id)
-            if parent_prompt_idx is not None:
-                return int(parent_prompt_idx), int(maybe_sample_idx)
-    return -1, 0
+    return resolve_prompt_sample(
+        req_id,
+        prompt_indices=prompt_map,
+        sample_indices=sample_map,
+    )
 
 
 def _index_int(values: object, idx: int, *, default: int = 0) -> int:

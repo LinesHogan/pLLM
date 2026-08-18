@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Protocol
 
 from tllm.contracts.port_bundle import BundleKey, PortBundle
@@ -16,58 +15,47 @@ from tllm.runtime.consumer_compat import on_step_end as call_consumer_step_end
 from tllm.runtime.dispatch_plan import DispatchPlan, FlowDispatchTarget
 from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
+from tllm.runtime.append_store import RuntimeAppendSink
 
 
 class PostGenerateRuntimeLike(Protocol):
     dispatch_plan: DispatchPlan | None
 
 
-@dataclass(frozen=True)
-class RewardOutcomeSink:
+class RewardOutcomeSink(RuntimeAppendSink[reward_outcome_runtime.RewardOutcomeBatch]):
     """Write-only sink exposed for RewardOutcome post-generate flow writes."""
 
-    runtime: object
-    mode: str = "append"
-
-    def append(self, batch: reward_outcome_runtime.RewardOutcomeBatch) -> int:
-        if self.mode != "append":
-            raise RuntimeError(f"unsupported reward outcome write mode `{self.mode}`")
-        return reward_outcome_runtime.write_reward_outcomes(self.runtime, batch)
-
-    def __call__(self, batch: reward_outcome_runtime.RewardOutcomeBatch) -> int:
-        return self.append(batch)
+    def __init__(self, *, runtime: object, mode: str = "append") -> None:
+        super().__init__(
+            runtime=runtime,
+            mode=mode,
+            port_name="reward outcome",
+            writer=reward_outcome_runtime.write_reward_outcomes,
+        )
 
 
-@dataclass(frozen=True)
-class RetryControlSink:
+class RetryControlSink(RuntimeAppendSink[retry_control_runtime.RetryControlBatch]):
     """Write-only sink exposed for RetryControl post-generate flow writes."""
 
-    runtime: object
-    mode: str = "append"
-
-    def append(self, batch: retry_control_runtime.RetryControlBatch) -> int:
-        if self.mode != "append":
-            raise RuntimeError(f"unsupported retry control write mode `{self.mode}`")
-        return retry_control_runtime.write_retry_controls(self.runtime, batch)
-
-    def __call__(self, batch: retry_control_runtime.RetryControlBatch) -> int:
-        return self.append(batch)
+    def __init__(self, *, runtime: object, mode: str = "append") -> None:
+        super().__init__(
+            runtime=runtime,
+            mode=mode,
+            port_name="retry control",
+            writer=retry_control_runtime.write_retry_controls,
+        )
 
 
-@dataclass(frozen=True)
-class UpdateBarrierSink:
+class UpdateBarrierSink(RuntimeAppendSink[update_barrier_runtime.UpdateBarrierBatch]):
     """Write-only sink exposed for UpdateBarrier post-generate flow writes."""
 
-    runtime: object
-    mode: str = "append"
-
-    def append(self, batch: update_barrier_runtime.UpdateBarrierBatch) -> int:
-        if self.mode != "append":
-            raise RuntimeError(f"unsupported update barrier write mode `{self.mode}`")
-        return update_barrier_runtime.write_update_barriers(self.runtime, batch)
-
-    def __call__(self, batch: update_barrier_runtime.UpdateBarrierBatch) -> int:
-        return self.append(batch)
+    def __init__(self, *, runtime: object, mode: str = "append") -> None:
+        super().__init__(
+            runtime=runtime,
+            mode=mode,
+            port_name="update barrier",
+            writer=update_barrier_runtime.write_update_barriers,
+        )
 
 
 def is_post_generate_flow(flow: ConsumerFlow) -> bool:
@@ -89,6 +77,13 @@ def _require_generation_trace(runtime: object) -> GenerationTraceBatch:
     if not isinstance(trace, GenerationTraceBatch):
         raise RuntimeError("post_generate flow requires runtime.last_generation_trace")
     return trace
+
+
+def _generation_group_id(trace: GenerationTraceBatch) -> str:
+    group_ids = {entry.group_id for entry in trace.entries}
+    if len(group_ids) > 1:
+        raise RuntimeError("post_generate bundle cannot combine multiple generation_group_id values")
+    return next(iter(group_ids), "")
 
 
 def _entry_for_read(*, runtime: object, read: PortRead) -> tuple[str, object]:
@@ -125,6 +120,12 @@ def build_post_generate_port_bundle(*, runtime: object, flow: ConsumerFlow) -> P
     if tuple(flow.bundle_key) not in {(), ("generation_group_id", "phase")}:
         raise RuntimeError("post_generate flows require bundle_key=() or ('generation_group_id', 'phase')")
 
+    trace = (
+        _require_generation_trace(runtime)
+        if "generation_group_id" in flow.bundle_key
+        or any(read.kind == PortKind.GENERATION_TRACE for read in flow.reads)
+        else None
+    )
     entries: dict[str, object] = {}
     for read in flow.reads:
         name, payload = _entry_for_read(runtime=runtime, read=read)
@@ -139,6 +140,7 @@ def build_post_generate_port_bundle(*, runtime: object, flow: ConsumerFlow) -> P
             phase="post_generate",
             request_id="",
             sample_idx=0,
+            generation_group_id=_generation_group_id(trace) if trace is not None else "",
         ),
         entries=entries,
     )

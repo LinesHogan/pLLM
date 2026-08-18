@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tllm.consumers._common.alignment import LowRankAdapter
+from tllm.consumers._common.alignment import LowRankAdapter, detached_train_input
 from tllm.consumers.override.config import OverRIDEConsumerConfig
 
 
@@ -107,11 +107,7 @@ class OverRIDEReweightEngine(nn.Module):
 
     @staticmethod
     def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
-        out = tensor.detach()
-        if torch.is_inference(out):
-            with torch.inference_mode(False):
-                out = out.clone()
-        return out
+        return detached_train_input(tensor)
 
     def reweight_logits(self, hidden: torch.Tensor, logits: torch.Tensor, *, iteration: int) -> OverRIDELogitsResult:
         if not bool(self.config.enabled):

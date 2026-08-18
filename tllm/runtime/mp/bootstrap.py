@@ -122,11 +122,17 @@ def capture_bootstrap_spec() -> BootstrapSpec:
                 skipped.append(type(consumer).__name__)
             else:
                 consumers.append(spec)
+    enable_flags = {
+        "test_time_lora_enabled": bool(runtime.test_time_lora_enabled),
+        "fast_weight_enabled": bool(runtime.config.fast_weight_enabled),
+    }
+    if primary is not None and primary.name == "esamp":
+        enable_flags["esamp_training_enabled"] = bool(primary.config.get("enable_esamp_training", True))
     return BootstrapSpec(
         runtime_config=dataclass_to_jsonable(runtime.config),
         primary_consumer=primary,
         consumers=tuple(consumers),
-        enable_flags={"test_time_lora_enabled": bool(runtime.test_time_lora_enabled)},
+        enable_flags=enable_flags,
         skipped_consumers=tuple(skipped),
     )
 
@@ -154,8 +160,12 @@ def apply_bootstrap_spec(spec: BootstrapSpec) -> None:
     primary = None if spec.primary_consumer is None else build_consumer_from_spec(spec.primary_consumer)
     residual_runtime.set_runtime_consumer(primary)
     residual_runtime.replace_dispatch_consumers([build_consumer_from_spec(s) for s in spec.consumers])
+    if "esamp_training_enabled" in spec.enable_flags:
+        residual_runtime.set_esamp_training_enabled(spec.enable_flags["esamp_training_enabled"])
     if "test_time_lora_enabled" in spec.enable_flags:
         residual_runtime.set_test_time_lora_enabled(spec.enable_flags["test_time_lora_enabled"])
+    if "fast_weight_enabled" in spec.enable_flags:
+        residual_runtime.set_fast_weight_enabled(spec.enable_flags["fast_weight_enabled"])
 
 
 def export_bootstrap_spec_env() -> str:
@@ -168,3 +178,17 @@ def export_bootstrap_spec_env() -> str:
     path = write_bootstrap_spec(capture_bootstrap_spec())
     os.environ[TLLM_BOOTSTRAP_SPEC_ENV] = path
     return path
+
+
+def refresh_exported_bootstrap_spec() -> None:
+    """Refresh the active parent-side spec after a runtime control change."""
+    path = os.environ.get(TLLM_BOOTSTRAP_SPEC_ENV, "")
+    if not path:
+        return
+    if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "0") == "1":
+        from tllm.runtime.mp.control import active_control_plane
+
+        if active_control_plane() is None:
+            return
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(capture_bootstrap_spec().to_json_dict(), handle, sort_keys=True)

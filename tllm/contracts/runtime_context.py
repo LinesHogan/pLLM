@@ -30,3 +30,4 @@ class RuntimeContext:
     is_compiling: bool
     uses_cudagraph: bool
     event_name: str
+    predecessor_events: tuple[object, ...] = ()

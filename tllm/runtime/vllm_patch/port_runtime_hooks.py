@@ -28,6 +28,7 @@ from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.fast_weight import runtime as _fast_weight
+from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 
 RUNTIME_EVENT_POINTS = (
     "load_model.pre",
@@ -41,6 +42,7 @@ RUNTIME_EVENT_POINTS = (
     "execute_model.pre",
     "execute_model.post",
     "sample_tokens.pre",
+    "sampler.pre_draw",
     "sample_tokens.post",
 )
 
@@ -151,18 +153,6 @@ def _needs_device_decode_metadata(runtime: PortRuntimeStateLike) -> bool:
     if bool(plan.requires_device_decode_metadata()):
         return True
     return _sampler_patch.runtime_has_active_sampler_provider(runtime)
-
-
-def _path_hotspots_enabled(core: object) -> bool:
-    runtime = getattr(core, "RUNTIME", None)
-    return bool(getattr(runtime, "path_hotspot_enabled", False)) and callable(getattr(core, "record_path_hotspot_cpu", None))
-
-
-def _record_cpu_hotspot(core: object, name: str, start_s: float, end_s: float) -> None:
-    if not _path_hotspots_enabled(core):
-        return
-    record = getattr(core, "record_path_hotspot_cpu")
-    record(name, float((end_s - start_s) * 1000.0))
 
 
 def _test_time_lora_enabled(runtime: object) -> bool:
@@ -379,6 +369,29 @@ def prepare_decode_localization(
     )
 
 
+def run_prepare_inputs_post_producers(
+    *,
+    core: DecodeHookCoreLike,
+    runner: RunnerLike,
+    localize_decode: object,
+) -> None:
+    """Run compiler-selected prepare producers in DAG order."""
+    _residual_bundle_dispatch.retire_step_device_leases(core=core, runner=runner)
+    executor = getattr(core.RUNTIME, "producer_executor", None)
+    if executor is not None:
+        from tllm.runtime.producer_executor import PrepareInputsPostContext
+
+        executor.run_prepare_inputs_post(
+            PrepareInputsPostContext(
+                runner=runner,
+                localize_decode=localize_decode,  # type: ignore[arg-type]
+                runtime=core.RUNTIME,
+            )
+        )
+    elif not hasattr(core.RUNTIME, "producer_executor"):
+        localize_decode()  # type: ignore[operator]
+
+
 def build_tap_path_list(*, core: PortDispatchCoreLike) -> List[str]:
     cfg = core.RUNTIME.config
     plan = getattr(core.RUNTIME, "dispatch_plan", None)
@@ -406,12 +419,40 @@ def build_decode_port_frames(*, core: PortDispatchCoreLike, layer_path: str) -> 
     return _residual_bundle_dispatch.build_decode_port_frames(core=core, layer_path=layer_path)
 
 
-def build_step_scope_port_bundle(*, core: PortDispatchCoreLike, flow: ConsumerFlow) -> PortBundle | None:
-    return _residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
+def build_step_scope_port_bundle(
+    *, core: PortDispatchCoreLike, flow: ConsumerFlow, consumer_id: str = ""
+) -> PortBundle | None:
+    return _residual_bundle_dispatch.build_step_scope_port_bundle(
+        core=core,
+        flow=flow,
+        consumer_id=consumer_id,
+    )
 
 
 def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLike) -> int:
     return _residual_bundle_dispatch.dispatch_decode_port_bundles(core=core, runner=runner)
+
+
+def run_execute_model_post_producers(
+    *,
+    core: PortDispatchCoreLike,
+    runner: RunnerLike,
+    publish_decode: object,
+) -> None:
+    """Run compiler-selected execute-model producers in DAG order."""
+    executor = getattr(core.RUNTIME, "producer_executor", None)
+    if executor is not None:
+        from tllm.runtime.producer_executor import ExecuteModelPostContext
+
+        executor.run_execute_model_post(
+            ExecuteModelPostContext(
+                runner=runner,
+                publish_decode=publish_decode,  # type: ignore[arg-type]
+                runtime=core.RUNTIME,
+            )
+        )
+    elif not hasattr(core.RUNTIME, "producer_executor"):
+        publish_decode()  # type: ignore[operator]
 
 
 def build_post_generate_port_bundle(*, runtime: object, flow: ConsumerFlow) -> PortBundle:
@@ -639,11 +680,11 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
     else:
         setup_runtime_hooks_if_active(core=core, runner=runner)
     _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
-    trace_hotspots = _path_hotspots_enabled(core)
+    trace_hotspots = path_hotspots_enabled(core)
     t0 = time.perf_counter() if trace_hotspots else 0.0
     out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
     t1 = time.perf_counter() if trace_hotspots else 0.0
-    _record_cpu_hotspot(core, "prepare_inputs.forward_cpu", t0, t1)
+    record_path_hotspot_cpu(core, "prepare_inputs.forward_cpu", t0, t1)
     core.RUNTIME.event_step_id += 1
     if isinstance(out, tuple):
         view = _prepare_inputs_adapter().unpack_prepare_inputs_output(
@@ -652,17 +693,26 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
             out=out,
         )
         t2 = time.perf_counter() if trace_hotspots else 0.0
-        prepare_decode_localization(core=core, runner=runner, out=out, prepare_inputs_view=view)
+        run_prepare_inputs_post_producers(
+            core=core,
+            runner=runner,
+            localize_decode=lambda: prepare_decode_localization(
+                core=core,
+                runner=runner,
+                out=out,
+                prepare_inputs_view=view,
+            ),
+        )
         _fast_weight.update_fast_weight_metadata_from_runner(
             core.RUNTIME,
             runner,
             num_scheduled_tokens_np=view.num_scheduled_tokens_np,
         )
         t3 = time.perf_counter() if trace_hotspots else 0.0
-        _record_cpu_hotspot(core, "prepare_inputs.decode_localization_cpu", t2, t3)
+        record_path_hotspot_cpu(core, "prepare_inputs.decode_localization_cpu", t2, t3)
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
         t4 = time.perf_counter() if trace_hotspots else 0.0
-        _record_cpu_hotspot(core, "prepare_inputs.sampler_prepare_cpu", t3, t4)
+        record_path_hotspot_cpu(core, "prepare_inputs.sampler_prepare_cpu", t3, t4)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
             runner=runner,
@@ -696,22 +746,26 @@ def wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) 
     else:
         setup_runtime_hooks_if_active(core=core, runner=runner)
     _check_fast_weight_static_key_request_count(core=core, runner=runner)
-    trace_hotspots = _path_hotspots_enabled(core)
+    trace_hotspots = path_hotspots_enabled(core)
     t0 = time.perf_counter() if trace_hotspots else 0.0
     out = core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
     t1 = time.perf_counter() if trace_hotspots else 0.0
-    _record_cpu_hotspot(core, "execute_model.forward_cpu", t0, t1)
+    record_path_hotspot_cpu(core, "execute_model.forward_cpu", t0, t1)
     if not bool(getattr(getattr(runner, "model", None), _COMPUTE_LOGITS_HOOK_FLAG, False)):
         maybe_launch_post_logits_decode_work(core=core, runner=runner)
     t2 = time.perf_counter() if trace_hotspots else 0.0
-    _record_cpu_hotspot(core, "execute_model.post_logits_cpu", t1, t2)
-    dispatch_decode_port_bundles(core=core, runner=runner)
+    record_path_hotspot_cpu(core, "execute_model.post_logits_cpu", t1, t2)
+    run_execute_model_post_producers(
+        core=core,
+        runner=runner,
+        publish_decode=lambda: dispatch_decode_port_bundles(core=core, runner=runner),
+    )
     t3 = time.perf_counter() if trace_hotspots else 0.0
-    _record_cpu_hotspot(core, "execute_model.dispatch_bundles_cpu", t2, t3)
+    record_path_hotspot_cpu(core, "execute_model.dispatch_bundles_cpu", t2, t3)
     if not core.RUNTIME.launch_consumer_from_hooks:
         _hidden_bridge.dispatch_deferred_layer_batches(core=core, runner=runner)
     t4 = time.perf_counter() if trace_hotspots else 0.0
-    _record_cpu_hotspot(core, "execute_model.deferred_layers_cpu", t3, t4)
+    record_path_hotspot_cpu(core, "execute_model.deferred_layers_cpu", t3, t4)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,

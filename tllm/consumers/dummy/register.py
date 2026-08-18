@@ -5,16 +5,16 @@ from __future__ import annotations
 
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.consumer import DummyConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = DummyConsumer
-CONFIG_TYPE = DummyConsumerConfig
+PLUGIN = ConsumerPluginSpec("dummy", DummyConsumer, DummyConsumerConfig, DummyConsumer)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: DummyConsumerConfig | None = None) -> DummyConsumer:
-    return DummyConsumer(config or DummyConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: DummyConsumerConfig | None = None, *, primary: bool = False) -> DummyConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

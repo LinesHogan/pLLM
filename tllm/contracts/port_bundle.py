@@ -20,6 +20,7 @@ class BundleKey:
     phase: str
     request_id: str
     sample_idx: int
+    generation_group_id: str = ""
 
 
 @dataclass(frozen=True)

@@ -54,6 +54,7 @@ def producer_desc(
                 kind=PortKind(str(spec["kind"])),
                 writable=bool(spec.get("writable", False)),
                 write_modes=tuple(str(m) for m in spec.get("write_modes", ())),
+                phases=tuple(str(phase) for phase in spec.get("phases", ())),
             )
             for spec in outputs
         ),
@@ -66,14 +67,24 @@ def producer_desc(
 def consumer_desc(
     *,
     id: str,
-    reads: Sequence[str] = (),
+    reads: Sequence[str | dict] = (),
     writes: Sequence[dict] = (),
 ) -> Any:
     flows = [
         SimpleNamespace(
-            reads=[SimpleNamespace(kind=PortKind(str(k))) for k in reads],
+            reads=[
+                SimpleNamespace(
+                    kind=PortKind(str(read["kind"] if isinstance(read, dict) else read)),
+                    phase=str(read.get("phase", "") if isinstance(read, dict) else ""),
+                )
+                for read in reads
+            ],
             writes=[
-                SimpleNamespace(kind=PortKind(str(w["kind"])), mode=str(w.get("mode", "")))
+                SimpleNamespace(
+                    kind=PortKind(str(w["kind"])),
+                    mode=str(w.get("mode", "")),
+                    phase=str(w.get("phase", "")),
+                )
                 for w in writes
             ],
         )
@@ -81,8 +92,8 @@ def consumer_desc(
     return SimpleNamespace(consumer_id=str(id), flows=lambda: flows)
 
 
-def _required_kinds(consumers: Iterable[Any]) -> list[tuple[str, PortKind]]:
-    required: list[tuple[str, PortKind]] = []
+def _required_kinds(consumers: Iterable[Any]) -> list[tuple[str, PortKind, str]]:
+    required: list[tuple[str, PortKind, str]] = []
     for consumer in consumers:
         consumer_id = str(getattr(consumer, "consumer_id", repr(consumer)))
         flows = consumer.flows() if callable(getattr(consumer, "flows", None)) else ()
@@ -90,8 +101,14 @@ def _required_kinds(consumers: Iterable[Any]) -> list[tuple[str, PortKind]]:
             for read in getattr(flow, "reads", ()) or ():
                 kind = getattr(read, "kind", None)
                 if isinstance(kind, PortKind):
-                    required.append((consumer_id, kind))
+                    required.append((consumer_id, kind, str(getattr(read, "phase", "") or "")))
     return required
+
+
+def _spec_matches(spec: PortSpec, kind: PortKind, phase: str) -> bool:
+    return spec.kind == kind and (
+        not phase or not spec.phases or phase in spec.phases
+    )
 
 
 def _validate_writes(
@@ -110,7 +127,13 @@ def _validate_writes(
                     continue
                 if enforced_kinds is not None and kind not in enforced_kinds:
                     continue
-                specs = [spec for p in producers for spec in p.outputs if spec.kind == kind]
+                phase = str(getattr(write, "phase", "") or "")
+                specs = [
+                    spec
+                    for producer in producers
+                    for spec in producer.outputs
+                    if _spec_matches(spec, kind, phase)
+                ]
                 if not specs:
                     raise OracleExecutionPlanError(
                         f"consumer {consumer_id!r} writes port kind {kind.value!r} "
@@ -139,31 +162,39 @@ def oracle_compile_execution_plan(
     enforced_kinds: Optional[frozenset] = None,
     supported_hooks: Optional[frozenset] = None,
     backend: Optional[tuple[str, str]] = None,
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], list[str]]:
     """The legacy compile, verbatim semantics, plain-data inputs.
 
-    Returns ``(ordered_producer_ids, {port_str: producer_id})``.
+    Returns ``(ordered_producer_ids, {port_str: producer_id},
+    capture_resident_producer_ids)``.
     """
     supported = HookPoint.all() if supported_hooks is None else supported_hooks
     _validate_writes(producers=producers, consumers=consumers, enforced_kinds=enforced_kinds)
 
     selected: dict[str, OracleProducerDesc] = {}
     port_winners: dict[PortId, OracleProducerDesc] = {}
-    for consumer_id, kind in _required_kinds(consumers):
+    selections_done: set[tuple[PortKind, str]] = set()
+    for consumer_id, kind, phase in _required_kinds(consumers):
         if enforced_kinds is not None and kind not in enforced_kinds:
             continue
-        candidates = [p for p in producers if any(spec.kind == kind for spec in p.outputs)]
+        candidates = [
+            producer
+            for producer in producers
+            if any(_spec_matches(spec, kind, phase) for spec in producer.outputs)
+        ]
         if not candidates:
             raise OracleExecutionPlanError(
                 f"consumer {consumer_id!r} reads port kind {kind.value!r} "
                 "but no registered producer offers it"
             )
-        if kind in selected:
+        selection = (kind, phase)
+        if selection in selections_done:
             continue
+        selections_done.add(selection)
         by_port: dict[PortId, list[OracleProducerDesc]] = {}
         for entry in candidates:
             for spec in entry.outputs:
-                if spec.kind == kind:
+                if _spec_matches(spec, kind, phase):
                     by_port.setdefault(spec.id, []).append(entry)
         for port, port_entries in by_port.items():
             if port in port_winners:
@@ -182,12 +213,11 @@ def oracle_compile_execution_plan(
 
     included: dict[str, OracleProducerDesc] = {}
     stack = [p for p in selected.values()]
-    offered: dict[PortId, OracleProducerDesc] = {}
+    providers_by_port: dict[PortId, list[OracleProducerDesc]] = {}
     for entry in producers:
         for spec in entry.outputs:
-            offered[spec.id] = entry
-    for port, winner in port_winners.items():
-        offered[port] = winner
+            providers_by_port.setdefault(spec.id, []).append(entry)
+    offered = dict(port_winners)
     while stack:
         entry = stack.pop()
         if entry.id in included:
@@ -196,10 +226,27 @@ def oracle_compile_execution_plan(
         for req in entry.requires:
             source = offered.get(req)
             if source is None:
-                raise OracleExecutionPlanError(
-                    f"producer {entry.id!r} requires port {req} "
-                    "but no registered producer offers it"
-                )
+                candidates = providers_by_port.get(req)
+                if not candidates:
+                    raise OracleExecutionPlanError(
+                        f"producer {entry.id!r} requires port {req} "
+                        "but no registered producer offers it"
+                    )
+                best_priority = max(candidate.priority for candidate in candidates)
+                top = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.priority == best_priority
+                ]
+                if len(top) > 1:
+                    raise OracleExecutionPlanError(
+                        f"port {req} required by producer {entry.id!r} has "
+                        f"{len(top)} producers at priority {best_priority}: "
+                        f"{sorted(candidate.id for candidate in top)}; "
+                        "disambiguate via priority"
+                    )
+                source = top[0]
+                offered[req] = source
             if source.id not in included:
                 stack.append(source)
 
@@ -247,4 +294,10 @@ def oracle_compile_execution_plan(
         for pid, entry in included.items()
         for spec in entry.outputs
     }
-    return ordered, port_sources
+    capture_resident = [
+        pid
+        for pid in ordered
+        if HookPoint.LAYER_POST in included[pid].hook_points
+        and included[pid].graph_safety != GraphSafety.EAGER_ONLY
+    ]
+    return ordered, port_sources, capture_resident

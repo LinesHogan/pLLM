@@ -6,6 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from numbers import Real
 
+from tllm.runtime.append_store import AppendStore, runtime_store
+
 __test__ = False
 
 
@@ -98,32 +100,22 @@ class RewardOutcomeBatch:
         object.__setattr__(self, "entries", tuple(entries))
 
 
-class RewardOutcomeStore:
+class RewardOutcomeStore(AppendStore[RewardOutcomeEntry, RewardOutcomeBatch]):
     def __init__(self) -> None:
-        self._entries: list[RewardOutcomeEntry] = []
-
-    def append(self, batch: RewardOutcomeBatch) -> int:
-        if not isinstance(batch, RewardOutcomeBatch):
-            raise TypeError("batch must be RewardOutcomeBatch")
-        self._entries.extend(batch.entries)
-        return len(batch.entries)
-
-    def read(self) -> RewardOutcomeBatch:
-        return RewardOutcomeBatch(entries=tuple(self._entries))
-
-    def drain(self) -> RewardOutcomeBatch:
-        batch = self.read()
-        self._entries.clear()
-        return batch
+        super().__init__(
+            batch_type=RewardOutcomeBatch,
+            entries_of=lambda batch: batch.entries,
+            make_batch=lambda entries: RewardOutcomeBatch(entries=entries),
+        )
 
 
 def _store_for_runtime(runtime: object) -> RewardOutcomeStore:
-    store = getattr(runtime, "reward_outcome_store", None)
-    if isinstance(store, RewardOutcomeStore):
-        return store
-    store = RewardOutcomeStore()
-    setattr(runtime, "reward_outcome_store", store)
-    return store
+    return runtime_store(
+        runtime,
+        attribute="reward_outcome_store",
+        store_type=RewardOutcomeStore,
+        factory=RewardOutcomeStore,
+    )
 
 
 def write_reward_outcomes(runtime: object, batch: RewardOutcomeBatch) -> int:

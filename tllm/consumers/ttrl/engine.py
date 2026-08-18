@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 from torch import nn
@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from tllm.consumers._common.alignment import (
     LowRankAdapter,
+    detached_train_input,
     select_top_k_per_prompt,
 )
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
@@ -23,6 +24,11 @@ from tllm.consumers.ttrl.verifier import (
     TTRLVerifier,
     _default_ttrl_verifier,
 )
+
+if TYPE_CHECKING:
+    from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
+    from tllm.runtime.retry_control_runtime import RetryControlBatch
+    from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch
 
 
 @dataclass(frozen=True)
@@ -80,9 +86,9 @@ class TTRLRetryScheduleEntry:
 
 @dataclass(frozen=True)
 class TTRLClosedLoopIntent:
-    reward_outcomes: object
-    retry_controls: object
-    update_barriers: object
+    reward_outcomes: RewardOutcomeBatch
+    retry_controls: RetryControlBatch
+    update_barriers: UpdateBarrierBatch
     training_row_count: int
     selected_reward_count: int = 0
     adapter_version_id: str = ""
@@ -190,7 +196,11 @@ def build_ttrl_reward_result(
     )
 
 
-def build_ttrl_reward_outcome_batch(trace: object, *, verifier: TTRLVerifier | None = None) -> object:
+def build_ttrl_reward_outcome_batch(
+    trace: object,
+    *,
+    verifier: TTRLVerifier | None = None,
+) -> RewardOutcomeBatch:
     from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
     from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
 
@@ -564,10 +574,7 @@ class TTRLEngine(nn.Module):
 
     @staticmethod
     def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
-        out = tensor.detach()
-        if torch.is_inference(out):
-            out = out.clone()
-        return out
+        return detached_train_input(tensor)
 
     def _build_adapter(self, hidden_size: int) -> None:
         self.config.hidden_size = int(hidden_size)

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import gc
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from vllm import LLM, SamplingParams
@@ -78,12 +78,18 @@ def make_plain_llm(
     enforce_eager: bool = False,
     seed: int | None = None,
     worker_extension_cls: str | None = None,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
 ) -> LLM:
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     if seed is not None:
         kwargs["seed"] = int(seed)
     if worker_extension_cls:
         kwargs["worker_extension_cls"] = str(worker_extension_cls)
+    if max_num_seqs is not None:
+        kwargs["max_num_seqs"] = int(max_num_seqs)
+    if max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
     return LLM(
         model=model_name,
         tensor_parallel_size=1,

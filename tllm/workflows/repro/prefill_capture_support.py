@@ -22,6 +22,7 @@ from tllm.producer.prefill import (
 from tllm.runtime.token_map import build_token_maps_from_outputs
 from tllm.runtime.vllm_patch import capture_runner as _capture_runner
 from tllm.runtime.vllm_patch.adapters import get_prepare_inputs_adapter
+from tllm.contracts.request_identity import resolve_prompt_sample
 from tllm.util import tools as _tool_helpers
 
 ensure_v1_env()
@@ -44,16 +45,11 @@ class _RequestMappingState:
     reqid_to_sampleidx: Dict[str, int] = field(default_factory=dict)
 
     def resolve_prompt_sample_for_req_id(self, req_id: str) -> tuple[int, int]:
-        prompt_idx = self.reqid_to_promptidx.get(req_id)
-        if prompt_idx is not None:
-            return int(prompt_idx), int(self.reqid_to_sampleidx.get(req_id, 0))
-        if "_" in req_id:
-            maybe_sample_idx, parent_req_id = req_id.split("_", 1)
-            if maybe_sample_idx.isdigit():
-                parent_prompt_idx = self.reqid_to_promptidx.get(parent_req_id)
-                if parent_prompt_idx is not None:
-                    return int(parent_prompt_idx), int(maybe_sample_idx)
-        return -1, -1
+        return resolve_prompt_sample(
+            req_id,
+            prompt_indices=self.reqid_to_promptidx,
+            sample_indices=self.reqid_to_sampleidx,
+        )
 
 
 def configure_capture_runtime(

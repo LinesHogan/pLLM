@@ -16,18 +16,24 @@ declarations into an ordered DAG at startup and fails fast on:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Protocol, Sequence
 
 from tllm.backends.protocol import BackendCapabilities
-from tllm.ports.base import PortKind
+from tllm.ports.base import ConsumerFlow, PortKind
+from tllm.ports.address import port_phase
 from tllm.ports.port_id import PortId
 from tllm.producers.base import (
     HookPoint,
-    producer_graph_safety,
-    producer_hook_points,
-    producer_output_specs,
-    producer_requires,
+    Producer,
     validate_producer,
+)
+from tllm.producers.ir import (
+    PlanConsumerDesc,
+    PlanConsumerFlowDesc,
+    PlanConsumerReadDesc,
+    PlanConsumerWriteDesc,
+    PlanPortSpecDesc,
+    PlanProducerDesc,
 )
 
 
@@ -35,23 +41,30 @@ class ExecutionPlanError(RuntimeError):
     pass
 
 
+class FlowConsumer(Protocol):
+    @property
+    def consumer_id(self) -> str: ...
+
+    def flows(self) -> Sequence[ConsumerFlow]: ...
+
+
 @dataclass(frozen=True)
 class ProducerEntry:
-    producer: Any
+    producer: Producer
     priority: int = 0
 
     @property
     def producer_id(self) -> str:
-        return str(getattr(self.producer, "producer_id", ""))
+        return self.producer.producer_id
 
 
 class ProducerRegistry:
     def __init__(self) -> None:
         self._entries: list[ProducerEntry] = []
 
-    def register(self, producer: Any, *, priority: int = 0) -> None:
-        validate_producer(producer)
-        entry = ProducerEntry(producer=producer, priority=int(priority))
+    def register(self, producer: object, *, priority: int = 0) -> None:
+        typed_producer = validate_producer(producer)
+        entry = ProducerEntry(producer=typed_producer, priority=int(priority))
         for existing in self._entries:
             if existing.producer_id == entry.producer_id:
                 raise ExecutionPlanError(
@@ -66,12 +79,12 @@ class ProducerRegistry:
         return [
             entry
             for entry in self._entries
-            if any(spec.kind == kind for spec in producer_output_specs(entry.producer))
+            if any(spec.kind == kind for spec in entry.producer.outputs)
         ]
 
     def provider_of(self, port: PortId) -> ProducerEntry | None:
         for entry in self._entries:
-            if any(spec.id == port for spec in producer_output_specs(entry.producer)):
+            if any(spec.id == port for spec in entry.producer.outputs):
                 return entry
         return None
 
@@ -95,6 +108,7 @@ class ExecutionPlan:
 
     producers: tuple[PlannedProducer, ...]
     port_sources: dict[PortId, str]  # port -> producer_id
+    capture_resident_producer_ids: tuple[str, ...] = ()
 
     def producers_for_hook(self, hook: HookPoint) -> list[PlannedProducer]:
         return [p for p in self.producers if hook in p.emits_at]
@@ -103,7 +117,7 @@ class ExecutionPlan:
 def compile_execution_plan(
     *,
     registry: ProducerRegistry,
-    consumers: Sequence[Any] = (),
+    consumers: Sequence[FlowConsumer] = (),
     backend_capabilities: BackendCapabilities | None = None,
     supported_hooks: frozenset[HookPoint] | None = None,
     enforced_kinds: frozenset[PortKind] | None = None,
@@ -117,43 +131,56 @@ def compile_execution_plan(
     """
     from tllm import core as _core
 
-    producers: list[dict[str, object]] = [
-        {
-            "id": entry.producer_id,
-            "priority": entry.priority,
-            "outputs": [
-                {
-                    "port": str(spec.id),
-                    "kind": spec.kind.value,
-                    "writable": bool(spec.writable),
-                    "write_modes": [str(m) for m in spec.write_modes],
-                }
-                for spec in producer_output_specs(entry.producer)
-            ],
-            "requires": [str(port) for port in producer_requires(entry.producer)],
-            "hook_points": [hook.value for hook in producer_hook_points(entry.producer)],
-            "graph_safety": producer_graph_safety(entry.producer).name,
-        }
+    producers = [
+        PlanProducerDesc(
+            id=entry.producer_id,
+            priority=entry.priority,
+            outputs=tuple(
+                PlanPortSpecDesc(
+                    port=str(spec.id),
+                    kind=spec.kind.value,
+                    writable=spec.writable,
+                    write_modes=tuple(spec.write_modes),
+                    phases=tuple(spec.phases),
+                )
+                for spec in entry.producer.outputs
+            ),
+            requires=tuple(str(port) for port in entry.producer.requires),
+            hook_points=tuple(hook.value for hook in entry.producer.hook_points),
+            graph_safety=entry.producer.graph_safety.name,
+        )
         for entry in registry.entries()
     ]
-    consumer_descs: list[dict[str, object]] = []
+    consumer_descs: list[PlanConsumerDesc] = []
     for consumer in consumers:
-        consumer_id = str(getattr(consumer, "consumer_id", repr(consumer)))
-        flows = consumer.flows() if callable(getattr(consumer, "flows", None)) else ()
-        reads: list[str] = []
-        writes: list[dict[str, str]] = []
-        for flow in flows or ():
-            for read in getattr(flow, "reads", ()) or ():
-                kind = getattr(read, "kind", None)
-                if isinstance(kind, PortKind):
-                    reads.append(kind.value)
-            for write in getattr(flow, "writes", ()) or ():
-                kind = getattr(write, "kind", None)
-                if isinstance(kind, PortKind):
-                    writes.append(
-                        {"kind": kind.value, "mode": str(getattr(write, "mode", "") or "")}
+        flows = tuple(consumer.flows())
+        consumer_descs.append(
+            PlanConsumerDesc(
+                id=consumer.consumer_id,
+                flows=tuple(
+                    PlanConsumerFlowDesc(
+                        reads=tuple(
+                            PlanConsumerReadDesc(
+                                kind=read.kind.value,
+                                role=read.role,
+                                phase=port_phase(read),
+                            )
+                            for read in flow.reads
+                        ),
+                        writes=tuple(
+                            PlanConsumerWriteDesc(
+                                kind=write.kind.value,
+                                mode=write.mode,
+                                phase=port_phase(write),
+                            )
+                            for write in flow.writes
+                        ),
+                        bundle_key=tuple(flow.bundle_key),
                     )
-        consumer_descs.append({"id": consumer_id, "reads": reads, "writes": writes})
+                    for flow in flows
+                ),
+            )
+        )
 
     backend = None
     if backend_capabilities is not None:
@@ -176,11 +203,17 @@ def compile_execution_plan(
     planned = tuple(
         PlannedProducer(
             entry=by_id[pid],
-            emits_at=frozenset(producer_hook_points(by_id[pid].producer)),
-            output_ports=tuple(spec.id for spec in producer_output_specs(by_id[pid].producer)),
-            depends_on=tuple(producer_requires(by_id[pid].producer)),
+            emits_at=by_id[pid].producer.hook_points,
+            output_ports=tuple(spec.id for spec in by_id[pid].producer.outputs),
+            depends_on=by_id[pid].producer.requires,
         )
         for pid in compiled.ordered_producer_ids
     )
     port_sources = {PortId.parse(port): pid for port, pid in compiled.port_sources}
-    return ExecutionPlan(producers=planned, port_sources=port_sources)
+    return ExecutionPlan(
+        producers=planned,
+        port_sources=port_sources,
+        capture_resident_producer_ids=tuple(
+            str(producer_id) for producer_id in compiled.capture_resident_producer_ids
+        ),
+    )

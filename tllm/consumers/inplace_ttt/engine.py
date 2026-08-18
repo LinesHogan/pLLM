@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from tllm.consumers._common.alignment import LowRankAdapter
+from tllm.consumers._common.alignment import LowRankAdapter, detached_train_input
 from tllm.consumers.inplace_ttt.config import InPlaceTTTConsumerConfig
 
 
@@ -175,10 +175,7 @@ class InPlaceTTTEngine(nn.Module):
 
     @staticmethod
     def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
-        out = tensor.detach()
-        if torch.is_inference(out):
-            out = out.clone()
-        return out
+        return detached_train_input(tensor)
 
     def _build_adapter(self, hidden_size: int) -> None:
         self.config.hidden_size = int(hidden_size)
@@ -265,4 +262,3 @@ class InPlaceTTTEngine(nn.Module):
             tail_rows=tail_rows,
             last_loss=float(self._last_loss),
         )
-

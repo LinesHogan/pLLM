@@ -67,9 +67,11 @@ class ResidualStream:
         layer: int,
         site: str,
         phase: ResidualPhase,
+        role: str = "",
         mode: WriteModeName = WriteMode.REPLACE,
         rows: WriteRowSelection = WriteRows.DECODE_ONLY,
         order: int = 0,
+        fusion_candidate: bool = False,
     ) -> PortWrite:
         write_mode = WriteMode(str(mode))
         if write_mode not in ResidualStream.SUPPORTED_WRITE_MODES:
@@ -80,7 +82,9 @@ class ResidualStream:
         return PortWrite(
             kind=ResidualStream.KIND,
             locator=ResidualLocator(layer=layer, site=site, phase=phase),
+            role=str(role),
             mode=write_mode.value,
             rows=rows,
             order=int(order),
+            fusion_candidate=bool(fusion_candidate),
         )

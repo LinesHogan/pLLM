@@ -217,7 +217,16 @@ def _wrapped_prepare_inputs(
         out=out,
         num_scheduled_tokens=num_scheduled_tokens,
     )
-    _hooks.prepare_decode_localization(core=core, runner=runner, out=out, prepare_inputs_view=view)
+    _hooks.run_prepare_inputs_post_producers(
+        core=core,
+        runner=runner,
+        localize_decode=lambda: _hooks.prepare_decode_localization(
+            core=core,
+            runner=runner,
+            out=out,
+            prepare_inputs_view=view,
+        ),
+    )
     _fast_weight.update_fast_weight_metadata_from_runner(
         runtime,
         runner,

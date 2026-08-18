@@ -19,6 +19,7 @@ from tllm.contracts.test_time_training import (
     TestTimeTrainingExample,
 )
 from tllm.consumers.base import BaseConsumer
+from tllm.consumers._common.bundle_inputs import post_generate_input
 from tllm.consumers.fttt.config import FTTTConsumerConfig
 from tllm.consumers.fttt.engine import (
     FeedbackRecord,
@@ -573,29 +574,15 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
 
     def consume_bundle(self, bundle, ctx) -> None:
         _ = ctx
-        trace = bundle.entries.get("generation_trace")
-        if not isinstance(trace, GenerationTraceBatch):
-            raise TypeError("generation_trace entry must be GenerationTraceBatch")
-        sink = bundle.entries.get("reward_outcome")
-        append = getattr(sink, "append", None)
-        if not callable(append):
-            raise TypeError("reward_outcome entry must provide append")
-        intent = self.closed_loop_intent_for_trace(trace)
-        append(intent.reward_outcomes)
+        inputs = post_generate_input(bundle)
+        intent = self.closed_loop_intent_for_trace(inputs.trace)
+        inputs.reward_outcome.append(intent.reward_outcomes)
         for record in intent.feedback_records:
             self.enqueue_feedback(record)
-        retry_sink = bundle.entries.get("retry_control")
-        retry_append = getattr(retry_sink, "append", None)
-        if retry_sink is not None and not callable(retry_append):
-            raise TypeError("retry_control entry must provide append")
-        if callable(retry_append):
-            retry_append(intent.retry_controls)
-        barrier_sink = bundle.entries.get("update_barrier")
-        barrier_append = getattr(barrier_sink, "append", None)
-        if barrier_sink is not None and not callable(barrier_append):
-            raise TypeError("update_barrier entry must provide append")
-        if callable(barrier_append):
-            barrier_append(intent.update_barriers)
+        if inputs.retry_control is not None:
+            inputs.retry_control.append(intent.retry_controls)
+        if inputs.update_barrier is not None:
+            inputs.update_barrier.append(intent.update_barriers)
 
     def apply_feedback_update(self, hidden: torch.Tensor, feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord]) -> None:
         records = list(feedback)

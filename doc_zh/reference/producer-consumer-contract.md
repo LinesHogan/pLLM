@@ -4,6 +4,15 @@
 
  Producer 的职责是从 vLLM 的 packed tensor 中定位并提取正确的 hidden rows。Consumer 的职责是拿到这些 rows 后做分析、训练或反馈。Runtime 在两者之间做桥接：装 hook、维护定位信息、把数据聚合成 bundle。
 
+ Producer plugin 暴露声明式 descriptor：输出 `PortSpec`、依赖的 `PortId`、支持的
+ hook point 与 graph safety。它不再实现另一套 `bind/emit` 执行路径。backend driver
+ 是 Tensor/CUDA 物化的唯一责任方，Rust execution-plan compiler 则在启动期解析并
+ 校验 descriptor 依赖。
+
+ Consumer package 暴露 typed `ConsumerPluginSpec`。内置 consumer 按需 lazy import；
+ 外部 package 可通过 `tllm.consumer_plugins` entry-point group 或程序化 registry
+ 注册。plugin 边界只动态校验一次，之后 registry 保存已经 narrow 的 typed spec。
+
  这篇文档覆盖三个层面：
  1. **数据格式** —— Producer 输出什么、Consumer 输入什么
  2. **交互方式** —— Port-based 消费的具体约定
@@ -32,6 +41,10 @@
  ### Consumer 输入
 
  Consumer 通过 `ConsumerFlow` 声明需求，通过 `consume_bundle(bundle, ctx)` 接收组装好的 `PortBundle`：
+
+ `PortBundle.key` 是 frozen typed record。除 decode identity 字段外，它还为
+ post-generate flow 明确携带 `generation_group_id`；同一个 post-generate bundle 不允许
+ 混入不同 generation group 的 trace entry。
 
  - decode 本地化后的 hidden（`[rows, hidden_size]`，dtype 跟捕获层一致）
  - runtime 投递本 step 的 active rows；hook 内部仍使用固定 scratch buffer 以兼容 CUDA Graph replay

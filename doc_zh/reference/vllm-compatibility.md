@@ -12,13 +12,10 @@ tLLM 通过 monkey-patch 在 vLLM `GPUModelRunner` 的关键生命周期里安�
 
 ## 支持的版本
 
-- `0.7.x`
-- `0.10.x`
-- `0.11+`
+- `0.27.x`（`>=0.27.1,<0.28`）
 
-当前开发环境锁定在 `vllm==0.10.1.1`，所以 `0.10.x` 是日常验证的主要目标。
-
-`0.7.x` 主要作为历史兼容底线和旧实验日志的参考。
+当前开发环境锁定在 `vllm==0.27.1`，MRv1 与默认的 MRv2 均纳入门禁。
+旧 adapter 仍服务于历史 repro 代码，但不属于当前生产 backend 支持矩阵。
 
 ## Adapter 做了什么
 
@@ -49,8 +46,10 @@ vLLM 的 `_prepare_inputs` 返回结构在不同版本里会变。tLLM 通过一
 - `V072PrepareInputsAdapter` 处理 `0.7.x`
 - `V010PrepareInputsAdapter` 处理 `0.10.x`
 - `V011PlusPrepareInputsAdapter` 处理 `0.11+`
+- `V027PrepareInputsAdapter` 处理 vLLM 0.27 MRv1
 
-当前实现共享一个解析核心，但按版本分开保持了边界清晰。如果未来 vLLM 再次改变 tuple layout，有稳定的地方做特化。
+MRv2 使用独立的 v0.27 backend 路径，不经过 MRv1 tuple adapter。当前实现共享解析核心，
+但按版本与 runner family 保持边界；未来 vLLM 再次改变接口时有稳定的特化位置。
 
 ## 哪些代码在用
 

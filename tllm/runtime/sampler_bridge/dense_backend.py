@@ -3,20 +3,10 @@
 
 from __future__ import annotations
 
-import os
-from contextlib import nullcontext
-
 import torch
-from torch.autograd.profiler import record_function
 
+from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.types import SamplerModifierState
-
-_ENABLE_DISTILLER_RECORD_FUNCTION = os.getenv("TLLM_ENABLE_DISTILLER_RECORD_FUNCTION", "") == "1"
-
-
-def _maybe_record_function(name: str):
-    return record_function(name) if _ENABLE_DISTILLER_RECORD_FUNCTION else nullcontext()
-
 
 def modify_rows_dense(
     *,
@@ -24,7 +14,7 @@ def modify_rows_dense(
     state: SamplerModifierState,
     row_ids: torch.Tensor,
 ) -> torch.Tensor:
-    with _maybe_record_function("distiller.modify_rows_dense"):
+    with maybe_record_function("distiller.modify_rows_dense"):
         pos_tensor = torch.searchsorted(
             state.affected_row_ids.to(device=row_ids.device, dtype=torch.long),
             row_ids.to(device=row_ids.device, dtype=torch.long),

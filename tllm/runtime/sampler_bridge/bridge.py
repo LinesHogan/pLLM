@@ -3,29 +3,23 @@
 
 from __future__ import annotations
 
-import os
+from collections.abc import Callable
 from typing import Any
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
-from torch.autograd.profiler import record_function
 
 from tllm.runtime.sampler_bridge.dense_backend import modify_rows_dense
 from tllm.runtime.sampler_bridge import exact_backend
-from tllm.runtime.sampler_bridge.exact_backend import sample_rows_exact
+from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.minp_kernel import MinPCandidateKernelRequest, select_minp_candidate_kernel
 from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
 from tllm.runtime.sampler_bridge.types import CandidateSampleResult, SamplerStepView
 
 _SAMPLING_EPS = 1e-5
-_ENABLE_DISTILLER_RECORD_FUNCTION = os.getenv("TLLM_ENABLE_DISTILLER_RECORD_FUNCTION", "") == "1"
+import os
 _ENABLE_EXACT_CANDIDATE_SAMPLING = os.getenv("TLLM_ENABLE_EXACT_CANDIDATE_SAMPLING", "") == "1"
 _ENABLE_TRITON_MINP_KEEP_MASK = os.getenv("TLLM_ENABLE_TRITON_MINP_KEEP_MASK", "") == "1"
-
-
-def _maybe_record_function(name: str):
-    return record_function(name) if _ENABLE_DISTILLER_RECORD_FUNCTION else nullcontext()
 
 
 def _unwrap_sampled(result: Any) -> torch.Tensor:
@@ -264,11 +258,14 @@ def sample_with_optional_modifier(
     view: SamplerStepView | None,
     provider: SamplerModifierProvider | None,
     greedy_sampled: torch.Tensor | None,
+    before_draw: Callable[[], None] | None = None,
 ) -> torch.Tensor | None:
-    with _maybe_record_function("distiller.sample_with_optional_modifier"):
+    with maybe_record_function("distiller.sample_with_optional_modifier"):
         if view is None or provider is None or not provider.is_active():
             return None
         state = provider.prepare_step(view)
+        if before_draw is not None:
+            before_draw()
         if state is None or int(state.affected_row_ids.numel()) <= 0:
             return None
         affected_rows = state.affected_row_ids.to(device=logits.device, dtype=torch.long)
@@ -297,7 +294,7 @@ def sample_with_optional_modifier(
         )
 
         if plan.path in ("full_dense_greedy", "full_dense_random"):
-            with _maybe_record_function("distiller.sample_with_optional_modifier.full_dense"):
+            with maybe_record_function("distiller.sample_with_optional_modifier.full_dense"):
                 modified = _build_dense_modified_logits(
                     logits=logits,
                     state=state,
@@ -313,7 +310,7 @@ def sample_with_optional_modifier(
                 )
 
         if plan.path in ("full_exact_greedy", "full_exact_random"):
-            with _maybe_record_function("distiller.sample_with_optional_modifier.full_exact"):
+            with maybe_record_function("distiller.sample_with_optional_modifier.full_exact"):
                 if plan.path == "full_exact_greedy":
                     return _sample_rows_exact_via_sampler(
                         sampler=sampler,

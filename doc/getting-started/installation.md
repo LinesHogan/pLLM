@@ -21,16 +21,17 @@ tLLM expects Python >= 3.10.
 ## 3. Install vLLM
 
 ```bash
-pip install vllm
+pip install 'vllm>=0.27.1,<0.28'
 ```
 
 tLLM uses vLLM as the underlying inference engine.
 
 Version notes:
 
-- Minimum supported version: `vllm >= 0.7.2`
+- Supported version family: `vllm >= 0.27.1, < 0.28`
 - Only the vLLM v1 engine is supported.
-- The main development and verification target is currently `vllm==0.10.x`.
+- The current development and verification target is `vllm==0.27.1` with both
+  MRv1 and MRv2.
 
 Check the installed version:
 
@@ -84,7 +85,10 @@ These variables are set automatically by the tLLM runtime entrypoints:
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `VLLM_USE_V1` | `1` | Force the vLLM v1 engine |
-| `VLLM_ENABLE_V1_MULTIPROCESSING` | `0` | Disable multiprocessing so runtime state stays in-process |
+| `VLLM_ENABLE_V1_MULTIPROCESSING` | `1` | Run vLLM's EngineCore out of process; tLLM bootstraps workers through its general plugin and forwards control/state through the worker extension |
+
+Set `VLLM_ENABLE_V1_MULTIPROCESSING=0` explicitly when debugging an in-process
+runner. Both modes are supported; tLLM preserves an explicit override.
 
 For throughput experiments, FlashInfer is usually worth enabling:
 

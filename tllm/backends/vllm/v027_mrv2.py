@@ -66,7 +66,21 @@ def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict
     if not active_targets.runtime_has_active_targets(runtime):
         return input_batch
     session = get_step_session(runner)
-    spec_rows = _decode_localization_from_mrv2(core=core, runner=runner, input_batch=input_batch)
+    spec_rows: tuple = ()
+
+    def _localize_decode() -> None:
+        nonlocal spec_rows
+        spec_rows = _decode_localization_from_mrv2(
+            core=core,
+            runner=runner,
+            input_batch=input_batch,
+        )
+
+    _hooks.run_prepare_inputs_post_producers(
+        core=core,
+        runner=runner,
+        localize_decode=_localize_decode,
+    )
     _sampler_patch.maybe_prepare_sampler_decode_step(runtime=runtime, runner=runner)
     if session is not None and session.state == StepState.CREATED:
         request_ids = tuple(str(x) for x in getattr(runtime, "decode_request_ids", ()))
@@ -130,7 +144,14 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
 
     if not bool(getattr(getattr(runner, "model", None), "_tllm_compute_logits_wrapped", False)):
         _hooks.maybe_launch_post_logits_decode_work(core=core, runner=runner)
-    _hooks.dispatch_decode_port_bundles(core=core, runner=runner)
+    _hooks.run_execute_model_post_producers(
+        core=core,
+        runner=runner,
+        publish_decode=lambda: _hooks.dispatch_decode_port_bundles(
+            core=core,
+            runner=runner,
+        ),
+    )
     if not runtime.launch_consumer_from_hooks:
         from tllm.runtime import hidden_event_bridge as _hidden_bridge
 

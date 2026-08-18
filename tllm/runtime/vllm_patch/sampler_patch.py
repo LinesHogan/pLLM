@@ -3,25 +3,16 @@
 
 from __future__ import annotations
 
-import os
-from contextlib import nullcontext
 from typing import Any
 
 import torch
-from torch.autograd.profiler import record_function
 
+from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.min_p import apply_min_p
 
 _PATCH_INSTALLED = False
 _ORIG_VLLM_SAMPLER_SAMPLE = None
 _SAMPLING_EPS = 1e-5
-_ENABLE_DISTILLER_RECORD_FUNCTION = os.getenv("TLLM_ENABLE_DISTILLER_RECORD_FUNCTION", "") == "1"
-
-
-def _maybe_record_function(name: str):
-    return record_function(name) if _ENABLE_DISTILLER_RECORD_FUNCTION else nullcontext()
-
-
 def _resolve_provider(runtime: Any) -> Any:
     consumer = getattr(runtime, "consumer", None)
     if consumer is None:
@@ -86,6 +77,27 @@ def runtime_has_active_sampler_provider(runtime: Any) -> bool:
     return bool(provider is not None and provider.is_active())
 
 
+def dispatch_sampler_pre_draw(*, runtime: Any, runner: Any, device: torch.device) -> None:
+    """Publish the sampler parameter-read fence, then drain placed side work."""
+    predecessor_events: tuple[object, ...] = ()
+    if device.type == "cuda" and torch.cuda.is_available():
+        stream = torch.cuda.current_stream(device=device)
+        parameter_read_done = torch.cuda.Event(blocking=False)
+        parameter_read_done.record(stream)
+        predecessor_events = (parameter_read_done,)
+    from tllm.runtime.vllm_patch import common_hooks as _common_hooks
+
+    _common_hooks.dispatch_runtime_event(
+        runtime=runtime,
+        runner=runner,
+        event_name="sampler.pre_draw",
+        phase="decode",
+        layer_path=None,
+        capture_enabled=bool(getattr(runtime, "launch_consumer_from_hooks", False)),
+        predecessor_events=predecessor_events,
+    )
+
+
 def maybe_capture_source_precompute(*, runtime: Any, runner: Any, layer_path: str) -> None:
     provider = _resolve_provider(runtime)
     if provider is None or not provider.is_active():
@@ -130,13 +142,14 @@ def _vanilla_sample(*, sampler: Any, logits: torch.Tensor, sampling_metadata: An
 def _maybe_sample_precomputed_dense_fast(
     *,
     runtime: Any,
+    runner: Any,
     provider: Any,
     sampler: Any,
     logits: torch.Tensor,
     sampling_metadata: Any,
     greedy_sampled: torch.Tensor | None,
 ) -> torch.Tensor | None:
-    with _maybe_record_function("distiller.precomputed_dense_fast_path"):
+    with maybe_record_function("distiller.precomputed_dense_fast_path"):
         if greedy_sampled is not None:
             return None
         if bool(getattr(sampling_metadata, "generators", {})):
@@ -155,6 +168,10 @@ def _maybe_sample_precomputed_dense_fast(
         backend = str(getattr(getattr(provider, "config", None), "distiller_sampler_backend", "") or "")
         if backend != "pre_filter_dense":
             return None
+        event = getattr(runtime.sampler_precompute, "event", None)
+        if event is not None and logits.device.type == "cuda":
+            torch.cuda.current_stream(device=logits.device).wait_event(event)
+        dispatch_sampler_pre_draw(runtime=runtime, runner=runner, device=logits.device)
         dense = dense.to(device=logits.device, dtype=logits.dtype)
         logits.mul_(1.0 + beta)
         logits.add_(dense, alpha=-beta)
@@ -190,6 +207,7 @@ def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metad
 
     fast_sampled = _maybe_sample_precomputed_dense_fast(
         runtime=runtime,
+        runner=runner,
         provider=provider,
         sampler=sampler,
         logits=logits_for_sampling,
@@ -213,6 +231,11 @@ def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metad
         view=view,
         provider=provider,
         greedy_sampled=greedy_sampled,
+        before_draw=lambda: dispatch_sampler_pre_draw(
+            runtime=runtime,
+            runner=runner,
+            device=logits_for_sampling.device,
+        ),
     )
     if sampled is not None:
         sampled = sampled.to(dtype=torch.long)

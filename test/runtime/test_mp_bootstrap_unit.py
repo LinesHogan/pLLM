@@ -12,6 +12,7 @@ from unittest import mock
 import torch
 
 from tllm.common.dataclass_json import dataclass_from_dict, dataclass_to_jsonable
+from tllm.common.state import ensure_v1_env
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
@@ -35,6 +36,7 @@ class DataclassJsonUnitTest(unittest.TestCase):
 
     def test_esamp_config_with_nested_initializer_round_trips(self) -> None:
         config = ESampConsumerConfig(
+            per_request_models=True,
             per_request_model_bank=True,
             model_bank_slots=8,
             model_bank_initializer=SVDModelBankInitializerConfig(method="ridge_svd", min_rows=16),
@@ -109,6 +111,20 @@ class BootstrapSpecUnitTest(unittest.TestCase):
             primary=True,
         )
 
+    def test_v1_multiprocessing_defaults_on_and_preserves_explicit_override(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ensure_v1_env()
+            self.assertEqual(os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"], "1")
+
+        for explicit in ("0", "1"):
+            with self.subTest(explicit=explicit), mock.patch.dict(
+                os.environ,
+                {"VLLM_ENABLE_V1_MULTIPROCESSING": explicit},
+                clear=True,
+            ):
+                ensure_v1_env()
+                self.assertEqual(os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"], explicit)
+
     def test_spec_json_round_trip(self) -> None:
         spec = BootstrapSpec(
             runtime_config={"graph_scratch_rows": 4},
@@ -144,6 +160,10 @@ class BootstrapSpecUnitTest(unittest.TestCase):
         consumer = residual_runtime.RUNTIME.consumer
         self.assertEqual(getattr(consumer.config, "consumer_id"), "dummy_mp")
         self.assertEqual(residual_runtime.RUNTIME.config.graph_scratch_rows, 4)
+        self.assertEqual(
+            spec.enable_flags,
+            {"test_time_lora_enabled": False, "fast_weight_enabled": False},
+        )
 
     def test_plugin_no_spec_is_noop(self) -> None:
         os.environ.pop(bootstrap.TLLM_BOOTSTRAP_SPEC_ENV, None)

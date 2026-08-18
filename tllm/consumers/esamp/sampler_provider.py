@@ -3,29 +3,20 @@
 
 from __future__ import annotations
 
-import os
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
-from torch.autograd.profiler import record_function
 
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine
 from tllm.runtime.resources import SamplerPrecomputeCache
+from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 
 _SAMPLER_PRECOMPUTE_STREAM_PRIORITY = 2
-_ENABLE_DISTILLER_RECORD_FUNCTION = os.getenv("TLLM_ENABLE_DISTILLER_RECORD_FUNCTION", "") == "1"
-
-
-def _maybe_record_function(name: str):
-    return record_function(name) if _ENABLE_DISTILLER_RECORD_FUNCTION else nullcontext()
-
-
 def _resolve_lm_head(model: Any) -> Any:
     candidates = [
         getattr(model, "lm_head", None),
@@ -45,7 +36,7 @@ def _project_dense_logits(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    with _maybe_record_function("distiller.precompute_dense_logits"):
+    with maybe_record_function("distiller.precompute_dense_logits"):
         dense = F.linear(pred_hidden.to(dtype=weight.dtype), weight, bias)
         return dense.to(device=pred_hidden.device, dtype=torch.float32)
 
@@ -241,7 +232,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                 timing_start = torch.cuda.Event(enable_timing=True, blocking=False)
                 timing_end = torch.cuda.Event(enable_timing=True, blocking=False)
                 timing_start.record(stream)
-            with _maybe_record_function("distiller.capture_precompute"):
+            with maybe_record_function("distiller.capture_precompute"):
                 buffers.source_hidden.copy_(source_hidden)
                 buffers.prompt_idx.copy_(prompt_idx_tensor)
                 _run_capture(buffers.source_hidden, buffers.prompt_idx)
@@ -251,7 +242,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
             event.record(stream)
 
     def maybe_schedule_precompute(self, *, runtime: Any, runner: Any) -> None:
-        with _maybe_record_function("distiller.schedule_precompute"):
+        with maybe_record_function("distiller.schedule_precompute"):
             if bool(getattr(runtime.sampler_precompute, "timing_enabled", False)):
                 runtime.sampler_precompute.schedule_attempt_count += 1
             if not self.is_active():
@@ -283,7 +274,10 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                 return
             full_row_map_tensor = None
             if self.engine.using_model_bank and self.config.distiller_sampler_backend in {"post_filter_exact", "post_filter_dense_cache"}:
-                prompt_list = tuple(int(x) for x in prompt_input.detach().cpu().tolist())
+                prompt_list = tuple(
+                    int(x)
+                    for x in tuple(runtime.decode_prompt_idxs)[:decode_count]
+                )
                 if len(prompt_list) == decode_count:
                     unique_rows, unique_prompts, row_map = _first_prompt_rows(prompt_list)
                     if unique_rows and len(unique_rows) < decode_count:
@@ -345,7 +339,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                     timing_start = torch.cuda.Event(enable_timing=True, blocking=False)
                     timing_end = torch.cuda.Event(enable_timing=True, blocking=False)
                     timing_start.record(stream)
-                with _maybe_record_function("distiller.precompute_hidden"):
+                with maybe_record_function("distiller.precompute_hidden"):
                     row_ids, pred_hidden = self.engine.predict_hidden_for_sampling(
                         active_hidden,
                         prompt_input,
@@ -369,7 +363,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                 event.record(stream)
 
     def prepare_step(self, view: SamplerStepView) -> CandidateModifierState | None:
-        with _maybe_record_function("distiller.prepare_step"):
+        with maybe_record_function("distiller.prepare_step"):
             if not self.is_active():
                 return None
             runtime = getattr(view.runner, "_tllm_runtime", None)
@@ -409,7 +403,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                     fallback_timing_start = torch.cuda.Event(enable_timing=True, blocking=False)
                     fallback_timing_end = torch.cuda.Event(enable_timing=True, blocking=False)
                     fallback_timing_start.record(current_stream)
-                with _maybe_record_function("distiller.prepare_step.fallback_predict"):
+                with maybe_record_function("distiller.prepare_step.fallback_predict"):
                     row_ids, pred_hidden = self.engine.predict_hidden_for_sampling(
                         view.source_hidden,
                         prompt_input,

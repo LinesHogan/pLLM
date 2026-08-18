@@ -21,23 +21,6 @@ class _Runner:
 
 
 class VllmAdapterSelectionUnitTest(unittest.TestCase):
-    def test_selects_expected_adapter_family(self) -> None:
-        from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter
-
-        cases = [
-            ("0.7.2", "V072PrepareInputsAdapter"),
-            ("0.7.9", "V072PrepareInputsAdapter"),
-            ("0.10.2", "V010PrepareInputsAdapter"),
-            ("0.11.0", "V011PlusPrepareInputsAdapter"),
-            ("0.12.0", "V011PlusPrepareInputsAdapter"),
-            ("0.25.0", "V027PrepareInputsAdapter"),
-            ("0.27.1", "V027PrepareInputsAdapter"),
-        ]
-
-        for version, expected in cases:
-            adapter = select_prepare_inputs_adapter(version)
-            self.assertEqual(type(adapter).__name__, expected, msg=version)
-
     def test_unknown_major_fails_fast(self) -> None:
         from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter
 
@@ -66,26 +49,6 @@ class VllmAdapterSelectionUnitTest(unittest.TestCase):
         self.assertTrue(torch.equal(view.logits_indices, logits_indices))
         self.assertIsNone(view.spec_decode_common)
         self.assertEqual(view.num_actual_tokens, 3)
-
-    def test_adapter_parses_two_tuple_output(self) -> None:
-        from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter
-
-        adapter = select_prepare_inputs_adapter("0.7.2")
-        runner = _Runner()
-        attn_metadata = SimpleNamespace(num_actual_tokens=7)
-        logits_indices = torch.tensor([1, 3], dtype=torch.long)
-        out = (attn_metadata, logits_indices)
-
-        view = adapter.unpack_prepare_inputs_output(
-            runner=runner,
-            scheduler_output=SimpleNamespace(num_scheduled_tokens={"reqA": 1, "reqB": 2}),
-            out=out,
-        )
-
-        self.assertIs(view.attn_metadata, attn_metadata)
-        self.assertTrue(torch.equal(view.logits_indices, logits_indices))
-        self.assertIsNone(view.spec_decode_common)
-        self.assertEqual(view.num_scheduled_tokens_np, [1, 2])
 
 
 if __name__ == "__main__":

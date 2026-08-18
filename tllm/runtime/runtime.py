@@ -73,18 +73,38 @@ class TllmRuntime:
         return tuple(self._consumers)
 
     def register_consumer(self, consumer: Any) -> None:
+        plane = None
+        spec = None
+        if active_runtime() is self:
+            from tllm.runtime.mp.control import active_control_plane
+
+            plane = active_control_plane()
+            if plane is not None:
+                from tllm.consumers.registry import spec_for_consumer
+
+                spec = spec_for_consumer(consumer)
         self._consumers.append(consumer)
         if active_runtime() is self:
             from tllm.runtime import residual_runtime
+            from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
 
             residual_runtime.register_dispatch_consumer(consumer)
+            refresh_exported_bootstrap_spec()
+            if plane is not None and spec is not None:
+                plane.register_consumer(spec.name, spec.config)
 
     def clear_consumers(self) -> None:
         self._consumers.clear()
         if active_runtime() is self:
             from tllm.runtime import residual_runtime
+            from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
+            from tllm.runtime.mp.control import active_control_plane
 
             residual_runtime.clear_dispatch_consumers()
+            refresh_exported_bootstrap_spec()
+            plane = active_control_plane()
+            if plane is not None:
+                plane.clear_consumers()
 
     def activate(self) -> None:
         """Make this runtime the one global hooks dispatch to.
@@ -107,7 +127,9 @@ class TllmRuntime:
 
     def make_llm(self, *args: Any, **kwargs: Any) -> Any:
         from tllm.runtime import residual_runtime
+        from tllm.runtime.mp.control import set_active_control_plane
 
+        set_active_control_plane(None)
         self.activate()
         llm = residual_runtime.make_llm(*args, **kwargs)
         self._bind_engine_runners(llm)
@@ -115,14 +137,16 @@ class TllmRuntime:
 
     def _bind_engine_runners(self, llm: Any) -> None:
         """Record runner -> runtime routing for every live worker runner."""
-        from tllm.runtime.mp.control import ControlPlane
+        from tllm.runtime.mp.control import ControlPlane, set_active_control_plane
 
         plane = ControlPlane.try_bind(llm)
         if plane is not None:
             try:
                 plane.call("tllm_bind_runner_runtime")
+                set_active_control_plane(plane)
                 return
             except Exception:
+                set_active_control_plane(None)
                 pass
         # Fallback for engines without a collective_rpc path (test doubles):
         # walk the in-process executor directly.

@@ -6,7 +6,6 @@ from __future__ import annotations
 from typing import Iterable, List
 
 from tllm.consumers.base import BaseConsumer
-from tllm.runtime.dispatch_plan import DispatchPlan
 
 
 class ConsumerRegistry:
@@ -24,6 +23,3 @@ class ConsumerRegistry:
 
     def replace_all(self, consumers: Iterable[BaseConsumer]) -> None:
         self._consumers = list(consumers)
-
-    def build_dispatch_plan(self) -> DispatchPlan:
-        return DispatchPlan.build(self._consumers)

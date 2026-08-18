@@ -4,13 +4,14 @@ This page explains how tLLM handles vLLM version differences.
 
 tLLM installs monkey patches at key `GPUModelRunner` lifecycle boundaries. vLLM changes internal interfaces across versions, especially the return structure of `_prepare_inputs`. tLLM isolates those differences behind versioned adapters, so the runtime can consume a normalized view.
 
-## Supported Version Families
+## Supported Version Family
 
-- `0.7.x`
-- `0.10.x`
-- `0.11+`
+- `0.27.x` (`>=0.27.1,<0.28`)
 
-The current development environment uses `vllm==0.10.1.1`, so 0.10.x is the primary day-to-day validation target. 0.7.x remains a historical compatibility baseline.
+The current development environment uses `vllm==0.27.1`. Both the legacy
+Model Runner V1 and the default Model Runner V2 are covered. Older adapter
+classes remain for historical repro code, but they are not the supported
+production backend matrix.
 
 ## What the Adapter Normalizes
 
@@ -42,8 +43,11 @@ For a 2-tuple result:
 - `V072PrepareInputsAdapter`: vLLM 0.7.x
 - `V010PrepareInputsAdapter`: vLLM 0.10.x
 - `V011PlusPrepareInputsAdapter`: vLLM 0.11+
+- `V027PrepareInputsAdapter`: vLLM 0.27 MRv1
 
-The implementation shares parsing helpers but keeps version-family boundaries explicit.
+MRv2 uses its dedicated v0.27 backend path rather than the MRv1 tuple adapter.
+The implementation shares parsing helpers but keeps version and runner-family
+boundaries explicit.
 
 ## Who Uses It?
 

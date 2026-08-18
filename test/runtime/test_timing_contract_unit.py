@@ -75,6 +75,25 @@ class ConsumerFlowTimingUnitTest(unittest.TestCase):
         )
         self.assertEqual(flow.timing.mobility, TimingMobility.DEFERRABLE)
 
+    def test_execution_time_version_observation_fails_before_runtime_dispatch(self) -> None:
+        flow = self._flow(
+            timing=TimingContract(
+                mobility="deferrable",
+                deadline="next_prepare",
+                max_defer_steps=1,
+                observes_version="latest_at_execution",
+            )
+        )
+
+        class UnsupportedVersionConsumer:
+            consumer_id = "test.unsupported_version"
+
+            def flows(self):
+                return (flow,)
+
+        with self.assertRaisesRegex(RuntimeError, "no execution-time port-version resolver"):
+            DispatchPlan.build([UnsupportedVersionConsumer()])
+
     def test_movable_device_lease_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "device_lease"):
             ConsumerFlow(

@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 import torch
 
+from tllm.consumers.base import BaseConsumer
 from tllm.contracts.gpu_stage import DeviceTensorLease
+from tllm.contracts.port_bundle import BundleKey, PortBundle
 from tllm.contracts.request_meta_view import RowBatchMeta
-from tllm.ports.base import ConsumerFlow
+from tllm.contracts.runtime_context import RuntimeContext
+from tllm.ports.base import ConsumerFlow, TimingContract
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualLocator, ResidualStream
-from tllm.runtime import hidden_event_bridge
+from tllm.runtime.dispatch_plan import FlowDispatchTarget
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports import residual_bundle_dispatch
+from tllm.runtime.ports import residual_write
+from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
+from tllm.runtime.scheduling.deferred import DeferredWorkQueue
+from tllm.ports.base import WriteMode, WriteRows
 
 
 class RuntimeResidualBundleDispatchUnitTest(unittest.TestCase):
@@ -25,6 +31,9 @@ class RuntimeResidualBundleDispatchUnitTest(unittest.TestCase):
             "layers.0": torch.tensor([[1.0, 2.0], [3.0, 4.0], [99.0, 99.0]], dtype=torch.float32),
             "layers.1": torch.tensor([[5.0, 6.0], [7.0, 8.0], [88.0, 88.0]], dtype=torch.float32),
         }
+        runtime.tap_decode_hidden_compact = {}
+        runtime.decode_compact_count = 0
+        runtime.decode_compact_row_ids = ()
         runtime.decode_count = 2
         runtime.decode_prompt_idxs = [10, 11]
         runtime.decode_sample_idxs = [0, 1]
@@ -43,14 +52,6 @@ class RuntimeResidualBundleDispatchUnitTest(unittest.TestCase):
         }
         runtime.event_step_id = 9
         return type("Core", (), {"RUNTIME": runtime})()
-
-    def _core_with_duplicate_prompt_rows(self):
-        core = self._core()
-        core.RUNTIME.decode_count = 3
-        core.RUNTIME.decode_prompt_idxs = [10, 10, 11]
-        core.RUNTIME.decode_sample_idxs = [0, 1, 0]
-        core.RUNTIME.decode_request_ids = ["reqA-0", "reqA-1", "reqB-0"]
-        return core
 
     def test_build_step_scope_port_bundle_uses_residual_binding_table(self) -> None:
         core = self._core()
@@ -108,8 +109,86 @@ class RuntimeResidualBundleDispatchUnitTest(unittest.TestCase):
         self.assertEqual(meta.phase, "decode")
         self.assertEqual(meta.engine_step_id, 9)
 
+    def test_step_lifetime_is_preserved_in_device_lease(self) -> None:
+        core = self._core()
+        flow = ConsumerFlow(
+            reads=(
+                ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
+                RequestMeta.read(),
+            ),
+            writes=(),
+            window="out_of_band",
+            bundle_key=("engine_step_id", "phase"),
+            delivery="device_lease",
+            ownership="runtime_lease",
+            lease_lifetime="step",
+            timing="pinned",
+        )
+
+        bundle = residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
+
+        self.assertIsNotNone(bundle)
+        assert bundle is not None
+        lease = bundle.entries["device_lease"]
+        self.assertIsInstance(lease, DeviceTensorLease)
+        self.assertEqual(lease.lifetime, "step")
+
+    def test_declared_write_output_stages_graph_resident_effect(self) -> None:
+        core = self._core()
+        key = WriteLeaseKey(layer_path="layers.0", writer_id="test.writer", order=0)
+        write_lease = ResidualWriteLease(
+            key=key,
+            mode=WriteMode.ADD,
+            rows=WriteRows.DECODE_ONLY,
+            max_rows=3,
+            hidden_size=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        core.RUNTIME.write_leases = {key: write_lease}
+        flow = ConsumerFlow(
+            reads=(RequestMeta.read(),),
+            writes=(
+                ResidualStream.write(
+                    layer=0,
+                    site="block_output",
+                    phase="decode",
+                    role="update",
+                    mode="add",
+                    fusion_candidate=True,
+                ),
+            ),
+            window="same_step",
+            bundle_key=("engine_step_id", "phase"),
+            delivery="device_lease",
+            ownership="runtime_lease",
+            max_bundle_rows=3,
+        )
+
+        bundle = residual_bundle_dispatch.build_step_scope_port_bundle(
+            core=core,
+            flow=flow,
+            consumer_id="test.writer",
+        )
+
+        self.assertIsNotNone(bundle)
+        assert bundle is not None
+        lease = bundle.entries["device_lease"]
+        self.assertIsInstance(lease, DeviceTensorLease)
+        lease.output("update").stage(
+            delta=torch.tensor([[3.0, 4.0]]),
+            row_idx=torch.tensor([1]),
+        )
+        hidden = torch.zeros((3, 2))
+        residual_write.apply_pending_writes(core.RUNTIME.write_leases, "layers.0", hidden)
+        self.assertTrue(torch.equal(hidden[1], torch.tensor([3.0, 4.0])))
+
     def test_first_per_prompt_compaction_shapes_device_lease_and_metadata(self) -> None:
-        core = self._core_with_duplicate_prompt_rows()
+        core = self._core()
+        core.RUNTIME.decode_count = 3
+        core.RUNTIME.decode_prompt_idxs = [10, 10, 11]
+        core.RUNTIME.decode_sample_idxs = [0, 1, 0]
+        core.RUNTIME.decode_request_ids = ["reqA-0", "reqA-1", "reqB-0"]
         flow = ConsumerFlow(
             reads=(
                 ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
@@ -143,153 +222,69 @@ class RuntimeResidualBundleDispatchUnitTest(unittest.TestCase):
         self.assertEqual(meta.row_compaction, "first_per_prompt")
         self.assertEqual(meta.row_ids, (0, 2))
 
-    def test_first_per_prompt_compaction_builds_metadata_without_full_row_materialization(self) -> None:
-        core = self._core_with_duplicate_prompt_rows()
+    def test_deferred_device_lease_target_rejects_legacy_frame_bundle(self) -> None:
         flow = ConsumerFlow(
-            reads=(
-                ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
-                RequestMeta.read(),
-            ),
+            reads=(RequestMeta.read(),),
             writes=(),
             window="out_of_band",
             bundle_key=("engine_step_id", "phase"),
             delivery="device_lease",
             ownership="runtime_lease",
-            row_compaction="first_per_prompt",
-        )
-
-        with mock.patch.object(
-            residual_bundle_dispatch,
-            "active_request_prompt_sample_metadata",
-            side_effect=AssertionError("full-row metadata should not be materialized for compact flow"),
-        ):
-            bundle = residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
-
-        self.assertIsNotNone(bundle)
-        assert bundle is not None
-        meta = bundle.entries["request_meta"]
-        self.assertIsInstance(meta, RowBatchMeta)
-        self.assertEqual(meta.request_ids, ("reqA-0", "reqB-0"))
-        self.assertEqual(meta.prompt_idxs, (10, 11))
-        self.assertEqual(meta.row_ids, (0, 2))
-
-    def test_first_per_prompt_compaction_prefers_runtime_compact_capture_lane(self) -> None:
-        core = self._core_with_duplicate_prompt_rows()
-        core.RUNTIME.decode_compact_count = 2
-        core.RUNTIME.decode_compact_row_ids = (0, 2)
-        core.RUNTIME.tap_decode_hidden_compact = {
-            "layers.0": torch.tensor([[101.0, 102.0], [103.0, 104.0]], dtype=torch.float32),
-            "layers.1": torch.tensor([[105.0, 106.0], [107.0, 108.0]], dtype=torch.float32),
-        }
-        flow = ConsumerFlow(
-            reads=(
-                ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
-                ResidualStream.read(layer=-1, site="block_output", phase="decode", role="target"),
-                RequestMeta.read(),
+            lease_lifetime="step",
+            timing=TimingContract(
+                mobility="deferrable",
+                deadline="next_prepare",
+                max_defer_steps=1,
             ),
-            writes=(),
-            window="out_of_band",
-            bundle_key=("engine_step_id", "phase"),
-            delivery="device_lease",
-            ownership="runtime_lease",
-            row_compaction="first_per_prompt",
         )
-
-        bundle = residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
-
-        self.assertIsNotNone(bundle)
-        assert bundle is not None
-        lease = bundle.entries["device_lease"]
-        self.assertIsInstance(lease, DeviceTensorLease)
-        self.assertEqual(lease.active_rows, 2)
-        self.assertTrue(torch.equal(lease.entries["source"], torch.tensor([[101.0, 102.0], [103.0, 104.0]])))
-        self.assertTrue(torch.equal(lease.entries["target"], torch.tensor([[105.0, 106.0], [107.0, 108.0]])))
-
-    def test_first_per_prompt_compaction_does_not_change_hidden_batch_global_rows(self) -> None:
-        core = self._core_with_duplicate_prompt_rows()
-        core.RUNTIME.decode_row_idx = torch.tensor([4, 5, 6], dtype=torch.long)
-        core.RUNTIME.decode_valid_mask = torch.ones((3, 1), dtype=torch.float32)
-        core.RUNTIME.decode_prompt_idx_tensor = torch.tensor([10, 10, 11], dtype=torch.long)
-        core.RUNTIME.decode_sample_idx_tensor = torch.tensor([0, 1, 0], dtype=torch.long)
-        flow = ConsumerFlow(
-            reads=(
-                ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
-                RequestMeta.read(),
-            ),
-            writes=(),
-            window="out_of_band",
-            bundle_key=("engine_step_id", "phase"),
-            delivery="device_lease",
-            ownership="runtime_lease",
-            row_compaction="first_per_prompt",
+        consumer = type(
+            "Consumer",
+            (BaseConsumer,),
+            {
+                "consumer_id": property(lambda self: "test.consumer"),
+                "consume_bundle": lambda self, bundle, ctx: None,
+                "flows": lambda self: (flow,),
+            },
+        )()
+        target = FlowDispatchTarget(
+            consumer=consumer,
+            flow=flow,
+            flow_id="test.consumer#0",
+            placement_hook="sample_tokens.pre",
         )
-
-        bundle = residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
-        batch = hidden_event_bridge.build_runtime_hidden_batch(core=core, layer_path="layers.0")
-
-        self.assertIsNotNone(bundle)
-        self.assertIsNotNone(batch)
-        assert bundle is not None
-        assert batch is not None
-        lease = bundle.entries["device_lease"]
-        self.assertIsInstance(lease, DeviceTensorLease)
-        self.assertEqual(lease.active_rows, 2)
-        self.assertEqual(tuple(batch.prompt_idx.tolist()), (10, 10, 11))
-        self.assertEqual(tuple(batch.sample_idx.tolist()), (0, 1, 0))
-        self.assertEqual(tuple(batch.row_idx.tolist()), (4, 5, 6))
-        self.assertEqual(int(batch.rows_hidden.shape[0]), 3)
-
-    def test_first_per_prompt_row_cap_overflow_is_explicit(self) -> None:
-        core = self._core_with_duplicate_prompt_rows()
-        flow = ConsumerFlow(
-            reads=(
-                ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
-                RequestMeta.read(),
-            ),
-            writes=(),
-            window="out_of_band",
-            bundle_key=("engine_step_id", "phase"),
-            delivery="device_lease",
-            ownership="runtime_lease",
-            row_compaction="first_per_prompt",
-            max_bundle_rows=1,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "flow row cap exceeded"):
-            residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
-
-    def test_default_step_scope_bundle_keeps_list_request_meta_for_compatibility(self) -> None:
-        core = self._core()
-        flow = ConsumerFlow(
-            reads=(
-                ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
-                RequestMeta.read(),
-            ),
-            writes=(),
-            window="background",
-            bundle_key=("engine_step_id", "phase"),
-        )
-
-        bundle = residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
-
-        self.assertIsNotNone(bundle)
-        assert bundle is not None
-        self.assertIsInstance(bundle.entries["request_meta"], list)
-        self.assertEqual(bundle.entries["request_meta"][0]["prompt_idx"], 10)
-
-    def test_row_batch_meta_rejects_mismatched_lengths(self) -> None:
-        with self.assertRaisesRegex(ValueError, "same length"):
-            RowBatchMeta(
-                request_ids=("reqA",),
-                prompt_idxs=(10, 11),
-                sample_idxs=(0,),
+        legacy_bundle = PortBundle(
+            key=BundleKey(
+                engine_step_id=1,
                 phase="decode",
-                engine_step_id=9,
+                request_id="",
+                sample_idx=0,
+            ),
+            entries={"request_meta": []},
+            version=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "device_lease flow.*legacy frame bundle"):
+            residual_bundle_dispatch._enqueue_flow_target(
+                queue=DeferredWorkQueue(),
+                runtime=object(),  # type: ignore[arg-type] - validation fails before runtime use
+                target=target,
+                bundle=legacy_bundle,
+                ctx=RuntimeContext(
+                    runner=None,
+                    model=None,
+                    device=torch.device("cpu"),
+                    main_stream=None,
+                    is_compiling=False,
+                    uses_cudagraph=False,
+                    event_name="test",
+                ),
+                step_id=1,
             )
 
-    def test_build_step_scope_port_bundle_rejects_inconsistent_decode_metadata(self) -> None:
+    def test_first_per_prompt_rejects_active_rows_without_prompt_identity(self) -> None:
         core = self._core()
-        core.RUNTIME.decode_request_ids = ["reqA"]
+        core.RUNTIME.decode_prompt_idxs = [-1, -1]
+        core.RUNTIME.decode_sample_idxs = [-1, -1]
         flow = ConsumerFlow(
             reads=(
                 ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
@@ -298,9 +293,12 @@ class RuntimeResidualBundleDispatchUnitTest(unittest.TestCase):
             writes=(),
             window="out_of_band",
             bundle_key=("engine_step_id", "phase"),
+            delivery="device_lease",
+            ownership="runtime_lease",
+            row_compaction="first_per_prompt",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "decode runtime metadata is inconsistent"):
+        with self.assertRaisesRegex(RuntimeError, "first_per_prompt.*request identity"):
             residual_bundle_dispatch.build_step_scope_port_bundle(core=core, flow=flow)
 
 

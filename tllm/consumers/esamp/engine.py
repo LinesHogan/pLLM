@@ -1204,11 +1204,34 @@ class _ESampEngineCore:
             return
         s.lane.launch_step(source_hidden, target_hidden)
 
-    def launch_delayed_backward(self, active_rows: int, prompt_idxs: Sequence[int] | None = None) -> None:
+    def launch_delayed_backward(
+        self,
+        active_rows: int,
+        prompt_idxs: Sequence[int] | None = None,
+        *,
+        wait_events: Sequence[object] = (),
+    ) -> None:
         s = self.state
         if not s.enabled:
             return
-        s.lane.enqueue_ready_and_drain(active_rows, prompt_idxs, self._train_slot)
+        s.lane.enqueue_ready_and_drain(
+            active_rows,
+            prompt_idxs,
+            self._train_slot,
+            wait_events=wait_events,
+        )
+
+    def retire_step_inputs(self) -> None:
+        if not self.state.enabled:
+            return
+        self.state.lane.retire_step_inputs()
+
+    def fusion_replay_count(self) -> int:
+        """Return completed host launches of captured training callables."""
+        s = self.state
+        return int(sum(graph.replay_hit_count for graph in s.graphs.values())) + int(
+            sum(graph.replay_hit_count for graph in s.model_bank_slot_graphs.values())
+        )
 
     def launch_external_backward(
         self,
@@ -1331,6 +1354,7 @@ class ESampTrainEngine(_ESampEngineCore):
             raise ValueError("out_valid_mask is smaller than active source rows")
         if int(out_pred_hidden.shape[0]) < rows or int(out_pred_hidden.shape[1]) != int(source_hidden.shape[1]):
             raise ValueError("out_pred_hidden shape does not match active source rows")
+        self.state.lane.wait_for_pending_parameters()
         s = self.state
         with torch.no_grad():
             if self.using_model_bank:
@@ -1370,6 +1394,7 @@ class ESampTrainEngine(_ESampEngineCore):
         empty_pred = source_hidden.new_empty((0, int(source_hidden.shape[1])))
         if rows <= 0 or not self.state.enabled:
             return empty_rows, empty_pred
+        self.state.lane.wait_for_pending_parameters()
         s = self.state
         prompt_tensor = prompt_idxs[:rows].to(device=row_device, dtype=torch.long)
         with torch.no_grad():

@@ -18,7 +18,7 @@ from tllm.consumers.inplace_ttt.engine import (
     pad_rows_to_chunk,
     run_exact_toy_down_proj_step,
 )
-from tllm.contracts.gpu_stage import DeviceTensorLease
+from tllm.consumers._common.bundle_inputs import residual_pair_input
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.ports.base import ConsumerFlow
@@ -83,21 +83,10 @@ class InPlaceTTTConsumer(BaseConsumer[InPlaceTTTConsumerConfig]):
         return flows
 
     def _extract_hidden_pair(self, bundle: PortBundle) -> tuple[torch.Tensor, torch.Tensor] | None:
-        lease = bundle.entries.get("device_lease")
-        if isinstance(lease, DeviceTensorLease):
-            source = lease.entries.get("source")
-            target = lease.entries.get("target")
-            active_rows = max(0, int(lease.active_rows))
-            if isinstance(source, torch.Tensor):
-                source = source[:active_rows]
-            if isinstance(target, torch.Tensor):
-                target = target[:active_rows]
-        else:
-            source = bundle.entries.get("source")
-            target = bundle.entries.get("target")
-        if not isinstance(source, torch.Tensor) or not isinstance(target, torch.Tensor):
+        inputs = residual_pair_input(bundle)
+        if inputs is None:
             return None
-        return source, target
+        return inputs.source, inputs.target
 
     def consume_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
         _ = ctx

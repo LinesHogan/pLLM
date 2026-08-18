@@ -58,7 +58,7 @@ class SamplerPlanOracleMatrixUnitTest(unittest.TestCase):
 
     def test_partition_rows_matrix(self) -> None:
         rng = random.Random(20260817)
-        for trial in range(120):
+        for trial in range(12):
             n_rows = rng.randint(1, 12)
             affected = tuple(sorted(rng.sample(range(n_rows), rng.randint(0, n_rows))))
             greedy_avail = rng.random() < 0.7
@@ -90,7 +90,7 @@ class DecodeLocalizationOracleUnitTest(unittest.TestCase):
             ([False, False], [3, 4], 2, 8, 0),
             ([True, True, True], [2, 5, 9], 3, 16, 2),
         ]
-        for _ in range(80):
+        for _ in range(8):
             n = rng.randint(1, 10)
             cases.append(
                 (

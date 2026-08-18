@@ -15,6 +15,7 @@ from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
@@ -123,6 +124,8 @@ class PipelineLane:
         "src_staged_events",
         "tgt_done_events",
         "slot_train_done_events",
+        "pending_reuse_slots",
+        "pending_parameter_slots",
     )
 
     def __init__(self, *, streams: StreamPool, slots: int, label: str) -> None:
@@ -139,6 +142,8 @@ class PipelineLane:
         self.src_staged_events: list[torch.cuda.Event] = []
         self.tgt_done_events: list[torch.cuda.Event] = []
         self.slot_train_done_events: list[torch.cuda.Event] = []
+        self.pending_reuse_slots: set[int] = set()
+        self.pending_parameter_slots: set[int] = set()
 
     def reset_runtime_state(self) -> None:
         self.src_ready_events = []
@@ -146,6 +151,8 @@ class PipelineLane:
         self.src_staged_events = []
         self.tgt_done_events = []
         self.slot_train_done_events = []
+        self.pending_reuse_slots.clear()
+        self.pending_parameter_slots.clear()
         self.pending_train_queue.clear()
         self.current_step_slot = None
         self.ready_step_slot = None
@@ -156,6 +163,8 @@ class PipelineLane:
         self.pending_train_queue.clear()
         self.current_step_slot = None
         self.ready_step_slot = None
+        self.pending_reuse_slots.clear()
+        self.pending_parameter_slots.clear()
 
     def ensure_buffers(
         self,
@@ -278,6 +287,7 @@ class PipelineLane:
             forward_stream.wait_event(tgt_ready)
             copy_rows_into_buffer(buffers.tgt[slot], target_hidden, label=f"{self.label} engine")
             tgt_done.record(forward_stream)
+        self.pending_reuse_slots.add(int(slot))
         self.current_step_slot = None
         self.ready_step_slot = slot
 
@@ -306,11 +316,24 @@ class PipelineLane:
         if int(source_hidden.shape[0]) != int(target_hidden.shape[0]):
             raise RuntimeError(f"{self.label} step launch requires source and target batches with the same row count")
         current_stream = torch.cuda.current_stream(device=source_hidden.device)
-        current_stream.wait_event(self.slot_train_done_events[slot])
-        copy_rows_into_buffer(buffers.src[slot], source_hidden, label=f"{self.label} engine")
-        copy_rows_into_buffer(buffers.tgt[slot], target_hidden, label=f"{self.label} engine")
-        self.src_staged_events[slot].record(current_stream)
-        self.tgt_done_events[slot].record(current_stream)
+        forward_stream = self._require_forward_stream()
+        ready = self.src_ready_events[slot]
+        ready.record(current_stream)
+        if forward_stream is None:
+            current_stream.wait_event(self.slot_train_done_events[slot])
+            copy_rows_into_buffer(buffers.src[slot], source_hidden, label=f"{self.label} engine")
+            copy_rows_into_buffer(buffers.tgt[slot], target_hidden, label=f"{self.label} engine")
+            self.src_staged_events[slot].record(current_stream)
+            self.tgt_done_events[slot].record(current_stream)
+            return
+        with torch.cuda.stream(forward_stream):
+            forward_stream.wait_event(self.slot_train_done_events[slot])
+            forward_stream.wait_event(ready)
+            copy_rows_into_buffer(buffers.src[slot], source_hidden, label=f"{self.label} engine")
+            copy_rows_into_buffer(buffers.tgt[slot], target_hidden, label=f"{self.label} engine")
+            self.src_staged_events[slot].record(forward_stream)
+            self.tgt_done_events[slot].record(forward_stream)
+        self.pending_reuse_slots.add(int(slot))
 
     def launch_step(self, source_hidden: torch.Tensor, target_hidden: torch.Tensor) -> None:
         if self.current_step_slot is not None or self.ready_step_slot is not None or self.pending_train_queue:
@@ -329,11 +352,42 @@ class PipelineLane:
         self.current_step_slot = None
         self.ready_step_slot = slot
 
+    def retire_step_inputs(self) -> None:
+        """Fence tap reuse at the next-forward boundary.
+
+        Training reads runtime-owned slot buffers after staging, so the base
+        model may start its next forward as soon as those copies complete.
+        Parameter readers fence training separately at their actual read site.
+        """
+        if not self.pending_reuse_slots or self.buffers is None:
+            return
+        current_stream = torch.cuda.current_stream(device=self.buffers.src.device)
+        for slot in sorted(self.pending_reuse_slots):
+            current_stream.wait_event(self.tgt_done_events[slot])
+        self.pending_reuse_slots.clear()
+
+    def wait_for_pending_parameters(
+        self,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Fence completed training publishes before reading consumer parameters."""
+        if not self.pending_parameter_slots or self.buffers is None:
+            return
+        if self.buffers.src.device.type != "cuda":
+            self.pending_parameter_slots.clear()
+            return
+        reader_stream = stream or torch.cuda.current_stream(device=self.buffers.src.device)
+        for slot in sorted(self.pending_parameter_slots):
+            reader_stream.wait_event(self.slot_train_done_events[slot])
+        self.pending_parameter_slots.clear()
+
     def enqueue_ready_and_drain(
         self,
         active_rows: int,
         prompt_idxs: Sequence[int] | None,
         train_slot: Callable[[int, int, tuple[int, ...]], None],
+        *,
+        wait_events: Sequence[object] = (),
     ) -> None:
         """Queue the ready slot (if any) and drain all pending training work."""
         buffers = self.require_buffers()
@@ -350,9 +404,12 @@ class PipelineLane:
                 queued_slot, queued_rows, queued_prompts = self.pending_train_queue.popleft()
                 current_stream.wait_event(self.src_staged_events[queued_slot])
                 current_stream.wait_event(self.tgt_done_events[queued_slot])
+                for event in wait_events:
+                    current_stream.wait_event(cast(torch.cuda.Event, event))
                 with train_grad_context():
                     train_slot(queued_slot, queued_rows, queued_prompts)
                 self.slot_train_done_events[queued_slot].record(current_stream)
+                self.pending_parameter_slots.add(int(queued_slot))
             return
         assert train_stream is not None
         with torch.cuda.stream(train_stream):
@@ -360,6 +417,9 @@ class PipelineLane:
                 queued_slot, queued_rows, queued_prompts = self.pending_train_queue.popleft()
                 train_stream.wait_event(self.src_staged_events[queued_slot])
                 train_stream.wait_event(self.tgt_done_events[queued_slot])
+                for event in wait_events:
+                    train_stream.wait_event(cast(torch.cuda.Event, event))
                 with train_grad_context():
                     train_slot(queued_slot, queued_rows, queued_prompts)
                 self.slot_train_done_events[queued_slot].record(train_stream)
+                self.pending_parameter_slots.add(int(queued_slot))

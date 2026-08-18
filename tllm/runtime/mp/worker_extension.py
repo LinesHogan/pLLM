@@ -61,6 +61,9 @@ class TllmWorkerExtension:
             "patch_installed": bool(core._PATCH_INSTALLED),
             "consumer": None if core.RUNTIME.consumer is None else str(core.RUNTIME.consumer.consumer_id),
             "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
+            "test_time_lora_enabled": bool(core.RUNTIME.test_time_lora_enabled),
+            "fast_weight_enabled": bool(core.RUNTIME.config.fast_weight_enabled),
+            "fast_weight_chunk_size": int(core.RUNTIME.config.fast_weight_chunk_size),
         }
 
     def tllm_push_request_mapping(self, mappings: list[list[Any]]) -> int:
@@ -80,16 +83,31 @@ class TllmWorkerExtension:
             count += 1
         return count
 
-    def tllm_pull_stats(self) -> dict[str, Any]:
+    def tllm_pull_stats(self, category: str = "all", sync: bool = True) -> dict[str, Any]:
         """Read and reset runtime stats, resolved to plain data child-side."""
         from tllm.runtime import residual_runtime as core
 
-        return {
-            "esamp": _to_plain(core.read_and_reset_esamp_stats(sync=True)),
-            "esamp_per_request": _to_plain(core.read_and_reset_esamp_per_request_stats(sync=True)),
-            "distiller_timing": _to_plain(core.read_and_reset_distiller_timing_stats(sync=True)),
-            "path_hotspot": _to_plain(core.read_and_reset_path_hotspot_stats(sync=True)),
+        supported = {"all", "esamp", "esamp_per_request", "distiller_timing", "path_hotspot", "placement"}
+        if category not in supported:
+            raise ValueError(f"unsupported stats category {category!r}; supported: {sorted(supported)}")
+        payload = {
+            "esamp": {"loss_avg": 0.0, "loss_count": 0, "trace_losses": []},
+            "esamp_per_request": {},
+            "distiller_timing": {},
+            "path_hotspot": {},
+            "placement": {},
         }
+        if category in ("all", "esamp"):
+            payload["esamp"] = _to_plain(core.read_and_reset_esamp_stats(sync=sync))
+        if category in ("all", "esamp_per_request"):
+            payload["esamp_per_request"] = _to_plain(core.read_and_reset_esamp_per_request_stats(sync=sync))
+        if category in ("all", "distiller_timing"):
+            payload["distiller_timing"] = _to_plain(core.read_and_reset_distiller_timing_stats(sync=sync))
+        if category in ("all", "path_hotspot"):
+            payload["path_hotspot"] = _to_plain(core.read_and_reset_path_hotspot_stats(sync=sync))
+        if category in ("all", "placement"):
+            payload["placement"] = _to_plain(core.read_and_reset_placement_stats())
+        return payload
 
     def tllm_synchronize(self) -> None:
         """Drain outstanding async consumer work in this process."""
@@ -110,6 +128,34 @@ class TllmWorkerExtension:
         if "test_time_lora_enabled" in flags:
             core.set_test_time_lora_enabled(bool(flags["test_time_lora_enabled"]))
 
+    def tllm_set_fast_weight_enabled(
+        self,
+        enabled: bool,
+        layers: list[int] | None = None,
+        chunk_size: int | None = None,
+        learning_rate: float | None = None,
+        mode: str | None = None,
+        decode_update_enabled: bool | None = None,
+        key_mode: str | None = None,
+        max_slots: int | None = None,
+        max_bytes: int | None = None,
+        fail_on_unsupported: bool | None = None,
+    ) -> None:
+        from tllm.runtime import residual_runtime as core
+
+        core.set_fast_weight_enabled(
+            bool(enabled),
+            layers=layers,
+            chunk_size=chunk_size,
+            learning_rate=learning_rate,
+            mode=mode,
+            decode_update_enabled=decode_update_enabled,
+            key_mode=key_mode,
+            max_slots=max_slots,
+            max_bytes=max_bytes,
+            fail_on_unsupported=fail_on_unsupported,
+        )
+
     def tllm_register_consumer(self, name: str, config: dict[str, Any], primary: bool = False) -> None:
         """Rebuild a consumer from its spec and activate it in this process."""
         from tllm.consumers import registry as consumer_registry
@@ -117,6 +163,11 @@ class TllmWorkerExtension:
 
         consumer = consumer_registry.build_consumer_from_spec(ConsumerSpec(name=str(name), config=dict(config)))
         consumer_registry.activate_consumer(consumer, primary=bool(primary))
+
+    def tllm_clear_consumers(self) -> None:
+        from tllm.runtime import residual_runtime as core
+
+        core.clear_dispatch_consumers()
 
     def tllm_bind_runner_runtime(self) -> None:
         """Record this worker's runner in the runner->runtime routing table.

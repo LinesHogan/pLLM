@@ -14,20 +14,22 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 ### 需要什么版本的 vLLM？
 
-tLLM 要求 **vLLM >= 0.7.2**，且仅支持 **v1 引擎**。
+tLLM 支持 **vLLM >= 0.27.1, < 0.28**，且仅支持 **v1 引擎**。
 
-当前 repo-local `.venv` 的实际开发环境是 **`vllm==0.10.1.1`**，所以日常验证应优先以 `0.10.x` 行为为准。tLLM 的核心机制是在 vLLM v1 的 `GPUModelRunner` 生命周期里安装 runtime hook；v0 引擎使用完全不同的 runner 架构，无法兼容。
+当前 repo-local `.venv` 的实际开发环境是 **`vllm==0.27.1`**，MRv1 与 MRv2 均纳入兼容性门禁。tLLM 的核心机制是在 vLLM v1 的 `GPUModelRunner` 生命周期里安装 runtime hook；v0 引擎使用完全不同的 runner 架构，无法兼容。
 
 ### `VLLM_USE_V1` 等环境变量是什么意思？
 
 | 环境变量 | 含义 | 是否自动设置 |
 |----------|------|-------------|
 | `VLLM_USE_V1=1` | 启用 vLLM v1 引擎 | 是，tLLM 运行时入口自动设置 |
-| `VLLM_ENABLE_V1_MULTIPROCESSING=0` | 关闭 vLLM 多进程模式 | 是，自动设置 |
+| `VLLM_ENABLE_V1_MULTIPROCESSING=1` | 让 EngineCore 在子进程运行 | 是，自动设置 |
 | `VLLM_USE_FLASHINFER_SAMPLER=1` | 启用 FlashInfer sampler | 否，需手动设置 |
 | `VLLM_DISABLE_COMPILE_CACHE` | 禁用编译缓存 | 见 [安装指南](getting-started/installation.md) |
 
-**为什么要关闭多进程？** tLLM 的 Producer/Consumer 通过进程内全局 `STATE` 对象在 `_prepare_inputs` 和 `execute_model` 之间传递每步的定位信息。多进程模式下 worker 在独立进程中运行，全局状态无法共享。
+多进程是默认模式。tLLM 通过 general plugin 在 EngineCore 子进程重建 runtime，
+并用 worker extension 跨进程传递 request mapping、在线控制、同步与统计。
+需要同进程调试时可显式设置 `VLLM_ENABLE_V1_MULTIPROCESSING=0`；显式覆盖会被保留。
 
 详见 [安装指南](getting-started/installation.md)。
 

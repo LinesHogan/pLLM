@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from tllm.runtime.sampler_bridge.min_p import apply_min_p, min_p_keep_mask
 from tllm.runtime.sampler_bridge.backends.dense_cache import gather_dense_candidate_logits as _gather_dense_candidate_logits
@@ -123,62 +123,6 @@ def _select_subset_inputs(
         min_p = _select_sampling_tensor_rows(getattr(sampling_metadata, "min_p", None), row_ids)
         generators = _select_generators(getattr(sampling_metadata, "generators", {}), row_ids)
     return subset_logits, subset_state, top_k, top_p, min_p, generators
-
-
-def _select_min_p_topk_candidates(
-    logits: torch.Tensor,
-    min_p: torch.Tensor,
-    cap: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    k = min(max(1, int(cap)), int(logits.shape[1]))
-    values, token_ids = logits.topk(k, dim=-1)
-    min_p_values = min_p.to(device=logits.device, dtype=torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
-    thresholds = values[:, :1].to(dtype=torch.float32) + min_p_values.log().unsqueeze(1)
-    keep = values.to(dtype=torch.float32) >= thresholds
-    row_ids, pos_ids = keep.nonzero(as_tuple=True)
-    return row_ids, token_ids[row_ids, pos_ids], values[row_ids, pos_ids]
-
-
-def _sample_fixed_topk_min_p_candidates(
-    *,
-    logits: torch.Tensor,
-    min_p: torch.Tensor,
-    state: SamplerModifierState,
-    cap: int,
-) -> torch.Tensor:
-    k = min(max(1, int(cap)), int(logits.shape[1]))
-    values, token_ids = logits.topk(k, dim=-1)
-    min_p_values = min_p.to(device=logits.device, dtype=torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
-    thresholds = values[:, :1].to(dtype=torch.float32) + min_p_values.log().unsqueeze(1)
-    keep = values.to(dtype=torch.float32) >= thresholds
-    keep[:, 0] = True
-    if state.backend == "post_filter_dense_cache" and state.precomputed_dense_logits is not None:
-        assert state.precomputed_dense_logits is not None
-        dense = state.precomputed_dense_logits
-        dense_row_ids = torch.arange(int(logits.shape[0]), device=token_ids.device, dtype=torch.long)
-        if state.pred_hidden_row_map is not None:
-            dense_row_ids = state.pred_hidden_row_map.index_select(0, dense_row_ids)
-        distiller_candidate_logits = dense[dense_row_ids.to(device=dense.device, dtype=torch.long).unsqueeze(1), token_ids.to(device=dense.device, dtype=torch.long)]
-        distiller_candidate_logits = distiller_candidate_logits.to(device=logits.device, dtype=logits.dtype)
-    else:
-        hidden_rows = torch.arange(int(logits.shape[0]), device=state.pred_hidden.device, dtype=torch.long)
-        if state.pred_hidden_row_map is not None:
-            hidden_rows = state.pred_hidden_row_map.to(device=state.pred_hidden.device, dtype=torch.long).index_select(0, hidden_rows)
-        pred_rows = state.pred_hidden.index_select(0, hidden_rows)
-        token_rows = state.lm_head_weight.index_select(0, token_ids.reshape(-1).to(device=state.lm_head_weight.device, dtype=torch.long))
-        token_rows = token_rows.view(int(logits.shape[0]), k, int(token_rows.shape[-1]))
-        distiller_candidate_logits = (pred_rows.to(dtype=token_rows.dtype).unsqueeze(1) * token_rows).sum(dim=-1)
-        if state.lm_head_bias is not None:
-            bias = state.lm_head_bias.index_select(0, token_ids.reshape(-1).to(device=state.lm_head_bias.device, dtype=torch.long))
-            distiller_candidate_logits = distiller_candidate_logits + bias.view(int(logits.shape[0]), k)
-        distiller_candidate_logits = distiller_candidate_logits.to(device=logits.device, dtype=logits.dtype)
-    candidate_logits = ((1.0 + float(state.beta)) * values) - (float(state.beta) * distiller_candidate_logits)
-    candidate_logits = candidate_logits.masked_fill(~keep, -float("inf"))
-    noise = torch.empty_like(candidate_logits, dtype=torch.float32)
-    noise.exponential_()
-    pos = (candidate_logits.to(dtype=torch.float32) - noise.log_()).argmax(dim=-1)
-    _record_candidate_stats(candidate_count=int(logits.shape[0]) * k, row_count=int(logits.shape[0]))
-    return token_ids.gather(1, pos.unsqueeze(1)).view(-1).to(dtype=torch.long)
 
 
 def build_modified_logits_exact(
@@ -313,26 +257,3 @@ def sample_rows_exact_candidates(
         row_ids=row_ids,
         all_rows=all_rows,
     )
-
-
-def sample_rows_exact(
-    *,
-    logits: torch.Tensor,
-    sampling_metadata: Any,
-    state: SamplerModifierState,
-    row_ids: torch.Tensor,
-    greedy: bool,
-    all_rows: bool | None = None,
-) -> torch.Tensor:
-    modified, generators = build_modified_logits_exact(
-        logits=logits,
-        sampling_metadata=sampling_metadata,
-        state=state,
-        row_ids=row_ids,
-        greedy=greedy,
-        all_rows=all_rows,
-    )
-    if greedy:
-        return modified.argmax(dim=-1).to(dtype=torch.long)
-    probs = modified.softmax(dim=-1, dtype=torch.float32)
-    return random_sample(probs, generators).to(dtype=torch.long)

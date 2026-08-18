@@ -5,16 +5,16 @@ from __future__ import annotations
 
 from tllm.consumers.fttt.config import FTTTConsumerConfig
 from tllm.consumers.fttt.consumer import FTTTConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = FTTTConsumer
-CONFIG_TYPE = FTTTConsumerConfig
+PLUGIN = ConsumerPluginSpec("fttt", FTTTConsumer, FTTTConsumerConfig, FTTTConsumer)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: FTTTConsumerConfig | None = None) -> FTTTConsumer:
-    return FTTTConsumer(config or FTTTConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: FTTTConsumerConfig | None = None, *, primary: bool = False) -> FTTTConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

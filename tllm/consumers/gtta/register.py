@@ -5,16 +5,16 @@ from __future__ import annotations
 
 from tllm.consumers.gtta.config import GTTAConsumerConfig
 from tllm.consumers.gtta.consumer import GTTAConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = GTTAConsumer
-CONFIG_TYPE = GTTAConsumerConfig
+PLUGIN = ConsumerPluginSpec("gtta", GTTAConsumer, GTTAConsumerConfig, GTTAConsumer)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: GTTAConsumerConfig | None = None) -> GTTAConsumer:
-    return GTTAConsumer(config or GTTAConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: GTTAConsumerConfig | None = None, *, primary: bool = False) -> GTTAConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

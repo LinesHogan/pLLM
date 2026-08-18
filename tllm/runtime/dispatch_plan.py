@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional
 
 from tllm.consumers.base import BaseConsumer
@@ -11,6 +11,8 @@ from tllm.ports.base import ConsumerFlow
 from tllm.ports.base import PortKind
 from tllm.contracts.subscription import ConsumerSubscription
 from tllm.runtime.consumer_compat import consumer_subscriptions
+from tllm.runtime.graph_policy import GraphMode
+from tllm.runtime.placement import CompiledPlacement
 
 
 @dataclass(frozen=True)
@@ -23,35 +25,76 @@ class DispatchTarget:
 class FlowDispatchTarget:
     consumer: BaseConsumer
     flow: ConsumerFlow
+    flow_id: str = ""
+    placement_hook: str = "execute_model.post"
 
 
 class DispatchPlan:
     def __init__(self, by_event: Dict[str, List[DispatchTarget]], flow_targets: List[FlowDispatchTarget]) -> None:
         self._by_event = by_event
         self._flow_targets = flow_targets
+        self._graph_mode = "eager"
+        self._fusion_groups: tuple[tuple[str, ...], ...] = ()
+        self._fusion_rejections: tuple[tuple[str, str], ...] = ()
+        self._placement_metadata_pending = True
+        self._rebuild_flow_hook_table()
+
+    def _rebuild_flow_hook_table(self) -> None:
+        by_hook: dict[str, list[FlowDispatchTarget]] = {}
+        for target in self._flow_targets:
+            by_hook.setdefault(target.placement_hook, []).append(target)
+        self._by_flow_hook = {hook: tuple(targets) for hook, targets in by_hook.items()}
+
+    def _install_compiled_placement(self, compiled: CompiledPlacement) -> None:
+        order = {flow_id: index for index, flow_id in enumerate(compiled.execution_order)}
+        targets = [
+            replace(
+                target,
+                placement_hook=compiled.by_flow_id.get(target.flow_id, target.placement_hook),
+            )
+            for target in self._flow_targets
+        ]
+        # Python's sort is stable, so post-generate flows absent from the Rust
+        # schedule retain declaration order after all dependency-scheduled flows.
+        targets.sort(key=lambda target: order.get(target.flow_id, len(order)))
+        self._flow_targets = targets
+        self._fusion_groups = compiled.fusion_groups
+        self._fusion_rejections = compiled.fusion_rejections
+        self._rebuild_flow_hook_table()
 
     @classmethod
     def build(cls, consumers: Iterable[BaseConsumer]) -> "DispatchPlan":
         by_event: Dict[str, List[DispatchTarget]] = {}
-        flow_targets: List[FlowDispatchTarget] = []
-        timed_flows: List[tuple[str, ConsumerFlow]] = []
+        flow_records: List[tuple[str, BaseConsumer, ConsumerFlow]] = []
         for consumer in consumers:
             flows = list(consumer.flows())
             for flow_i, flow in enumerate(flows):
-                flow_targets.append(FlowDispatchTarget(consumer=consumer, flow=flow))
-                timed_flows.append((f"{consumer.consumer_id}#{flow_i}", flow))
+                flow_records.append((f"{consumer.consumer_id}#{flow_i}", consumer, flow))
             if flows:
                 continue
             for sub in consumer_subscriptions(consumer):
                 by_event.setdefault(sub.event_name, []).append(DispatchTarget(consumer=consumer, subscription=sub))
-        plan = cls(by_event=by_event, flow_targets=flow_targets)
         # Timing-contract validation is owned by the Rust placement compiler;
-        # graph-mode-aware checks join when the plan meets the runner (B5).
-        from tllm.runtime.placement import validate_flow_timing
+        # its result is cached so the per-step path does no graph traversal.
+        from tllm.runtime.placement import compile_flow_placement
         from tllm.runtime.ports.post_generate_dispatch import is_post_generate_flow
 
-        validate_flow_timing([(fid, f) for fid, f in timed_flows if not is_post_generate_flow(f)])
+        flow_targets = [
+            FlowDispatchTarget(
+                consumer=consumer,
+                flow=flow,
+                flow_id=flow_id,
+            )
+            for flow_id, consumer, flow in flow_records
+        ]
+        plan = cls(by_event=by_event, flow_targets=flow_targets)
+        # Preserve the public DispatchPlan validation contract before the Rust
+        # compiler builds WAW edges from the same descriptors.
         plan.write_conflict_check()
+        compiled = compile_flow_placement(
+            [(flow_id, flow) for flow_id, _consumer, flow in flow_records if not is_post_generate_flow(flow)]
+        )
+        plan._install_compiled_placement(compiled)
         return plan
 
     def select(
@@ -79,6 +122,49 @@ class DispatchPlan:
 
     def flow_targets(self) -> List[FlowDispatchTarget]:
         return list(self._flow_targets)
+
+    def has_movable_flow_targets(self) -> bool:
+        return any(target.placement_hook != "execute_model.post" for target in self._flow_targets)
+
+    def requires_graph_mode_resolution(self) -> bool:
+        return any(
+            str(target.flow.fusion) != "none"
+            or any(write.fusion_candidate for write in target.flow.writes)
+            for target in self._flow_targets
+        )
+
+    def flow_targets_for_hook(self, hook: str) -> tuple[FlowDispatchTarget, ...]:
+        return self._by_flow_hook.get(str(hook), ())
+
+    @property
+    def fusion_groups(self) -> tuple[tuple[str, ...], ...]:
+        return self._fusion_groups
+
+    @property
+    def fusion_rejections(self) -> tuple[tuple[str, str], ...]:
+        return self._fusion_rejections
+
+    def ensure_graph_mode(self, graph_mode: GraphMode) -> bool:
+        from tllm.runtime.placement import compile_flow_placement
+        from tllm.runtime.ports.post_generate_dispatch import is_post_generate_flow
+
+        mode_name = graph_mode.name.lower()
+        if mode_name == self._graph_mode:
+            pending = self._placement_metadata_pending
+            self._placement_metadata_pending = False
+            return pending
+        compiled = compile_flow_placement(
+            [
+                (target.flow_id, target.flow)
+                for target in self._flow_targets
+                if not is_post_generate_flow(target.flow)
+            ],
+            graph_mode=graph_mode,
+        )
+        self._graph_mode = mode_name
+        self._placement_metadata_pending = False
+        self._install_compiled_placement(compiled)
+        return True
 
     def has_active_targets(self) -> bool:
         return not self.is_empty()

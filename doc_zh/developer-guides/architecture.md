@@ -49,6 +49,63 @@ Producer 的改动只影响"怎么找到正确的行"。Consumer 的改动只影
 
 ---
 
+## 语言与编译器边界
+
+tLLM 的声明模型既是一个小型数据流语言，也是一条编译流水线。正确边界不是按
+Python/Rust 文件数量划分，而是按“声明、决策、执行”划分：
+
+| 层 | 负责 | 不负责 |
+|----|------|--------|
+| Python typed front-end | `ConsumerFlow`、producer descriptor、plugin spec、结构化 port address、typed consumer input view | 跨 flow 的调度决策 |
+| Rust compiler mid-end | 启动期校验、provider 选择、依赖 DAG、合法 hook placement、fusion eligibility 元数据 | Tensor、CUDA stream/event、vLLM 对象、plugin 实例 |
+| Python runtime executor | vLLM adapter、Tensor/CUDA 物化、bundle 组装、延迟队列、stream/event 启动 | 每 token 重新决定已编译计划 |
+
+FFI 只传 frozen、基于属性的 descriptor，不传嵌套 magic dict 或 Torch 对象。动态结构
+探测只保留在外部 API 和 plugin 边界；边界值完成一次校验后，下游只通过 typed
+attribute 访问。`PortBundle.entries` 继续作为兼容与扩展 API，内置 consumer 则在入口
+处一次性降低为 typed input view。
+
+Producer 对象是声明，不是小型 executor。它描述 outputs、requires、hook points 和
+graph safety；真正从 vLLM Tensor 物化 port 的工作仍由 backend driver 负责。
+
+---
+
+## DAG 与自动 placement
+
+启动时，tLLM 把 flow 的读写降低为带 tag 的结构化 `PortAddress`。Rust core 为同一
+consumer 的状态顺序、RAW/WAR hazard 和显式排序的 WAW hazard 建边；稳定 Kahn
+拓扑排序负责拒绝环并生成执行顺序。
+
+随后 placement 根据 mobility、declared/earliest hook、graph mode、backend 已物化
+hook 以及前驱选择计算合法区间。当前算法是受约束的贪心 list scheduling：按拓扑序
+依次为每个 flow 最大化以下目标：
+
+1. capture eligibility bonus；
+2. 配置或默认的 hook `bubble_score`；
+3. 与 declared hook 的接近程度；
+4. 稳定 hook 顺序，作为确定性 tie-break。
+
+这不是资源约束项目调度器。当前成本模型没有任务时长、SM/HBM/copy-engine 容量或
+传输成本，因此 tLLM 不声称全局最优。fusion 输出也只是 eligibility 元数据：group
+必须在拓扑上连续，实际 selected hook 必须等于已物化的 fusion hook，并且使用稳定
+lease buffer 与静态 row bucket。kernel 和图优化仍交给 Torch/vLLM 编译系统。
+
+后续算法应由实际优化机会和已有成本数据决定：
+
+| 优化机会 | 合适算法 |
+|----------|----------|
+| 依赖合法性与稳定顺序 | Kahn；只有需要更丰富 SCC 诊断时才引入 Tarjan |
+| 最早/最晚合法 hook 区间 | ASAP/ALAP 约束传播 |
+| 有时长/资源 profile 后的在线 deadline | critical-path 或 EDF 驱动的 list scheduling + admission control |
+| capture-safe fusion region | 拓扑凸区域构造 |
+| 顺序固定后的稳定 buffer 复用 | liveness interval + linear scan/interval coloring |
+| 带共享依赖的多 provider 选择 | AND-OR selection；仅在图规模需要时使用 bounded search 或 ILP |
+
+CP-SAT 或穷举适合做小图 oracle；在真实资源/成本模型出现之前引入求解器，只会对
+虚构数字做更精确的优化。
+
+---
+
 ## 核心抽象：Port
 
 Runtime 和 Consumer 之间不共享 vLLM 内部对象，而是通过正式的数据接口交互。

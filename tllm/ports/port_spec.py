@@ -23,3 +23,12 @@ class PortSpec:
     description: str = ""
     writable: bool = False
     write_modes: tuple[str, ...] = ()
+    phases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        phases = tuple(str(phase).strip() for phase in self.phases)
+        if any(not phase for phase in phases):
+            raise ValueError("PortSpec phases must be non-empty strings")
+        if len(set(phases)) != len(phases):
+            raise ValueError(f"PortSpec declares duplicate phases: {phases}")
+        object.__setattr__(self, "phases", phases)

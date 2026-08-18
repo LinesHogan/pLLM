@@ -9,6 +9,7 @@ from typing import Iterable, Sequence
 import torch
 
 from tllm.consumers.base import BaseConsumer
+from tllm.consumers._common.bundle_inputs import post_generate_input
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
 from tllm.consumers.ttrl.engine import (
     TTRLClosedLoopIntent,
@@ -106,29 +107,13 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
 
     def consume_bundle(self, bundle, ctx) -> None:
         _ = ctx
-        from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
-
-        trace = bundle.entries.get("generation_trace")
-        if not isinstance(trace, GenerationTraceBatch):
-            raise TypeError("generation_trace entry must be GenerationTraceBatch")
-        sink = bundle.entries.get("reward_outcome")
-        append = getattr(sink, "append", None)
-        if not callable(append):
-            raise TypeError("reward_outcome entry must provide append")
-        intent = self.closed_loop_intent_for_trace(trace)
-        append(intent.reward_outcomes)
-        retry_sink = bundle.entries.get("retry_control")
-        retry_append = getattr(retry_sink, "append", None)
-        if retry_sink is not None and not callable(retry_append):
-            raise TypeError("retry_control entry must provide append")
-        if callable(retry_append):
-            retry_append(intent.retry_controls)
-        barrier_sink = bundle.entries.get("update_barrier")
-        barrier_append = getattr(barrier_sink, "append", None)
-        if barrier_sink is not None and not callable(barrier_append):
-            raise TypeError("update_barrier entry must provide append")
-        if callable(barrier_append):
-            barrier_append(intent.update_barriers)
+        inputs = post_generate_input(bundle)
+        intent = self.closed_loop_intent_for_trace(inputs.trace)
+        inputs.reward_outcome.append(intent.reward_outcomes)
+        if inputs.retry_control is not None:
+            inputs.retry_control.append(intent.retry_controls)
+        if inputs.update_barrier is not None:
+            inputs.update_barrier.append(intent.update_barriers)
 
     def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
         reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)

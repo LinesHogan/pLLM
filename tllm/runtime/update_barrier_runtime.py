@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tllm.runtime.append_store import AppendStore, runtime_store
+
 __test__ = False
 
 _BARRIER_STATES = frozenset({"pending", "ready", "blocked"})
@@ -83,32 +85,22 @@ class UpdateBarrierBatch:
         object.__setattr__(self, "entries", tuple(entries))
 
 
-class UpdateBarrierStore:
+class UpdateBarrierStore(AppendStore[UpdateBarrierEntry, UpdateBarrierBatch]):
     def __init__(self) -> None:
-        self._entries: list[UpdateBarrierEntry] = []
-
-    def append(self, batch: UpdateBarrierBatch) -> int:
-        if not isinstance(batch, UpdateBarrierBatch):
-            raise TypeError("batch must be UpdateBarrierBatch")
-        self._entries.extend(batch.entries)
-        return len(batch.entries)
-
-    def read(self) -> UpdateBarrierBatch:
-        return UpdateBarrierBatch(entries=tuple(self._entries))
-
-    def drain(self) -> UpdateBarrierBatch:
-        batch = self.read()
-        self._entries.clear()
-        return batch
+        super().__init__(
+            batch_type=UpdateBarrierBatch,
+            entries_of=lambda batch: batch.entries,
+            make_batch=lambda entries: UpdateBarrierBatch(entries=entries),
+        )
 
 
 def _store_for_runtime(runtime: object) -> UpdateBarrierStore:
-    store = getattr(runtime, "update_barrier_store", None)
-    if isinstance(store, UpdateBarrierStore):
-        return store
-    store = UpdateBarrierStore()
-    setattr(runtime, "update_barrier_store", store)
-    return store
+    return runtime_store(
+        runtime,
+        attribute="update_barrier_store",
+        store_type=UpdateBarrierStore,
+        factory=UpdateBarrierStore,
+    )
 
 
 def write_update_barriers(runtime: object, batch: UpdateBarrierBatch) -> int:

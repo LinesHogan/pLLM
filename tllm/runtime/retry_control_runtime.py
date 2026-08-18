@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tllm.runtime.append_store import AppendStore, runtime_store
+
 __test__ = False
 
 _RETRY_ACTIONS = frozenset({"retry", "stop", "accept"})
@@ -78,32 +80,22 @@ class RetryControlBatch:
         object.__setattr__(self, "entries", tuple(entries))
 
 
-class RetryControlStore:
+class RetryControlStore(AppendStore[RetryControlEntry, RetryControlBatch]):
     def __init__(self) -> None:
-        self._entries: list[RetryControlEntry] = []
-
-    def append(self, batch: RetryControlBatch) -> int:
-        if not isinstance(batch, RetryControlBatch):
-            raise TypeError("batch must be RetryControlBatch")
-        self._entries.extend(batch.entries)
-        return len(batch.entries)
-
-    def read(self) -> RetryControlBatch:
-        return RetryControlBatch(entries=tuple(self._entries))
-
-    def drain(self) -> RetryControlBatch:
-        batch = self.read()
-        self._entries.clear()
-        return batch
+        super().__init__(
+            batch_type=RetryControlBatch,
+            entries_of=lambda batch: batch.entries,
+            make_batch=lambda entries: RetryControlBatch(entries=entries),
+        )
 
 
 def _store_for_runtime(runtime: object) -> RetryControlStore:
-    store = getattr(runtime, "retry_control_store", None)
-    if isinstance(store, RetryControlStore):
-        return store
-    store = RetryControlStore()
-    setattr(runtime, "retry_control_store", store)
-    return store
+    return runtime_store(
+        runtime,
+        attribute="retry_control_store",
+        store_type=RetryControlStore,
+        factory=RetryControlStore,
+    )
 
 
 def write_retry_controls(runtime: object, batch: RetryControlBatch) -> int:

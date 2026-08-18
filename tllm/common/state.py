@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import torch
 
+from tllm.contracts.request_identity import resolve_prompt_sample
 from tllm.common.path_resolution import (
     candidate_capture_paths as _candidate_capture_paths,
     resolve_layers_container as _resolve_layers_container,
@@ -21,7 +22,7 @@ from tllm.common.runtime_step_state import (
 
 def ensure_v1_env() -> None:
     os.environ.setdefault("VLLM_USE_V1", "1")
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
 
 
 @dataclass
@@ -172,18 +173,7 @@ def resolve_prompt_sample_for_req_id(req_id: str) -> tuple[int, int]:
     For vLLM parallel sampling with n>1:
       child_req_id = f"{sample_idx}_{parent_req_id}".
     """
-    prompt_idx = STATE.reqid_to_promptidx.get(req_id)
-    if prompt_idx is not None:
-        return int(prompt_idx), 0
-
-    if "_" in req_id:
-        maybe_sample_idx, parent_req_id = req_id.split("_", 1)
-        if maybe_sample_idx.isdigit():
-            parent_prompt_idx = STATE.reqid_to_promptidx.get(parent_req_id)
-            if parent_prompt_idx is not None:
-                return int(parent_prompt_idx), int(maybe_sample_idx)
-
-    return -1, -1
+    return resolve_prompt_sample(req_id, prompt_indices=STATE.reqid_to_promptidx)
 
 
 def find_capture_layer(model: Any) -> tuple[torch.nn.Module, str]:

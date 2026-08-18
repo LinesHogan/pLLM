@@ -14,7 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from tllm.contracts.test_time_lora import LoRAScope, TestTimeLoRAUpdate, TestTimeLoRAWeights
-from tllm.consumers._common.alignment import LowRankAdapter
+from tllm.consumers._common.alignment import LowRankAdapter, detached_train_input
 from tllm.consumers.fttt.config import FTTTConsumerConfig
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry
 
@@ -218,10 +218,7 @@ class FTTTEngine(nn.Module):
 
     @staticmethod
     def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
-        out = tensor.detach()
-        if torch.is_inference(out):
-            out = out.clone()
-        return out
+        return detached_train_input(tensor)
 
     def _build_adapter(self, hidden_size: int) -> None:
         self.config.hidden_size = int(hidden_size)

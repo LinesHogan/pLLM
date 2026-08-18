@@ -12,7 +12,6 @@ from tllm.consumers.base import BaseConsumer
 from tllm.contracts.port_bundle import PortBundle
 from tllm.ports.base import ConsumerFlow
 from tllm.ports.generation_trace import GenerationTrace
-from tllm.ports.request_meta import RequestMeta
 from tllm.ports.reward_outcome import RewardOutcome
 from tllm.ports.retry_control import RetryControl
 from tllm.ports.update_barrier import UpdateBarrier
@@ -156,24 +155,12 @@ class PostGenerateDispatchUnitTest(unittest.TestCase):
         bundle = consumer.seen[0]
         self.assertEqual(bundle.key.phase, "post_generate")
         self.assertEqual(bundle.key.engine_step_id, 17)
+        self.assertEqual(bundle.key.generation_group_id, "round-a")
         self.assertIs(bundle.entries["generation_trace"], runtime.last_generation_trace)
         outcomes = read_reward_outcomes(runtime)
         self.assertEqual(len(outcomes.entries), 1)
         self.assertEqual(outcomes.entries[0].request_id, "req-a")
         self.assertEqual(outcomes.entries[0].reward, 1.0)
-
-    def test_reward_outcome_sink_rejects_non_batch_payloads(self) -> None:
-        runtime = self._runtime()
-        flow = ConsumerFlow(
-            reads=(GenerationTrace.read(),),
-            writes=(RewardOutcome.write(),),
-            window="out_of_band",
-            bundle_key=("generation_group_id", "phase"),
-        )
-
-        bundle = port_runtime_hooks.build_post_generate_port_bundle(runtime=runtime, flow=flow)
-        with self.assertRaisesRegex(TypeError, "batch must be RewardOutcomeBatch"):
-            bundle.entries["reward_outcome"].append("bad")  # type: ignore[attr-defined]
 
     def test_post_generate_flow_writes_retry_control_and_update_barrier(self) -> None:
         runtime = self._runtime()
@@ -193,159 +180,30 @@ class PostGenerateDispatchUnitTest(unittest.TestCase):
         self.assertEqual(barrier_entries[0].state, "ready")
         self.assertEqual(barrier_entries[0].request_ids, ("req-a",))
 
-    def test_post_generate_dispatches_trace_to_ttrl_and_fttt_closed_loop_consumers(self) -> None:
-        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
-        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
-
-        runner = SimpleNamespace(device=torch.device("cpu"), model=None, use_cuda_graph=False, compilation_config=None)
-
-        with self.subTest("ttrl"):
-            runtime = SimpleNamespace(event_step_id=21)
-            runtime.last_generation_trace = GenerationTraceBatch(
-                entries=(
-                    CompletionTraceEntry(
-                        request_id="req-ttrl-a",
-                        prompt_idx=8,
-                        sample_idx=0,
-                        output_index=0,
-                        token_ids=(),
-                        text=r"\boxed{4}",
-                        finish_reason="stop",
-                        group_id="vote-runtime",
-                    ),
-                    CompletionTraceEntry(
-                        request_id="req-ttrl-b",
-                        prompt_idx=8,
-                        sample_idx=1,
-                        output_index=0,
-                        token_ids=(),
-                        text=r"\boxed{5}",
-                        finish_reason="stop",
-                        group_id="vote-runtime",
-                    ),
-                )
-            )
-            runtime.dispatch_plan = DispatchPlan.build([TTRLConsumer(TTRLConsumerConfig())])
-
-            self.assertEqual(port_runtime_hooks.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner), 1)
-
-            reward_entries = read_reward_outcomes(runtime).entries
-            retry_entries = read_retry_controls(runtime).entries
-            barrier_entries = read_update_barriers(runtime).entries
-            self.assertEqual([entry.reward for entry in reward_entries], [1.0, 0.0])
-            self.assertEqual([entry.action for entry in retry_entries], ["accept", "retry"])
-            self.assertTrue(retry_entries[1].retry_after_update)
-            self.assertEqual(len(barrier_entries), 1)
-            self.assertEqual(barrier_entries[0].consumer_id, "ttrl")
-            self.assertEqual(barrier_entries[0].state, "ready")
-            self.assertEqual(barrier_entries[0].ready_count, 2)
-
-        with self.subTest("fttt"):
-            runtime = SimpleNamespace(event_step_id=22)
-            runtime.last_generation_trace = GenerationTraceBatch(
-                entries=(
-                    CompletionTraceEntry(
-                        request_id="req-fttt-fail",
-                        prompt_idx=9,
-                        sample_idx=0,
-                        output_index=0,
-                        token_ids=(),
-                        text="5",
-                        finish_reason="stop",
-                        group_id="feedback-runtime",
-                    ),
-                )
-            )
-            consumer = FTTTConsumer(
-                FTTTConsumerConfig(max_retries=2),
-                judge=lambda entry: FTTTJudgeResult(
-                    is_correct=False,
-                    reward=0.0,
-                    feedback_text=f"fix {entry.text}",
-                    label="expected=4",
-                    judge="toy",
+    def test_post_generate_bundle_rejects_mixed_generation_groups(self) -> None:
+        runtime = self._runtime()
+        first = runtime.last_generation_trace.entries[0]
+        runtime.last_generation_trace = GenerationTraceBatch(
+            entries=(
+                first,
+                CompletionTraceEntry(
+                    request_id="req-b",
+                    prompt_idx=4,
+                    sample_idx=0,
+                    output_index=0,
+                    token_ids=(4,),
+                    text="other",
+                    finish_reason="stop",
+                    group_id="round-b",
                 ),
             )
-            runtime.dispatch_plan = DispatchPlan.build([consumer])
-
-            self.assertEqual(port_runtime_hooks.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner), 1)
-
-            reward_entries = read_reward_outcomes(runtime).entries
-            retry_entries = read_retry_controls(runtime).entries
-            barrier_entries = read_update_barriers(runtime).entries
-            self.assertEqual(reward_entries[0].feedback_text, "fix 5")
-            self.assertEqual(retry_entries[0].action, "retry")
-            self.assertTrue(retry_entries[0].retry_after_update)
-            self.assertEqual(barrier_entries[0].consumer_id, "fttt")
-            self.assertEqual(barrier_entries[0].state, "ready")
-            self.assertEqual(barrier_entries[0].ready_count, 1)
-            self.assertEqual(consumer.read_stats().queued_feedback, 1)
-
-    def test_retry_and_barrier_sinks_reject_wrong_payload_types(self) -> None:
-        runtime = self._runtime()
-        flow = ConsumerFlow(
-            reads=(GenerationTrace.read(),),
-            writes=(RetryControl.write(), UpdateBarrier.write()),
-            window="out_of_band",
-            bundle_key=("generation_group_id", "phase"),
         )
-
-        bundle = port_runtime_hooks.build_post_generate_port_bundle(runtime=runtime, flow=flow)
-        with self.assertRaisesRegex(TypeError, "batch must be RetryControlBatch"):
-            bundle.entries["retry_control"].append("bad")  # type: ignore[attr-defined]
-        with self.assertRaisesRegex(TypeError, "batch must be UpdateBarrierBatch"):
-            bundle.entries["update_barrier"].append("bad")  # type: ignore[attr-defined]
-
-    def test_post_generate_reward_write_mode_must_be_explicit_string(self) -> None:
-        from tllm.ports.base import PortKind, PortWrite
-        from tllm.ports.reward_outcome import RewardOutcomeLocator
-
-        with self.assertRaisesRegex(TypeError, "write mode must be str"):
-            PortWrite(kind=PortKind.REWARD_OUTCOME, locator=RewardOutcomeLocator(), mode=object())  # type: ignore[arg-type]
-
-    def test_decode_dispatch_ignores_post_generate_only_flows(self) -> None:
-        runtime = SimpleNamespace()
-        runtime.dispatch_plan = DispatchPlan.build([_PostGenerateConsumer()])
-        runtime.event_step_id = 1
-        runtime.decode_count = 1
-        runtime.tap_decode_hidden = {}
-        runtime.tap_decode_hidden_compact = {}
-        runtime.decode_compact_count = 0
-        runtime.decode_compact_row_ids = ()
-        runtime.decode_request_ids = ["req-a"]
-        runtime.decode_prompt_idxs = [0]
-        runtime.decode_sample_idxs = [0]
-        runtime.residual_bindings = {}
-        core = SimpleNamespace(RUNTIME=runtime)
-        runner = SimpleNamespace(device=torch.device("cpu"), model=None, use_cuda_graph=False, compilation_config=None)
-
-        with unittest.mock.patch.object(
-            port_runtime_hooks, "build_decode_port_frames", side_effect=AssertionError("decode frames should not be built")
-        ):
-            dispatched = port_runtime_hooks.dispatch_decode_port_bundles(core=core, runner=runner)
-
-        self.assertEqual(dispatched, 0)
-
-    def test_generate_wrapper_dispatches_post_generate_flows(self) -> None:
-        from test.test_runtime_generation_trace_unit import _Candidate, _LLM, _Output
-        from tllm.runtime.vllm_patch.capture_runner import run_generate_with_request_mapping
-
-        runtime = SimpleNamespace()
         consumer = _PostGenerateConsumer()
         runtime.dispatch_plan = DispatchPlan.build([consumer])
-        llm = _LLM([_Output("req0", [_Candidate([9], text="done", finish_reason="stop")])])
+        runner = SimpleNamespace(device=torch.device("cpu"), model=None, use_cuda_graph=False, compilation_config=None)
 
-        run_generate_with_request_mapping(
-            runtime=runtime,
-            llm=llm,
-            prompts=["prompt"],
-            params=[object()],
-            request_prompt_indices=[5],
-            generation_group_id="round-b",
-        )
-
-        self.assertEqual(len(consumer.seen), 1)
-        self.assertEqual(read_reward_outcomes(runtime).entries[0].group_id, "round-b")
+        with self.assertRaisesRegex(RuntimeError, "multiple generation_group_id"):
+            port_runtime_hooks.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner)
 
 
 if __name__ == "__main__":

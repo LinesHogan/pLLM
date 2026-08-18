@@ -13,6 +13,7 @@ from tllm.runtime.config import (
     normalize_model_bank_forward_backend,
 )
 from tllm.runtime.sampler_bridge.types import SamplerBackend, normalize_sampler_backend
+from tllm.ports.base import RowSelection
 
 __all__ = [
     "AdaptationStreamMode",
@@ -34,6 +35,7 @@ class ESampConsumerConfig:
     distiller_lr: float = 1e-3
     per_request_models: bool = False
     per_request_model_bank: bool = False
+    training_row_selection: RowSelection = RowSelection.ALL
     model_bank_slots: int = 0
     model_bank_flush_interval: int = 1
     model_bank_rank: int = 64
@@ -53,6 +55,14 @@ class ESampConsumerConfig:
     compact_capture_lane: bool = False
 
     def __post_init__(self) -> None:
+        if bool(self.per_request_model_bank) and not bool(self.per_request_models):
+            raise ValueError("per_request_model_bank=True requires per_request_models=True")
+        try:
+            self.training_row_selection = RowSelection(str(self.training_row_selection))
+        except ValueError as exc:
+            raise ValueError(
+                "training_row_selection must be 'none' or 'first_per_prompt'"
+            ) from exc
         self.distiller_sampler_backend = normalize_sampler_backend(self.distiller_sampler_backend)
         self.model_bank_forward_backend = normalize_model_bank_forward_backend(self.model_bank_forward_backend)
         self.adaptation_stream_mode = normalize_adaptation_stream_mode(self.adaptation_stream_mode)

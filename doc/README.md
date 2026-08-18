@@ -85,9 +85,10 @@ If the environment is healthy, you should see 16 generated answers and ESamp sta
 
 ## Requirements
 
-- Python >= 3.10
-- vLLM >= 0.7.2, v1 engine only
+- Python >= 3.11
+- vLLM >= 0.27.1 and < 0.28, v1 engine only
 - PyTorch >= 2.0
 - CUDA >= 12.1
 
-The currently validated development environment uses `vllm==0.10.x`.
+The currently validated development environment uses `vllm==0.27.1`, with
+both MRv1 and MRv2 covered.

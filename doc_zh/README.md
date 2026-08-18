@@ -83,12 +83,12 @@ python starter.py --max-new-tokens 32
 
 ## 环境要求
 
-- Python >= 3.10
-- vLLM >= 0.7.2，**仅限 v1 引擎**（v0 不兼容）
+- Python >= 3.11
+- vLLM >= 0.27.1 且 < 0.28，**仅限 v1 引擎**（v0 不兼容）
 - PyTorch >= 2.0
 - CUDA >= 12.1
 
-当前主要验证的版本是 `vllm==0.10.x`。
+当前主要验证的版本是 `vllm==0.27.1`，MRv1 与 MRv2 均覆盖。
 
 ---
 

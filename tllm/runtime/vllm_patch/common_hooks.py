@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, Sequence
 
 import torch
 
@@ -12,31 +12,14 @@ from tllm.contracts.hidden_batch import HiddenBatch
 from tllm.contracts.runtime_context import RunnerLike, RuntimeContext
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.consumer_compat import dispatch_consumer_event
+from tllm.runtime.scheduling.deferred import DeferredWorkQueue
+from tllm.runtime.vllm_patch.compilation import is_torch_compiling
 
 
 class RuntimeWithDispatchPlan(Protocol):
     dispatch_plan: DispatchPlan | None
-
-
-def _is_torch_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    if compiler is not None:
-        fn = getattr(compiler, "is_compiling", None)
-        if callable(fn):
-            try:
-                return bool(fn())
-            except Exception:
-                pass
-
-    dynamo = getattr(torch, "_dynamo", None)
-    if dynamo is not None:
-        fn = getattr(dynamo, "is_compiling", None)
-        if callable(fn):
-            try:
-                return bool(fn())
-            except Exception:
-                pass
-    return False
+    deferred_work_queue: DeferredWorkQueue
+    event_step_id: int
 
 
 def _runner_uses_cudagraph(runner: RunnerLike) -> bool:
@@ -78,7 +61,12 @@ def _resolve_device(runner: RunnerLike) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_runtime_context(*, runner: RunnerLike, event_name: str) -> RuntimeContext:
+def build_runtime_context(
+    *,
+    runner: RunnerLike,
+    event_name: str,
+    predecessor_events: Sequence[object] = (),
+) -> RuntimeContext:
     device = _resolve_device(runner)
     main_stream = None
     if device.type == "cuda" and torch.cuda.is_available():
@@ -91,9 +79,10 @@ def build_runtime_context(*, runner: RunnerLike, event_name: str) -> RuntimeCont
         model=getattr(runner, "model", None),
         device=device,
         main_stream=main_stream,
-        is_compiling=_is_torch_compiling(),
+        is_compiling=is_torch_compiling(),
         uses_cudagraph=_runner_uses_cudagraph(runner),
         event_name=event_name,
+        predecessor_events=tuple(predecessor_events),
     )
 
 
@@ -107,8 +96,31 @@ def dispatch_runtime_event(
     capture_enabled: Optional[bool] = None,
     batch: Optional[HiddenBatch] = None,
     batch_factory: Optional[Callable[[], Optional[HiddenBatch]]] = None,
+    predecessor_events: Sequence[object] = (),
 ) -> int:
     """Dispatch one runtime event to registered consumers, if any."""
+    effective_predecessors = tuple(predecessor_events)
+    if (
+        runtime.deferred_work_queue
+        and not effective_predecessors
+        and event_name == "prepare_inputs.pre"
+    ):
+        device = _resolve_device(runner)
+        if device.type == "cuda" and torch.cuda.is_available():
+            stream = torch.cuda.current_stream(device=device)
+            deadline_fence = torch.cuda.Event(blocking=False)
+            deadline_fence.record(stream)
+            effective_predecessors = (deadline_fence,)
+    if runtime.deferred_work_queue:
+        from tllm.runtime.ports.residual_bundle_dispatch import drain_deferred_port_bundles
+
+        drain_deferred_port_bundles(
+            runtime=runtime,
+            step_id=int(runtime.event_step_id),
+            hook=event_name,
+            expired_only=event_name == "prepare_inputs.pre",
+            predecessor_events=effective_predecessors,
+        )
     plan = getattr(runtime, "dispatch_plan", None)
     if plan is None:
         return 0
@@ -125,7 +137,11 @@ def dispatch_runtime_event(
     if not targets:
         return 0
 
-    ctx = build_runtime_context(runner=runner, event_name=event_name)
+    ctx = build_runtime_context(
+        runner=runner,
+        event_name=event_name,
+        predecessor_events=effective_predecessors,
+    )
     payload = batch
     if payload is None and batch_factory is not None:
         payload = batch_factory()

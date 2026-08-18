@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import torch
 
@@ -15,11 +15,19 @@ from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine, ESampStats
 from tllm.consumers.esamp.initializers.svd import build_model_bank_initializer
 from tllm.consumers.esamp.sampler_provider import ESampSamplerModifierProvider
-from tllm.contracts.gpu_stage import DeviceTensorLease
+from tllm.consumers._common.bundle_inputs import residual_pair_input
 from tllm.contracts.port_bundle import PortBundle
-from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
-from tllm.ports.base import ConsumerFlow
+from tllm.ports.base import (
+    BufferOwnership,
+    ConsumerFlow,
+    FlowFusion,
+    TimingContract,
+    TimingDeadline,
+    TimingMobility,
+    RowSelection,
+    VersionObservation,
+)
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
 
@@ -30,6 +38,34 @@ class _TrainingRows:
     target_hidden: torch.Tensor
     prompt_idxs: list[int]
     request_meta_is_first_per_prompt: bool
+
+
+class _ESampFusionGroupHandle:
+    def __init__(
+        self,
+        consumer: "ESampConsumer",
+        flow_ids: tuple[str, ...],
+    ) -> None:
+        self._consumer = consumer
+        self._flow_ids = flow_ids
+
+    def execute(
+        self,
+        bundles: Mapping[str, PortBundle],
+        ctx: RuntimeContext,
+    ) -> None:
+        if tuple(bundles) != self._flow_ids:
+            raise RuntimeError(
+                f"ESamp fusion handle expected flows {self._flow_ids!r}, "
+                f"got {tuple(bundles)!r}"
+            )
+        self._consumer._execute_fusion_group(
+            bundles[self._flow_ids[0]],
+            ctx,
+        )
+
+    def replay_count(self) -> int:
+        return self._consumer.fusion_replay_count()
 
 
 class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
@@ -75,6 +111,7 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._runtime_initializer_key: tuple[int, str, int, str, torch.dtype] | None = None
         self._runtime_resource_key: tuple[object, ...] | None = None
         self._sampler_provider = ESampSamplerModifierProvider(config=self.config, engine=self._engine)
+        self._fusion_handle: _ESampFusionGroupHandle | None = None
 
     @property
     def consumer_id(self) -> str:
@@ -83,6 +120,13 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
     def flows(self) -> Sequence[ConsumerFlow]:
         if not bool(self.config.enable_esamp_training):
             return ()
+        compact_first_per_prompt = self._compact_first_per_prompt()
+        static_rows = self._static_training_rows()
+        fusion = (
+            FlowFusion.SIDE_STREAM_CUDAGRAPH
+            if bool(self.config.model_bank_train_cudagraph) and static_rows > 0
+            else FlowFusion.NONE
+        )
         return [
             ConsumerFlow(
                 reads=(
@@ -93,12 +137,37 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
                 writes=(),
                 window="out_of_band",
                 delivery="device_lease",
-                ownership="runtime_lease",
-                row_compaction="first_per_prompt" if bool(self.config.per_request_model_bank) else "none",
-                max_bundle_rows=int(self.config.model_bank_slots) if bool(self.config.per_request_model_bank) else 0,
+                ownership=BufferOwnership.RUNTIME_LEASE,
+                lease_lifetime="step",
+                row_compaction=(
+                    RowSelection.FIRST_PER_PROMPT
+                    if compact_first_per_prompt
+                    else RowSelection.ALL
+                ),
+                max_bundle_rows=static_rows,
+                fusion=fusion,
                 bundle_key=("engine_step_id", "phase"),
+                timing=TimingContract(
+                    mobility=TimingMobility.DEFERRABLE,
+                    deadline=TimingDeadline.NEXT_PREPARE,
+                    max_defer_steps=1,
+                    observes_version=VersionObservation.AT_DECLARED_WINDOW,
+                ),
             )
         ]
+
+    def _compact_first_per_prompt(self) -> bool:
+        return bool(self.config.per_request_model_bank) or (
+            self.config.training_row_selection == RowSelection.FIRST_PER_PROMPT
+        )
+
+    def _static_training_rows(self) -> int:
+        if self._compact_first_per_prompt():
+            return max(
+                0,
+                int(self.config.model_bank_slots or self.config.graph_scratch_rows),
+            )
+        return max(0, int(self.config.graph_scratch_rows))
 
     def update_config(self, config: ESampConsumerConfig) -> None:
         self.config = config
@@ -207,7 +276,7 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
             hidden_dtype = hidden_dtype or rows_hidden.dtype
         if hidden_size <= 0 or hidden_dtype is None:
             raise RuntimeError("ESamp consumer cannot infer hidden_size/hidden_dtype for runtime resources")
-        rows = int(self.config.graph_scratch_rows)
+        rows = self._static_training_rows()
         if rows <= 0:
             runner_rows = int(getattr(ctx.runner, "max_num_reqs", 0) or 0)
             rows = runner_rows
@@ -260,28 +329,24 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self,
         bundle: PortBundle,
     ) -> _TrainingRows | None:
-        stage_lease = bundle.entries.get("device_lease")
-        uses_device_lease = isinstance(stage_lease, DeviceTensorLease)
-        if uses_device_lease:
-            source_hidden = stage_lease.entries.get("source")
-            target_hidden = stage_lease.entries.get("target")
-            active_rows = max(0, int(stage_lease.active_rows))
-            if isinstance(source_hidden, torch.Tensor) and active_rows < int(source_hidden.shape[0]):
-                source_hidden = source_hidden[:active_rows]
-            if isinstance(target_hidden, torch.Tensor) and active_rows < int(target_hidden.shape[0]):
-                target_hidden = target_hidden[:active_rows]
-        else:
-            source_hidden = bundle.entries.get("source")
-            target_hidden = bundle.entries.get("target")
-        request_meta = bundle.entries.get("request_meta")
-        if not isinstance(source_hidden, torch.Tensor) or not isinstance(target_hidden, torch.Tensor):
+        inputs = residual_pair_input(bundle)
+        if inputs is None:
             return None
+        source_hidden = inputs.source
+        target_hidden = inputs.target
         if int(source_hidden.shape[0]) != int(target_hidden.shape[0]):
             raise RuntimeError("ESamp consumer requires source/target hidden batches to have the same row count")
 
-        if not isinstance(request_meta, RowBatchMeta):
-            raise RuntimeError("ESamp consumer requires request_meta to be RowBatchMeta")
-        if uses_device_lease and len(request_meta.request_ids) != int(source_hidden.shape[0]):
+        request_meta = inputs.request_meta
+        if request_meta is None:
+            raw_meta = bundle.entries.get("request_meta")
+            raise RuntimeError(
+                "ESamp consumer requires request_meta to be RowBatchMeta; "
+                f"got {type(raw_meta).__module__}.{type(raw_meta).__qualname__} "
+                f"with bundle entries {tuple(bundle.entries)} and "
+                f"uses_device_lease={inputs.uses_device_lease}"
+            )
+        if inputs.uses_device_lease and len(request_meta.request_ids) != int(source_hidden.shape[0]):
             raise RuntimeError("ESamp consumer requires row metadata to match active lease rows")
         prompt_idxs = [int(prompt_idx) for prompt_idx in request_meta.prompt_idxs]
         request_meta_is_first_per_prompt = str(request_meta.row_compaction) == "first_per_prompt"
@@ -295,7 +360,7 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
             request_meta_is_first_per_prompt=request_meta_is_first_per_prompt,
         )
 
-    def consume_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
+    def _stage_training_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
         if not bool(self.config.enable_esamp_training):
             return
         rows = self._extract_training_rows(bundle)
@@ -322,13 +387,49 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._last_prompt_idxs = tuple(prompt_idxs[: int(source_hidden.shape[0])])
         self._engine.launch_step(source_hidden, target_hidden)
 
-    def on_step_end(self, ctx: RuntimeContext) -> None:
+    def _launch_staged_training(self, ctx: RuntimeContext) -> None:
         self._engine.launch_delayed_backward(
             int(self._last_active_rows),
             prompt_idxs=self._last_prompt_idxs,
+            wait_events=ctx.predecessor_events,
         )
         self._last_active_rows = 0
         self._last_prompt_idxs = ()
+
+    def _execute_fusion_group(
+        self,
+        bundle: PortBundle,
+        ctx: RuntimeContext,
+    ) -> None:
+        """Stage and launch the compiler-owned ESamp training node."""
+        self._stage_training_bundle(bundle, ctx)
+        self._launch_staged_training(ctx)
+
+    def consume_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
+        self._stage_training_bundle(bundle, ctx)
+
+    def on_step_end(self, ctx: RuntimeContext) -> None:
+        self._launch_staged_training(ctx)
+
+    def retire_device_lease(self, ctx: RuntimeContext) -> None:
+        del ctx
+        self._engine.retire_step_inputs()
+
+    def fusion_replay_count(self) -> int:
+        return self._engine.fusion_replay_count()
+
+    def fusion_group_handle(
+        self,
+        flow_ids: tuple[str, ...],
+    ) -> _ESampFusionGroupHandle | None:
+        expected = (f"{self.consumer_id}#0",)
+        if flow_ids != expected:
+            return None
+        handle = self._fusion_handle
+        if handle is None or handle._flow_ids != expected:
+            handle = _ESampFusionGroupHandle(self, expected)
+            self._fusion_handle = handle
+        return handle
 
     def set_enabled(self, enabled: bool) -> None:
         self.config.enable_esamp_training = bool(enabled)

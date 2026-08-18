@@ -61,6 +61,7 @@ class ResidualWriteLease:
         self.rows = rows
         self.delta = torch.zeros((int(max_rows), int(hidden_size)), device=device, dtype=dtype)
         self.row_idx = torch.zeros((int(max_rows),), device=device, dtype=torch.long)
+        self.active_mask = torch.zeros((int(max_rows), 1), device=device, dtype=dtype)
         self.count = 0
 
     @property
@@ -93,12 +94,15 @@ class ResidualWriteLease:
                 raise ValueError(
                     f"staged write rows must be unique for deterministic apply: rows={n} unique={unique}"
                 )
+        self.active_mask.zero_()
         if n > 0:
             self.delta[:n].copy_(delta, non_blocking=True)
             self.row_idx[:n].copy_(row_idx.to(dtype=torch.long), non_blocking=True)
+            self.active_mask[:n].fill_(1)
         self.count = n
 
     def clear(self) -> None:
+        self.active_mask.zero_()
         self.count = 0
 
 
@@ -124,15 +128,16 @@ def apply_pending_writes(
     under piecewise/full CUDA graphs and identical under eager.
     """
     for lease in leases_for_path(leases, layer_path):
-        count = int(lease.count)
-        if count <= 0:
-            continue
-        rows = lease.row_idx[:count]
-        delta = lease.delta[:count]
+        # CUDA graph replay only replays Tensor operations captured from this
+        # block; it never re-evaluates a Python row count. Always launch the
+        # fixed-capacity operation and gate active rows with device state.
+        rows = lease.row_idx
         if lease.mode == WriteMode.REPLACE:
-            tensor.index_copy_(0, rows, delta)
+            current = tensor.index_select(0, rows)
+            updates = (lease.delta - current) * lease.active_mask
+            tensor.index_add_(0, rows, updates)
         else:
-            tensor.index_add_(0, rows, delta)
+            tensor.index_add_(0, rows, lease.delta * lease.active_mask)
         lease.clear()
 
 

@@ -10,22 +10,24 @@ import torch
 
 
 class SharedAlignmentPrimitivesUnitTest(unittest.TestCase):
-    def test_sentence_cross_entropy_selects_high_ce_rows(self) -> None:
-        from tllm.consumers._common.alignment import select_rows_above_threshold, sentence_cross_entropy
+    def test_detached_train_input_reuses_normal_storage(self) -> None:
+        from tllm.consumers._common.alignment import detached_train_input
 
-        logits = torch.tensor(
-            [
-                [[4.0, 0.0], [4.0, 0.0]],
-                [[0.0, 4.0], [0.0, 4.0]],
-            ],
-            dtype=torch.float32,
-        )
-        labels = torch.tensor([[0, 0], [0, 0]], dtype=torch.long)
+        source = torch.randn(2, 3, requires_grad=True)
+        result = detached_train_input(source)
 
-        ce = sentence_cross_entropy(logits, labels)
-        selected = select_rows_above_threshold(ce, threshold=float(ce.mean()))
+        self.assertEqual(result.data_ptr(), source.data_ptr())
+        self.assertFalse(result.requires_grad)
 
-        self.assertEqual(selected, [1])
+    def test_detached_train_input_clones_inference_storage(self) -> None:
+        from tllm.consumers._common.alignment import detached_train_input
+
+        with torch.inference_mode():
+            source = torch.randn(2, 3)
+        result = detached_train_input(source)
+
+        self.assertNotEqual(result.data_ptr(), source.data_ptr())
+        self.assertFalse(torch.is_inference(result))
 
     def test_weighted_one_hot_kl_matches_expected_ce_weighting(self) -> None:
         from tllm.consumers._common.alignment import weighted_one_hot_kl_loss
@@ -55,13 +57,6 @@ class SharedAlignmentPrimitivesUnitTest(unittest.TestCase):
 
         self.assertEqual(left, "4")
         self.assertEqual(left, right)
-
-    def test_select_top_k_per_prompt_matches_vote_sample_ordering(self) -> None:
-        from tllm.consumers._common.alignment import select_top_k_per_prompt
-
-        selected = select_top_k_per_prompt(num_prompts=2, votes_per_prompt=4, samples_per_prompt=2)
-
-        self.assertEqual(selected, [0, 1, 4, 5])
 
 
 if __name__ == "__main__":

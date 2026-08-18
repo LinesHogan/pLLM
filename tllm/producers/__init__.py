@@ -2,11 +2,9 @@
 """Producer plan: registry, compiler, and contracts."""
 
 from tllm.producers.base import (
-    BindContext,
-    BoundProducer,
     HookPoint,
-    PortSink,
     Producer,
+    ProducerDescriptor,
 )
 from tllm.producers.registry import (
     ExecutionPlan,
@@ -18,14 +16,12 @@ from tllm.producers.registry import (
 )
 
 __all__ = [
-    "BindContext",
-    "BoundProducer",
     "ExecutionPlan",
     "ExecutionPlanError",
     "HookPoint",
     "PlannedProducer",
-    "PortSink",
     "Producer",
+    "ProducerDescriptor",
     "ProducerEntry",
     "ProducerRegistry",
     "compile_execution_plan",

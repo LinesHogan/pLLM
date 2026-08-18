@@ -5,16 +5,18 @@ from __future__ import annotations
 
 from tllm.consumers.inplace_ttt.config import InPlaceTTTConsumerConfig
 from tllm.consumers.inplace_ttt.consumer import InPlaceTTTConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = InPlaceTTTConsumer
-CONFIG_TYPE = InPlaceTTTConsumerConfig
+PLUGIN = ConsumerPluginSpec(
+    "inplace_ttt", InPlaceTTTConsumer, InPlaceTTTConsumerConfig, InPlaceTTTConsumer
+)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: InPlaceTTTConsumerConfig | None = None) -> InPlaceTTTConsumer:
-    return InPlaceTTTConsumer(config or InPlaceTTTConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: InPlaceTTTConsumerConfig | None = None, *, primary: bool = False) -> InPlaceTTTConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

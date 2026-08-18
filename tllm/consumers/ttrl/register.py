@@ -5,16 +5,16 @@ from __future__ import annotations
 
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
 from tllm.consumers.ttrl.consumer import TTRLConsumer
+from tllm.consumers.plugin import ConsumerPluginSpec
 
-CONSUMER_TYPE = TTRLConsumer
-CONFIG_TYPE = TTRLConsumerConfig
+PLUGIN = ConsumerPluginSpec("ttrl", TTRLConsumer, TTRLConsumerConfig, TTRLConsumer)
+CONSUMER_TYPE = PLUGIN.consumer_type
+CONFIG_TYPE = PLUGIN.config_type
 
 
 def build(config: TTRLConsumerConfig | None = None) -> TTRLConsumer:
-    return TTRLConsumer(config or TTRLConsumerConfig())
+    return PLUGIN.build(config)
 
 
 def activate(config: TTRLConsumerConfig | None = None, *, primary: bool = False) -> TTRLConsumer:
-    from tllm.consumers.registry import activate_consumer
-
-    return activate_consumer(build(config), primary=primary)
+    return PLUGIN.activate(config, primary=primary)

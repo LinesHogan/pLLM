@@ -21,15 +21,15 @@ source .venv/bin/activate
 ## 3. 安装 vLLM
 
 ```bash
-pip install vllm
+pip install 'vllm>=0.27.1,<0.28'
 ```
 
 tLLM 本身不需要 `pip install`，以源码方式直接运行。但它依赖 vLLM 作为底层推理引擎。
 
 vLLM 版本要求：
-- 最低 `vllm >= 0.7.2`
+- 支持 `vllm >= 0.27.1, < 0.28`
 - **仅支持 v1 引擎**，v0 引擎使用完全不同的 runner 架构，无法兼容
-- 当前 tLLM 主要开发和验证的版本是 `vllm==0.10.x`，建议优先使用这个版本
+- 当前主要开发和验证版本是 `vllm==0.27.1`，MRv1 与 MRv2 均覆盖
 
 安装后验证：
 
@@ -80,7 +80,10 @@ ESamp stats: loss_avg=... loss_count=... answers=16 ...
 | 变量 | 值 | 作用 |
 |------|-----|------|
 | `VLLM_USE_V1` | `1` | 强制启用 v1 引擎 |
-| `VLLM_ENABLE_V1_MULTIPROCESSING` | `0` | 关闭多进程。因为 Producer/Consumer 通过进程内全局状态传递每步定位信息，多进程下状态无法共享 |
+| `VLLM_ENABLE_V1_MULTIPROCESSING` | `1` | 默认让 EngineCore 在子进程运行；tLLM 通过 general plugin 引导 worker，并通过 worker extension 转发控制与状态 |
+
+需要在同进程调试 runner 时，可以显式设置
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`。两种模式均受支持，tLLM 不会覆盖显式设置。
 
 建议手动开启的：
 

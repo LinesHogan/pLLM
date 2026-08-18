@@ -27,7 +27,8 @@ import torch
 
 from tllm.common.state import ensure_v1_env, pick_common_attn_metadata, resolve_object_by_path
 from tllm.consumers.base import BaseConsumer
-from tllm.contracts.consumer_stats import TrainingStats
+from tllm.contracts.consumer_stats import TrainingStats, merge_training_stats_maps
+from tllm.contracts.request_identity import resolve_prompt_sample
 
 # Backward-compatible alias: ESamp's stats name, canonical type is TrainingStats.
 ESampStats = TrainingStats
@@ -45,7 +46,7 @@ from tllm.runtime.resources import (
     SamplerPrecomputeState,
 )
 from tllm.runtime.state import RUNTIME, ResidualRuntimeConfig, ResidualRuntimeState, RuntimeConsumer
-from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspotStats
+from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspotStats, PlacementStats
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 
 ensure_v1_env()
@@ -78,6 +79,7 @@ def _refresh_dispatch_plan() -> None:
     if not consumers:
         RUNTIME.dispatch_plan = None
         RUNTIME.execution_plan = None
+        RUNTIME.producer_executor = None
         return
     plan = DispatchPlan.build(consumers)
     RUNTIME.dispatch_plan = None if plan.is_empty() else plan
@@ -86,7 +88,21 @@ def _refresh_dispatch_plan() -> None:
     # producers are not enforced yet).
     from tllm.runtime.execution_plan import compile_default_plan
 
-    RUNTIME.execution_plan = compile_default_plan(consumers=consumers)
+    execution_plan = compile_default_plan(consumers=consumers)
+    from tllm.runtime.producer_executor import (
+        ProducerExecutor,
+        default_producer_materializers,
+    )
+
+    RUNTIME.execution_plan = execution_plan
+    RUNTIME.producer_executor = ProducerExecutor.bind(
+        plan=execution_plan,
+        registry=default_producer_materializers(),
+    )
+    RUNTIME.placement_stats.capture_resident_stage_count = max(
+        RUNTIME.placement_stats.capture_resident_stage_count,
+        len(execution_plan.capture_resident_producer_ids),
+    )
 
 
 def register_dispatch_consumer(consumer: BaseConsumer) -> None:
@@ -171,37 +187,12 @@ _resolve_module_by_path_with_fallback = resolve_module_by_path_with_fallback
 
 
 def _resolve_prompt_sample_for_req_id(req_id: str) -> tuple[int, int]:
-    prompt_idx = RUNTIME.reqid_to_promptidx.get(req_id)
-    if prompt_idx is not None:
-        return int(prompt_idx), int(RUNTIME.reqid_to_sampleidx.get(req_id, 0))
+    return resolve_prompt_sample(
+        req_id,
+        prompt_indices=RUNTIME.reqid_to_promptidx,
+        sample_indices=RUNTIME.reqid_to_sampleidx,
+    )
 
-    if "_" in req_id:
-        maybe_sample_idx, parent_req_id = req_id.split("_", 1)
-        if maybe_sample_idx.isdigit():
-            parent_prompt_idx = RUNTIME.reqid_to_promptidx.get(parent_req_id)
-            if parent_prompt_idx is not None:
-                return int(parent_prompt_idx), int(maybe_sample_idx)
-    return -1, -1
-
-
-def _is_torch_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    if compiler is not None:
-        fn = getattr(compiler, "is_compiling", None)
-        if callable(fn):
-            try:
-                return bool(fn())
-            except Exception:
-                pass
-
-    dynamo = getattr(torch, "_dynamo", None)
-    if dynamo is not None:
-        fn = getattr(dynamo, "is_compiling", None)
-        if callable(fn):
-            try:
-                return bool(fn())
-            except Exception:
-                pass
 
     return False
 
@@ -293,10 +284,25 @@ def set_esamp_training_enabled(enabled: bool) -> None:
     """Toggle training on the active consumer (config lives on the consumer)."""
     if RUNTIME.consumer is not None:
         RUNTIME.consumer.set_enabled(enabled)
+        _refresh_dispatch_plan()
+    from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
+    from tllm.runtime.mp.control import active_control_plane
+
+    refresh_exported_bootstrap_spec()
+    plane = active_control_plane()
+    if plane is not None:
+        plane.apply_enable_flags({"esamp_training_enabled": bool(enabled)})
 
 
 def set_test_time_lora_enabled(enabled: bool) -> None:
     RUNTIME.test_time_lora_enabled = bool(enabled)
+    from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
+    from tllm.runtime.mp.control import active_control_plane
+
+    refresh_exported_bootstrap_spec()
+    plane = active_control_plane()
+    if plane is not None:
+        plane.apply_enable_flags({"test_time_lora_enabled": bool(enabled)})
 
 
 def set_fast_weight_enabled(
@@ -342,32 +348,78 @@ def set_fast_weight_enabled(
         RUNTIME.config.fast_weight_max_bytes = max(0, int(max_bytes))
     if fail_on_unsupported is not None:
         RUNTIME.config.fast_weight_fail_on_unsupported = bool(fail_on_unsupported)
+    from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
+    from tllm.runtime.mp.control import active_control_plane
+
+    refresh_exported_bootstrap_spec()
+    plane = active_control_plane()
+    if plane is not None:
+        plane.set_fast_weight_enabled(
+            enabled,
+            layers=layers,
+            chunk_size=chunk_size,
+            learning_rate=learning_rate,
+            mode=mode,
+            decode_update_enabled=decode_update_enabled,
+            key_mode=key_mode,
+            max_slots=max_slots,
+            max_bytes=max_bytes,
+            fail_on_unsupported=fail_on_unsupported,
+        )
 
 
 def synchronize_esamp() -> None:
+    RUNTIME.deferred_work_queue.flush_all()
     if RUNTIME.consumer is not None:
         synchronize_consumer(RUNTIME.consumer)
     registry = RUNTIME.consumer_registry
-    if registry is None:
-        return
-    for consumer in registry.consumers():
-        synchronize_consumer(consumer)
+    if registry is not None:
+        for consumer in registry.consumers():
+            synchronize_consumer(consumer)
+
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is not None:
+        plane.synchronize()
 
 
 def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
-    if RUNTIME.consumer is None:
-        return TrainingStats(loss_avg=0.0, loss_count=0)
-    return RUNTIME.consumer.read_and_reset_stats(sync=sync)
+    local = (
+        TrainingStats(loss_avg=0.0, loss_count=0)
+        if RUNTIME.consumer is None
+        else RUNTIME.consumer.read_and_reset_stats(sync=sync)
+    )
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is None:
+        return local
+    return TrainingStats.merge([local, *(reply.esamp for reply in plane.pull_stats("esamp", sync=sync))])
 
 
 def read_and_reset_esamp_per_request_stats(sync: bool = True) -> Dict[int, TrainingStats]:
-    if RUNTIME.consumer is None:
-        return {}
-    return RUNTIME.consumer.read_and_reset_per_request_stats(sync=sync)
+    local = {} if RUNTIME.consumer is None else RUNTIME.consumer.read_and_reset_per_request_stats(sync=sync)
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is None:
+        return local
+    return merge_training_stats_maps(
+        [local, *(reply.esamp_per_request for reply in plane.pull_stats("esamp_per_request", sync=sync))]
+    )
 
 
 def read_and_reset_distiller_timing_stats(sync: bool = True) -> DistillerTimingStats:
-    return _stats.read_and_reset_distiller_timing_stats(RUNTIME, sync=sync)
+    local = _stats.read_and_reset_distiller_timing_stats(RUNTIME, sync=sync)
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is None:
+        return local
+    return DistillerTimingStats.merge(
+        [local, *(reply.distiller_timing for reply in plane.pull_stats("distiller_timing", sync=sync))]
+    )
 
 
 def record_path_hotspot_cpu(name: str, ms: float) -> None:
@@ -375,7 +427,25 @@ def record_path_hotspot_cpu(name: str, ms: float) -> None:
 
 
 def read_and_reset_path_hotspot_stats(sync: bool = True) -> PathHotspotStats:
-    return _stats.read_and_reset_path_hotspot_stats(RUNTIME, sync=sync)
+    local = _stats.read_and_reset_path_hotspot_stats(RUNTIME, sync=sync)
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is None:
+        return local
+    return PathHotspotStats.merge(
+        [local, *(reply.path_hotspot for reply in plane.pull_stats("path_hotspot", sync=sync))]
+    )
+
+
+def read_and_reset_placement_stats() -> PlacementStats:
+    local = _stats.read_and_reset_placement_stats(RUNTIME)
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is None:
+        return local
+    return PlacementStats.merge([local, *(reply.placement for reply in plane.pull_stats("placement"))])
 
 
 def read_graph_debug_stats(*, mode: str = "model_bank") -> GraphDebugStats:
@@ -420,6 +490,7 @@ __all__ = [
     "TrainingStats",
     "GraphDebugStats",
     "PathHotspotStats",
+    "PlacementStats",
     "MODEL_HOOK_FLAG",
     "MODEL_HOOK_SPEC_ATTR",
     "RUNTIME",
@@ -437,6 +508,7 @@ __all__ = [
     "pick_common_attn_metadata",
     "read_and_reset_distiller_timing_stats",
     "read_and_reset_path_hotspot_stats",
+    "read_and_reset_placement_stats",
     "read_graph_debug_stats",
     "read_and_reset_esamp_per_request_stats",
     "read_and_reset_esamp_stats",
