@@ -8,7 +8,7 @@ No Tensor or CUDA runtime is needed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import importlib
 import unittest
 
@@ -281,6 +281,20 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
             _proxy(plan, leases=(_proxy(lease, residency=unknown_residency), *plan.leases[1:])),
         )
         _assert_rejected(self, _proxy(plan, leases=(_proxy(lease, live_end=0), *plan.leases[1:])))
+
+    def test_python_and_rust_reject_the_same_missing_lease(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        self.assertGreaterEqual(len(plan.leases), 2)
+        missing_lease = plan.leases[:-1]
+
+        with self.assertRaises(ValueError):
+            replace(plan, leases=missing_lease)
+        _assert_rejected(self, _proxy(plan, leases=missing_lease))
 
     def test_validator_rejects_copy_engine_capacity_corruption(self) -> None:
         phase3 = _phase3(self)

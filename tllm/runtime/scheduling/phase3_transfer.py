@@ -8,7 +8,16 @@ from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import torch
 
-from tllm.workgraph.phase3 import MemoryKind, Move, MoveKind
+from tllm.workgraph.ir import NodeKey
+from tllm.workgraph.phase3 import (
+    CopyEngine,
+    CopyEngineCapacityDesc,
+    MemoryKind,
+    Move,
+    MoveKind,
+    PlacementPlan,
+    ValueKey,
+)
 
 
 @runtime_checkable
@@ -144,6 +153,17 @@ class PinnedMemoryPool:
                 raise ValueError("pinned-memory slot is not acquired from this pool")
             slot.retire_fence = fence
 
+    def release(self, slot: PinnedMemorySlot) -> None:
+        """Return a slot when submission failed before producing a fence."""
+
+        slot = _instance(slot, PinnedMemorySlot, "PinnedMemoryPool.slot")
+        with self._lock:
+            if slot not in self._slots or not slot.acquired:
+                raise ValueError("pinned-memory slot is not acquired from this pool")
+            if slot.retire_fence is not None:
+                raise RuntimeError("a fenced pinned-memory slot must retire through reap()")
+            slot.acquired = False
+
     def reap(self) -> None:
         with self._lock:
             self._reap_locked()
@@ -160,6 +180,7 @@ class PinnedMemoryPool:
 class CopyHandle:
     moves: tuple[Move, ...]
     complete: bool = field(default=False, init=False)
+    error: Exception | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(cast(object, self.moves), tuple) or any(
@@ -183,7 +204,7 @@ class _InFlightCopy:
 class CopyExecutor:
     """Execute admitted one- or two-segment typed transfers asynchronously."""
 
-    __slots__ = ("_pool", "_adapter", "_capacity", "_active", "_lock")
+    __slots__ = ("_pool", "_adapter", "_capacities", "_active", "_lock")
 
     def __init__(
         self,
@@ -191,13 +212,29 @@ class CopyExecutor:
         pool: PinnedMemoryPool,
         adapter: TensorCopyAdapter,
         capacity: int = 1,
+        capacities: tuple[CopyEngineCapacityDesc, ...] = (),
     ) -> None:
         self._pool = _instance(pool, PinnedMemoryPool, "CopyExecutor.pool")
         raw_adapter = cast(object, adapter)
         if not isinstance(raw_adapter, TensorCopyAdapter):
             raise TypeError("CopyExecutor.adapter must implement TensorCopyAdapter")
         self._adapter = adapter
-        self._capacity = _integer(capacity, "CopyExecutor.capacity", minimum=1)
+        default_capacity = _integer(capacity, "CopyExecutor.capacity", minimum=1)
+        raw_capacities = cast(object, capacities)
+        if not isinstance(raw_capacities, tuple) or any(
+            not isinstance(item, CopyEngineCapacityDesc)
+            for item in cast(tuple[object, ...], raw_capacities)
+        ):
+            raise TypeError("CopyExecutor.capacities must be CopyEngineCapacityDesc tuple")
+        typed_capacities = cast(tuple[CopyEngineCapacityDesc, ...], raw_capacities)
+        if len({item.engine for item in typed_capacities}) != len(typed_capacities):
+            raise ValueError("CopyExecutor capacities must have unique engines")
+        self._capacities: dict[CopyEngine, int] = {
+            engine: default_capacity for engine in CopyEngine
+        }
+        self._capacities.update(
+            {item.engine: item.capacity for item in typed_capacities}
+        )
         self._active: list[_InFlightCopy] = []
         self._lock = Lock()
 
@@ -205,6 +242,13 @@ class CopyExecutor:
     def in_flight(self) -> int:
         with self._lock:
             return len(self._active)
+
+    @property
+    def capacities(self) -> tuple[CopyEngineCapacityDesc, ...]:
+        return tuple(
+            CopyEngineCapacityDesc(engine, self._capacities[engine])
+            for engine in CopyEngine
+        )
 
     def submit(
         self,
@@ -230,7 +274,8 @@ class CopyExecutor:
             raise ValueError("two-segment CopyExecutor routes must use pinned D2H then H2D")
         with self._lock:
             self._poll_locked()
-            if len(self._active) >= self._capacity:
+            engine = typed_moves[0].engine
+            if self._engine_in_flight(engine) >= self._capacities[engine]:
                 raise BufferError("copy-engine capacity is exhausted")
             needs_staging = any(move.kind != MoveKind.P2P for move in typed_moves)
             slot: PinnedMemorySlot | None = None
@@ -240,7 +285,12 @@ class CopyExecutor:
                 slot = self._pool.acquire(shape=shape, dtype=dtype)
             handle = CopyHandle(typed_moves)
             active = _InFlightCopy(handle, source, destination, slot)
-            self._submit_segment(active)
+            try:
+                self._submit_segment(active)
+            except Exception:
+                if slot is not None:
+                    self._pool.release(slot)
+                raise
             self._active.append(active)
             return handle
 
@@ -251,20 +301,50 @@ class CopyExecutor:
 
     def _poll_locked(self) -> None:
         remaining: list[_InFlightCopy] = []
+        first_error: Exception | None = None
         for active in self._active:
             fence = active.fence
             if fence is None or not fence.query():
                 remaining.append(active)
                 continue
             if active.index + 1 < len(active.handle.moves):
+                next_engine = active.handle.moves[active.index + 1].engine
+                if self._engine_in_flight(next_engine, excluding=active) >= self._capacities[
+                    next_engine
+                ]:
+                    remaining.append(active)
+                    continue
                 active.index += 1
-                self._submit_segment(active)
-                remaining.append(active)
+                try:
+                    self._submit_segment(active)
+                except Exception as exc:
+                    active.handle.error = exc
+                    active.handle.complete = True
+                    if active.slot is not None:
+                        self._pool.release(active.slot)
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    remaining.append(active)
                 continue
             active.handle.complete = True
             if active.slot is not None:
                 self._pool.retire(active.slot, fence)
         self._active = remaining
+        if first_error is not None:
+            raise first_error
+
+    def _engine_in_flight(
+        self,
+        engine: CopyEngine,
+        *,
+        excluding: _InFlightCopy | None = None,
+    ) -> int:
+        return sum(
+            active is not excluding
+            and active.handle.moves[active.index].engine == engine
+            for active in self._active
+        )
 
     def _submit_segment(self, active: _InFlightCopy) -> None:
         move = active.handle.moves[active.index]
@@ -291,6 +371,70 @@ class CopyExecutor:
         if not isinstance(raw_fence, CopyFenceLike):
             raise TypeError("copy adapter must return a fence implementing query()")
         active.fence = fence
+
+
+class PlacementPlanDispatcher:
+    """Bind frozen plan routes and per-engine credits to the copy runtime."""
+
+    __slots__ = ("plan", "_executor", "_routes")
+
+    def __init__(
+        self,
+        *,
+        plan: PlacementPlan,
+        pool: PinnedMemoryPool,
+        adapter: TensorCopyAdapter,
+    ) -> None:
+        self.plan = _instance(plan, PlacementPlan, "PlacementPlanDispatcher.plan")
+        self._executor = CopyExecutor(
+            pool=pool,
+            adapter=adapter,
+            capacities=plan.copy_engines,
+        )
+        routes: dict[tuple[NodeKey, NodeKey, ValueKey], list[Move]] = {}
+        for scheduled in plan.moves:
+            if scheduled.producer is None or scheduled.consumer is None:
+                raise ValueError("placement plan move lacks producer/consumer binding")
+            key = (scheduled.producer, scheduled.consumer, scheduled.move.value)
+            routes.setdefault(key, []).append(scheduled.move)
+        self._routes = {
+            key: tuple(moves) for key, moves in routes.items()
+        }
+
+    @property
+    def in_flight(self) -> int:
+        return self._executor.in_flight
+
+    @property
+    def capacities(self) -> tuple[CopyEngineCapacityDesc, ...]:
+        return self._executor.capacities
+
+    def submit(
+        self,
+        *,
+        producer: NodeKey,
+        consumer: NodeKey,
+        value: ValueKey,
+        source: TensorLike,
+        destination: TensorLike,
+    ) -> CopyHandle:
+        key = (
+            _instance(producer, NodeKey, "PlacementPlanDispatcher.producer"),
+            _instance(consumer, NodeKey, "PlacementPlanDispatcher.consumer"),
+            _instance(value, ValueKey, "PlacementPlanDispatcher.value"),
+        )
+        try:
+            moves = self._routes[key]
+        except KeyError as exc:
+            raise KeyError("placement plan has no matching transfer route") from exc
+        return self._executor.submit(
+            moves,
+            source=source,
+            destination=destination,
+        )
+
+    def poll(self) -> None:
+        self._executor.poll()
 
 
 class _TorchCopyFence:
@@ -349,24 +493,37 @@ class TorchTensorCopyAdapter:
             else _instance(staging, torch.Tensor, "Torch copy staging")
         )
         finalize: object | None = None
-        if kind == MoveKind.H2D.value:
-            copy_source = source_tensor
-            if staging_tensor is not None and source_tensor.device.type == "cpu":
-                staging_tensor.copy_(source_tensor)
-                copy_source = staging_tensor
-            destination_tensor.copy_(copy_source, non_blocking=True)
-        elif kind == MoveKind.D2H.value:
-            if staging_tensor is not None and destination_tensor is not staging_tensor:
-                staging_tensor.copy_(source_tensor, non_blocking=True)
-                finalize = lambda: destination_tensor.copy_(staging_tensor)
-            else:
+        cuda_device = (
+            destination_tensor.device
+            if destination_tensor.device.type == "cuda"
+            else source_tensor.device
+        )
+        if cuda_device.type != "cuda":
+            raise ValueError("typed H2D/D2H/P2P copy requires one CUDA endpoint")
+        stream = torch.cuda.current_stream(cuda_device)
+        with torch.cuda.stream(stream):
+            if kind == MoveKind.H2D.value:
+                copy_source = source_tensor
+                if (
+                    staging_tensor is not None
+                    and source_tensor.device.type == "cpu"
+                    and source_tensor is not staging_tensor
+                ):
+                    staging_tensor.copy_(source_tensor)
+                    copy_source = staging_tensor
+                destination_tensor.copy_(copy_source, non_blocking=True)
+            elif kind == MoveKind.D2H.value:
+                if staging_tensor is not None and destination_tensor is not staging_tensor:
+                    staging_tensor.copy_(source_tensor, non_blocking=True)
+                    finalize = lambda: destination_tensor.copy_(staging_tensor)
+                else:
+                    destination_tensor.copy_(source_tensor, non_blocking=True)
+            elif kind == MoveKind.P2P.value:
                 destination_tensor.copy_(source_tensor, non_blocking=True)
-        elif kind == MoveKind.P2P.value:
-            destination_tensor.copy_(source_tensor, non_blocking=True)
-        else:
-            raise ValueError("unsupported typed copy kind")
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream())
+            else:
+                raise ValueError("unsupported typed copy kind")
+            event = torch.cuda.Event()
+            event.record(stream)
         return _TorchCopyFence(event, finalize)
 
 
@@ -376,6 +533,7 @@ __all__ = [
     "CopyHandle",
     "PinnedMemoryPool",
     "PinnedMemorySlot",
+    "PlacementPlanDispatcher",
     "TensorCopyAdapter",
     "TorchTensorCopyAdapter",
 ]

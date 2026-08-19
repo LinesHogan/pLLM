@@ -16,6 +16,7 @@ from tllm.runtime.scheduling.phase3_transfer import (
     CopyHandle,
     PinnedMemoryPool,
     PinnedMemorySlot,
+    PlacementPlanDispatcher,
     TorchTensorCopyAdapter,
 )
 from tllm.runtime.scheduling.workgraph_executor import (
@@ -48,6 +49,7 @@ __all__ = [
     "PhysicalStepResult",
     "PinnedMemoryPool",
     "PinnedMemorySlot",
+    "PlacementPlanDispatcher",
     "SpecializationRequestDesc",
     "WorkGraphRuntimeStats",
     "WorkGraphRuntimeStatsReader",

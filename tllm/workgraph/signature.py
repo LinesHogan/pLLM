@@ -83,6 +83,8 @@ from tllm.workgraph.phase3 import (
     PlacementPlan,
     Residency,
     ScheduledMove,
+    SemanticOracleKey,
+    SemanticOracleVerificationDesc,
     TransferProfile,
     TransferProfileDesc,
     ValueFlowDesc,
@@ -243,6 +245,7 @@ def _canonical(value: Any) -> Any:
             "logical_executor": _canonical(value.logical_executor),
             "placement": _canonical(value.placement),
             "duration": _canonical(value.duration),
+            "oracle_key": _canonical(value.oracle_key),
         }
     if isinstance(value, ImplementationSelectionDesc):
         return {
@@ -251,6 +254,20 @@ def _canonical(value: Any) -> Any:
             "key": _canonical(value.key),
             "placement": _canonical(value.placement),
             "duration": _canonical(value.duration),
+            "oracle_key": _canonical(value.oracle_key),
+        }
+    if isinstance(value, SemanticOracleKey):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "version": value.version,
+        }
+    if isinstance(value, SemanticOracleVerificationDesc):
+        return {
+            "logical_executor": _canonical(value.logical_executor),
+            "oracle_key": _canonical(value.oracle_key),
+            "implementations": _canonical(value.implementations),
+            "case_count": value.case_count,
         }
     if isinstance(value, PlacedNodeDesc):
         return {

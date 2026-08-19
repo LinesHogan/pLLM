@@ -766,6 +766,16 @@ struct DurationProfileV3Desc {
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct SemanticOracleKeyV3Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    version: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
 struct ImplementationSelectionV3Desc {
     #[pyo3(attribute)]
     node_key: NodeKeyDesc,
@@ -777,6 +787,8 @@ struct ImplementationSelectionV3Desc {
     placement: PlacementV3Desc,
     #[pyo3(attribute)]
     duration: DurationProfileV3Desc,
+    #[pyo3(attribute)]
+    oracle_key: Option<SemanticOracleKeyV3Desc>,
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
@@ -2812,6 +2824,8 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     }
 
     let mut selections = HashMap::new();
+    let mut logical_oracles: HashMap<String, (PlacementV3Desc, Option<SemanticOracleKeyV3Desc>)> =
+        HashMap::new();
     for selection in &plan.selections {
         validate_node_key(&selection.node_key, "placement selection")?;
         validate_executor(Some(&selection.logical_executor), "placement logical")?;
@@ -2828,6 +2842,37 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
         validate_v3_placement(&selection.placement, "placement selection")?;
         if selection.duration.microseconds < 1 || selection.duration.samples < 1 {
             return Err("placement selection has an invalid duration profile".to_string());
+        }
+        if let Some(oracle) = &selection.oracle_key {
+            if oracle.namespace.is_empty()
+                || oracle.name.is_empty()
+                || oracle.version.is_empty()
+                || contains_runtime_text(&oracle.namespace)
+                || contains_runtime_text(&oracle.name)
+                || contains_runtime_text(&oracle.version)
+            {
+                return Err("placement selection has an invalid semantic oracle key".to_string());
+            }
+        }
+        let logical = format!(
+            "{}:{}@{}",
+            selection.logical_executor.namespace,
+            selection.logical_executor.name,
+            selection.logical_executor.version
+        );
+        if let Some((placement, oracle)) = logical_oracles.get(&logical) {
+            if *placement != selection.placement
+                && (oracle.is_none() || *oracle != selection.oracle_key)
+            {
+                return Err(
+                    "cross-placement selections require one semantic oracle key".to_string()
+                );
+            }
+        } else {
+            logical_oracles.insert(
+                logical,
+                (selection.placement.clone(), selection.oracle_key.clone()),
+            );
         }
         let node = selection.node_key.text();
         if selections.insert(node, selection).is_some() {

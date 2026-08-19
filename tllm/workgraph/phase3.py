@@ -75,6 +75,21 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _executor_key(value: object, label: str) -> ExecutorKey:
+    key = _instance(value, ExecutorKey, label)
+    _text(key.namespace, f"{label}.namespace")
+    _text(key.name, f"{label}.name")
+    _text(key.version, f"{label}.version")
+    return key
+
+
+def _node_key(value: object, label: str) -> NodeKey:
+    key = _instance(value, NodeKey, label)
+    _text(key.namespace, f"{label}.namespace")
+    _text(key.owner, f"{label}.owner")
+    return key
+
+
 def _tuple_of(value: object, expected: type[_T], label: str) -> tuple[_T, ...]:
     if not isinstance(value, tuple):
         raise TypeError(f"{label} must be tuple")
@@ -267,6 +282,13 @@ class DeviceTopology:
             return False
         return (source.index, destination.index) in self.peer_access
 
+    def contains(self, placement: Placement) -> bool:
+        placement = _instance(placement, Placement, "DeviceTopology.placement")
+        if placement.kind == DeviceKind.CPU or not self.cuda_devices:
+            return True
+        assert placement.index is not None
+        return placement.index in self.cuda_devices
+
 
 def compile_moves(
     requests: tuple[TransferRequest, ...],
@@ -279,6 +301,10 @@ def compile_moves(
     for request in requests:
         source = request.source
         destination = request.destination
+        if not topology.contains(source.placement) or not topology.contains(
+            destination.placement
+        ):
+            raise ValueError("transfer references a placement outside DeviceTopology")
         if source.placement == destination.placement:
             continue
         if (
@@ -340,6 +366,91 @@ def compile_moves(
 @runtime_checkable
 class RuntimeImplementation(Protocol):
     def execute(self, *args: object) -> object: ...
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class SemanticOracleKey:
+    namespace: str
+    name: str
+    version: str = "1"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "namespace", _text(self.namespace, "SemanticOracleKey.namespace"))
+        object.__setattr__(self, "name", _text(self.name, "SemanticOracleKey.name"))
+        object.__setattr__(self, "version", _text(self.version, "SemanticOracleKey.version"))
+
+    @property
+    def value(self) -> str:
+        return f"{self.namespace}:{self.name}@{self.version}"
+
+
+@runtime_checkable
+class SemanticOracle(Protocol):
+    def equivalent(self, reference: object, candidate: object) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticOracleSpec:
+    key: SemanticOracleKey
+    oracle: SemanticOracle
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "key",
+            _instance(self.key, SemanticOracleKey, "SemanticOracleSpec.key"),
+        )
+        if not isinstance(cast(object, self.oracle), SemanticOracle):
+            raise TypeError("SemanticOracleSpec.oracle must implement equivalent()")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticOracleVerificationDesc:
+    logical_executor: ExecutorKey
+    oracle_key: SemanticOracleKey
+    implementations: tuple[ExecutorKey, ...]
+    case_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "logical_executor",
+            _instance(
+                self.logical_executor,
+                ExecutorKey,
+                "SemanticOracleVerificationDesc.logical_executor",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "oracle_key",
+            _instance(
+                self.oracle_key,
+                SemanticOracleKey,
+                "SemanticOracleVerificationDesc.oracle_key",
+            ),
+        )
+        implementations = _tuple_of(
+            self.implementations,
+            ExecutorKey,
+            "SemanticOracleVerificationDesc.implementations",
+        )
+        if not implementations or len(set(implementations)) != len(implementations):
+            raise ValueError("semantic oracle implementations must be non-empty and unique")
+        object.__setattr__(self, "implementations", implementations)
+        object.__setattr__(
+            self,
+            "case_count",
+            _integer(
+                self.case_count,
+                "SemanticOracleVerificationDesc.case_count",
+                minimum=1,
+            ),
+        )
+
+
+class SemanticOracleMismatch(RuntimeError):
+    """Raised when cross-placement implementations are not proven equivalent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,8 +552,8 @@ class ScheduledMove:
         if (producer is None) != (consumer is None):
             raise ValueError("ScheduledMove producer and consumer must be declared together")
         if producer is not None and consumer is not None:
-            producer = _instance(producer, NodeKey, "ScheduledMove.producer")
-            consumer = _instance(consumer, NodeKey, "ScheduledMove.consumer")
+            producer = _node_key(producer, "ScheduledMove.producer")
+            consumer = _node_key(consumer, "ScheduledMove.consumer")
             if producer == consumer:
                 raise ValueError("ScheduledMove producer and consumer must differ")
         if key.value != move.value:
@@ -612,8 +723,8 @@ class ValueFlowDesc:
 
     def __post_init__(self) -> None:
         value = _instance(self.value, ValueKey, "ValueFlowDesc.value")
-        producer = _instance(self.producer, NodeKey, "ValueFlowDesc.producer")
-        consumer = _instance(self.consumer, NodeKey, "ValueFlowDesc.consumer")
+        producer = _node_key(self.producer, "ValueFlowDesc.producer")
+        consumer = _node_key(self.consumer, "ValueFlowDesc.consumer")
         if producer == consumer:
             raise ValueError("ValueFlowDesc producer and consumer must differ")
         object.__setattr__(self, "value", value)
@@ -633,9 +744,10 @@ class ImplementationSpec:
     implementation: RuntimeImplementation
     logical_executor: ExecutorKey | None = None
     duration: DurationProfile = DurationProfile(1)
+    oracle_key: SemanticOracleKey | None = None
 
     def __post_init__(self) -> None:
-        key = _instance(self.key, ExecutorKey, "ImplementationSpec.key")
+        key = _executor_key(self.key, "ImplementationSpec.key")
         placement = _instance(
             self.placement, Placement, "ImplementationSpec.placement"
         )
@@ -646,9 +758,7 @@ class ImplementationSpec:
         if logical is None:
             logical = key
         else:
-            logical = _instance(
-                logical, ExecutorKey, "ImplementationSpec.logical_executor"
-            )
+            logical = _executor_key(logical, "ImplementationSpec.logical_executor")
         object.__setattr__(self, "key", key)
         object.__setattr__(self, "placement", placement)
         object.__setattr__(self, "implementation", implementation)
@@ -658,6 +768,16 @@ class ImplementationSpec:
             "duration",
             _instance(self.duration, DurationProfile, "ImplementationSpec.duration"),
         )
+        if self.oracle_key is not None:
+            object.__setattr__(
+                self,
+                "oracle_key",
+                _instance(
+                    self.oracle_key,
+                    SemanticOracleKey,
+                    "ImplementationSpec.oracle_key",
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -666,15 +786,15 @@ class ImplementationDesc:
     logical_executor: ExecutorKey
     placement: Placement
     duration: DurationProfile
+    oracle_key: SemanticOracleKey | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "key", _instance(self.key, ExecutorKey, "ImplementationDesc.key"))
+        object.__setattr__(self, "key", _executor_key(self.key, "ImplementationDesc.key"))
         object.__setattr__(
             self,
             "logical_executor",
-            _instance(
+            _executor_key(
                 self.logical_executor,
-                ExecutorKey,
                 "ImplementationDesc.logical_executor",
             ),
         )
@@ -688,16 +808,34 @@ class ImplementationDesc:
             "duration",
             _instance(self.duration, DurationProfile, "ImplementationDesc.duration"),
         )
+        if self.oracle_key is not None:
+            object.__setattr__(
+                self,
+                "oracle_key",
+                _instance(
+                    self.oracle_key,
+                    SemanticOracleKey,
+                    "ImplementationDesc.oracle_key",
+                ),
+            )
 
 
 class ImplementationRegistry:
     """Control-plane registry; runtime callables never enter frozen plans."""
 
-    __slots__ = ("_specs", "_by_logical")
+    __slots__ = ("_specs", "_by_logical", "_oracles", "_verified")
 
     def __init__(self) -> None:
         self._specs: dict[ExecutorKey, ImplementationSpec] = {}
         self._by_logical: dict[ExecutorKey, list[ImplementationSpec]] = {}
+        self._oracles: dict[SemanticOracleKey, SemanticOracle] = {}
+        self._verified: dict[ExecutorKey, SemanticOracleVerificationDesc] = {}
+
+    def register_oracle(self, spec: SemanticOracleSpec) -> None:
+        spec = _instance(spec, SemanticOracleSpec, "ImplementationRegistry.oracle")
+        if spec.key in self._oracles:
+            raise ValueError(f"duplicate semantic oracle key {spec.key.value}")
+        self._oracles[spec.key] = spec.oracle
 
     def register(self, spec: ImplementationSpec) -> None:
         spec = _instance(spec, ImplementationSpec, "ImplementationRegistry.spec")
@@ -713,26 +851,91 @@ class ImplementationRegistry:
                 candidate.key.value,
             )
         )
+        self._verified.pop(spec.logical_executor, None)
 
     def resolve(self, key: ExecutorKey) -> RuntimeImplementation:
-        key = _instance(key, ExecutorKey, "ImplementationRegistry.key")
+        key = _executor_key(key, "ImplementationRegistry.key")
         return self._specs[key].implementation
 
     def candidates(self, logical_executor: ExecutorKey) -> tuple[ImplementationDesc, ...]:
-        logical_executor = _instance(
+        logical_executor = _executor_key(
             logical_executor,
-            ExecutorKey,
             "ImplementationRegistry.logical_executor",
         )
+        specs = tuple(self._by_logical.get(logical_executor, ()))
+        placements = {spec.placement for spec in specs}
+        if len(placements) > 1:
+            oracle_keys = {spec.oracle_key for spec in specs}
+            if None in oracle_keys or len(oracle_keys) != 1:
+                raise SemanticOracleMismatch(
+                    "cross-placement implementations require one shared semantic oracle"
+                )
+            verification = self._verified.get(logical_executor)
+            oracle_key = cast(SemanticOracleKey, next(iter(oracle_keys)))
+            if verification is None or verification.oracle_key != oracle_key:
+                raise SemanticOracleMismatch(
+                    "cross-placement implementations require semantic oracle verification"
+                )
         return tuple(
             ImplementationDesc(
                 key=spec.key,
                 logical_executor=logical_executor,
                 placement=spec.placement,
                 duration=spec.duration,
+                oracle_key=spec.oracle_key,
             )
-            for spec in self._by_logical.get(logical_executor, ())
+            for spec in specs
         )
+
+    def verify_semantics(
+        self,
+        logical_executor: ExecutorKey,
+        *,
+        cases: tuple[tuple[object, ...], ...],
+    ) -> SemanticOracleVerificationDesc:
+        logical_executor = _executor_key(
+            logical_executor,
+            "ImplementationRegistry.logical_executor",
+        )
+        specs = tuple(self._by_logical.get(logical_executor, ()))
+        if len(specs) < 2 or len({spec.placement for spec in specs}) < 2:
+            raise ValueError("semantic verification requires cross-placement implementations")
+        raw_cases = cast(object, cases)
+        if not isinstance(raw_cases, tuple) or not raw_cases or any(
+            not isinstance(case, tuple) for case in cast(tuple[object, ...], raw_cases)
+        ):
+            raise TypeError("semantic oracle cases must be a non-empty tuple of tuples")
+        typed_cases = cast(tuple[tuple[object, ...], ...], raw_cases)
+        oracle_keys = {spec.oracle_key for spec in specs}
+        if None in oracle_keys or len(oracle_keys) != 1:
+            raise SemanticOracleMismatch(
+                "cross-placement implementations require one shared semantic oracle"
+            )
+        oracle_key = cast(SemanticOracleKey, next(iter(oracle_keys)))
+        try:
+            oracle = self._oracles[oracle_key]
+        except KeyError as exc:
+            raise SemanticOracleMismatch(
+                f"semantic oracle {oracle_key.value} is not registered"
+            ) from exc
+        reference = specs[0]
+        for case_index, case in enumerate(typed_cases):
+            expected = reference.implementation.execute(*case)
+            for candidate in specs[1:]:
+                actual = candidate.implementation.execute(*case)
+                if not oracle.equivalent(expected, actual):
+                    raise SemanticOracleMismatch(
+                        "semantic oracle mismatch for "
+                        f"{candidate.key.value} on case {case_index}"
+                    )
+        verification = SemanticOracleVerificationDesc(
+            logical_executor=logical_executor,
+            oracle_key=oracle_key,
+            implementations=tuple(spec.key for spec in specs),
+            case_count=len(typed_cases),
+        )
+        self._verified[logical_executor] = verification
+        return verification
 
     def keys(self) -> tuple[ExecutorKey, ...]:
         return tuple(sorted(self._specs, key=lambda key: key.value))
@@ -744,6 +947,7 @@ class ImplementationRegistry:
                 logical_executor=cast(ExecutorKey, spec.logical_executor),
                 placement=spec.placement,
                 duration=spec.duration,
+                oracle_key=spec.oracle_key,
             )
             for spec in sorted(self._specs.values(), key=lambda item: item.key.value)
         )
@@ -855,26 +1059,36 @@ class ImplementationSelectionDesc:
     key: ExecutorKey
     placement: Placement
     duration: DurationProfile
+    oracle_key: SemanticOracleKey | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             "node_key",
-            _instance(self.node_key, NodeKey, "ImplementationSelectionDesc.node_key"),
+            _node_key(self.node_key, "ImplementationSelectionDesc.node_key"),
         )
         object.__setattr__(
             self,
             "logical_executor",
-            _instance(
+            _executor_key(
                 self.logical_executor,
-                ExecutorKey,
                 "ImplementationSelectionDesc.logical_executor",
             ),
         )
+        if self.oracle_key is not None:
+            object.__setattr__(
+                self,
+                "oracle_key",
+                _instance(
+                    self.oracle_key,
+                    SemanticOracleKey,
+                    "ImplementationSelectionDesc.oracle_key",
+                ),
+            )
         object.__setattr__(
             self,
             "key",
-            _instance(self.key, ExecutorKey, "ImplementationSelectionDesc.key"),
+            _executor_key(self.key, "ImplementationSelectionDesc.key"),
         )
         object.__setattr__(
             self,
@@ -904,9 +1118,9 @@ class PlacedNodeDesc:
     depends_on: tuple[NodeKey, ...] = ()
 
     def __post_init__(self) -> None:
-        node_key = _instance(self.node_key, NodeKey, "PlacedNodeDesc.node_key")
-        implementation = _instance(
-            self.implementation, ExecutorKey, "PlacedNodeDesc.implementation"
+        node_key = _node_key(self.node_key, "PlacedNodeDesc.node_key")
+        implementation = _executor_key(
+            self.implementation, "PlacedNodeDesc.implementation"
         )
         placement = _instance(self.placement, Placement, "PlacedNodeDesc.placement")
         start = _integer(self.start_at, "PlacedNodeDesc.start_at")
@@ -980,6 +1194,16 @@ class PlacementPlan:
         schedule_nodes = tuple(item.node_key for item in schedule)
         if len(set(selection_nodes)) != len(selection_nodes):
             raise ValueError("PlacementPlan selections must have unique nodes")
+        selections_by_logical: dict[ExecutorKey, list[ImplementationSelectionDesc]] = {}
+        for selection in selections:
+            selections_by_logical.setdefault(selection.logical_executor, []).append(selection)
+        for logical_selections in selections_by_logical.values():
+            if len({item.placement for item in logical_selections}) > 1:
+                oracle_keys = {item.oracle_key for item in logical_selections}
+                if None in oracle_keys or len(oracle_keys) != 1:
+                    raise ValueError(
+                        "cross-placement selections require one semantic oracle key"
+                    )
         if len(set(schedule_nodes)) != len(schedule_nodes):
             raise ValueError("PlacementPlan schedule must have unique nodes")
         if set(selection_nodes) != set(schedule_nodes):
@@ -1033,11 +1257,50 @@ class PlacementPlan:
             for dependency in item.depends_on
         ):
             raise ValueError("PlacementPlan move dependencies must be ordered")
+        if any(
+            moves[move_positions[dependency]].end_at > item.start_at
+            for item in moves
+            for dependency in item.depends_on
+        ):
+            raise ValueError("PlacementPlan move dependencies must finish before launch")
+        for item in moves:
+            if item.move.source.memory == MemoryKind.PINNED_HOST and not any(
+                moves[move_positions[dependency]].move.destination == item.move.source
+                for dependency in item.depends_on
+            ):
+                raise ValueError("pinned-host H2D requires its D2H dependency")
         if any(lease.residency not in residency_set for lease in leases):
             raise ValueError("PlacementPlan lease references an unknown residency")
+        lease_residencies = tuple(lease.residency for lease in leases)
+        if len(set(lease_residencies)) != len(lease_residencies):
+            raise ValueError("PlacementPlan leases must have unique residencies")
+        if set(lease_residencies) != residency_set:
+            raise ValueError("every PlacementPlan residency requires one lease")
+        lease_by_residency = {lease.residency: lease for lease in leases}
+        if any(
+            lease_by_residency[residency].live_start > item.start_at
+            or lease_by_residency[residency].live_end < item.end_at
+            for item in moves
+            for residency in (item.move.source, item.move.destination)
+        ):
+            raise ValueError("PlacementPlan lease does not cover its scheduled move")
         engines = tuple(item.engine for item in copy_engines)
         if len(set(engines)) != len(engines):
             raise ValueError("PlacementPlan copy engines must be unique")
+        capacity_by_engine = {
+            item.engine: item.capacity for item in copy_engines
+        }
+        if any(item.engine not in capacity_by_engine for item in moves):
+            raise ValueError("PlacementPlan move references an undeclared copy engine")
+        for item in moves:
+            overlapping = sum(
+                other.engine == item.engine
+                and other.start_at < item.end_at
+                and other.end_at > item.start_at
+                for other in moves
+            )
+            if overlapping > capacity_by_engine[item.engine]:
+                raise ValueError("PlacementPlan moves exceed copy-engine capacity")
         object.__setattr__(self, "plan_epoch", epoch)
         object.__setattr__(self, "selections", selections)
         object.__setattr__(self, "schedule", schedule)
@@ -1049,10 +1312,11 @@ class PlacementPlan:
 
 def _residency_sort_key(residency: Residency) -> tuple[str, int, str, int]:
     placement = residency.placement
+    memory = cast(MemoryKind, residency.memory)
     return (
         residency.value.name,
         residency.value.version,
-        placement.kind.value,
+        f"{placement.kind.value}:{memory.value}",
         -1 if placement.index is None else placement.index,
     )
 
@@ -1139,6 +1403,16 @@ def compile_placement_plan(
         raise ValueError("value flow must follow the physical DAG")
     if len({(flow.value, flow.producer, flow.consumer) for flow in flows}) != len(flows):
         raise ValueError("value flows must be unique")
+    logical_executors = {node.executor for node in physical.nodes}
+    if any(logical not in logical_executors for logical in overrides):
+        raise ValueError("placement override references an unknown logical executor")
+
+    def available_candidates(logical: ExecutorKey) -> tuple[ImplementationDesc, ...]:
+        return tuple(
+            candidate
+            for candidate in registry.candidates(logical)
+            if topology.contains(candidate.placement)
+        )
 
     dependencies: dict[NodeKey, set[NodeKey]] = {
         node.node_key: {fence.producer for fence in node.fences}
@@ -1149,7 +1423,7 @@ def compile_placement_plan(
 
     minimum_duration: dict[NodeKey, int] = {}
     for node in physical.nodes:
-        candidates = registry.candidates(node.executor)
+        candidates = available_candidates(node.executor)
         if not candidates:
             raise ValueError(f"no implementation registered for {node.executor.value}")
         override = overrides.get(node.executor)
@@ -1178,7 +1452,7 @@ def compile_placement_plan(
 
     selections_by_node: dict[NodeKey, ImplementationSelectionDesc] = {}
     for node in node_order:
-        choices = registry.candidates(node.executor)
+        choices = available_candidates(node.executor)
         override = overrides.get(node.executor)
         if override is not None:
             choices = tuple(item for item in choices if item.key == override)
@@ -1203,7 +1477,7 @@ def compile_placement_plan(
             outbound = tuple(flow for flow in flows if flow.producer == node.node_key)
             for flow in outbound:
                 consumer_node = nodes[flow.consumer]
-                consumer_choices = registry.candidates(consumer_node.executor)
+                consumer_choices = available_candidates(consumer_node.executor)
                 consumer_override = overrides.get(consumer_node.executor)
                 if consumer_override is not None:
                     consumer_choices = tuple(
@@ -1249,6 +1523,7 @@ def compile_placement_plan(
             key=chosen.key,
             placement=chosen.placement,
             duration=chosen.duration,
+            oracle_key=chosen.oracle_key,
         )
 
     capacity_by_engine = {item.engine: item.capacity for item in capacities}
@@ -1456,8 +1731,9 @@ class CopyEngineAdmission:
             (lease for lease in leases if lease.key == copy.destination),
             None,
         )
-        if matching is not None:
-            self._active[matching.key] = matching
+        if matching is None:
+            return False
+        self._active[matching.key] = matching
         return True
 
     def reap(self, leases: tuple[Lease, ...]) -> None:
@@ -1511,6 +1787,11 @@ __all__ = [
     "Residency",
     "ScheduleCandidate",
     "ScheduledMove",
+    "SemanticOracle",
+    "SemanticOracleKey",
+    "SemanticOracleMismatch",
+    "SemanticOracleSpec",
+    "SemanticOracleVerificationDesc",
     "TransferProfile",
     "TransferProfileDesc",
     "TransferRequest",

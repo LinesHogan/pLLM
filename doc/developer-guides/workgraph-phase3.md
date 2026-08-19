@@ -13,6 +13,13 @@ runtime implementation is registered under an `ExecutorKey`; only its frozen
 `ImplementationDesc` and selected key enter a plan. Tensor, callable, stream,
 event, request, and backend handles remain outside structural metadata.
 
+When one logical executor has implementations on more than one placement,
+each implementation must name the same `SemanticOracleKey`. The registry must
+run that registered oracle over explicit shared input cases before those
+candidates become eligible. A mismatch, absent oracle, or stale verification
+fails closed; the frozen selection records only the oracle key, never the
+oracle callable or runtime outputs.
+
 `compile_placement_plan()` consumes an already validated `PhysicalFlowPlan`, a
 typed `ImplementationRegistry`, directional `DeviceTopology`, and explicit
 `ValueFlowDesc` values. It performs deterministic candidate selection and a
@@ -58,8 +65,16 @@ move depends on the D2H move and the pinned-host lease covers both intervals.
 `tllm.runtime.scheduling.phase3_transfer` owns actual tensors and asynchronous
 resources. `PinnedMemoryPool` is bounded and cannot reuse a slot until its
 retire fence reports completion. `CopyExecutor` admits a bounded number of
-transfers, preserves one staging slot across a two-segment route, and releases
-both its slot and copy credit only after the final fence completes.
+transfers per typed copy engine, preserves one staging slot across a two-segment
+route, and releases both its slot and copy credit only after the final fence
+completes. Submission is transactional: adapter failures return an unlaunched
+slot, including a failure while launching the second staged segment.
+
+`PlacementPlanDispatcher` resolves routes by typed producer, consumer, and
+`ValueKey`, then configures the executor directly from the plan's copy-engine
+capacities. This is the runtime connection between the frozen moves/leases and
+Python-owned tensors and fences; an undeclared route fails closed, while the
+same frozen plan can dispatch the route again in later runtime steps.
 
 `TorchTensorCopyAdapter` supplies real pinned allocation and non-blocking
 Torch copies. CPU-only tests use the same protocol with fake tensors and
