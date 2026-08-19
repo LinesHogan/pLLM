@@ -386,3 +386,8 @@ def validate_workgraph_ir(
     semantic: WorkGraphSemanticDescriptor,
     data: WorkGraphDataDescriptor,
 ) -> WorkGraphValidation: ...
+
+def validate_capture_hierarchy(
+    hierarchy: object,
+    semantic: WorkGraphSemanticDescriptor,
+) -> WorkGraphValidation: ...

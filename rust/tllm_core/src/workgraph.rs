@@ -410,6 +410,333 @@ struct DataCentricDesc {
     graph_mode: String,
 }
 
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ArtifactKeyV2Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    version: i64,
+    #[pyo3(attribute)]
+    digest: String,
+}
+
+impl ArtifactKeyV2Desc {
+    fn text(&self) -> String {
+        let suffix = if self.digest.is_empty() {
+            String::new()
+        } else {
+            format!("#{}", self.digest)
+        };
+        format!(
+            "{}:{}@{}{}",
+            self.namespace, self.name, self.version, suffix
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct RegionKeyV2Desc {
+    #[pyo3(attribute)]
+    artifact_key: ArtifactKeyV2Desc,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    ordinal: i64,
+}
+
+impl RegionKeyV2Desc {
+    fn text(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.artifact_key.text(),
+            self.kind,
+            self.ordinal
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct LeafOperatorV2Desc {
+    #[pyo3(attribute)]
+    ordinal: i64,
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    overload: String,
+    #[pyo3(attribute)]
+    inputs: Vec<i64>,
+    #[pyo3(attribute)]
+    outputs: Vec<String>,
+    #[pyo3(attribute)]
+    module_path: Vec<String>,
+    #[pyo3(attribute)]
+    operator_kind: String,
+    #[pyo3(attribute)]
+    effects: Vec<String>,
+    #[pyo3(attribute)]
+    capabilities: Vec<String>,
+    #[pyo3(attribute)]
+    attributes: Vec<OperatorAttributeV2Desc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct OperatorAttributeV2Desc {
+    #[pyo3(attribute)]
+    path: Vec<String>,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    value: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct LeafArtifactV2Desc {
+    #[pyo3(attribute)]
+    artifact_key: ArtifactKeyV2Desc,
+    #[pyo3(attribute)]
+    operators: Vec<LeafOperatorV2Desc>,
+    #[pyo3(attribute)]
+    input_values: Vec<String>,
+    #[pyo3(attribute)]
+    output_values: Vec<String>,
+    #[pyo3(attribute)]
+    terminal_ordinal: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct LeafRegionV2Desc {
+    #[pyo3(attribute)]
+    key: RegionKeyV2Desc,
+    #[pyo3(attribute)]
+    artifact_key: ArtifactKeyV2Desc,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    operator_ordinals: Vec<i64>,
+    #[pyo3(attribute)]
+    leaf_artifact: Option<LeafArtifactV2Desc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct TaskRegionV2Desc {
+    #[pyo3(attribute)]
+    key: RegionKeyV2Desc,
+    #[pyo3(attribute)]
+    node_key: NodeKeyDesc,
+    #[pyo3(attribute)]
+    executor: ExecutorKeyDesc,
+    #[pyo3(attribute)]
+    boundary: String,
+    #[pyo3(attribute)]
+    module_path: Vec<String>,
+    #[pyo3(attribute)]
+    operator_ordinals: Vec<i64>,
+    #[pyo3(attribute)]
+    input_values: Vec<String>,
+    #[pyo3(attribute)]
+    output_values: Vec<String>,
+    #[pyo3(attribute)]
+    effects: Vec<String>,
+    #[pyo3(attribute)]
+    capabilities: Vec<String>,
+    #[pyo3(attribute)]
+    dependencies: Vec<RegionKeyV2Desc>,
+    #[pyo3(attribute)]
+    children: Vec<LeafRegionV2Desc>,
+    #[pyo3(attribute)]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct SourceSpanV2Desc {
+    #[pyo3(attribute)]
+    file: String,
+    #[pyo3(attribute)]
+    start_line: i64,
+    #[pyo3(attribute)]
+    start_column: i64,
+    #[pyo3(attribute)]
+    end_line: i64,
+    #[pyo3(attribute)]
+    end_column: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct RootFlowV2Desc {
+    #[pyo3(attribute)]
+    key: RegionKeyV2Desc,
+    #[pyo3(attribute)]
+    artifact_key: ArtifactKeyV2Desc,
+    #[pyo3(attribute)]
+    source_span: SourceSpanV2Desc,
+    #[pyo3(attribute)]
+    status: String,
+    #[pyo3(attribute)]
+    shape_guard: ShapeGuardV2Desc,
+    #[pyo3(attribute)]
+    inputs: Vec<PortBindingV2Desc>,
+    #[pyo3(attribute)]
+    outputs: Vec<PortBindingV2Desc>,
+    #[pyo3(attribute)]
+    values: Vec<CapturedValueV2Desc>,
+    #[pyo3(attribute)]
+    effects: Vec<String>,
+    #[pyo3(attribute)]
+    diagnostics: Vec<FlowDiagnosticV2Desc>,
+    #[pyo3(attribute)]
+    children: Vec<TaskRegionV2Desc>,
+    #[pyo3(attribute)]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ShapeGuardExprV2Desc {
+    #[pyo3(attribute)]
+    value_path: Vec<i64>,
+    #[pyo3(attribute)]
+    dimension: i64,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    lower_bound: i64,
+    #[pyo3(attribute)]
+    upper_bound: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ShapeGuardV2Desc {
+    #[pyo3(attribute)]
+    expressions: Vec<ShapeGuardExprV2Desc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct TensorDTypeV2Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct TensorDeviceV2Desc {
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    index: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct UseDefV2Desc {
+    #[pyo3(attribute)]
+    producer: i64,
+    #[pyo3(attribute)]
+    inputs: Vec<i64>,
+    #[pyo3(attribute)]
+    users: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CapturedValueV2Desc {
+    #[pyo3(attribute)]
+    value_id: String,
+    #[pyo3(attribute)]
+    version: i64,
+    #[pyo3(attribute)]
+    shape: Vec<String>,
+    #[pyo3(attribute)]
+    dtype: TensorDTypeV2Desc,
+    #[pyo3(attribute)]
+    device: TensorDeviceV2Desc,
+    #[pyo3(attribute)]
+    layout: String,
+    #[pyo3(attribute)]
+    stride: Vec<String>,
+    #[pyo3(attribute)]
+    use_def: UseDefV2Desc,
+    #[pyo3(attribute)]
+    alias_set: String,
+    #[pyo3(attribute)]
+    effect: String,
+}
+
+impl CapturedValueV2Desc {
+    fn key(&self) -> String {
+        format!("{}@{}", self.value_id, self.version)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct FlowDiagnosticV2Desc {
+    #[pyo3(attribute)]
+    code: String,
+    #[pyo3(attribute)]
+    message: String,
+    #[pyo3(attribute)]
+    source_span: SourceSpanV2Desc,
+    #[pyo3(attribute)]
+    detail: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PortBindingV2Desc {
+    #[pyo3(attribute)]
+    port: PortRefDesc,
+    #[pyo3(attribute)]
+    direction: String,
+    #[pyo3(attribute)]
+    value_path: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CaptureAttachmentV2Desc {
+    #[pyo3(attribute)]
+    node_key: NodeKeyDesc,
+    #[pyo3(attribute)]
+    artifact_key: ArtifactKeyV2Desc,
+    #[pyo3(attribute)]
+    bindings: Vec<PortBindingV2Desc>,
+    #[pyo3(attribute)]
+    anchor_node_key: Option<NodeKeyDesc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CaptureLeaseV2Desc {
+    #[pyo3(attribute)]
+    value_id: String,
+    #[pyo3(attribute)]
+    live_start: NodeKeyDesc,
+    #[pyo3(attribute)]
+    live_end: NodeKeyDesc,
+    #[pyo3(attribute)]
+    reader_count: i64,
+    #[pyo3(attribute)]
+    materialized: bool,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CaptureDataCentricV2Desc {
+    #[pyo3(attribute)]
+    leases: Vec<CaptureLeaseV2Desc>,
+    #[pyo3(attribute)]
+    moves: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CaptureHierarchyV2Desc {
+    #[pyo3(attribute)]
+    roots: Vec<RootFlowV2Desc>,
+    #[pyo3(attribute)]
+    attachments: Vec<CaptureAttachmentV2Desc>,
+    #[pyo3(attribute)]
+    data_centric: CaptureDataCentricV2Desc,
+    #[pyo3(attribute)]
+    schema_version: i64,
+}
+
 #[pyclass]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkGraphValidation {
@@ -1298,6 +1625,677 @@ fn validate_data(
     Ok((node_keys, value_keys))
 }
 
+fn validate_artifact_key_v2(key: &ArtifactKeyV2Desc) -> Result<(), String> {
+    if key.namespace.is_empty()
+        || key.name.is_empty()
+        || key.version < 1
+        || key.namespace.contains('/')
+        || key.namespace.contains('\\')
+        || key.name.contains('/')
+        || key.name.contains('\\')
+        || key.digest.len() != 64
+        || key
+            .digest
+            .chars()
+            .any(|character| !character.is_ascii_hexdigit() || character.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "invalid capture artifact key {}",
+            quote(&key.text())
+        ));
+    }
+    Ok(())
+}
+
+fn validate_region_key_v2(
+    key: &RegionKeyV2Desc,
+    expected_kind: &str,
+    artifact: &ArtifactKeyV2Desc,
+) -> Result<(), String> {
+    validate_artifact_key_v2(&key.artifact_key)?;
+    if key.kind != expected_kind || &key.artifact_key != artifact || key.ordinal < 0 {
+        return Err(format!(
+            "capture region key {} does not match its descriptor",
+            quote(&key.text())
+        ));
+    }
+    Ok(())
+}
+
+fn validate_leaf_operator_v2(operator: &LeafOperatorV2Desc) -> Result<(), String> {
+    if operator.ordinal < 0 || operator.name.is_empty() || operator.namespace.is_empty() {
+        return Err("capture leaf operator has an invalid identity".to_string());
+    }
+    if operator.operator_kind == "aten" && operator.namespace != "aten" {
+        return Err("ATen capture leaf operator must use the aten namespace".to_string());
+    }
+    if operator.operator_kind == "custom" && operator.namespace == "aten" {
+        return Err("custom capture leaf operator must not use the aten namespace".to_string());
+    }
+    if !["aten", "custom"].contains(&operator.operator_kind.as_str()) {
+        return Err("capture leaf operator has an unsupported typed kind".to_string());
+    }
+    if operator.effects.is_empty()
+        || operator.effects.iter().any(|effect| {
+            ![
+                "pure",
+                "read_state",
+                "write_state",
+                "rng",
+                "host_io",
+                "opaque",
+            ]
+            .contains(&effect.as_str())
+        })
+    {
+        return Err("capture leaf operator has invalid effect facts".to_string());
+    }
+    if operator.capabilities.is_empty()
+        || operator.capabilities.iter().any(|capability| {
+            !["eager_only", "capture_safe", "replay_safe"].contains(&capability.as_str())
+        })
+    {
+        return Err("capture leaf operator has invalid capability facts".to_string());
+    }
+    if operator
+        .module_path
+        .iter()
+        .any(|segment| segment.is_empty() || segment.contains('/') || segment.contains('\\'))
+    {
+        return Err("capture leaf operator has an invalid module path".to_string());
+    }
+    if operator.inputs.iter().any(|ordinal| *ordinal < 0)
+        || operator.outputs.iter().any(|value| value.is_empty())
+    {
+        return Err("capture leaf operator has invalid SSA facts".to_string());
+    }
+    let attribute_kinds = [
+        "none",
+        "bool",
+        "int",
+        "float",
+        "string",
+        "tuple",
+        "list",
+        "mapping",
+        "slice",
+        "ellipsis",
+        "dtype",
+        "device",
+        "layout",
+        "memory_format",
+    ];
+    let mut attribute_paths = HashSet::new();
+    for attribute in &operator.attributes {
+        if attribute.path.is_empty()
+            || attribute.path.iter().any(|segment| segment.is_empty())
+            || !attribute_kinds.contains(&attribute.kind.as_str())
+            || !attribute_paths.insert(attribute.path.clone())
+        {
+            return Err("capture leaf operator has invalid typed attributes".to_string());
+        }
+        let _ = &attribute.value;
+    }
+    let _ = &operator.overload;
+    Ok(())
+}
+
+fn validate_leaf_region_v2(
+    leaf: &LeafRegionV2Desc,
+    artifact: &ArtifactKeyV2Desc,
+) -> Result<HashSet<i64>, String> {
+    if &leaf.artifact_key != artifact {
+        return Err("capture leaf belongs to another artifact".to_string());
+    }
+    validate_region_key_v2(&leaf.key, &leaf.kind, artifact)?;
+    let ordinals: HashSet<i64> = leaf.operator_ordinals.iter().copied().collect();
+    if ordinals.len() != leaf.operator_ordinals.len()
+        || leaf.operator_ordinals.iter().any(|ordinal| *ordinal < 0)
+    {
+        return Err("capture leaf has duplicate or invalid operator ordinals".to_string());
+    }
+    match leaf.kind.as_str() {
+        "opaque" => {
+            if leaf.leaf_artifact.is_some() || !ordinals.is_empty() {
+                return Err("opaque capture leaf retained a partial export graph".to_string());
+            }
+        }
+        "leaf" => {
+            let leaf_artifact = leaf
+                .leaf_artifact
+                .as_ref()
+                .ok_or_else(|| "exported capture leaf is missing its artifact".to_string())?;
+            if &leaf_artifact.artifact_key != artifact {
+                return Err("capture leaf artifact identity differs from its region".to_string());
+            }
+            let known: HashSet<i64> = leaf_artifact
+                .operators
+                .iter()
+                .map(|operator| operator.ordinal)
+                .collect();
+            if known.len() != leaf_artifact.operators.len() || !ordinals.is_subset(&known) {
+                return Err("capture leaf has invalid operator coverage".to_string());
+            }
+            if ordinals.is_empty() && !known.is_empty() {
+                return Err("capture leaf omitted operator coverage".to_string());
+            }
+            for operator in &leaf_artifact.operators {
+                validate_leaf_operator_v2(operator)?;
+            }
+            if leaf_artifact
+                .input_values
+                .iter()
+                .chain(leaf_artifact.output_values.iter())
+                .any(|value| value.is_empty())
+            {
+                return Err("capture leaf has an empty input/output value identity".to_string());
+            }
+            if leaf_artifact.terminal_ordinal < 0 {
+                return Err("capture leaf has an invalid terminal ordinal".to_string());
+            }
+        }
+        _ => return Err("capture leaf has an unsupported region kind".to_string()),
+    }
+    Ok(ordinals)
+}
+
+fn partition_boundary_v2(
+    previous: Option<&LeafOperatorV2Desc>,
+    current: Option<&LeafOperatorV2Desc>,
+) -> &'static str {
+    let Some(current) = current else {
+        return "root";
+    };
+    if current.operator_kind == "custom" {
+        return "custom_op";
+    }
+    let Some(previous) = previous else {
+        return "root";
+    };
+    if previous.module_path != current.module_path {
+        "module"
+    } else if previous.effects != current.effects {
+        "effect"
+    } else if previous.capabilities != current.capabilities {
+        "capability"
+    } else {
+        "root"
+    }
+}
+
+fn valid_capture_effect(effect: &str) -> bool {
+    [
+        "pure",
+        "read_state",
+        "write_state",
+        "rng",
+        "host_io",
+        "opaque",
+    ]
+    .contains(&effect)
+}
+
+fn validate_root_specialization_v2(root: &RootFlowV2Desc) -> Result<(), String> {
+    for expression in &root.shape_guard.expressions {
+        if expression.value_path.iter().any(|part| *part < 0)
+            || expression.dimension < 0
+            || expression.lower_bound < 0
+            || expression.upper_bound < expression.lower_bound
+            || !["static", "range"].contains(&expression.kind.as_str())
+            || expression.kind == "static" && expression.lower_bound != expression.upper_bound
+        {
+            return Err("capture root has an invalid shape guard".to_string());
+        }
+    }
+    if root.effects.is_empty()
+        || root
+            .effects
+            .iter()
+            .any(|effect| !valid_capture_effect(effect))
+    {
+        return Err("capture root has invalid effect facts".to_string());
+    }
+    let mut bindings = HashSet::new();
+    for binding in root.inputs.iter().chain(root.outputs.iter()) {
+        validate_port_ref(&binding.port, "capture root")?;
+        if !["input", "output"].contains(&binding.direction.as_str())
+            || binding.value_path.iter().any(|part| *part < 0)
+            || !bindings.insert(binding.clone())
+        {
+            return Err("capture root has an invalid or duplicate binding".to_string());
+        }
+    }
+    if root
+        .inputs
+        .iter()
+        .any(|binding| binding.direction != "input")
+        || root
+            .outputs
+            .iter()
+            .any(|binding| binding.direction != "output")
+    {
+        return Err("capture root binding direction differs from its collection".to_string());
+    }
+    let mut value_keys = HashSet::new();
+    let mut value_ordinals = HashSet::new();
+    for value in &root.values {
+        if value.value_id.is_empty()
+            || value.version < 1
+            || value.shape.is_empty()
+            || value.stride.is_empty()
+            || value.dtype.namespace.is_empty()
+            || value.dtype.name.is_empty()
+            || !["cpu", "cuda"].contains(&value.device.kind.as_str())
+            || value.device.index.is_some_and(|index| index < 0)
+            || value.layout.is_empty()
+            || value.alias_set.is_empty()
+            || !valid_capture_effect(&value.effect)
+            || value.use_def.producer < 0
+            || value.use_def.inputs.iter().any(|ordinal| *ordinal < 0)
+            || value.use_def.users.iter().any(|ordinal| *ordinal < 0)
+            || !value_keys.insert(value.key())
+            || !value_ordinals.insert(value.use_def.producer)
+        {
+            return Err("capture root has invalid inferred value facts".to_string());
+        }
+    }
+    for diagnostic in &root.diagnostics {
+        if diagnostic.code.is_empty()
+            || diagnostic.message.is_empty()
+            || diagnostic.source_span.file.is_empty()
+        {
+            return Err("capture root has an invalid typed diagnostic".to_string());
+        }
+        let _ = &diagnostic.detail;
+    }
+    if root.status == "captured" {
+        if root.values.is_empty() || !root.diagnostics.is_empty() {
+            return Err("captured root requires inferred values and no diagnostics".to_string());
+        }
+    } else if root.status == "opaque_barrier"
+        && (!root.values.is_empty()
+            || root.diagnostics.is_empty()
+            || !root.effects.iter().any(|effect| effect == "opaque"))
+    {
+        return Err("opaque root retained partial values or lost diagnostics/effect".to_string());
+    }
+    Ok(())
+}
+
+fn validate_capture_root_v2(root: &RootFlowV2Desc) -> Result<Vec<String>, String> {
+    validate_artifact_key_v2(&root.artifact_key)?;
+    validate_region_key_v2(&root.key, "root", &root.artifact_key)?;
+    if root.kind != "root" || root.children.is_empty() {
+        return Err("capture root must contain task regions".to_string());
+    }
+    if root.source_span.file.is_empty()
+        || root.source_span.start_line < 1
+        || root.source_span.end_line < root.source_span.start_line
+        || root.source_span.start_column < 0
+        || root.source_span.end_column < 0
+    {
+        return Err("capture root has an invalid source span".to_string());
+    }
+    validate_root_specialization_v2(root)?;
+    let mut task_positions = HashMap::new();
+    for (position, task) in root.children.iter().enumerate() {
+        validate_region_key_v2(&task.key, "task", &root.artifact_key)?;
+        if task.kind != "task" || task.children.len() != 1 {
+            return Err("capture task must contain exactly one leaf".to_string());
+        }
+        if task_positions.insert(task.key.clone(), position).is_some() {
+            return Err("capture root contains duplicate task keys".to_string());
+        }
+    }
+    let mut covered = HashSet::new();
+    let mut expected: Option<HashSet<i64>> = None;
+    let mut previous_operator: Option<LeafOperatorV2Desc> = None;
+    let mut order = Vec::with_capacity(root.children.len());
+    for (position, task) in root.children.iter().enumerate() {
+        validate_node_key(&task.node_key, "capture task")?;
+        validate_executor(Some(&task.executor), "capture task")?;
+        if task.node_key.namespace != "capture_task" {
+            return Err("capture task must use the capture_task node namespace".to_string());
+        }
+        if ![
+            "root",
+            "module",
+            "custom_op",
+            "effect",
+            "capability",
+            "opaque",
+        ]
+        .contains(&task.boundary.as_str())
+        {
+            return Err("capture task has an unsupported partition boundary".to_string());
+        }
+        if task.effects.is_empty() || task.capabilities.is_empty() {
+            return Err("capture task requires effect and capability facts".to_string());
+        }
+        if task.effects.iter().any(|effect| {
+            ![
+                "pure",
+                "read_state",
+                "write_state",
+                "rng",
+                "host_io",
+                "opaque",
+            ]
+            .contains(&effect.as_str())
+        }) || task.capabilities.iter().any(|capability| {
+            !["eager_only", "capture_safe", "replay_safe"].contains(&capability.as_str())
+        }) {
+            return Err("capture task has invalid effect or capability facts".to_string());
+        }
+        if task
+            .module_path
+            .iter()
+            .any(|segment| segment.is_empty() || segment.contains('/') || segment.contains('\\'))
+            || task.input_values.iter().any(|value| value.is_empty())
+            || task.output_values.iter().any(|value| value.is_empty())
+        {
+            return Err("capture task has invalid structural facts".to_string());
+        }
+        for dependency in &task.dependencies {
+            let dependency_position = task_positions
+                .get(dependency)
+                .ok_or_else(|| "capture task dependency references another root".to_string())?;
+            if *dependency_position >= position {
+                return Err("capture task dependency violates topological order".to_string());
+            }
+        }
+        let task_ordinals: HashSet<i64> = task.operator_ordinals.iter().copied().collect();
+        if task_ordinals.len() != task.operator_ordinals.len() {
+            return Err("capture task has duplicate operator coverage".to_string());
+        }
+        let leaf_ordinals = validate_leaf_region_v2(&task.children[0], &root.artifact_key)?;
+        if leaf_ordinals != task_ordinals || !covered.is_disjoint(&task_ordinals) {
+            return Err("capture task/leaf operator coverage differs or overlaps".to_string());
+        }
+        covered.extend(task_ordinals);
+        if let Some(leaf_artifact) = &task.children[0].leaf_artifact {
+            let selected: Vec<&LeafOperatorV2Desc> = task
+                .operator_ordinals
+                .iter()
+                .map(|ordinal| {
+                    leaf_artifact
+                        .operators
+                        .iter()
+                        .find(|operator| operator.ordinal == *ordinal)
+                        .expect("validated leaf coverage")
+                })
+                .collect();
+            if selected.iter().any(|operator| {
+                operator.module_path != task.module_path
+                    || operator.effects != task.effects
+                    || operator.capabilities != task.capabilities
+            }) {
+                return Err("capture task facts differ from its leaf operators".to_string());
+            }
+            if task.boundary
+                != partition_boundary_v2(previous_operator.as_ref(), selected.first().copied())
+            {
+                return Err("capture task boundary differs from its leaf facts".to_string());
+            }
+            if let Some(operator) = selected.last() {
+                previous_operator = Some((*operator).clone());
+            }
+            let known = leaf_artifact
+                .operators
+                .iter()
+                .map(|operator| operator.ordinal)
+                .collect();
+            if let Some(previous) = &expected {
+                if previous != &known {
+                    return Err("capture tasks disagree on the leaf artifact".to_string());
+                }
+            } else {
+                expected = Some(known);
+            }
+        }
+        order.push(task.node_key.text());
+    }
+    match root.status.as_str() {
+        "captured" => {
+            if covered != expected.unwrap_or_default() {
+                return Err(
+                    "capture root does not cover every leaf operator exactly once".to_string(),
+                );
+            }
+            let leaf_artifact = root.children[0].children[0]
+                .leaf_artifact
+                .as_ref()
+                .expect("captured root has a validated leaf artifact");
+            let value_keys: HashSet<String> =
+                root.values.iter().map(CapturedValueV2Desc::key).collect();
+            let value_ordinals: HashSet<i64> = root
+                .values
+                .iter()
+                .map(|value| value.use_def.producer)
+                .collect();
+            let operator_ordinals: HashSet<i64> = leaf_artifact
+                .operators
+                .iter()
+                .map(|operator| operator.ordinal)
+                .collect();
+            let expected_effects: HashSet<String> = if leaf_artifact.operators.is_empty() {
+                HashSet::from(["pure".to_string()])
+            } else {
+                leaf_artifact
+                    .operators
+                    .iter()
+                    .flat_map(|operator| operator.effects.iter().cloned())
+                    .collect()
+            };
+            let root_effects: HashSet<String> = root.effects.iter().cloned().collect();
+            if root_effects.len() != root.effects.len() || root_effects != expected_effects {
+                return Err("capture root effects differ from its leaf operators".to_string());
+            }
+            if !leaf_artifact
+                .input_values
+                .iter()
+                .chain(leaf_artifact.output_values.iter())
+                .all(|value| value_keys.contains(value))
+            {
+                return Err("capture leaf input/output references an unknown value".to_string());
+            }
+            let leaf_outputs: HashSet<String> =
+                leaf_artifact.output_values.iter().cloned().collect();
+            for value in &root.values {
+                if !value
+                    .use_def
+                    .inputs
+                    .iter()
+                    .all(|ordinal| value_ordinals.contains(ordinal))
+                {
+                    return Err("capture value references an unknown input".to_string());
+                }
+                let unknown_users: HashSet<i64> = value
+                    .use_def
+                    .users
+                    .iter()
+                    .filter(|ordinal| {
+                        !value_ordinals.contains(ordinal) && !operator_ordinals.contains(ordinal)
+                    })
+                    .copied()
+                    .collect();
+                if !unknown_users.is_empty()
+                    && (unknown_users != HashSet::from([leaf_artifact.terminal_ordinal])
+                        || !leaf_outputs.contains(&value.key()))
+                {
+                    return Err("capture value references an unknown user".to_string());
+                }
+            }
+            for operator in &leaf_artifact.operators {
+                if !operator
+                    .inputs
+                    .iter()
+                    .all(|ordinal| value_ordinals.contains(ordinal))
+                    || !operator
+                        .outputs
+                        .iter()
+                        .all(|value| value_keys.contains(value))
+                {
+                    return Err("capture operator has dangling SSA facts".to_string());
+                }
+            }
+        }
+        "opaque_barrier" => {
+            if root.children.len() != 1
+                || root.children[0].boundary != "opaque"
+                || root.children[0].children[0].kind != "opaque"
+            {
+                return Err("opaque capture root must contain one opaque task".to_string());
+            }
+        }
+        _ => return Err("capture root has an unsupported status".to_string()),
+    }
+    Ok(order)
+}
+
+fn validate_capture_hierarchy_v2(
+    hierarchy: &CaptureHierarchyV2Desc,
+    semantic: &SemanticGraphDesc,
+) -> Result<Vec<String>, String> {
+    if hierarchy.schema_version != 2 {
+        return Err("capture hierarchy schema version must be 2".to_string());
+    }
+    if hierarchy.roots.is_empty() {
+        return Err("capture hierarchy requires at least one root".to_string());
+    }
+    let mut root_artifacts = HashSet::new();
+    let mut root_bindings: HashMap<ArtifactKeyV2Desc, HashSet<PortBindingV2Desc>> = HashMap::new();
+    let mut order = Vec::new();
+    for root in &hierarchy.roots {
+        if !root_artifacts.insert(root.artifact_key.clone()) {
+            return Err("capture hierarchy contains duplicate root artifacts".to_string());
+        }
+        root_bindings.insert(
+            root.artifact_key.clone(),
+            root.inputs
+                .iter()
+                .chain(root.outputs.iter())
+                .cloned()
+                .collect(),
+        );
+        order.extend(validate_capture_root_v2(root)?);
+    }
+    let semantic_nodes: HashSet<NodeKeyDesc> = semantic
+        .nodes
+        .iter()
+        .map(|node| node.node_key.clone())
+        .collect();
+    let semantic_anchors: HashSet<NodeKeyDesc> = semantic
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "anchor")
+        .map(|node| node.node_key.clone())
+        .collect();
+    let semantic_ports: HashSet<PortRefDesc> = semantic
+        .values
+        .iter()
+        .filter_map(|value| value.port.clone())
+        .collect();
+    let mut attachment_artifacts = HashSet::new();
+    for attachment in &hierarchy.attachments {
+        validate_artifact_key_v2(&attachment.artifact_key)?;
+        validate_node_key(&attachment.node_key, "capture attachment")?;
+        if !root_artifacts.contains(&attachment.artifact_key)
+            || !attachment_artifacts.insert(attachment.artifact_key.clone())
+        {
+            return Err("capture attachment has an unknown or duplicate artifact".to_string());
+        }
+        if !semantic_nodes.contains(&attachment.node_key) {
+            return Err("capture attachment references an unknown semantic node".to_string());
+        }
+        let target_node = semantic
+            .nodes
+            .iter()
+            .find(|node| node.node_key == attachment.node_key)
+            .expect("attachment target membership validated");
+        if attachment.node_key.namespace != "consumer_flow" || target_node.kind != "compute" {
+            return Err("capture attachment must target a consumer flow node".to_string());
+        }
+        let mut bindings = HashSet::new();
+        for binding in &attachment.bindings {
+            validate_port_ref(&binding.port, "capture attachment")?;
+            if !["input", "output"].contains(&binding.direction.as_str())
+                || binding.value_path.iter().any(|part| *part < 0)
+                || !bindings.insert(binding.clone())
+            {
+                return Err("capture attachment has an invalid or duplicate binding".to_string());
+            }
+            match &binding.port {
+                PortRefDesc::Id(port) => {
+                    if !semantic_ports.contains(&PortRefDesc::Id(port.clone())) {
+                        return Err("capture attachment references an unknown PortId".to_string());
+                    }
+                }
+                PortRefDesc::Address(address) => {
+                    let accesses = if binding.direction == "input" {
+                        &target_node.reads
+                    } else {
+                        &target_node.writes
+                    };
+                    if !accesses.iter().any(|access| {
+                        access.port.as_ref() == Some(&PortRefDesc::Address(address.clone()))
+                    }) {
+                        return Err(
+                            "capture attachment address is not declared by its target".to_string()
+                        );
+                    }
+                }
+            }
+        }
+        if root_bindings[&attachment.artifact_key] != bindings {
+            return Err("capture attachment does not bind every captured port exactly".to_string());
+        }
+        if let Some(anchor) = &attachment.anchor_node_key {
+            if !semantic_anchors.contains(anchor)
+                || !semantic.edges.iter().any(|(source, target, kind)| {
+                    source == anchor && target == &attachment.node_key && kind == "anchor"
+                })
+            {
+                return Err("capture attachment references a mismatched anchor".to_string());
+            }
+        }
+    }
+    if root_artifacts != attachment_artifacts {
+        return Err("every capture root requires one explicit attachment".to_string());
+    }
+    if !hierarchy.data_centric.moves.is_empty() {
+        return Err("Phase 1 capture hierarchy must not contain Move".to_string());
+    }
+    let mut lease_values = HashSet::new();
+    let task_positions: HashMap<String, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(position, key)| (key.clone(), position))
+        .collect();
+    for lease in &hierarchy.data_centric.leases {
+        validate_node_key(&lease.live_start, "capture lease start")?;
+        validate_node_key(&lease.live_end, "capture lease end")?;
+        if lease.value_id.is_empty()
+            || lease.reader_count < 0
+            || lease.materialized
+            || !lease_values.insert(lease.value_id.clone())
+            || !task_positions.contains_key(&lease.live_start.text())
+            || !task_positions.contains_key(&lease.live_end.text())
+            || task_positions[&lease.live_start.text()] > task_positions[&lease.live_end.text()]
+        {
+            return Err("capture hierarchy has an invalid logical lease".to_string());
+        }
+    }
+    if semantic
+        .nodes
+        .iter()
+        .any(|node| node.node_key.namespace == "capture_operator")
+    {
+        return Err("ATen leaf operators must not become semantic schedule nodes".to_string());
+    }
+    Ok(order)
+}
+
 /// Validate semantic and data-centric WorkGraph descriptors and return the
 /// deterministic topological order of semantic nodes.
 #[pyfunction]
@@ -1354,9 +2352,23 @@ fn validate_workgraph_ir(
     validate_workgraph(semantic, data)
 }
 
+/// Validate the frozen Phase 1 v2 capture hierarchy against the existing
+/// semantic schedule projection. The sidecar remains metadata-only.
+#[pyfunction]
+#[pyo3(signature = (hierarchy, semantic))]
+fn validate_capture_hierarchy(
+    hierarchy: CaptureHierarchyV2Desc,
+    semantic: SemanticGraphDesc,
+) -> PyResult<WorkGraphValidation> {
+    let topological_order =
+        validate_capture_hierarchy_v2(&hierarchy, &semantic).map_err(validation_error)?;
+    Ok(WorkGraphValidation { topological_order })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_workgraph, m)?)?;
     m.add_function(wrap_pyfunction!(validate_workgraph_ir, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_capture_hierarchy, m)?)?;
     m.add_class::<WorkGraphValidation>()?;
     Ok(())
 }

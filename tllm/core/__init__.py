@@ -27,6 +27,7 @@ try:
         partition_rows,
         plan_sampler_step,
         WorkGraphValidation,
+        validate_capture_hierarchy,
         validate_workgraph,
         validate_workgraph_ir,
     )
@@ -51,6 +52,7 @@ __all__ = [
     "partition_rows",
     "plan_sampler_step",
     "WorkGraphValidation",
+    "validate_capture_hierarchy",
     "validate_workgraph",
     "validate_workgraph_ir",
 ]

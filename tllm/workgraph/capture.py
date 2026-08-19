@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import inspect
+import json
 import textwrap
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
@@ -15,6 +17,7 @@ import torch
 
 from tllm.workgraph.frontend import (
     ArtifactKey,
+    Capability,
     CapturedFlow,
     CapturedValueDesc,
     CaptureStatus,
@@ -25,6 +28,9 @@ from tllm.workgraph.frontend import (
     FlowCaptureDiagnostic,
     LeafArtifactDesc,
     LeafOperatorDesc,
+    OperatorAttributeDesc,
+    OperatorAttributeKind,
+    OperatorKind,
     PortBindingDesc,
     PortBindingDirection,
     ShapeGuard,
@@ -67,6 +73,7 @@ class _SchemaLike(Protocol):
 class _OperatorLike(Protocol):
     namespace: str
     _schema: _SchemaLike
+    tags: Sequence[object]
 
 
 class _RangeLike(Protocol):
@@ -79,6 +86,12 @@ class _PositionedNode(Protocol):
     col_offset: int
     end_lineno: int | None
     end_col_offset: int | None
+
+
+class _SliceLike(Protocol):
+    start: object
+    stop: object
+    step: object
 
 
 class _ExportModule(torch.nn.Module):
@@ -153,7 +166,9 @@ class _EffectVisitor(ast.NodeVisitor):
                 self._record(FlowCaptureCode.HOST_IO, "host I/O is not capturable", node)
             case ast.Attribute(attr=attribute, value=value):
                 root = _root_name(value)
-                if attribute in {"item", "numpy", "tolist"}:
+                if root == "torch" and attribute in {"load", "save"}:
+                    self._record(FlowCaptureCode.HOST_IO, "host I/O is not capturable", node)
+                elif attribute in {"item", "numpy", "tolist"}:
                     self._record(
                         FlowCaptureCode.DATA_DEPENDENT_CONTROL_FLOW,
                         "Tensor data escapes to Python control flow",
@@ -231,6 +246,19 @@ def _is_supported_input(value: object) -> bool:
         return all(
             _is_immutable_constant(key) and _is_supported_input(item)
             for key, item in mapping.items()
+        )
+    return False
+
+
+def _is_tensor_input_tree(value: object) -> bool:
+    if torch.is_tensor(value):
+        return True
+    if type(value) in {list, tuple}:
+        return all(_is_tensor_input_tree(item) for item in cast(Sequence[object], value))
+    if type(value) is dict:
+        return all(
+            _is_tensor_input_tree(item)
+            for item in cast(dict[object, object], value).values()
         )
     return False
 
@@ -359,8 +387,16 @@ def _opaque_capture(
     if FlowCaptureCode.UNSUPPORTED_MUTATION in codes:
         known_effects.append(Effect.WRITE_STATE)
     known_effects.append(Effect.OPAQUE)
+    digest_payload = {
+        "status": CaptureStatus.OPAQUE_BARRIER.value,
+        "diagnostics": [item.code.value for item in evidence],
+        "effects": [effect.value for effect in known_effects],
+    }
+    digest = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
     return CapturedFlow(
-        artifact_key=ArtifactKey.from_callable(function),
+        artifact_key=ArtifactKey.from_callable(function, digest=digest),
         source_span=flow_span,
         inputs=tuple(
             binding for binding in bindings if binding.direction == PortBindingDirection.INPUT
@@ -444,13 +480,192 @@ def _finite_bound(bound: object, source_span: SourceSpan) -> int:
         ) from exc
 
 
+def _operator_module_path(metadata: Mapping[str, object]) -> tuple[str, ...]:
+    raw_stack = metadata.get("nn_module_stack")
+    if raw_stack is None:
+        return ()
+    if not isinstance(raw_stack, Mapping):
+        return ()
+    module_path = ""
+    typed_stack = cast(Mapping[object, object], raw_stack)
+    for entry in typed_stack.values():
+        if isinstance(entry, tuple) and entry and isinstance(entry[0], str):
+            module_path = entry[0]
+    return tuple(segment for segment in module_path.split(".") if segment)
+
+
+def _append_operator_attribute(
+    out: list[OperatorAttributeDesc],
+    value: object,
+    path: tuple[str, ...],
+    source_span: SourceSpan,
+) -> None:
+    if isinstance(value, torch.fx.Node):
+        return
+    if value is None:
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.NONE, ""))
+        return
+    if value is Ellipsis:
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.ELLIPSIS, ""))
+        return
+    if type(value) is bool:
+        out.append(
+            OperatorAttributeDesc(
+                path,
+                OperatorAttributeKind.BOOL,
+                "true" if value else "false",
+            )
+        )
+        return
+    if type(value) is int:
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.INT, str(value)))
+        return
+    if type(value) is float:
+        out.append(
+            OperatorAttributeDesc(path, OperatorAttributeKind.FLOAT, value.hex())
+        )
+        return
+    if type(value) is str:
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.STRING, value))
+        return
+    if isinstance(value, torch.dtype):
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.DTYPE, str(value)))
+        return
+    if isinstance(value, torch.device):
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.DEVICE, str(value)))
+        return
+    if isinstance(value, torch.layout):
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.LAYOUT, str(value)))
+        return
+    if isinstance(value, torch.memory_format):
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.MEMORY_FORMAT, str(value)))
+        return
+    if isinstance(value, slice):
+        slice_value = cast(_SliceLike, value)
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.SLICE, ""))
+        _append_operator_attribute(out, slice_value.start, (*path, "start"), source_span)
+        _append_operator_attribute(out, slice_value.stop, (*path, "stop"), source_span)
+        _append_operator_attribute(out, slice_value.step, (*path, "step"), source_span)
+        return
+    if isinstance(value, (tuple, list)):
+        sequence = cast(Sequence[object], value)
+        kind = (
+            OperatorAttributeKind.TUPLE
+            if isinstance(value, tuple)
+            else OperatorAttributeKind.LIST
+        )
+        out.append(OperatorAttributeDesc(path, kind, str(len(sequence))))
+        for index, item in enumerate(sequence):
+            _append_operator_attribute(out, item, (*path, str(index)), source_span)
+        return
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        if any(not isinstance(key, str) for key in mapping):
+            raise _CaptureRejected(
+                FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+                "operator attributes contain a non-string mapping key",
+                source_span,
+            )
+        string_mapping = cast(Mapping[str, object], mapping)
+        out.append(OperatorAttributeDesc(path, OperatorAttributeKind.MAPPING, str(len(mapping))))
+        for key in sorted(string_mapping):
+            _append_operator_attribute(out, string_mapping[key], (*path, key), source_span)
+        return
+    raise _CaptureRejected(
+        FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+        "operator attributes contain an unsupported runtime value",
+        source_span,
+    )
+
+
+def _operator_attributes(node: torch.fx.Node, source_span: SourceSpan) -> tuple[OperatorAttributeDesc, ...]:
+    attributes: list[OperatorAttributeDesc] = []
+    for index, value in enumerate(node.args):
+        _append_operator_attribute(attributes, value, ("args", str(index)), source_span)
+    for name in sorted(node.kwargs):
+        _append_operator_attribute(attributes, node.kwargs[name], ("kwargs", name), source_span)
+    return tuple(attributes)
+
+
+def _operator_facts(target: _OperatorLike) -> tuple[tuple[Effect, ...], tuple[Capability, ...]]:
+    tag_names = {
+        tag.name
+        for tag in target.tags
+        if isinstance(tag, torch.Tag)
+    }
+    if "nondeterministic_seeded" in tag_names:
+        return (Effect.RNG,), (Capability.REPLAY_SAFE,)
+    return (Effect.PURE,), (Capability.CAPTURE_SAFE,)
+
+
+def _captured_artifact_digest(
+    operators: Sequence[LeafOperatorDesc],
+    values: Sequence[CapturedValueDesc],
+    shape_guard: ShapeGuard,
+) -> str:
+    payload = {
+        "operators": [
+            {
+                "ordinal": operator.ordinal,
+                "namespace": operator.namespace,
+                "name": operator.name,
+                "overload": operator.overload,
+                "inputs": list(operator.inputs),
+                "outputs": list(operator.outputs),
+                "module_path": list(operator.module_path),
+                "operator_kind": operator.operator_kind.value,
+                "effects": [effect.value for effect in operator.effects],
+                "capabilities": [capability.value for capability in operator.capabilities],
+                "attributes": [
+                    {
+                        "path": list(attribute.path),
+                        "kind": attribute.kind.value,
+                        "value": attribute.value,
+                    }
+                    for attribute in operator.attributes
+                ],
+            }
+            for operator in operators
+        ],
+        "values": [
+            {
+                "value_id": value.value_id,
+                "version": value.version,
+                "shape": list(value.shape),
+                "dtype": [value.dtype.namespace, value.dtype.name],
+                "device": [value.device.kind.value, value.device.index],
+                "layout": value.layout.value,
+                "stride": list(value.stride),
+                "producer": value.use_def.producer,
+                "inputs": list(value.use_def.inputs),
+                "users": list(value.use_def.users),
+                "alias_set": value.alias_set,
+                "effect": value.effect.value,
+            }
+            for value in values
+        ],
+        "shape_guard": [
+            {
+                "value_path": list(expression.value_path),
+                "dimension": expression.dimension,
+                "kind": expression.kind.value,
+                "lower_bound": expression.lower_bound,
+                "upper_bound": expression.upper_bound,
+            }
+            for expression in shape_guard.expressions
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+
+
 def _lower_exported_program(
     function: FunctionType,
     exported_program: torch.export.ExportedProgram,
     bindings: tuple[PortBindingDesc, ...],
 ) -> CapturedFlow:
     source_span = SourceSpan.from_callable(function)
-    artifact_key = ArtifactKey.from_callable(function)
     nodes = tuple(exported_program.graph.nodes)
     ordinal_by_node = {node: ordinal for ordinal, node in enumerate(nodes)}
     tensor_by_node: dict[torch.fx.Node, torch.Tensor] = {}
@@ -476,6 +691,7 @@ def _lower_exported_program(
         parent[second] = first
 
     operators: list[LeafOperatorDesc] = []
+    effect_by_ordinal: dict[int, Effect] = {}
     for node in nodes:
         if node.op != "call_function":
             continue
@@ -489,6 +705,12 @@ def _lower_exported_program(
                 "export produced an operator without a typed schema",
                 source_span,
             ) from exc
+        if namespace != "aten":
+            raise _CaptureRejected(
+                FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+                "non-ATen operator requires a registered typed extern contract",
+                source_span,
+            )
         alias_arguments = tuple(
             argument.alias_info
             for argument in schema.arguments
@@ -521,6 +743,8 @@ def _lower_exported_program(
             (f"leaf/{output_ordinal}@1",) if node in tensor_by_node else ()
         )
         schema_name = schema.name.split("::", maxsplit=1)[-1]
+        operator_effects, operator_capabilities = _operator_facts(target)
+        effect_by_ordinal[output_ordinal] = operator_effects[0]
         operators.append(
             LeafOperatorDesc(
                 ordinal=output_ordinal,
@@ -529,8 +753,48 @@ def _lower_exported_program(
                 overload=schema.overload_name,
                 inputs=input_ordinals,
                 outputs=output_ids,
+                module_path=_operator_module_path(node.meta),
+                operator_kind=OperatorKind.ATEN,
+                effects=operator_effects,
+                capabilities=operator_capabilities,
+                attributes=_operator_attributes(node, source_span),
             )
         )
+
+    output_nodes = tuple(node for node in nodes if node.op == "output")
+    if len(output_nodes) != 1:
+        raise _CaptureRejected(
+            FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+            "strict export did not produce exactly one output node",
+            source_span,
+        )
+
+    def validate_output_tree(value: object) -> None:
+        if isinstance(value, torch.fx.Node):
+            if value not in tensor_by_node:
+                raise _CaptureRejected(
+                    FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+                    "strict export produced a non-Tensor output without a typed SSA descriptor",
+                    source_span,
+                )
+            return
+        if isinstance(value, Mapping):
+            mapping = cast(Mapping[object, object], value)
+            for item in mapping.values():
+                validate_output_tree(item)
+            return
+        if isinstance(value, (tuple, list)):
+            sequence = cast(Sequence[object], value)
+            for item in sequence:
+                validate_output_tree(item)
+            return
+        raise _CaptureRejected(
+            FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+            "strict export produced a non-Tensor output without a typed SSA descriptor",
+            source_span,
+        )
+
+    validate_output_tree(output_nodes[0].args)
 
     raw_range_constraints: object = exported_program.range_constraints  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
     range_constraints = cast(Mapping[object, _RangeLike], raw_range_constraints)
@@ -568,7 +832,7 @@ def _lower_exported_program(
                 stride=stride,
                 use_def=UseDefDesc(producer=ordinal, inputs=inputs, users=users),
                 alias_set=f"alias/{find(ordinal)}",
-                effect=Effect.PURE,
+                effect=effect_by_ordinal.get(ordinal, Effect.PURE),
             )
         )
         if node.op == "placeholder":
@@ -615,16 +879,22 @@ def _lower_exported_program(
         for node in output_node.all_input_nodes
         if node in tensor_by_node
     )
+    shape_guard = ShapeGuard(tuple(guard_expressions))
+    artifact_key = ArtifactKey.from_callable(
+        function,
+        digest=_captured_artifact_digest(operators, captured_values, shape_guard),
+    )
     leaf_artifact = LeafArtifactDesc(
         artifact_key=artifact_key,
         operators=tuple(operators),
         input_values=input_values,
         output_values=output_values,
+        terminal_ordinal=ordinal_by_node[output_nodes[0]],
     )
     return CapturedFlow(
         artifact_key=artifact_key,
         source_span=source_span,
-        shape_guard=ShapeGuard(tuple(guard_expressions)),
+        shape_guard=shape_guard,
         inputs=tuple(
             binding for binding in bindings if binding.direction == PortBindingDirection.INPUT
         ),
@@ -633,12 +903,19 @@ def _lower_exported_program(
         ),
         values=tuple(captured_values),
         leaf_artifact=leaf_artifact,
-        effects=(Effect.PURE,),
+        effects=tuple(
+            dict.fromkeys(effect for operator in operators for effect in operator.effects)
+        )
+        or (Effect.PURE,),
         diagnostics=(),
         status=CaptureStatus.CAPTURED,
         node_kind=NodeKind.COMPUTE,
         mobility=TimingMobilityKind.PINNED,
-        graph_safety=GraphSafetyKind.CAPTURE_SAFE,
+        graph_safety=(
+            GraphSafetyKind.REPLAY_STATEFUL
+            if any(Effect.RNG in operator.effects for operator in operators)
+            else GraphSafetyKind.CAPTURE_SAFE
+        ),
     )
 
 
@@ -658,6 +935,16 @@ def capture_flow(
             _Evidence(
                 FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
                 "capture inputs contain an unsupported runtime object",
+                source_span,
+            ),
+        )
+        return _opaque_capture(function, bindings, evidence), None
+    if any(not _is_tensor_input_tree(value) for value in (*args, *kwargs.values())):
+        source_span = SourceSpan.from_callable(function)
+        evidence = (
+            _Evidence(
+                FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+                "non-Tensor capture inputs require a typed scalar SSA descriptor",
                 source_span,
             ),
         )

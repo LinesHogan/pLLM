@@ -120,6 +120,28 @@ class Capability(StrEnum):
     REPLAY_SAFE = "replay_safe"
 
 
+class OperatorKind(StrEnum):
+    ATEN = "aten"
+    CUSTOM = "custom"
+
+
+class OperatorAttributeKind(StrEnum):
+    NONE = "none"
+    BOOL = "bool"
+    INT = "int"
+    FLOAT = "float"
+    STRING = "string"
+    TUPLE = "tuple"
+    LIST = "list"
+    MAPPING = "mapping"
+    SLICE = "slice"
+    ELLIPSIS = "ellipsis"
+    DTYPE = "dtype"
+    DEVICE = "device"
+    LAYOUT = "layout"
+    MEMORY_FORMAT = "memory_format"
+
+
 @dataclass(frozen=True, slots=True)
 class _BeforeNextUse:
     """Freshness singleton requiring completion before the next value use."""
@@ -135,6 +157,7 @@ class ArtifactKey:
     namespace: str
     name: str
     version: int = 1
+    digest: str = ""
 
     def __post_init__(self) -> None:
         namespace = _require_str(cast(object, self.namespace), "ArtifactKey.namespace", nonempty=True)
@@ -146,23 +169,36 @@ class ArtifactKey:
         version = _require_int(cast(object, self.version), "ArtifactKey.version")
         if version < 1:
             raise ValueError("ArtifactKey.version must be >= 1")
+        digest = _require_str(cast(object, self.digest), "ArtifactKey.digest")
+        if digest and (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("ArtifactKey.digest must be an empty string or lowercase SHA-256")
         object.__setattr__(self, "namespace", namespace)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "version", version)
+        object.__setattr__(self, "digest", digest)
 
     @classmethod
-    def from_callable(cls, function: Callable[..., object]) -> "ArtifactKey":
+    def from_callable(
+        cls,
+        function: Callable[..., object],
+        *,
+        digest: str = "",
+    ) -> "ArtifactKey":
         if not isinstance(function, FunctionType):
             raise TypeError("captured callable must be a Python function")
         namespace = function.__module__
         name = function.__qualname__
         if not name:
             raise TypeError("captured callable must have a stable qualified name")
-        return cls(namespace=namespace, name=name)
+        return cls(namespace=namespace, name=name, digest=digest)
 
     @property
     def value(self) -> str:
-        return f"{self.namespace}:{self.name}@{self.version}"
+        suffix = "" if not self.digest else f"#{self.digest}"
+        return f"{self.namespace}:{self.name}@{self.version}{suffix}"
 
     def __str__(self) -> str:
         return self.value
@@ -390,6 +426,25 @@ class CapturedValueDesc:
 
 
 @dataclass(frozen=True, slots=True)
+class OperatorAttributeDesc:
+    path: tuple[str, ...]
+    kind: OperatorAttributeKind
+    value: str
+
+    def __post_init__(self) -> None:
+        path = _require_tuple(cast(object, self.path), str, "OperatorAttributeDesc.path")
+        if not path or any(not segment for segment in path):
+            raise ValueError("OperatorAttributeDesc.path must contain non-empty segments")
+        kind = _require_instance(
+            cast(object, self.kind), OperatorAttributeKind, "OperatorAttributeDesc.kind"
+        )
+        value = _require_str(cast(object, self.value), "OperatorAttributeDesc.value")
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "value", value)
+
+
+@dataclass(frozen=True, slots=True)
 class LeafOperatorDesc:
     ordinal: int
     namespace: str
@@ -397,6 +452,11 @@ class LeafOperatorDesc:
     overload: str
     inputs: tuple[int, ...]
     outputs: tuple[str, ...]
+    module_path: tuple[str, ...] = ()
+    operator_kind: OperatorKind = OperatorKind.ATEN
+    effects: tuple[Effect, ...] = (Effect.PURE,)
+    capabilities: tuple[Capability, ...] = (Capability.CAPTURE_SAFE,)
+    attributes: tuple[OperatorAttributeDesc, ...] = ()
 
     def __post_init__(self) -> None:
         ordinal = _require_int(cast(object, self.ordinal), "LeafOperatorDesc.ordinal")
@@ -428,6 +488,34 @@ class LeafOperatorDesc:
             "outputs",
             _require_tuple(cast(object, self.outputs), str, "LeafOperatorDesc.outputs"),
         )
+        module_path = _require_tuple(
+            cast(object, self.module_path), str, "LeafOperatorDesc.module_path"
+        )
+        if any(not segment or "/" in segment or "\\" in segment for segment in module_path):
+            raise ValueError("LeafOperatorDesc.module_path must contain stable path segments")
+        operator_kind = _require_instance(
+            cast(object, self.operator_kind), OperatorKind, "LeafOperatorDesc.operator_kind"
+        )
+        effects = _require_tuple(cast(object, self.effects), Effect, "LeafOperatorDesc.effects")
+        capabilities = _require_tuple(
+            cast(object, self.capabilities), Capability, "LeafOperatorDesc.capabilities"
+        )
+        attributes = _require_tuple(
+            cast(object, self.attributes), OperatorAttributeDesc, "LeafOperatorDesc.attributes"
+        )
+        if not effects or not capabilities:
+            raise ValueError("LeafOperatorDesc requires typed effect and capability facts")
+        if operator_kind == OperatorKind.ATEN and self.namespace != "aten":
+            raise ValueError("ATen LeafOperatorDesc must use the 'aten' namespace")
+        if operator_kind == OperatorKind.CUSTOM and self.namespace == "aten":
+            raise ValueError("custom LeafOperatorDesc must not use the 'aten' namespace")
+        object.__setattr__(self, "module_path", module_path)
+        object.__setattr__(self, "operator_kind", operator_kind)
+        object.__setattr__(self, "effects", effects)
+        object.__setattr__(self, "capabilities", capabilities)
+        if len({attribute.path for attribute in attributes}) != len(attributes):
+            raise ValueError("LeafOperatorDesc attributes must use unique paths")
+        object.__setattr__(self, "attributes", attributes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +524,7 @@ class LeafArtifactDesc:
     operators: tuple[LeafOperatorDesc, ...]
     input_values: tuple[str, ...]
     output_values: tuple[str, ...]
+    terminal_ordinal: int = 0
 
     def __post_init__(self) -> None:
         artifact_key = _require_instance(
@@ -450,10 +539,16 @@ class LeafArtifactDesc:
         output_values = _require_tuple(
             cast(object, self.output_values), str, "LeafArtifactDesc.output_values"
         )
+        terminal_ordinal = _require_int(
+            cast(object, self.terminal_ordinal), "LeafArtifactDesc.terminal_ordinal"
+        )
+        if terminal_ordinal < 0:
+            raise ValueError("LeafArtifactDesc.terminal_ordinal must be non-negative")
         object.__setattr__(self, "artifact_key", artifact_key)
         object.__setattr__(self, "operators", operators)
         object.__setattr__(self, "input_values", input_values)
         object.__setattr__(self, "output_values", output_values)
+        object.__setattr__(self, "terminal_ordinal", terminal_ordinal)
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,8 +667,11 @@ class CapturedFlow:
         else:
             if node_kind != NodeKind.COMPUTE:
                 raise ValueError("successful capture must lower to a ComputeNode")
-            if graph_safety != GraphSafetyKind.CAPTURE_SAFE:
-                raise ValueError("successful capture must be capture-safe")
+            if graph_safety not in {
+                GraphSafetyKind.CAPTURE_SAFE,
+                GraphSafetyKind.REPLAY_STATEFUL,
+            }:
+                raise ValueError("successful capture must be capture-safe or replay-stateful")
             if leaf_artifact is None or not values:
                 raise ValueError("successful capture requires a complete typed leaf artifact")
             if diagnostics:
@@ -831,6 +929,9 @@ __all__ = [
     "FlowCaptureDiagnostic",
     "LeafArtifactDesc",
     "LeafOperatorDesc",
+    "OperatorKind",
+    "OperatorAttributeDesc",
+    "OperatorAttributeKind",
     "PortBindingDesc",
     "PortBindingDirection",
     "ShapeGuard",

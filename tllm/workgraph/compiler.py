@@ -10,6 +10,13 @@ from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.workgraph.anchors import shadow_backend_snapshot
 from tllm.workgraph.explain import explain_workgraph
+from tllm.workgraph.frontend import CapturedFlow
+from tllm.workgraph.hierarchy import (
+    CaptureAttachment,
+    CaptureHierarchy,
+    apply_attachment_live_ranges,
+    build_hierarchy,
+)
 from tllm.workgraph.ir import (
     BackendSnapshot,
     CompiledWorkGraph,
@@ -29,6 +36,7 @@ from tllm.workgraph.signature import structural_signature
 class Phase1aPlan:
     compiled: CompiledWorkGraph
     binding: RuntimePlanBinding
+    hierarchy: CaptureHierarchy | None = None
     legacy_boundaries: tuple[str, ...] = ()
     lowering_notes: tuple[str, ...] = ()
     diagnostics: tuple[WorkGraphDiagnostic, ...] = ()
@@ -78,13 +86,21 @@ class Phase1aPlan:
             }
             for diagnostic in self.diagnostics
         ]
+        result["capture_hierarchy"] = (
+            None if self.hierarchy is None else self.hierarchy.to_dict()
+        )
         return result
 
 
-def _current_signature(graph: object, data: object, binding: RuntimePlanBinding) -> str:
+def _current_signature(
+    graph: object,
+    data: object,
+    binding: RuntimePlanBinding,
+    hierarchy: CaptureHierarchy | None,
+) -> str:
     """Hash the IR plus the authoritative runtime-plan binding facts."""
 
-    return structural_signature((graph, data, binding))
+    return structural_signature((graph, data, binding, hierarchy))
 
 
 def compile_phase1a(
@@ -95,6 +111,8 @@ def compile_phase1a(
     backend: BackendSnapshot,
     previous: Phase1aPlan | None = None,
     strict_native: bool = False,
+    captures: tuple[CapturedFlow, ...] = (),
+    attachments: tuple[CaptureAttachment, ...] = (),
 ) -> Phase1aPlan:
     """Build a shadow IR and verify its binding to existing runtime plans."""
     if backend.graph_mode not in {"eager", "piecewise", "full"}:
@@ -109,6 +127,16 @@ def compile_phase1a(
         backend=backend,
         strict_native=strict_native,
     )
+    hierarchy: CaptureHierarchy | None = None
+    if captures or attachments:
+        hierarchy = build_hierarchy(
+            captures=captures,
+            attachments=attachments,
+            dispatch_plan=dispatch_plan,
+            execution_plan=execution_plan,
+            semantic=graph,
+        )
+        data = apply_attachment_live_ranges(data, hierarchy, execution_plan)
     expected_flows = tuple(target.flow_id for target in dispatch_plan.flow_targets())
     if binding.dispatch_flow_ids != expected_flows:
         raise WorkGraphError("WG200_DISPATCH_PARITY", "IR dispatch flow order differs from DispatchPlan")
@@ -157,7 +185,7 @@ def compile_phase1a(
     candidate = CompiledWorkGraph(
         semantic=graph,
         data_centric=data,
-        structural_signature=_current_signature(graph, data, binding),
+        structural_signature=_current_signature(graph, data, binding, hierarchy),
         diagnostics=tuple((*legacy, *notes)),
     )
     if backend.graph_mode in {"eager", "piecewise"}:
@@ -165,6 +193,8 @@ def compile_phase1a(
             from tllm import core as _core
 
             cast(Any, _core.validate_workgraph)(graph, data)
+            if hierarchy is not None:
+                cast(Any, _core.validate_capture_hierarchy)(hierarchy, graph)
         except (TypeError, ValueError) as exc:
             raise WorkGraphError(
                 "WG300_RUST_VALIDATION",
@@ -176,6 +206,7 @@ def compile_phase1a(
     return Phase1aPlan(
         compiled=compiled,
         binding=binding,
+        hierarchy=hierarchy,
         legacy_boundaries=legacy,
         lowering_notes=notes,
         diagnostics=diagnostics,

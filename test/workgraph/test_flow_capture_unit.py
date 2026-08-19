@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest import mock
 
 import torch
@@ -106,6 +108,59 @@ class WorkGraphFlowCaptureTest(unittest.TestCase):
         self.assertTrue(captured.leaf_artifact.operators)
         self.assertTrue(all(operator.namespace == "aten" for operator in captured.leaf_artifact.operators))
 
+    def test_rng_schema_tags_produce_typed_rng_and_replay_stateful_facts(self) -> None:
+        @flow
+        def sample(value: torch.Tensor) -> torch.Tensor:
+            return value + torch.rand_like(value)
+
+        captured = sample.capture(torch.ones(2))
+
+        self.assertEqual(captured.status, CaptureStatus.CAPTURED)
+        self.assertIn(Effect.RNG, captured.effects)
+        self.assertEqual(captured.graph_safety, GraphSafetyKind.REPLAY_STATEFUL)
+        rng_operators = [
+            operator for operator in captured.leaf_artifact.operators if Effect.RNG in operator.effects
+        ]
+        self.assertEqual(len(rng_operators), 1)
+
+    def test_scalar_runtime_input_fails_closed_instead_of_dropping_ssa(self) -> None:
+        @flow
+        def add_scalar(value: torch.Tensor, scalar: int) -> torch.Tensor:
+            return value + scalar
+
+        with mock.patch.object(torch.export, "export") as export:
+            captured = add_scalar.capture(torch.ones(2), 3)
+
+        export.assert_not_called()
+        _assert_opaque_barrier(self, captured, FlowCaptureCode.UNKNOWN_SIDE_EFFECT)
+
+    def test_scalar_runtime_output_fails_closed_instead_of_dropping_ssa(self) -> None:
+        @flow
+        def tensor_numel(value: torch.Tensor) -> int:
+            return value.numel()
+
+        captured = tensor_numel.capture(torch.ones(2))
+
+        _assert_opaque_barrier(self, captured, FlowCaptureCode.UNKNOWN_SIDE_EFFECT)
+        self.assertIsNone(captured.leaf_artifact)
+
+    def test_operator_constants_participate_in_artifact_identity(self) -> None:
+        def make_flow(offset: int):
+            @flow
+            def add_offset(value: torch.Tensor) -> torch.Tensor:
+                return value + offset
+
+            return add_offset
+
+        add_one = make_flow(1).capture(torch.ones(2))
+        add_two = make_flow(2).capture(torch.ones(2))
+
+        self.assertNotEqual(add_one.artifact_key, add_two.artifact_key)
+        self.assertNotEqual(
+            add_one.leaf_artifact.operators[0].attributes,
+            add_two.leaf_artifact.operators[0].attributes,
+        )
+
     def test_view_alias_and_leaf_aten_nodes_are_retained_without_runtime_objects(self) -> None:
         @flow
         def flatten(value: torch.Tensor) -> torch.Tensor:
@@ -187,6 +242,18 @@ class WorkGraphFlowCaptureTest(unittest.TestCase):
         export.assert_not_called()
         _assert_opaque_barrier(self, captured, FlowCaptureCode.HOST_IO)
 
+    def test_direct_torch_save_is_rejected_as_source_aware_host_io(self) -> None:
+        @flow
+        def save_tensor(value: torch.Tensor) -> torch.Tensor:
+            torch.save(value, "/tmp/workgraph-capture.pt")
+            return value
+
+        with mock.patch.object(torch.export, "export") as export:
+            captured = save_tensor.capture(torch.ones(1))
+
+        export.assert_not_called()
+        _assert_opaque_barrier(self, captured, FlowCaptureCode.HOST_IO)
+
     def test_unregistered_closure_state_is_a_typed_opaque_barrier(self) -> None:
         class MutableState:
             def __init__(self) -> None:
@@ -228,6 +295,31 @@ class WorkGraphFlowCaptureTest(unittest.TestCase):
             schema_mutation.capture(torch.ones(2)),
             FlowCaptureCode.UNSUPPORTED_MUTATION,
         )
+
+    def test_unregistered_non_aten_operator_is_an_opaque_barrier(self) -> None:
+        @flow
+        def add_one(value: torch.Tensor) -> torch.Tensor:
+            return value + 1
+
+        def custom_add(value: torch.Tensor, scalar: int) -> torch.Tensor:
+            return value + scalar
+
+        target = cast(Any, custom_add)
+        target.namespace = "unregistered"
+        target._schema = torch.ops.aten.add.Tensor._schema
+        graph = torch.fx.Graph()
+        input_node = graph.placeholder("value")
+        input_node.meta["val"] = torch.ones(2)
+        output_node = graph.call_function(custom_add, args=(input_node, 1))
+        output_node.meta["val"] = torch.ones(2)
+        graph.output(output_node)
+        exported = SimpleNamespace(graph=graph, range_constraints={})
+
+        with mock.patch.object(torch.export, "export", return_value=exported):
+            captured = add_one.capture(torch.ones(2))
+
+        _assert_opaque_barrier(self, captured, FlowCaptureCode.UNKNOWN_SIDE_EFFECT)
+        self.assertIsNone(captured.leaf_artifact)
 
     def test_capture_freshness_uses_the_typed_singleton(self) -> None:
         @flow(freshness=BeforeNextUse)

@@ -78,23 +78,98 @@ front end accepts bounded positional Tensor dimensions and rejects an
 unbounded dimension before export with `WG206_UNBOUNDED_DYNAMIC_SHAPE`.
 Unknown symbolic bounds returned by PyTorch are rejected in the same way.
 
+## Milestone 3: Hierarchy And Compatibility Lowering
+
+Captured flows now lower into a frozen `CaptureHierarchy` sidecar with
+`schema_version=2`. Each `@flow` specialization owns one root flow region,
+one or more task regions, and one exported or opaque leaf region. The existing
+`SemanticGraph` and `DataCentricIR` remain the version-1 compatibility
+projection used by `DispatchPlan` and `ExecutionPlan`; ATen operators are
+retained only in `LeafArtifactDesc` and never become schedule nodes.
+
+The accepted exported leaf is schema-validated ATen Tensor dataflow. Each
+`LeafOperatorDesc` retains its typed namespace/name/overload, SSA ordinals,
+stable module path, effect/capability facts, and typed operator constants and
+attributes (`OperatorAttributeDesc`) at deterministic paths. The successful
+`ArtifactKey` includes a lowercase SHA-256 structural digest over these
+operator facts, captured Tensor value/use-def/alias/effect facts, and shape
+guards; the digest is part of the artifact identity and structural signature.
+Opaque barriers use a digest of their typed barrier status, diagnostics, and
+effect facts instead of retaining a partial export.
+
+Initial task partitions are deterministic runs of operators with identical
+typed module path, operator kind, effect, and capability facts. A change in
+module path, effect, or capability records the corresponding typed
+`PartitionBoundary`. ATen schema tags marked `nondeterministic_seeded` infer
+`Effect.RNG` and `Capability.REPLAY_SAFE`; the containing flow is marked
+`REPLAY_STATEFUL`. Other accepted schema-validated ATen operators currently
+infer `PURE` and `CAPTURE_SAFE`.
+
+Module paths are retained only from stable export metadata. A Python module
+object or mutable module state captured through a function closure is an
+unregistered closure boundary and fails closed as an opaque capture; it is not
+silently converted into a schedulable module task. The custom-op boundary is
+represented in the schema, but the current capture path rejects every
+non-ATen operator. Typed `@extern` contracts are not yet consumed as
+`CUSTOM_OP` leaf records, so typed extern custom-op partitioning remains
+unsupported until a typed registry exists. A strict-export identity graph with
+no ATen calls still receives an empty exported leaf under one task region.
+
+Runtime scalar inputs and scalar outputs are also fail-closed: without a typed
+scalar SSA descriptor, capture rejects inputs before strict export and rejects
+non-Tensor output leaves during lowering rather than dropping their ordinals
+from the leaf dataflow.
+
+`CaptureAttachment` connects an artifact to one existing `NodeKey` with the
+exact `PortBindingDesc` records declared by its capture. A `PortId` must name a
+selected output in the authoritative `ExecutionPlan`; a `PortAddressDesc`
+must exactly equal a read or write address on the target consumer flow.
+Unknown ports, missing or duplicate bindings, unknown nodes, and mismatched
+anchors fail closed. No role, name, kind, or phase string is used to infer an
+attachment.
+
+The hierarchy and attachments participate in the structural signature, so a
+sidecar-only change advances the shadow epoch and conservatively rebuilds the
+owning compatibility projection. Explicit producer-port readers also produce
+metadata-only logical live ranges from the producer `NodeKey` to the last
+attached reader. These Phase 1 lease descriptors do not allocate physical
+buffers, retain runtime storage, or introduce transfer operations: all leases
+remain `materialized=False`, and both the compatibility and capture data views
+require `Move=()`.
+
+Python validates descriptor construction and plan bindings. Rust separately
+reads the frozen hierarchy through `#[pyo3(attribute)]`, checks region and
+artifact identity, task/leaf coverage and facts, attachment endpoints,
+logical leases, and the rule that leaf operators do not enter the semantic
+schedule. Neither validator receives Tensor, FakeTensor, FX nodes,
+`ExportedProgram`, runtime plans, callbacks, streams, events, or handles.
+
+`Phase1aPlan.explain()` now includes a JSON-safe `capture_hierarchy` section
+with source, artifact, partition, effect, capability, attachment, and logical
+lease facts. A plan without captured flows reports `capture_hierarchy: null`.
+
 ## Current Limits
 
-- No root/task/leaf hierarchical graph or `CaptureAttachment` exists yet.
-- The accepted success subset is pure ATen Tensor dataflow with static or
-  finitely bounded positional dynamic dimensions. Structured multi-result and
-  schema-less operators remain conservative barriers.
+- The accepted success subset is schema-validated ATen Tensor dataflow with static or
+  finitely bounded positional dynamic dimensions. Unregistered custom,
+  structured multi-result, and schema-less operators remain conservative
+  barriers.
 - Mutation is detected and retained as a typed write effect, but no mutation
   is yet proven equivalent and accepted as a captured compute leaf.
 - `@extern` contracts are typed but are not yet partitioned into an opaque leaf
   region inside a captured flow.
+- Hierarchy reconciliation currently rebuilds the flat owning projection; it
+  does not yet retain or rebuild individual `ArtifactKey` regions.
+- There is no read-only LSP adapter or event-by-event shadow/runtime trace
+  equivalence recorder yet.
 - No WorkGraph artifact affects runtime execution or the token hot path.
 - FULL graph mode remains typed unsupported in the Phase 1a compatibility
   compiler.
 
-The next accepted milestone is the root/task/leaf hierarchical graph plus
-explicit `CaptureAttachment` and typed port bindings into the existing
-compatibility lowering. The existing runtime plans remain authoritative.
+The next accepted milestone is the Phase 1 closeout: source/inference-rich
+explain output, a read-only LSP adapter, event-by-event shadow/runtime trace
+equivalence, MRv1/MRv2 eager/piecewise matrix coverage, and explicit FULL-mode
+unsupported coverage. The existing runtime plans remain authoritative.
 
 ## Verification
 

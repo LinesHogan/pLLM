@@ -415,8 +415,8 @@ def lower_plans(
         LeaseDesc(
             value=access.value,
             storage="backend_owned",
-            live_start=node.source,
-            live_end=node.source,
+            live_start=str(node.node_key),
+            live_end=str(node.node_key),
             stable_address=False,
             materialized=False,
         )
@@ -432,7 +432,9 @@ def lower_plans(
             executor=node.executor,
             accesses=tuple((*node.reads, *node.writes)),
             residence_keys=tuple(access.value.key for access in (*node.reads, *node.writes)),
-            lease_keys=tuple(lease.value.key for lease in leases if lease.live_start == node.source),
+            lease_keys=tuple(
+                lease.value.key for lease in leases if lease.live_start == str(node.node_key)
+            ),
             device=backend.device,
             rank=backend.rank,
             anchor=node.anchor,

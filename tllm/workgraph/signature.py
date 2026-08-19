@@ -42,6 +42,7 @@ from tllm.workgraph.frontend import (
     FlowCaptureDiagnostic,
     LeafArtifactDesc,
     LeafOperatorDesc,
+    OperatorAttributeDesc,
     PortBindingDesc,
     ShapeGuard,
     ShapeGuardExpr,
@@ -50,6 +51,16 @@ from tllm.workgraph.frontend import (
     TensorDeviceDesc,
     TypeDesc,
     UseDefDesc,
+)
+from tllm.workgraph.hierarchy import (
+    CaptureAttachment,
+    CaptureDataCentricIR,
+    CaptureHierarchy,
+    CaptureLeaseDesc,
+    LeafRegionDesc,
+    RegionKey,
+    RootFlowDesc,
+    TaskRegionDesc,
 )
 
 
@@ -104,6 +115,7 @@ def _canonical(value: Any) -> Any:
             "namespace": value.namespace,
             "name": value.name,
             "version": value.version,
+            "digest": value.digest,
         }
     if isinstance(value, SourceSpan):
         return {
@@ -161,6 +173,17 @@ def _canonical(value: Any) -> Any:
             "overload": value.overload,
             "inputs": _canonical(value.inputs),
             "outputs": _canonical(value.outputs),
+            "module_path": _canonical(value.module_path),
+            "operator_kind": _canonical(value.operator_kind),
+            "effects": _canonical(value.effects),
+            "capabilities": _canonical(value.capabilities),
+            "attributes": _canonical(value.attributes),
+        }
+    if isinstance(value, OperatorAttributeDesc):
+        return {
+            "path": _canonical(value.path),
+            "kind": _canonical(value.kind),
+            "value": value.value,
         }
     if isinstance(value, LeafArtifactDesc):
         return {
@@ -168,6 +191,7 @@ def _canonical(value: Any) -> Any:
             "operators": _canonical(value.operators),
             "input_values": _canonical(value.input_values),
             "output_values": _canonical(value.output_values),
+            "terminal_ordinal": value.terminal_ordinal,
         }
     if isinstance(value, PortBindingDesc):
         return {
@@ -215,6 +239,78 @@ def _canonical(value: Any) -> Any:
             "node_kind": _canonical(value.node_kind),
             "mobility": _canonical(value.mobility),
             "graph_safety": _canonical(value.graph_safety),
+        }
+    if isinstance(value, RegionKey):
+        return {
+            "artifact_key": _canonical(value.artifact_key),
+            "kind": _canonical(value.kind),
+            "ordinal": value.ordinal,
+        }
+    if isinstance(value, LeafRegionDesc):
+        return {
+            "key": _canonical(value.key),
+            "artifact_key": _canonical(value.artifact_key),
+            "kind": _canonical(value.kind),
+            "operator_ordinals": _canonical(value.operator_ordinals),
+            "leaf_artifact": _canonical(value.leaf_artifact),
+        }
+    if isinstance(value, TaskRegionDesc):
+        return {
+            "key": _canonical(value.key),
+            "node_key": _canonical(value.node_key),
+            "executor": _canonical(value.executor),
+            "boundary": _canonical(value.boundary),
+            "module_path": _canonical(value.module_path),
+            "operator_ordinals": _canonical(value.operator_ordinals),
+            "input_values": _canonical(value.input_values),
+            "output_values": _canonical(value.output_values),
+            "effects": _canonical(value.effects),
+            "capabilities": _canonical(value.capabilities),
+            "dependencies": _canonical(value.dependencies),
+            "children": _canonical(value.children),
+            "kind": _canonical(value.kind),
+        }
+    if isinstance(value, RootFlowDesc):
+        return {
+            "key": _canonical(value.key),
+            "artifact_key": _canonical(value.artifact_key),
+            "source_span": _canonical(value.source_span),
+            "status": _canonical(value.status),
+            "shape_guard": _canonical(value.shape_guard),
+            "inputs": _canonical(value.inputs),
+            "outputs": _canonical(value.outputs),
+            "values": _canonical(value.values),
+            "effects": _canonical(value.effects),
+            "diagnostics": _canonical(value.diagnostics),
+            "children": _canonical(value.children),
+            "kind": _canonical(value.kind),
+        }
+    if isinstance(value, CaptureAttachment):
+        return {
+            "node_key": _canonical(value.node_key),
+            "artifact_key": _canonical(value.artifact_key),
+            "bindings": _canonical(value.bindings),
+            "anchor_node_key": _canonical(value.anchor_node_key),
+        }
+    if isinstance(value, CaptureLeaseDesc):
+        return {
+            "value_id": value.value_id,
+            "live_start": _canonical(value.live_start),
+            "live_end": _canonical(value.live_end),
+            "reader_count": value.reader_count,
+            "materialized": value.materialized,
+        }
+    if isinstance(value, CaptureDataCentricIR):
+        return {
+            "leases": _canonical(value.leases),
+            "moves": _canonical(value.moves),
+        }
+    if isinstance(value, CaptureHierarchy):
+        return {
+            "schema_version": value.schema_version,
+            "roots": _canonical(value.roots),
+            "attachments": _canonical(value.attachments),
+            "data_centric": _canonical(value.data_centric),
         }
     if isinstance(value, BackendSnapshot):
         return {
