@@ -65,6 +65,12 @@ reorder, or execute them. Its explicit anchor edge represents one fixed
 `AnchorNode -> WorkNode` attachment. It does not yet encode the future
 "between two vLLM lifecycle points" interval constraint.
 
+The Phase 1 typed front end adds transparent `@flow` and `@extern` control
+plane declarations. Normal calls still execute their original Python
+functions. Until strict export and effect analysis prove a complete leaf
+artifact, `.capture(...)` records one source-aware opaque barrier and cannot
+affect runtime execution.
+
 Producer objects are declarations, not miniature executors. They describe
 outputs, requirements, hooks, and graph safety. Backend drivers remain
 responsible for materializing those declarations from vLLM tensors.
@@ -208,6 +214,7 @@ If you need step-end work, implement `on_step_end(ctx)` as an optional compatibi
 ## Related Docs
 
 - [WorkGraph Phase 1a](workgraph-phase1a.md)
+- [WorkGraph Phase 1](workgraph-phase1.md)
 - [Glossary](../reference/glossary.md)
 - [Project Structure](../reference/project-structure.md)
 - [Write Your First Consumer](../getting-started/write-your-first-consumer.md)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from tllm.consumers.base import BaseConsumer
 from tllm.runtime.runtime import TllmRuntime, default_runtime
+from tllm.workgraph.frontend import BeforeNextUse, extern, flow
 
 
 def make_llm(*args: object, **kwargs: object) -> object:
@@ -26,4 +27,13 @@ def clear_consumers() -> None:
     default_runtime().clear_consumers()
 
 
-__all__ = ["TllmRuntime", "clear_consumers", "default_runtime", "make_llm", "register_consumer"]
+__all__ = [
+    "BeforeNextUse",
+    "TllmRuntime",
+    "clear_consumers",
+    "default_runtime",
+    "extern",
+    "flow",
+    "make_llm",
+    "register_consumer",
+]

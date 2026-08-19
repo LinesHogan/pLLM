@@ -32,6 +32,18 @@ from tllm.workgraph.ir import (
     TimingDesc,
     ValueDesc,
 )
+from tllm.workgraph.frontend import (
+    ArtifactKey,
+    CapturedFlow,
+    ExternContract,
+    ExternInputDesc,
+    FlowCaptureDiagnostic,
+    PortBindingDesc,
+    ShapeGuard,
+    ShapeGuardExpr,
+    SourceSpan,
+    TypeDesc,
+)
 
 
 def _unsupported(value: Any) -> TypeError:
@@ -79,6 +91,76 @@ def _canonical(value: Any) -> Any:
             "namespace": value.namespace,
             "name": value.name,
             "version": value.version,
+        }
+    if isinstance(value, ArtifactKey):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "version": value.version,
+        }
+    if isinstance(value, SourceSpan):
+        return {
+            "file": value.file,
+            "start_line": value.start_line,
+            "start_column": value.start_column,
+            "end_line": value.end_line,
+            "end_column": value.end_column,
+        }
+    if isinstance(value, ShapeGuardExpr):
+        return {
+            "value_path": _canonical(value.value_path),
+            "dimension": value.dimension,
+            "kind": _canonical(value.kind),
+            "lower_bound": value.lower_bound,
+            "upper_bound": value.upper_bound,
+        }
+    if isinstance(value, ShapeGuard):
+        return {"expressions": _canonical(value.expressions)}
+    if isinstance(value, PortBindingDesc):
+        return {
+            "port": _canonical(value.port),
+            "direction": _canonical(value.direction),
+            "value_path": _canonical(value.value_path),
+        }
+    if isinstance(value, FlowCaptureDiagnostic):
+        return {
+            "code": _canonical(value.code),
+            "message": value.message,
+            "source_span": _canonical(value.source_span),
+            "detail": value.detail,
+        }
+    if isinstance(value, TypeDesc):
+        return {"module": value.module, "qualname": value.qualname}
+    if isinstance(value, ExternInputDesc):
+        return {
+            "position": value.position,
+            "name": value.name,
+            "value_type": _canonical(value.value_type),
+        }
+    if isinstance(value, ExternContract):
+        return {
+            "inputs": _canonical(value.inputs),
+            "output": _canonical(value.output),
+            "effect": _canonical(value.effect),
+            "state": _canonical(value.state),
+            "device": _canonical(value.device),
+            "capability": _canonical(value.capability),
+            "bindings": _canonical(value.bindings),
+        }
+    if isinstance(value, CapturedFlow):
+        return {
+            "artifact_key": _canonical(value.artifact_key),
+            "source_span": _canonical(value.source_span),
+            "shape_guard": _canonical(value.shape_guard),
+            "inputs": _canonical(value.inputs),
+            "outputs": _canonical(value.outputs),
+            "values": _canonical(value.values),
+            "effects": _canonical(value.effects),
+            "diagnostics": _canonical(value.diagnostics),
+            "status": _canonical(value.status),
+            "node_kind": _canonical(value.node_kind),
+            "mobility": _canonical(value.mobility),
+            "graph_safety": _canonical(value.graph_safety),
         }
     if isinstance(value, BackendSnapshot):
         return {
