@@ -451,6 +451,14 @@ class CaptureHierarchy:
         def region_key(key: RegionKey) -> str:
             return key.value
 
+        def artifact_key(key: ArtifactKey) -> dict[str, object]:
+            return {
+                "namespace": key.namespace,
+                "name": key.name,
+                "version": key.version,
+                "digest": key.digest,
+            }
+
         def port_ref(port: PortId | PortAddressDesc) -> dict[str, object]:
             if isinstance(port, PortId):
                 return {
@@ -473,17 +481,72 @@ class CaptureHierarchy:
                 ],
             }
 
+        def binding_desc(binding: PortBindingDesc) -> dict[str, object]:
+            return {
+                "port": port_ref(binding.port),
+                "direction": binding.direction.value,
+                "value_path": list(binding.value_path),
+            }
+
+        def operator_desc(operator: LeafOperatorDesc) -> dict[str, object]:
+            return {
+                "ordinal": operator.ordinal,
+                "namespace": operator.namespace,
+                "name": operator.name,
+                "overload": operator.overload,
+                "inputs": list(operator.inputs),
+                "outputs": list(operator.outputs),
+                "module_path": list(operator.module_path),
+                "operator_kind": operator.operator_kind.value,
+                "effects": [effect.value for effect in operator.effects],
+                "capabilities": [item.value for item in operator.capabilities],
+                "attributes": [
+                    {
+                        "path": list(attribute.path),
+                        "kind": attribute.kind.value,
+                        "value": attribute.value,
+                    }
+                    for attribute in operator.attributes
+                ],
+            }
+
+        def leaf_desc(task: TaskRegionDesc) -> dict[str, object]:
+            leaf = task.children[0]
+            artifact = leaf.leaf_artifact
+            return {
+                "kind": leaf.kind.value,
+                "artifact": leaf.artifact_key.value,
+                "artifact_key": artifact_key(leaf.artifact_key),
+                "terminal_ordinal": None if artifact is None else artifact.terminal_ordinal,
+                "operators": (
+                    []
+                    if artifact is None
+                    else [
+                        operator_desc(operator)
+                        for operator in artifact.operators
+                        if operator.ordinal in task.operator_ordinals
+                    ]
+                ),
+            }
+
         return {
             "schema_version": self.schema_version,
             "roots": [
                 {
                     "key": region_key(root.key),
                     "artifact": root.artifact_key.value,
+                    "artifact_key": artifact_key(root.artifact_key),
                     "status": root.status.value,
                     "source": {
                         "file": root.source_span.file,
                         "line": root.source_span.start_line,
+                        "start_line": root.source_span.start_line,
+                        "start_column": root.source_span.start_column,
+                        "end_line": root.source_span.end_line,
+                        "end_column": root.source_span.end_column,
                     },
+                    "inputs": [binding_desc(binding) for binding in root.inputs],
+                    "outputs": [binding_desc(binding) for binding in root.outputs],
                     "shape_guard": [
                         {
                             "value_path": list(expression.value_path),
@@ -538,10 +601,7 @@ class CaptureHierarchy:
                             "effects": [effect.value for effect in task.effects],
                             "capabilities": [item.value for item in task.capabilities],
                             "dependencies": [region_key(item) for item in task.dependencies],
-                            "leaf": {
-                                "kind": task.children[0].kind.value,
-                                "artifact": task.children[0].artifact_key.value,
-                            },
+                            "leaf": leaf_desc(task),
                         }
                         for task in root.children
                     ],
@@ -551,20 +611,14 @@ class CaptureHierarchy:
             "attachments": [
                 {
                     "artifact": attachment.artifact_key.value,
+                    "artifact_key": artifact_key(attachment.artifact_key),
                     "node_key": str(attachment.node_key),
                     "anchor_node_key": (
                         None
                         if attachment.anchor_node_key is None
                         else str(attachment.anchor_node_key)
                     ),
-                    "bindings": [
-                        {
-                            "port": port_ref(binding.port),
-                            "direction": binding.direction.value,
-                            "value_path": list(binding.value_path),
-                        }
-                        for binding in attachment.bindings
-                    ],
+                    "bindings": [binding_desc(binding) for binding in attachment.bindings],
                 }
                 for attachment in self.attachments
             ],
@@ -799,6 +853,17 @@ def _opaque_root(capture: CapturedFlow) -> RootFlowDesc:
     )
 
 
+def build_capture_root(capture: CapturedFlow) -> RootFlowDesc:
+    """Build one pure root/task/leaf view without attaching runtime plans."""
+
+    if not isinstance(cast(object, capture), CapturedFlow):
+        raise TypeError("build_capture_root.capture must be CapturedFlow")
+    _validate_capture_ssa(capture)
+    if capture.status == CaptureStatus.CAPTURED:
+        return _successful_root(capture)
+    return _opaque_root(capture)
+
+
 def _capture_leases(
     captures: tuple[CapturedFlow, ...],
     roots: tuple[RootFlowDesc, ...],
@@ -917,8 +982,6 @@ def build_hierarchy(
     )
     if len({capture.artifact_key for capture in typed_captures}) != len(typed_captures):
         raise ValueError("build_hierarchy captures contain duplicate artifacts")
-    for capture in typed_captures:
-        _validate_capture_ssa(capture)
     _validate_attachments(
         typed_captures,
         typed_attachments,
@@ -926,12 +989,7 @@ def build_hierarchy(
         execution_plan,
         semantic,
     )
-    roots = tuple(
-        _successful_root(capture)
-        if capture.status == CaptureStatus.CAPTURED
-        else _opaque_root(capture)
-        for capture in typed_captures
-    )
+    roots = tuple(build_capture_root(capture) for capture in typed_captures)
     return CaptureHierarchy(
         roots=roots,
         attachments=typed_attachments,
@@ -1004,5 +1062,6 @@ __all__ = [
     "RootFlowDesc",
     "TaskRegionDesc",
     "apply_attachment_live_ranges",
+    "build_capture_root",
     "build_hierarchy",
 ]

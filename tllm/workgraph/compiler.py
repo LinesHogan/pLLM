@@ -30,6 +30,12 @@ from tllm.workgraph.lowering import (
 )
 from tllm.workgraph.reconcile import PlanDiff, reconcile
 from tllm.workgraph.signature import structural_signature
+from tllm.workgraph.trace import (
+    TraceComparison,
+    compare_event_traces,
+    legacy_event_trace,
+    shadow_event_trace,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +43,7 @@ class Phase1aPlan:
     compiled: CompiledWorkGraph
     binding: RuntimePlanBinding
     hierarchy: CaptureHierarchy | None = None
+    trace: TraceComparison | None = None
     legacy_boundaries: tuple[str, ...] = ()
     lowering_notes: tuple[str, ...] = ()
     diagnostics: tuple[WorkGraphDiagnostic, ...] = ()
@@ -89,6 +96,7 @@ class Phase1aPlan:
         result["capture_hierarchy"] = (
             None if self.hierarchy is None else self.hierarchy.to_dict()
         )
+        result["event_trace"] = None if self.trace is None else self.trace.to_dict()
         return result
 
 
@@ -168,6 +176,12 @@ def compile_phase1a(
             "WG207_CAPTURE_RESIDENT_PARITY",
             "IR capture-resident producer ids differ from ExecutionPlan",
         )
+    trace = compare_event_traces(
+        legacy_event_trace(dispatch_plan, execution_plan),
+        shadow_event_trace(binding),
+    )
+    if not trace.equivalent:
+        raise WorkGraphError("WG208_TRACE_PARITY", trace.mismatches[0].message)
     if data.moves:
         raise WorkGraphError("WG202_UNEXPECTED_MOVE", "Phase 1a Data-Centric IR must not contain Move")
 
@@ -207,6 +221,7 @@ def compile_phase1a(
         compiled=compiled,
         binding=binding,
         hierarchy=hierarchy,
+        trace=trace,
         legacy_boundaries=legacy,
         lowering_notes=notes,
         diagnostics=diagnostics,

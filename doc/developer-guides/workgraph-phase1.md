@@ -148,6 +148,43 @@ schedule. Neither validator receives Tensor, FakeTensor, FX nodes,
 with source, artifact, partition, effect, capability, attachment, and logical
 lease facts. A plan without captured flows reports `capture_hierarchy: null`.
 
+## Milestone 4: Phase 1 Closeout
+
+The compatibility compiler now derives two frozen event traces on the cold
+path. The legacy trace comes directly from the authoritative `DispatchPlan`
+and `ExecutionPlan`; the shadow trace comes from `RuntimePlanBinding`. Their
+ordered events cover producer hooks, consumer-flow hooks, fusion membership,
+port-source bindings, and capture-resident producers. Compilation rejects an
+ordinal mismatch with `WG208_TRACE_PARITY`. The equivalent traces and any
+typed mismatch records are available in `Phase1aPlan.explain()` as
+`event_trace`; no trace observer is installed in the token hot path.
+
+Hierarchy explain output retains the existing display identities and adds
+structured `ArtifactKey`, full source span, typed input/output port bindings,
+shape/value/use-def facts, task boundaries, and the operator schema facts and
+constants covered by each leaf. The existing reconciliation report continues
+to state explicit Keep/Rebuild regions and reasons.
+
+`build_lsp_snapshot()` is a read-only control-plane adapter over a frozen
+`CapturedFlow` or `Phase1aPlan`. It produces frozen diagnostics, Tensor hover
+facts, guards, and root/task/leaf region descriptors, with a JSON-safe outer
+view for an editor client. Standalone captures use the same partition builder
+as `CaptureHierarchy`, including RNG/effect boundaries. The adapter has no
+command, code-action, capture, compile, execution, or runtime-recompile API and
+does not retain Tensor, FX, export, callback, stream, event, or runtime-plan
+objects.
+
+The support matrix is covered for MRv1 and MRv2 in both eager and piecewise
+graph modes with a real captured hierarchy and attachment. All four cases
+remain shadow-only and leave the runtime plans unchanged. FULL mode for either
+runner family remains the typed `WG120_UNSUPPORTED_GRAPH_MODE` legacy-only
+case; it is not reported as eager or piecewise.
+
+The Rust hierarchy validator and a closed-world Python differential oracle
+agree on valid topology and systematic corruptions of schema, region and
+artifact identity, operator/value facts, coverage, attachment binding,
+logical lease, Move, and schedule-node constraints.
+
 ## Current Limits
 
 - The accepted success subset is schema-validated ATen Tensor dataflow with static or
@@ -160,16 +197,14 @@ lease facts. A plan without captured flows reports `capture_hierarchy: null`.
   region inside a captured flow.
 - Hierarchy reconciliation currently rebuilds the flat owning projection; it
   does not yet retain or rebuild individual `ArtifactKey` regions.
-- There is no read-only LSP adapter or event-by-event shadow/runtime trace
-  equivalence recorder yet.
 - No WorkGraph artifact affects runtime execution or the token hot path.
 - FULL graph mode remains typed unsupported in the Phase 1a compatibility
   compiler.
 
-The next accepted milestone is the Phase 1 closeout: source/inference-rich
-explain output, a read-only LSP adapter, event-by-event shadow/runtime trace
-equivalence, MRv1/MRv2 eager/piecewise matrix coverage, and explicit FULL-mode
-unsupported coverage. The existing runtime plans remain authoritative.
+Phase 1 is complete at the control-plane boundary. Before Phase 2 enables
+physical execution, the known ESamp initialization-memory regression must be
+closed or converted into an explicit support boundary. The existing runtime
+plans remain authoritative until then.
 
 ## Verification
 

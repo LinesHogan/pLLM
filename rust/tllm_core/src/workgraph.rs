@@ -2078,17 +2078,20 @@ fn validate_capture_root_v2(root: &RootFlowV2Desc) -> Result<Vec<String>, String
                 .iter()
                 .map(|operator| operator.ordinal)
                 .collect();
-            let expected_effects: HashSet<String> = if leaf_artifact.operators.is_empty() {
-                HashSet::from(["pure".to_string()])
+            let expected_effects: Vec<String> = if leaf_artifact.operators.is_empty() {
+                vec!["pure".to_string()]
             } else {
-                leaf_artifact
-                    .operators
-                    .iter()
-                    .flat_map(|operator| operator.effects.iter().cloned())
-                    .collect()
+                let mut effects = Vec::new();
+                for operator in &leaf_artifact.operators {
+                    for effect in &operator.effects {
+                        if !effects.contains(effect) {
+                            effects.push(effect.clone());
+                        }
+                    }
+                }
+                effects
             };
-            let root_effects: HashSet<String> = root.effects.iter().cloned().collect();
-            if root_effects.len() != root.effects.len() || root_effects != expected_effects {
+            if root.effects != expected_effects {
                 return Err("capture root effects differ from its leaf operators".to_string());
             }
             if !leaf_artifact

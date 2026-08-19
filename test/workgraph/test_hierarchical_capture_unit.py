@@ -525,7 +525,32 @@ class WorkGraphHierarchicalCaptureTest(unittest.TestCase):
         self.assertEqual(producer_lease.live_start, str(NodeKey.producer("hidden-producer")))
         self.assertEqual(producer_lease.live_end, str(NodeKey.consumer_flow("consumer", 0)))
         self.assertFalse(producer_lease.materialized)
-        self.assertIn("capture_hierarchy", plan.explain())
+        explain = plan.explain()
+        hierarchy_report = explain["capture_hierarchy"]
+        root_report = hierarchy_report["roots"][0]
+        self.assertEqual(root_report["artifact_key"]["digest"], captured.artifact_key.digest)
+        self.assertEqual(root_report["source"]["start_line"], captured.source_span.start_line)
+        self.assertEqual(root_report["source"]["end_line"], captured.source_span.end_line)
+        self.assertEqual(root_report["inputs"][0]["port"]["type"], "port_id")
+        operator_report = root_report["tasks"][0]["leaf"]["operators"][0]
+        operator = captured.leaf_artifact.operators[0]
+        self.assertEqual(operator_report["namespace"], operator.namespace)
+        self.assertEqual(operator_report["effects"], [effect.value for effect in operator.effects])
+        self.assertEqual(
+            operator_report["attributes"],
+            [
+                {
+                    "path": list(attribute.path),
+                    "kind": attribute.kind.value,
+                    "value": attribute.value,
+                }
+                for attribute in operator.attributes
+            ],
+        )
+        self.assertEqual(
+            explain["reconciliation"]["rebuild_regions"][0]["reason"],
+            "initial_plan",
+        )
 
     def test_hierarchy_changes_participate_in_signature_and_epoch(self) -> None:
         dispatch, execution, port = _plans()
