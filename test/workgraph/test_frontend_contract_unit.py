@@ -64,10 +64,10 @@ class WorkGraphFrontendContractTest(unittest.TestCase):
         self.assertTrue(
             all(isinstance(diagnostic, FlowCaptureDiagnostic) for diagnostic in captured.diagnostics)
         )
-        self.assertEqual(captured.node_kind.value, "barrier")
+        self.assertEqual(captured.node_kind.value, "compute")
         self.assertEqual(captured.mobility.value, "pinned")
-        self.assertEqual(captured.graph_safety.value, "eager_only")
-        self.assertIn(Effect.OPAQUE, captured.effects)
+        self.assertEqual(captured.graph_safety.value, "capture_safe")
+        self.assertEqual(captured.effects, (Effect.PURE,))
         self.assertNotIn("0x", str(captured.artifact_key))
 
     def test_public_frontend_descriptors_are_frozen_and_enum_contracts_are_typed(self) -> None:

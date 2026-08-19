@@ -35,14 +35,21 @@ from tllm.workgraph.ir import (
 from tllm.workgraph.frontend import (
     ArtifactKey,
     CapturedFlow,
+    CapturedValueDesc,
+    DynamicDim,
     ExternContract,
     ExternInputDesc,
     FlowCaptureDiagnostic,
+    LeafArtifactDesc,
+    LeafOperatorDesc,
     PortBindingDesc,
     ShapeGuard,
     ShapeGuardExpr,
     SourceSpan,
+    TensorDTypeDesc,
+    TensorDeviceDesc,
     TypeDesc,
+    UseDefDesc,
 )
 
 
@@ -116,6 +123,52 @@ def _canonical(value: Any) -> Any:
         }
     if isinstance(value, ShapeGuard):
         return {"expressions": _canonical(value.expressions)}
+    if isinstance(value, DynamicDim):
+        return {
+            "value_path": _canonical(value.value_path),
+            "dimension": value.dimension,
+            "lower_bound": value.lower_bound,
+            "upper_bound": value.upper_bound,
+        }
+    if isinstance(value, TensorDeviceDesc):
+        return {"kind": _canonical(value.kind), "index": value.index}
+    if isinstance(value, TensorDTypeDesc):
+        return {"namespace": value.namespace, "name": value.name}
+    if isinstance(value, UseDefDesc):
+        return {
+            "producer": value.producer,
+            "inputs": _canonical(value.inputs),
+            "users": _canonical(value.users),
+        }
+    if isinstance(value, CapturedValueDesc):
+        return {
+            "value_id": value.value_id,
+            "version": value.version,
+            "shape": _canonical(value.shape),
+            "dtype": _canonical(value.dtype),
+            "device": _canonical(value.device),
+            "layout": _canonical(value.layout),
+            "stride": _canonical(value.stride),
+            "use_def": _canonical(value.use_def),
+            "alias_set": value.alias_set,
+            "effect": _canonical(value.effect),
+        }
+    if isinstance(value, LeafOperatorDesc):
+        return {
+            "ordinal": value.ordinal,
+            "namespace": value.namespace,
+            "name": value.name,
+            "overload": value.overload,
+            "inputs": _canonical(value.inputs),
+            "outputs": _canonical(value.outputs),
+        }
+    if isinstance(value, LeafArtifactDesc):
+        return {
+            "artifact_key": _canonical(value.artifact_key),
+            "operators": _canonical(value.operators),
+            "input_values": _canonical(value.input_values),
+            "output_values": _canonical(value.output_values),
+        }
     if isinstance(value, PortBindingDesc):
         return {
             "port": _canonical(value.port),
@@ -155,6 +208,7 @@ def _canonical(value: Any) -> Any:
             "inputs": _canonical(value.inputs),
             "outputs": _canonical(value.outputs),
             "values": _canonical(value.values),
+            "leaf_artifact": _canonical(value.leaf_artifact),
             "effects": _canonical(value.effects),
             "diagnostics": _canonical(value.diagnostics),
             "status": _canonical(value.status),

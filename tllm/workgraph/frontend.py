@@ -16,7 +16,6 @@ from tllm.workgraph.ir import (
     NodeKind,
     PortRef,
     TimingMobilityKind,
-    ValueDesc,
 )
 
 
@@ -81,6 +80,16 @@ class PortBindingDirection(StrEnum):
 class ShapeGuardKind(StrEnum):
     STATIC = "static"
     RANGE = "range"
+
+
+class TensorLayout(StrEnum):
+    STRIDED = "strided"
+    SPARSE_COO = "sparse_coo"
+    SPARSE_CSR = "sparse_csr"
+    SPARSE_CSC = "sparse_csc"
+    SPARSE_BSR = "sparse_bsr"
+    SPARSE_BSC = "sparse_bsc"
+    MKLDNN = "mkldnn"
 
 
 class Effect(StrEnum):
@@ -244,6 +253,210 @@ class ShapeGuard:
 
 
 @dataclass(frozen=True, slots=True)
+class DynamicDim:
+    """One typed, positional input dimension admitted by strict export."""
+
+    value_path: tuple[int, ...]
+    dimension: int
+    lower_bound: int = 1
+    upper_bound: int | None = None
+
+    def __post_init__(self) -> None:
+        value_path = _require_tuple(cast(object, self.value_path), int, "DynamicDim.value_path")
+        if len(value_path) != 1 or isinstance(value_path[0], bool) or value_path[0] < 0:
+            raise ValueError("DynamicDim currently requires one positional input index")
+        dimension = _require_int(cast(object, self.dimension), "DynamicDim.dimension")
+        lower_bound = _require_int(cast(object, self.lower_bound), "DynamicDim.lower_bound")
+        upper_value = cast(object, self.upper_bound)
+        upper_bound: int | None
+        if upper_value is None:
+            upper_bound = None
+        else:
+            upper_bound = _require_int(upper_value, "DynamicDim.upper_bound")
+        if dimension < 0 or lower_bound < 0:
+            raise ValueError("DynamicDim dimension and lower bound must be non-negative")
+        if upper_bound is not None and upper_bound < lower_bound:
+            raise ValueError("DynamicDim upper bound must be >= lower bound")
+        object.__setattr__(self, "value_path", value_path)
+        object.__setattr__(self, "dimension", dimension)
+        object.__setattr__(self, "lower_bound", lower_bound)
+        object.__setattr__(self, "upper_bound", upper_bound)
+
+
+@dataclass(frozen=True, slots=True)
+class TensorDeviceDesc:
+    kind: Device
+    index: int | None = None
+
+    def __post_init__(self) -> None:
+        kind = _require_instance(cast(object, self.kind), Device, "TensorDeviceDesc.kind")
+        index_value = cast(object, self.index)
+        index: int | None
+        if index_value is None:
+            index = None
+        else:
+            index = _require_int(index_value, "TensorDeviceDesc.index")
+            if index < 0:
+                raise ValueError("TensorDeviceDesc.index must be non-negative")
+        if kind == Device.CPU and index is not None:
+            raise ValueError("CPU TensorDeviceDesc cannot declare a device index")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "index", index)
+
+
+@dataclass(frozen=True, slots=True)
+class TensorDTypeDesc:
+    namespace: str
+    name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "namespace",
+            _require_str(cast(object, self.namespace), "TensorDTypeDesc.namespace", nonempty=True),
+        )
+        object.__setattr__(
+            self,
+            "name",
+            _require_str(cast(object, self.name), "TensorDTypeDesc.name", nonempty=True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UseDefDesc:
+    producer: int
+    inputs: tuple[int, ...]
+    users: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        producer = _require_int(cast(object, self.producer), "UseDefDesc.producer")
+        inputs = _require_tuple(cast(object, self.inputs), int, "UseDefDesc.inputs")
+        users = _require_tuple(cast(object, self.users), int, "UseDefDesc.users")
+        if producer < 0 or any(value < 0 for value in (*inputs, *users)):
+            raise ValueError("UseDefDesc ordinals must be non-negative")
+        object.__setattr__(self, "producer", producer)
+        object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "users", users)
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedValueDesc:
+    value_id: str
+    version: int
+    shape: tuple[str, ...]
+    dtype: TensorDTypeDesc
+    device: TensorDeviceDesc
+    layout: TensorLayout
+    stride: tuple[str, ...]
+    use_def: UseDefDesc
+    alias_set: str
+    effect: Effect
+
+    def __post_init__(self) -> None:
+        value_id = _require_str(
+            cast(object, self.value_id), "CapturedValueDesc.value_id", nonempty=True
+        )
+        version = _require_int(cast(object, self.version), "CapturedValueDesc.version")
+        shape = _require_tuple(cast(object, self.shape), str, "CapturedValueDesc.shape")
+        dtype = _require_instance(
+            cast(object, self.dtype), TensorDTypeDesc, "CapturedValueDesc.dtype"
+        )
+        device = _require_instance(
+            cast(object, self.device), TensorDeviceDesc, "CapturedValueDesc.device"
+        )
+        layout = _require_instance(
+            cast(object, self.layout), TensorLayout, "CapturedValueDesc.layout"
+        )
+        stride = _require_tuple(cast(object, self.stride), str, "CapturedValueDesc.stride")
+        use_def = _require_instance(
+            cast(object, self.use_def), UseDefDesc, "CapturedValueDesc.use_def"
+        )
+        alias_set = _require_str(
+            cast(object, self.alias_set), "CapturedValueDesc.alias_set", nonempty=True
+        )
+        effect = _require_instance(cast(object, self.effect), Effect, "CapturedValueDesc.effect")
+        if version < 1 or not shape or not stride:
+            raise ValueError("CapturedValueDesc requires version, shape, and stride facts")
+        object.__setattr__(self, "value_id", value_id)
+        object.__setattr__(self, "version", version)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "layout", layout)
+        object.__setattr__(self, "stride", stride)
+        object.__setattr__(self, "use_def", use_def)
+        object.__setattr__(self, "alias_set", alias_set)
+        object.__setattr__(self, "effect", effect)
+
+
+@dataclass(frozen=True, slots=True)
+class LeafOperatorDesc:
+    ordinal: int
+    namespace: str
+    name: str
+    overload: str
+    inputs: tuple[int, ...]
+    outputs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        ordinal = _require_int(cast(object, self.ordinal), "LeafOperatorDesc.ordinal")
+        if ordinal < 0:
+            raise ValueError("LeafOperatorDesc.ordinal must be non-negative")
+        object.__setattr__(self, "ordinal", ordinal)
+        object.__setattr__(
+            self,
+            "namespace",
+            _require_str(cast(object, self.namespace), "LeafOperatorDesc.namespace", nonempty=True),
+        )
+        object.__setattr__(
+            self,
+            "name",
+            _require_str(cast(object, self.name), "LeafOperatorDesc.name", nonempty=True),
+        )
+        object.__setattr__(
+            self,
+            "overload",
+            _require_str(cast(object, self.overload), "LeafOperatorDesc.overload"),
+        )
+        object.__setattr__(
+            self,
+            "inputs",
+            _require_tuple(cast(object, self.inputs), int, "LeafOperatorDesc.inputs"),
+        )
+        object.__setattr__(
+            self,
+            "outputs",
+            _require_tuple(cast(object, self.outputs), str, "LeafOperatorDesc.outputs"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LeafArtifactDesc:
+    artifact_key: ArtifactKey
+    operators: tuple[LeafOperatorDesc, ...]
+    input_values: tuple[str, ...]
+    output_values: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        artifact_key = _require_instance(
+            cast(object, self.artifact_key), ArtifactKey, "LeafArtifactDesc.artifact_key"
+        )
+        operators = _require_tuple(
+            cast(object, self.operators), LeafOperatorDesc, "LeafArtifactDesc.operators"
+        )
+        input_values = _require_tuple(
+            cast(object, self.input_values), str, "LeafArtifactDesc.input_values"
+        )
+        output_values = _require_tuple(
+            cast(object, self.output_values), str, "LeafArtifactDesc.output_values"
+        )
+        object.__setattr__(self, "artifact_key", artifact_key)
+        object.__setattr__(self, "operators", operators)
+        object.__setattr__(self, "input_values", input_values)
+        object.__setattr__(self, "output_values", output_values)
+
+
+@dataclass(frozen=True, slots=True)
 class PortBindingDesc:
     """Explicit mapping between one structured port and one captured pytree leaf."""
 
@@ -299,7 +512,8 @@ class CapturedFlow:
     shape_guard: ShapeGuard = ShapeGuard()
     inputs: tuple[PortBindingDesc, ...] = ()
     outputs: tuple[PortBindingDesc, ...] = ()
-    values: tuple[ValueDesc, ...] = ()
+    values: tuple[CapturedValueDesc, ...] = ()
+    leaf_artifact: LeafArtifactDesc | None = None
     effects: tuple[Effect, ...] = (Effect.OPAQUE,)
     diagnostics: tuple[FlowCaptureDiagnostic, ...] = ()
     status: CaptureStatus = CaptureStatus.OPAQUE_BARRIER
@@ -319,7 +533,17 @@ class CapturedFlow:
         )
         inputs = _require_tuple(cast(object, self.inputs), PortBindingDesc, "CapturedFlow.inputs")
         outputs = _require_tuple(cast(object, self.outputs), PortBindingDesc, "CapturedFlow.outputs")
-        values = _require_tuple(cast(object, self.values), ValueDesc, "CapturedFlow.values")
+        values = _require_tuple(
+            cast(object, self.values), CapturedValueDesc, "CapturedFlow.values"
+        )
+        leaf_value = cast(object, self.leaf_artifact)
+        leaf_artifact: LeafArtifactDesc | None
+        if leaf_value is None:
+            leaf_artifact = None
+        else:
+            leaf_artifact = _require_instance(
+                leaf_value, LeafArtifactDesc, "CapturedFlow.leaf_artifact"
+            )
         effects = _require_tuple(cast(object, self.effects), Effect, "CapturedFlow.effects")
         diagnostics = _require_tuple(
             cast(object, self.diagnostics), FlowCaptureDiagnostic, "CapturedFlow.diagnostics"
@@ -343,6 +567,17 @@ class CapturedFlow:
                 raise ValueError("opaque capture must retain an opaque effect")
             if not diagnostics:
                 raise ValueError("opaque capture must explain why it is a barrier")
+            if values or leaf_artifact is not None:
+                raise ValueError("opaque capture must discard every partial leaf artifact")
+        else:
+            if node_kind != NodeKind.COMPUTE:
+                raise ValueError("successful capture must lower to a ComputeNode")
+            if graph_safety != GraphSafetyKind.CAPTURE_SAFE:
+                raise ValueError("successful capture must be capture-safe")
+            if leaf_artifact is None or not values:
+                raise ValueError("successful capture requires a complete typed leaf artifact")
+            if diagnostics:
+                raise ValueError("successful capture cannot retain failure diagnostics")
         binding_keys = tuple(
             (binding.direction, binding.value_path) for binding in (*inputs, *outputs)
         )
@@ -354,6 +589,7 @@ class CapturedFlow:
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "outputs", outputs)
         object.__setattr__(self, "values", values)
+        object.__setattr__(self, "leaf_artifact", leaf_artifact)
         object.__setattr__(self, "effects", effects)
         object.__setattr__(self, "diagnostics", diagnostics)
         object.__setattr__(self, "status", status)
@@ -448,26 +684,6 @@ class FlowCallable(Protocol[_P, _R_co]):
     def capture(self, *args: _P.args, **kwargs: _P.kwargs) -> CapturedFlow: ...
 
 
-def _capture_placeholder(
-    function: Callable[..., object],
-    bindings: tuple[PortBindingDesc, ...],
-) -> CapturedFlow:
-    span = SourceSpan.from_callable(function)
-    diagnostic = FlowCaptureDiagnostic(
-        code=FlowCaptureCode.OPAQUE_PYTHON_REGION,
-        message="flow capture has not produced a proven strict export graph",
-        source_span=span,
-        detail="the original Python function remains authoritative",
-    )
-    return CapturedFlow(
-        artifact_key=ArtifactKey.from_callable(function),
-        source_span=span,
-        inputs=tuple(binding for binding in bindings if binding.direction == PortBindingDirection.INPUT),
-        outputs=tuple(binding for binding in bindings if binding.direction == PortBindingDirection.OUTPUT),
-        diagnostics=(diagnostic,),
-    )
-
-
 @overload
 def flow(function: Callable[_P, _R], /) -> FlowCallable[_P, _R]: ...
 
@@ -479,6 +695,7 @@ def flow(
     *,
     freshness: _BeforeNextUse = BeforeNextUse,
     bindings: tuple[PortBindingDesc, ...] = (),
+    dynamic_dims: tuple[DynamicDim, ...] = (),
 ) -> Callable[[Callable[_P, _R]], FlowCallable[_P, _R]]: ...
 
 
@@ -488,12 +705,14 @@ def flow(
     *,
     freshness: _BeforeNextUse = BeforeNextUse,
     bindings: tuple[PortBindingDesc, ...] = (),
+    dynamic_dims: tuple[DynamicDim, ...] = (),
 ) -> FlowCallable[_P, _R] | Callable[[Callable[_P, _R]], FlowCallable[_P, _R]]:
     """Wrap a function transparently; only ``.capture`` enters control-plane capture."""
 
     if freshness is not BeforeNextUse:
         raise TypeError("flow.freshness must be the BeforeNextUse singleton")
     bindings = _require_tuple(cast(object, bindings), PortBindingDesc, "flow.bindings")
+    dynamic_dims = _require_tuple(cast(object, dynamic_dims), DynamicDim, "flow.dynamic_dims")
 
     def decorate(target: Callable[_P, _R]) -> FlowCallable[_P, _R]:
         if not isinstance(target, FunctionType):
@@ -505,11 +724,24 @@ def flow(
 
         def capture(*_args: _P.args, **_kwargs: _P.kwargs) -> CapturedFlow:
             inspect.signature(target).bind(*_args, **_kwargs)
-            return _capture_placeholder(target, bindings)
+            from tllm.workgraph.capture import capture_flow
 
+            captured, exported_program = capture_flow(
+                target,
+                tuple(cast(tuple[object, ...], _args)),
+                cast(dict[str, object], _kwargs),
+                bindings=bindings,
+                dynamic_dims=dynamic_dims,
+            )
+            if exported_program is not None:
+                capture_handles[captured.shape_guard] = exported_program
+            return captured
+
+        capture_handles: dict[ShapeGuard, object] = {}
         setattr(wrapped, "capture", capture)
         setattr(wrapped, "flow_freshness", freshness)
         setattr(wrapped, "flow_bindings", bindings)
+        setattr(wrapped, "flow_dynamic_dims", dynamic_dims)
         return cast(FlowCallable[_P, _R], wrapped)
 
     if function is None:
@@ -588,13 +820,17 @@ __all__ = [
     "Capability",
     "CaptureStatus",
     "CapturedFlow",
+    "CapturedValueDesc",
     "Device",
+    "DynamicDim",
     "Effect",
     "ExternContract",
     "ExternInputDesc",
     "FlowCallable",
     "FlowCaptureCode",
     "FlowCaptureDiagnostic",
+    "LeafArtifactDesc",
+    "LeafOperatorDesc",
     "PortBindingDesc",
     "PortBindingDirection",
     "ShapeGuard",
@@ -602,7 +838,11 @@ __all__ = [
     "ShapeGuardKind",
     "SourceSpan",
     "StateScope",
+    "TensorDTypeDesc",
+    "TensorDeviceDesc",
+    "TensorLayout",
     "TypeDesc",
+    "UseDefDesc",
     "extern",
     "flow",
 ]
