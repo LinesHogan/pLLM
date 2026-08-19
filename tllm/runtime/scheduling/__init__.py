@@ -11,6 +11,17 @@ from tllm.runtime.scheduling.plan_store import (
     RuntimeStream,
     select_buffer_bucket,
 )
+from tllm.runtime.scheduling.workgraph_executor import (
+    PhysicalExecutionContext,
+    PhysicalExecutionError,
+    PhysicalExecutionKind,
+    PhysicalExecutionStats,
+    PhysicalExecutor,
+    PhysicalStepResult,
+    WorkGraphRuntimeStats,
+    WorkGraphRuntimeStatsReader,
+    runtime_stats_from_executor,
+)
 
 __all__ = [
     "BufferLease",
@@ -19,8 +30,17 @@ __all__ = [
     "Fence",
     "PlanResources",
     "PlanSnapshotStore",
+    "PhysicalExecutionContext",
+    "PhysicalExecutionError",
+    "PhysicalExecutionKind",
+    "PhysicalExecutionStats",
+    "PhysicalExecutor",
+    "PhysicalStepResult",
+    "WorkGraphRuntimeStats",
+    "WorkGraphRuntimeStatsReader",
     "RuntimeEvent",
     "RuntimeGraph",
     "RuntimeStream",
     "select_buffer_bucket",
+    "runtime_stats_from_executor",
 ]

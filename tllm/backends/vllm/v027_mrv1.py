@@ -27,7 +27,10 @@ from tllm.backends.protocol import (
     UnsupportedBackendError,
 )
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
-from tllm.backends.vllm.workgraph_runtime import record_resolved_backend
+from tllm.backends.vllm.workgraph_runtime import (
+    cold_specialize_loaded_runtime,
+    record_resolved_backend,
+)
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
@@ -212,6 +215,10 @@ def _wrapped_prepare_inputs(
 
     out = orig(runner, scheduler_output, num_scheduled_tokens)
     runtime.event_step_id += 1
+    from tllm.runtime import residual_runtime as _residual_runtime
+
+    if core is _residual_runtime:
+        _residual_runtime.prepare_physical_workgraph_step(int(runtime.event_step_id))
     view = _ADAPTER.unpack_prepare_inputs_output(
         runner=runner,
         scheduler_output=scheduler_output,
@@ -348,6 +355,7 @@ class V027MRv1Driver:
                 capabilities=self.capabilities(),
                 graph_mode=resolve_graph_mode(runner),
             )
+            cold_specialize_loaded_runtime(core=core, runner=runner)
             return out
 
         def _prepare_inputs(runner: Any, scheduler_output: Any, num_scheduled_tokens: Any = None) -> Any:

@@ -18,7 +18,7 @@ from tllm.workgraph.frontend import (
     TensorDTypeDesc,
     TensorDeviceDesc,
 )
-from tllm.workgraph.hierarchy import RootFlowDesc
+from tllm.workgraph.hierarchy import CaptureAttachment, RootFlowDesc
 from tllm.workgraph.ir import (
     EdgeKind,
     ExecutionNodeDesc,
@@ -294,6 +294,30 @@ class PhysicalFlowPlan:
         object.__setattr__(self, "buffer_buckets", buckets)
 
 
+@dataclass(frozen=True, slots=True)
+class PhysicalCaptureRegion:
+    """One explicitly attached capture root and its executable task plan."""
+
+    attachment: CaptureAttachment
+    plan: PhysicalFlowPlan
+
+    def __post_init__(self) -> None:
+        attachment = _instance(
+            self.attachment,
+            CaptureAttachment,
+            "PhysicalCaptureRegion.attachment",
+        )
+        plan = _instance(self.plan, PhysicalFlowPlan, "PhysicalCaptureRegion.plan")
+        if not plan.nodes:
+            raise ValueError("PhysicalCaptureRegion.plan must contain a capture task")
+        if any(node.node_key.namespace != "capture_task" for node in plan.nodes):
+            raise ValueError("PhysicalCaptureRegion.plan may contain only capture tasks")
+        if any(node.artifact_key != attachment.artifact_key for node in plan.nodes):
+            raise ValueError("PhysicalCaptureRegion plan artifact differs from its attachment")
+        object.__setattr__(self, "attachment", attachment)
+        object.__setattr__(self, "plan", plan)
+
+
 def _fence_kind(edge_kind: EdgeKind) -> FenceKind:
     if edge_kind == EdgeKind.LEASE:
         return FenceKind.RETIRE
@@ -502,6 +526,108 @@ def compile_physical_flow_plan(plan: Phase1aPlan) -> PhysicalFlowPlan:
     return physical
 
 
+def compile_physical_capture_region(
+    plan: Phase1aPlan,
+    artifact_key: ArtifactKey,
+) -> PhysicalCaptureRegion:
+    """Lower one complete hierarchy root into an independently runnable plan.
+
+    Compatibility producer/consumer nodes are intentionally absent.  They
+    remain authoritative legacy boundaries while this plan owns only the
+    explicitly migrated capture task.
+    """
+
+    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.lowering import WorkGraphError
+
+    raw_plan = cast(object, plan)
+    if not isinstance(raw_plan, Phase1aPlan):
+        raise TypeError("compile_physical_capture_region.plan must be Phase1aPlan")
+    key = _instance(
+        artifact_key,
+        ArtifactKey,
+        "compile_physical_capture_region.artifact_key",
+    )
+    hierarchy = raw_plan.hierarchy
+    if hierarchy is None:
+        raise WorkGraphError(
+            "WG420_UNKNOWN_CAPTURE_REGION",
+            "physical capture region requires a hierarchy artifact",
+        )
+    root = next(
+        (candidate for candidate in hierarchy.roots if candidate.artifact_key == key),
+        None,
+    )
+    if root is None:
+        raise WorkGraphError(
+            "WG420_UNKNOWN_CAPTURE_REGION",
+            f"capture artifact {key.value!r} is not present in the hierarchy",
+        )
+    attachment = next(
+        (
+            candidate
+            for candidate in hierarchy.attachments
+            if candidate.artifact_key == key
+        ),
+        None,
+    )
+    if attachment is None:
+        raise WorkGraphError(
+            "WG420_UNKNOWN_CAPTURE_REGION",
+            "capture artifact has no explicit runtime attachment",
+        )
+    if root.status != CaptureStatus.CAPTURED:
+        raise WorkGraphError(
+            "WG422_OPAQUE_CAPTURE_REGION",
+            "opaque capture artifacts cannot become physical regions",
+        )
+    if len(root.children) != 1:
+        raise WorkGraphError(
+            "WG421_UNSUPPORTED_CAPTURE_PARTITION",
+            "physical execution currently requires one complete capture task",
+        )
+    task = root.children[0]
+    leaf = task.children[0]
+    artifact = leaf.leaf_artifact
+    if artifact is None:
+        raise WorkGraphError(
+            "WG422_OPAQUE_CAPTURE_REGION",
+            "capture task has no complete leaf artifact",
+        )
+
+    # An alias-only handoff has no CUDA work to capture.  Treating its empty
+    # exported graph as replay would inflate replay counters without doing
+    # work, so it uses the normal eager handler and records no fallback.
+    policy = (
+        CapturePolicy.DISABLED
+        if not artifact.operators
+        else _capture_policy(root)
+    )
+    physical = PhysicalFlowPlan(
+        plan_epoch=raw_plan.epoch,
+        nodes=(
+            PhysicalNodePlan(
+                node_key=task.node_key,
+                executor=task.executor,
+                stream=StreamClass.SIDE_FORWARD,
+                artifact_key=key,
+                capture_policy=policy,
+                fallback_policy=FallbackPolicy.EAGER,
+            ),
+        ),
+    )
+    try:
+        from tllm import core as _core
+
+        _core.validate_physical_flow_plan(physical)
+    except (TypeError, ValueError) as exc:
+        raise WorkGraphError(
+            "WG400_RUST_PHYSICAL_VALIDATION",
+            "Rust capture-region descriptor validation failed",
+        ) from exc
+    return PhysicalCaptureRegion(attachment=attachment, plan=physical)
+
+
 __all__ = [
     "BufferBucketDesc",
     "BufferBucketKey",
@@ -512,7 +638,9 @@ __all__ = [
     "FenceKey",
     "FenceKind",
     "PhysicalFlowPlan",
+    "PhysicalCaptureRegion",
     "PhysicalNodePlan",
     "StreamClass",
     "compile_physical_flow_plan",
+    "compile_physical_capture_region",
 ]

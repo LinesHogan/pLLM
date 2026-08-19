@@ -108,8 +108,10 @@ from tllm.workgraph.physical import (
     FenceKey,
     FenceKind,
     PhysicalFlowPlan,
+    PhysicalCaptureRegion,
     PhysicalNodePlan,
     StreamClass,
+    compile_physical_capture_region,
     compile_physical_flow_plan,
 )
 from tllm.workgraph.reconcile import KeepRegion, PlanDiff, RebuildRegion, reconcile
@@ -189,6 +191,7 @@ __all__ = [
     "NodeKind",
     "Phase1aPlan",
     "PhysicalFlowPlan",
+    "PhysicalCaptureRegion",
     "PhysicalNodePlan",
     "PlanDiff",
     "PortBindingDesc",
@@ -232,6 +235,7 @@ __all__ = [
     "build_lsp_snapshot",
     "compile_phase1a",
     "compile_physical_flow_plan",
+    "compile_physical_capture_region",
     "compile_shadow_snapshot",
     "compare_event_traces",
     "extern",

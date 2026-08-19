@@ -12,7 +12,7 @@ required.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from tllm.contracts.consumer_stats import (
@@ -20,6 +20,7 @@ from tllm.contracts.consumer_stats import (
     training_stats_map_from_wire,
 )
 from tllm.runtime.stats import DistillerTimingStats, PathHotspotStats, PlacementStats
+from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
 
 TLLM_WORKER_EXTENSION_QUALNAME = "tllm.runtime.mp.worker_extension.TllmWorkerExtension"
 
@@ -31,6 +32,7 @@ class WorkerStatsReply:
     distiller_timing: DistillerTimingStats
     path_hotspot: PathHotspotStats
     placement: PlacementStats
+    workgraph: WorkGraphRuntimeStats = field(default_factory=WorkGraphRuntimeStats)
 
     @classmethod
     def from_wire(cls, payload: Mapping[str, Any]) -> "WorkerStatsReply":
@@ -40,6 +42,7 @@ class WorkerStatsReply:
             distiller_timing=DistillerTimingStats.from_wire(payload["distiller_timing"]),
             path_hotspot=PathHotspotStats.from_wire(payload["path_hotspot"]),
             placement=PlacementStats.from_wire(payload["placement"]),
+            workgraph=WorkGraphRuntimeStats.from_wire(payload.get("workgraph", {})),
         )
 
 

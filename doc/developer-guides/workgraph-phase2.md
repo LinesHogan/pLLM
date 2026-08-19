@@ -1,9 +1,10 @@
 # WorkGraph Phase 2
 
-This guide tracks the single-GPU physical execution layer. Phase 1 remains the
-typed source of truth for hierarchy, effects, artifacts, and compatibility
-boundaries. The existing `DispatchPlan` and `ExecutionPlan` are still
-authoritative at runtime until the GPU execution gates in this guide pass.
+This guide documents the single-GPU physical execution layer. Phase 1 remains
+the typed source of truth for hierarchy, effects, artifacts, and compatibility
+boundaries. The existing `DispatchPlan` and `ExecutionPlan` remain
+authoritative for legacy regions; WorkGraph executes only explicitly attached,
+fully captured regions.
 
 ## Milestone 1: Physical Contracts
 
@@ -76,10 +77,17 @@ device-index matching without touching the CUDA driver or synchronizing. A
 miss returns `None`; the current step must use eager fallback while a future
 cold path may build a specialization.
 
+`PhysicalExecutor` binds handlers by typed `NodeKey` or `ExecutorKey` when a
+step is prepared. It follows the frozen node order, waits and publishes typed
+fences, selects exact buckets, and records eager/replay/fallback and lease
+statistics. Bucket misses are de-duplicated before invoking the cold
+specialization callback. No handler lookup, graph compilation, or capture is
+performed by `execute_step()`.
+
 ## ESamp Residual Capture Bridge
 
-`ESampConsumer.specialize_workgraph(source_example, target_example)` is the
-first explicit cold specialization entry point. It strict-captures a pure
+`ESampConsumer.specialize_workgraph(source_example, target_example)` is an
+explicit cold specialization entry point. It strict-captures a pure
 source/target residual handoff and binds both Tensor inputs to the exact typed
 `ResidualStream` addresses declared by the ESamp flow. The resulting
 `CapturedFlow` and `CaptureAttachment` use stable artifact, source, and
@@ -91,29 +99,59 @@ publish its frozen metadata with
 `residual_runtime.refresh_workgraph_capture_metadata()`. Publication rebuilds
 only the WorkGraph shadow snapshot: it preserves the existing `DispatchPlan`
 and `ExecutionPlan` objects and short-circuits when metadata is unchanged.
-Disabled ESamp consumers expose no capture metadata.
+
+The MRv1/MRv2 load-model quarantine derives a typed
+`RuntimeSpecializationSpec` from the resolved model layout and publishes it
+before the first token. Ordinary ESamp case toggles retain that load-time
+specialization; disabling WorkGraph execution or changing the consumer
+identity clears it. Disabled ESamp consumers expose no active capture
+metadata.
 
 The outer ESamp consumer flow is still deferrable legacy work. Its hierarchy
-can therefore explain the captured residual leaf, but physical lowering keeps
-the compatibility node at `CapturePolicy.DISABLED` with eager fallback. This
-bridge does not change first-per-prompt filtering, training density, update,
-publish, sampler, or fence behavior.
+can therefore explain the captured residual leaf, while physical lowering
+keeps the compatibility node at `CapturePolicy.DISABLED` with eager fallback.
+The attached leaf region is activated independently through the typed
+`BaseConsumer.activate_workgraph_regions()` boundary. MRv1 prepares the next
+bundle epoch at its prepare-inputs safe point; MRv2 prepares immediately after
+allocating the new execute-model step id. Both happen before residual dispatch
+and never trigger capture or compilation.
 
-## Current Execution Boundary
+The ESamp consumer runs the activated identity-preserving residual handoff
+through `PhysicalExecutor`, then delegates training to the existing
+`ESampTrainEngine`, `PipelineLane`, delayed-backward, update, and publish
+machinery. This preserves first-per-prompt filtering, training density,
+parameter updates, sampler behavior, and the hand-written stream/event code as
+the behavior oracle.
 
-This milestone builds and validates physical metadata, Python resource
-lifecycle primitives, and an explicit ESamp residual capture sidecar. It does
-not install a WorkGraph executor in the token hot path, capture a CUDA graph
-during a step, or select a Python implementation dynamically. The legacy
-runtime remains authoritative.
+## Execution Boundary And Gate Status
 
-The ESamp resource initializer is no longer called during `load_model.post`,
-so training allocation remains lazy until the first complete bundle. The
-current host cannot communicate with the NVIDIA driver. Automatic WorkGraph
-GPU execution remains disabled until an aligned ESamp run at
-`gpu_memory_utilization=0.5` verifies startup, `loss_count > 0`, update and
-capture/replay counts, zero steady-state fallback/deadline misses, and
-fence/buffer/epoch statistics.
+Automatic execution is enabled by default and can be disabled with
+`--no-workgraph-execution`. Only the explicitly migrated ESamp residual
+handoff is executed by WorkGraph. Unmigrated producer/consumer work remains a
+visible legacy boundary; FULL graph mode clears physical activation rather
+than partially executing a graph.
+
+The ESamp resource initializer is not called during `load_model.post`, so
+training allocation remains lazy until the first complete bundle. Runtime
+statistics include plan epoch, prepare/execute/finish, replay/eager/fallback,
+fence, bucket, specialization, lease, retired-plan, and deadline counts. In
+multi-process vLLM these frozen numeric snapshots are returned through the
+existing worker control plane; CUDA objects never cross the process boundary.
+
+Validation on 2026-08-20 used the repository virtual environment and a
+low-memory `Qwen/Qwen2.5-0.5B-Instruct`, bfloat16, batch 1, `n=2`, 8-token,
+eager workload at `gpu_memory_utilization=0.35`. The legacy-reference and
+automatic runs both reported `loss_count=7` and
+`loss_avg=4.092917578560965`. The automatic run reported plan epoch 2,
+`execute_count=7`, `eager_count=7`, and zero fallback/deadline misses; its
+single-pair throughput ratio was about 0.9969.
+
+The formal `gpu_memory_utilization=0.5` gate is currently environment-blocked,
+not waived: a co-resident process owns about 9.2 GiB, and vLLM OOMs during its
+own sampler warmup before WorkGraph execution while requesting another 150
+MiB. Therefore the required five aligned alternating pairs and 95% confidence
+bound are not yet recorded. Do not treat the low-memory smoke as the formal
+performance gate.
 
 ## Verification
 
@@ -122,7 +160,12 @@ Use the repository virtual environment:
 ```bash
 /workspace/pllm/.venv/bin/python -m pytest -q test/workgraph/test_physical_plan_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_physical_executor_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_physical_flow_executor_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_physical_plan_snapshot_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_phase2_runtime_activation_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_phase2_migrated_region_activation_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_automatic_cold_specialization_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_phase2_gpu_gate_stats_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/core/test_physical_plan_validator_oracle_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/consumers/esamp/test_esamp_consumer_contract_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/workgraph/test_phase1a_runtime_refresh_unit.py

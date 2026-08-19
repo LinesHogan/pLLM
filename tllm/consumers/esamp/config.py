@@ -31,6 +31,7 @@ class ESampConsumerConfig:
     source_layer_path: str = "model.model.layers[0].input_layernorm"
     target_layer_path: str = "model.model.layers[-1].input_layernorm"
     enable_esamp_training: bool = True
+    enable_workgraph_execution: bool = True
     distiller_hidden_dim: int = 128
     distiller_lr: float = 1e-3
     per_request_models: bool = False

@@ -153,6 +153,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-rounds", type=int, default=3)
     parser.add_argument("--benchmark-ignore-eos", action="store_true")
     parser.add_argument("--benchmark-disable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--workgraph-execution",
+        dest="workgraph_execution",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-workgraph-execution",
+        dest="workgraph_execution",
+        action="store_false",
+    )
 
     parser.add_argument("--sampling-n", type=int, default=16)
     parser.add_argument("--sampling-temperature", type=float, default=0.8)
@@ -206,7 +216,30 @@ def _parse_args() -> argparse.Namespace:
     parser.set_defaults(model_bank_use_output_layernorm=True)
     parser.set_defaults(model_bank_train_cudagraph=True)
     parser.set_defaults(model_bank_compact_capture=False)
+    parser.set_defaults(workgraph_execution=True)
     return parser.parse_args()
+
+
+def _workgraph_runtime_stats_fields(stats: object) -> Dict[str, float]:
+    return {
+        name: float(getattr(stats, name))
+        for name in (
+            "active_plan_epoch",
+            "prepare_count",
+            "execute_count",
+            "finish_count",
+            "replay_count",
+            "eager_count",
+            "fallback_count",
+            "fence_wait_count",
+            "fence_record_count",
+            "bucket_miss_count",
+            "specialization_request_count",
+            "active_leases",
+            "retired_plans",
+            "deadline_flush_count",
+        )
+    }
 
 
 def _expand_requests_for_effective_n(
@@ -380,6 +413,12 @@ def _build_isolated_case_subprocess_cmd(
     if prompt_file:
         cmd.extend(["--prompt-file", prompt_file])
     _append_bool_flag(cmd, bool(args.enforce_eager), "--enforce-eager", "--no-enforce-eager")
+    _append_bool_flag(
+        cmd,
+        bool(args.workgraph_execution),
+        "--workgraph-execution",
+        "--no-workgraph-execution",
+    )
     _append_bool_flag(cmd, bool(getattr(args, "enable_distiller_intervention", False)), "--enable-distiller-intervention")
     _append_bool_flag(cmd, bool(args.run_model_bank_case), "--run-model-bank-case", "--no-run-model-bank-case")
     _append_bool_flag(
@@ -467,6 +506,7 @@ def _run_case(
     adaptation_stream_priority: int,
     compact_capture_lane: bool,
     train_enabled: bool,
+    workgraph_execution: bool,
     prompts: Sequence[str],
     params: Sequence[SamplingParams],
     request_prompt_indices: Sequence[int] | None,
@@ -481,6 +521,7 @@ def _run_case(
         source_layer_path=source_layer_path,
         target_layer_path=target_layer_path,
         enable_esamp_training=bool(train_enabled),
+        enable_workgraph_execution=bool(workgraph_execution),
         distiller_hidden_dim=int(distiller_hidden_dim),
         distiller_lr=float(distiller_lr),
         enable_distiller_intervention=bool(enable_distiller_intervention),
@@ -610,6 +651,14 @@ def _run_case(
         "model_bank_graph_kernel_fallback_count": float(model_bank_graph.kernel_fallback_count),
     }
     result.update(_path_hotspot_fields(path_hotspots))
+    result.update(
+        {
+            f"workgraph_{name}": value
+            for name, value in _workgraph_runtime_stats_fields(
+                core.read_workgraph_runtime_stats()
+            ).items()
+        }
+    )
     return result
 
 
@@ -637,6 +686,7 @@ def _configure_case_runtime(
     adaptation_stream_priority: int,
     compact_capture_lane: bool,
     train_enabled: bool,
+    workgraph_execution: bool,
 ) -> None:
     esamp_workflow_support.configure_esamp_runtime(
         graph_scratch_rows=int(graph_scratch_rows),
@@ -644,6 +694,7 @@ def _configure_case_runtime(
         source_layer_path=source_layer_path,
         target_layer_path=target_layer_path,
         enable_esamp_training=bool(train_enabled),
+        enable_workgraph_execution=bool(workgraph_execution),
         distiller_hidden_dim=int(distiller_hidden_dim),
         distiller_lr=float(distiller_lr),
         enable_distiller_intervention=bool(enable_distiller_intervention),
@@ -682,6 +733,7 @@ def _run_per_request_trajectory(
         source_layer_path=args.source_layer_path,
         target_layer_path=args.target_layer_path,
         enable_esamp_training=True,
+        enable_workgraph_execution=bool(args.workgraph_execution),
         distiller_hidden_dim=int(args.distiller_hidden_dim),
         distiller_lr=float(args.distiller_lr),
         per_request_models=True,
@@ -858,6 +910,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
         effective_batch_cap=effective_batch_cap,
         warmup_rounds=int(args.benchmark_warmup_rounds),
         rounds=int(args.benchmark_rounds),
+        workgraph_execution=bool(args.workgraph_execution),
     )
     requested_case_filter = str(getattr(args, "case_filter", "all") or "all").strip()
     if requested_case_filter == "all":
@@ -915,6 +968,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
             source_layer_path=args.source_layer_path,
             target_layer_path=args.target_layer_path,
             enable_esamp_training=True,
+            enable_workgraph_execution=bool(args.workgraph_execution),
             distiller_hidden_dim=int(args.distiller_hidden_dim),
             distiller_lr=float(args.distiller_lr),
             enable_distiller_intervention=bool(args.enable_distiller_intervention),
@@ -980,6 +1034,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
                 adaptation_stream_priority=common["adaptation_stream_priority"],
                 compact_capture_lane=common["compact_capture_lane"],
                 train_enabled=train_enabled,
+                workgraph_execution=bool(args.workgraph_execution),
             )
             case_llm = _make_case_llm()
             try:
@@ -1129,6 +1184,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
                 adaptation_stream_priority=common["adaptation_stream_priority"],
                 compact_capture_lane=common["compact_capture_lane"],
                 train_enabled=True,
+                workgraph_execution=bool(args.workgraph_execution),
             )
             trajectory_llm = _make_case_llm()
             try:

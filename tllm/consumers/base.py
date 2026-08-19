@@ -11,8 +11,11 @@ from tllm.contracts.runtime_context import RuntimeContext
 from tllm.ports.base import ConsumerFlow
 
 if TYPE_CHECKING:
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
+    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
+    from tllm.workgraph.physical import PhysicalCaptureRegion
 
 ConfigT = TypeVar("ConfigT")
 
@@ -76,6 +79,36 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         """Return explicit runtime-node bindings for ``workgraph_captures``."""
 
         return ()
+
+    def cold_specialize_workgraph(self, spec: "RuntimeSpecializationSpec") -> None:
+        """Optionally specialize capture metadata after the backend loads a model."""
+
+        _ = spec
+
+    def activate_workgraph_regions(
+        self,
+        regions: tuple["PhysicalCaptureRegion", ...],
+    ) -> None:
+        """Atomically replace cold-compiled regions attached to this consumer."""
+
+        _ = regions
+
+    def prepare_workgraph_step(self, step_id: int) -> None:
+        """Acquire this consumer's staged physical region at a prepare safe point."""
+
+        _ = step_id
+
+    def finish_workgraph_step(self, step_id: int) -> None:
+        """Release one prepared physical region after its legacy boundary runs."""
+
+        _ = step_id
+
+    def read_workgraph_runtime_stats(self) -> "WorkGraphRuntimeStats":
+        """Return a non-resetting snapshot for physical execution gates."""
+
+        from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
+
+        return WorkGraphRuntimeStats()
 
     def synchronize(self) -> None:
         """Optional flush hook for async/background consumers."""

@@ -110,6 +110,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
             self.assertIsInstance(reply.distiller_timing, DistillerTimingStats)
             self.assertIsInstance(reply.path_hotspot, PathHotspotStats)
             self.assertIsInstance(reply.placement, PlacementStats)
+            self.assertEqual(reply.workgraph.execute_count, 0)
             import json
 
             json.dumps(asdict(reply))
@@ -215,6 +216,7 @@ class WorkerStatsMergeUnitTest(unittest.TestCase):
                 "distiller_timing": {"precompute_ms_total": loss_avg, "precompute_count": loss_count},
                 "path_hotspot": {"cpu_ms_total": {"dispatch": loss_avg}, "counts": {"dispatch": loss_count}},
                 "placement": {"moved_dispatch_count": loss_count, "max_queue_depth": queue_depth},
+                "workgraph": {"execute_count": loss_count, "active_plan_epoch": queue_depth},
             }
         )
 
@@ -236,6 +238,8 @@ class WorkerStatsMergeUnitTest(unittest.TestCase):
         placement = PlacementStats.merge((first.placement, second.placement))
         self.assertEqual(placement.moved_dispatch_count, 4)
         self.assertEqual(placement.max_queue_depth, 7)
+        self.assertEqual(first.workgraph.execute_count, 1)
+        self.assertEqual(second.workgraph.active_plan_epoch, 7)
 
     def test_public_stats_api_merges_active_worker_replies(self) -> None:
         reply = self._reply(loss_avg=3.5, loss_count=2, request_key=9, queue_depth=6)

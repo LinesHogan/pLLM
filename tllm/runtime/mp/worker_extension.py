@@ -87,7 +87,15 @@ class TllmWorkerExtension:
         """Read and reset runtime stats, resolved to plain data child-side."""
         from tllm.runtime import residual_runtime as core
 
-        supported = {"all", "esamp", "esamp_per_request", "distiller_timing", "path_hotspot", "placement"}
+        supported = {
+            "all",
+            "esamp",
+            "esamp_per_request",
+            "distiller_timing",
+            "path_hotspot",
+            "placement",
+            "workgraph",
+        }
         if category not in supported:
             raise ValueError(f"unsupported stats category {category!r}; supported: {sorted(supported)}")
         payload = {
@@ -96,6 +104,7 @@ class TllmWorkerExtension:
             "distiller_timing": {},
             "path_hotspot": {},
             "placement": {},
+            "workgraph": {},
         }
         if category in ("all", "esamp"):
             payload["esamp"] = _to_plain(core.read_and_reset_esamp_stats(sync=sync))
@@ -107,6 +116,8 @@ class TllmWorkerExtension:
             payload["path_hotspot"] = _to_plain(core.read_and_reset_path_hotspot_stats(sync=sync))
         if category in ("all", "placement"):
             payload["placement"] = _to_plain(core.read_and_reset_placement_stats())
+        if category in ("all", "workgraph"):
+            payload["workgraph"] = _to_plain(core.read_workgraph_runtime_stats())
         return payload
 
     def tllm_synchronize(self) -> None:

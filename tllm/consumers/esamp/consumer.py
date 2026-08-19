@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Optional, Sequence
 
 import torch
@@ -39,6 +39,20 @@ from tllm.workgraph.frontend import (
 )
 from tllm.workgraph.hierarchy import CaptureAttachment
 from tllm.workgraph.ir import NodeKey
+from tllm.workgraph.physical import PhysicalCaptureRegion, StreamClass
+from tllm.runtime.scheduling.plan_store import (
+    PlanResources,
+    PlanSnapshotStore,
+    RuntimeStream,
+)
+from tllm.runtime.scheduling.workgraph_executor import (
+    PhysicalExecutionContext,
+    PhysicalExecutionStats,
+    PhysicalExecutor,
+    WorkGraphRuntimeStats,
+    runtime_stats_from_executor,
+)
+from tllm.runtime.specialization import RuntimeSpecializationSpec
 
 
 _ESAMP_SOURCE_READ = ResidualStream.read(
@@ -83,6 +97,14 @@ class _TrainingRows:
     target_hidden: torch.Tensor
     prompt_idxs: list[int]
     request_meta_is_first_per_prompt: bool
+
+
+class _FenceFreeRegionStream:
+    """Marker stream for an alias-only region that declares no fences."""
+
+    def wait_event(self, event: object) -> None:
+        del event
+        raise RuntimeError("fence-free ESamp handoff cannot wait on an event")
 
 
 class _ESampFusionGroupHandle:
@@ -159,6 +181,9 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._fusion_handle: _ESampFusionGroupHandle | None = None
         self._workgraph_capture: CapturedFlow | None = None
         self._workgraph_attachment: CaptureAttachment | None = None
+        self._workgraph_plan_store: PlanSnapshotStore | None = None
+        self._workgraph_executor: PhysicalExecutor | None = None
+        self._workgraph_prepared_step_id = -1
 
     @property
     def consumer_id(self) -> str:
@@ -217,6 +242,12 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         return max(0, int(self.config.graph_scratch_rows))
 
     def update_config(self, config: ESampConsumerConfig) -> None:
+        preserve_workgraph_capture = (
+            self._workgraph_capture is not None
+            and self._workgraph_attachment is not None
+            and str(config.consumer_id) == str(self.config.consumer_id)
+            and bool(config.enable_workgraph_execution)
+        )
         self.config = config
         self._sampler_provider.config = config
         self._engine.configure(config)
@@ -225,8 +256,12 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._runtime_target_layer = None
         self._runtime_initializer_key = None
         self._runtime_resource_key = None
-        self._workgraph_capture = None
-        self._workgraph_attachment = None
+        if not preserve_workgraph_capture:
+            self._workgraph_capture = None
+            self._workgraph_attachment = None
+            self._workgraph_plan_store = None
+            self._workgraph_executor = None
+            self._workgraph_prepared_step_id = -1
 
     def specialize_workgraph(
         self,
@@ -254,6 +289,19 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._workgraph_attachment = attachment
         return captured, attachment
 
+    def cold_specialize_workgraph(self, spec: RuntimeSpecializationSpec) -> None:
+        if not bool(self.config.enable_esamp_training) or not bool(
+            self.config.enable_workgraph_execution
+        ):
+            return
+        source_example = torch.empty(
+            (spec.rows, spec.hidden_size),
+            dtype=spec.dtype,
+            device=spec.device,
+        )
+        target_example = torch.empty_like(source_example)
+        self.specialize_workgraph(source_example, target_example)
+
     def workgraph_captures(self) -> tuple[CapturedFlow, ...]:
         if not bool(self.config.enable_esamp_training) or self._workgraph_capture is None:
             return ()
@@ -263,6 +311,99 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         if not bool(self.config.enable_esamp_training) or self._workgraph_attachment is None:
             return ()
         return (self._workgraph_attachment,)
+
+    def activate_workgraph_regions(
+        self,
+        regions: tuple[PhysicalCaptureRegion, ...],
+    ) -> None:
+        capture = self._workgraph_capture
+        attachment = self._workgraph_attachment
+        if not regions:
+            self._workgraph_plan_store = None
+            self._workgraph_executor = None
+            self._workgraph_prepared_step_id = -1
+            return
+        if capture is None or attachment is None:
+            raise RuntimeError("ESamp physical region requires a specialized capture")
+        matching = tuple(
+            region
+            for region in regions
+            if region.attachment.node_key == attachment.node_key
+            and region.attachment.artifact_key == attachment.artifact_key
+        )
+        if len(matching) != 1:
+            raise ValueError("ESamp requires exactly one explicitly attached region")
+        plan = matching[0].plan
+        if len(plan.nodes) != 1:
+            raise ValueError("ESamp physical handoff requires exactly one capture task")
+        node = plan.nodes[0]
+        if node.artifact_key != capture.artifact_key:
+            raise ValueError("ESamp physical region artifact differs from its capture")
+        if attachment.artifact_key != capture.artifact_key:
+            raise ValueError("ESamp capture attachment artifact is inconsistent")
+        resources = PlanResources(
+            plan=plan,
+            streams=(RuntimeStream(StreamClass.SIDE_FORWARD, _FenceFreeRegionStream()),),
+        )
+        store = self._workgraph_plan_store
+        if store is None:
+            store = PlanSnapshotStore(resources)
+            self._workgraph_plan_store = store
+            self._workgraph_executor = PhysicalExecutor(
+                snapshots=store,
+                handlers={node.executor: self._execute_workgraph_handoff},
+            )
+            return
+        if plan.plan_epoch > store.current.plan.plan_epoch:
+            store.stage(resources)
+
+    @staticmethod
+    def _execute_workgraph_handoff(context: PhysicalExecutionContext) -> None:
+        if len(context.tensors) != 2:
+            raise RuntimeError("ESamp residual handoff requires source and target tensors")
+        source, target = _esamp_residual_side_work(
+            context.tensors[0],
+            context.tensors[1],
+        )
+        if source is not context.tensors[0] or target is not context.tensors[1]:
+            raise RuntimeError("ESamp residual handoff must preserve Tensor identity")
+
+    def prepare_workgraph_step(self, step_id: int) -> None:
+        executor = self._workgraph_executor
+        if executor is None:
+            return
+        previous = self._workgraph_prepared_step_id
+        if previous >= 0 and previous != int(step_id):
+            executor.finish_step(previous)
+        executor.prepare_step(int(step_id))
+        self._workgraph_prepared_step_id = int(step_id)
+
+    def finish_workgraph_step(self, step_id: int) -> None:
+        executor = self._workgraph_executor
+        if executor is None or self._workgraph_prepared_step_id != int(step_id):
+            return
+        executor.finish_step(int(step_id))
+        self._workgraph_prepared_step_id = -1
+
+    def physical_execution_stats(self) -> PhysicalExecutionStats:
+        executor = self._workgraph_executor
+        return (
+            PhysicalExecutionStats()
+            if executor is None
+            else replace(executor.stats)
+        )
+
+    def workgraph_execution_stats(self) -> PhysicalExecutionStats | None:
+        executor = self._workgraph_executor
+        return None if executor is None else replace(executor.stats)
+
+    def read_workgraph_runtime_stats(self) -> WorkGraphRuntimeStats:
+        executor = self._workgraph_executor
+        if executor is None:
+            return WorkGraphRuntimeStats()
+        store = self._workgraph_plan_store
+        leases = 0 if store is None else len(store.current.leases)
+        return runtime_stats_from_executor(executor.stats, active_leases=leases)
 
     def sampler_modifier_provider(self) -> ESampSamplerModifierProvider:
         return self._sampler_provider
@@ -468,6 +609,15 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
                 prompt_idxs = []
 
         self._ensure_runtime_resources(ctx, rows_hidden=source_hidden)
+        executor = self._workgraph_executor
+        step_id = int(bundle.key.engine_step_id)
+        if executor is not None and self._workgraph_prepared_step_id == step_id:
+            executor.execute_step(
+                step_id,
+                tensors=(source_hidden, target_hidden),
+            )
+        else:
+            _esamp_residual_side_work(source_hidden, target_hidden)
         self._last_active_rows = int(source_hidden.shape[0])
         self._last_prompt_idxs = tuple(prompt_idxs[: int(source_hidden.shape[0])])
         self._engine.launch_step(source_hidden, target_hidden)
@@ -489,12 +639,16 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         """Stage and launch the compiler-owned ESamp training node."""
         self._stage_training_bundle(bundle, ctx)
         self._launch_staged_training(ctx)
+        self.finish_workgraph_step(int(bundle.key.engine_step_id))
 
     def consume_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
         self._stage_training_bundle(bundle, ctx)
 
     def on_step_end(self, ctx: RuntimeContext) -> None:
         self._launch_staged_training(ctx)
+        step_id = self._workgraph_prepared_step_id
+        if step_id >= 0:
+            self.finish_workgraph_step(step_id)
 
     def retire_device_lease(self, ctx: RuntimeContext) -> None:
         del ctx

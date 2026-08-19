@@ -659,6 +659,15 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         else:
             _fast_weight.update_fast_weight_phase_from_runner(core.RUNTIME, runner)
         return out
+    from tllm.runtime import residual_runtime as _residual_runtime
+
+    if core is _residual_runtime:
+        _residual_runtime.prepare_physical_workgraph_step(
+            # ``event_step_id`` is advanced after the legacy runner builds
+            # its inputs.  Prepare the step that the resulting bundle will
+            # carry, while retaining this prepare-inputs safe point.
+            int(_residual_runtime.RUNTIME.event_step_id) + 1
+        )
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,

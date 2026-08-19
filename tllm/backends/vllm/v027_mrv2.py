@@ -26,7 +26,10 @@ from tllm.backends.protocol import (
     SamplerStage,
 )
 from tllm.backends.vllm import sampler_mrv2 as _sampler_mrv2
-from tllm.backends.vllm.workgraph_runtime import record_resolved_backend
+from tllm.backends.vllm.workgraph_runtime import (
+    cold_specialize_loaded_runtime,
+    record_resolved_backend,
+)
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
@@ -103,6 +106,10 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         return orig(runner, *args, **kwargs)
 
     runtime.event_step_id += 1
+    from tllm.runtime import residual_runtime as _residual_runtime
+
+    if core is _residual_runtime:
+        _residual_runtime.prepare_physical_workgraph_step(int(runtime.event_step_id))
     session = StepSession(
         step_id=int(runtime.event_step_id),
         backend_id=V027MRv2Driver.backend_id,
@@ -213,6 +220,7 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
             capabilities=V027MRv2Driver().capabilities(),
             graph_mode=resolve_graph_mode(runner),
         )
+        cold_specialize_loaded_runtime(core=core, runner=runner)
 
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, *args, **kwargs)

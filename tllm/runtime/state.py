@@ -36,6 +36,8 @@ from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrie
 
 if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
+    from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
+    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.compiler import Phase1aPlan
     from tllm.workgraph.frontend import CapturedFlow
@@ -129,6 +131,11 @@ class ResidualRuntimeState:
     # and reused by cold shadow refreshes after later plan changes.
     workgraph_backend_resolution: Optional["BackendResolution"] = None
     workgraph_refresh_pending: bool = False
+    # Physical descriptors are published only by the cold compiler path and
+    # become visible when the next step acquires its prepare-time snapshot.
+    physical_plan_store: Optional["PlanSnapshotStore"] = None
+    physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
+    physical_prepared_step_id: int = -1
     producer_executor: Optional["ProducerExecutor"] = None
     deferred_work_queue: DeferredWorkQueue = field(default_factory=DeferredWorkQueue)
     fusion_executor: FusionExecutor = field(default_factory=FusionExecutor)

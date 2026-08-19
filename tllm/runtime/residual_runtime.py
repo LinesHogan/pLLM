@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
+    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
 
 ensure_v1_env()
 
@@ -108,6 +110,8 @@ def _refresh_dispatch_plan() -> None:
         RUNTIME.workgraph_captures = ()
         RUNTIME.workgraph_attachments = ()
         RUNTIME.workgraph_refresh_pending = False
+        RUNTIME.physical_plan_store = None
+        _clear_physical_capture_regions()
         RUNTIME.producer_executor = None
         return
     captures, attachments = _collect_workgraph_capture_metadata(consumers)
@@ -193,7 +197,157 @@ def _compile_concrete_workgraph_snapshot() -> None:
         captures=RUNTIME.workgraph_captures,
         attachments=RUNTIME.workgraph_attachments,
     )
+    _stage_physical_workgraph_snapshot()
     RUNTIME.workgraph_refresh_pending = False
+
+
+def _stage_physical_workgraph_snapshot() -> None:
+    """Lower and stage one concrete physical descriptor snapshot.
+
+    Runtime streams, events, leases, and graphs are attached by the executor
+    resource factory when an executable region is activated.  Publishing the
+    frozen plan here keeps compilation off the step path and gives every step
+    a stable epoch even while those resources are still legacy-owned.
+    """
+
+    snapshot = RUNTIME.workgraph_snapshot
+    if snapshot is None:
+        RUNTIME.physical_plan_store = None
+        _clear_physical_capture_regions()
+        return
+    backend = snapshot.backend
+    if backend is None or backend.graph_mode == "full":
+        # FULL remains a typed Phase 1 diagnostic and an explicit legacy
+        # boundary.  It must never acquire a partially usable physical plan.
+        RUNTIME.physical_plan_store = None
+        _clear_physical_capture_regions()
+        return
+
+    from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
+    from tllm.workgraph.physical import compile_physical_flow_plan
+
+    resources = PlanResources(plan=compile_physical_flow_plan(snapshot))
+    store = RUNTIME.physical_plan_store
+    if store is None:
+        RUNTIME.physical_plan_store = PlanSnapshotStore(resources)
+        _activate_physical_capture_regions(snapshot)
+        return
+    current_epoch = store.current.plan.plan_epoch
+    if resources.plan.plan_epoch <= current_epoch:
+        _activate_physical_capture_regions(snapshot)
+        return
+    store.stage(resources)
+    _activate_physical_capture_regions(snapshot)
+
+
+def _activate_physical_capture_regions(snapshot: object) -> None:
+    """Publish migrated regions through the typed consumer interface."""
+
+    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.ir import NodeKey
+    from tllm.workgraph.physical import compile_physical_capture_region
+
+    if not isinstance(snapshot, Phase1aPlan):
+        raise TypeError("physical capture activation requires Phase1aPlan")
+    hierarchy = snapshot.hierarchy
+    if hierarchy is None:
+        return
+    from tllm.workgraph.frontend import CaptureStatus
+
+    executable_artifacts = {
+        root.artifact_key
+        for root in hierarchy.roots
+        if root.status == CaptureStatus.CAPTURED and len(root.children) == 1
+    }
+    consumers = _active_dispatch_consumers()
+    for consumer in consumers:
+        owned_nodes = {
+            NodeKey.consumer_flow(consumer.consumer_id, ordinal)
+            for ordinal, _flow in enumerate(consumer.flows())
+        }
+        consumer.activate_workgraph_regions(
+            tuple(
+                compile_physical_capture_region(snapshot, attachment.artifact_key)
+                for attachment in hierarchy.attachments
+                if attachment.node_key in owned_nodes
+                and attachment.artifact_key in executable_artifacts
+            )
+        )
+
+
+def _clear_physical_capture_regions() -> None:
+    for consumer in _active_dispatch_consumers():
+        consumer.activate_workgraph_regions(())
+
+
+def prepare_physical_workgraph_step(step_id: int) -> None:
+    """Publish staged physical epochs at the existing prepare safe point."""
+
+    step = int(step_id)
+    if step < 0:
+        raise ValueError("physical WorkGraph step id must be non-negative")
+    previous = RUNTIME.physical_prepared_step_id
+    store = RUNTIME.physical_plan_store
+    if previous >= 0 and previous != step:
+        if store is not None:
+            store.finish_step(previous)
+            store.collect_retired()
+        for consumer in _active_dispatch_consumers():
+            consumer.finish_workgraph_step(previous)
+    if store is not None:
+        store.prepare_step(step)
+    for consumer in _active_dispatch_consumers():
+        consumer.prepare_workgraph_step(step)
+    RUNTIME.physical_prepared_step_id = step
+
+
+def prepare_workgraph_step(step_id: int) -> None:
+    """Compatibility-free public name used by runner safe-point adapters."""
+
+    prepare_physical_workgraph_step(step_id)
+
+
+def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
+    """Aggregate non-resetting physical executor and deadline statistics."""
+
+    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
+
+    snapshots = [
+        consumer.read_workgraph_runtime_stats()
+        for consumer in _active_dispatch_consumers()
+    ]
+    physical_executor = RUNTIME.physical_executor
+    if physical_executor is not None:
+        snapshots.insert(0, physical_executor.read_workgraph_runtime_stats())
+    local = WorkGraphRuntimeStats(
+        active_plan_epoch=max(
+            (snapshot.active_plan_epoch for snapshot in snapshots),
+            default=0,
+        ),
+        prepare_count=sum(snapshot.prepare_count for snapshot in snapshots),
+        execute_count=sum(snapshot.execute_count for snapshot in snapshots),
+        finish_count=sum(snapshot.finish_count for snapshot in snapshots),
+        replay_count=sum(snapshot.replay_count for snapshot in snapshots),
+        eager_count=sum(snapshot.eager_count for snapshot in snapshots),
+        fallback_count=sum(snapshot.fallback_count for snapshot in snapshots),
+        fence_wait_count=sum(snapshot.fence_wait_count for snapshot in snapshots),
+        fence_record_count=sum(snapshot.fence_record_count for snapshot in snapshots),
+        bucket_miss_count=sum(snapshot.bucket_miss_count for snapshot in snapshots),
+        specialization_request_count=sum(
+            snapshot.specialization_request_count for snapshot in snapshots
+        ),
+        active_leases=sum(snapshot.active_leases for snapshot in snapshots),
+        retired_plans=sum(snapshot.retired_plans for snapshot in snapshots),
+        deadline_flush_count=int(RUNTIME.placement_stats.deadline_flush_count),
+    )
+    from tllm.runtime.mp.control import active_control_plane
+
+    plane = active_control_plane()
+    if plane is None:
+        return local
+    return WorkGraphRuntimeStats.merge(
+        (local, *(reply.workgraph for reply in plane.pull_stats("workgraph", sync=False)))
+    )
 
 
 def record_workgraph_backend_resolution(*, resolution: "BackendResolution") -> None:
@@ -267,6 +421,18 @@ def refresh_workgraph_capture_metadata() -> None:
     RUNTIME.workgraph_refresh_pending = True
     if not plan.requires_graph_mode_refresh(resolution.graph_mode):
         _compile_concrete_workgraph_snapshot()
+
+
+def cold_specialize_workgraph(spec: "RuntimeSpecializationSpec") -> None:
+    """Publish backend-derived capture examples before the first runtime step."""
+
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
+
+    if not isinstance(spec, RuntimeSpecializationSpec):
+        raise TypeError("cold WorkGraph specialization requires RuntimeSpecializationSpec")
+    for consumer in _active_dispatch_consumers():
+        consumer.cold_specialize_workgraph(spec)
+    refresh_workgraph_capture_metadata()
 
 
 def register_dispatch_consumer(consumer: BaseConsumer) -> None:
