@@ -15,6 +15,7 @@ from tllm.workgraph.frontend import (
     ArtifactKey,
     Capability,
     CaptureStatus,
+    ExternContract,
     TensorDTypeDesc,
     TensorDeviceDesc,
 )
@@ -300,6 +301,7 @@ class PhysicalCaptureRegion:
 
     attachment: CaptureAttachment
     plan: PhysicalFlowPlan
+    executor_contract: ExternContract | None = None
 
     def __post_init__(self) -> None:
         attachment = _instance(
@@ -308,14 +310,73 @@ class PhysicalCaptureRegion:
             "PhysicalCaptureRegion.attachment",
         )
         plan = _instance(self.plan, PhysicalFlowPlan, "PhysicalCaptureRegion.plan")
+        contract = self.executor_contract
+        if contract is not None:
+            contract = _instance(
+                contract,
+                ExternContract,
+                "PhysicalCaptureRegion.executor_contract",
+            )
         if not plan.nodes:
             raise ValueError("PhysicalCaptureRegion.plan must contain a capture task")
         if any(node.node_key.namespace != "capture_task" for node in plan.nodes):
             raise ValueError("PhysicalCaptureRegion.plan may contain only capture tasks")
         if any(node.artifact_key != attachment.artifact_key for node in plan.nodes):
             raise ValueError("PhysicalCaptureRegion plan artifact differs from its attachment")
+        if contract is not None:
+            attached_ports = {
+                (binding.port, binding.direction)
+                for binding in attachment.bindings
+            }
+            implementation_ports = {
+                (binding.port, binding.direction)
+                for binding in contract.bindings
+            }
+            if implementation_ports != attached_ports:
+                raise ValueError(
+                    "physical region executor contract must bind every attached port"
+                )
         object.__setattr__(self, "attachment", attachment)
         object.__setattr__(self, "plan", plan)
+        object.__setattr__(self, "executor_contract", contract)
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalRegionExecutorDesc:
+    """Frozen external implementation selected for one attached region."""
+
+    artifact_key: ArtifactKey
+    executor: ExecutorKey
+    contract: ExternContract
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "artifact_key",
+            _instance(
+                self.artifact_key,
+                ArtifactKey,
+                "PhysicalRegionExecutorDesc.artifact_key",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "executor",
+            _instance(
+                self.executor,
+                ExecutorKey,
+                "PhysicalRegionExecutorDesc.executor",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "contract",
+            _instance(
+                self.contract,
+                ExternContract,
+                "PhysicalRegionExecutorDesc.contract",
+            ),
+        )
 
 
 def _fence_kind(edge_kind: EdgeKind) -> FenceKind:
@@ -529,6 +590,7 @@ def compile_physical_flow_plan(plan: Phase1aPlan) -> PhysicalFlowPlan:
 def compile_physical_capture_region(
     plan: Phase1aPlan,
     artifact_key: ArtifactKey,
+    executor_desc: PhysicalRegionExecutorDesc | None = None,
 ) -> PhysicalCaptureRegion:
     """Lower one complete hierarchy root into an independently runnable plan.
 
@@ -548,6 +610,15 @@ def compile_physical_capture_region(
         ArtifactKey,
         "compile_physical_capture_region.artifact_key",
     )
+    implementation = executor_desc
+    if implementation is not None:
+        implementation = _instance(
+            implementation,
+            PhysicalRegionExecutorDesc,
+            "compile_physical_capture_region.executor_desc",
+        )
+        if implementation.artifact_key != key:
+            raise ValueError("physical region executor artifact does not match capture")
     hierarchy = raw_plan.hierarchy
     if hierarchy is None:
         raise WorkGraphError(
@@ -595,20 +666,25 @@ def compile_physical_capture_region(
             "capture task has no complete leaf artifact",
         )
 
-    # An alias-only handoff has no CUDA work to capture.  Treating its empty
-    # exported graph as replay would inflate replay counters without doing
-    # work, so it uses the normal eager handler and records no fallback.
-    policy = (
-        CapturePolicy.DISABLED
-        if not artifact.operators
-        else _capture_policy(root)
-    )
+    # An empty exported leaf has no graph work to replay. A selected eager-only
+    # extern may still perform real runtime work, but it must run via its fixed
+    # handler instead of inflating graph replay or fallback counters.
+    policy = _capture_policy(root)
+    if not artifact.operators or (
+        implementation is not None
+        and implementation.contract.capability == Capability.EAGER_ONLY
+    ):
+        policy = CapturePolicy.DISABLED
     physical = PhysicalFlowPlan(
         plan_epoch=raw_plan.epoch,
         nodes=(
             PhysicalNodePlan(
                 node_key=task.node_key,
-                executor=task.executor,
+                executor=(
+                    task.executor
+                    if implementation is None
+                    else implementation.executor
+                ),
                 stream=StreamClass.SIDE_FORWARD,
                 artifact_key=key,
                 capture_policy=policy,
@@ -625,7 +701,13 @@ def compile_physical_capture_region(
             "WG400_RUST_PHYSICAL_VALIDATION",
             "Rust capture-region descriptor validation failed",
         ) from exc
-    return PhysicalCaptureRegion(attachment=attachment, plan=physical)
+    return PhysicalCaptureRegion(
+        attachment=attachment,
+        plan=physical,
+        executor_contract=(
+            None if implementation is None else implementation.contract
+        ),
+    )
 
 
 __all__ = [
@@ -640,6 +722,7 @@ __all__ = [
     "PhysicalFlowPlan",
     "PhysicalCaptureRegion",
     "PhysicalNodePlan",
+    "PhysicalRegionExecutorDesc",
     "StreamClass",
     "compile_physical_flow_plan",
     "compile_physical_capture_region",

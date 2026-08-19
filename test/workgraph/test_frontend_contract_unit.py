@@ -132,6 +132,25 @@ class WorkGraphFrontendContractTest(unittest.TestCase):
                 lambda value: value
             )
 
+    def test_extern_rejects_input_binding_to_an_unknown_parameter_position(self) -> None:
+        binding = PortBindingDesc(
+            port=PortId("extern", "input"),
+            direction=PortBindingDirection.INPUT,
+            value_path=(99,),
+        )
+
+        with self.assertRaises(ValueError):
+
+            @extern(
+                effect=Effect.WRITE_STATE,
+                state=StateScope.REPLICA,
+                device=Device.CPU,
+                capability=Capability.EAGER_ONLY,
+                bindings=(binding,),
+            )
+            def invalid_binding(value: int) -> int:
+                return value
+
     def test_port_bindings_are_structured_unique_and_signature_stable(self) -> None:
         binding = PortBindingDesc(
             port=PortId("capture", "input"),

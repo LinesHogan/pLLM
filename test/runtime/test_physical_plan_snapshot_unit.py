@@ -60,6 +60,17 @@ class _FakeGraph:
         pass
 
 
+def _runtime_stream(key: StreamClass, fence_name: str) -> RuntimeStream:
+    return RuntimeStream(
+        key=key,
+        stream=_FakeStream(),
+        retire_fence=Fence(
+            FenceKey("snapshot", fence_name),
+            _FakeEvent(),
+        ),
+    )
+
+
 def _bucket(
     name: str,
     *,
@@ -143,6 +154,38 @@ def _lease(
 
 
 class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
+    def test_stream_retire_fence_key_has_one_event_identity_across_runtime_events_and_leases(self) -> None:
+        bucket = _bucket("retire-identity")
+        plan, ready_key, _capture_key = _runtime_plan(1, bucket)
+
+        with self.assertRaises(ValueError):
+            PlanResources(
+                plan=plan,
+                streams=(
+                    RuntimeStream(
+                        StreamClass.DEFAULT,
+                        _FakeStream(),
+                        Fence(ready_key, _FakeEvent()),
+                    ),
+                ),
+                events=(RuntimeEvent(ready_key, _FakeEvent()),),
+            )
+
+        lease, _completion_event, _retire_event = _lease(1, bucket, 0)
+        assert lease.retire_fence is not None
+        with self.assertRaises(ValueError):
+            PlanResources(
+                plan=plan,
+                leases=(lease,),
+                streams=(
+                    RuntimeStream(
+                        StreamClass.DEFAULT,
+                        _FakeStream(),
+                        Fence(lease.retire_fence.key, _FakeEvent()),
+                    ),
+                ),
+            )
+
     def test_step_snapshot_is_fixed_until_the_next_prepare_safe_point(self) -> None:
         initial = PlanResources(plan=_plan(1))
         staged = PlanResources(plan=_plan(2))
@@ -208,9 +251,17 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
         lease, completion_event, retire_event = _lease(1, bucket, 0)
         runtime_plan, ready_key, capture_key = _runtime_plan(1, bucket)
         stream = _FakeStream()
+        stream_retire_event = _FakeEvent()
         event = _FakeEvent()
         graph = _FakeGraph()
-        stream_resource = RuntimeStream(key=StreamClass.DEFAULT, stream=stream)
+        stream_resource = RuntimeStream(
+            key=StreamClass.DEFAULT,
+            stream=stream,
+            retire_fence=Fence(
+                FenceKey("snapshot", "retire-strong"),
+                stream_retire_event,
+            ),
+        )
         event_resource = RuntimeEvent(
             key=ready_key,
             event=event,
@@ -243,6 +294,8 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
         store.stage(replacement)
         store.prepare_step(31)
         store.finish_step(31)
+        store.finish_step(30)
+        stream_resource.retire_fence.record(stream)
         del initial, stream_resource, event_resource, graph_resource
         del stream, event, graph
         gc.collect()
@@ -253,7 +306,6 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
         self.assertIsNotNone(graph_ref())
         self.assertEqual(store.collect_retired(), 0)
 
-        store.finish_step(30)
         # Finishing the step is not enough while its lease still has in-flight work.
         self.assertEqual(store.collect_retired(), 0)
         gc.collect()
@@ -265,12 +317,75 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
         lease.publish_retire(None)
         completion_event.done = True
         retire_event.done = True
+        stream_retire_event.done = True
         self.assertTrue(lease.reusable)
         self.assertEqual(store.collect_retired(), 1)
         gc.collect()
 
         self.assertIsNone(stream_ref())
         self.assertIsNone(event_ref())
+        self.assertIsNone(graph_ref())
+
+    def test_runtime_stream_resources_wait_for_all_retire_fences_without_leases(self) -> None:
+        bucket = _bucket("stream-retire")
+        runtime_plan, ready_key, capture_key = _runtime_plan(1, bucket)
+        default_stream = _FakeStream()
+        side_train_stream = _FakeStream()
+        default_retire = _FakeEvent()
+        side_train_retire = _FakeEvent()
+        default_stream_resource = RuntimeStream(
+            StreamClass.DEFAULT,
+            default_stream,
+            retire_fence=Fence(
+                FenceKey("snapshot", "retire-default"),
+                default_retire,
+            ),
+        )
+        side_train_stream_resource = RuntimeStream(
+            StreamClass.SIDE_TRAIN,
+            side_train_stream,
+            retire_fence=Fence(
+                FenceKey("snapshot", "retire-side-train"),
+                side_train_retire,
+            ),
+        )
+        event = _FakeEvent()
+        graph = _FakeGraph()
+        initial = PlanResources(
+            plan=runtime_plan,
+            streams=(default_stream_resource, side_train_stream_resource),
+            events=(RuntimeEvent(ready_key, event),),
+            graphs=(RuntimeGraph(capture_key, graph),),
+        )
+        replacement = PlanResources(plan=_plan(2))
+        stream_ref = weakref.ref(default_stream)
+        side_train_stream_ref = weakref.ref(side_train_stream)
+        graph_ref = weakref.ref(graph)
+        store = PlanSnapshotStore(initial)
+
+        store.prepare_step(30)
+        store.stage(replacement)
+        store.prepare_step(31)
+        store.finish_step(31)
+        store.finish_step(30)
+        default_stream_resource.retire_fence.record(default_stream)
+        side_train_stream_resource.retire_fence.record(side_train_stream)
+        del initial, default_stream_resource, side_train_stream_resource
+        del default_stream, side_train_stream, graph
+        gc.collect()
+
+        self.assertEqual(store.collect_retired(), 0)
+        self.assertEqual(store.retired_count, 1)
+        self.assertIsNotNone(stream_ref())
+        self.assertIsNotNone(side_train_stream_ref())
+        self.assertIsNotNone(graph_ref())
+
+        default_retire.done = True
+        side_train_retire.done = True
+        self.assertEqual(store.collect_retired(), 1)
+        gc.collect()
+        self.assertIsNone(stream_ref())
+        self.assertIsNone(side_train_stream_ref())
         self.assertIsNone(graph_ref())
 
     def test_plan_resources_reject_stream_key_not_used_by_the_plan(self) -> None:
@@ -280,7 +395,7 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             PlanResources(
                 plan=plan,
-                streams=(RuntimeStream(StreamClass.SIDE_FORWARD, _FakeStream()),),
+                streams=(_runtime_stream(StreamClass.SIDE_FORWARD, "retire-invalid"),),
             )
 
     def test_plan_resources_reject_event_key_not_owned_by_plan_or_leases(self) -> None:
@@ -335,11 +450,23 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
         graph_key = ArtifactKey("snapshot", "capture", digest="a" * 64)
 
         with self.assertRaises(TypeError):
-            RuntimeStream(key="default", stream=_FakeStream())  # type: ignore[arg-type]
+            RuntimeStream(
+                key="default",
+                stream=_FakeStream(),
+                retire_fence=Fence(FenceKey("snapshot", "retire-invalid-key"), _FakeEvent()),  # type: ignore[arg-type]
+            )
         with self.assertRaises(TypeError):
-            RuntimeStream(key=stream_key, stream=None)
+            RuntimeStream(
+                key=stream_key,
+                stream=None,
+                retire_fence=Fence(FenceKey("snapshot", "retire-invalid-stream"), _FakeEvent()),
+            )
         with self.assertRaises(TypeError):
-            RuntimeStream(key=stream_key, stream=0)
+            RuntimeStream(
+                key=stream_key,
+                stream=0,
+                retire_fence=Fence(FenceKey("snapshot", "retire-invalid-handle"), _FakeEvent()),
+            )
 
         with self.assertRaises(TypeError):
             RuntimeEvent(key="ready", event=_FakeEvent())  # type: ignore[arg-type]
@@ -363,8 +490,8 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
             PlanResources(
                 plan=plan,
                 streams=(
-                    RuntimeStream(StreamClass.DEFAULT, _FakeStream()),
-                    RuntimeStream(StreamClass.DEFAULT, _FakeStream()),
+                    _runtime_stream(StreamClass.DEFAULT, "retire-duplicate-1"),
+                    _runtime_stream(StreamClass.DEFAULT, "retire-duplicate-2"),
                 ),
             )
         with self.assertRaises(ValueError):
@@ -391,7 +518,7 @@ class PhysicalPlanSnapshotUnitTest(unittest.TestCase):
             )
 
     def test_runtime_holders_are_not_structural_workgraph_metadata(self) -> None:
-        runtime_stream = RuntimeStream(StreamClass.DEFAULT, _FakeStream())
+        runtime_stream = _runtime_stream(StreamClass.DEFAULT, "retire-signature")
 
         with self.assertRaises(TypeError):
             structural_signature((runtime_stream,))

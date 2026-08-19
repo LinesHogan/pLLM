@@ -19,6 +19,7 @@ from tllm.contracts.runtime_context import RuntimeContext
 from tllm.runtime import residual_runtime
 from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
+from tllm.runtime.scheduling.workgraph_executor import PhysicalExecutor
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph.anchors import BackendResolution
@@ -278,6 +279,32 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
 
         capture_flow.assert_not_called()
         engine.launch_step.assert_called_once()
+
+    def test_cold_specialized_executor_performs_training_without_consume_wrapper(self) -> None:
+        engine = mock.Mock()
+        consumer = ESampConsumer(
+            ESampConsumerConfig(graph_scratch_rows=4),
+            engine=engine,
+        )
+        state = ResidualRuntimeState()
+        source = torch.randn(4, 8)
+        target = torch.randn(4, 8)
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.register_dispatch_consumer(consumer)
+            residual_runtime.record_workgraph_backend_resolution(
+                resolution=_resolution(),
+            )
+            residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
+            residual_runtime.cold_specialize_workgraph(_spec())
+            consumer.prepare_workgraph_step(1)
+            executor = getattr(consumer, "_workgraph_executor", None)
+            self.assertIsInstance(executor, PhysicalExecutor)
+            assert isinstance(executor, PhysicalExecutor)
+            executor.execute_step(1, tensors=(source, target))
+            consumer.finish_workgraph_step(1)
+
+        engine.launch_step.assert_called_once_with(source, target)
 
     def test_mrv2_prepare_safe_point_uses_new_event_step_id(self) -> None:
         state = ResidualRuntimeState()

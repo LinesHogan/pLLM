@@ -14,6 +14,7 @@ from unittest import mock
 import torch
 
 from tllm.backends.protocol import BackendCapabilities, GraphSafety, SamplerStage
+from tllm.consumers.base import BaseConsumer
 from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
 from tllm.runtime import residual_runtime
 from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
@@ -72,6 +73,71 @@ def _activate_concrete(
 
 
 class Phase2RuntimeActivationUnitTest(unittest.TestCase):
+    def test_prepare_drains_consumer_specializations_before_acquiring_new_snapshot(self) -> None:
+        order: list[tuple[str, int]] = []
+
+        class _DrainProbeConsumer(BaseConsumer[object]):
+            config = object()
+
+            @property
+            def consumer_id(self) -> str:
+                return "phase2.drain-probe"
+
+            def drain_workgraph_specializations(self) -> int:
+                order.append(("drain", 7))
+                return 1
+
+            def prepare_workgraph_step(self, step_id: int) -> None:
+                order.append(("consumer_prepare", int(step_id)))
+
+        store = mock.Mock()
+        store.prepare_step.side_effect = lambda step_id: order.append(("acquire", int(step_id)))
+        state = ResidualRuntimeState()
+        state.physical_plan_store = store
+        consumer = _DrainProbeConsumer()
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(
+                residual_runtime,
+                "_active_dispatch_consumers",
+                return_value=[consumer],
+            ),
+        ):
+            residual_runtime.prepare_physical_workgraph_step(7)
+
+        self.assertEqual(
+            order,
+            [("drain", 7), ("acquire", 7), ("consumer_prepare", 7)],
+        )
+
+    def test_attachment_without_executor_descriptor_remains_shadow_only(self) -> None:
+        consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
+        _specialize(consumer, 2)
+        state = ResidualRuntimeState()
+        _activate_concrete(state, consumer)
+        snapshot = state.workgraph_snapshot
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(
+                residual_runtime,
+                "_active_dispatch_consumers",
+                return_value=[consumer],
+            ),
+            mock.patch.object(
+                consumer,
+                "workgraph_region_executors",
+                return_value=(),
+            ),
+            mock.patch.object(consumer, "activate_workgraph_regions") as activate,
+        ):
+            residual_runtime._activate_physical_capture_regions(snapshot)
+
+        activate.assert_called_once_with(())
+
     def test_concrete_shadow_lowers_to_a_physical_plan_resources_snapshot(self) -> None:
         consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
         _specialize(consumer, 2)

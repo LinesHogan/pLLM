@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -21,6 +22,7 @@ from tllm.runtime.vllm_patch import port_runtime_hooks
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.execution_plan import compile_default_plan
 from tllm.runtime.graph_policy import GraphMode
+from tllm.runtime.scheduling.physical import Fence
 from tllm.runtime.scheduling.plan_store import (
     PlanResources,
     PlanSnapshotStore,
@@ -34,14 +36,19 @@ from tllm.runtime.scheduling.workgraph_executor import (
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import (
     ArtifactKey,
+    Capability,
     CaptureAttachment,
     CaptureStatus,
     CapturedFlow,
+    Device,
+    Effect,
     ExecutorKey,
     NodeKey,
+    StateScope,
     compile_phase1a,
     flow,
 )
+from tllm.workgraph.frontend import ExternContract
 from tllm.workgraph.anchors import BackendResolution, shadow_backend_snapshot
 from tllm.workgraph import physical as physical_module
 from tllm.workgraph.lowering import WorkGraphError
@@ -49,6 +56,7 @@ from tllm.workgraph.physical import (
     CapturePolicy,
     FallbackPolicy,
     PhysicalFlowPlan,
+    FenceKey,
     StreamClass,
 )
 
@@ -56,6 +64,28 @@ from tllm.workgraph.physical import (
 class _FakeStream:
     def wait_event(self, event: object) -> None:
         del event
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self.done = True
+
+    def record(self, stream: object) -> None:
+        del stream
+
+    def query(self) -> bool:
+        return self.done
+
+
+def _runtime_stream() -> RuntimeStream:
+    return RuntimeStream(
+        StreamClass.SIDE_FORWARD,
+        _FakeStream(),
+        Fence(
+            FenceKey("phase2-region", "retire-side-forward"),
+            _FakeEvent(),
+        ),
+    )
 
 
 class _RecordingESampConsumer(ESampConsumer):
@@ -198,6 +228,39 @@ def _step_bundle(
 
 
 class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
+    def test_clear_active_region_defers_destruction_until_the_prepared_step_retires(self) -> None:
+        consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
+        _consumer, _phase1, _captured = _esamp_phase1(consumer)
+        state = ResidualRuntimeState()
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.register_dispatch_consumer(consumer)
+            residual_runtime.record_workgraph_backend_resolution(
+                resolution=_resolution(),
+            )
+            residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
+            consumer.prepare_workgraph_step(1)
+            store = consumer._workgraph_plan_store
+            executor = consumer._workgraph_executor
+            self.assertIsNotNone(store)
+            self.assertIsNotNone(executor)
+            assert store is not None
+            active = store.active(1)
+
+            # FULL/disable paths use this same clear API. They must retain the
+            # active epoch until its executor records and observes retirement.
+            consumer.activate_workgraph_regions(())
+
+            self.assertIs(consumer._workgraph_plan_store, store)
+            self.assertIs(consumer._workgraph_executor, executor)
+            self.assertIs(store.active(1), active)
+
+            consumer.finish_workgraph_step(1)
+            consumer.activate_workgraph_regions(())
+
+        self.assertIsNone(consumer._workgraph_plan_store)
+        self.assertIsNone(consumer._workgraph_executor)
+
     def test_wrapped_prepare_inputs_prepares_physical_regions_before_prepare_dispatch(self) -> None:
         state = ResidualRuntimeState()
         state.event_step_id = 17
@@ -311,7 +374,14 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
             residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
 
             self.assertIsNone(state.physical_plan_store)
-            self.assertIsNone(consumer.workgraph_execution_stats())
+            # FULL clears the runtime-wide physical publication immediately,
+            # but an active consumer step still owns its private epoch.  The
+            # deactivation is pending until that step records retirement.
+            self.assertIsNotNone(consumer._workgraph_plan_store)
+            self.assertIsNotNone(consumer._workgraph_executor)
+            self.assertTrue(consumer._workgraph_deactivate_pending)
+            self.assertEqual(consumer._workgraph_prepared_step_id, 1)
+            self.assertIsNotNone(consumer.workgraph_execution_stats())
             with mock.patch.object(
                 consumer,
                 "_ensure_runtime_resources",
@@ -321,6 +391,10 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
                     _step_bundle(torch.randn(2, 4), torch.randn(2, 4), step_id=2),
                     _context(),
                 )
+
+            consumer.finish_workgraph_step(1)
+            self.assertIsNone(consumer._workgraph_plan_store)
+            self.assertIsNone(consumer._workgraph_executor)
 
         self.assertEqual(piecewise_stats.execute_count, 1)
         self.assertEqual(piecewise_stats.fallback_count, 0)
@@ -401,6 +475,85 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
         self.assertEqual(plan.plan_epoch, state.workgraph_snapshot.epoch)
         self.assertEqual(plan.nodes[0].artifact_key, captured.artifact_key)
 
+    def test_physical_handler_performs_training_launch_without_outer_consume(self) -> None:
+        """The physical executor must own the real ESamp launch.
+
+        A pure identity capture is only a data handoff description.  Calling
+        the activated executor directly must still enter the authoritative
+        training engine; otherwise an outer ``consume_bundle`` launch can
+        make the physical path look active while the region itself does no
+        training.
+        """
+
+        engine = mock.Mock()
+        consumer = ESampConsumer(
+            ESampConsumerConfig(graph_scratch_rows=8),
+            engine=engine,
+        )
+        _consumer, _phase1, _captured = _esamp_phase1(consumer)
+        state = ResidualRuntimeState()
+        source = torch.randn(2, 4)
+        target = torch.randn(2, 4)
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.register_dispatch_consumer(consumer)
+            residual_runtime.record_workgraph_backend_resolution(
+                resolution=_resolution(),
+            )
+            residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
+            consumer.prepare_workgraph_step(1)
+            executor = getattr(consumer, "_workgraph_executor", None)
+            self.assertIsInstance(executor, PhysicalExecutor)
+            assert isinstance(executor, PhysicalExecutor)
+            with mock.patch.object(
+                consumer,
+                "_ensure_runtime_resources",
+                return_value=None,
+            ):
+                executor.execute_step(1, tensors=(source, target))
+            consumer.finish_workgraph_step(1)
+
+        engine.launch_step.assert_called_once_with(source, target)
+
+    def test_physical_region_exposes_frozen_typed_training_executor_contract(self) -> None:
+        """The capture task must not be mistaken for the stateful trainer."""
+
+        consumer, phase1, captured = _esamp_phase1()
+        executors = getattr(consumer, "workgraph_region_executors", None)
+        self.assertTrue(
+            callable(executors),
+            "migrated consumers must expose typed region executor descriptors",
+        )
+        assert callable(executors)
+        executor_descs = executors()
+        self.assertEqual(len(executor_descs), 1)
+        compiler = getattr(physical_module, "compile_physical_capture_region", None)
+        self.assertTrue(callable(compiler))
+        assert callable(compiler)
+        region = compiler(
+            phase1,
+            captured.artifact_key,
+            executor_desc=executor_descs[0],
+        )
+        contract = getattr(region, "executor_contract", None)
+        self.assertIsInstance(
+            contract,
+            ExternContract,
+            "physical capture regions need an explicit typed executor contract",
+        )
+        assert isinstance(contract, ExternContract)
+        self.assertIs(contract.effect, Effect.WRITE_STATE)
+        self.assertIs(contract.state, StateScope.REPLICA)
+        self.assertIsInstance(contract.device, Device)
+        self.assertIs(contract.capability, Capability.EAGER_ONLY)
+        self.assertGreaterEqual(len(contract.inputs), 2)
+        with self.assertRaises(FrozenInstanceError):
+            contract.effect = Effect.PURE  # type: ignore[misc]
+
+        node = _region_plan(self, region).nodes[0]
+        self.assertIsInstance(node.executor, ExecutorKey)
+        self.assertEqual(node.executor, executor_descs[0].executor)
+
     def test_real_esamp_prepare_then_consume_uses_activated_region_and_exposes_physical_stats(self) -> None:
         engine = mock.Mock()
         consumer = ESampConsumer(
@@ -449,7 +602,7 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
         plan = _region_plan(self, region)
         resources = PlanResources(
             plan=plan,
-            streams=(RuntimeStream(StreamClass.SIDE_FORWARD, _FakeStream()),),
+            streams=(_runtime_stream(),),
         )
         executor = PhysicalExecutor(
             snapshots=PlanSnapshotStore(resources),
@@ -500,13 +653,30 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
             snapshots=PlanSnapshotStore(
                 PlanResources(
                     plan=plan,
-                    streams=(RuntimeStream(StreamClass.SIDE_FORWARD, _FakeStream()),),
+                    streams=(_runtime_stream(),),
                 )
             ),
             handlers={plan.nodes[0].executor: lambda _ctx: None},
         )
         with self.assertRaises(PhysicalExecutionError):
             executor.execute_step(1, tensors=(source, target))
+
+    def test_disabled_physical_region_uses_one_legacy_training_launch(self) -> None:
+        engine = mock.Mock()
+        consumer = ESampConsumer(
+            ESampConsumerConfig(
+                graph_scratch_rows=8,
+                enable_workgraph_execution=False,
+            ),
+            engine=engine,
+        )
+        source = torch.randn(2, 4)
+        target = torch.randn(2, 4)
+
+        with mock.patch.object(consumer, "_ensure_runtime_resources", return_value=None):
+            consumer.consume_bundle(_bundle(source, target), _context())
+
+        engine.launch_step.assert_called_once_with(source, target)
 
 
 if __name__ == "__main__":

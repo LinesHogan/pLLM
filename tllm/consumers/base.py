@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
-    from tllm.workgraph.physical import PhysicalCaptureRegion
+    from tllm.workgraph.physical import PhysicalCaptureRegion, PhysicalRegionExecutorDesc
 
 ConfigT = TypeVar("ConfigT")
 
@@ -80,6 +80,11 @@ class BaseConsumer(ABC, Generic[ConfigT]):
 
         return ()
 
+    def workgraph_region_executors(self) -> tuple["PhysicalRegionExecutorDesc", ...]:
+        """Return frozen typed implementations for explicitly migrated regions."""
+
+        return ()
+
     def cold_specialize_workgraph(self, spec: "RuntimeSpecializationSpec") -> None:
         """Optionally specialize capture metadata after the backend loads a model."""
 
@@ -92,6 +97,11 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         """Atomically replace cold-compiled regions attached to this consumer."""
 
         _ = regions
+
+    def drain_workgraph_specializations(self) -> int:
+        """Run queued physical specialization work at a prepare safe point."""
+
+        return 0
 
     def prepare_workgraph_step(self, step_id: int) -> None:
         """Acquire this consumer's staged physical region at a prepare safe point."""

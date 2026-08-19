@@ -261,16 +261,42 @@ def _activate_physical_capture_regions(snapshot: object) -> None:
     }
     consumers = _active_dispatch_consumers()
     for consumer in consumers:
+        declared_executors = consumer.workgraph_region_executors()
+        executor_descs = {
+            descriptor.artifact_key: descriptor
+            for descriptor in declared_executors
+        }
+        if len(executor_descs) != len(declared_executors):
+            raise ValueError("consumer declares duplicate WorkGraph region executors")
         owned_nodes = {
             NodeKey.consumer_flow(consumer.consumer_id, ordinal)
             for ordinal, _flow in enumerate(consumer.flows())
         }
+        owned_attachments = tuple(
+            attachment
+            for attachment in hierarchy.attachments
+            if attachment.node_key in owned_nodes
+            and attachment.artifact_key in executable_artifacts
+        )
+        owned_artifacts = {attachment.artifact_key for attachment in owned_attachments}
+        undeclared_artifacts = set(executor_descs).difference(owned_artifacts)
+        if undeclared_artifacts:
+            raise ValueError(
+                "consumer declares WorkGraph executors without matching attachments"
+            )
+        executable_attachments = tuple(
+            attachment
+            for attachment in owned_attachments
+            if attachment.artifact_key in executor_descs
+        )
         consumer.activate_workgraph_regions(
             tuple(
-                compile_physical_capture_region(snapshot, attachment.artifact_key)
-                for attachment in hierarchy.attachments
-                if attachment.node_key in owned_nodes
-                and attachment.artifact_key in executable_artifacts
+                compile_physical_capture_region(
+                    snapshot,
+                    attachment.artifact_key,
+                    executor_descs[attachment.artifact_key],
+                )
+                for attachment in executable_attachments
             )
         )
 
@@ -294,6 +320,8 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
             store.collect_retired()
         for consumer in _active_dispatch_consumers():
             consumer.finish_workgraph_step(previous)
+    for consumer in _active_dispatch_consumers():
+        consumer.drain_workgraph_specializations()
     if store is not None:
         store.prepare_step(step)
     for consumer in _active_dispatch_consumers():

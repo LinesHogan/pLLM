@@ -767,6 +767,28 @@ class ExternContract:
         )
         if effect == Effect.PURE and state != StateScope.NONE:
             raise ValueError("pure extern cannot declare mutable state scope")
+        input_positions = {item.position for item in inputs}
+        if any(
+            binding.direction == PortBindingDirection.INPUT
+            and (
+                len(binding.value_path) != 1
+                or binding.value_path[0] not in input_positions
+            )
+            for binding in bindings
+        ):
+            raise ValueError(
+                "extern input bindings must reference a declared input position"
+            )
+        port_bindings = tuple(
+            (binding.port, binding.direction) for binding in bindings
+        )
+        value_bindings = tuple(
+            (binding.direction, binding.value_path) for binding in bindings
+        )
+        if len(set(port_bindings)) != len(port_bindings):
+            raise ValueError("extern bindings must map each port exactly once")
+        if len(set(value_bindings)) != len(value_bindings):
+            raise ValueError("extern bindings must map each value path exactly once")
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "output", output)
         object.__setattr__(self, "effect", effect)
@@ -774,6 +796,12 @@ class ExternContract:
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "capability", capability)
         object.__setattr__(self, "bindings", bindings)
+
+
+class ExternCallable(Protocol[_P, _R_co]):
+    extern_contract: ExternContract
+
+    def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R_co: ...
 
 
 class FlowCallable(Protocol[_P, _R_co]):
@@ -870,7 +898,7 @@ def extern(
     device: Device,
     capability: Capability,
     bindings: tuple[PortBindingDesc, ...] = (),
-) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+) -> Callable[[Callable[_P, _R]], ExternCallable[_P, _R]]:
     """Declare a typed opaque implementation while retaining normal Python calls."""
 
     effect = _require_instance(cast(object, effect), Effect, "extern.effect")
@@ -879,7 +907,7 @@ def extern(
     capability = _require_instance(cast(object, capability), Capability, "extern.capability")
     bindings = _require_tuple(cast(object, bindings), PortBindingDesc, "extern.bindings")
 
-    def decorate(function: Callable[_P, _R]) -> Callable[_P, _R]:
+    def decorate(function: Callable[_P, _R]) -> ExternCallable[_P, _R]:
         if not isinstance(function, FunctionType):
             raise TypeError("extern currently requires a Python function")
         signature = _resolved_signature(function)
@@ -907,7 +935,7 @@ def extern(
 
         setattr(wrapped, "__signature__", signature)
         setattr(wrapped, "extern_contract", contract)
-        return wrapped
+        return cast(ExternCallable[_P, _R], wrapped)
 
     return decorate
 
@@ -923,6 +951,7 @@ __all__ = [
     "DynamicDim",
     "Effect",
     "ExternContract",
+    "ExternCallable",
     "ExternInputDesc",
     "FlowCallable",
     "FlowCaptureCode",

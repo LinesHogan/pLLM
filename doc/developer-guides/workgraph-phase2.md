@@ -45,7 +45,7 @@ recorded and their events report complete.
 
 `PlanResources` owns the runtime objects for one epoch:
 
-- `RuntimeStream(StreamClass, stream)`;
+- `RuntimeStream(StreamClass, stream, retire_fence)`;
 - `RuntimeEvent(FenceKey, event)`;
 - `RuntimeGraph(ArtifactKey, graph)`;
 - the epoch's `BufferLease` objects and their Tensors.
@@ -54,8 +54,8 @@ These holders bind Python objects to frozen typed identities but are not
 structural metadata and cannot enter a WorkGraph signature or the Rust
 validator. `StreamPool`, `PipelineLane`, and `GraphCaptureLane` remain the
 behavior oracles for stream topology, rotating buffers, event choreography,
-and graph capture/replay. WorkGraph does not replace their execution path in
-this milestone.
+and graph capture/replay. The migrated ESamp region reuses those general
+runtime primitives rather than duplicating their CUDA choreography.
 
 No physical path calls `torch.cuda.synchronize()` to satisfy a dependency.
 Stream/event dependencies and retire fences are the required protocol.
@@ -67,10 +67,12 @@ Stream/event dependencies and retire fences are the required protocol.
 same `PlanResources` object until `finish_step()`, even if a later step
 publishes a new plan.
 
-Retired resources remain strongly owned while an old step is active or any
-lease is not reusable. Streams, events, graphs, and buffer storage become
-collectable only after the active-step and retire-fence conditions are both
-satisfied. Staging an equal or older epoch is rejected.
+Retired resources remain strongly owned while an old step is active, any
+lease is not reusable, or any per-stream retire fence is incomplete. Streams,
+events, graphs, and buffer storage become collectable only after the
+active-step and retire-fence conditions are both satisfied. An epoch that was
+never acquired has no work to retire and can be released immediately. Staging
+an equal or older epoch is rejected.
 
 `select_buffer_bucket()` performs exact shape, dtype, device-kind, and CUDA
 device-index matching without touching the CUDA driver or synchronizing. A
@@ -80,9 +82,15 @@ cold path may build a specialization.
 `PhysicalExecutor` binds handlers by typed `NodeKey` or `ExecutorKey` when a
 step is prepared. It follows the frozen node order, waits and publishes typed
 fences, selects exact buckets, and records eager/replay/fallback and lease
-statistics. Bucket misses are de-duplicated before invoking the cold
-specialization callback. No handler lookup, graph compilation, or capture is
-performed by `execute_step()`.
+statistics. `finish_step()` waits for an in-progress execute before recording
+retirement, so a concurrent lifecycle call cannot release an epoch underneath
+a handler. Physical step ids are monotonic; once a step lifecycle closes, the
+same id cannot reacquire resources during the retire-record window. Bucket
+misses enqueue a frozen request carrying plan epoch, node,
+bucket, artifact, shape, dtype, and device. The callback runs only when the
+next prepare safe point explicitly drains the queue; it may stage a higher
+epoch before that step acquires its snapshot. No callback, handler lookup,
+graph compilation, or capture is performed by `execute_step()`.
 
 ## ESamp Residual Capture Bridge
 
@@ -116,20 +124,30 @@ bundle epoch at its prepare-inputs safe point; MRv2 prepares immediately after
 allocating the new execute-model step id. Both happen before residual dispatch
 and never trigger capture or compilation.
 
-The ESamp consumer runs the activated identity-preserving residual handoff
-through `PhysicalExecutor`, then delegates training to the existing
-`ESampTrainEngine`, `PipelineLane`, delayed-backward, update, and publish
-machinery. This preserves first-per-prompt filtering, training density,
-parameter updates, sampler behavior, and the hand-written stream/event code as
-the behavior oracle.
+The ESamp consumer declares a frozen `PhysicalRegionExecutorDesc` whose typed
+extern contract is `WRITE_STATE`, replica-scoped, CUDA, and eager-only. The
+activated `PhysicalExecutor` invokes the real `ESampTrainEngine.launch_step`
+residual-staging operation; the outer consumer does not launch it a second
+time. Its runtime stream adapter resolves the actual `PipelineLane` forward
+stream (or the caller stream in serial mode), and the plan-level retire event
+is recorded on that CUDA stream. CPU unit tests use the same contract with an
+immediately complete non-CUDA retirement.
+
+Delayed backward, update, and publish remain an explicit legacy boundary after
+the migrated staging region. They continue to use the existing
+`ESampTrainEngine`, `PipelineLane`, and `GraphCaptureLane` choreography. This
+preserves first-per-prompt filtering, training density, parameter updates, and
+sampler behavior while making the migrated physical region itself perform real
+work rather than an identity-only counter update.
 
 ## Execution Boundary And Gate Status
 
 Automatic execution is enabled by default and can be disabled with
-`--no-workgraph-execution`. Only the explicitly migrated ESamp residual
-handoff is executed by WorkGraph. Unmigrated producer/consumer work remains a
-visible legacy boundary; FULL graph mode clears physical activation rather
-than partially executing a graph.
+`--no-workgraph-execution`. Only attachments with an explicit typed region
+executor are activated; other captures remain shadow metadata. Unmigrated
+producer/consumer work remains a visible legacy boundary. FULL graph mode
+requests deactivation rather than partially executing a graph; an active
+snapshot is retained until its step finishes and its retire event completes.
 
 The ESamp resource initializer is not called during `load_model.post`, so
 training allocation remains lazy until the first complete bundle. Runtime

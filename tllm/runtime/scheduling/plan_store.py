@@ -11,6 +11,7 @@ import torch
 from tllm.runtime.scheduling.physical import (
     BufferLease,
     EventLike,
+    Fence,
     GraphLike,
     StreamLike,
 )
@@ -42,6 +43,7 @@ class RuntimeStream:
 
     key: StreamClass
     stream: object
+    retire_fence: Fence
 
     def __post_init__(self) -> None:
         if not isinstance(cast(object, self.key), StreamClass):
@@ -49,6 +51,8 @@ class RuntimeStream:
         stream = cast(object, self.stream)
         if not isinstance(stream, StreamLike):
             raise TypeError("RuntimeStream.stream must implement wait_event(event)")
+        if not isinstance(cast(object, self.retire_fence), Fence):
+            raise TypeError("RuntimeStream.retire_fence must be Fence")
         object.__setattr__(self, "stream", stream)
 
 
@@ -159,11 +163,34 @@ class PlanResources:
         ):
             if len(set(keys)) != len(keys):
                 raise ValueError(f"PlanResources contains duplicate {label} resource keys")
+        retire_keys = tuple(resource.retire_fence.key for resource in streams)
+        if len(set(retire_keys)) != len(retire_keys):
+            raise ValueError("PlanResources contains duplicate retire fence keys")
+        externally_bound_fences = {
+            resource.key: resource.event for resource in events
+        }
+        externally_bound_fences.update(lease_events)
+        if any(
+            resource.retire_fence.key in externally_bound_fences
+            and externally_bound_fences[resource.retire_fence.key]
+            is not resource.retire_fence.event
+            for resource in streams
+        ):
+            raise ValueError(
+                "PlanResources binds one fence key to different event objects"
+            )
         object.__setattr__(self, "plan", raw_plan)
         object.__setattr__(self, "leases", leases)
         object.__setattr__(self, "streams", streams)
         object.__setattr__(self, "events", events)
         object.__setattr__(self, "graphs", graphs)
+
+    @property
+    def reusable(self) -> bool:
+        return all(lease.reusable for lease in self.leases) and all(
+            resource.retire_fence.recorded and resource.retire_fence.complete
+            for resource in self.streams
+        )
 
 
 class PlanSnapshotStore:
@@ -173,7 +200,14 @@ class PlanSnapshotStore:
     even when a later step publishes a staged epoch.
     """
 
-    __slots__ = ("_current", "_pending", "_active", "_retired", "_lock")
+    __slots__ = (
+        "_current",
+        "_pending",
+        "_active",
+        "_retired",
+        "_acquired",
+        "_lock",
+    )
 
     def __init__(self, initial: PlanResources) -> None:
         if not isinstance(cast(object, initial), PlanResources):
@@ -182,6 +216,7 @@ class PlanSnapshotStore:
         self._pending: PlanResources | None = None
         self._active: dict[int, PlanResources] = {}
         self._retired: list[PlanResources] = []
+        self._acquired: set[int] = set()
         self._lock = Lock()
 
     @property
@@ -193,6 +228,19 @@ class PlanSnapshotStore:
     def retired_count(self) -> int:
         with self._lock:
             return len(self._retired)
+
+    @property
+    def closeable(self) -> bool:
+        """Return whether every acquired epoch can be released without waiting."""
+
+        with self._lock:
+            if self._active:
+                return False
+            resources = (self._current, *self._retired)
+            return all(
+                id(item) not in self._acquired or item.reusable
+                for item in resources
+            )
 
     def stage(self, resources: PlanResources) -> None:
         if not isinstance(cast(object, resources), PlanResources):
@@ -219,6 +267,7 @@ class PlanSnapshotStore:
                 if all(resources is not previous for resources in self._retired):
                     self._retired.append(previous)
             self._active[step] = self._current
+            self._acquired.add(id(self._current))
             return self._current
 
     def active(self, step_id: int) -> PlanResources:
@@ -235,12 +284,14 @@ class PlanSnapshotStore:
             kept: list[PlanResources] = []
             collected = 0
             for resources in self._retired:
-                if id(resources) in active_ids or any(
-                    not lease.reusable for lease in resources.leases
+                resource_id = id(resources)
+                if resource_id in active_ids or (
+                    resource_id in self._acquired and not resources.reusable
                 ):
                     kept.append(resources)
                 else:
                     collected += 1
+                    self._acquired.discard(resource_id)
             self._retired = kept
             return collected
 
@@ -264,10 +315,10 @@ def select_buffer_bucket(
     if not isinstance(cast(object, plan), PhysicalFlowPlan):
         raise TypeError("select_buffer_bucket.plan must be PhysicalFlowPlan")
     if not isinstance(cast(object, shape), tuple) or any(
-        not isinstance(dimension, int) or isinstance(dimension, bool) or dimension < 1
+        not isinstance(dimension, int) or isinstance(dimension, bool) or dimension < 0
         for dimension in shape
     ):
-        raise TypeError("select_buffer_bucket.shape must contain positive ints")
+        raise TypeError("select_buffer_bucket.shape must contain non-negative ints")
     if not isinstance(cast(object, dtype), torch.dtype):
         raise TypeError("select_buffer_bucket.dtype must be torch.dtype")
     if not isinstance(cast(object, device), torch.device):
