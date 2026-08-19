@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Generic, Mapping, Protocol, Sequence, TypeVar
+from typing import TYPE_CHECKING, Generic, Mapping, Protocol, Sequence, TypeVar
 
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.ports.base import ConsumerFlow
+
+if TYPE_CHECKING:
+    from tllm.workgraph.frontend import CapturedFlow
+    from tllm.workgraph.hierarchy import CaptureAttachment
 
 ConfigT = TypeVar("ConfigT")
 
@@ -62,6 +66,16 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         """Return the single executable artifact owning ``flow_ids``."""
         _ = flow_ids
         return None
+
+    def workgraph_captures(self) -> tuple["CapturedFlow", ...]:
+        """Return cold-path capture artifacts already specialized by this consumer."""
+
+        return ()
+
+    def workgraph_attachments(self) -> tuple["CaptureAttachment", ...]:
+        """Return explicit runtime-node bindings for ``workgraph_captures``."""
+
+        return ()
 
     def synchronize(self) -> None:
         """Optional flush hook for async/background consumers."""

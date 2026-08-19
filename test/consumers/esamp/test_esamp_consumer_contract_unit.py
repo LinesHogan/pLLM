@@ -16,10 +16,19 @@ from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.port_bundle import BundleKey, PortBundle
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
+from tllm.ports.address import port_address_desc
 from tllm.ports.base import PortKind
-from tllm.ports.residual_stream import ResidualLocator
+from tllm.ports.residual_stream import ResidualLocator, ResidualStream
 from tllm.runtime import residual_runtime as esamp_runtime
 from tllm.workflows import esamp_support
+from tllm.workgraph import (
+    CaptureAttachment,
+    CaptureStatus,
+    CapturedFlow,
+    NodeKey,
+    PortBindingDesc,
+    PortBindingDirection,
+)
 
 
 class ESampConsumerContractUnitTest(unittest.TestCase):
@@ -81,6 +90,177 @@ class ESampConsumerContractUnitTest(unittest.TestCase):
         consumer = ESampConsumer(ESampConsumerConfig(enable_esamp_training=False), engine=mock.Mock())
 
         self.assertEqual(tuple(consumer.flows()), ())
+
+    def test_cold_path_specialization_captures_identity_residual_handoff(self) -> None:
+        engine = mock.Mock()
+        consumer = ESampConsumer(ESampConsumerConfig(), engine=engine)
+        source_example = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        target_example = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+        captured, attachment = consumer.specialize_workgraph(
+            source_example,
+            target_example,
+        )
+
+        expected_reads = (
+            ResidualStream.read(
+                layer=0,
+                site="block_output",
+                phase="decode",
+                role="source",
+            ),
+            ResidualStream.read(
+                layer=-1,
+                site="block_output",
+                phase="decode",
+                role="target",
+            ),
+        )
+        self.assertEqual(tuple(consumer.flows()[0].reads[:2]), expected_reads)
+        expected_bindings = tuple(
+            PortBindingDesc(
+                port=port_address_desc(read),
+                direction=PortBindingDirection.INPUT,
+                value_path=(index,),
+            )
+            for index, read in enumerate(consumer.flows()[0].reads[:2])
+        )
+        self.assertEqual(captured.status, CaptureStatus.CAPTURED)
+        self.assertIsInstance(captured, CapturedFlow)
+        self.assertIsInstance(attachment, CaptureAttachment)
+        self.assertEqual(captured.inputs, expected_bindings)
+        self.assertEqual(attachment.bindings, expected_bindings)
+        self.assertEqual(
+            attachment.node_key,
+            NodeKey.consumer_flow(consumer.consumer_id, 0),
+        )
+        self.assertEqual(attachment.artifact_key, captured.artifact_key)
+        self.assertIsNotNone(captured.leaf_artifact)
+        assert captured.leaf_artifact is not None
+        self.assertEqual(captured.leaf_artifact.operators, ())
+        self.assertEqual(
+            captured.leaf_artifact.input_values,
+            captured.leaf_artifact.output_values,
+        )
+        engine.assert_not_called()
+
+    def test_consume_bundle_hot_path_does_not_capture_residual_handoff(self) -> None:
+        engine = mock.Mock()
+        consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=4), engine=engine)
+        source_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        target_hidden = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+        bundle = PortBundle(
+            key=BundleKey(engine_step_id=1, phase="decode", request_id="reqA", sample_idx=0),
+            entries={
+                "device_lease": DeviceTensorLease(
+                    entries={"source": source_hidden, "target": target_hidden},
+                    active_rows=2,
+                ),
+                "request_meta": RowBatchMeta(
+                    request_ids=("reqA", "reqB"),
+                    prompt_idxs=(7, 9),
+                    sample_idxs=(0, 1),
+                    phase="decode",
+                    engine_step_id=1,
+                ),
+            },
+        )
+
+        with mock.patch(
+            "tllm.workgraph.capture.capture_flow",
+            side_effect=AssertionError("consume_bundle must not enter cold-path capture"),
+        ) as capture_flow, mock.patch.object(
+            consumer,
+            "_ensure_runtime_resources",
+            return_value=None,
+        ):
+            consumer.consume_bundle(bundle, self._ctx())
+
+        capture_flow.assert_not_called()
+        engine.launch_step.assert_called_once_with(source_hidden, target_hidden)
+
+    def test_disabled_esamp_does_not_publish_workgraph_specialization(self) -> None:
+        engine = mock.Mock()
+        consumer = ESampConsumer(
+            ESampConsumerConfig(enable_esamp_training=False),
+            engine=engine,
+        )
+        source_example = torch.ones((2, 2))
+        target_example = torch.zeros((2, 2))
+
+        with self.assertRaisesRegex(RuntimeError, "disabled ESamp"):
+            consumer.specialize_workgraph(source_example, target_example)
+
+        self.assertEqual(consumer.workgraph_captures(), ())
+        self.assertEqual(consumer.workgraph_attachments(), ())
+        engine.assert_not_called()
+
+    def test_specialize_workgraph_rejects_rank_layout_and_device_mismatch(self) -> None:
+        engine = mock.Mock()
+        consumer = ESampConsumer(ESampConsumerConfig(), engine=engine)
+        cases = (
+            (
+                "rank",
+                torch.ones((2, 2)),
+                torch.ones((2,)),
+                "matching rank",
+            ),
+            (
+                "layout",
+                torch.ones((2, 2)),
+                torch.sparse_coo_tensor(
+                    indices=torch.tensor([[0, 1], [0, 1]]),
+                    values=torch.ones((2,)),
+                    size=(2, 2),
+                ),
+                "matching tensor layouts",
+            ),
+            (
+                "device",
+                torch.ones((2, 2)),
+                torch.empty((2, 2), device="meta"),
+                "same device",
+            ),
+        )
+
+        for label, source_example, target_example, message in cases:
+            with self.subTest(kind=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    consumer.specialize_workgraph(source_example, target_example)
+
+        engine.assert_not_called()
+
+    def test_equivalent_workgraph_specializations_keep_artifact_identity_stable(self) -> None:
+        consumer = ESampConsumer(ESampConsumerConfig(), engine=mock.Mock())
+        first_captured, first_attachment = consumer.specialize_workgraph(
+            torch.ones((2, 2)),
+            torch.zeros((2, 2)),
+        )
+        second_captured, second_attachment = consumer.specialize_workgraph(
+            torch.full((2, 2), 3.0),
+            torch.full((2, 2), 4.0),
+        )
+
+        self.assertEqual(first_captured.artifact_key, second_captured.artifact_key)
+        self.assertEqual(first_captured.source_span, second_captured.source_span)
+        self.assertEqual(first_attachment.artifact_key, second_attachment.artifact_key)
+        self.assertEqual(
+            consumer.workgraph_captures(),
+            (second_captured,),
+        )
+        self.assertEqual(
+            consumer.workgraph_attachments(),
+            (second_attachment,),
+        )
+
+    def test_disabled_workgraph_metadata_accessors_remain_empty(self) -> None:
+        consumer = ESampConsumer(
+            ESampConsumerConfig(enable_esamp_training=False),
+            engine=mock.Mock(),
+        )
+
+        self.assertEqual(consumer.workgraph_captures(), ())
+        self.assertEqual(consumer.workgraph_attachments(), ())
 
     def test_consume_bundle_passes_device_lease_to_engine_owned_step_stage(self) -> None:
         engine = mock.Mock()

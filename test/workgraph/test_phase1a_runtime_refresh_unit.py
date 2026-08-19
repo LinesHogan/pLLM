@@ -8,18 +8,23 @@ import torch
 from tllm.backends.protocol import BackendCapabilities, GraphSafety, SamplerStage
 from tllm.backends.vllm.workgraph_runtime import record_resolved_backend
 from tllm.consumers.base import BaseConsumer
+from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
 from tllm.ports.base import ConsumerFlow, FlowFusion, TimingContract
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
 from tllm.producers.registry import ExecutionPlan
 from tllm.runtime import residual_runtime
 from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.runtime.execution_plan import compile_default_plan
 from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime.ports.residual_bundle_dispatch import dispatch_decode_port_bundles
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.workgraph.anchors import BackendResolution
-from tllm.workgraph.compiler import compile_shadow_snapshot
-from tllm.workgraph.ir import WorkGraphDiagnosticCode
+from tllm.workgraph.anchors import BackendResolution, shadow_backend_snapshot
+from tllm.workgraph.compiler import compile_phase1a, compile_shadow_snapshot
+from tllm.workgraph.frontend import CapturedFlow
+from tllm.workgraph.hierarchy import CaptureAttachment
+from tllm.workgraph.ir import NodeKey, WorkGraphDiagnosticCode
+from tllm.workgraph.physical import CapturePolicy, FallbackPolicy, compile_physical_flow_plan
 
 
 class _FlowConsumer(BaseConsumer[object]):
@@ -104,7 +109,111 @@ def _runtime_state(*, fused: bool = False) -> ResidualRuntimeState:
     return state
 
 
+def _specialized_esamp() -> tuple[ESampConsumer, CapturedFlow, CaptureAttachment]:
+    consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
+    captured, attachment = consumer.specialize_workgraph(
+        torch.ones(2, 4),
+        torch.ones(2, 4),
+    )
+    return consumer, captured, attachment
+
+
 class Phase1aRuntimeRefreshTest(unittest.TestCase):
+    def test_base_consumer_defaults_to_typed_empty_capture_metadata(self) -> None:
+        consumer = _FlowConsumer("capture.defaults")
+
+        captures = consumer.workgraph_captures()
+        attachments = consumer.workgraph_attachments()
+
+        self.assertIsInstance(captures, tuple)
+        self.assertIsInstance(attachments, tuple)
+        self.assertEqual(captures, ())
+        self.assertEqual(attachments, ())
+
+    def test_registered_specialized_esamp_reaches_shadow_and_concrete_hierarchies(self) -> None:
+        consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
+        state = ResidualRuntimeState()
+        resolution = BackendResolution(
+            capabilities=_capabilities("mrv2"),
+            graph_mode=GraphMode.PIECEWISE,
+        )
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.register_dispatch_consumer(consumer)
+            dispatch_plan = state.dispatch_plan
+            execution_plan = state.execution_plan
+            self.assertIsNotNone(dispatch_plan)
+            self.assertIsNotNone(execution_plan)
+            self.assertEqual(state.workgraph_captures, ())
+            self.assertEqual(state.workgraph_attachments, ())
+
+            captured, attachment = consumer.specialize_workgraph(
+                torch.ones(2, 4),
+                torch.ones(2, 4),
+            )
+            residual_runtime.refresh_workgraph_capture_metadata()
+            shadow = state.workgraph_snapshot
+            self.assertIsNotNone(shadow)
+            self.assertIsNotNone(shadow.hierarchy)
+            self.assertEqual(shadow.hierarchy.attachments, (attachment,))
+            self.assertEqual(shadow.hierarchy.roots[0].artifact_key, captured.artifact_key)
+
+            dispatch_targets = tuple(
+                (target.flow_id, target.placement_hook)
+                for target in dispatch_plan.flow_targets()
+            )
+            execution_producers = tuple(
+                planned.entry.producer_id for planned in execution_plan.producers
+            )
+
+            residual_runtime.record_workgraph_backend_resolution(resolution=resolution)
+            concrete = state.workgraph_snapshot
+            self.assertIsNotNone(concrete)
+            self.assertIsNotNone(concrete.hierarchy)
+            self.assertEqual(concrete.hierarchy.attachments, (attachment,))
+            self.assertEqual(concrete.hierarchy.roots[0].artifact_key, captured.artifact_key)
+            self.assertIs(state.dispatch_plan, dispatch_plan)
+            self.assertIs(state.execution_plan, execution_plan)
+            self.assertEqual(
+                tuple(
+                    (target.flow_id, target.placement_hook)
+                    for target in state.dispatch_plan.flow_targets()
+                ),
+                dispatch_targets,
+            )
+            self.assertEqual(
+                tuple(planned.entry.producer_id for planned in state.execution_plan.producers),
+                execution_producers,
+            )
+
+            same_snapshot = state.workgraph_snapshot
+            same_epoch = same_snapshot.epoch
+            residual_runtime.refresh_workgraph_capture_metadata()
+            self.assertIs(state.workgraph_snapshot, same_snapshot)
+            self.assertEqual(state.workgraph_snapshot.epoch, same_epoch)
+
+    def test_deferrable_esamp_capture_metadata_stays_eager_at_physical_boundary(self) -> None:
+        consumer, captured, attachment = _specialized_esamp()
+        dispatch_plan = DispatchPlan.build([consumer])
+        execution_plan = compile_default_plan(consumers=[consumer])
+        phase1a = compile_phase1a(
+            consumers=(consumer,),
+            dispatch_plan=dispatch_plan,
+            execution_plan=execution_plan,
+            backend=shadow_backend_snapshot(),
+            captures=(captured,),
+            attachments=(attachment,),
+        )
+
+        physical = compile_physical_flow_plan(phase1a)
+        node = next(
+            node
+            for node in physical.nodes
+            if node.node_key == NodeKey.consumer_flow(consumer.consumer_id, 0)
+        )
+        self.assertEqual(node.capture_policy, CapturePolicy.DISABLED)
+        self.assertEqual(node.fallback_policy, FallbackPolicy.EAGER)
+
     def test_resolution_before_consumer_registration_refreshes_the_new_plan(self) -> None:
         state = ResidualRuntimeState()
         resolution = BackendResolution(

@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.frontend import CapturedFlow
+    from tllm.workgraph.hierarchy import CaptureAttachment
 
 
 RuntimeConsumer = BaseConsumer
@@ -121,6 +123,8 @@ class ResidualRuntimeState:
     # Startup-only WorkGraph shadow metadata. Runtime dispatch does not read
     # this field; the existing plans above remain authoritative.
     workgraph_snapshot: Optional["Phase1aPlan"] = None
+    workgraph_captures: tuple["CapturedFlow", ...] = ()
+    workgraph_attachments: tuple["CaptureAttachment", ...] = ()
     # The latest concrete backend context is captured at the backend boundary
     # and reused by cold shadow refreshes after later plan changes.
     workgraph_backend_resolution: Optional["BackendResolution"] = None

@@ -51,6 +51,8 @@ from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 
 if TYPE_CHECKING:
     from tllm.workgraph.anchors import BackendResolution
+    from tllm.workgraph.frontend import CapturedFlow
+    from tllm.workgraph.hierarchy import CaptureAttachment
 
 ensure_v1_env()
 
@@ -74,18 +76,43 @@ def _ensure_dispatch_registry() -> ConsumerRegistry:
     return RUNTIME.consumer_registry
 
 
-def _refresh_dispatch_plan() -> None:
-    registry = _ensure_dispatch_registry()
-    consumers = registry.consumers()
+def _active_dispatch_consumers() -> list[BaseConsumer[object]]:
+    consumers = _ensure_dispatch_registry().consumers()
     if isinstance(RUNTIME.consumer, BaseConsumer):
         consumers = consumers + [RUNTIME.consumer]
+    return consumers
+
+
+def _collect_workgraph_capture_metadata(
+    consumers: Sequence[BaseConsumer[object]],
+) -> tuple[tuple["CapturedFlow", ...], tuple["CaptureAttachment", ...]]:
+    captures = tuple(
+        capture
+        for consumer in consumers
+        for capture in consumer.workgraph_captures()
+    )
+    attachments = tuple(
+        attachment
+        for consumer in consumers
+        for attachment in consumer.workgraph_attachments()
+    )
+    return captures, attachments
+
+
+def _refresh_dispatch_plan() -> None:
+    consumers = _active_dispatch_consumers()
     if not consumers:
         RUNTIME.dispatch_plan = None
         RUNTIME.execution_plan = None
         RUNTIME.workgraph_snapshot = None
+        RUNTIME.workgraph_captures = ()
+        RUNTIME.workgraph_attachments = ()
         RUNTIME.workgraph_refresh_pending = False
         RUNTIME.producer_executor = None
         return
+    captures, attachments = _collect_workgraph_capture_metadata(consumers)
+    RUNTIME.workgraph_captures = captures
+    RUNTIME.workgraph_attachments = attachments
     plan = DispatchPlan.build(consumers)
     RUNTIME.dispatch_plan = None if plan.is_empty() else plan
     # Fail fast at startup when a consumer reads a migrated port kind that no
@@ -117,6 +144,8 @@ def _refresh_dispatch_plan() -> None:
             dispatch_plan=plan,
             execution_plan=execution_plan,
             previous=RUNTIME.workgraph_snapshot,
+            captures=captures,
+            attachments=attachments,
         )
         RUNTIME.workgraph_refresh_pending = True
     elif not plan.requires_graph_mode_refresh(RUNTIME.workgraph_backend_resolution.graph_mode):
@@ -161,6 +190,8 @@ def _compile_concrete_workgraph_snapshot() -> None:
         execution_plan=execution_plan,
         backend=backend_snapshot_from_resolution(resolution),
         previous=RUNTIME.workgraph_snapshot,
+        captures=RUNTIME.workgraph_captures,
+        attachments=RUNTIME.workgraph_attachments,
     )
     RUNTIME.workgraph_refresh_pending = False
 
@@ -195,6 +226,46 @@ def finalize_workgraph_snapshot_after_placement_refresh() -> None:
     """Finish the one-time refresh after existing placement/fusion work."""
 
     if RUNTIME.workgraph_refresh_pending:
+        _compile_concrete_workgraph_snapshot()
+
+
+def refresh_workgraph_capture_metadata() -> None:
+    """Publish cold-path consumer captures without rebuilding runtime plans."""
+
+    consumers = _active_dispatch_consumers()
+    captures, attachments = _collect_workgraph_capture_metadata(consumers)
+    if (
+        captures == RUNTIME.workgraph_captures
+        and attachments == RUNTIME.workgraph_attachments
+    ):
+        return
+
+    RUNTIME.workgraph_captures = captures
+    RUNTIME.workgraph_attachments = attachments
+    plan = RUNTIME.dispatch_plan
+    execution_plan = RUNTIME.execution_plan
+    if plan is None or execution_plan is None:
+        RUNTIME.workgraph_snapshot = None
+        RUNTIME.workgraph_refresh_pending = False
+        return
+
+    resolution = RUNTIME.workgraph_backend_resolution
+    if resolution is None:
+        from tllm.workgraph.compiler import compile_shadow_snapshot
+
+        RUNTIME.workgraph_snapshot = compile_shadow_snapshot(
+            consumers=consumers,
+            dispatch_plan=plan,
+            execution_plan=execution_plan,
+            previous=RUNTIME.workgraph_snapshot,
+            captures=captures,
+            attachments=attachments,
+        )
+        RUNTIME.workgraph_refresh_pending = True
+        return
+
+    RUNTIME.workgraph_refresh_pending = True
+    if not plan.requires_graph_mode_refresh(resolution.graph_mode):
         _compile_concrete_workgraph_snapshot()
 
 
@@ -605,6 +676,7 @@ __all__ = [
     "read_graph_debug_stats",
     "read_and_reset_esamp_per_request_stats",
     "read_and_reset_esamp_stats",
+    "refresh_workgraph_capture_metadata",
     "register_dispatch_consumer",
     "replace_dispatch_consumers",
     "resolve_module_by_path_with_fallback",

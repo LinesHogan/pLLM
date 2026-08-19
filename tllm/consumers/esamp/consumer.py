@@ -18,6 +18,7 @@ from tllm.consumers.esamp.sampler_provider import ESampSamplerModifierProvider
 from tllm.consumers._common.bundle_inputs import residual_pair_input
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
+from tllm.ports.address import port_address_desc
 from tllm.ports.base import (
     BufferOwnership,
     ConsumerFlow,
@@ -30,6 +31,50 @@ from tllm.ports.base import (
 )
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
+from tllm.workgraph.frontend import (
+    CapturedFlow,
+    PortBindingDesc,
+    PortBindingDirection,
+    flow,
+)
+from tllm.workgraph.hierarchy import CaptureAttachment
+from tllm.workgraph.ir import NodeKey
+
+
+_ESAMP_SOURCE_READ = ResidualStream.read(
+    layer=0,
+    site="block_output",
+    phase="decode",
+    role="source",
+)
+_ESAMP_TARGET_READ = ResidualStream.read(
+    layer=-1,
+    site="block_output",
+    phase="decode",
+    role="target",
+)
+_ESAMP_RESIDUAL_BINDINGS = (
+    PortBindingDesc(
+        port=port_address_desc(_ESAMP_SOURCE_READ),
+        direction=PortBindingDirection.INPUT,
+        value_path=(0,),
+    ),
+    PortBindingDesc(
+        port=port_address_desc(_ESAMP_TARGET_READ),
+        direction=PortBindingDirection.INPUT,
+        value_path=(1,),
+    ),
+)
+
+
+@flow(bindings=_ESAMP_RESIDUAL_BINDINGS)
+def _esamp_residual_side_work(
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe the capture-safe residual handoff inside legacy ESamp work."""
+
+    return source, target
 
 
 @dataclass(slots=True)
@@ -112,6 +157,8 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._runtime_resource_key: tuple[object, ...] | None = None
         self._sampler_provider = ESampSamplerModifierProvider(config=self.config, engine=self._engine)
         self._fusion_handle: _ESampFusionGroupHandle | None = None
+        self._workgraph_capture: CapturedFlow | None = None
+        self._workgraph_attachment: CaptureAttachment | None = None
 
     @property
     def consumer_id(self) -> str:
@@ -130,8 +177,8 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         return [
             ConsumerFlow(
                 reads=(
-                    ResidualStream.read(layer=0, site="block_output", phase="decode", role="source"),
-                    ResidualStream.read(layer=-1, site="block_output", phase="decode", role="target"),
+                    _ESAMP_SOURCE_READ,
+                    _ESAMP_TARGET_READ,
                     RequestMeta.read(),
                 ),
                 writes=(),
@@ -178,6 +225,44 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self._runtime_target_layer = None
         self._runtime_initializer_key = None
         self._runtime_resource_key = None
+        self._workgraph_capture = None
+        self._workgraph_attachment = None
+
+    def specialize_workgraph(
+        self,
+        source_example: torch.Tensor,
+        target_example: torch.Tensor,
+    ) -> tuple[CapturedFlow, CaptureAttachment]:
+        """Capture residual handoff metadata on an explicit control-plane path."""
+
+        if not bool(self.config.enable_esamp_training):
+            raise RuntimeError("disabled ESamp cannot publish a WorkGraph specialization")
+        if source_example.ndim < 2 or source_example.ndim != target_example.ndim:
+            raise ValueError("ESamp residual examples must have matching rank of at least two")
+        if source_example.layout != target_example.layout:
+            raise ValueError("ESamp residual examples must have matching tensor layouts")
+        if source_example.device != target_example.device:
+            raise ValueError("ESamp residual examples must reside on the same device")
+
+        captured = _esamp_residual_side_work.capture(source_example, target_example)
+        attachment = CaptureAttachment(
+            node_key=NodeKey.consumer_flow(self.consumer_id, 0),
+            artifact_key=captured.artifact_key,
+            bindings=_ESAMP_RESIDUAL_BINDINGS,
+        )
+        self._workgraph_capture = captured
+        self._workgraph_attachment = attachment
+        return captured, attachment
+
+    def workgraph_captures(self) -> tuple[CapturedFlow, ...]:
+        if not bool(self.config.enable_esamp_training) or self._workgraph_capture is None:
+            return ()
+        return (self._workgraph_capture,)
+
+    def workgraph_attachments(self) -> tuple[CaptureAttachment, ...]:
+        if not bool(self.config.enable_esamp_training) or self._workgraph_attachment is None:
+            return ()
+        return (self._workgraph_attachment,)
 
     def sampler_modifier_provider(self) -> ESampSamplerModifierProvider:
         return self._sampler_provider

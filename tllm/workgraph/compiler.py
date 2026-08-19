@@ -235,6 +235,8 @@ def compile_shadow_snapshot(
     dispatch_plan: DispatchPlan,
     execution_plan: ExecutionPlan,
     previous: Phase1aPlan | None = None,
+    captures: tuple[CapturedFlow, ...] = (),
+    attachments: tuple[CaptureAttachment, ...] = (),
 ) -> Phase1aPlan:
     """Compile startup metadata before a concrete vLLM runner is selected."""
     return compile_phase1a(
@@ -244,6 +246,8 @@ def compile_shadow_snapshot(
         backend=shadow_backend_snapshot(),
         previous=previous,
         strict_native=False,
+        captures=captures,
+        attachments=attachments,
     )
 
 

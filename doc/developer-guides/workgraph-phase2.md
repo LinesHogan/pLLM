@@ -76,12 +76,36 @@ device-index matching without touching the CUDA driver or synchronizing. A
 miss returns `None`; the current step must use eager fallback while a future
 cold path may build a specialization.
 
+## ESamp Residual Capture Bridge
+
+`ESampConsumer.specialize_workgraph(source_example, target_example)` is the
+first explicit cold specialization entry point. It strict-captures a pure
+source/target residual handoff and binds both Tensor inputs to the exact typed
+`ResidualStream` addresses declared by the ESamp flow. The resulting
+`CapturedFlow` and `CaptureAttachment` use stable artifact, source, and
+`NodeKey.consumer_flow(...)` identities.
+
+Specialization is never called from `consume_bundle()`, a step hook, deferred
+dispatch, or the token hot path. A consumer specialized after registration can
+publish its frozen metadata with
+`residual_runtime.refresh_workgraph_capture_metadata()`. Publication rebuilds
+only the WorkGraph shadow snapshot: it preserves the existing `DispatchPlan`
+and `ExecutionPlan` objects and short-circuits when metadata is unchanged.
+Disabled ESamp consumers expose no capture metadata.
+
+The outer ESamp consumer flow is still deferrable legacy work. Its hierarchy
+can therefore explain the captured residual leaf, but physical lowering keeps
+the compatibility node at `CapturePolicy.DISABLED` with eager fallback. This
+bridge does not change first-per-prompt filtering, training density, update,
+publish, sampler, or fence behavior.
+
 ## Current Execution Boundary
 
-This milestone builds and validates physical metadata and Python resource
-lifecycle primitives. It does not install a WorkGraph executor in the token
-hot path, capture a CUDA graph during a step, or select a Python implementation
-dynamically. The legacy runtime remains authoritative.
+This milestone builds and validates physical metadata, Python resource
+lifecycle primitives, and an explicit ESamp residual capture sidecar. It does
+not install a WorkGraph executor in the token hot path, capture a CUDA graph
+during a step, or select a Python implementation dynamically. The legacy
+runtime remains authoritative.
 
 The ESamp resource initializer is no longer called during `load_model.post`,
 so training allocation remains lazy until the first complete bundle. The
@@ -100,6 +124,8 @@ Use the repository virtual environment:
 /workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_physical_executor_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/runtime/test_physical_plan_snapshot_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q test/core/test_physical_plan_validator_oracle_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/consumers/esamp/test_esamp_consumer_contract_unit.py
+/workspace/pllm/.venv/bin/python -m pytest -q test/workgraph/test_phase1a_runtime_refresh_unit.py
 /workspace/pllm/.venv/bin/python -m pytest -q
 /workspace/pllm/.venv/bin/pyright -p pyrightconfig.strict.json
 cargo test --manifest-path rust/tllm_core/Cargo.toml
