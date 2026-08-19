@@ -28,6 +28,7 @@ try:
         plan_sampler_step,
         WorkGraphValidation,
         validate_capture_hierarchy,
+        validate_physical_flow_plan,
         validate_workgraph,
         validate_workgraph_ir,
     )
@@ -53,6 +54,7 @@ __all__ = [
     "plan_sampler_step",
     "WorkGraphValidation",
     "validate_capture_hierarchy",
+    "validate_physical_flow_plan",
     "validate_workgraph",
     "validate_workgraph_ir",
 ]

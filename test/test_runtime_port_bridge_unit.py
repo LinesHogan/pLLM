@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -95,6 +97,48 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
                 "record_path_hotspot_cpu": staticmethod(lambda _name, _ms: None),
             },
         )()
+
+    def test_runtime_hook_setup_defers_consumer_resources_until_first_bundle(self) -> None:
+        consumer = mock.Mock()
+        runtime = SimpleNamespace(
+            consumer=consumer,
+            launch_consumer_from_hooks=False,
+        )
+        core = SimpleNamespace(
+            RUNTIME=runtime,
+            MODEL_HOOK_FLAG="_tllm_hooked",
+            MODEL_HOOK_SPEC_ATTR="_tllm_hook_spec",
+            _runner_uses_compilation_or_cudagraph=lambda _runner: False,
+        )
+        model = SimpleNamespace(compute_logits=lambda *args, **kwargs: (args, kwargs))
+        runner = SimpleNamespace(model=model)
+        setup = SimpleNamespace(
+            resolved_layers=(),
+            target_resolved="layers.1",
+            hook_spec=("layers.0", "layers.1"),
+        )
+
+        with mock.patch.object(
+            port_runtime_hooks.active_targets,
+            "runtime_has_active_targets",
+            return_value=True,
+        ), mock.patch.object(
+            port_runtime_hooks._residual_runtime_setup,
+            "resolve_runtime_setup",
+            return_value=setup,
+        ), mock.patch.object(
+            port_runtime_hooks._residual_runtime_setup,
+            "apply_runtime_setup",
+        ), mock.patch.object(
+            port_runtime_hooks._sampler_patch,
+            "bind_runner_sampler",
+        ), mock.patch.object(
+            port_runtime_hooks._sampler_patch,
+            "ensure_sampler_precompute_buffers",
+        ):
+            port_runtime_hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
+
+        consumer._ensure_runtime_resources.assert_not_called()
 
     def test_decode_runtime_state_bridges_into_complete_source_target_bundles(self) -> None:
         core = self._core()

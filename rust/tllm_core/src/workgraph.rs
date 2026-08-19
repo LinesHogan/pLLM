@@ -630,6 +630,82 @@ struct TensorDeviceV2Desc {
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PhysicalKeyDesc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    ordinal: i64,
+}
+
+impl PhysicalKeyDesc {
+    fn text(&self) -> String {
+        format!("{}:{}/{}", self.namespace, self.name, self.ordinal)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PhysicalBucketDesc {
+    #[pyo3(attribute)]
+    key: PhysicalKeyDesc,
+    #[pyo3(attribute)]
+    shape: Vec<i64>,
+    #[pyo3(attribute)]
+    dtype: TensorDTypeV2Desc,
+    #[pyo3(attribute)]
+    device: TensorDeviceV2Desc,
+    #[pyo3(attribute)]
+    slots: i64,
+    #[pyo3(attribute)]
+    ownership: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PhysicalFenceDesc {
+    #[pyo3(attribute)]
+    fence: PhysicalKeyDesc,
+    #[pyo3(attribute)]
+    producer: NodeKeyDesc,
+    #[pyo3(attribute)]
+    consumer: NodeKeyDesc,
+    #[pyo3(attribute)]
+    kind: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PhysicalNodeDesc {
+    #[pyo3(attribute)]
+    node_key: NodeKeyDesc,
+    #[pyo3(attribute)]
+    executor: ExecutorKeyDesc,
+    #[pyo3(attribute)]
+    stream: String,
+    #[pyo3(attribute)]
+    fences: Vec<PhysicalFenceDesc>,
+    #[pyo3(attribute)]
+    artifact_key: Option<ArtifactKeyV2Desc>,
+    #[pyo3(attribute)]
+    buffer_bucket: Option<PhysicalKeyDesc>,
+    #[pyo3(attribute)]
+    capture_policy: String,
+    #[pyo3(attribute)]
+    fallback_policy: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct PhysicalFlowPlanDesc {
+    #[pyo3(attribute)]
+    plan_epoch: i64,
+    #[pyo3(attribute)]
+    nodes: Vec<PhysicalNodeDesc>,
+    #[pyo3(attribute)]
+    buffer_buckets: Vec<PhysicalBucketDesc>,
+    #[pyo3(attribute)]
+    schema_version: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
 struct UseDefV2Desc {
     #[pyo3(attribute)]
     producer: i64,
@@ -2368,10 +2444,159 @@ fn validate_capture_hierarchy(
     Ok(WorkGraphValidation { topological_order })
 }
 
+fn contains_runtime_text(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("0x") || value.contains('<') || value.contains('>')
+}
+
+fn validate_physical_key(key: &PhysicalKeyDesc, layer: &str) -> Result<(), String> {
+    if key.namespace.is_empty()
+        || key.name.is_empty()
+        || key.ordinal < 0
+        || key.namespace.contains('/')
+        || key.namespace.contains('\\')
+        || key.name.contains('/')
+        || key.name.contains('\\')
+        || contains_runtime_text(&key.namespace)
+        || contains_runtime_text(&key.name)
+    {
+        return Err(format!("{} has an invalid stable key", layer));
+    }
+    Ok(())
+}
+
+fn validate_physical_plan(plan: &PhysicalFlowPlanDesc) -> Result<Vec<String>, String> {
+    if plan.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported PhysicalFlowPlan schema version {}",
+            plan.schema_version
+        ));
+    }
+    if plan.plan_epoch < 1 {
+        return Err("PhysicalFlowPlan plan_epoch must be >= 1".to_string());
+    }
+
+    let mut bucket_keys = HashSet::new();
+    for bucket in &plan.buffer_buckets {
+        validate_physical_key(&bucket.key, "physical buffer bucket")?;
+        if !bucket_keys.insert(bucket.key.text()) {
+            return Err("PhysicalFlowPlan contains duplicate buffer bucket keys".to_string());
+        }
+        if bucket.shape.is_empty()
+            || bucket.shape.iter().any(|dimension| *dimension < 1)
+            || bucket.slots < 1
+            || bucket.dtype.namespace.is_empty()
+            || bucket.dtype.name.is_empty()
+            || contains_runtime_text(&bucket.dtype.namespace)
+            || contains_runtime_text(&bucket.dtype.name)
+            || !["borrowed", "managed"].contains(&bucket.ownership.as_str())
+            || !["cpu", "cuda"].contains(&bucket.device.kind.as_str())
+            || bucket.device.index.is_some_and(|index| index < 0)
+            || bucket.device.kind == "cpu" && bucket.device.index.is_some()
+        {
+            return Err(format!(
+                "physical buffer bucket {} has invalid typed facts",
+                quote(&bucket.key.text())
+            ));
+        }
+    }
+
+    let mut node_keys = HashSet::new();
+    let mut positions = HashMap::new();
+    for (position, node) in plan.nodes.iter().enumerate() {
+        validate_node_key(&node.node_key, "physical node")?;
+        if contains_runtime_text(&node.node_key.namespace)
+            || contains_runtime_text(&node.node_key.owner)
+        {
+            return Err("physical node key contains runtime identity text".to_string());
+        }
+        validate_executor(Some(&node.executor), "physical")?;
+        if contains_runtime_text(&node.executor.namespace)
+            || contains_runtime_text(&node.executor.name)
+            || contains_runtime_text(&node.executor.version)
+        {
+            return Err("physical node executor contains runtime identity text".to_string());
+        }
+        let node_text = node.node_key.text();
+        if !node_keys.insert(node_text.clone()) {
+            return Err("PhysicalFlowPlan contains duplicate node keys".to_string());
+        }
+        positions.insert(node_text, position);
+        if !["default", "side_forward", "side_train"].contains(&node.stream.as_str()) {
+            return Err("physical node declares an unsupported stream class".to_string());
+        }
+        if !["disabled", "prefer", "require"].contains(&node.capture_policy.as_str()) {
+            return Err("physical node declares an unsupported capture policy".to_string());
+        }
+        if !["eager", "reject"].contains(&node.fallback_policy.as_str()) {
+            return Err("physical node declares an unsupported fallback policy".to_string());
+        }
+        if node.capture_policy == "require" && node.fallback_policy == "eager" {
+            return Err("required physical capture cannot use eager fallback".to_string());
+        }
+        if node.capture_policy != "disabled" && node.artifact_key.is_none() {
+            return Err("enabled physical capture requires an ArtifactKey".to_string());
+        }
+        if let Some(artifact) = &node.artifact_key {
+            validate_artifact_key_v2(artifact)?;
+        }
+        if let Some(bucket) = &node.buffer_bucket {
+            validate_physical_key(bucket, "physical node buffer bucket")?;
+            if !bucket_keys.contains(&bucket.text()) {
+                return Err("physical node references an unknown buffer bucket".to_string());
+            }
+        }
+    }
+
+    let mut fence_keys = HashSet::new();
+    for node in &plan.nodes {
+        for fence in &node.fences {
+            validate_physical_key(&fence.fence, "physical fence")?;
+            validate_node_key(&fence.producer, "physical fence producer")?;
+            validate_node_key(&fence.consumer, "physical fence consumer")?;
+            if !fence_keys.insert(fence.fence.text()) {
+                return Err("PhysicalFlowPlan contains duplicate fence keys".to_string());
+            }
+            if fence.consumer != node.node_key {
+                return Err("physical fence must target its owning node".to_string());
+            }
+            if fence.producer == fence.consumer {
+                return Err("physical fence cannot depend on its own node".to_string());
+            }
+            if !["ready", "completion", "retire"].contains(&fence.kind.as_str()) {
+                return Err("physical fence declares an unsupported kind".to_string());
+            }
+            let producer_position = positions
+                .get(&fence.producer.text())
+                .ok_or_else(|| "physical fence references an unknown producer".to_string())?;
+            let consumer_position = positions
+                .get(&fence.consumer.text())
+                .ok_or_else(|| "physical fence references an unknown consumer".to_string())?;
+            if producer_position >= consumer_position {
+                return Err(
+                    "physical nodes must be in dependency order and fences must be acyclic"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(plan.nodes.iter().map(|node| node.node_key.text()).collect())
+}
+
+/// Validate one frozen, metadata-only physical execution plan. Runtime Tensor,
+/// stream, event, graph, callback, and lease objects remain in Python.
+#[pyfunction]
+#[pyo3(signature = (plan))]
+fn validate_physical_flow_plan(plan: PhysicalFlowPlanDesc) -> PyResult<WorkGraphValidation> {
+    let topological_order = validate_physical_plan(&plan).map_err(validation_error)?;
+    Ok(WorkGraphValidation { topological_order })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_workgraph, m)?)?;
     m.add_function(wrap_pyfunction!(validate_workgraph_ir, m)?)?;
     m.add_function(wrap_pyfunction!(validate_capture_hierarchy, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_physical_flow_plan, m)?)?;
     m.add_class::<WorkGraphValidation>()?;
     Ok(())
 }

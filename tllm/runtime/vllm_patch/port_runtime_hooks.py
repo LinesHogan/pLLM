@@ -513,13 +513,6 @@ def setup_runtime_hooks_if_active(*, core: Any, runner: Any) -> None:
 
     _residual_runtime_setup.apply_runtime_setup(core=core, runner=runner, setup=setup)
     _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
-    consumer = getattr(core.RUNTIME, "consumer", None)
-    ensure_consumer_resources = getattr(consumer, "_ensure_runtime_resources", None)
-    if callable(ensure_consumer_resources):
-        ensure_consumer_resources(
-            _common_hooks.build_runtime_context(runner=runner, event_name="load_model.post"),
-            rows_hidden=None,
-        )
     _sampler_patch.ensure_sampler_precompute_buffers(runtime=core.RUNTIME, runner=runner)
 
     if hasattr(model, "compute_logits") and not getattr(model, _COMPUTE_LOGITS_HOOK_FLAG, False):

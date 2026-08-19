@@ -62,6 +62,14 @@ from tllm.workgraph.hierarchy import (
     RootFlowDesc,
     TaskRegionDesc,
 )
+from tllm.workgraph.physical import (
+    BufferBucketDesc,
+    BufferBucketKey,
+    FenceDependencyDesc,
+    FenceKey,
+    PhysicalFlowPlan,
+    PhysicalNodePlan,
+)
 
 
 def _unsupported(value: Any) -> TypeError:
@@ -116,6 +124,52 @@ def _canonical(value: Any) -> Any:
             "name": value.name,
             "version": value.version,
             "digest": value.digest,
+        }
+    if isinstance(value, FenceKey):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "ordinal": value.ordinal,
+        }
+    if isinstance(value, BufferBucketKey):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "ordinal": value.ordinal,
+        }
+    if isinstance(value, BufferBucketDesc):
+        return {
+            "key": _canonical(value.key),
+            "shape": _canonical(value.shape),
+            "dtype": _canonical(value.dtype),
+            "device": _canonical(value.device),
+            "slots": value.slots,
+            "ownership": _canonical(value.ownership),
+        }
+    if isinstance(value, FenceDependencyDesc):
+        return {
+            "fence": _canonical(value.fence),
+            "producer": _canonical(value.producer),
+            "consumer": _canonical(value.consumer),
+            "kind": _canonical(value.kind),
+        }
+    if isinstance(value, PhysicalNodePlan):
+        return {
+            "node_key": _canonical(value.node_key),
+            "executor": _canonical(value.executor),
+            "stream": _canonical(value.stream),
+            "fences": _canonical(value.fences),
+            "artifact_key": _canonical(value.artifact_key),
+            "buffer_bucket": _canonical(value.buffer_bucket),
+            "capture_policy": _canonical(value.capture_policy),
+            "fallback_policy": _canonical(value.fallback_policy),
+        }
+    if isinstance(value, PhysicalFlowPlan):
+        return {
+            "plan_epoch": value.plan_epoch,
+            "nodes": _canonical(value.nodes),
+            "buffer_buckets": _canonical(value.buffer_buckets),
+            "schema_version": value.schema_version,
         }
     if isinstance(value, SourceSpan):
         return {

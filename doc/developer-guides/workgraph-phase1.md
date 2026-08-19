@@ -201,10 +201,17 @@ logical lease, Move, and schedule-node constraints.
 - FULL graph mode remains typed unsupported in the Phase 1a compatibility
   compiler.
 
-Phase 1 is complete at the control-plane boundary. Before Phase 2 enables
-physical execution, the known ESamp initialization-memory regression must be
-closed or converted into an explicit support boundary. The existing runtime
-plans remain authoritative until then.
+Phase 1 is complete at the control-plane boundary. The historical ESamp
+initialization-memory regression was traced to generic vLLM hook setup calling
+the consumer's private resource initializer during `load_model.post`, before
+vLLM finished its KV-cache memory profile. That call is removed and a runtime
+lifecycle regression test requires ESamp training resources to remain lazy
+until the first complete port bundle. The current host cannot communicate with
+the NVIDIA driver, so an aligned `gpu_memory_utilization=0.5` rerun is not yet
+GPU-verified. Phase 2 may build and validate typed physical plans and CPU-side
+lifecycle contracts, but automatic GPU execution and performance claims remain
+unsupported until that aligned gate passes. The existing runtime plans remain
+authoritative until then.
 
 ## Verification
 

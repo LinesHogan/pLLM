@@ -2,5 +2,25 @@
 """Shared scheduling infrastructure for off-critical-path consumer work."""
 
 from tllm.runtime.scheduling.deferred import DeferredWork, DeferredWorkQueue
+from tllm.runtime.scheduling.physical import BufferLease, Fence
+from tllm.runtime.scheduling.plan_store import (
+    PlanResources,
+    PlanSnapshotStore,
+    RuntimeEvent,
+    RuntimeGraph,
+    RuntimeStream,
+    select_buffer_bucket,
+)
 
-__all__ = ["DeferredWork", "DeferredWorkQueue"]
+__all__ = [
+    "BufferLease",
+    "DeferredWork",
+    "DeferredWorkQueue",
+    "Fence",
+    "PlanResources",
+    "PlanSnapshotStore",
+    "RuntimeEvent",
+    "RuntimeGraph",
+    "RuntimeStream",
+    "select_buffer_bucket",
+]

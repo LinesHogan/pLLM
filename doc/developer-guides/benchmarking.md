@@ -36,6 +36,21 @@ stats = consumer.read_stats()
 
 Keep `prompts`, sampling params, model, batch size, dtype, prefix caching, and max model length identical between `off` and `on`.
 
+## ESamp Initialization Memory Gate
+
+ESamp training models, optimizers, model-bank tensors, and pipeline buffers
+must not be allocated from `load_model.post`. vLLM profiles the remaining
+memory for its KV cache after model load, so allocating consumer resources in
+that interval can make a valid `gpu_memory_utilization` budget appear negative.
+The port runtime initializes those resources lazily from the first complete
+training bundle, after engine initialization.
+
+Before accepting an automatic WorkGraph GPU path, run the aligned ESamp
+workload at `gpu_memory_utilization=0.5` and report startup/KV-cache outcome,
+`loss_count`, update/capture/replay counters, fallback/deadline counts, and
+fence/buffer/plan-epoch statistics. A CPU lifecycle test proves the allocation
+ordering but does not replace this GPU gate.
+
 ## DummyConsumer Baseline
 
 DummyConsumer is configured to be intentionally light by default:
