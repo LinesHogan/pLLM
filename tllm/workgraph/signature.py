@@ -70,6 +70,24 @@ from tllm.workgraph.physical import (
     PhysicalFlowPlan,
     PhysicalNodePlan,
 )
+from tllm.workgraph.phase3 import (
+    CopyEngineCapacityDesc,
+    DurationProfile,
+    ImplementationDesc,
+    ImplementationSelectionDesc,
+    Move,
+    MoveKey,
+    PlacedNodeDesc,
+    Placement,
+    PlacementLeaseDesc,
+    PlacementPlan,
+    Residency,
+    ScheduledMove,
+    TransferProfile,
+    TransferProfileDesc,
+    ValueFlowDesc,
+    ValueKey,
+)
 
 
 def _unsupported(value: Any) -> TypeError:
@@ -169,6 +187,107 @@ def _canonical(value: Any) -> Any:
             "plan_epoch": value.plan_epoch,
             "nodes": _canonical(value.nodes),
             "buffer_buckets": _canonical(value.buffer_buckets),
+            "schema_version": value.schema_version,
+        }
+    if isinstance(value, Placement):
+        return {"kind": _canonical(value.kind), "index": value.index}
+    if isinstance(value, ValueKey):
+        return {"name": value.name, "version": value.version}
+    if isinstance(value, Residency):
+        return {
+            "value": _canonical(value.value),
+            "placement": _canonical(value.placement),
+            "memory": _canonical(value.memory),
+        }
+    if isinstance(value, Move):
+        return {
+            "value": _canonical(value.value),
+            "source": _canonical(value.source),
+            "destination": _canonical(value.destination),
+            "kind": _canonical(value.kind),
+            "byte_count": value.byte_count,
+            "asynchronous": value.asynchronous,
+        }
+    if isinstance(value, MoveKey):
+        return {"value": _canonical(value.value), "ordinal": value.ordinal}
+    if isinstance(value, DurationProfile):
+        return {"microseconds": value.microseconds, "samples": value.samples}
+    if isinstance(value, TransferProfile):
+        return {
+            "h2d": _canonical(value.h2d),
+            "d2h": _canonical(value.d2h),
+            "p2p": _canonical(value.p2p),
+            "fallback": _canonical(value.fallback),
+        }
+    if isinstance(value, TransferProfileDesc):
+        return {
+            "kind": _canonical(value.kind),
+            "source": _canonical(value.source),
+            "destination": _canonical(value.destination),
+            "bytes_per_microsecond": value.bytes_per_microsecond,
+            "fixed_latency_microseconds": value.fixed_latency_microseconds,
+            "samples": value.samples,
+        }
+    if isinstance(value, CopyEngineCapacityDesc):
+        return {"engine": _canonical(value.engine), "capacity": value.capacity}
+    if isinstance(value, ValueFlowDesc):
+        return {
+            "value": _canonical(value.value),
+            "producer": _canonical(value.producer),
+            "consumer": _canonical(value.consumer),
+            "byte_count": value.byte_count,
+        }
+    if isinstance(value, ImplementationDesc):
+        return {
+            "key": _canonical(value.key),
+            "logical_executor": _canonical(value.logical_executor),
+            "placement": _canonical(value.placement),
+            "duration": _canonical(value.duration),
+        }
+    if isinstance(value, ImplementationSelectionDesc):
+        return {
+            "node_key": _canonical(value.node_key),
+            "logical_executor": _canonical(value.logical_executor),
+            "key": _canonical(value.key),
+            "placement": _canonical(value.placement),
+            "duration": _canonical(value.duration),
+        }
+    if isinstance(value, PlacedNodeDesc):
+        return {
+            "node_key": _canonical(value.node_key),
+            "implementation": _canonical(value.implementation),
+            "placement": _canonical(value.placement),
+            "start_at": value.start_at,
+            "end_at": value.end_at,
+            "depends_on": _canonical(value.depends_on),
+        }
+    if isinstance(value, ScheduledMove):
+        return {
+            "key": _canonical(value.key),
+            "move": _canonical(value.move),
+            "engine": _canonical(value.engine),
+            "start_at": value.start_at,
+            "end_at": value.end_at,
+            "producer": _canonical(value.producer),
+            "consumer": _canonical(value.consumer),
+            "depends_on": _canonical(value.depends_on),
+            "used_fallback": value.used_fallback,
+        }
+    if isinstance(value, PlacementLeaseDesc):
+        return {
+            "residency": _canonical(value.residency),
+            "live_start": value.live_start,
+            "live_end": value.live_end,
+        }
+    if isinstance(value, PlacementPlan):
+        return {
+            "plan_epoch": value.plan_epoch,
+            "selections": _canonical(value.selections),
+            "schedule": _canonical(value.schedule),
+            "residencies": _canonical(value.residencies),
+            "moves": _canonical(value.moves),
+            "leases": _canonical(value.leases),
+            "copy_engines": _canonical(value.copy_engines),
             "schema_version": value.schema_version,
         }
     if isinstance(value, SourceSpan):

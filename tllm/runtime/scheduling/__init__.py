@@ -11,6 +11,13 @@ from tllm.runtime.scheduling.plan_store import (
     RuntimeStream,
     select_buffer_bucket,
 )
+from tllm.runtime.scheduling.phase3_transfer import (
+    CopyExecutor,
+    CopyHandle,
+    PinnedMemoryPool,
+    PinnedMemorySlot,
+    TorchTensorCopyAdapter,
+)
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
     PhysicalExecutionError,
@@ -26,6 +33,8 @@ from tllm.runtime.scheduling.workgraph_executor import (
 
 __all__ = [
     "BufferLease",
+    "CopyExecutor",
+    "CopyHandle",
     "DeferredWork",
     "DeferredWorkQueue",
     "Fence",
@@ -37,12 +46,15 @@ __all__ = [
     "PhysicalExecutionStats",
     "PhysicalExecutor",
     "PhysicalStepResult",
+    "PinnedMemoryPool",
+    "PinnedMemorySlot",
     "SpecializationRequestDesc",
     "WorkGraphRuntimeStats",
     "WorkGraphRuntimeStatsReader",
     "RuntimeEvent",
     "RuntimeGraph",
     "RuntimeStream",
+    "TorchTensorCopyAdapter",
     "select_buffer_bucket",
     "runtime_stats_from_executor",
 ]

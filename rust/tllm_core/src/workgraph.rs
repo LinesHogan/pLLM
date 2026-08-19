@@ -706,6 +706,186 @@ struct PhysicalFlowPlanDesc {
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PlacementV3Desc {
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    index: Option<i64>,
+}
+
+impl PlacementV3Desc {
+    fn text(&self) -> String {
+        match self.index {
+            Some(index) => format!("{}:{}", self.kind, index),
+            None => self.kind.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ValueKeyV3Desc {
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    version: i64,
+}
+
+impl ValueKeyV3Desc {
+    fn text(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ResidencyV3Desc {
+    #[pyo3(attribute)]
+    value: ValueKeyV3Desc,
+    #[pyo3(attribute)]
+    placement: PlacementV3Desc,
+    #[pyo3(attribute)]
+    memory: String,
+}
+
+impl ResidencyV3Desc {
+    fn text(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.value.text(),
+            self.placement.text(),
+            self.memory
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct DurationProfileV3Desc {
+    #[pyo3(attribute)]
+    microseconds: i64,
+    #[pyo3(attribute)]
+    samples: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ImplementationSelectionV3Desc {
+    #[pyo3(attribute)]
+    node_key: NodeKeyDesc,
+    #[pyo3(attribute)]
+    logical_executor: ExecutorKeyDesc,
+    #[pyo3(attribute)]
+    key: ExecutorKeyDesc,
+    #[pyo3(attribute)]
+    placement: PlacementV3Desc,
+    #[pyo3(attribute)]
+    duration: DurationProfileV3Desc,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PlacedNodeV3Desc {
+    #[pyo3(attribute)]
+    node_key: NodeKeyDesc,
+    #[pyo3(attribute)]
+    implementation: ExecutorKeyDesc,
+    #[pyo3(attribute)]
+    placement: PlacementV3Desc,
+    #[pyo3(attribute)]
+    start_at: i64,
+    #[pyo3(attribute)]
+    end_at: i64,
+    #[pyo3(attribute)]
+    depends_on: Vec<NodeKeyDesc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct MoveKeyV3Desc {
+    #[pyo3(attribute)]
+    value: ValueKeyV3Desc,
+    #[pyo3(attribute)]
+    ordinal: i64,
+}
+
+impl MoveKeyV3Desc {
+    fn text(&self) -> String {
+        format!("{}/move/{}", self.value.text(), self.ordinal)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct MoveV3Desc {
+    #[pyo3(attribute)]
+    value: ValueKeyV3Desc,
+    #[pyo3(attribute)]
+    source: ResidencyV3Desc,
+    #[pyo3(attribute)]
+    destination: ResidencyV3Desc,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    byte_count: i64,
+    #[pyo3(attribute)]
+    asynchronous: bool,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ScheduledMoveV3Desc {
+    #[pyo3(attribute)]
+    key: MoveKeyV3Desc,
+    #[pyo3(attribute)]
+    r#move: MoveV3Desc,
+    #[pyo3(attribute)]
+    engine: String,
+    #[pyo3(attribute)]
+    start_at: i64,
+    #[pyo3(attribute)]
+    end_at: i64,
+    #[pyo3(attribute)]
+    producer: Option<NodeKeyDesc>,
+    #[pyo3(attribute)]
+    consumer: Option<NodeKeyDesc>,
+    #[pyo3(attribute)]
+    depends_on: Vec<MoveKeyV3Desc>,
+    #[pyo3(attribute)]
+    used_fallback: bool,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PlacementLeaseV3Desc {
+    #[pyo3(attribute)]
+    residency: ResidencyV3Desc,
+    #[pyo3(attribute)]
+    live_start: i64,
+    #[pyo3(attribute)]
+    live_end: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CopyEngineCapacityV3Desc {
+    #[pyo3(attribute)]
+    engine: String,
+    #[pyo3(attribute)]
+    capacity: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct PlacementPlanV3Desc {
+    #[pyo3(attribute)]
+    plan_epoch: i64,
+    #[pyo3(attribute)]
+    selections: Vec<ImplementationSelectionV3Desc>,
+    #[pyo3(attribute)]
+    schedule: Vec<PlacedNodeV3Desc>,
+    #[pyo3(attribute)]
+    residencies: Vec<ResidencyV3Desc>,
+    #[pyo3(attribute)]
+    moves: Vec<ScheduledMoveV3Desc>,
+    #[pyo3(attribute)]
+    leases: Vec<PlacementLeaseV3Desc>,
+    #[pyo3(attribute)]
+    copy_engines: Vec<CopyEngineCapacityV3Desc>,
+    #[pyo3(attribute)]
+    schema_version: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
 struct UseDefV2Desc {
     #[pyo3(attribute)]
     producer: i64,
@@ -2583,6 +2763,297 @@ fn validate_physical_plan(plan: &PhysicalFlowPlanDesc) -> Result<Vec<String>, St
     Ok(plan.nodes.iter().map(|node| node.node_key.text()).collect())
 }
 
+fn validate_v3_placement(placement: &PlacementV3Desc, layer: &str) -> Result<(), String> {
+    if contains_runtime_text(&placement.kind) {
+        return Err(format!("{} contains runtime identity text", layer));
+    }
+    match (placement.kind.as_str(), placement.index) {
+        ("cpu", None) => Ok(()),
+        ("cuda", Some(index)) if index >= 0 => Ok(()),
+        _ => Err(format!("{} has an invalid typed placement", layer)),
+    }
+}
+
+fn validate_v3_value(value: &ValueKeyV3Desc, layer: &str) -> Result<(), String> {
+    if value.name.is_empty()
+        || value.version < 1
+        || contains_runtime_text(&value.name)
+        || value.name.contains('/')
+        || value.name.contains('\\')
+    {
+        return Err(format!("{} has an invalid stable value key", layer));
+    }
+    Ok(())
+}
+
+fn validate_v3_residency(residency: &ResidencyV3Desc, layer: &str) -> Result<(), String> {
+    validate_v3_value(&residency.value, layer)?;
+    validate_v3_placement(&residency.placement, layer)?;
+    let valid_memory = match residency.placement.kind.as_str() {
+        "cpu" => ["host", "pinned_host"].contains(&residency.memory.as_str()),
+        "cuda" => residency.memory == "device",
+        _ => false,
+    };
+    if !valid_memory || contains_runtime_text(&residency.memory) {
+        return Err(format!("{} has an invalid typed memory kind", layer));
+    }
+    Ok(())
+}
+
+fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>, String> {
+    if plan.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported PlacementPlan schema version {}",
+            plan.schema_version
+        ));
+    }
+    if plan.plan_epoch < 1 {
+        return Err("PlacementPlan plan_epoch must be >= 1".to_string());
+    }
+
+    let mut selections = HashMap::new();
+    for selection in &plan.selections {
+        validate_node_key(&selection.node_key, "placement selection")?;
+        validate_executor(Some(&selection.logical_executor), "placement logical")?;
+        validate_executor(Some(&selection.key), "placement implementation")?;
+        if contains_runtime_text(&selection.logical_executor.namespace)
+            || contains_runtime_text(&selection.logical_executor.name)
+            || contains_runtime_text(&selection.logical_executor.version)
+            || contains_runtime_text(&selection.key.namespace)
+            || contains_runtime_text(&selection.key.name)
+            || contains_runtime_text(&selection.key.version)
+        {
+            return Err("placement selection contains runtime identity text".to_string());
+        }
+        validate_v3_placement(&selection.placement, "placement selection")?;
+        if selection.duration.microseconds < 1 || selection.duration.samples < 1 {
+            return Err("placement selection has an invalid duration profile".to_string());
+        }
+        let node = selection.node_key.text();
+        if selections.insert(node, selection).is_some() {
+            return Err("PlacementPlan contains duplicate selections".to_string());
+        }
+    }
+
+    let mut schedule_positions = HashMap::new();
+    for (position, item) in plan.schedule.iter().enumerate() {
+        validate_node_key(&item.node_key, "placed node")?;
+        validate_executor(Some(&item.implementation), "placed implementation")?;
+        if contains_runtime_text(&item.implementation.namespace)
+            || contains_runtime_text(&item.implementation.name)
+            || contains_runtime_text(&item.implementation.version)
+        {
+            return Err("placed implementation contains runtime identity text".to_string());
+        }
+        validate_v3_placement(&item.placement, "placed node")?;
+        if item.start_at < 0 || item.end_at <= item.start_at {
+            return Err("placed node has an invalid schedule interval".to_string());
+        }
+        let node = item.node_key.text();
+        if schedule_positions.insert(node.clone(), position).is_some() {
+            return Err("PlacementPlan contains duplicate scheduled nodes".to_string());
+        }
+        let selection = selections
+            .get(&node)
+            .ok_or_else(|| "placed node has no implementation selection".to_string())?;
+        if selection.key != item.implementation || selection.placement != item.placement {
+            return Err("placed node differs from its implementation selection".to_string());
+        }
+        if item.end_at - item.start_at != selection.duration.microseconds {
+            return Err("placed node duration differs from its selected profile".to_string());
+        }
+    }
+    if selections.len() != schedule_positions.len() {
+        return Err("PlacementPlan selections and schedule must cover the same nodes".to_string());
+    }
+    for (position, item) in plan.schedule.iter().enumerate() {
+        let mut dependencies = HashSet::new();
+        for dependency in &item.depends_on {
+            validate_node_key(dependency, "placed node dependency")?;
+            let text = dependency.text();
+            if !dependencies.insert(text.clone()) {
+                return Err("placed node dependencies must be unique".to_string());
+            }
+            let dependency_position = schedule_positions
+                .get(&text)
+                .ok_or_else(|| "placed node references an unknown dependency".to_string())?;
+            if *dependency_position >= position
+                || plan.schedule[*dependency_position].end_at > item.start_at
+            {
+                return Err("placed node dependencies must be ordered before launch".to_string());
+            }
+        }
+    }
+
+    let mut residencies = HashSet::new();
+    for residency in &plan.residencies {
+        validate_v3_residency(residency, "placement residency")?;
+        if !residencies.insert(residency.text()) {
+            return Err("PlacementPlan contains duplicate residencies".to_string());
+        }
+    }
+
+    let mut engine_capacities = HashMap::new();
+    for descriptor in &plan.copy_engines {
+        if !["h2d", "d2h", "p2p"].contains(&descriptor.engine.as_str())
+            || descriptor.capacity < 1
+            || contains_runtime_text(&descriptor.engine)
+        {
+            return Err("PlacementPlan has an invalid copy-engine capacity".to_string());
+        }
+        if engine_capacities
+            .insert(descriptor.engine.clone(), descriptor.capacity)
+            .is_some()
+        {
+            return Err("PlacementPlan contains duplicate copy-engine capacities".to_string());
+        }
+    }
+
+    let mut move_positions = HashMap::new();
+    for (position, item) in plan.moves.iter().enumerate() {
+        validate_v3_value(&item.key.value, "scheduled move key")?;
+        if item.key.ordinal < 0 || item.key.value != item.r#move.value {
+            return Err("scheduled move has an invalid stable key".to_string());
+        }
+        validate_v3_value(&item.r#move.value, "scheduled move value")?;
+        validate_v3_residency(&item.r#move.source, "scheduled move source")?;
+        validate_v3_residency(&item.r#move.destination, "scheduled move destination")?;
+        if item.r#move.source.value != item.r#move.value
+            || item.r#move.destination.value != item.r#move.value
+            || item.r#move.source.placement == item.r#move.destination.placement
+            || item.r#move.byte_count < 0
+            || !item.r#move.asynchronous
+        {
+            return Err("scheduled move has inconsistent typed values".to_string());
+        }
+        let expected_kind = match (
+            item.r#move.source.placement.kind.as_str(),
+            item.r#move.destination.placement.kind.as_str(),
+        ) {
+            ("cpu", "cuda") => "h2d",
+            ("cuda", "cpu") => "d2h",
+            ("cuda", "cuda") => "p2p",
+            _ => "",
+        };
+        if item.r#move.kind != expected_kind || item.engine != expected_kind {
+            return Err("scheduled move kind/engine differs from its placements".to_string());
+        }
+        if item.start_at < 0 || item.end_at <= item.start_at {
+            return Err("scheduled move has an invalid interval".to_string());
+        }
+        let producer = item
+            .producer
+            .as_ref()
+            .ok_or_else(|| "scheduled move requires a producer node".to_string())?;
+        let consumer = item
+            .consumer
+            .as_ref()
+            .ok_or_else(|| "scheduled move requires a consumer node".to_string())?;
+        validate_node_key(producer, "scheduled move producer")?;
+        validate_node_key(consumer, "scheduled move consumer")?;
+        let producer_position = schedule_positions
+            .get(&producer.text())
+            .ok_or_else(|| "scheduled move references an unknown producer".to_string())?;
+        let consumer_position = schedule_positions
+            .get(&consumer.text())
+            .ok_or_else(|| "scheduled move references an unknown consumer".to_string())?;
+        if producer_position >= consumer_position
+            || item.start_at < plan.schedule[*producer_position].end_at
+            || item.end_at > plan.schedule[*consumer_position].start_at
+        {
+            return Err(
+                "scheduled move must complete between its producer and consumer".to_string(),
+            );
+        }
+        if !engine_capacities.contains_key(&item.engine) {
+            return Err("scheduled move references an undeclared copy engine".to_string());
+        }
+        if !residencies.contains(&item.r#move.source.text())
+            || !residencies.contains(&item.r#move.destination.text())
+        {
+            return Err("scheduled move references an unknown residency".to_string());
+        }
+        if move_positions.insert(item.key.text(), position).is_some() {
+            return Err("PlacementPlan contains duplicate scheduled move keys".to_string());
+        }
+        let _ = item.used_fallback;
+    }
+    for (position, item) in plan.moves.iter().enumerate() {
+        let mut dependencies = HashSet::new();
+        for dependency in &item.depends_on {
+            let text = dependency.text();
+            if !dependencies.insert(text.clone()) {
+                return Err("scheduled move dependencies must be unique".to_string());
+            }
+            let dependency_position = move_positions
+                .get(&text)
+                .ok_or_else(|| "scheduled move references an unknown dependency".to_string())?;
+            if *dependency_position >= position
+                || plan.moves[*dependency_position].end_at > item.start_at
+            {
+                return Err("scheduled move dependencies must complete before launch".to_string());
+            }
+        }
+        if item.r#move.source.memory == "pinned_host" {
+            let has_staging_dependency = item.depends_on.iter().any(|dependency| {
+                let dependency_position = move_positions[&dependency.text()];
+                plan.moves[dependency_position].r#move.destination == item.r#move.source
+            });
+            if !has_staging_dependency {
+                return Err("pinned-host H2D requires its D2H dependency".to_string());
+            }
+        }
+    }
+    for (engine, capacity) in &engine_capacities {
+        for item in plan.moves.iter().filter(|item| item.engine == *engine) {
+            let overlap = plan
+                .moves
+                .iter()
+                .filter(|other| {
+                    other.engine == *engine
+                        && other.start_at < item.end_at
+                        && other.end_at > item.start_at
+                })
+                .count() as i64;
+            if overlap > *capacity {
+                return Err("scheduled moves exceed copy-engine capacity".to_string());
+            }
+        }
+    }
+
+    let mut leases = HashMap::new();
+    for lease in &plan.leases {
+        validate_v3_residency(&lease.residency, "placement lease")?;
+        if lease.live_start < 0 || lease.live_end < lease.live_start {
+            return Err("placement lease has an invalid live range".to_string());
+        }
+        let residency = lease.residency.text();
+        if !residencies.contains(&residency) {
+            return Err("placement lease references an unknown residency".to_string());
+        }
+        if leases.insert(residency, lease).is_some() {
+            return Err("PlacementPlan contains duplicate residency leases".to_string());
+        }
+    }
+    if leases.len() != residencies.len() {
+        return Err("every PlacementPlan residency requires one lease".to_string());
+    }
+    for item in &plan.moves {
+        for residency in [&item.r#move.source, &item.r#move.destination] {
+            let lease = leases[&residency.text()];
+            if lease.live_start > item.start_at || lease.live_end < item.end_at {
+                return Err("placement lease does not cover its scheduled move".to_string());
+            }
+        }
+    }
+
+    Ok(plan
+        .schedule
+        .iter()
+        .map(|item| item.node_key.text())
+        .collect())
+}
+
 /// Validate one frozen, metadata-only physical execution plan. Runtime Tensor,
 /// stream, event, graph, callback, and lease objects remain in Python.
 #[pyfunction]
@@ -2592,11 +3063,21 @@ fn validate_physical_flow_plan(plan: PhysicalFlowPlanDesc) -> PyResult<WorkGraph
     Ok(WorkGraphValidation { topological_order })
 }
 
+/// Validate one frozen Phase 3 local placement plan. Runtime implementations,
+/// tensors, streams, events, pinned allocations, and transfer handles stay in Python.
+#[pyfunction]
+#[pyo3(signature = (plan))]
+fn validate_placement_plan(plan: PlacementPlanV3Desc) -> PyResult<WorkGraphValidation> {
+    let topological_order = validate_placement_plan_v3(&plan).map_err(validation_error)?;
+    Ok(WorkGraphValidation { topological_order })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_workgraph, m)?)?;
     m.add_function(wrap_pyfunction!(validate_workgraph_ir, m)?)?;
     m.add_function(wrap_pyfunction!(validate_capture_hierarchy, m)?)?;
     m.add_function(wrap_pyfunction!(validate_physical_flow_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_placement_plan, m)?)?;
     m.add_class::<WorkGraphValidation>()?;
     Ok(())
 }
