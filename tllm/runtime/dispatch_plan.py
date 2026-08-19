@@ -133,6 +133,17 @@ class DispatchPlan:
             for target in self._flow_targets
         )
 
+    def requires_graph_mode_refresh(self, graph_mode: GraphMode) -> bool:
+        """Whether resolving ``graph_mode`` will still change placement state.
+
+        This is a cold-path query for startup/control-plane observers.  The
+        dispatch loop continues to own the actual ``ensure_graph_mode`` call.
+        """
+
+        return self.requires_graph_mode_resolution() and (
+            self._placement_metadata_pending or graph_mode.name.lower() != self._graph_mode
+        )
+
     def flow_targets_for_hook(self, hook: str) -> tuple[FlowDispatchTarget, ...]:
         return self._by_flow_hook.get(str(hook), ())
 

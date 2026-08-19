@@ -58,6 +58,13 @@ API and plugin boundaries; after a boundary value is validated, downstream
 code uses typed attributes. `PortBundle.entries` remains a compatibility and
 extension API, while built-in consumers lower it once into typed input views.
 
+Phase 1a WorkGraph is a startup/control-plane shadow only. `DispatchPlan` and
+`ExecutionPlan` remain authoritative for every runtime decision and dispatch;
+the shadow records and validates their typed structure but cannot replace,
+reorder, or execute them. Its explicit anchor edge represents one fixed
+`AnchorNode -> WorkNode` attachment. It does not yet encode the future
+"between two vLLM lifecycle points" interval constraint.
+
 Producer objects are declarations, not miniature executors. They describe
 outputs, requirements, hooks, and graph safety. Backend drivers remain
 responsible for materializing those declarations from vLLM tensors.
@@ -200,6 +207,7 @@ If you need step-end work, implement `on_step_end(ctx)` as an optional compatibi
 
 ## Related Docs
 
+- [WorkGraph Phase 1a](workgraph-phase1a.md)
 - [Glossary](../reference/glossary.md)
 - [Project Structure](../reference/project-structure.md)
 - [Write Your First Consumer](../getting-started/write-your-first-consumer.md)

@@ -27,6 +27,7 @@ from tllm.backends.protocol import (
     UnsupportedBackendError,
 )
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
+from tllm.backends.vllm.workgraph_runtime import record_resolved_backend
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
@@ -339,7 +340,15 @@ class V027MRv1Driver:
         core._ORIG_SAMPLE_TOKENS = orig_sample_tokens
 
         def _load_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            return _hooks.wrapped_load_model(core=core, runner=runner, args=args, kwargs=kwargs)
+            out = _hooks.wrapped_load_model(core=core, runner=runner, args=args, kwargs=kwargs)
+            from tllm.runtime.graph_policy import resolve_graph_mode
+
+            record_resolved_backend(
+                core=core,
+                capabilities=self.capabilities(),
+                graph_mode=resolve_graph_mode(runner),
+            )
+            return out
 
         def _prepare_inputs(runner: Any, scheduler_output: Any, num_scheduled_tokens: Any = None) -> Any:
             return _wrapped_prepare_inputs(

@@ -26,6 +26,9 @@ try:
         localize_decode_rows,
         partition_rows,
         plan_sampler_step,
+        WorkGraphValidation,
+        validate_workgraph,
+        validate_workgraph_ir,
     )
 except ImportError as exc:  # pragma: no cover - build guard
     raise ImportError(
@@ -47,4 +50,7 @@ __all__ = [
     "localize_decode_rows",
     "partition_rows",
     "plan_sampler_step",
+    "WorkGraphValidation",
+    "validate_workgraph",
+    "validate_workgraph_ir",
 ]

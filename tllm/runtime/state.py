@@ -36,6 +36,8 @@ from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrie
 
 if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
+    from tllm.workgraph.anchors import BackendResolution
+    from tllm.workgraph.compiler import Phase1aPlan
 
 
 RuntimeConsumer = BaseConsumer
@@ -116,6 +118,13 @@ class ResidualRuntimeState:
     consumer_registry: Optional[ConsumerRegistry] = None
     dispatch_plan: Optional[DispatchPlan] = None
     execution_plan: Optional[ExecutionPlan] = None
+    # Startup-only WorkGraph shadow metadata. Runtime dispatch does not read
+    # this field; the existing plans above remain authoritative.
+    workgraph_snapshot: Optional["Phase1aPlan"] = None
+    # The latest concrete backend context is captured at the backend boundary
+    # and reused by cold shadow refreshes after later plan changes.
+    workgraph_backend_resolution: Optional["BackendResolution"] = None
+    workgraph_refresh_pending: bool = False
     producer_executor: Optional["ProducerExecutor"] = None
     deferred_work_queue: DeferredWorkQueue = field(default_factory=DeferredWorkQueue)
     fusion_executor: FusionExecutor = field(default_factory=FusionExecutor)

@@ -62,6 +62,7 @@ Start here if you want to add ports, change runtime hooks, or contribute to the 
 1. [Project Structure](reference/project-structure.md)
 2. [Developer Testing Guide](development/testing-guide.md)
 3. [Glossary](reference/glossary.md)
+4. [WorkGraph Phase 1a Startup Shadow](developer-guides/workgraph-phase1a.md)
 
 ---
 

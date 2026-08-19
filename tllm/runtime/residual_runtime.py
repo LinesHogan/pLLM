@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Optional, Sequence
 
 import torch
 
@@ -48,6 +48,9 @@ from tllm.runtime.resources import (
 from tllm.runtime.state import RUNTIME, ResidualRuntimeConfig, ResidualRuntimeState, RuntimeConsumer
 from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspotStats, PlacementStats
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
+
+if TYPE_CHECKING:
+    from tllm.workgraph.anchors import BackendResolution
 
 ensure_v1_env()
 
@@ -79,6 +82,8 @@ def _refresh_dispatch_plan() -> None:
     if not consumers:
         RUNTIME.dispatch_plan = None
         RUNTIME.execution_plan = None
+        RUNTIME.workgraph_snapshot = None
+        RUNTIME.workgraph_refresh_pending = False
         RUNTIME.producer_executor = None
         return
     plan = DispatchPlan.build(consumers)
@@ -95,6 +100,30 @@ def _refresh_dispatch_plan() -> None:
     )
 
     RUNTIME.execution_plan = execution_plan
+    # Shadow-only compatibility metadata. The runtime dispatch path continues
+    # to consume DispatchPlan/ExecutionPlan directly and never reads this
+    # snapshot from a per-step hook.  Once a typed backend has been resolved,
+    # retain the previous concrete snapshot until the replacement can be
+    # compiled.  Persisting an unresolved intermediate would make one logical
+    # plan rebuild consume two reconciliation epochs.
+    if RUNTIME.dispatch_plan is None:
+        RUNTIME.workgraph_snapshot = None
+        RUNTIME.workgraph_refresh_pending = False
+    elif RUNTIME.workgraph_backend_resolution is None:
+        from tllm.workgraph.compiler import compile_shadow_snapshot
+
+        RUNTIME.workgraph_snapshot = compile_shadow_snapshot(
+            consumers=consumers,
+            dispatch_plan=plan,
+            execution_plan=execution_plan,
+            previous=RUNTIME.workgraph_snapshot,
+        )
+        RUNTIME.workgraph_refresh_pending = True
+    elif not plan.requires_graph_mode_refresh(RUNTIME.workgraph_backend_resolution.graph_mode):
+        RUNTIME.workgraph_refresh_pending = True
+        _compile_concrete_workgraph_snapshot()
+    else:
+        RUNTIME.workgraph_refresh_pending = True
     RUNTIME.producer_executor = ProducerExecutor.bind(
         plan=execution_plan,
         registry=default_producer_materializers(),
@@ -103,6 +132,70 @@ def _refresh_dispatch_plan() -> None:
         RUNTIME.placement_stats.capture_resident_stage_count,
         len(execution_plan.capture_resident_producer_ids),
     )
+
+
+def _compile_concrete_workgraph_snapshot() -> None:
+    """Compile one concrete shadow snapshot from already-authoritative plans.
+
+    This cold path deliberately has no access to runner instances or runtime
+    payloads. ``DispatchPlan`` and ``ExecutionPlan`` remain the only inputs
+    used to describe scheduling; this result is never consulted for dispatch.
+    """
+
+    resolution = RUNTIME.workgraph_backend_resolution
+    plan = RUNTIME.dispatch_plan
+    execution_plan = RUNTIME.execution_plan
+    if resolution is None:
+        raise RuntimeError("WorkGraph refresh requires a resolved backend context")
+    if plan is None or execution_plan is None:
+        raise RuntimeError("WorkGraph refresh requires DispatchPlan and ExecutionPlan")
+
+    from tllm.workgraph.anchors import backend_snapshot_from_resolution
+    from tllm.workgraph.compiler import compile_phase1a
+
+    # ``lower_plans`` binds the existing authoritative plans directly; it
+    # intentionally does not inspect consumer instances at this boundary.
+    RUNTIME.workgraph_snapshot = compile_phase1a(
+        consumers=(),
+        dispatch_plan=plan,
+        execution_plan=execution_plan,
+        backend=backend_snapshot_from_resolution(resolution),
+        previous=RUNTIME.workgraph_snapshot,
+    )
+    RUNTIME.workgraph_refresh_pending = False
+
+
+def record_workgraph_backend_resolution(*, resolution: "BackendResolution") -> None:
+    """Record one typed backend resolution and refresh non-placement plans.
+
+    Drivers call this only after vLLM has resolved its effective graph mode.
+    Plans whose fusion placement depends on that mode wait for the existing
+    dispatch-side placement refresh so its counters and behavior remain
+    unchanged.
+    """
+
+    previous_resolution = RUNTIME.workgraph_backend_resolution
+    RUNTIME.workgraph_backend_resolution = resolution
+    plan = RUNTIME.dispatch_plan
+    if plan is None:
+        return
+    if previous_resolution == resolution and not RUNTIME.workgraph_refresh_pending:
+        return
+    if plan.requires_graph_mode_refresh(resolution.graph_mode):
+        RUNTIME.workgraph_refresh_pending = True
+        return
+    RUNTIME.workgraph_refresh_pending = True
+    # Placement is already current for this graph mode.  A changed typed
+    # backend descriptor therefore needs only the cold shadow refresh, not a
+    # second dispatch-side placement transition.
+    _compile_concrete_workgraph_snapshot()
+
+
+def finalize_workgraph_snapshot_after_placement_refresh() -> None:
+    """Finish the one-time refresh after existing placement/fusion work."""
+
+    if RUNTIME.workgraph_refresh_pending:
+        _compile_concrete_workgraph_snapshot()
 
 
 def register_dispatch_consumer(consumer: BaseConsumer) -> None:

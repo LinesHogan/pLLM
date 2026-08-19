@@ -26,6 +26,7 @@ from tllm.backends.protocol import (
     SamplerStage,
 )
 from tllm.backends.vllm import sampler_mrv2 as _sampler_mrv2
+from tllm.backends.vllm.workgraph_runtime import record_resolved_backend
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
@@ -203,12 +204,23 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
 
 def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, orig: Any) -> Any:
     runtime = core.RUNTIME
+
+    def _record_workgraph_resolution() -> None:
+        from tllm.runtime.graph_policy import resolve_graph_mode
+
+        record_resolved_backend(
+            core=core,
+            capabilities=V027MRv2Driver().capabilities(),
+            graph_mode=resolve_graph_mode(runner),
+        )
+
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, *args, **kwargs)
         if _test_time_lora_enabled(runtime):
             _test_time_lora.maybe_bind_test_time_lora_service(runtime=runtime, runner=runner)
         _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
         _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
+        _record_workgraph_resolution()
         return out
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
@@ -223,6 +235,7 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
     _test_time_lora.maybe_bind_test_time_lora_service(runtime=runtime, runner=runner)
     _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
     _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
+    _record_workgraph_resolution()
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,

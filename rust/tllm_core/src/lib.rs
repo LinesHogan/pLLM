@@ -8,6 +8,7 @@ mod decode_localization;
 mod execution_plan;
 mod placement;
 mod sampler_plan;
+mod workgraph;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -15,5 +16,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     sampler_plan::register(m)?;
     execution_plan::register(m)?;
     placement::register(m)?;
+    workgraph::register(m)?;
     Ok(())
 }

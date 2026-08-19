@@ -624,12 +624,23 @@ def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLi
 
     from tllm.runtime.graph_policy import resolve_graph_mode
 
-    if plan.requires_graph_mode_resolution() and plan.ensure_graph_mode(resolve_graph_mode(runner)):
+    placement_refreshed = plan.requires_graph_mode_resolution() and plan.ensure_graph_mode(
+        resolve_graph_mode(runner)
+    )
+    if placement_refreshed:
         core.RUNTIME.placement_stats.fusion_eligible_count += sum(
             len(group) for group in plan.fusion_groups
         )
         core.RUNTIME.placement_stats.fusion_fallback_count += len(plan.fusion_rejections)
     core.RUNTIME.fusion_executor.configure(plan)
+    if placement_refreshed:
+        # Preserve the existing plan transition and statistics above. The
+        # shadow WorkGraph is compiled only after them, once, for the actual
+        # residual runtime module; standalone dispatch test cores stay pure.
+        from tllm.runtime import residual_runtime
+
+        if core is residual_runtime:
+            residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
 
     step_id = int(core.RUNTIME.event_step_id)
     targets = [

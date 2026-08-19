@@ -179,6 +179,158 @@ class PlacementSchedule:
     fusion_groups: list[list[str]]
     fusion_rejections: list[tuple[str, str]]
 
+class WorkGraphNodeKeyDescriptor(Protocol):
+    namespace: str
+    owner: str
+    ordinal: int
+
+class WorkGraphPortIdDescriptor(Protocol):
+    namespace: str
+    name: str
+    version: int
+
+class WorkGraphLocatorFieldDescriptor(Protocol):
+    path: Sequence[str]
+    value_type: str
+    value: str
+
+class WorkGraphPortAddressDescriptor(Protocol):
+    kind: str
+    locator_type: str
+    locator_fields: Sequence[WorkGraphLocatorFieldDescriptor]
+
+WorkGraphPortRefDescriptor = WorkGraphPortIdDescriptor | WorkGraphPortAddressDescriptor
+
+class WorkGraphValueDescriptor(Protocol):
+    value_id: str
+    version: int
+    port: WorkGraphPortRefDescriptor | None
+    shape: Sequence[str]
+    dtype: str
+    layout: str
+    alias_set: str
+
+class WorkGraphAccessDescriptor(Protocol):
+    node_key: WorkGraphNodeKeyDescriptor
+    value: WorkGraphValueDescriptor
+    mode: str
+    port: WorkGraphPortRefDescriptor | None
+    subset: Sequence[str]
+    consistency: str
+
+class WorkGraphTimingDescriptor(Protocol):
+    window: str
+    mobility: str
+    deadline: str
+    max_defer_steps: int
+    observes_version: str
+
+class WorkGraphExecutorDescriptor(Protocol):
+    namespace: str
+    name: str
+    version: str
+
+class WorkGraphAnchorDescriptor(Protocol):
+    backend: str
+    runner: str
+    graph_mode: str
+    hook: str
+    externally_owned: bool
+    mobility: str
+    service_class: str
+
+class WorkGraphBackendDescriptor(Protocol):
+    backend_id: str
+    runner_family: str
+    graph_mode: str
+    backend_version: str
+    capabilities: Sequence[str]
+    device: str
+    rank: int
+    tp_size: int
+    pp_size: int
+    dp_size: int
+    topology: Sequence[str]
+
+class WorkGraphSemanticNodeDescriptor(Protocol):
+    node_key: WorkGraphNodeKeyDescriptor
+    kind: str
+    executor: WorkGraphExecutorDescriptor | None
+    reads: Sequence[WorkGraphAccessDescriptor]
+    writes: Sequence[WorkGraphAccessDescriptor]
+    effects: Sequence[str]
+    timing: WorkGraphTimingDescriptor
+    anchor: WorkGraphAnchorDescriptor | None
+    graph_safety: str
+    source: str
+    legacy_boundary: str | None
+    shape_guard: Sequence[str]
+
+class WorkGraphSemanticDescriptor(Protocol):
+    schema_version: int
+    nodes: Sequence[WorkGraphSemanticNodeDescriptor]
+    edges: Sequence[tuple[WorkGraphNodeKeyDescriptor, WorkGraphNodeKeyDescriptor, str]]
+    values: Sequence[WorkGraphValueDescriptor]
+    backend: WorkGraphBackendDescriptor | None
+    graph_mode: str
+
+class WorkGraphExecutionNodeDescriptor(Protocol):
+    node_key: WorkGraphNodeKeyDescriptor
+    semantic_key: WorkGraphNodeKeyDescriptor | None
+    kind: str
+    executor: WorkGraphExecutorDescriptor | None
+    accesses: Sequence[WorkGraphAccessDescriptor]
+    residence_keys: Sequence[str]
+    move_keys: Sequence[str]
+    lease_keys: Sequence[str]
+    device: str
+    rank: int
+    anchor: WorkGraphAnchorDescriptor | None
+    graph_safety: str
+    fusion_group: str
+
+class WorkGraphResidenceDescriptor(Protocol):
+    value: WorkGraphValueDescriptor
+    device: str
+    rank: int
+    memory_kind: str
+    valid_version: int
+
+class WorkGraphMoveDescriptor(Protocol):
+    value: WorkGraphValueDescriptor
+    source: WorkGraphResidenceDescriptor
+    destination: WorkGraphResidenceDescriptor
+    subset: Sequence[str]
+    layout: str
+    engine: str
+    asynchronous: bool
+
+class WorkGraphLeaseDescriptor(Protocol):
+    value: WorkGraphValueDescriptor
+    storage: str
+    live_start: str
+    live_end: str
+    ready_fence: str
+    retire_fence: str
+    reader_count: int
+    stable_address: bool
+    materialized: bool
+
+class WorkGraphDataDescriptor(Protocol):
+    schema_version: int
+    nodes: Sequence[WorkGraphExecutionNodeDescriptor]
+    values: Sequence[WorkGraphValueDescriptor]
+    accesses: Sequence[WorkGraphAccessDescriptor]
+    residences: Sequence[WorkGraphResidenceDescriptor]
+    moves: Sequence[WorkGraphMoveDescriptor]
+    leases: Sequence[WorkGraphLeaseDescriptor]
+    edges: Sequence[tuple[WorkGraphNodeKeyDescriptor, WorkGraphNodeKeyDescriptor, str]]
+    backend: WorkGraphBackendDescriptor | None
+    graph_mode: str
+
+class WorkGraphValidation:
+    topological_order: list[str]
+
 def compile_placement_schedule(
     flows: Sequence[PlacementFlowDescriptor],
     graph_mode: str,
@@ -224,3 +376,13 @@ def compile_execution_plan(
     supported_hooks: list[str] | None = ...,
     backend: tuple[str, str] | None = ...,
 ) -> CompiledPlan: ...
+
+def validate_workgraph(
+    semantic: WorkGraphSemanticDescriptor,
+    data: WorkGraphDataDescriptor,
+) -> WorkGraphValidation: ...
+
+def validate_workgraph_ir(
+    semantic: WorkGraphSemanticDescriptor,
+    data: WorkGraphDataDescriptor,
+) -> WorkGraphValidation: ...

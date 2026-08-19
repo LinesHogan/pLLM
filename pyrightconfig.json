@@ -8,9 +8,12 @@
     "tllm/ports",
     "tllm/producers",
     "tllm/core",
+    "tllm/workgraph",
     "**/__pycache__"
   ],
   "reportMissingImports": true,
   "reportMissingTypeStubs": false,
+  "venvPath": ".",
+  "venv": ".venv",
   "pythonVersion": "3.11"
 }
