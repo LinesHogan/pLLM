@@ -795,6 +795,13 @@ class DistributedFlowPlan:
             raise ValueError("DistributedFlowPlan.schema_version must be 1")
         if len({item.key for item in requirements}) != len(requirements):
             raise ValueError("distributed state requirement keys must be unique")
+        ordered_requirements = tuple(
+            sorted(requirements, key=lambda item: item.key.value)
+        )
+        if requirements != ordered_requirements:
+            raise ValueError(
+                "DistributedFlowPlan state requirements must use canonical order"
+            )
         expected_residences = _compile_state_residences(topology, requirements)
         if residences != expected_residences:
             raise ValueError(

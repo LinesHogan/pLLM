@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from tllm.backends.vllm import v027_mrv1, v027_mrv2
 from tllm.runtime import active_targets, residual_runtime
 from tllm.runtime.scheduling import phase4_collective as phase4_runtime
 from tllm.runtime.state import ResidualRuntimeState
@@ -372,6 +373,109 @@ class Phase4DistributedBindingActivationAuditRedTest(unittest.TestCase):
         resolve_setup.assert_called_once_with(core=core, runner=runner)
         apply_setup.assert_called_once_with(core=core, runner=runner, setup=setup)
         self.assertTrue(getattr(model, "_audit_hooks_installed", False))
+
+
+class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
+    """vLLM 0.27 drivers must enter PREPARE after acquiring the step."""
+
+    def _prepare_binding(self) -> object:
+        return _binding(
+            self,
+            request=_request(name="prepare", window=CollectiveWindow.PREPARE),
+        )
+
+    def test_mrv1_dispatches_prepare_lifecycle_after_distributed_step_prepare(self) -> None:
+        binding = self._prepare_binding()
+        state = ResidualRuntimeState()
+        runner = SimpleNamespace(model=None)
+        view = SimpleNamespace(
+            logits_indices=None,
+            spec_decode_metadata=None,
+            num_scheduled_tokens_np=(),
+        )
+        events: list[tuple[str, int]] = []
+        real_dispatch = common_hooks.dispatch_runtime_event
+
+        def dispatch(**kwargs: object) -> int:
+            event_name = str(kwargs["event_name"])
+            events.append((event_name, state.distributed_prepared_step_id))
+            result = real_dispatch(**kwargs)
+            if event_name == "prepare_inputs.pre":
+                step = state.distributed_prepared_step_id
+                self.assertGreaterEqual(step, 0)
+                key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]
+                residual_runtime.launch_workgraph_collective(
+                    step,
+                    collective=key,
+                    payload=object(),
+                )
+            return result
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(v027_mrv1._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
+            mock.patch.object(v027_mrv1.active_targets, "runtime_has_active_targets", return_value=True),
+            mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
+            mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
+            mock.patch.object(v027_mrv1._fast_weight, "update_fast_weight_metadata_from_runner"),
+            mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
+            mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
+        ):
+            residual_runtime.configure_workgraph_distributed(binding)
+            residual_runtime.publish_workgraph_distributed(plan_epoch=1)
+            v027_mrv1._wrapped_prepare_inputs(
+                core=residual_runtime,
+                runner=runner,
+                scheduler_output=object(),
+                num_scheduled_tokens=object(),
+                orig=mock.Mock(return_value=(None, None)),
+            )
+
+        self.assertEqual(events, [("prepare_inputs.pre", 1), ("prepare_inputs.post", 1)])
+        self.assertEqual(binding.adapter.calls[0][0].key.name, "prepare")
+
+    def test_mrv2_dispatches_prepare_lifecycle_before_execute_model_compute_window(self) -> None:
+        binding = self._prepare_binding()
+        state = ResidualRuntimeState()
+        runner = SimpleNamespace(model=None)
+        events: list[tuple[str, int]] = []
+        real_dispatch = common_hooks.dispatch_runtime_event
+
+        def dispatch(**kwargs: object) -> int:
+            event_name = str(kwargs["event_name"])
+            events.append((event_name, state.distributed_prepared_step_id))
+            result = real_dispatch(**kwargs)
+            if event_name == "prepare_inputs.pre":
+                step = state.distributed_prepared_step_id
+                self.assertGreaterEqual(step, 0)
+                key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]
+                residual_runtime.launch_workgraph_collective(
+                    step,
+                    collective=key,
+                    payload=object(),
+                )
+            return result
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(v027_mrv2._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
+            mock.patch.object(v027_mrv2.active_targets, "runtime_has_active_targets", return_value=True),
+            mock.patch.object(v027_mrv2._hooks, "setup_runtime_hooks_if_active"),
+            mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
+            mock.patch.object(v027_mrv2._test_time_lora, "maybe_commit_and_apply_request_mapping"),
+        ):
+            residual_runtime.configure_workgraph_distributed(binding)
+            residual_runtime.publish_workgraph_distributed(plan_epoch=1)
+            v027_mrv2._wrapped_execute_model(
+                core=residual_runtime,
+                runner=runner,
+                args=(),
+                kwargs={},
+                orig=mock.Mock(return_value="executed"),
+            )
+
+        self.assertEqual(events, [("prepare_inputs.pre", 1), ("execute_model.pre", 1)])
+        self.assertEqual(binding.adapter.calls[0][0].key.name, "prepare")
 
 
 if __name__ == "__main__":

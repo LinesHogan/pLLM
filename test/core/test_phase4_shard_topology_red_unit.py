@@ -230,6 +230,45 @@ def test_python_plan_rejects_ordinal_residences_for_coordinate_shards(
         )
 
 
+def test_python_and_rust_reject_noncanonical_state_requirement_order() -> None:
+    topology = _topology()
+    requirements = (
+        _requirement(phase4.ShardKind.TENSOR),
+        _requirement(phase4.ShardKind.PIPELINE),
+    )
+    canonical_requirements = tuple(
+        sorted(requirements, key=lambda item: item.key.value)
+    )
+    canonical_residences = phase4._compile_state_residences(
+        topology,
+        canonical_requirements,
+    )
+    canonical_plan = phase4.DistributedFlowPlan(
+        plan_epoch=1,
+        topology=topology,
+        state_requirements=canonical_requirements,
+        state_residences=canonical_residences,
+        local_schedules=tuple(
+            phase4.LocalCollectiveSchedule(rank.rank, ())
+            for rank in topology.ranks
+        ),
+    )
+    shuffled_requirements = tuple(reversed(canonical_requirements))
+
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        phase4.DistributedFlowPlan(
+            plan_epoch=canonical_plan.plan_epoch,
+            topology=topology,
+            state_requirements=shuffled_requirements,
+            state_residences=canonical_residences,
+            local_schedules=canonical_plan.local_schedules,
+        )
+
+    candidate = _proxy(canonical_plan, state_requirements=shuffled_requirements)
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        _rust_validate(candidate)
+
+
 @pytest.mark.parametrize(
     ("kind", "candidate_ranks"),
     (

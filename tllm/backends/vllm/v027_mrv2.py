@@ -115,6 +115,16 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         backend_id=V027MRv2Driver.backend_id,
     )
     set_step_session(runner, session)
+    # MRv2 builds inputs inside execute_model, so expose its logical PREPARE
+    # boundary after the new step snapshot exists and before compute begins.
+    _common_hooks.dispatch_runtime_event(
+        runtime=runtime,
+        runner=runner,
+        event_name="prepare_inputs.pre",
+        phase="decode",
+        layer_path=None,
+        capture_enabled=bool(runtime.launch_consumer_from_hooks),
+    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,

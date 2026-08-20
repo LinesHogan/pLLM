@@ -198,6 +198,14 @@ def _wrapped_prepare_inputs(
         )
         return out
 
+    from tllm.runtime import residual_runtime as _residual_runtime
+
+    if core is _residual_runtime:
+        _residual_runtime.prepare_physical_workgraph_step(
+            # MRv1 increments the public step id after input construction.
+            # Prepare that next step before its PREPARE lifecycle event.
+            int(runtime.event_step_id) + 1
+        )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,
@@ -215,10 +223,6 @@ def _wrapped_prepare_inputs(
 
     out = orig(runner, scheduler_output, num_scheduled_tokens)
     runtime.event_step_id += 1
-    from tllm.runtime import residual_runtime as _residual_runtime
-
-    if core is _residual_runtime:
-        _residual_runtime.prepare_physical_workgraph_step(int(runtime.event_step_id))
     view = _ADAPTER.unpack_prepare_inputs_output(
         runner=runner,
         scheduler_output=scheduler_output,
