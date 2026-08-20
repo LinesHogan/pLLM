@@ -8,10 +8,17 @@ from unittest import mock
 
 import torch
 
+from tllm.consumers.base import BaseConsumer
 from tllm.contracts.port_bundle import BundleKey, PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
+from tllm.ports.base import ConsumerFlow, TimingContract
 from tllm.runtime import residual_runtime
-from tllm.runtime.ports.residual_bundle_dispatch import drain_deferred_port_bundles
+from tllm.runtime.dispatch_plan import FlowDispatchTarget
+from tllm.runtime.ports.residual_bundle_dispatch import (
+    _enqueue_flow_target,
+    drain_deferred_port_bundles,
+    synchronize_deferred_port_bundles,
+)
 from tllm.runtime.scheduling.deferred import DeferredWork
 from tllm.runtime.scheduling.phase3_transfer import (
     PinnedMemoryPool,
@@ -194,6 +201,7 @@ def _queued(
     *,
     entries: dict[str, object] | None = None,
     deadline_step: int = 8,
+    plan_resources: PlanResources | None = None,
 ) -> DeferredWork:
     return DeferredWork(
         flow_id=flow_id,
@@ -217,6 +225,7 @@ def _queued(
         eligible_hook="sampler.pre_draw",
         deadline_step=deadline_step,
         deadline_hook="prepare_inputs.pre",
+        plan_resources=plan_resources,
     )
 
 
@@ -337,6 +346,54 @@ def _transfer_resources(
         adaptive_flow_bindings=(flow_binding,),
     )
     return resources, adapter
+
+
+def _enqueue_production_transfer(
+    state: ResidualRuntimeState,
+    trace: list[str],
+) -> None:
+    flow = ConsumerFlow(
+        reads=(),
+        writes=(),
+        window="background",
+        bundle_key=("engine_step_id", "phase"),
+        timing=TimingContract(
+            mobility="deferrable",
+            deadline="next_prepare",
+            max_defer_steps=1,
+        ),
+    )
+    consumer = type(
+        "QueuedTransferConsumer",
+        (BaseConsumer,),
+        {
+            "consumer_id": property(lambda self: "phase5.transfer.consumer"),
+            "consume_bundle": lambda self, bundle, ctx: trace.append("run"),
+            "flows": lambda self: (flow,),
+        },
+    )()
+    target = FlowDispatchTarget(
+        consumer=consumer,
+        flow=flow,
+        flow_id="phase5.transfer.flow",
+        placement_hook="sampler.pre_draw",
+    )
+    queued = _queued(
+        target.flow_id,
+        trace,
+        entries={
+            "source": _FakeTensor((4,), "float32", "cuda:0"),
+            "destination": _FakeTensor((4,), "float32", "cuda:1"),
+        },
+    )
+    _enqueue_flow_target(
+        queue=state.deferred_work_queue,
+        runtime=state,
+        target=target,
+        bundle=queued.bundle,
+        ctx=queued.context,
+        step_id=7,
+    )
 
 
 class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
@@ -633,6 +690,112 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         )
         self.assertEqual(trace, ["run"])
         self.assertEqual(store.collect_retired(), 1)
+
+    def test_queued_transfer_retains_enqueue_epoch_before_first_drain(self) -> None:
+        old_resources, old_adapter = _transfer_resources()
+        new_resources, new_adapter = _transfer_resources(epoch=2)
+        state = self._state(old_resources)
+        trace: list[str] = []
+        _enqueue_production_transfer(state, trace)
+
+        store = state.physical_plan_store
+        assert store is not None
+        store.finish_step(7)
+        store.stage(new_resources)
+        store.prepare_step(8)
+        state.physical_prepared_step_id = 8
+        prematurely_collected = store.collect_retired()
+
+        def complete_latest_fence(_seconds: float) -> None:
+            adapter = old_adapter if old_adapter.fences else new_adapter
+            self.assertTrue(adapter.fences)
+            adapter.fences[-1].complete = True
+
+        with mock.patch("time.sleep", side_effect=complete_latest_fence):
+            synchronize_deferred_port_bundles(runtime=state)
+        collected_after_callback = store.collect_retired()
+
+        self.assertEqual(
+            (
+                prematurely_collected,
+                old_adapter.calls,
+                new_adapter.calls,
+                trace,
+                collected_after_callback,
+            ),
+            (0, ["d2h", "h2d"], [], ["run"], 1),
+        )
+
+    def test_owned_old_epoch_uses_typed_drain_when_current_is_non_adaptive(self) -> None:
+        old_resources, old_adapter = _transfer_resources()
+        state = self._state(old_resources)
+        trace: list[str] = []
+        _enqueue_production_transfer(state, trace)
+
+        store = state.physical_plan_store
+        assert store is not None
+        store.finish_step(7)
+        store.stage(PlanResources(plan=PhysicalFlowPlan(plan_epoch=2, nodes=())))
+        store.prepare_step(8)
+        state.physical_prepared_step_id = 8
+        self.assertEqual(store.collect_retired(), 0)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "adaptive Phase 3 transfer missed the bundle deadline",
+        ):
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=8,
+                hook="sampler.pre_draw",
+            )
+        self.assertEqual(old_adapter.calls, ["d2h"])
+        self.assertEqual(trace, [])
+        self.assertEqual(state.deferred_work_queue.depth, 1)
+        state.deferred_work_queue.clear()
+
+    def test_clear_abandons_pending_transfer_handoff_after_fence_completion(self) -> None:
+        old_resources, old_adapter = _transfer_resources()
+        new_resources, _new_adapter = _transfer_resources(epoch=2)
+        state = self._state(old_resources)
+        trace: list[str] = []
+        old_resources.retain_deferred_handoff()
+        state.deferred_work_queue.enqueue(
+            _queued(
+                "phase5.transfer.flow",
+                trace,
+                entries={
+                    "source": _FakeTensor((4,), "float32", "cuda:0"),
+                    "destination": _FakeTensor((4,), "float32", "cuda:1"),
+                },
+                plan_resources=old_resources,
+            )
+        )
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(old_adapter.calls, ["d2h"])
+
+        state.deferred_work_queue.clear()
+        store = state.physical_plan_store
+        assert store is not None
+        store.finish_step(7)
+        store.stage(new_resources)
+        store.prepare_step(8)
+        state.physical_prepared_step_id = 8
+        self.assertEqual(store.collect_retired(), 0)
+
+        old_adapter.fences[0].complete = True
+        self.assertEqual(store.collect_retired(), 0)
+        self.assertEqual(old_adapter.calls, ["d2h", "h2d"])
+        old_adapter.fences[1].complete = True
+        self.assertEqual(store.collect_retired(), 1)
+        self.assertEqual(trace, [])
 
     def test_authoritative_fallback_completes_its_bound_move_set_before_callback(self) -> None:
         resources, adapter = _transfer_resources(fallback_move_set=True)

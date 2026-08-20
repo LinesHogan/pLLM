@@ -14,10 +14,12 @@ state and string policy dictionaries are not part of the contract.
 
 Every `Phase5ControlPlan` embeds the exact `PlacementPlan` that owns its epoch.
 Its scheduled Moves must equal the Phase 3 plan, and each candidate Move set
-must be a dependency-closed subset of those Moves. The placement structural
-signature is frozen in the plan. `compile_phase5_plan()` derives all of these
-fields from the typed placement plan rather than accepting a caller-provided
-Move universe.
+must be a dependency-closed subset of those complete `ScheduledMove`
+descriptors. Reusing a Phase 3 `MoveKey` while changing timing, dependencies,
+route, or transfer attributes is rejected by both Python and Rust. The
+placement structural signature is frozen in the plan. `compile_phase5_plan()`
+derives all of these fields from the typed placement plan rather than accepting
+a caller-provided Move universe.
 
 Execute actions require a semantic-preserving authoritative fallback. Required
 work cannot select a shedding action. This includes explicitly required work,
@@ -78,8 +80,13 @@ For an admitted action with a Move set, the exact dependency-closed frozen
 subset is submitted before the consumer callback. The queue returns `KEEP`
 while its copy fences are pending and runs the callback only after completion.
 An old plan epoch remains retained across safe-point publication until both the
-copy and its queued callback handoff resolve; a pending transfer at its hard
+copy and its queued callback handoff resolve. Ownership is pinned when the
+deferred item is enqueued, before its first admission decision or transfer, so
+a later epoch cannot take over an older bundle. A pending transfer at its hard
 deadline fails fast instead of allowing borrowed source storage to be reused.
+If a queued callback is explicitly discarded, its handoff token is abandoned,
+but the Phase 3 dispatcher retains the copy until its individual fence finishes
+before the old epoch becomes reusable.
 Explicit `synchronize_esamp()` uses the same typed selector instead of bypassing
 it with an unconditional queue flush. It forces admission to choose an approved
 run, fallback, or shed action, then polls that action's individual transfer

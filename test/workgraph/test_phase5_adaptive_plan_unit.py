@@ -50,6 +50,7 @@ from tllm.workgraph.phase5 import (
     exhaustive_admission_oracle,
     greedy_admission,
     static_admission,
+    validate_candidate_move_sets,
 )
 from tllm.workgraph.signature import structural_signature
 from tllm.runtime.scheduling.phase5_adaptive import (
@@ -371,6 +372,38 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             CandidateMoveSetDesc(MoveSetKey("moves", "open"), (second,))
         self.assertEqual(tuple(item.key for item in placement.moves), (first.key, second.key))
+
+    def test_control_plan_rejects_move_set_descriptor_that_differs_from_placement(self) -> None:
+        placement, first, second = _two_hop_placement()
+        base = _plan(placement=placement)
+        move_set = CandidateMoveSetDesc(
+            MoveSetKey("moves", "descriptor-mismatch"),
+            (replace(first, end_at=4), second),
+        )
+
+        with self.assertRaises(ValueError):
+            Phase5ControlPlan(
+                plan_epoch=base.plan_epoch,
+                placement_plan=placement,
+                scheduled_moves=placement.moves,
+                move_sets=(move_set,),
+                workload_buckets=base.workload_buckets,
+                shape_buckets=base.shape_buckets,
+                budgets=base.budgets,
+                actions=base.actions,
+                unknown_bucket_fallback=base.unknown_bucket_fallback,
+                buffer_capacity=base.buffer_capacity,
+            )
+
+    def test_candidate_move_set_validator_rejects_descriptor_mismatch(self) -> None:
+        placement, first, second = _two_hop_placement()
+        move_set = CandidateMoveSetDesc(
+            MoveSetKey("moves", "descriptor-mismatch"),
+            (replace(first, end_at=4), second),
+        )
+
+        with self.assertRaises(ValueError):
+            validate_candidate_move_sets(placement.moves, (move_set,))
 
     def test_move_deadline_is_identical_in_runtime_greedy_and_oracle(self) -> None:
         placement, first, second = _two_hop_placement()

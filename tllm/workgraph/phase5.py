@@ -599,10 +599,14 @@ class Phase5ControlPlan:
             raise ValueError("Phase5ControlPlan move-set keys must be unique")
         if len(move_sets) > densification_limit or len(actions) > densification_limit:
             raise ValueError("Phase5ControlPlan exceeds its densification limit")
-        move_key_set = set(move_keys)
+        move_by_key = {item.key: item for item in moves}
         for move_set in move_sets:
-            if any(item.key not in move_key_set for item in move_set.moves):
-                raise ValueError("candidate Move set references a non-Phase-3 Move")
+            for item in move_set.moves:
+                anchored = move_by_key.get(item.key)
+                if anchored is None:
+                    raise ValueError("candidate Move set references a non-Phase-3 Move")
+                if anchored != item:
+                    raise ValueError("candidate Move set rewrites a Phase 3 Move")
             selected = set(move_set.move_keys)
             if any(dep not in selected for item in move_set.moves for dep in item.depends_on):
                 raise ValueError("candidate Move sets must be dependency-closed")
@@ -716,10 +720,14 @@ def validate_candidate_move_sets(
 
     scheduled = _tuple_of(scheduled_moves, ScheduledMove, "validate_candidate_move_sets.scheduled_moves")
     candidates = _tuple_of(move_sets, CandidateMoveSetDesc, "validate_candidate_move_sets.move_sets")
-    universe = {item.key for item in scheduled}
+    universe = {item.key: item for item in scheduled}
     for candidate in candidates:
-        if any(item.key not in universe for item in candidate.moves):
-            raise ValueError("candidate Move set is not a subset of scheduled Phase 3 Moves")
+        for item in candidate.moves:
+            anchored = universe.get(item.key)
+            if anchored is None:
+                raise ValueError("candidate Move set is not a subset of scheduled Phase 3 Moves")
+            if anchored != item:
+                raise ValueError("candidate Move set rewrites a scheduled Phase 3 Move")
         selected = set(candidate.move_keys)
         if any(dep not in selected for item in candidate.moves for dep in item.depends_on):
             raise ValueError("candidate Move set is not dependency-closed")

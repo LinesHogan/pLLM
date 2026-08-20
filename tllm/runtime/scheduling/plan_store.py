@@ -124,6 +124,7 @@ class PlanResources:
         tuple[str, object, int],
         tuple[CandidateActionDesc, tuple[CopyHandle, ...]],
     ] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _deferred_handoffs: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         raw_plan = cast(object, self.plan)
@@ -343,7 +344,16 @@ class PlanResources:
                 or self.placement_dispatcher.in_flight == 0
             )
             and not self._adaptive_transfers
+            and self._deferred_handoffs == 0
         )
+
+    def retain_deferred_handoff(self) -> None:
+        object.__setattr__(self, "_deferred_handoffs", self._deferred_handoffs + 1)
+
+    def release_deferred_handoff(self) -> None:
+        if self._deferred_handoffs <= 0:
+            raise RuntimeError("adaptive deferred handoff ownership is unbalanced")
+        object.__setattr__(self, "_deferred_handoffs", self._deferred_handoffs - 1)
 
     def poll_transfers(self) -> None:
         if self.placement_dispatcher is not None:
@@ -389,6 +399,25 @@ class PlanResources:
         )
         batch = self._adaptive_transfers.get(token)
         return None if batch is None else batch[0]
+
+    def abandon_adaptive_transfer(
+        self,
+        *,
+        flow_id: str,
+        bundle_key: object,
+        bundle_version: int,
+    ) -> None:
+        """Drop a discarded callback's token while its copy fence stays owned."""
+
+        binding = self.adaptive_flow_binding(flow_id)
+        if binding is None:
+            return
+        token = self._adaptive_transfer_token(
+            binding,
+            bundle_key,
+            bundle_version,
+        )
+        self._adaptive_transfers.pop(token, None)
 
     def advance_adaptive_transfers(
         self,

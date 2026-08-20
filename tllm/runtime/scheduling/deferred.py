@@ -7,10 +7,14 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.producers.base import HookPoint
+
+if TYPE_CHECKING:
+    from tllm.runtime.scheduling.plan_store import PlanResources
 
 
 WorkRunner = Callable[[PortBundle, RuntimeContext], None]
@@ -41,6 +45,7 @@ class DeferredWork:
     deadline_step: int
     deadline_hook: str
     verify: WorkVerifier | None = None
+    plan_resources: PlanResources | None = None
 
 
 class DeferredWorkDecision(StrEnum):
@@ -118,6 +123,24 @@ class DeferredWorkQueue:
             else work.context
         )
         work.run(work.bundle, context)
+        DeferredWorkQueue._release_owner(work)
+
+    @staticmethod
+    def _release_owner(
+        work: DeferredWork,
+        *,
+        abandon_transfer: bool = False,
+    ) -> None:
+        resources = work.plan_resources
+        if resources is None:
+            return
+        if abandon_transfer:
+            resources.abandon_adaptive_transfer(
+                flow_id=work.flow_id,
+                bundle_key=work.bundle.key,
+                bundle_version=work.bundle.version,
+            )
+        resources.release_deferred_handoff()
 
     def drain_on_bubble(
         self,
@@ -268,6 +291,7 @@ class DeferredWorkQueue:
                 self._items.append(work)
                 continue
             if decision == DeferredWorkDecision.DROP:
+                self._release_owner(work)
                 dropped += 1
                 continue
             try:
@@ -280,4 +304,6 @@ class DeferredWorkQueue:
         return DeferredDrainResult(ran=ran, dropped=dropped)
 
     def clear(self) -> None:
+        for work in self._items:
+            self._release_owner(work, abandon_transfer=True)
         self._items.clear()

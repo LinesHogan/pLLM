@@ -549,28 +549,44 @@ def _enqueue_flow_target(
         if timing_debug_mode() == TimingDebugMode.CROSS_CHECK
         else None
     )
-    queue.enqueue(
-        DeferredWork(
-            flow_id=target.flow_id,
-            bundle=bundle,
-            context=ctx,
-            run=lambda queued_bundle, queued_ctx, dispatch_target=target: _consume_flow_target(
-                runtime, dispatch_target, queued_bundle, queued_ctx
-            ),
-            enqueued_step=int(step_id),
-            eligible_step=int(step_id),
-            eligible_hook=target.placement_hook,
-            deadline_step=deadline_step,
-            deadline_hook="prepare_inputs.pre",
-            verify=(
-                None
-                if declared_fingerprint is None
-                else lambda queued_bundle, expected=declared_fingerprint, flow_id=target.flow_id: assert_bundle_matches(
-                    expected, queued_bundle, flow_id=flow_id
-                )
-            ),
-        )
+    plan_resources: PlanResources | None = None
+    store = runtime.physical_plan_store
+    if store is not None and runtime.physical_prepared_step_id == int(step_id):
+        prepared = store.active(int(step_id))
+        if (
+            prepared.adaptive_scheduler is not None
+            and prepared.adaptive_flow_binding(target.flow_id) is not None
+        ):
+            plan_resources = prepared
+    work = DeferredWork(
+        flow_id=target.flow_id,
+        bundle=bundle,
+        context=ctx,
+        run=lambda queued_bundle, queued_ctx, dispatch_target=target: _consume_flow_target(
+            runtime, dispatch_target, queued_bundle, queued_ctx
+        ),
+        enqueued_step=int(step_id),
+        eligible_step=int(step_id),
+        eligible_hook=target.placement_hook,
+        deadline_step=deadline_step,
+        deadline_hook="prepare_inputs.pre",
+        verify=(
+            None
+            if declared_fingerprint is None
+            else lambda queued_bundle, expected=declared_fingerprint, flow_id=target.flow_id: assert_bundle_matches(
+                expected, queued_bundle, flow_id=flow_id
+            )
+        ),
+        plan_resources=plan_resources,
     )
+    if plan_resources is not None:
+        plan_resources.retain_deferred_handoff()
+    try:
+        queue.enqueue(work)
+    except Exception:
+        if plan_resources is not None:
+            plan_resources.release_deferred_handoff()
+        raise
 
 
 def drain_deferred_port_bundles(
@@ -591,7 +607,27 @@ def drain_deferred_port_bundles(
         and runtime.physical_prepared_step_id == int(step_id)
     ):
         resources = runtime.physical_plan_store.active(int(step_id))
-    if resources is not None and resources.adaptive_scheduler is not None:
+    owned_adaptive_work = any(
+        work.plan_resources is not None
+        and work.plan_resources.adaptive_scheduler is not None
+        for work in queue
+    )
+    pending_adaptive_work = False
+    if not owned_adaptive_work and runtime.physical_plan_store is not None:
+        pending_adaptive_work = any(
+            runtime.physical_plan_store.adaptive_transfer_owner(
+                flow_id=work.flow_id,
+                bundle_key=work.bundle.key,
+                bundle_version=work.bundle.version,
+            )
+            is not None
+            for work in queue
+        )
+    if (
+        (resources is not None and resources.adaptive_scheduler is not None)
+        or owned_adaptive_work
+        or pending_adaptive_work
+    ):
         def select(
             work: DeferredWork,
             must_resolve: bool,
@@ -650,9 +686,11 @@ def _select_adaptive_deferred_work(
 ) -> DeferredWorkDecision:
     """Resolve one queue item through its owning frozen Phase 5 epoch."""
 
-    work_resources = resources
+    work_resources = (
+        work.plan_resources if work.plan_resources is not None else resources
+    )
     store = runtime.physical_plan_store
-    if store is not None:
+    if work.plan_resources is None and store is not None:
         transfer_owner = store.adaptive_transfer_owner(
             flow_id=work.flow_id,
             bundle_key=work.bundle.key,

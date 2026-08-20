@@ -3,11 +3,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import unittest
 
 from tllm.contracts.port_bundle import BundleKey, PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
-from tllm.runtime.scheduling.deferred import DeferredWork, DeferredWorkQueue
+from tllm.runtime.scheduling.deferred import (
+    DeferredWork,
+    DeferredWorkDecision,
+    DeferredWorkQueue,
+)
+from tllm.runtime.scheduling.plan_store import PlanResources
+from tllm.workgraph.physical import PhysicalFlowPlan
 
 
 def _bundle(step: int, *, version: int | None = None) -> PortBundle:
@@ -29,6 +36,27 @@ def _context() -> RuntimeContext:
         is_compiling=False,
         uses_cudagraph=False,
         event_name="flow:decode",
+    )
+
+
+def _owned_work(
+    resources: PlanResources,
+    *,
+    run: Callable[[PortBundle, RuntimeContext], None],
+    flow_id: str = "owned",
+) -> DeferredWork:
+    resources.retain_deferred_handoff()
+    return DeferredWork(
+        flow_id=flow_id,
+        bundle=_bundle(4),
+        context=_context(),
+        run=run,
+        enqueued_step=4,
+        eligible_step=4,
+        eligible_hook="sample_tokens.pre",
+        deadline_step=5,
+        deadline_hook="prepare_inputs.pre",
+        plan_resources=resources,
     )
 
 
@@ -302,6 +330,95 @@ class DeferredWorkQueueUnitTest(unittest.TestCase):
 
         self.assertEqual(queue.flush_all(), 2)
         self.assertEqual(seen, ["first", "second"])
+
+    def test_successful_run_releases_owner_after_callback(self) -> None:
+        resources = PlanResources(plan=PhysicalFlowPlan(plan_epoch=1, nodes=()))
+        queue = DeferredWorkQueue()
+        callback_reusability: list[bool] = []
+        queue.enqueue(
+            _owned_work(
+                resources,
+                run=lambda _bundle, _ctx: callback_reusability.append(
+                    resources.reusable
+                ),
+            )
+        )
+
+        self.assertFalse(resources.reusable)
+        result = queue.drain_selected(
+            step_id=4,
+            hook="sample_tokens.pre",
+            select=lambda _work, _must_resolve: DeferredWorkDecision.RUN,
+        )
+
+        self.assertEqual(result.ran, 1)
+        self.assertEqual(callback_reusability, [False])
+        self.assertTrue(resources.reusable)
+        self.assertFalse(queue)
+
+    def test_failed_run_remains_queued_and_retains_owner(self) -> None:
+        resources = PlanResources(plan=PhysicalFlowPlan(plan_epoch=1, nodes=()))
+        queue = DeferredWorkQueue()
+
+        def fail(_bundle: PortBundle, _ctx: RuntimeContext) -> None:
+            self.assertFalse(resources.reusable)
+            raise RuntimeError("retryable owned callback")
+
+        work = _owned_work(resources, run=fail)
+        queue.enqueue(work)
+
+        with self.assertRaisesRegex(RuntimeError, "retryable owned callback"):
+            queue.drain_selected(
+                step_id=4,
+                hook="sample_tokens.pre",
+                select=lambda _work, _must_resolve: DeferredWorkDecision.RUN,
+            )
+
+        self.assertEqual(tuple(queue), (work,))
+        self.assertFalse(resources.reusable)
+        queue.clear()
+        self.assertTrue(resources.reusable)
+
+    def test_drop_releases_retained_owner(self) -> None:
+        resources = PlanResources(plan=PhysicalFlowPlan(plan_epoch=1, nodes=()))
+        queue = DeferredWorkQueue()
+        callbacks: list[str] = []
+        queue.enqueue(
+            _owned_work(
+                resources,
+                run=lambda _bundle, _ctx: callbacks.append("run"),
+            )
+        )
+
+        self.assertFalse(resources.reusable)
+        result = queue.drain_selected(
+            step_id=4,
+            hook="sample_tokens.pre",
+            select=lambda _work, _must_resolve: DeferredWorkDecision.DROP,
+        )
+
+        self.assertEqual(result.dropped, 1)
+        self.assertEqual(callbacks, [])
+        self.assertTrue(resources.reusable)
+        self.assertFalse(queue)
+
+    def test_clear_releases_every_retained_owner_reference(self) -> None:
+        resources = PlanResources(plan=PhysicalFlowPlan(plan_epoch=1, nodes=()))
+        queue = DeferredWorkQueue()
+        for flow_id in ("owned-a", "owned-b"):
+            queue.enqueue(
+                _owned_work(
+                    resources,
+                    flow_id=flow_id,
+                    run=lambda _bundle, _ctx: None,
+                )
+            )
+
+        self.assertFalse(resources.reusable)
+        queue.clear()
+
+        self.assertFalse(queue)
+        self.assertTrue(resources.reusable)
 
     def test_invalid_deadline_and_version_are_rejected_at_enqueue(self) -> None:
         queue = DeferredWorkQueue()
