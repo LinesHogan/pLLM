@@ -1,0 +1,78 @@
+{
+  "comment": "Cross-package import baseline (only-decrease). Regenerate with `python tools/check_import_layers.py --rebase`.",
+  "rules": {
+    "backends": [
+      "contracts",
+      "core",
+      "ports",
+      "workgraph"
+    ],
+    "common": [
+      "contracts",
+      "core",
+      "ports"
+    ],
+    "consumers": [
+      "common",
+      "contracts",
+      "core",
+      "ports",
+      "producers",
+      "runtime",
+      "workgraph"
+    ],
+    "contracts": [
+      "core"
+    ],
+    "core": [],
+    "ports": [
+      "contracts",
+      "core"
+    ],
+    "producer": [
+      "common",
+      "contracts",
+      "core",
+      "ports"
+    ],
+    "producers": [
+      "contracts",
+      "core",
+      "ports"
+    ],
+    "runtime": [
+      "common",
+      "contracts",
+      "core",
+      "ports",
+      "producers",
+      "workgraph"
+    ],
+    "util": "leaf (any)",
+    "verification": "leaf (any)",
+    "workflows": "leaf (any)",
+    "workgraph": [
+      "contracts",
+      "core",
+      "ports",
+      "producers"
+    ]
+  },
+  "module_level": {
+    "backends->runtime": 36,
+    "contracts->ports": 1,
+    "ports->runtime": 1,
+    "producers->backends": 3,
+    "runtime->backends": 1,
+    "runtime->consumers": 7,
+    "runtime->producer": 1,
+    "runtime->util": 1,
+    "workgraph->backends": 1,
+    "workgraph->consumers": 2,
+    "workgraph->runtime": 5
+  },
+  "local_level": {
+    "backends->runtime": 7,
+    "runtime->consumers": 2
+  }
+}
