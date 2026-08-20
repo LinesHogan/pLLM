@@ -207,6 +207,96 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
             phase3.ValueKey("value/with/slash", 1)
         with self.assertRaises(ValueError):
             phase3.ValueKey("value\\with\\slash", 1)
+        with self.assertRaises(ValueError):
+            phase3.ValueKey("hidden0Xdeadbeef", 1)
+
+    def test_python_and_rust_reject_route_endpoints_that_differ_from_nodes(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        scheduled = plan.moves[0]
+        wrong_destination = phase3.Residency(
+            scheduled.move.value,
+            phase3.Placement("cuda", 1),
+        )
+        wrong_move = replace(scheduled.move, destination=wrong_destination)
+        malformed = replace(scheduled, move=wrong_move)
+        proxy = _proxy(
+            plan,
+            residencies=(*plan.residencies, wrong_destination),
+            moves=(malformed,),
+            leases=(
+                *plan.leases,
+                phase3.PlacementLeaseDesc(
+                    wrong_destination,
+                    scheduled.start_at,
+                    scheduled.end_at,
+                ),
+            ),
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            replace(
+                plan,
+                residencies=(*plan.residencies, wrong_destination),
+                moves=(malformed,),
+                leases=(
+                    *plan.leases,
+                    phase3.PlacementLeaseDesc(
+                        wrong_destination,
+                        scheduled.start_at,
+                        scheduled.end_at,
+                    ),
+                ),
+            )
+        _assert_rejected(self, proxy)
+
+    def test_rust_rejects_mixed_oracle_keys_before_cross_placement_selection(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        logical = ExecutorKey("logical", "phase3.validator.shared")
+        oracle = phase3.SemanticOracleKey("oracle", "phase3.validator.shared")
+        source = _proxy(
+            plan.selections[0],
+            logical_executor=logical,
+            oracle_key=oracle,
+        )
+        middle_node = NodeKey.consumer_flow("phase3.validator.middle", 0)
+        middle_key = ExecutorKey("implementation", "phase3.validator.middle")
+        middle = phase3.ImplementationSelectionDesc(
+            node_key=middle_node,
+            logical_executor=logical,
+            key=middle_key,
+            placement=phase3.Placement("cpu"),
+            duration=phase3.DurationProfile(1),
+            oracle_key=None,
+        )
+        target = _proxy(
+            plan.selections[1],
+            logical_executor=logical,
+            oracle_key=oracle,
+        )
+        middle_schedule = phase3.PlacedNodeDesc(
+            node_key=middle_node,
+            implementation=middle_key,
+            placement=phase3.Placement("cpu"),
+            start_at=0,
+            end_at=1,
+        )
+        _assert_rejected(
+            self,
+            _proxy(
+                plan,
+                selections=(source, middle, target),
+                schedule=(plan.schedule[0], middle_schedule, plan.schedule[1]),
+            ),
+        )
 
     def test_validator_accepts_real_compiled_placement_plan(self) -> None:
         phase3 = _phase3(self)

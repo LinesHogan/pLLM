@@ -128,6 +128,69 @@ def _register_equal_oracle(phase3: object, registry: object) -> object:
 
 
 class Phase3PlacementPlanTest(unittest.TestCase):
+    def test_value_key_cannot_alias_outputs_from_multiple_producers(self) -> None:
+        phase3 = _phase3(self)
+        source1 = NodeKey.producer("phase3.alias.source1")
+        source2 = NodeKey.producer("phase3.alias.source2")
+        target = NodeKey.consumer_flow("phase3.alias.target", 0)
+        logical1 = ExecutorKey("logical", "phase3.alias.source1")
+        logical2 = ExecutorKey("logical", "phase3.alias.source2")
+        logical_target = ExecutorKey("logical", "phase3.alias.target")
+        physical = PhysicalFlowPlan(
+            plan_epoch=1,
+            nodes=(
+                PhysicalNodePlan(source1, logical1, StreamClass.DEFAULT),
+                PhysicalNodePlan(source2, logical2, StreamClass.DEFAULT),
+                PhysicalNodePlan(
+                    target,
+                    logical_target,
+                    StreamClass.SIDE_TRAIN,
+                    fences=(
+                        FenceDependencyDesc(
+                            FenceKey("phase3", "alias1"),
+                            source1,
+                            target,
+                            FenceKind.READY,
+                        ),
+                        FenceDependencyDesc(
+                            FenceKey("phase3", "alias2"),
+                            source2,
+                            target,
+                            FenceKind.READY,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        registry = phase3.ImplementationRegistry()
+        for logical, name in (
+            (logical1, "source1"),
+            (logical2, "source2"),
+            (logical_target, "target"),
+        ):
+            registry.register(
+                _implementation(
+                    phase3,
+                    key=ExecutorKey("implementation", "phase3.alias." + name),
+                    logical_executor=logical,
+                    placement=phase3.Placement("cpu"),
+                    duration=1,
+                )
+            )
+        value = phase3.ValueKey("alias", 1)
+        with self.assertRaises(ValueError):
+            phase3.compile_placement_plan(
+                physical,
+                registry=registry,
+                topology=phase3.DeviceTopology(
+                    peer_access=frozenset(), cuda_devices=()
+                ),
+                value_flows=(
+                    phase3.ValueFlowDesc(value, source1, target, 1),
+                    phase3.ValueFlowDesc(value, source2, target, 1),
+                ),
+            )
+
     def test_frozen_plan_selects_typed_implementations_from_dag_deterministically(self) -> None:
         phase3 = _phase3(self)
         physical, source_executor, target_executor = _physical_plan()

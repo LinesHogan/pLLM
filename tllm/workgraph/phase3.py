@@ -66,7 +66,7 @@ def _enum(value: object, expected: type[_EnumT], label: str) -> _EnumT:
 def _text(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} must be str")
-    if not value or "0x" in value or "<" in value or ">" in value:
+    if not value or "0x" in value.lower() or "<" in value or ">" in value:
         raise ValueError(f"{label} must be a stable non-empty string")
     return value
 
@@ -81,11 +81,14 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
 
 def _executor_key(value: object, label: str) -> ExecutorKey:
     key = _instance(value, ExecutorKey, label)
-    return ExecutorKey(
+    components = (
         _text(key.namespace, f"{label}.namespace"),
         _text(key.name, f"{label}.name"),
         _text(key.version, f"{label}.version"),
     )
+    if any(":" in item or "@" in item for item in components):
+        raise ValueError(f"{label} components must not contain ':' or '@'")
+    return ExecutorKey(*components)
 
 
 def _node_key(value: object, label: str) -> NodeKey:
@@ -1419,6 +1422,44 @@ class PlacementPlan:
                 or item.end_at > consumer.start_at
             ):
                 raise ValueError("PlacementPlan move must complete between producer and consumer")
+        routes: dict[
+            tuple[NodeKey, NodeKey, ValueKey], list[ScheduledMove]
+        ] = {}
+        for item in moves:
+            assert item.producer is not None and item.consumer is not None
+            routes.setdefault(
+                (item.producer, item.consumer, item.move.value), []
+            ).append(item)
+        for (producer_key, consumer_key, _value), route in routes.items():
+            producer_placement = selection_by_node[producer_key].placement
+            consumer_placement = selection_by_node[consumer_key].placement
+            if route[0].move.source.placement != producer_placement:
+                raise ValueError("PlacementPlan route source differs from its producer")
+            if route[-1].move.destination.placement != consumer_placement:
+                raise ValueError("PlacementPlan route destination differs from its consumer")
+            if route[0].depends_on:
+                raise ValueError("PlacementPlan route head must not depend on another move")
+            if producer_placement == consumer_placement:
+                raise ValueError("same-placement values must not have a Move route")
+            if producer_placement.kind == DeviceKind.CPU:
+                expected_kinds = (MoveKind.H2D,)
+            elif consumer_placement.kind == DeviceKind.CPU:
+                expected_kinds = (MoveKind.D2H,)
+            elif topology.supports_peer(producer_placement, consumer_placement):
+                expected_kinds = (MoveKind.P2P,)
+            else:
+                expected_kinds = (MoveKind.D2H, MoveKind.H2D)
+            if tuple(item.move.kind for item in route) != expected_kinds:
+                raise ValueError("PlacementPlan route differs from its topology matrix")
+            if len(route) == 2:
+                if (
+                    route[0].move.destination != route[1].move.source
+                    or route[0].move.destination.memory != MemoryKind.PINNED_HOST
+                    or route[1].depends_on != (route[0].key,)
+                ):
+                    raise ValueError(
+                        "PlacementPlan staged route must use one continuous pinned chain"
+                    )
         move_positions = {item.key: index for index, item in enumerate(moves)}
         if len(move_positions) != len(moves):
             raise ValueError("PlacementPlan moves must have unique keys")
@@ -1576,6 +1617,13 @@ def compile_placement_plan(
         raise ValueError("value flow must follow the physical DAG")
     if len({(flow.value, flow.producer, flow.consumer) for flow in flows}) != len(flows):
         raise ValueError("value flows must be unique")
+    producer_by_value: dict[ValueKey, NodeKey] = {}
+    for flow in flows:
+        previous_producer = producer_by_value.setdefault(flow.value, flow.producer)
+        if previous_producer != flow.producer:
+            raise ValueError(
+                "each ValueKey must have exactly one producer; use distinct value versions"
+            )
     logical_executors = {node.executor for node in physical.nodes}
     if any(logical not in logical_executors for logical in overrides):
         raise ValueError("placement override references an unknown logical executor")

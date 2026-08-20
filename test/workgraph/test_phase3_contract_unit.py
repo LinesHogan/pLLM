@@ -52,6 +52,18 @@ class _FakeCopyRuntime:
 
 
 class Phase3ImplementationRegistryTest(unittest.TestCase):
+    def test_registry_rejects_ambiguous_executor_key_separators(self) -> None:
+        phase3 = _phase3(self)
+        registry = phase3.ImplementationRegistry()
+        with self.assertRaises(ValueError):
+            registry.register(
+                phase3.ImplementationSpec(
+                    ExecutorKey("implementation:ambiguous", "candidate"),
+                    phase3.Placement("cpu"),
+                    _FakeImplementation("ambiguous", []),
+                )
+            )
+
     def test_registry_is_typed_and_rejects_duplicate_executor_keys(self) -> None:
         phase3 = _phase3(self)
         registry = phase3.ImplementationRegistry()

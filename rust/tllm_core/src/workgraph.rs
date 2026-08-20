@@ -2804,6 +2804,20 @@ fn validate_v3_node_key(node_key: &NodeKeyDesc, layer: &str) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_v3_executor(executor: &ExecutorKeyDesc, layer: &str) -> Result<(), String> {
+    validate_executor(Some(executor), layer)?;
+    let components = [&executor.namespace, &executor.name, &executor.version];
+    if components.iter().any(|component| {
+        component.contains(':') || component.contains('@') || contains_runtime_text(component)
+    }) {
+        return Err(format!(
+            "{} has an ambiguous or runtime executor key",
+            layer
+        ));
+    }
+    Ok(())
+}
+
 fn validate_v3_value(value: &ValueKeyV3Desc, layer: &str) -> Result<(), String> {
     if value.name.is_empty()
         || value.version < 1
@@ -2873,21 +2887,17 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     let topology_devices = validate_v3_topology(&plan.topology)?;
 
     let mut selections = HashMap::new();
-    let mut logical_oracles: HashMap<String, (PlacementV3Desc, Option<SemanticOracleKeyV3Desc>)> =
-        HashMap::new();
+    let mut logical_oracles: HashMap<
+        String,
+        (
+            HashSet<PlacementV3Desc>,
+            HashSet<Option<SemanticOracleKeyV3Desc>>,
+        ),
+    > = HashMap::new();
     for selection in &plan.selections {
         validate_v3_node_key(&selection.node_key, "placement selection")?;
-        validate_executor(Some(&selection.logical_executor), "placement logical")?;
-        validate_executor(Some(&selection.key), "placement implementation")?;
-        if contains_runtime_text(&selection.logical_executor.namespace)
-            || contains_runtime_text(&selection.logical_executor.name)
-            || contains_runtime_text(&selection.logical_executor.version)
-            || contains_runtime_text(&selection.key.namespace)
-            || contains_runtime_text(&selection.key.name)
-            || contains_runtime_text(&selection.key.version)
-        {
-            return Err("placement selection contains runtime identity text".to_string());
-        }
+        validate_v3_executor(&selection.logical_executor, "placement logical")?;
+        validate_v3_executor(&selection.key, "placement implementation")?;
         validate_v3_placement(&selection.placement, "placement selection")?;
         if !topology_contains_v3(&selection.placement, &topology_devices) {
             return Err("placement selection is outside topology".to_string());
@@ -2912,36 +2922,26 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             selection.logical_executor.name,
             selection.logical_executor.version
         );
-        if let Some((placement, oracle)) = logical_oracles.get(&logical) {
-            if *placement != selection.placement
-                && (oracle.is_none() || *oracle != selection.oracle_key)
-            {
-                return Err(
-                    "cross-placement selections require one semantic oracle key".to_string()
-                );
-            }
-        } else {
-            logical_oracles.insert(
-                logical,
-                (selection.placement.clone(), selection.oracle_key.clone()),
-            );
-        }
+        let (placements, oracles) = logical_oracles
+            .entry(logical)
+            .or_insert_with(|| (HashSet::new(), HashSet::new()));
+        placements.insert(selection.placement.clone());
+        oracles.insert(selection.oracle_key.clone());
         let node = selection.node_key.text();
         if selections.insert(node, selection).is_some() {
             return Err("PlacementPlan contains duplicate selections".to_string());
         }
     }
+    if logical_oracles.values().any(|(placements, oracles)| {
+        placements.len() > 1 && (oracles.len() != 1 || oracles.contains(&None))
+    }) {
+        return Err("cross-placement selections require one semantic oracle key".to_string());
+    }
 
     let mut schedule_positions = HashMap::new();
     for (position, item) in plan.schedule.iter().enumerate() {
         validate_v3_node_key(&item.node_key, "placed node")?;
-        validate_executor(Some(&item.implementation), "placed implementation")?;
-        if contains_runtime_text(&item.implementation.namespace)
-            || contains_runtime_text(&item.implementation.name)
-            || contains_runtime_text(&item.implementation.version)
-        {
-            return Err("placed implementation contains runtime identity text".to_string());
-        }
+        validate_v3_executor(&item.implementation, "placed implementation")?;
         validate_v3_placement(&item.placement, "placed node")?;
         if !topology_contains_v3(&item.placement, &topology_devices) {
             return Err("placed node is outside topology".to_string());
@@ -3010,6 +3010,8 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     }
 
     let mut move_positions = HashMap::new();
+    let mut routes: HashMap<(NodeKeyDesc, NodeKeyDesc, ValueKeyV3Desc), Vec<usize>> =
+        HashMap::new();
     for (position, item) in plan.moves.iter().enumerate() {
         validate_v3_value(&item.key.value, "scheduled move key")?;
         if item.key.ordinal < 0 || item.key.value != item.r#move.value {
@@ -3076,6 +3078,14 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             .ok_or_else(|| "scheduled move requires a consumer node".to_string())?;
         validate_v3_node_key(producer, "scheduled move producer")?;
         validate_v3_node_key(consumer, "scheduled move consumer")?;
+        routes
+            .entry((
+                producer.clone(),
+                consumer.clone(),
+                item.r#move.value.clone(),
+            ))
+            .or_default()
+            .push(position);
         let producer_position = schedule_positions
             .get(&producer.text())
             .ok_or_else(|| "scheduled move references an unknown producer".to_string())?;
@@ -3102,6 +3112,63 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             return Err("PlacementPlan contains duplicate scheduled move keys".to_string());
         }
         let _ = item.used_fallback;
+    }
+    for ((producer, consumer, _value), positions) in &routes {
+        let route: Vec<&ScheduledMoveV3Desc> = positions
+            .iter()
+            .map(|position| &plan.moves[*position])
+            .collect();
+        let producer_selection = selections
+            .get(&producer.text())
+            .ok_or_else(|| "transfer route references an unknown producer".to_string())?;
+        let consumer_selection = selections
+            .get(&consumer.text())
+            .ok_or_else(|| "transfer route references an unknown consumer".to_string())?;
+        if route[0].r#move.source.placement != producer_selection.placement {
+            return Err("transfer route source differs from its producer".to_string());
+        }
+        if route[route.len() - 1].r#move.destination.placement != consumer_selection.placement {
+            return Err("transfer route destination differs from its consumer".to_string());
+        }
+        if !route[0].depends_on.is_empty() {
+            return Err("transfer route head must not depend on another move".to_string());
+        }
+        let source = &producer_selection.placement;
+        let destination = &consumer_selection.placement;
+        let expected_kinds: &[&str] = if source == destination {
+            &[]
+        } else if source.kind == "cpu" {
+            &["h2d"]
+        } else if destination.kind == "cpu" {
+            &["d2h"]
+        } else {
+            let source_index = source.index.expect("validated CUDA source");
+            let destination_index = destination.index.expect("validated CUDA destination");
+            if plan
+                .topology
+                .peer_access
+                .contains(&(source_index, destination_index))
+            {
+                &["p2p"]
+            } else {
+                &["d2h", "h2d"]
+            }
+        };
+        if route
+            .iter()
+            .map(|item| item.r#move.kind.as_str())
+            .collect::<Vec<_>>()
+            != expected_kinds
+        {
+            return Err("transfer route differs from its topology matrix".to_string());
+        }
+        if route.len() == 2
+            && (route[0].r#move.destination != route[1].r#move.source
+                || route[0].r#move.destination.memory != "pinned_host"
+                || route[1].depends_on.as_slice() != [route[0].key.clone()])
+        {
+            return Err("staged transfer route must use one continuous pinned chain".to_string());
+        }
     }
     for (position, item) in plan.moves.iter().enumerate() {
         let mut dependencies = HashSet::new();
