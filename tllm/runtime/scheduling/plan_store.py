@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import TypeVar, cast
 
@@ -16,12 +17,16 @@ from tllm.runtime.scheduling.physical import (
     StreamLike,
 )
 from tllm.runtime.scheduling.phase3_transfer import (
+    CopyHandle,
     PlacementImplementationBinding,
     PlacementPlanDispatcher,
+    TensorLike,
 )
 from tllm.runtime.scheduling.phase5_adaptive import (
     AdaptiveFlowBinding,
+    AdaptiveTransferStatus,
     Phase5AdaptiveScheduler,
+    validate_adaptive_flow_bindings,
 )
 from tllm.workgraph.frontend import ArtifactKey, Device
 from tllm.workgraph.physical import (
@@ -32,7 +37,7 @@ from tllm.workgraph.physical import (
     StreamClass,
 )
 from tllm.workgraph.phase3 import PlacementPlan
-from tllm.workgraph.phase5 import Phase5ControlPlan
+from tllm.workgraph.phase5 import CandidateActionDesc, Phase5ControlPlan
 
 
 _T = TypeVar("_T")
@@ -115,6 +120,10 @@ class PlanResources:
     streams: tuple[RuntimeStream, ...] = ()
     events: tuple[RuntimeEvent, ...] = ()
     graphs: tuple[RuntimeGraph, ...] = ()
+    _adaptive_transfers: dict[
+        tuple[str, object, int],
+        tuple[CandidateActionDesc, tuple[CopyHandle, ...]],
+    ] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         raw_plan = cast(object, self.plan)
@@ -218,6 +227,10 @@ class PlanResources:
                 raise ValueError(
                     "PlanResources adaptive flow bindings must use unique flow ids"
                 )
+            adaptive_flow_bindings = validate_adaptive_flow_bindings(
+                adaptive_plan,
+                adaptive_flow_bindings,
+            )
         elif adaptive_flow_bindings:
             raise ValueError(
                 "PlanResources adaptive flow bindings require an adaptive plan"
@@ -329,6 +342,7 @@ class PlanResources:
                 self.placement_dispatcher is None
                 or self.placement_dispatcher.in_flight == 0
             )
+            and not self._adaptive_transfers
         )
 
     def poll_transfers(self) -> None:
@@ -346,6 +360,105 @@ class PlanResources:
             ),
             None,
         )
+
+    @staticmethod
+    def _adaptive_transfer_token(
+        binding: AdaptiveFlowBinding,
+        bundle_key: object,
+        bundle_version: int,
+    ) -> tuple[str, object, int]:
+        try:
+            hash(bundle_key)
+        except TypeError as exc:
+            raise TypeError("adaptive transfer bundle key must be hashable") from exc
+        if not isinstance(bundle_version, int) or isinstance(bundle_version, bool):
+            raise TypeError("adaptive transfer bundle version must be int")
+        return binding.flow_id, bundle_key, bundle_version
+
+    def adaptive_pending_action(
+        self,
+        binding: AdaptiveFlowBinding,
+        *,
+        bundle_key: object,
+        bundle_version: int,
+    ) -> CandidateActionDesc | None:
+        token = self._adaptive_transfer_token(
+            binding,
+            bundle_key,
+            bundle_version,
+        )
+        batch = self._adaptive_transfers.get(token)
+        return None if batch is None else batch[0]
+
+    def advance_adaptive_transfers(
+        self,
+        binding: AdaptiveFlowBinding,
+        *,
+        bundle_key: object,
+        bundle_version: int,
+        entries: Mapping[str, object],
+        candidate: CandidateActionDesc,
+        must_resolve: bool,
+    ) -> AdaptiveTransferStatus:
+        """Start or poll the exact Phase 3 MoveSet selected for one bundle."""
+
+        if not isinstance(binding, AdaptiveFlowBinding):
+            raise TypeError("adaptive transfer requires AdaptiveFlowBinding")
+        if not isinstance(candidate, CandidateActionDesc):
+            raise TypeError("adaptive transfer requires CandidateActionDesc")
+        if not isinstance(entries, Mapping):
+            raise TypeError("adaptive transfer entries must be a mapping")
+        move_set_key = candidate.move_set
+        if move_set_key is None:
+            return AdaptiveTransferStatus.READY
+        adaptive_plan = self.adaptive_plan
+        dispatcher = self.placement_dispatcher
+        if adaptive_plan is None or dispatcher is None:
+            raise RuntimeError("adaptive transfer requires a prepared placement epoch")
+        move_set = next(
+            item for item in adaptive_plan.move_sets if item.key == move_set_key
+        )
+        if not move_set.moves:
+            return AdaptiveTransferStatus.READY
+        transfer = binding.transfer_for(move_set_key)
+        if transfer is None:
+            raise RuntimeError("adaptive MoveSet lacks its explicit transfer binding")
+        token = self._adaptive_transfer_token(
+            binding,
+            bundle_key,
+            bundle_version,
+        )
+        batch = self._adaptive_transfers.get(token)
+        if batch is None:
+            try:
+                source = entries[transfer.source_entry]
+                destination = entries[transfer.destination_entry]
+            except KeyError as exc:
+                raise KeyError(
+                    "adaptive transfer bundle lacks an explicitly bound payload"
+                ) from exc
+            handle = dispatcher.submit_scheduled(
+                move_set.moves,
+                source=cast(TensorLike, source),
+                destination=cast(TensorLike, destination),
+            )
+            batch = candidate, (handle,)
+            self._adaptive_transfers[token] = batch
+        elif batch[0] != candidate:
+            raise RuntimeError("adaptive bundle changed action while transfers were pending")
+
+        dispatcher.poll()
+        handles = batch[1]
+        failed = next((handle.error for handle in handles if handle.error is not None), None)
+        if failed is not None:
+            self._adaptive_transfers.pop(token, None)
+            raise RuntimeError("adaptive Phase 3 transfer failed") from failed
+        if all(handle.complete for handle in handles):
+            self._adaptive_transfers.pop(token, None)
+            return AdaptiveTransferStatus.READY
+        if must_resolve:
+            raise RuntimeError("adaptive Phase 3 transfer missed the bundle deadline")
+        return AdaptiveTransferStatus.PENDING
 
     def reset_adaptive_reservations(self) -> None:
         if self.adaptive_scheduler is not None:
@@ -432,6 +545,36 @@ class PlanSnapshotStore:
     def active(self, step_id: int) -> PlanResources:
         with self._lock:
             return self._active[_step_id(step_id)]
+
+    def adaptive_transfer_owner(
+        self,
+        *,
+        flow_id: str,
+        bundle_key: object,
+        bundle_version: int,
+    ) -> PlanResources | None:
+        """Find the retained epoch that owns an in-flight adaptive transfer."""
+
+        with self._lock:
+            candidates = (
+                *self._active.values(),
+                self._current,
+                *self._retired,
+            )
+        seen: set[int] = set()
+        for resources in candidates:
+            resource_id = id(resources)
+            if resource_id in seen:
+                continue
+            seen.add(resource_id)
+            binding = resources.adaptive_flow_binding(flow_id)
+            if binding is not None and resources.adaptive_pending_action(
+                binding,
+                bundle_key=bundle_key,
+                bundle_version=bundle_version,
+            ) is not None:
+                return resources
+        return None
 
     def finish_step(self, step_id: int) -> None:
         with self._lock:

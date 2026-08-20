@@ -52,6 +52,10 @@ from tllm.workgraph.phase5 import (
     static_admission,
 )
 from tllm.workgraph.signature import structural_signature
+from tllm.runtime.scheduling.phase5_adaptive import (
+    AdaptiveDecisionKind,
+    Phase5AdaptiveScheduler,
+)
 
 
 def _empty_placement(epoch: int = 1) -> PlacementPlan:
@@ -283,11 +287,17 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
 
     def test_fallback_is_authoritative_and_preserves_semantics(self) -> None:
         plan = _plan()
+        execute = next(
+            action
+            for action in plan.actions
+            if action.kind == CandidateActionKind.EXECUTE
+        )
+        fallback = next(action for action in plan.actions if action.unknown_bucket)
         with self.assertRaises(ValueError):
             _plan(
                 actions=(
-                    plan.actions[0],
-                    replace(plan.actions[1], semantic_key="different"),
+                    execute,
+                    replace(fallback, semantic_key="different"),
                 )
             )
         unknown = WorkItemDesc(
@@ -296,10 +306,15 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
             WorkloadBucketKey("work", "decode"),
         )
         candidates = approved_actions(plan, unknown)
-        fallback = next(action for action in plan.actions if action.unknown_bucket)
         self.assertEqual(candidates, (fallback,))
         self.assertTrue(candidates[0].authoritative)
         self.assertTrue(candidates[0].unknown_bucket)
+        with self.assertRaises(RuntimeError):
+            approved_actions(plan, replace(unknown, semantic_key="other"))
+        with self.assertRaises(RuntimeError):
+            static_admission(plan, (replace(unknown, semantic_key="other"),))
+        with self.assertRaises(TypeError):
+            replace(fallback, authoritative=0)  # type: ignore[arg-type]
 
     def test_placement_epoch_signature_and_existing_move_anchoring(self) -> None:
         placement, first, second = _two_hop_placement(epoch=7)
@@ -356,6 +371,54 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             CandidateMoveSetDesc(MoveSetKey("moves", "open"), (second,))
         self.assertEqual(tuple(item.key for item in placement.moves), (first.key, second.key))
+
+    def test_move_deadline_is_identical_in_runtime_greedy_and_oracle(self) -> None:
+        placement, first, second = _two_hop_placement()
+        base = _plan(placement=placement)
+        move_set = CandidateMoveSetDesc(
+            MoveSetKey("moves", "deadline"),
+            (first, second),
+        )
+        base_execute = next(
+            action
+            for action in base.actions
+            if action.kind == CandidateActionKind.EXECUTE
+        )
+        fallback = next(action for action in base.actions if action.unknown_bucket)
+        execute = replace(
+            base_execute,
+            move_set=move_set.key,
+            ready_at=5,
+            duration=1,
+            deadline=7,
+        )
+        plan = Phase5ControlPlan(
+            plan_epoch=base.plan_epoch,
+            placement_plan=placement,
+            scheduled_moves=placement.moves,
+            move_sets=(move_set,),
+            workload_buckets=base.workload_buckets,
+            shape_buckets=base.shape_buckets,
+            budgets=base.budgets,
+            actions=(fallback, execute),
+            unknown_bucket_fallback=base.unknown_bucket_fallback,
+            buffer_capacity=base.buffer_capacity,
+            mode=AdmissionMode.ADAPTIVE,
+        )
+        item = WorkItemDesc(
+            WorkItemKey("item", "move-deadline"),
+            (2, 4),
+            WorkloadBucketKey("work", "decode"),
+        )
+
+        greedy = greedy_admission(plan, (item,))
+        oracle = exhaustive_admission_oracle(plan, (item,))
+        runtime = Phase5AdaptiveScheduler(plan).decide(item)
+
+        self.assertEqual(greedy.selected, ((item.key, execute.key),))
+        self.assertEqual(oracle.selected, ((item.key, execute.key),))
+        self.assertEqual(runtime.action, AdaptiveDecisionKind.RUN)
+        self.assertEqual(runtime.action_key, execute.key)
 
     def test_workload_and_shape_buckets_match_exact_and_bounded_shapes(self) -> None:
         exact = ShapeBucketKey("shape", "exact")
@@ -414,9 +477,31 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
         budget = InterferenceBudgetDesc(budget_key, capacity=1)
         use = (BudgetUseDesc(budget_key, 1),)
         base = _plan(budgets=(budget,), buffer_capacity=1)
-        execute = replace(base.actions[1], budget_uses=use)
-        fallback = replace(base.actions[0], buffer_credits=1, budget_uses=use)
-        constrained = _plan(actions=(fallback, execute), budgets=(budget,), buffer_capacity=1)
+        execute = replace(
+            next(
+                action
+                for action in base.actions
+                if action.kind == CandidateActionKind.EXECUTE
+            ),
+            budget_uses=use,
+        )
+        fallback = replace(
+            next(action for action in base.actions if action.unknown_bucket),
+            buffer_credits=1,
+            budget_uses=use,
+        )
+        shed = CandidateActionDesc(
+            CandidateActionKey("action", "shed"),
+            CandidateActionKind.SHED,
+            workload_bucket=execute.workload_bucket,
+            shape_bucket=execute.shape_bucket,
+            duration=0,
+        )
+        constrained = _plan(
+            actions=(fallback, execute, shed),
+            budgets=(budget,),
+            buffer_capacity=1,
+        )
         items = (
             WorkItemDesc(WorkItemKey("item", "a"), (2, 4), WorkloadBucketKey("work", "decode")),
             WorkItemDesc(WorkItemKey("item", "b"), (2, 4), WorkloadBucketKey("work", "decode")),

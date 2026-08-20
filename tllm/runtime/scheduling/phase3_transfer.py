@@ -22,6 +22,7 @@ from tllm.workgraph.phase3 import (
     Placement,
     PlacementPlan,
     RuntimeImplementation,
+    ScheduledMove,
     TransferProfile,
     TransferProfileDesc,
     ValueFlowDesc,
@@ -70,6 +71,19 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     if value < minimum:
         raise ValueError(f"{label} must be >= {minimum}")
     return value
+
+
+def _typed_scheduled_moves(value: object) -> tuple[ScheduledMove, ...]:
+    if not isinstance(value, tuple) or any(
+        not isinstance(item, ScheduledMove) for item in cast(tuple[object, ...], value)
+    ):
+        raise TypeError("scheduled transfer subset must be tuple[ScheduledMove, ...]")
+    scheduled = cast(tuple[ScheduledMove, ...], value)
+    if not scheduled:
+        raise ValueError("scheduled transfer subset must be non-empty")
+    if tuple(sorted(scheduled, key=lambda item: item.key)) != scheduled:
+        raise ValueError("scheduled transfer subset must use canonical Move order")
+    return scheduled
 
 
 def _shape(value: object) -> tuple[int, ...]:
@@ -451,6 +465,40 @@ class PlacementPlanDispatcher:
             raise KeyError("placement plan has no matching transfer route") from exc
         return self._executor.submit(
             moves,
+            source=source,
+            destination=destination,
+        )
+
+    def submit_scheduled(
+        self,
+        scheduled_moves: tuple[ScheduledMove, ...],
+        *,
+        source: TensorLike,
+        destination: TensorLike,
+    ) -> CopyHandle:
+        """Submit one exact dependency-closed subset of the frozen plan."""
+
+        scheduled = _typed_scheduled_moves(scheduled_moves)
+        plan_by_key = {item.key: item for item in self.plan.moves}
+        if any(plan_by_key.get(item.key) != item for item in scheduled):
+            raise ValueError("scheduled transfer subset differs from the frozen placement plan")
+        selected_keys = {item.key for item in scheduled}
+        if any(
+            dependency not in selected_keys
+            for item in scheduled
+            for dependency in item.depends_on
+        ):
+            raise ValueError("scheduled transfer subset must be dependency-closed")
+        routes = {
+            (item.producer, item.consumer, item.move.value)
+            for item in scheduled
+        }
+        if len(routes) != 1 or any(
+            item.producer is None or item.consumer is None for item in scheduled
+        ):
+            raise ValueError("scheduled transfer subset must describe one bound route")
+        return self._executor.submit(
+            tuple(item.move for item in scheduled),
             source=source,
             destination=destination,
         )

@@ -213,10 +213,101 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(buffer_drop.action, AdaptiveDecisionKind.DROP)
-        self.assertEqual(buffer_drop.reason, "buffer admission")
-        self.assertEqual(deadline_drop.action, AdaptiveDecisionKind.DROP)
-        self.assertEqual(interference_drop.action, AdaptiveDecisionKind.DROP)
+        self.assertEqual(buffer_drop.action, AdaptiveDecisionKind.FALLBACK)
+        self.assertEqual(buffer_drop.reason, "shedding not approved")
+        self.assertEqual(deadline_drop.action, AdaptiveDecisionKind.FALLBACK)
+        self.assertEqual(interference_drop.action, AdaptiveDecisionKind.FALLBACK)
+
+    def test_action_level_required_prevents_approved_shedding(self) -> None:
+        plan, optional, _required, _budget = self._plan()
+        fallback = next(action for action in plan.actions if action.unknown_bucket)
+        execute = next(
+            action
+            for action in plan.actions
+            if action.kind == CandidateActionKind.EXECUTE
+        )
+        required_execute = CandidateActionDesc(
+            key=execute.key,
+            kind=execute.kind,
+            semantic_key=execute.semantic_key,
+            workload_bucket=execute.workload_bucket,
+            shape_bucket=execute.shape_bucket,
+            fallback_key=execute.fallback_key,
+            deadline=execute.deadline,
+            duration=execute.duration,
+            buffer_credits=execute.buffer_credits,
+            required=True,
+        )
+        shed = CandidateActionDesc(
+            CandidateActionKey("action", "shed"),
+            CandidateActionKind.SHED,
+            workload_bucket=execute.workload_bucket,
+            shape_bucket=execute.shape_bucket,
+            duration=0,
+        )
+        required_plan = Phase5ControlPlan(
+            plan_epoch=plan.plan_epoch,
+            placement_plan=plan.placement_plan,
+            scheduled_moves=plan.scheduled_moves,
+            move_sets=plan.move_sets,
+            workload_buckets=plan.workload_buckets,
+            shape_buckets=plan.shape_buckets,
+            budgets=plan.budgets,
+            actions=(fallback, required_execute, shed),
+            unknown_bucket_fallback=fallback.key,
+            buffer_capacity=plan.buffer_capacity,
+            mode=plan.mode,
+        )
+
+        decision = Phase5AdaptiveScheduler(required_plan).decide(
+            optional,
+            context=AdmissionContext(available_buffers=0),
+        )
+
+        self.assertEqual(decision.action, AdaptiveDecisionKind.FALLBACK)
+
+    def test_drop_reports_the_high_priority_approved_shed_candidate(self) -> None:
+        plan, optional, _required, _budget = self._plan()
+        fallback = next(action for action in plan.actions if action.unknown_bucket)
+        execute = next(
+            action
+            for action in plan.actions
+            if action.kind == CandidateActionKind.EXECUTE
+        )
+        shed = CandidateActionDesc(
+            key=CandidateActionKey("action", "shed"),
+            kind=CandidateActionKind.SHED,
+            semantic_key=execute.semantic_key,
+            workload_bucket=execute.workload_bucket,
+            shape_bucket=execute.shape_bucket,
+            duration=0,
+            priority=100,
+        )
+        plan_with_shed = Phase5ControlPlan(
+            plan_epoch=plan.plan_epoch,
+            placement_plan=plan.placement_plan,
+            scheduled_moves=plan.scheduled_moves,
+            move_sets=plan.move_sets,
+            workload_buckets=plan.workload_buckets,
+            shape_buckets=plan.shape_buckets,
+            budgets=plan.budgets,
+            actions=(fallback, execute, shed),
+            unknown_bucket_fallback=plan.unknown_bucket_fallback,
+            buffer_capacity=plan.buffer_capacity,
+            mode=plan.mode,
+        )
+
+        decision = Phase5AdaptiveScheduler(plan_with_shed).decide(
+            optional,
+            context=AdmissionContext(available_buffers=0),
+            allow_defer=False,
+        )
+
+        self.assertEqual(decision.action, AdaptiveDecisionKind.DROP)
+        self.assertEqual(decision.action_key, shed.key)
+        self.assertIsNotNone(decision.candidate)
+        assert decision.candidate is not None
+        self.assertEqual(decision.candidate.key, shed.key)
 
     def test_runtime_never_adds_or_rewrites_phase3_moves(self) -> None:
         plan, optional, _required, _budget = self._plan()
@@ -310,6 +401,13 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             buffer_credits=1,
             unknown_bucket=True,
         )
+        shed = CandidateActionDesc(
+            CandidateActionKey("action", "shed"),
+            CandidateActionKind.SHED,
+            workload_bucket=execute.workload_bucket,
+            shape_bucket=execute.shape_bucket,
+            duration=0,
+        )
         with_fallback_credit = Phase5ControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
@@ -318,7 +416,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             workload_buckets=plan.workload_buckets,
             shape_buckets=plan.shape_buckets,
             budgets=plan.budgets,
-            actions=(fallback, execute),
+            actions=(fallback, execute, shed),
             unknown_bucket_fallback=fallback.key,
             buffer_capacity=1,
             mode=plan.mode,

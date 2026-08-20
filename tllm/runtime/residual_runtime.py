@@ -989,7 +989,11 @@ def set_fast_weight_enabled(
 
 
 def synchronize_esamp() -> None:
-    RUNTIME.deferred_work_queue.flush_all()
+    from tllm.runtime.ports.residual_bundle_dispatch import (
+        synchronize_deferred_port_bundles,
+    )
+
+    synchronize_deferred_port_bundles(runtime=RUNTIME)
     if RUNTIME.consumer is not None:
         synchronize_consumer(RUNTIME.consumer)
     registry = RUNTIME.consumer_registry

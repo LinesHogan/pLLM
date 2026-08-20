@@ -22,10 +22,13 @@ Move universe.
 Execute actions require a semantic-preserving authoritative fallback. Required
 work cannot select a shedding action. This includes explicitly required work,
 work in a `required_by_default` workload bucket, and work whose descriptor sets
-`allow_shedding=False`. Unknown workload or shape buckets use the single
-approved unknown-bucket fallback, and explicit runtime flow bindings must share
-that fallback's semantic identity. Candidate and Move-set counts are bounded by
-the compiler's densification limit.
+`allow_shedding=False`, or an approved action marked `required=True`. Optional
+work may be dropped only when its resolved candidate set contains an explicit
+`SHED` action; rejection without compiler-approved shedding uses the
+authoritative fallback. Unknown workload, shape, or semantic identity fails
+closed unless the single unknown-bucket fallback preserves that exact semantic
+identity. Candidate and Move-set counts are bounded by the compiler's
+densification limit.
 
 The greedy scheduler and the small-graph exhaustive oracle share one resource
 feasibility predicate and lexicographic objective. Both enforce deadlines,
@@ -56,6 +59,13 @@ adaptive plans and the Python scheduler atomically at the existing prepare safe
 point. A step keeps the epoch snapshot it acquired, and reservations reset only
 when that prepared step begins.
 
+Every selectable non-empty Move set also requires an `AdaptiveTransferBinding`
+that names its typed producer, consumer, value, and source/destination bundle
+entries. The cold validator requires exact coverage and an exact match to one
+frozen Phase 3 route. The current production executor supports one route per
+Move set, using the Phase 3 executor's direct one-hop copy or pinned-host
+two-hop D2H/H2D chain. It does not infer payload entries or synthesize a route.
+
 The deferred queue accepts typed `RUN`, `KEEP`, and `DROP` decisions. An
 admitted execute action and an authoritative fallback both invoke the existing
 consumer callback, preserving the legacy semantic oracle. A rejected optional
@@ -63,6 +73,18 @@ item stays queued while its approved deadline remains reachable and is shed
 only when the deadline forces resolution. Required work falls back and is
 never dropped. Flows without an `AdaptiveFlowBinding` remain an explicit legacy
 boundary and retain the previous queue behavior.
+
+For an admitted action with a Move set, the exact dependency-closed frozen
+subset is submitted before the consumer callback. The queue returns `KEEP`
+while its copy fences are pending and runs the callback only after completion.
+An old plan epoch remains retained across safe-point publication until both the
+copy and its queued callback handoff resolve; a pending transfer at its hard
+deadline fails fast instead of allowing borrowed source storage to be reused.
+Explicit `synchronize_esamp()` uses the same typed selector instead of bypassing
+it with an unconditional queue flush. It forces admission to choose an approved
+run, fallback, or shed action, then polls that action's individual transfer
+fences until the callback handoff completes; it does not call a global CUDA
+synchronization primitive.
 
 ## Support boundary
 

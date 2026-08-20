@@ -263,6 +263,10 @@ class Phase5AdaptiveValidatorOracleTest(unittest.TestCase):
         mismatched = replace(execute, semantic_key="different")
         with self.assertRaises((TypeError, ValueError, RuntimeError)):
             core.validate_adaptive_flow_plan(_proxy(plan, actions=(fallback, mismatched)))
+        with self.assertRaises((TypeError, ValueError, RuntimeError)):
+            core.validate_adaptive_flow_plan(
+                _proxy(plan, actions=(_proxy(fallback, authoritative=0), execute))
+            )
 
     def test_rust_rejects_unknown_fallback_and_unstable_or_noncanonical_keys(self) -> None:
         plan = _phase5()

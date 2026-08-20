@@ -16,20 +16,26 @@ from tllm.runtime.scheduling.deferred import DeferredWork
 from tllm.runtime.scheduling.phase3_transfer import (
     PinnedMemoryPool,
     PlacementPlanDispatcher,
+    PlacementRuntimeBinding,
 )
 from tllm.runtime.scheduling.phase5_adaptive import (
     AdaptiveFlowBinding,
     AdaptiveRuntimeBinding,
+    AdaptiveTransferBinding,
     Phase5AdaptiveScheduler,
 )
 from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
 from tllm.runtime.state import ResidualRuntimeState
+from tllm.workgraph import phase3
+from tllm.workgraph.ir import ExecutorKey, NodeKey
 from tllm.workgraph.phase3 import DeviceTopology, PlacementPlan
 from tllm.workgraph.phase5 import (
     AdmissionMode,
     CandidateActionDesc,
     CandidateActionKey,
     CandidateActionKind,
+    CandidateMoveSetDesc,
+    MoveSetKey,
     Phase5ControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
@@ -38,7 +44,11 @@ from tllm.workgraph.phase5 import (
     WorkloadBucketDesc,
     WorkloadBucketKey,
 )
-from tllm.workgraph.physical import PhysicalFlowPlan
+from tllm.workgraph.physical import (
+    PhysicalFlowPlan,
+    PhysicalNodePlan,
+    StreamClass,
+)
 
 
 class _UnusedFence:
@@ -63,11 +73,55 @@ class _UnusedCopyAdapter:
         raise AssertionError("empty placement plan must not submit a copy")
 
 
+class _FakeTensor:
+    def __init__(self, shape: tuple[int, ...], dtype: str, device: str) -> None:
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+
+
+class _TrackingFence:
+    def __init__(self) -> None:
+        self.complete = False
+
+    def query(self) -> bool:
+        return self.complete
+
+
+class _TrackingCopyAdapter:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.fences: list[_TrackingFence] = []
+
+    def allocate_pinned(self, shape: tuple[int, ...], dtype: str) -> _FakeTensor:
+        return _FakeTensor(shape, dtype, "cpu:pinned")
+
+    def copy(
+        self,
+        kind: str,
+        source: object,
+        destination: object,
+        *,
+        staging: object | None = None,
+    ) -> _TrackingFence:
+        del source, destination, staging
+        self.calls.append(kind)
+        fence = _TrackingFence()
+        self.fences.append(fence)
+        return fence
+
+
+class _Implementation:
+    def execute(self, *args: object) -> None:
+        del args
+
+
 def _runtime_resources(
     *,
     item: WorkItemDesc,
     mode: AdmissionMode,
     flow_id: str = "phase5.flow",
+    include_shed: bool = False,
 ) -> tuple[PlanResources, CandidateActionKey]:
     placement = PlacementPlan(
         plan_epoch=1,
@@ -99,6 +153,14 @@ def _runtime_resources(
         deadline=4,
         duration=1,
     )
+    shed = CandidateActionDesc(
+        CandidateActionKey("phase5", "shed"),
+        CandidateActionKind.SHED,
+        workload_bucket=workload_key,
+        shape_bucket=shape_key,
+        duration=0,
+    )
+    actions = (fallback, execute, shed) if include_shed else (fallback, execute)
     plan = Phase5ControlPlan(
         plan_epoch=1,
         placement_plan=placement,
@@ -107,7 +169,7 @@ def _runtime_resources(
         workload_buckets=(WorkloadBucketDesc(workload_key, (shape_key,)),),
         shape_buckets=(ShapeBucketDesc(shape_key, shape=(2,)),),
         budgets=(),
-        actions=(fallback, execute),
+        actions=actions,
         unknown_bucket_fallback=fallback_key,
         buffer_capacity=1,
         mode=mode,
@@ -126,11 +188,18 @@ def _runtime_resources(
     )
 
 
-def _queued(flow_id: str, trace: list[str]) -> DeferredWork:
+def _queued(
+    flow_id: str,
+    trace: list[str],
+    *,
+    entries: dict[str, object] | None = None,
+    deadline_step: int = 8,
+) -> DeferredWork:
     return DeferredWork(
         flow_id=flow_id,
         bundle=PortBundle(
             key=BundleKey(7, "decode", "request", 0),
+            entries={} if entries is None else entries,
             version=7,
         ),
         context=RuntimeContext(
@@ -146,9 +215,128 @@ def _queued(flow_id: str, trace: list[str]) -> DeferredWork:
         enqueued_step=7,
         eligible_step=7,
         eligible_hook="sampler.pre_draw",
-        deadline_step=8,
+        deadline_step=deadline_step,
         deadline_hook="prepare_inputs.pre",
     )
+
+
+def _transfer_resources(
+    *,
+    epoch: int = 1,
+    adapter: _TrackingCopyAdapter | None = None,
+    include_binding: bool = True,
+    fallback_move_set: bool = False,
+) -> tuple[PlanResources, _TrackingCopyAdapter]:
+    """Build one cold adaptive resource epoch with a two-hop transfer route."""
+
+    source_node = NodeKey.producer("phase5.transfer.source")
+    target_node = NodeKey.consumer_flow("phase5.transfer.target", 0)
+    source_logical = ExecutorKey("logical", "phase5.transfer.source")
+    target_logical = ExecutorKey("logical", "phase5.transfer.target")
+    source_impl = ExecutorKey("implementation", "phase5.transfer.source.cuda0")
+    target_impl = ExecutorKey("implementation", "phase5.transfer.target.cuda1")
+    physical = PhysicalFlowPlan(
+        plan_epoch=epoch,
+        nodes=(
+            PhysicalNodePlan(source_node, source_logical, StreamClass.DEFAULT),
+            PhysicalNodePlan(target_node, target_logical, StreamClass.SIDE_TRAIN),
+        ),
+    )
+    registry = phase3.ImplementationRegistry()
+    registry.register(
+        phase3.ImplementationSpec(
+            source_impl,
+            phase3.Placement("cuda", 0),
+            _Implementation(),
+            logical_executor=source_logical,
+        )
+    )
+    registry.register(
+        phase3.ImplementationSpec(
+            target_impl,
+            phase3.Placement("cuda", 1),
+            _Implementation(),
+            logical_executor=target_logical,
+        )
+    )
+    value = phase3.ValueKey("phase5-transfer", 1)
+    if adapter is None:
+        adapter = _TrackingCopyAdapter()
+    placement, dispatcher, implementations = PlacementRuntimeBinding(
+        registry=registry,
+        topology=phase3.DeviceTopology(frozenset(), (0, 1)),
+        value_flows=(phase3.ValueFlowDesc(value, source_node, target_node, 16),),
+        adapter=adapter,
+    ).compile(physical)
+    move_set = CandidateMoveSetDesc(
+        MoveSetKey("phase5", "transfer"),
+        placement.moves,
+    )
+    route_deadline = max(move.end_at for move in placement.moves) + 1
+    shape_key = ShapeBucketKey("phase5", "transfer-shape")
+    workload_key = WorkloadBucketKey("phase5", "transfer-work")
+    fallback_key = CandidateActionKey("phase5", "transfer-fallback")
+    execute_key = CandidateActionKey("phase5", "transfer-execute")
+    fallback = CandidateActionDesc(
+        fallback_key,
+        CandidateActionKind.AUTHORITATIVE_FALLBACK,
+        move_set=move_set.key if fallback_move_set else None,
+        deadline=route_deadline if fallback_move_set else 1,
+        unknown_bucket=True,
+    )
+    execute = CandidateActionDesc(
+        execute_key,
+        CandidateActionKind.EXECUTE,
+        workload_bucket=workload_key,
+        shape_bucket=shape_key,
+        move_set=move_set.key,
+        fallback_key=fallback_key,
+        deadline=route_deadline,
+    )
+    plan = Phase5ControlPlan(
+        plan_epoch=epoch,
+        placement_plan=placement,
+        scheduled_moves=placement.moves,
+        move_sets=(move_set,),
+        workload_buckets=(WorkloadBucketDesc(workload_key, (shape_key,)),),
+        shape_buckets=(ShapeBucketDesc(shape_key, shape=(4,)),),
+        budgets=(),
+        actions=(fallback, execute),
+        unknown_bucket_fallback=fallback_key,
+        buffer_capacity=1,
+        mode=AdmissionMode.ADAPTIVE,
+    )
+    item = WorkItemDesc(
+        WorkItemKey("phase5", "transfer-item"),
+        (99,) if fallback_move_set else (4,),
+        workload_key,
+    )
+    flow_binding = AdaptiveFlowBinding(
+        "phase5.transfer.flow",
+        item,
+        ()
+        if not include_binding
+        else (
+            AdaptiveTransferBinding(
+                move_set.key,
+                source_node,
+                target_node,
+                value,
+                "source",
+                "destination",
+            ),
+        ),
+    )
+    resources = PlanResources(
+        plan=physical,
+        placement_plan=placement,
+        placement_dispatcher=dispatcher,
+        placement_implementations=implementations,
+        adaptive_plan=plan,
+        adaptive_scheduler=Phase5AdaptiveScheduler(plan),
+        adaptive_flow_bindings=(flow_binding,),
+    )
+    return resources, adapter
 
 
 class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
@@ -258,6 +446,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         resources, execute_key = _runtime_resources(
             item=item,
             mode=AdmissionMode.ADAPTIVE,
+            include_shed=True,
         )
         assert resources.adaptive_scheduler is not None
         resources.adaptive_scheduler.observe(execute_key, 100)
@@ -292,6 +481,47 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         self.assertEqual(state.placement_stats.adaptive_defer_count, 1)
         self.assertEqual(state.placement_stats.adaptive_shed_count, 1)
 
+    def test_optional_work_falls_back_when_shedding_was_not_approved(self) -> None:
+        item = WorkItemDesc(
+            WorkItemKey("phase5", "optional-fallback"),
+            (2,),
+            WorkloadBucketKey("phase5", "decode"),
+        )
+        resources, execute_key = _runtime_resources(
+            item=item,
+            mode=AdmissionMode.ADAPTIVE,
+        )
+        assert resources.adaptive_scheduler is not None
+        resources.adaptive_scheduler.observe(execute_key, 100)
+        state = self._state(resources)
+        trace: list[str] = []
+        state.deferred_work_queue.enqueue(_queued("phase5.flow", trace))
+
+        drained = drain_deferred_port_bundles(
+            runtime=state,
+            step_id=7,
+            hook="sampler.pre_draw",
+            expired_only=True,
+        )
+
+        self.assertEqual(drained, 0)
+        self.assertEqual(trace, [])
+        self.assertEqual(state.deferred_work_queue.depth, 1)
+
+        state.physical_plan_store.finish_step(7)
+        state.physical_plan_store.prepare_step(8)
+        state.physical_prepared_step_id = 8
+        drained = drain_deferred_port_bundles(
+            runtime=state,
+            step_id=8,
+            hook="prepare_inputs.pre",
+            expired_only=True,
+        )
+        self.assertEqual(drained, 1)
+        self.assertEqual(trace, ["run"])
+        self.assertEqual(state.placement_stats.adaptive_fallback_count, 1)
+        self.assertEqual(state.placement_stats.adaptive_shed_count, 0)
+
     def test_required_work_uses_authoritative_fallback_instead_of_drop(self) -> None:
         item = WorkItemDesc(
             WorkItemKey("phase5", "required"),
@@ -320,6 +550,238 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         self.assertEqual(trace, ["run"])
         self.assertEqual(state.placement_stats.adaptive_fallback_count, 1)
         self.assertEqual(state.placement_stats.adaptive_shed_count, 0)
+
+    def test_cold_plan_resources_reject_selectable_move_set_without_transfer_binding(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly cover selectable non-empty MoveSets"):
+            _transfer_resources(include_binding=False)
+
+    def test_pending_transfer_remains_owned_by_old_epoch_until_callback(self) -> None:
+        old_resources, old_adapter = _transfer_resources()
+        new_resources, new_adapter = _transfer_resources(epoch=2)
+        state = self._state(old_resources)
+        trace: list[str] = []
+        state.deferred_work_queue.enqueue(
+            _queued(
+                "phase5.transfer.flow",
+                trace,
+                entries={
+                    "source": _FakeTensor((4,), "float32", "cuda:0"),
+                    "destination": _FakeTensor((4,), "float32", "cuda:1"),
+                },
+                deadline_step=12,
+            )
+        )
+
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(old_adapter.calls, ["d2h"])
+        self.assertEqual(trace, [])
+
+        store = state.physical_plan_store
+        assert store is not None
+        store.finish_step(7)
+        store.stage(new_resources)
+        store.prepare_step(8)
+        state.physical_prepared_step_id = 8
+        binding = old_resources.adaptive_flow_binding("phase5.transfer.flow")
+        assert binding is not None
+        self.assertIs(
+            store.adaptive_transfer_owner(
+                flow_id=binding.flow_id,
+                bundle_key=BundleKey(7, "decode", "request", 0),
+                bundle_version=7,
+            ),
+            old_resources,
+        )
+
+        old_adapter.fences[0].complete = True
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=8,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(old_adapter.calls, ["d2h", "h2d"])
+        self.assertEqual(new_adapter.calls, [])
+        self.assertEqual(trace, [])
+
+        old_adapter.fences[1].complete = True
+        self.assertEqual(store.collect_retired(), 0)
+        self.assertIs(
+            store.adaptive_transfer_owner(
+                flow_id=binding.flow_id,
+                bundle_key=BundleKey(7, "decode", "request", 0),
+                bundle_version=7,
+            ),
+            old_resources,
+        )
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=8,
+                hook="sampler.pre_draw",
+            ),
+            1,
+        )
+        self.assertEqual(trace, ["run"])
+        self.assertEqual(store.collect_retired(), 1)
+
+    def test_authoritative_fallback_completes_its_bound_move_set_before_callback(self) -> None:
+        resources, adapter = _transfer_resources(fallback_move_set=True)
+        state = self._state(resources)
+        trace: list[str] = []
+        state.deferred_work_queue.enqueue(
+            _queued(
+                "phase5.transfer.flow",
+                trace,
+                entries={
+                    "source": _FakeTensor((4,), "float32", "cuda:0"),
+                    "destination": _FakeTensor((4,), "float32", "cuda:1"),
+                },
+            )
+        )
+
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(adapter.calls, ["d2h"])
+        self.assertEqual(trace, [])
+
+        adapter.fences[0].complete = True
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(adapter.calls, ["d2h", "h2d"])
+        self.assertEqual(trace, [])
+
+        adapter.fences[1].complete = True
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            1,
+        )
+        self.assertEqual(trace, ["run"])
+        self.assertEqual(state.placement_stats.adaptive_fallback_count, 1)
+        self.assertEqual(state.placement_stats.adaptive_run_count, 0)
+
+    def test_synchronize_esamp_drains_adaptive_transfer_before_callback(self) -> None:
+        resources, adapter = _transfer_resources()
+        state = self._state(resources)
+        trace: list[str] = []
+        state.deferred_work_queue.enqueue(
+            _queued(
+                "phase5.transfer.flow",
+                trace,
+                entries={
+                    "source": _FakeTensor((4,), "float32", "cuda:0"),
+                    "destination": _FakeTensor((4,), "float32", "cuda:1"),
+                },
+                deadline_step=12,
+            )
+        )
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(adapter.calls, ["d2h"])
+        self.assertEqual(trace, [])
+
+        def complete_latest_fence(_seconds: float) -> None:
+            self.assertTrue(adapter.fences)
+            adapter.fences[-1].complete = True
+
+        queue_type = type(state.deferred_work_queue)
+        with (
+            mock.patch.object(
+                queue_type,
+                "flush_all",
+                wraps=state.deferred_work_queue.flush_all,
+            ) as flush_all,
+            mock.patch("time.sleep", side_effect=complete_latest_fence) as sleep,
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+        ):
+            residual_runtime.synchronize_esamp()
+
+        flush_all.assert_not_called()
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(adapter.calls, ["d2h", "h2d"])
+        self.assertEqual(trace, ["run"])
+
+    def test_selected_move_set_runs_exact_phase3_route_before_callback(self) -> None:
+        resources, adapter = _transfer_resources()
+        placement = resources.placement_plan
+        assert placement is not None
+        self.assertEqual(len(placement.moves), 2)
+        state = self._state(resources)
+        trace: list[str] = []
+        source = _FakeTensor((4,), "float32", "cuda:0")
+        destination = _FakeTensor((4,), "float32", "cuda:1")
+        state.deferred_work_queue.enqueue(
+            _queued(
+                "phase5.transfer.flow",
+                trace,
+                entries={"source": source, "destination": destination},
+            )
+        )
+
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(adapter.calls, ["d2h"])
+        self.assertEqual(trace, [])
+        adapter.fences[0].complete = True
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            0,
+        )
+        self.assertEqual(adapter.calls, ["d2h", "h2d"])
+        self.assertEqual(trace, [])
+        adapter.fences[1].complete = True
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=7,
+                hook="sampler.pre_draw",
+            ),
+            1,
+        )
+        self.assertEqual(trace, ["run"])
+        self.assertEqual(state.placement_stats.adaptive_defer_count, 2)
+        self.assertEqual(state.placement_stats.adaptive_run_count, 1)
 
 
 if __name__ == "__main__":

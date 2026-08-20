@@ -14,7 +14,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypeVar, cast
 
-from tllm.workgraph.phase3 import MoveKey, PlacementPlan
+from tllm.workgraph.ir import NodeKey
+from tllm.workgraph.phase3 import MoveKey, PlacementPlan, ValueKey
 from tllm.workgraph.phase5 import (
     AdmissionMode,
     CandidateActionDesc,
@@ -46,6 +47,11 @@ class AdaptiveDecisionKind(StrEnum):
     KEEP = "keep"
     DROP = "drop"
     FALLBACK = "fallback"
+
+
+class AdaptiveTransferStatus(StrEnum):
+    READY = "ready"
+    PENDING = "pending"
 
 
 _T = TypeVar("_T")
@@ -245,11 +251,65 @@ class RuntimeAdmissionState:
 
 
 @dataclass(frozen=True, slots=True)
+class AdaptiveTransferBinding:
+    """Bind one approved MoveSet route to explicit bundle payload entries."""
+
+    move_set: MoveSetKey
+    producer: NodeKey
+    consumer: NodeKey
+    value: ValueKey
+    source_entry: str
+    destination_entry: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "move_set",
+            _instance(self.move_set, MoveSetKey, "AdaptiveTransferBinding.move_set"),
+        )
+        object.__setattr__(
+            self,
+            "producer",
+            _instance(self.producer, NodeKey, "AdaptiveTransferBinding.producer"),
+        )
+        object.__setattr__(
+            self,
+            "consumer",
+            _instance(self.consumer, NodeKey, "AdaptiveTransferBinding.consumer"),
+        )
+        object.__setattr__(
+            self,
+            "value",
+            _instance(self.value, ValueKey, "AdaptiveTransferBinding.value"),
+        )
+        for name, value in (
+            ("source_entry", self.source_entry),
+            ("destination_entry", self.destination_entry),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or "0x" in value.lower()
+                or "<" in value
+                or ">" in value
+            ):
+                raise ValueError(f"AdaptiveTransferBinding.{name} must be stable text")
+            object.__setattr__(self, name, value.strip())
+        if self.source_entry == self.destination_entry:
+            raise ValueError("adaptive transfer source and destination entries must differ")
+
+    @property
+    def route_key(self) -> tuple[NodeKey, NodeKey, ValueKey]:
+        return self.producer, self.consumer, self.value
+
+
+@dataclass(frozen=True, slots=True)
 class AdaptiveFlowBinding:
     """Explicitly migrate one legacy flow id to one typed work descriptor."""
 
     flow_id: str
     work: WorkItemDesc
+    transfers: tuple[AdaptiveTransferBinding, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -265,6 +325,36 @@ class AdaptiveFlowBinding:
             self,
             "work",
             _instance(self.work, WorkItemDesc, "AdaptiveFlowBinding.work"),
+        )
+        if not isinstance(self.transfers, tuple) or any(
+            not isinstance(transfer, AdaptiveTransferBinding)
+            for transfer in self.transfers
+        ):
+            raise TypeError(
+                "AdaptiveFlowBinding.transfers must be tuple[AdaptiveTransferBinding, ...]"
+            )
+        move_sets = tuple(transfer.move_set for transfer in self.transfers)
+        if len(set(move_sets)) != len(move_sets):
+            raise ValueError(
+                "AdaptiveFlowBinding supports one explicit route per MoveSet"
+            )
+        object.__setattr__(
+            self,
+            "transfers",
+            tuple(sorted(self.transfers, key=lambda transfer: transfer.move_set)),
+        )
+
+    def transfer_for(
+        self,
+        move_set: MoveSetKey,
+    ) -> AdaptiveTransferBinding | None:
+        return next(
+            (
+                transfer
+                for transfer in self.transfers
+                if transfer.move_set == move_set
+            ),
+            None,
         )
 
 
@@ -359,7 +449,11 @@ class AdaptiveRuntimeBinding:
             raise ValueError(
                 "adaptive flow semantics must match the authoritative unknown-bucket fallback"
             )
-        return plan, Phase5AdaptiveScheduler(plan), self.flow_bindings
+        validated_bindings = validate_adaptive_flow_bindings(
+            plan,
+            self.flow_bindings,
+        )
+        return plan, Phase5AdaptiveScheduler(plan), validated_bindings
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,7 +516,7 @@ def _approved_actions(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> tuple
     workload_key = item.workload_bucket
     workload_keys = {bucket.key for bucket in prepared.workload_buckets}
     if workload_key is None or workload_key not in workload_keys or shape_key is None:
-        return (prepared.fallback_action,)
+        return (_semantic_fallback(prepared, item, unknown_bucket=True),)
     must_complete = _must_complete(prepared, item)
     actions = tuple(
         action
@@ -434,8 +528,23 @@ def _approved_actions(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> tuple
         and (not must_complete or action.kind != CandidateActionKind.SHED)
     )
     if not actions:
-        return (prepared.fallback_action,)
+        return (_semantic_fallback(prepared, item, unknown_bucket=False),)
     return tuple(sorted(actions, key=lambda action: (-action.priority, action.key)))
+
+
+def _semantic_fallback(
+    prepared: PreparedPhase5Plan,
+    item: WorkItemDesc,
+    *,
+    unknown_bucket: bool,
+) -> CandidateActionDesc:
+    fallback = prepared.fallback_action
+    if fallback.semantic_key != item.semantic_key:
+        boundary = "unknown bucket" if unknown_bucket else "work item"
+        raise RuntimeError(
+            f"{boundary} has no semantic-preserving authoritative fallback"
+        )
+    return fallback
 
 
 def _must_complete(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> bool:
@@ -443,7 +552,29 @@ def _must_complete(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> bool:
         bucket.key == item.workload_bucket and bucket.required_by_default
         for bucket in prepared.workload_buckets
     )
-    return item.required or workload_required or not item.allow_shedding
+    shape_key = _shape_bucket(prepared, item.shape)
+    action_required = any(
+        action.required
+        and action.semantic_key == item.semantic_key
+        and (
+            (
+                item.workload_bucket is not None
+                and action.workload_bucket == item.workload_bucket
+                and (action.shape_bucket is None or action.shape_bucket == shape_key)
+            )
+            or (
+                (item.workload_bucket is None or shape_key is None)
+                and action.key == prepared.fallback_action.key
+            )
+        )
+        for action in prepared.actions
+    )
+    return (
+        item.required
+        or workload_required
+        or action_required
+        or not item.allow_shedding
+    )
 
 
 def _action_is_approved(
@@ -460,6 +591,64 @@ def _action_is_approved(
         and candidate.semantic_key == item.semantic_key
         for action in primary
     )
+
+
+def validate_adaptive_flow_bindings(
+    plan: Phase5ControlPlan,
+    bindings: tuple[AdaptiveFlowBinding, ...],
+) -> tuple[AdaptiveFlowBinding, ...]:
+    """Require explicit exact runtime bindings for every selectable MoveSet."""
+
+    plan = _instance(plan, Phase5ControlPlan, "adaptive binding plan")
+    if not isinstance(bindings, tuple) or any(
+        not isinstance(binding, AdaptiveFlowBinding) for binding in bindings
+    ):
+        raise TypeError("adaptive flow bindings must be AdaptiveFlowBinding tuple")
+    prepared = prepare_phase5_plan(plan)
+    action_by_key = prepared.action_by_key
+    move_sets = prepared.move_sets
+    for binding in bindings:
+        actions = list(_approved_actions(prepared, binding.work))
+        for action in tuple(actions):
+            if action.fallback_key is not None:
+                fallback = action_by_key[action.fallback_key]
+                if fallback not in actions:
+                    actions.append(fallback)
+        required_move_sets = {
+            action.move_set
+            for action in actions
+            if action.move_set is not None and move_sets[action.move_set].moves
+        }
+        configured_move_sets = {transfer.move_set for transfer in binding.transfers}
+        if configured_move_sets != required_move_sets:
+            raise ValueError(
+                "adaptive flow transfers must exactly cover selectable non-empty MoveSets"
+            )
+        for move_set_key in required_move_sets:
+            move_set = move_sets[move_set_key]
+            routes = {
+                (scheduled.producer, scheduled.consumer, scheduled.move.value)
+                for scheduled in move_set.moves
+            }
+            if None in {
+                endpoint
+                for scheduled in move_set.moves
+                for endpoint in (scheduled.producer, scheduled.consumer)
+            }:
+                raise ValueError(
+                    "adaptive production MoveSet requires producer/consumer bindings"
+                )
+            if len(routes) != 1:
+                raise ValueError(
+                    "adaptive production MoveSet currently supports one transfer route"
+                )
+            transfer = binding.transfer_for(move_set_key)
+            assert transfer is not None
+            if transfer.route_key != next(iter(routes)):
+                raise ValueError(
+                    "adaptive transfer binding differs from its frozen MoveSet route"
+                )
+    return tuple(bindings)
 
 
 class Phase5AdaptiveScheduler:
@@ -589,8 +778,11 @@ class Phase5AdaptiveScheduler:
             return self._emit(item.key, AdaptiveDecisionKind.FALLBACK, "unknown bucket", prepared.fallback_action)
 
         last_reason = "admission rejected"
+        approved_shed: CandidateActionDesc | None = None
         for candidate in actions:
             if candidate.kind == CandidateActionKind.SHED:
+                if approved_shed is None:
+                    approved_shed = candidate
                 continue
             if candidate.kind == CandidateActionKind.AUTHORITATIVE_FALLBACK:
                 if reserve:
@@ -623,11 +815,37 @@ class Phase5AdaptiveScheduler:
             if reserve:
                 self._reserve(actions[0])
             return self._emit(item.key, AdaptiveDecisionKind.RUN, "required work", actions[0])
+        if allow_defer:
+            return self._emit(
+                item.key,
+                AdaptiveDecisionKind.KEEP,
+                last_reason,
+                actions[-1] if actions else None,
+            )
+        if approved_shed is None:
+            fallback = next(
+                (
+                    self._fallback_for(candidate)
+                    for candidate in actions
+                    if candidate.kind == CandidateActionKind.EXECUTE
+                    and self._fallback_for(candidate) is not None
+                ),
+                prepared.fallback_action,
+            )
+            assert fallback is not None
+            if reserve:
+                self._reserve(fallback)
+            return self._emit(
+                item.key,
+                AdaptiveDecisionKind.FALLBACK,
+                "shedding not approved",
+                fallback,
+            )
         return self._emit(
             item.key,
-            AdaptiveDecisionKind.KEEP if allow_defer else AdaptiveDecisionKind.DROP,
+            AdaptiveDecisionKind.DROP,
             last_reason,
-            actions[-1] if actions else None,
+            approved_shed,
         )
 
     def decide_all(
@@ -700,7 +918,10 @@ class Phase5AdaptiveScheduler:
         duration = action.duration
         move_set = self._require_prepared().move_sets.get(action.move_set) if action.move_set is not None else None
         if move_set is not None and move_set.moves:
-            duration = max(duration, max(move.end_at for move in move_set.moves))
+            duration = max(
+                duration,
+                max(move.end_at - action.ready_at for move in move_set.moves),
+            )
         if self.mode == AdaptiveMode.ADAPTIVE:
             estimate = self.latency_ewma.get(action.key)
             if estimate is not None:
@@ -764,6 +985,8 @@ class Phase5AdaptiveScheduler:
 __all__ = [
     "AdaptiveFlowBinding",
     "AdaptiveRuntimeBinding",
+    "AdaptiveTransferBinding",
+    "AdaptiveTransferStatus",
     "AdaptiveDecision",
     "AdaptiveDecisionKind",
     "AdaptiveMode",
@@ -773,4 +996,5 @@ __all__ = [
     "PreparedPhase5Plan",
     "RuntimeAdmissionState",
     "prepare_phase5_plan",
+    "validate_adaptive_flow_bindings",
 ]

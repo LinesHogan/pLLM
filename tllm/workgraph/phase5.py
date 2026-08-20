@@ -458,6 +458,8 @@ class CandidateActionDesc:
             raise TypeError("CandidateActionDesc.required must be bool")
         if not isinstance(cast(object, self.unknown_bucket), bool):
             raise TypeError("CandidateActionDesc.unknown_bucket must be bool")
+        if not isinstance(cast(object, self.authoritative), bool):
+            raise TypeError("CandidateActionDesc.authoritative must be bool")
         if kind == CandidateActionKind.SHED:
             if self.required:
                 raise ValueError("required work cannot use a shedding action")
@@ -734,7 +736,29 @@ def _must_complete(plan: Phase5ControlPlan, item: WorkItemDesc) -> bool:
         bucket.key == item.workload_bucket and bucket.required_by_default
         for bucket in plan.workload_buckets
     )
-    return item.required or workload_required or not item.allow_shedding
+    shape_key = _shape_bucket(plan, item.shape)
+    action_required = any(
+        action.required
+        and action.semantic_key == item.semantic_key
+        and (
+            (
+                item.workload_bucket is not None
+                and action.workload_bucket == item.workload_bucket
+                and (action.shape_bucket is None or action.shape_bucket == shape_key)
+            )
+            or (
+                (item.workload_bucket is None or shape_key is None)
+                and action.key == plan.unknown_bucket_fallback
+            )
+        )
+        for action in plan.actions
+    )
+    return (
+        item.required
+        or workload_required
+        or action_required
+        or not item.allow_shedding
+    )
 
 
 def approved_actions(plan: Phase5ControlPlan, item: WorkItemDesc) -> tuple[CandidateActionDesc, ...]:
@@ -745,8 +769,17 @@ def approved_actions(plan: Phase5ControlPlan, item: WorkItemDesc) -> tuple[Candi
     shape_key = _shape_bucket(plan, item.shape)
     known_workload = item.workload_bucket in {bucket.key for bucket in plan.workload_buckets}
     must_complete = _must_complete(plan, item)
+    fallback = next(
+        action
+        for action in plan.actions
+        if action.key == plan.unknown_bucket_fallback
+    )
     if item.workload_bucket is None or not known_workload or shape_key is None:
-        return (next(action for action in plan.actions if action.key == plan.unknown_bucket_fallback),)
+        if fallback.semantic_key != item.semantic_key:
+            raise RuntimeError(
+                "unknown bucket has no semantic-preserving authoritative fallback"
+            )
+        return (fallback,)
     candidates = tuple(
         action
         for action in plan.actions
@@ -764,7 +797,11 @@ def approved_actions(plan: Phase5ControlPlan, item: WorkItemDesc) -> tuple[Candi
             or action.fallback_key is not None
         )
     if not candidates:
-        return (next(action for action in plan.actions if action.key == plan.unknown_bucket_fallback),)
+        if fallback.semantic_key != item.semantic_key:
+            raise RuntimeError(
+                "work item has no semantic-preserving authoritative fallback"
+            )
+        return (fallback,)
     approved = list(candidates)
     candidate_keys = {action.key for action in approved}
     for action in candidates:
@@ -775,6 +812,15 @@ def approved_actions(plan: Phase5ControlPlan, item: WorkItemDesc) -> tuple[Candi
             approved.append(fallback)
             candidate_keys.add(fallback.key)
     return tuple(sorted(approved, key=lambda action: (-action.priority, action.key)))
+
+
+def _can_shed(plan: Phase5ControlPlan, item: WorkItemDesc) -> bool:
+    if _must_complete(plan, item):
+        return False
+    return any(
+        action.kind == CandidateActionKind.SHED
+        for action in approved_actions(plan, item)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -821,7 +867,7 @@ def _evaluate_selection(
         return None
     selected_keys = {item.key for item, _ in selection}
     shed = tuple(item for item in items if item.key not in selected_keys)
-    if any(_must_complete(plan, item) for item in shed):
+    if any(not _can_shed(plan, item) for item in shed):
         return None
     required_count = sum(1 for item, _ in selection if _must_complete(plan, item))
     optional_count = sum(1 for item, _ in selection if not _must_complete(plan, item))
@@ -915,7 +961,7 @@ def exhaustive_admission_oracle(
     options: list[tuple[CandidateActionDesc | None, ...]] = []
     for item in typed:
         candidates = approved_actions(plan, item)
-        if not _must_complete(plan, item):
+        if _can_shed(plan, item):
             candidates = candidates + (None,)
         options.append(candidates)
     best: _EvaluatedSelection | None = None

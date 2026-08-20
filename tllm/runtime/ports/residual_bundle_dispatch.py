@@ -32,11 +32,13 @@ from tllm.runtime.scheduling.deferred import (
     DeferredWorkDecision,
     DeferredWorkQueue,
 )
-from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
+from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
 from tllm.runtime.scheduling.phase5_adaptive import (
     AdaptiveDecisionKind,
+    AdaptiveTransferStatus,
     AdmissionContext,
 )
+from tllm.workgraph.phase5 import CandidateActionKind
 from tllm.runtime.fusion import FusionExecutor
 from tllm.runtime.timing_debug import (
     TimingDebugMode,
@@ -590,32 +592,18 @@ def drain_deferred_port_bundles(
     ):
         resources = runtime.physical_plan_store.active(int(step_id))
     if resources is not None and resources.adaptive_scheduler is not None:
-        scheduler = resources.adaptive_scheduler
-
         def select(
             work: DeferredWork,
             must_resolve: bool,
         ) -> DeferredWorkDecision:
-            binding = resources.adaptive_flow_binding(work.flow_id)
-            if binding is None:
-                return DeferredWorkDecision.RUN
-            decision = scheduler.decide(
-                binding.work,
-                context=AdmissionContext(step=int(step_id)),
-                reserve=True,
-                allow_defer=not must_resolve,
+            return _select_adaptive_deferred_work(
+                runtime=runtime,
+                resources=resources,
+                work=work,
+                step_id=int(step_id),
+                must_resolve=must_resolve,
+                wait_for_transfer=False,
             )
-            if decision.action == AdaptiveDecisionKind.RUN:
-                runtime.placement_stats.adaptive_run_count += 1
-                return DeferredWorkDecision.RUN
-            if decision.action == AdaptiveDecisionKind.FALLBACK:
-                runtime.placement_stats.adaptive_fallback_count += 1
-                return DeferredWorkDecision.RUN
-            if decision.action == AdaptiveDecisionKind.KEEP:
-                runtime.placement_stats.adaptive_defer_count += 1
-                return DeferredWorkDecision.KEEP
-            runtime.placement_stats.adaptive_shed_count += 1
-            return DeferredWorkDecision.DROP
 
         result = queue.drain_selected(
             step_id=int(step_id),
@@ -649,6 +637,139 @@ def drain_deferred_port_bundles(
         runtime.placement_stats.bubble_drain_count += drained
         runtime.placement_stats.bubble_drain_ms += (time.perf_counter() - started) * 1000.0
     return drained
+
+
+def _select_adaptive_deferred_work(
+    *,
+    runtime: PortDispatchRuntimeLike,
+    resources: PlanResources | None,
+    work: DeferredWork,
+    step_id: int,
+    must_resolve: bool,
+    wait_for_transfer: bool,
+) -> DeferredWorkDecision:
+    """Resolve one queue item through its owning frozen Phase 5 epoch."""
+
+    work_resources = resources
+    store = runtime.physical_plan_store
+    if store is not None:
+        transfer_owner = store.adaptive_transfer_owner(
+            flow_id=work.flow_id,
+            bundle_key=work.bundle.key,
+            bundle_version=work.bundle.version,
+        )
+        if transfer_owner is not None:
+            work_resources = transfer_owner
+    if work_resources is None or work_resources.adaptive_scheduler is None:
+        return DeferredWorkDecision.RUN
+    binding = work_resources.adaptive_flow_binding(work.flow_id)
+    if binding is None:
+        return DeferredWorkDecision.RUN
+
+    transfer_must_resolve = must_resolve and not wait_for_transfer
+    pending = work_resources.adaptive_pending_action(
+        binding,
+        bundle_key=work.bundle.key,
+        bundle_version=work.bundle.version,
+    )
+    if pending is not None:
+        transfer_status = work_resources.advance_adaptive_transfers(
+            binding,
+            bundle_key=work.bundle.key,
+            bundle_version=work.bundle.version,
+            entries=work.bundle.entries,
+            candidate=pending,
+            must_resolve=transfer_must_resolve,
+        )
+        if transfer_status == AdaptiveTransferStatus.PENDING:
+            runtime.placement_stats.adaptive_defer_count += 1
+            return DeferredWorkDecision.KEEP
+        if pending.kind == CandidateActionKind.AUTHORITATIVE_FALLBACK:
+            runtime.placement_stats.adaptive_fallback_count += 1
+        else:
+            runtime.placement_stats.adaptive_run_count += 1
+        return DeferredWorkDecision.RUN
+
+    work_scheduler = work_resources.adaptive_scheduler
+    decision = work_scheduler.decide(
+        binding.work,
+        context=AdmissionContext(step=int(step_id)),
+        reserve=True,
+        allow_defer=not must_resolve,
+    )
+    if decision.action in (
+        AdaptiveDecisionKind.RUN,
+        AdaptiveDecisionKind.FALLBACK,
+    ):
+        candidate = decision.candidate
+        assert candidate is not None
+        transfer_status = work_resources.advance_adaptive_transfers(
+            binding,
+            bundle_key=work.bundle.key,
+            bundle_version=work.bundle.version,
+            entries=work.bundle.entries,
+            candidate=candidate,
+            must_resolve=transfer_must_resolve,
+        )
+        if transfer_status == AdaptiveTransferStatus.PENDING:
+            runtime.placement_stats.adaptive_defer_count += 1
+            return DeferredWorkDecision.KEEP
+        if decision.action == AdaptiveDecisionKind.FALLBACK:
+            runtime.placement_stats.adaptive_fallback_count += 1
+        else:
+            runtime.placement_stats.adaptive_run_count += 1
+        return DeferredWorkDecision.RUN
+    if decision.action == AdaptiveDecisionKind.KEEP:
+        runtime.placement_stats.adaptive_defer_count += 1
+        return DeferredWorkDecision.KEEP
+    runtime.placement_stats.adaptive_shed_count += 1
+    return DeferredWorkDecision.DROP
+
+
+def synchronize_deferred_port_bundles(
+    *,
+    runtime: PortDispatchRuntimeLike,
+) -> int:
+    """Resolve all queued work while polling, rather than bypassing, Phase 5."""
+
+    queue = runtime.deferred_work_queue
+    if not queue:
+        return 0
+    store = runtime.physical_plan_store
+    resources: PlanResources | None = None
+    prepared_step = int(runtime.physical_prepared_step_id)
+    if store is not None:
+        if prepared_step >= 0:
+            try:
+                resources = store.active(prepared_step)
+            except KeyError:
+                resources = store.current
+        else:
+            resources = store.current
+    admission_step = max(int(runtime.event_step_id), prepared_step, 0)
+    ran = 0
+    while queue:
+        force_step = max(
+            admission_step,
+            *(max(work.eligible_step, work.deadline_step) for work in queue),
+        ) + 1
+        before = len(queue)
+        result = queue.drain_selected(
+            step_id=force_step,
+            hook="prepare_inputs.pre",
+            select=lambda work, _must_resolve: _select_adaptive_deferred_work(
+                runtime=runtime,
+                resources=resources,
+                work=work,
+                step_id=admission_step,
+                must_resolve=True,
+                wait_for_transfer=True,
+            ),
+        )
+        ran += result.ran
+        if queue and len(queue) == before:
+            time.sleep(0.001)
+    return ran
 
 
 def retire_step_device_leases(*, core: PortDispatchCoreLike, runner: RunnerLike) -> int:
