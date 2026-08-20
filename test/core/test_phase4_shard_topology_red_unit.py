@@ -293,3 +293,27 @@ def test_rust_attribute_only_validator_rejects_coordinate_mismatch_in_residences
 
     with pytest.raises((TypeError, ValueError, RuntimeError)):
         _rust_validate(candidate)
+
+
+def test_rust_rejects_noncanonical_extra_affinity_node_id() -> None:
+    topology = _topology()
+    requirement = _requirement(
+        phase4.ShardKind.TENSOR,
+        phase4.PlacementAffinity(node_ids=("node-0", "node-1")),
+    )
+    plan = phase4.compile_distributed_flow_plan(
+        plan_epoch=1,
+        topology=topology,
+        state_requirements=(requirement,),
+    )
+    malformed_requirement = _proxy(
+        requirement,
+        affinity=_proxy(
+            requirement.affinity,
+            node_ids=("node-0", "node-1", "bad/path"),
+        ),
+    )
+    candidate = _proxy(plan, state_requirements=(malformed_requirement,))
+
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        _rust_validate(candidate)

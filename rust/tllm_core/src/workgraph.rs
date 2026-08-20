@@ -3800,8 +3800,21 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
             .iter()
             .map(String::as_str)
             .collect();
+        for node_id in &requirement.affinity.node_ids {
+            validate_v4_segment(node_id, "distributed state affinity node id")?;
+        }
         if rank_filter.len() != requirement.affinity.ranks.len()
             || node_filter.len() != requirement.affinity.node_ids.len()
+            || requirement
+                .affinity
+                .ranks
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || requirement
+                .affinity
+                .node_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || rank_filter
                 .iter()
                 .any(|rank| *rank < 0 || *rank >= plan.topology.ranks.len() as i64)
