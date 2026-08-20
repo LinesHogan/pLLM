@@ -372,7 +372,13 @@ class V027MRv1Driver:
             )
 
         def _execute_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            out = _hooks.wrapped_execute_model(core=core, runner=runner, args=args, kwargs=kwargs)
+            out = _hooks.wrapped_execute_model(
+                core=core,
+                runner=runner,
+                args=args,
+                kwargs=kwargs,
+                split_execute_and_sample=True,
+            )
             session = get_step_session(runner)
             if session is not None and session.state == StepState.INPUTS_READY:
                 session.transition(StepState.FORWARD_DONE)

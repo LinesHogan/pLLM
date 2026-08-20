@@ -478,5 +478,111 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
         self.assertEqual(binding.adapter.calls[0][0].key.name, "prepare")
 
 
+class Phase4LegacyGenericLifecycleAuditRedTest(unittest.TestCase):
+    def test_legacy_generic_execute_emits_terminal_sample_event_for_step_end(self) -> None:
+        """Legacy execute_model owns sampling and must close the distributed step."""
+
+        binding = _binding(
+            self,
+            request=_request(name="step-end", window=CollectiveWindow.STEP_END),
+        )
+        state = ResidualRuntimeState()
+        runner = SimpleNamespace(model=SimpleNamespace())
+        events: list[str] = []
+
+        def orig_execute(_runner: object, *_args: object, **_kwargs: object) -> str:
+            # Legacy MRv1 performs sampling before execute_model returns.
+            events.append("legacy_sampling_complete")
+            return "executed"
+
+        core = SimpleNamespace(
+            RUNTIME=state,
+            MODEL_HOOK_FLAG="_legacy_hooks_installed",
+            _ORIG_EXECUTE_MODEL=orig_execute,
+            _runner_uses_compilation_or_cudagraph=lambda _runner: False,
+        )
+        real_dispatch = common_hooks.dispatch_runtime_event
+
+        def dispatch(**kwargs: object) -> int:
+            event_name = str(kwargs["event_name"])
+            events.append(event_name)
+            result = real_dispatch(**kwargs)
+            if event_name == "sample_tokens.post":
+                step = state.distributed_prepared_step_id
+                self.assertEqual(step, 1)
+                key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]
+                residual_runtime.launch_workgraph_collective(
+                    step,
+                    collective=key,
+                    payload=object(),
+                )
+            return result
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(
+                port_runtime_hooks._common_hooks,
+                "dispatch_runtime_event",
+                side_effect=dispatch,
+            ),
+            mock.patch.object(port_runtime_hooks, "setup_runtime_hooks_if_active"),
+        ):
+            residual_runtime.configure_workgraph_distributed(binding)
+            residual_runtime.publish_workgraph_distributed(plan_epoch=1)
+            residual_runtime.prepare_workgraph_step(1)
+            result = port_runtime_hooks.wrapped_execute_model(
+                core=core,
+                runner=runner,
+                args=(),
+                kwargs={},
+            )
+
+        self.assertEqual(result, "executed")
+        self.assertEqual(
+            events,
+            [
+                "execute_model.pre",
+                "legacy_sampling_complete",
+                "execute_model.post",
+                "sample_tokens.post",
+            ],
+        )
+        self.assertEqual(binding.adapter.calls[0][0].key.name, "step-end")
+
+    def test_split_execute_path_leaves_terminal_event_to_sample_wrapper(self) -> None:
+        state = ResidualRuntimeState()
+        runner = SimpleNamespace(model=SimpleNamespace())
+        core = SimpleNamespace(
+            RUNTIME=state,
+            MODEL_HOOK_FLAG="_split_hooks_installed",
+            _ORIG_EXECUTE_MODEL=lambda _runner: "executed",
+            _runner_uses_compilation_or_cudagraph=lambda _runner: False,
+        )
+        events: list[str] = []
+        with (
+            mock.patch.object(
+                port_runtime_hooks.active_targets,
+                "runtime_has_active_targets",
+                return_value=True,
+            ),
+            mock.patch.object(port_runtime_hooks, "setup_runtime_hooks_if_active"),
+            mock.patch.object(
+                port_runtime_hooks._common_hooks,
+                "dispatch_runtime_event",
+                side_effect=lambda **kwargs: events.append(str(kwargs["event_name"])) or 0,
+            ),
+        ):
+            result = port_runtime_hooks.wrapped_execute_model(
+                core=core,
+                runner=runner,
+                args=(),
+                kwargs={},
+                split_execute_and_sample=True,
+            )
+
+        self.assertEqual(result, "executed")
+        self.assertEqual(events, ["execute_model.pre", "execute_model.post"])
+
+
 if __name__ == "__main__":
     unittest.main()

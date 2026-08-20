@@ -730,7 +730,14 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
     return out
 
 
-def wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> Any:
+def wrapped_execute_model(
+    *,
+    core: Any,
+    runner: Any,
+    args: tuple,
+    kwargs: dict,
+    split_execute_and_sample: bool = False,
+) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         _check_fast_weight_static_key_request_count(core=core, runner=runner)
         return core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
@@ -776,6 +783,15 @@ def wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) 
         layer_path=None,
         capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
     )
+    if not split_execute_and_sample:
+        _common_hooks.dispatch_runtime_event(
+            runtime=core.RUNTIME,
+            runner=runner,
+            event_name="sample_tokens.post",
+            phase="decode",
+            layer_path=None,
+            capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
+        )
     return out
 
 
