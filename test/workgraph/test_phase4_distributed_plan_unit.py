@@ -165,6 +165,17 @@ class Phase4TopologyTest(unittest.TestCase):
 
 
 class Phase4StatePlanningTest(unittest.TestCase):
+    def test_state_key_rejects_value_delimiters_in_namespace_and_name(self) -> None:
+        phase4 = _phase4(self)
+
+        for field in ("namespace", "name"):
+            for delimiter in (":", "@"):
+                with self.subTest(field=field, delimiter=delimiter):
+                    values = {"namespace": "model", "name": "weights"}
+                    values[field] = f"{values[field]}{delimiter}part"
+                    with self.assertRaises(ValueError):
+                        phase4.StateKey(**values)
+
     def test_frontend_state_scope_and_all_shard_residences_are_typed(self) -> None:
         phase4 = _phase4(self)
         topology = _topology(phase4)
@@ -252,6 +263,17 @@ class Phase4StatePlanningTest(unittest.TestCase):
 
 
 class Phase4CollectivePlanningTest(unittest.TestCase):
+    def test_collective_key_rejects_value_delimiters_in_namespace_and_name(self) -> None:
+        phase4 = _phase4(self)
+
+        for field in ("namespace", "name"):
+            for delimiter in (":", "/"):
+                with self.subTest(field=field, delimiter=delimiter):
+                    values = {"namespace": "train", "name": "hidden"}
+                    values[field] = f"{values[field]}{delimiter}part"
+                    with self.assertRaises(ValueError):
+                        phase4.CollectiveKey(**values)
+
     def test_collective_global_order_is_window_monotonic_and_rejects_time_travel(self) -> None:
         phase4 = _phase4(self)
         topology = _topology(phase4)
@@ -336,6 +358,64 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
         )
         self.assertEqual(first, second)
         self.assertEqual(structural_signature(first), structural_signature(second))
+
+    def test_compile_plan_is_independent_of_state_and_collective_declaration_order(self) -> None:
+        phase4 = _phase4(self)
+        topology = _topology(phase4, helper=True)
+        requirements = (
+            phase4.StateRequirementDesc(
+                phase4.StateKey("model", "a"),
+                StateScope.REPLICA,
+                phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+            ),
+            phase4.StateRequirementDesc(
+                phase4.StateKey("model-x", "a"),
+                StateScope.REPLICA,
+                phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+            ),
+        )
+        requests = (
+            *_request_set(phase4),
+            phase4.CollectiveRequestDesc(
+                key=phase4.CollectiveKey("train", "a"),
+                kind=phase4.CollectiveKind.ALL_REDUCE,
+                group=phase4.ParallelGroupKind.GLOBAL,
+                window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+            ),
+            phase4.CollectiveRequestDesc(
+                key=phase4.CollectiveKey("train-x", "a"),
+                kind=phase4.CollectiveKind.ALL_REDUCE,
+                group=phase4.ParallelGroupKind.GLOBAL,
+                window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+            ),
+        )
+        first = phase4.compile_distributed_flow_plan(
+            plan_epoch=5,
+            topology=topology,
+            state_requirements=requirements,
+            collective_requests=requests,
+        )
+        second = phase4.compile_distributed_flow_plan(
+            plan_epoch=5,
+            topology=topology,
+            state_requirements=tuple(reversed(requirements)),
+            collective_requests=tuple(reversed(requests)),
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(structural_signature(first), structural_signature(second))
+        self.assertEqual(
+            tuple(item.key for item in first.state_requirements),
+            tuple(sorted((item.key for item in requirements))),
+        )
+        self.assertEqual(
+            tuple(item.key for item in first.collectives[:3]),
+            (
+                phase4.CollectiveKey("train", "a"),
+                phase4.CollectiveKey("train", "tp"),
+                phase4.CollectiveKey("train-x", "a"),
+            ),
+        )
 
 
 class Phase4FailFastTest(unittest.TestCase):

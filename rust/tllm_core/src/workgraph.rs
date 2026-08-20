@@ -921,7 +921,7 @@ struct PlacementPlanV3Desc {
     schema_version: i64,
 }
 
-#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
 struct StateKeyV4Desc {
     #[pyo3(attribute)]
     namespace: String,
@@ -929,12 +929,6 @@ struct StateKeyV4Desc {
     name: String,
     #[pyo3(attribute)]
     version: i64,
-}
-
-impl StateKeyV4Desc {
-    fn text(&self) -> String {
-        format!("{}:{}@{}", self.namespace, self.name, self.version)
-    }
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
@@ -3575,6 +3569,14 @@ fn validate_v4_segment(value: &str, layer: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_v4_key_segment(value: &str, layer: &str, reserved: &[char]) -> Result<(), String> {
+    validate_v4_segment(value, layer)?;
+    if value.chars().any(|character| reserved.contains(&character)) {
+        return Err(format!("{} contains a reserved key delimiter", layer));
+    }
+    Ok(())
+}
+
 fn distributed_groups(
     topology: &DistributedTopologyV4Desc,
     kind: &str,
@@ -3755,20 +3757,24 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
 
     let mut requirement_keys = HashSet::new();
     let mut expected_residences = Vec::new();
-    let mut last_state_key: Option<String> = None;
+    let mut last_state_key: Option<StateKeyV4Desc> = None;
     for requirement in &plan.state_requirements {
-        validate_v4_segment(&requirement.key.namespace, "distributed state namespace")?;
-        validate_v4_segment(&requirement.key.name, "distributed state name")?;
+        validate_v4_key_segment(
+            &requirement.key.namespace,
+            "distributed state namespace",
+            &[':', '@'],
+        )?;
+        validate_v4_key_segment(&requirement.key.name, "distributed state name", &[':', '@'])?;
         if requirement.key.version < 1 || !requirement_keys.insert(requirement.key.clone()) {
             return Err(
                 "distributed state requirement has an invalid or duplicate key".to_string(),
             );
         }
-        let state_text = requirement.key.text();
-        if last_state_key.as_ref().is_some_and(|key| key > &state_text) {
+        let state_key = requirement.key.clone();
+        if last_state_key.as_ref().is_some_and(|key| key > &state_key) {
             return Err("distributed state requirements must use canonical order".to_string());
         }
-        last_state_key = Some(state_text);
+        last_state_key = Some(state_key);
         if !["replica", "shard", "global"].contains(&requirement.scope.as_str()) {
             return Err("distributed state has an unsupported scope".to_string());
         }
@@ -3891,8 +3897,12 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
 
     let mut request_by_key = HashMap::new();
     for request in &plan.collective_requests {
-        validate_v4_segment(&request.key.namespace, "collective namespace")?;
-        validate_v4_segment(&request.key.name, "collective name")?;
+        validate_v4_key_segment(
+            &request.key.namespace,
+            "collective namespace",
+            &[':', '/', '@'],
+        )?;
+        validate_v4_key_segment(&request.key.name, "collective name", &[':', '/', '@'])?;
         if request.key.ordinal < 0
             || request_by_key
                 .insert(request.key.clone(), request)
@@ -3991,7 +4001,7 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
             (
                 v4_collective_window_order(&request_by_key[key].window)
                     .expect("request window validated"),
-                key.text(),
+                key.clone(),
             )
         });
         let key = ready

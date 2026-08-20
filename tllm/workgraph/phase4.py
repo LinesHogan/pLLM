@@ -107,6 +107,18 @@ def _text(value: object, label: str) -> str:
     return value
 
 
+def _key_segment(
+    value: object,
+    label: str,
+    *,
+    reserved: tuple[str, ...],
+) -> str:
+    text = _text(value, label)
+    if any(delimiter in text for delimiter in reserved):
+        raise ValueError(f"{label} contains a reserved key delimiter")
+    return text
+
+
 def _tuple_of(value: object, expected: type[_T], label: str) -> tuple[_T, ...]:
     if not isinstance(value, tuple):
         raise TypeError(f"{label} must be tuple")
@@ -123,8 +135,24 @@ class StateKey:
     version: int = 1
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "namespace", _text(self.namespace, "StateKey.namespace"))
-        object.__setattr__(self, "name", _text(self.name, "StateKey.name"))
+        object.__setattr__(
+            self,
+            "namespace",
+            _key_segment(
+                self.namespace,
+                "StateKey.namespace",
+                reserved=(":", "@"),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "name",
+            _key_segment(
+                self.name,
+                "StateKey.name",
+                reserved=(":", "@"),
+            ),
+        )
         object.__setattr__(
             self,
             "version",
@@ -438,9 +466,21 @@ class CollectiveKey:
         object.__setattr__(
             self,
             "namespace",
-            _text(self.namespace, "CollectiveKey.namespace"),
+            _key_segment(
+                self.namespace,
+                "CollectiveKey.namespace",
+                reserved=(":", "/", "@"),
+            ),
         )
-        object.__setattr__(self, "name", _text(self.name, "CollectiveKey.name"))
+        object.__setattr__(
+            self,
+            "name",
+            _key_segment(
+                self.name,
+                "CollectiveKey.name",
+                reserved=(":", "/", "@"),
+            ),
+        )
         object.__setattr__(
             self,
             "ordinal",
@@ -611,7 +651,7 @@ def _compile_state_residences(
     requirements: tuple[StateRequirementDesc, ...],
 ) -> tuple[StateResidenceDesc, ...]:
     result: list[StateResidenceDesc] = []
-    for requirement in sorted(requirements, key=lambda item: item.key.value):
+    for requirement in sorted(requirements, key=lambda item: item.key):
         if requirement.scope == StateScope.REQUEST:
             raise ValueError("request-scoped state cannot enter a distributed plan")
         shard = requirement.shard
@@ -703,7 +743,7 @@ def _collective_order(
             (key for key, dependencies in remaining.items() if not dependencies),
             key=lambda key: (
                 _COLLECTIVE_WINDOW_ORDER[by_key[key].window],
-                key.value,
+                key,
             ),
         )
         if not ready:
@@ -796,7 +836,7 @@ class DistributedFlowPlan:
         if len({item.key for item in requirements}) != len(requirements):
             raise ValueError("distributed state requirement keys must be unique")
         ordered_requirements = tuple(
-            sorted(requirements, key=lambda item: item.key.value)
+            sorted(requirements, key=lambda item: item.key)
         )
         if requirements != ordered_requirements:
             raise ValueError(
@@ -915,7 +955,7 @@ def compile_distributed_flow_plan(
         plan_epoch=_integer(plan_epoch, "compile_distributed_flow_plan.plan_epoch", minimum=1),
         topology=topology,
         state_requirements=tuple(
-            sorted(requirements, key=lambda item: item.key.value)
+            sorted(requirements, key=lambda item: item.key)
         ),
         state_residences=_compile_state_residences(topology, requirements),
         collective_requests=ordered_requests,

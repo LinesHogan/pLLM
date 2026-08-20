@@ -13,7 +13,7 @@ import importlib
 from typing import Iterable
 import unittest
 
-from tllm.workgraph import phase3
+from tllm.workgraph import phase3, phase4
 from tllm.workgraph.frontend import StateScope
 from tllm.workgraph.phase4 import (
     CollectiveBackend,
@@ -24,7 +24,11 @@ from tllm.workgraph.phase4 import (
     DistributedTopology,
     ParallelGroupKind,
     RankRole,
+    ShardKind,
+    ShardSpec,
     TopologyRankDesc,
+    StateKey,
+    StateRequirementDesc,
 )
 
 
@@ -118,10 +122,17 @@ def _nonnegative_int(value: object, label: str) -> int:
     return value
 
 
+def _key_segment(value: object, label: str) -> str:
+    value = _text(value)
+    if ":" in value or "@" in value:
+        raise ValueError(f"{label} contains a reserved key delimiter")
+    return value
+
+
 def _key(value: object) -> tuple[str, str, int]:
     return (
-        _text(getattr(value, "namespace")),
-        _text(getattr(value, "name")),
+        _key_segment(getattr(value, "namespace"), "collective namespace"),
+        _key_segment(getattr(value, "name"), "collective name"),
         _nonnegative_int(getattr(value, "ordinal"), "collective ordinal"),
     )
 
@@ -217,8 +228,8 @@ def _oracle_validate(plan: object) -> None:
     for requirement in requirements:
         key = getattr(requirement, "key")
         requirement_key = (
-            _text(getattr(key, "namespace")),
-            _text(getattr(key, "name")),
+            _key_segment(getattr(key, "namespace"), "state namespace"),
+            _key_segment(getattr(key, "name"), "state name"),
             _nonnegative_int(getattr(key, "version"), "state version"),
         )
         if requirement_key in requirement_keys:
@@ -245,8 +256,8 @@ def _oracle_validate(plan: object) -> None:
     for residence in residences:
         residence_key = getattr(residence, "key")
         signature = (
-            _text(getattr(residence_key, "namespace")),
-            _text(getattr(residence_key, "name")),
+            _key_segment(getattr(residence_key, "namespace"), "state namespace"),
+            _key_segment(getattr(residence_key, "name"), "state name"),
             _nonnegative_int(getattr(residence_key, "version"), "residence version"),
         )
         if signature not in requirement_keys:
@@ -449,6 +460,99 @@ class Phase4DistributedValidatorOracleUnitTest(unittest.TestCase):
             )
         )
         _assert_same(self, _proxy(plan, state_requirements=(bad_requirement,)), expected="err")
+
+    def test_python_and_rust_reject_reserved_delimiters_in_state_keys(self) -> None:
+        base_plan = _plan()
+        plan = phase4.compile_distributed_flow_plan(
+            plan_epoch=base_plan.plan_epoch,
+            topology=base_plan.topology,
+            state_requirements=(
+                StateRequirementDesc(
+                    key=StateKey("phase4.oracle", "weights"),
+                    scope=StateScope.REPLICA,
+                    shard=ShardSpec(ShardKind.REPLICATED),
+                ),
+            ),
+            collective_requests=base_plan.collective_requests,
+        )
+        requirement = plan.state_requirements[0]
+        for field in ("namespace", "name"):
+            for delimiter in (":", "@"):
+                with self.subTest(field=field, delimiter=delimiter):
+                    key_values = {
+                        "namespace": requirement.key.namespace,
+                        "name": requirement.key.name,
+                        "version": requirement.key.version,
+                    }
+                    key_values[field] = f"{key_values[field]}{delimiter}malformed"
+                    malformed_key = _FrozenAttrs(tuple(key_values.items()))
+                    malformed_requirement = _proxy(requirement, key=malformed_key)
+                    malformed_residences = tuple(
+                        _proxy(residence, key=malformed_key)
+                        for residence in plan.state_residences
+                    )
+                    candidate = _proxy(
+                        plan,
+                        state_requirements=(malformed_requirement,),
+                        state_residences=malformed_residences,
+                    )
+                    _assert_same(self, candidate, expected="err")
+
+    def test_python_and_rust_reject_reserved_delimiters_in_collective_keys(self) -> None:
+        plan = _plan()
+        original_key = plan.collective_requests[0].key
+        for field in ("namespace", "name"):
+            for delimiter in (":", "@"):
+                with self.subTest(field=field, delimiter=delimiter):
+                    key_values = {
+                        "namespace": original_key.namespace,
+                        "name": original_key.name,
+                        "ordinal": original_key.ordinal,
+                    }
+                    key_values[field] = f"{key_values[field]}{delimiter}malformed"
+                    malformed_key = _FrozenAttrs(tuple(key_values.items()))
+
+                    def replace_key(value: object) -> object:
+                        return malformed_key if value == original_key else value
+
+                    requests = tuple(
+                        _proxy(
+                            request,
+                            key=replace_key(request.key),
+                            depends_on=tuple(
+                                replace_key(dependency)
+                                for dependency in request.depends_on
+                            ),
+                        )
+                        for request in plan.collective_requests
+                    )
+                    collectives = tuple(
+                        _proxy(
+                            collective,
+                            key=replace_key(collective.key),
+                            depends_on=tuple(
+                                replace_key(dependency)
+                                for dependency in collective.depends_on
+                            ),
+                        )
+                        for collective in plan.collectives
+                    )
+                    schedules = tuple(
+                        _proxy(
+                            schedule,
+                            collectives=tuple(
+                                replace_key(key) for key in schedule.collectives
+                            ),
+                        )
+                        for schedule in plan.local_schedules
+                    )
+                    candidate = _proxy(
+                        plan,
+                        collective_requests=requests,
+                        collectives=collectives,
+                        local_schedules=schedules,
+                    )
+                    _assert_same(self, candidate, expected="err")
 
     def test_python_and_rust_reject_missing_or_wrong_communicator(self) -> None:
         plan = _plan()
