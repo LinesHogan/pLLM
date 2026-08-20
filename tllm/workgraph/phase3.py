@@ -1421,11 +1421,13 @@ class PlacementPlan:
         ):
             raise ValueError("PlacementPlan residency is outside its topology")
         residency_set = set(residencies)
+        expected_residencies: set[Residency] = set()
         for flow in value_flows:
             required = (
                 Residency(flow.value, selection_by_node[flow.producer].placement),
                 Residency(flow.value, selection_by_node[flow.consumer].placement),
             )
+            expected_residencies.update(required)
             if any(item not in residency_set for item in required):
                 raise ValueError(
                     "PlacementPlan value flow is missing a required residency"
@@ -1436,6 +1438,15 @@ class PlacementPlan:
             for item in moves
         ):
             raise ValueError("PlacementPlan move references an unknown residency")
+        expected_residencies.update(
+            residency
+            for item in moves
+            for residency in (item.move.source, item.move.destination)
+        )
+        if residency_set != expected_residencies:
+            raise ValueError(
+                "PlacementPlan residencies must exactly cover value flows and routes"
+            )
         schedule_by_node = {item.node_key: item for item in schedule}
         if any(item.producer is None or item.consumer is None for item in moves):
             raise ValueError("PlacementPlan moves require explicit producer and consumer nodes")
@@ -1537,6 +1548,21 @@ class PlacementPlan:
         if set(lease_residencies) != residency_set:
             raise ValueError("every PlacementPlan residency requires one lease")
         lease_by_residency = {lease.residency: lease for lease in leases}
+        for flow in value_flows:
+            producer = schedule_by_node[flow.producer]
+            consumer = schedule_by_node[flow.consumer]
+            for residency in (
+                Residency(flow.value, selection_by_node[flow.producer].placement),
+                Residency(flow.value, selection_by_node[flow.consumer].placement),
+            ):
+                lease = lease_by_residency[residency]
+                if (
+                    lease.live_start > producer.end_at
+                    or lease.live_end < consumer.end_at
+                ):
+                    raise ValueError(
+                        "PlacementPlan value-flow lease must cover producer to consumer"
+                    )
         if any(
             lease_by_residency[residency].live_start > item.start_at
             or lease_by_residency[residency].live_end < item.end_at

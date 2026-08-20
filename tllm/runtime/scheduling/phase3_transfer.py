@@ -8,17 +8,24 @@ from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import torch
 
-from tllm.workgraph.ir import NodeKey
+from tllm.workgraph.ir import ExecutorKey, NodeKey
+from tllm.workgraph.physical import PhysicalFlowPlan
 from tllm.workgraph.phase3 import (
     CopyEngine,
     CopyEngineCapacityDesc,
     DeviceKind,
+    DeviceTopology,
+    ImplementationRegistry,
     MemoryKind,
     Move,
     MoveKind,
     Placement,
     PlacementPlan,
+    TransferProfile,
+    TransferProfileDesc,
+    ValueFlowDesc,
     ValueKey,
+    compile_placement_plan,
 )
 
 
@@ -541,6 +548,103 @@ class TorchTensorCopyAdapter:
         return _TorchCopyFence(event, finalize)
 
 
+@dataclass(frozen=True, slots=True)
+class PlacementRuntimeBinding:
+    """Cold-path inputs and Python-owned resources for Phase 3 publication."""
+
+    registry: ImplementationRegistry
+    topology: DeviceTopology
+    value_flows: tuple[ValueFlowDesc, ...] = ()
+    transfer_profile: TransferProfile = TransferProfile()
+    transfer_profiles: tuple[TransferProfileDesc, ...] = ()
+    copy_engines: tuple[CopyEngineCapacityDesc, ...] = ()
+    placement_overrides: tuple[tuple[ExecutorKey, ExecutorKey], ...] = ()
+    pinned_pool_capacity: int = 4
+    adapter: TensorCopyAdapter = field(default_factory=TorchTensorCopyAdapter)
+
+    def __post_init__(self) -> None:
+        _instance(
+            self.registry,
+            ImplementationRegistry,
+            "PlacementRuntimeBinding.registry",
+        )
+        _instance(
+            self.topology,
+            DeviceTopology,
+            "PlacementRuntimeBinding.topology",
+        )
+        for value, expected, label in (
+            (self.value_flows, ValueFlowDesc, "PlacementRuntimeBinding.value_flows"),
+            (
+                self.transfer_profiles,
+                TransferProfileDesc,
+                "PlacementRuntimeBinding.transfer_profiles",
+            ),
+            (
+                self.copy_engines,
+                CopyEngineCapacityDesc,
+                "PlacementRuntimeBinding.copy_engines",
+            ),
+        ):
+            if not isinstance(value, tuple) or any(
+                not isinstance(item, expected) for item in value
+            ):
+                raise TypeError(f"{label} must be a typed tuple")
+        _instance(
+            self.transfer_profile,
+            TransferProfile,
+            "PlacementRuntimeBinding.transfer_profile",
+        )
+        if not isinstance(self.placement_overrides, tuple) or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not all(isinstance(key, ExecutorKey) for key in item)
+            for item in self.placement_overrides
+        ):
+            raise TypeError(
+                "PlacementRuntimeBinding.placement_overrides must contain ExecutorKey pairs"
+            )
+        logical_keys = tuple(item[0] for item in self.placement_overrides)
+        if len(set(logical_keys)) != len(logical_keys):
+            raise ValueError("placement runtime overrides must have unique logical keys")
+        _integer(
+            self.pinned_pool_capacity,
+            "PlacementRuntimeBinding.pinned_pool_capacity",
+            minimum=1,
+        )
+        if not isinstance(cast(object, self.adapter), TensorCopyAdapter):
+            raise TypeError(
+                "PlacementRuntimeBinding.adapter must implement TensorCopyAdapter"
+            )
+
+    def compile(
+        self,
+        physical: PhysicalFlowPlan,
+    ) -> tuple[PlacementPlan, PlacementPlanDispatcher]:
+        physical = _instance(
+            physical, PhysicalFlowPlan, "PlacementRuntimeBinding.physical"
+        )
+        plan = compile_placement_plan(
+            physical,
+            registry=self.registry,
+            topology=self.topology,
+            value_flows=self.value_flows,
+            transfer_profile=self.transfer_profile,
+            transfer_profiles=self.transfer_profiles,
+            copy_engines=self.copy_engines,
+            placement_overrides=dict(self.placement_overrides),
+        )
+        pool = PinnedMemoryPool(
+            capacity=self.pinned_pool_capacity,
+            adapter=self.adapter,
+        )
+        return plan, PlacementPlanDispatcher(
+            plan=plan,
+            pool=pool,
+            adapter=self.adapter,
+        )
+
+
 __all__ = [
     "CopyExecutor",
     "CopyFenceLike",
@@ -548,6 +652,7 @@ __all__ = [
     "PinnedMemoryPool",
     "PinnedMemorySlot",
     "PlacementPlanDispatcher",
+    "PlacementRuntimeBinding",
     "TensorCopyAdapter",
     "TorchTensorCopyAdapter",
 ]

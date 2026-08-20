@@ -55,6 +55,13 @@ if TYPE_CHECKING:
     from tllm.workgraph.hierarchy import CaptureAttachment
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
     from tllm.runtime.specialization import RuntimeSpecializationSpec
+    from tllm.runtime.scheduling.phase3_transfer import (
+        CopyHandle,
+        PlacementRuntimeBinding,
+        TensorLike,
+    )
+    from tllm.workgraph.ir import NodeKey
+    from tllm.workgraph.phase3 import ValueKey
 
 ensure_v1_env()
 
@@ -226,7 +233,17 @@ def _stage_physical_workgraph_snapshot() -> None:
     from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
     from tllm.workgraph.physical import compile_physical_flow_plan
 
-    resources = PlanResources(plan=compile_physical_flow_plan(snapshot))
+    physical_plan = compile_physical_flow_plan(snapshot)
+    placement_plan = None
+    placement_dispatcher = None
+    placement_binding = RUNTIME.placement_runtime_binding
+    if placement_binding is not None:
+        placement_plan, placement_dispatcher = placement_binding.compile(physical_plan)
+    resources = PlanResources(
+        plan=physical_plan,
+        placement_plan=placement_plan,
+        placement_dispatcher=placement_dispatcher,
+    )
     store = RUNTIME.physical_plan_store
     if store is None:
         RUNTIME.physical_plan_store = PlanSnapshotStore(resources)
@@ -316,6 +333,7 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
     store = RUNTIME.physical_plan_store
     if previous >= 0 and previous != step:
         if store is not None:
+            store.active(previous).poll_transfers()
             store.finish_step(previous)
             store.collect_retired()
         for consumer in _active_dispatch_consumers():
@@ -323,7 +341,9 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
     for consumer in _active_dispatch_consumers():
         consumer.drain_workgraph_specializations()
     if store is not None:
-        store.prepare_step(step)
+        resources = store.prepare_step(step)
+        if resources is not None:
+            resources.poll_transfers()
     for consumer in _active_dispatch_consumers():
         consumer.prepare_workgraph_step(step)
     RUNTIME.physical_prepared_step_id = step
@@ -333,6 +353,66 @@ def prepare_workgraph_step(step_id: int) -> None:
     """Compatibility-free public name used by runner safe-point adapters."""
 
     prepare_physical_workgraph_step(step_id)
+
+
+def configure_workgraph_placement(
+    binding: "PlacementRuntimeBinding | None",
+) -> None:
+    """Install or remove typed Phase 3 cold-compilation inputs."""
+
+    from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
+
+    if binding is not None and not isinstance(binding, PlacementRuntimeBinding):
+        raise TypeError(
+            "configure_workgraph_placement binding must be PlacementRuntimeBinding"
+        )
+    store = RUNTIME.physical_plan_store
+    if store is not None and not store.closeable:
+        raise RuntimeError(
+            "cannot replace WorkGraph placement binding while an epoch is active"
+        )
+    RUNTIME.placement_runtime_binding = binding
+    RUNTIME.physical_plan_store = None
+    RUNTIME.physical_prepared_step_id = -1
+    if RUNTIME.workgraph_snapshot is not None:
+        _stage_physical_workgraph_snapshot()
+
+
+def dispatch_workgraph_value(
+    *,
+    producer: "NodeKey",
+    consumer: "NodeKey",
+    value: "ValueKey",
+    source: "TensorLike",
+    destination: "TensorLike",
+) -> "CopyHandle":
+    """Submit one transfer from the placement snapshot acquired for this step."""
+
+    store = RUNTIME.physical_plan_store
+    step = RUNTIME.physical_prepared_step_id
+    if store is None or step < 0:
+        raise RuntimeError("WorkGraph placement dispatch requires a prepared step")
+    resources = store.active(step)
+    dispatcher = resources.placement_dispatcher
+    if dispatcher is None:
+        raise RuntimeError("prepared WorkGraph epoch has no placement dispatcher")
+    return dispatcher.submit(
+        producer=producer,
+        consumer=consumer,
+        value=value,
+        source=source,
+        destination=destination,
+    )
+
+
+def poll_workgraph_transfers() -> None:
+    """Poll asynchronous transfers owned by the currently prepared epoch."""
+
+    store = RUNTIME.physical_plan_store
+    step = RUNTIME.physical_prepared_step_id
+    if store is None or step < 0:
+        return
+    store.active(step).poll_transfers()
 
 
 def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
@@ -861,9 +941,12 @@ __all__ = [
     "clear_dispatch_consumers",
     "compute_decode_localization",
     "configure_runtime",
+    "configure_workgraph_placement",
+    "dispatch_workgraph_value",
     "infer_hidden_dtype",
     "make_llm",
     "pick_common_attn_metadata",
+    "poll_workgraph_transfers",
     "read_and_reset_distiller_timing_stats",
     "read_and_reset_path_hotspot_stats",
     "read_and_reset_placement_stats",

@@ -185,6 +185,55 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
             _proxy(plan, moves=(), residencies=(), leases=()),
         )
 
+    def test_python_and_rust_require_flow_leases_through_consumer_end(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        destination = plan.moves[-1].move.destination
+        shortened = tuple(
+            replace(
+                lease,
+                live_start=plan.moves[-1].start_at,
+                live_end=plan.moves[-1].end_at,
+            )
+            if lease.residency == destination
+            else lease
+            for lease in plan.leases
+        )
+        with self.assertRaises(ValueError):
+            replace(plan, leases=shortened)
+        _assert_rejected(self, _proxy(plan, leases=shortened))
+
+    def test_python_and_rust_reject_phantom_residency_and_lease(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        extra = phase3.Residency(
+            plan.value_flows[0].value,
+            phase3.Placement("cuda", 1),
+        )
+        extra_lease = phase3.PlacementLeaseDesc(extra, 0, 0)
+        with self.assertRaises(ValueError):
+            replace(
+                plan,
+                residencies=(*plan.residencies, extra),
+                leases=(*plan.leases, extra_lease),
+            )
+        _assert_rejected(
+            self,
+            _proxy(
+                plan,
+                residencies=(*plan.residencies, extra),
+                leases=(*plan.leases, extra_lease),
+            ),
+        )
+
     def test_python_and_rust_reject_runtime_text_in_node_keys(self) -> None:
         phase3 = _phase3(self)
         plan = _compile(

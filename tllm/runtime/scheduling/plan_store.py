@@ -15,6 +15,7 @@ from tllm.runtime.scheduling.physical import (
     GraphLike,
     StreamLike,
 )
+from tllm.runtime.scheduling.phase3_transfer import PlacementPlanDispatcher
 from tllm.workgraph.frontend import ArtifactKey, Device
 from tllm.workgraph.physical import (
     BufferBucketDesc,
@@ -23,6 +24,7 @@ from tllm.workgraph.physical import (
     PhysicalFlowPlan,
     StreamClass,
 )
+from tllm.workgraph.phase3 import PlacementPlan
 
 
 _T = TypeVar("_T")
@@ -95,6 +97,8 @@ class PlanResources:
     """One physical plan and the Python runtime resources owned by its epoch."""
 
     plan: PhysicalFlowPlan
+    placement_plan: PlacementPlan | None = None
+    placement_dispatcher: PlacementPlanDispatcher | None = None
     leases: tuple[BufferLease, ...] = ()
     streams: tuple[RuntimeStream, ...] = ()
     events: tuple[RuntimeEvent, ...] = ()
@@ -104,6 +108,30 @@ class PlanResources:
         raw_plan = cast(object, self.plan)
         if not isinstance(raw_plan, PhysicalFlowPlan):
             raise TypeError("PlanResources.plan must be PhysicalFlowPlan")
+        placement_plan = self.placement_plan
+        placement_dispatcher = self.placement_dispatcher
+        if (placement_plan is None) != (placement_dispatcher is None):
+            raise ValueError(
+                "PlanResources placement plan and dispatcher must be published together"
+            )
+        if placement_plan is not None:
+            if not isinstance(cast(object, placement_plan), PlacementPlan):
+                raise TypeError("PlanResources.placement_plan must be PlacementPlan")
+            if not isinstance(
+                cast(object, placement_dispatcher), PlacementPlanDispatcher
+            ):
+                raise TypeError(
+                    "PlanResources.placement_dispatcher must be PlacementPlanDispatcher"
+                )
+            assert placement_dispatcher is not None
+            if placement_plan.plan_epoch != raw_plan.plan_epoch:
+                raise ValueError(
+                    "PlanResources physical and placement epochs must match"
+                )
+            if placement_dispatcher.plan != placement_plan:
+                raise ValueError(
+                    "PlanResources dispatcher must bind its frozen placement plan"
+                )
         leases = _typed_tuple(self.leases, BufferLease, "PlanResources.leases")
         streams = _typed_tuple(self.streams, RuntimeStream, "PlanResources.streams")
         events = _typed_tuple(self.events, RuntimeEvent, "PlanResources.events")
@@ -180,6 +208,8 @@ class PlanResources:
                 "PlanResources binds one fence key to different event objects"
             )
         object.__setattr__(self, "plan", raw_plan)
+        object.__setattr__(self, "placement_plan", placement_plan)
+        object.__setattr__(self, "placement_dispatcher", placement_dispatcher)
         object.__setattr__(self, "leases", leases)
         object.__setattr__(self, "streams", streams)
         object.__setattr__(self, "events", events)
@@ -187,10 +217,21 @@ class PlanResources:
 
     @property
     def reusable(self) -> bool:
-        return all(lease.reusable for lease in self.leases) and all(
-            resource.retire_fence.recorded and resource.retire_fence.complete
-            for resource in self.streams
+        return (
+            all(lease.reusable for lease in self.leases)
+            and all(
+                resource.retire_fence.recorded and resource.retire_fence.complete
+                for resource in self.streams
+            )
+            and (
+                self.placement_dispatcher is None
+                or self.placement_dispatcher.in_flight == 0
+            )
         )
+
+    def poll_transfers(self) -> None:
+        if self.placement_dispatcher is not None:
+            self.placement_dispatcher.poll()
 
 
 class PlanSnapshotStore:
@@ -284,6 +325,7 @@ class PlanSnapshotStore:
             kept: list[PlanResources] = []
             collected = 0
             for resources in self._retired:
+                resources.poll_transfers()
                 resource_id = id(resources)
                 if resource_id in active_ids or (
                     resource_id in self._acquired and not resources.reusable

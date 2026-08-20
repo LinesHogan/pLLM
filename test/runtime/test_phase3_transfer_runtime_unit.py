@@ -9,8 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
+from tllm.runtime import residual_runtime
+from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import phase3
 from tllm.workgraph.ir import ExecutorKey, NodeKey
 from tllm.workgraph.physical import (
@@ -219,6 +223,100 @@ class Phase3CopyAdmissionTest(unittest.TestCase):
 
 
 class Phase3CopyExecutorTest(unittest.TestCase):
+    def test_cold_runtime_publishes_and_dispatches_typed_placement_snapshot(self) -> None:
+        transfer = _transfer_runtime(self)
+        source = NodeKey.producer("phase3.production.source")
+        target = NodeKey.consumer_flow("phase3.production.target", 0)
+        source_executor = ExecutorKey("logical", "phase3.production.source")
+        target_executor = ExecutorKey("logical", "phase3.production.target")
+        physical = PhysicalFlowPlan(
+            plan_epoch=23,
+            nodes=(
+                PhysicalNodePlan(source, source_executor, StreamClass.DEFAULT),
+                PhysicalNodePlan(
+                    target,
+                    target_executor,
+                    StreamClass.SIDE_TRAIN,
+                    fences=(
+                        FenceDependencyDesc(
+                            FenceKey("phase3", "production-ready"),
+                            source,
+                            target,
+                            FenceKind.READY,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        registry = phase3.ImplementationRegistry()
+        registry.register(
+            phase3.ImplementationSpec(
+                ExecutorKey("implementation", "phase3.production.source.cpu"),
+                phase3.Placement("cpu"),
+                _FakeImplementation(),
+                logical_executor=source_executor,
+            )
+        )
+        registry.register(
+            phase3.ImplementationSpec(
+                ExecutorKey("implementation", "phase3.production.target.cuda0"),
+                phase3.Placement("cuda", 0),
+                _FakeImplementation(),
+                logical_executor=target_executor,
+            )
+        )
+        value = phase3.ValueKey("production", 1)
+        adapter = _FakeTensorCopyAdapter()
+        binding = transfer.PlacementRuntimeBinding(
+            registry=registry,
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
+            value_flows=(phase3.ValueFlowDesc(value, source, target, 16),),
+            adapter=adapter,
+        )
+        state = ResidualRuntimeState()
+        state.workgraph_snapshot = SimpleNamespace(
+            backend=SimpleNamespace(graph_mode="eager")
+        )
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch(
+                "tllm.workgraph.physical.compile_physical_flow_plan",
+                return_value=physical,
+            ),
+            mock.patch.object(
+                residual_runtime,
+                "_activate_physical_capture_regions",
+            ),
+        ):
+            residual_runtime.configure_workgraph_placement(binding)
+            residual_runtime.prepare_workgraph_step(7)
+            source_tensor = _FakeTensor((4,), "float32", "cpu", [1.0] * 4)
+            destination_tensor = _FakeTensor(
+                (4,), "float32", "cuda:0", [0.0] * 4
+            )
+            handle = residual_runtime.dispatch_workgraph_value(
+                producer=source,
+                consumer=target,
+                value=value,
+                source=source_tensor,
+                destination=destination_tensor,
+            )
+
+        self.assertFalse(handle.complete)
+        self.assertEqual(adapter.calls, [("h2d", "cpu", "cuda:0", 0)])
+        self.assertIsNotNone(state.physical_plan_store)
+        resources = state.physical_plan_store.active(7)
+        self.assertEqual(resources.placement_plan.plan_epoch, physical.plan_epoch)
+        self.assertIsNotNone(resources.placement_dispatcher)
+        self.assertFalse(resources.reusable)
+        adapter.fences[0].complete = True
+        resources.poll_transfers()
+        self.assertTrue(handle.complete)
+        self.assertTrue(resources.reusable)
+
     def test_directional_engines_admit_h2d_and_d2h_concurrently(self) -> None:
         transfer = _transfer_runtime(self)
         adapter = _FakeTensorCopyAdapter()

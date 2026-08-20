@@ -3185,6 +3185,16 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
         }
         let _ = item.used_fallback;
     }
+    let mut expected_residencies = required_flow_residencies.clone();
+    for item in &plan.moves {
+        expected_residencies.insert(item.r#move.source.text());
+        expected_residencies.insert(item.r#move.destination.text());
+    }
+    if residencies != expected_residencies {
+        return Err(
+            "PlacementPlan residencies must exactly cover value flows and routes".to_string(),
+        );
+    }
     for ((producer, consumer, _value), positions) in &routes {
         let route: Vec<&ScheduledMoveV3Desc> = positions
             .iter()
@@ -3306,6 +3316,28 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     }
     if leases.len() != residencies.len() {
         return Err("every PlacementPlan residency requires one lease".to_string());
+    }
+    for flow in &plan.value_flows {
+        let producer_position = schedule_positions[&flow.producer.text()];
+        let consumer_position = schedule_positions[&flow.consumer.text()];
+        let producer_end = plan.schedule[producer_position].end_at;
+        let consumer_end = plan.schedule[consumer_position].end_at;
+        let producer_placement = &selections[&flow.producer.text()].placement;
+        let consumer_placement = &selections[&flow.consumer.text()].placement;
+        for placement in [producer_placement, consumer_placement] {
+            let memory = if placement.kind == "cpu" {
+                "host"
+            } else {
+                "device"
+            };
+            let residency = format!("{}|{}|{}", flow.value.text(), placement.text(), memory);
+            let lease = leases[&residency];
+            if lease.live_start > producer_end || lease.live_end < consumer_end {
+                return Err(
+                    "PlacementPlan value-flow lease must cover producer to consumer".to_string(),
+                );
+            }
+        }
     }
     for item in &plan.moves {
         for residency in [&item.r#move.source, &item.r#move.destination] {

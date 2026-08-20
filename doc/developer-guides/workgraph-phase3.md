@@ -96,6 +96,14 @@ capacities. This is the runtime connection between the frozen moves/leases and
 Python-owned tensors and fences; an undeclared route fails closed, while the
 same frozen plan can dispatch the route again in later runtime steps.
 
+Production cold paths install a typed `PlacementRuntimeBinding`. The concrete
+WorkGraph compiler publishes its `PlacementPlan` and dispatcher in the same
+`PlanResources` epoch as the `PhysicalFlowPlan`; `PlanSnapshotStore` makes both
+visible atomically at the next prepare safe point. `dispatch_workgraph_value()`
+can only submit through the dispatcher acquired for that prepared epoch. Old
+resources remain non-reusable while their dispatcher has an in-flight copy,
+and retirement polls its fences before collection.
+
 `TorchTensorCopyAdapter` supplies real pinned allocation and non-blocking
 Torch copies. CPU-only tests use the same protocol with fake tensors and
 fences, which verifies route and lifetime semantics without probing CUDA.
