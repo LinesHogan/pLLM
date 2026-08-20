@@ -308,6 +308,7 @@ def _canonical(value: Any) -> Any:
             "selections": _canonical(value.selections),
             "schedule": _canonical(value.schedule),
             "topology": _canonical(value.topology),
+            "value_flows": _canonical(value.value_flows),
             "residencies": _canonical(value.residencies),
             "moves": _canonical(value.moves),
             "leases": _canonical(value.leases),

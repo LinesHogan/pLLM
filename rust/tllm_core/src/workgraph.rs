@@ -885,6 +885,18 @@ struct CopyEngineCapacityV3Desc {
     capacity: i64,
 }
 
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ValueFlowV3Desc {
+    #[pyo3(attribute)]
+    value: ValueKeyV3Desc,
+    #[pyo3(attribute)]
+    producer: NodeKeyDesc,
+    #[pyo3(attribute)]
+    consumer: NodeKeyDesc,
+    #[pyo3(attribute)]
+    byte_count: i64,
+}
+
 #[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
 struct PlacementPlanV3Desc {
     #[pyo3(attribute)]
@@ -895,6 +907,8 @@ struct PlacementPlanV3Desc {
     schedule: Vec<PlacedNodeV3Desc>,
     #[pyo3(attribute)]
     topology: DeviceTopologyV3Desc,
+    #[pyo3(attribute)]
+    value_flows: Vec<ValueFlowV3Desc>,
     #[pyo3(attribute)]
     residencies: Vec<ResidencyV3Desc>,
     #[pyo3(attribute)]
@@ -2985,12 +2999,70 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
         }
     }
 
+    let mut flow_keys = HashSet::new();
+    let mut flow_producers: HashMap<ValueKeyV3Desc, NodeKeyDesc> = HashMap::new();
+    let mut expected_routes: HashSet<(NodeKeyDesc, NodeKeyDesc, ValueKeyV3Desc)> = HashSet::new();
+    let mut required_flow_residencies = HashSet::new();
+    for flow in &plan.value_flows {
+        validate_v3_value(&flow.value, "placement value flow")?;
+        validate_v3_node_key(&flow.producer, "placement value-flow producer")?;
+        validate_v3_node_key(&flow.consumer, "placement value-flow consumer")?;
+        if flow.byte_count < 1
+            || !flow_keys.insert((
+                flow.value.clone(),
+                flow.producer.clone(),
+                flow.consumer.clone(),
+            ))
+        {
+            return Err("PlacementPlan contains an invalid or duplicate value flow".to_string());
+        }
+        let producer_position = schedule_positions
+            .get(&flow.producer.text())
+            .ok_or_else(|| "value flow references an unknown producer".to_string())?;
+        let consumer_position = schedule_positions
+            .get(&flow.consumer.text())
+            .ok_or_else(|| "value flow references an unknown consumer".to_string())?;
+        if producer_position >= consumer_position {
+            return Err("PlacementPlan value flow must follow its schedule".to_string());
+        }
+        if let Some(previous) = flow_producers.insert(flow.value.clone(), flow.producer.clone()) {
+            if previous != flow.producer {
+                return Err("PlacementPlan ValueKey must have one producer".to_string());
+            }
+        }
+        let producer_selection = selections[&flow.producer.text()];
+        let consumer_selection = selections[&flow.consumer.text()];
+        for placement in [&producer_selection.placement, &consumer_selection.placement] {
+            let memory = if placement.kind == "cpu" {
+                "host"
+            } else {
+                "device"
+            };
+            required_flow_residencies.insert(format!(
+                "{}|{}|{}",
+                flow.value.text(),
+                placement.text(),
+                memory
+            ));
+        }
+        if producer_selection.placement != consumer_selection.placement {
+            expected_routes.insert((
+                flow.producer.clone(),
+                flow.consumer.clone(),
+                flow.value.clone(),
+            ));
+        }
+    }
+
     let mut residencies = HashSet::new();
     for residency in &plan.residencies {
         validate_v3_residency(residency, "placement residency", &topology_devices)?;
         if !residencies.insert(residency.text()) {
             return Err("PlacementPlan contains duplicate residencies".to_string());
         }
+    }
+    if !required_flow_residencies.is_subset(&residencies) {
+        return Err("PlacementPlan value flow is missing a required residency".to_string());
     }
 
     let mut engine_capacities = HashMap::new();
@@ -3169,6 +3241,11 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
         {
             return Err("staged transfer route must use one continuous pinned chain".to_string());
         }
+    }
+    if routes.keys().cloned().collect::<HashSet<_>>() != expected_routes {
+        return Err(
+            "PlacementPlan routes must exactly cover cross-placement value flows".to_string(),
+        );
     }
     for (position, item) in plan.moves.iter().enumerate() {
         let mut dependencies = HashSet::new();

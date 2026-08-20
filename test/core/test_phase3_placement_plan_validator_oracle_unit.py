@@ -171,6 +171,20 @@ def _assert_rejected(test_case: unittest.TestCase, plan: object) -> None:
 
 
 class Phase3PlacementPlanValidatorTest(unittest.TestCase):
+    def test_python_and_rust_require_routes_for_frozen_cross_placement_flows(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        with self.assertRaises(ValueError):
+            replace(plan, moves=(), residencies=(), leases=())
+        _assert_rejected(
+            self,
+            _proxy(plan, moves=(), residencies=(), leases=()),
+        )
+
     def test_python_and_rust_reject_runtime_text_in_node_keys(self) -> None:
         phase3 = _phase3(self)
         plan = _compile(

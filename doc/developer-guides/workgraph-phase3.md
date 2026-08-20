@@ -49,6 +49,8 @@ The resulting plan records:
 - the implementation and `Placement` selected for every physical node;
 - the frozen `DeviceTopology` inventory and directional peer-access edges used
   to validate every selected endpoint and route at runtime;
+- the frozen `ValueFlowDesc` demand projection, with one producer per
+  `ValueKey`, required residencies, and exact cross-placement route coverage;
 - node start/end times and ordered dependencies;
 - all materialized `Residency` values;
 - every `ScheduledMove`, directional copy engine, interval, and dependency;

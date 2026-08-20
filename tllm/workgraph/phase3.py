@@ -1218,6 +1218,7 @@ class PlacementPlan:
     selections: tuple[ImplementationSelectionDesc, ...]
     schedule: tuple[PlacedNodeDesc, ...]
     topology: DeviceTopology
+    value_flows: tuple[ValueFlowDesc, ...] = ()
     residencies: tuple[Residency, ...] = ()
     moves: tuple[ScheduledMove, ...] = ()
     leases: tuple[PlacementLeaseDesc, ...] = ()
@@ -1244,6 +1245,9 @@ class PlacementPlan:
         )
         raw_topology = _instance(
             self.topology, DeviceTopology, "PlacementPlan.topology"
+        )
+        value_flows = _tuple_of(
+            self.value_flows, ValueFlowDesc, "PlacementPlan.value_flows"
         )
         topology = DeviceTopology(
             peer_access=raw_topology.peer_access,
@@ -1336,6 +1340,15 @@ class PlacementPlan:
             CopyEngineCapacityDesc(item.engine, item.capacity)
             for item in copy_engines
         )
+        value_flows = tuple(
+            ValueFlowDesc(
+                canonical_value(item.value),
+                item.producer,
+                item.consumer,
+                item.byte_count,
+            )
+            for item in value_flows
+        )
         if self.schema_version != 1:
             raise ValueError("PlacementPlan.schema_version must be 1")
         selection_nodes = tuple(item.node_key for item in selections)
@@ -1362,6 +1375,21 @@ class PlacementPlan:
             raise ValueError("PlacementPlan selections and schedule must cover the same nodes")
         selection_by_node = {item.node_key: item for item in selections}
         positions = {node: index for index, node in enumerate(schedule_nodes)}
+        if len(
+            {(item.value, item.producer, item.consumer) for item in value_flows}
+        ) != len(value_flows):
+            raise ValueError("PlacementPlan value flows must be unique")
+        flow_producers: dict[ValueKey, NodeKey] = {}
+        for flow in value_flows:
+            if (
+                flow.producer not in positions
+                or flow.consumer not in positions
+                or positions[flow.producer] >= positions[flow.consumer]
+            ):
+                raise ValueError("PlacementPlan value flow must follow its schedule")
+            previous = flow_producers.setdefault(flow.value, flow.producer)
+            if previous != flow.producer:
+                raise ValueError("PlacementPlan ValueKey must have one producer")
         for item in schedule:
             selected = selection_by_node[item.node_key]
             if (
@@ -1393,6 +1421,15 @@ class PlacementPlan:
         ):
             raise ValueError("PlacementPlan residency is outside its topology")
         residency_set = set(residencies)
+        for flow in value_flows:
+            required = (
+                Residency(flow.value, selection_by_node[flow.producer].placement),
+                Residency(flow.value, selection_by_node[flow.consumer].placement),
+            )
+            if any(item not in residency_set for item in required):
+                raise ValueError(
+                    "PlacementPlan value flow is missing a required residency"
+                )
         if any(
             item.move.source not in residency_set
             or item.move.destination not in residency_set
@@ -1460,6 +1497,16 @@ class PlacementPlan:
                     raise ValueError(
                         "PlacementPlan staged route must use one continuous pinned chain"
                     )
+        expected_routes = {
+            (flow.producer, flow.consumer, flow.value)
+            for flow in value_flows
+            if selection_by_node[flow.producer].placement
+            != selection_by_node[flow.consumer].placement
+        }
+        if set(routes) != expected_routes:
+            raise ValueError(
+                "PlacementPlan routes must exactly cover cross-placement value flows"
+            )
         move_positions = {item.key: index for index, item in enumerate(moves)}
         if len(move_positions) != len(moves):
             raise ValueError("PlacementPlan moves must have unique keys")
@@ -1518,6 +1565,7 @@ class PlacementPlan:
         object.__setattr__(self, "selections", selections)
         object.__setattr__(self, "schedule", schedule)
         object.__setattr__(self, "topology", topology)
+        object.__setattr__(self, "value_flows", value_flows)
         object.__setattr__(self, "residencies", residencies)
         object.__setattr__(self, "moves", moves)
         object.__setattr__(self, "leases", leases)
@@ -1901,6 +1949,7 @@ def compile_placement_plan(
         ),
         schedule=tuple(scheduled_nodes),
         topology=topology,
+        value_flows=flows,
         residencies=ordered_residencies,
         moves=tuple(scheduled_moves),
         leases=leases,
