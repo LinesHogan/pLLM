@@ -60,8 +60,13 @@ if TYPE_CHECKING:
         PlacementRuntimeBinding,
         TensorLike,
     )
+    from tllm.runtime.scheduling.phase4_collective import (
+        CollectiveHandle,
+        DistributedRuntimeBinding,
+    )
     from tllm.workgraph.ir import NodeKey
     from tllm.workgraph.phase3 import ValueKey
+    from tllm.workgraph.phase4 import CollectiveKey, CollectiveWindow
 
 ensure_v1_env()
 
@@ -358,6 +363,14 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
     if step < 0:
         raise ValueError("physical WorkGraph step id must be non-negative")
     previous = RUNTIME.physical_prepared_step_id
+    distributed_previous = RUNTIME.distributed_prepared_step_id
+    distributed_store = RUNTIME.distributed_plan_store
+    if distributed_previous >= 0 and distributed_previous != step:
+        if distributed_store is not None:
+            distributed_store.poll()
+            distributed_store.finish_step(distributed_previous)
+            distributed_store.collect_retired()
+        RUNTIME.distributed_prepared_step_id = -1
     store = RUNTIME.physical_plan_store
     if previous >= 0 and previous != step:
         if store is not None:
@@ -374,6 +387,9 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
             resources.poll_transfers()
     for consumer in _active_dispatch_consumers():
         consumer.prepare_workgraph_step(step)
+    if distributed_store is not None:
+        distributed_store.prepare_step(step)
+        RUNTIME.distributed_prepared_step_id = step
     RUNTIME.physical_prepared_step_id = step
 
 
@@ -405,6 +421,94 @@ def configure_workgraph_placement(
     RUNTIME.physical_prepared_step_id = -1
     if RUNTIME.workgraph_snapshot is not None:
         _stage_physical_workgraph_snapshot()
+
+
+def configure_workgraph_distributed(
+    binding: "DistributedRuntimeBinding | None",
+) -> None:
+    """Install typed Phase 4 topology and rank-local runtime bindings."""
+
+    from tllm.runtime.scheduling.phase4_collective import DistributedRuntimeBinding
+
+    if binding is not None and not isinstance(binding, DistributedRuntimeBinding):
+        raise TypeError(
+            "configure_workgraph_distributed binding must be DistributedRuntimeBinding"
+        )
+    store = RUNTIME.distributed_plan_store
+    if store is not None and not store.closeable:
+        raise RuntimeError(
+            "cannot replace WorkGraph distributed binding while an epoch is active"
+        )
+    RUNTIME.distributed_runtime_binding = binding
+    RUNTIME.distributed_plan_store = None
+    RUNTIME.distributed_prepared_step_id = -1
+
+
+def publish_workgraph_distributed(*, plan_epoch: int) -> None:
+    """Compile and stage one distributed plan on the explicit cold path."""
+
+    from tllm.runtime.scheduling.phase4_collective import (
+        DistributedPlanResources,
+        DistributedPlanSnapshotStore,
+    )
+
+    binding = RUNTIME.distributed_runtime_binding
+    if binding is None:
+        raise RuntimeError("distributed WorkGraph publication requires a binding")
+    plan, executor = binding.compile(plan_epoch)
+    resources = DistributedPlanResources(plan, executor)
+    store = RUNTIME.distributed_plan_store
+    if store is None:
+        RUNTIME.distributed_plan_store = DistributedPlanSnapshotStore(resources)
+    else:
+        store.stage(resources)
+
+
+def launch_workgraph_collective(
+    step_id: int,
+    *,
+    collective: "CollectiveKey",
+    window: "CollectiveWindow",
+    payload: object,
+) -> "CollectiveHandle":
+    """Launch only the next collective approved by the prepared rank plan."""
+
+    step = int(step_id)
+    if step != RUNTIME.distributed_prepared_step_id:
+        raise RuntimeError("collective launch requires the currently prepared step")
+    store = RUNTIME.distributed_plan_store
+    if store is None:
+        raise RuntimeError("collective launch requires a distributed plan")
+    return store.executor(step).launch(
+        step,
+        collective=collective,
+        window=window,
+        payload=payload,
+    )
+
+
+def poll_workgraph_collectives() -> int:
+    """Poll Python-owned async collective fences without global synchronization."""
+
+    store = RUNTIME.distributed_plan_store
+    if store is None:
+        return 0
+    completed = store.poll()
+    store.collect_retired()
+    return completed
+
+
+def finish_workgraph_distributed_step(step_id: int) -> None:
+    """Close one distributed step after its full frozen local sequence launched."""
+
+    step = int(step_id)
+    store = RUNTIME.distributed_plan_store
+    if store is None:
+        return
+    store.finish_step(step)
+    store.collect_retired()
+    if RUNTIME.distributed_prepared_step_id == step:
+        RUNTIME.distributed_prepared_step_id = -1
 
 
 def dispatch_workgraph_value(
@@ -970,12 +1074,17 @@ __all__ = [
     "clear_dispatch_consumers",
     "compute_decode_localization",
     "configure_runtime",
+    "configure_workgraph_distributed",
     "configure_workgraph_placement",
     "dispatch_workgraph_value",
     "infer_hidden_dtype",
     "make_llm",
+    "finish_workgraph_distributed_step",
+    "launch_workgraph_collective",
     "pick_common_attn_metadata",
     "poll_workgraph_transfers",
+    "poll_workgraph_collectives",
+    "publish_workgraph_distributed",
     "read_and_reset_distiller_timing_stats",
     "read_and_reset_path_hotspot_stats",
     "read_and_reset_placement_stats",

@@ -38,6 +38,10 @@ if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
     from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
+    from tllm.runtime.scheduling.phase4_collective import (
+        DistributedPlanSnapshotStore,
+        DistributedRuntimeBinding,
+    )
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.compiler import Phase1aPlan
@@ -136,6 +140,9 @@ class ResidualRuntimeState:
     # become visible when the next step acquires its prepare-time snapshot.
     physical_plan_store: Optional["PlanSnapshotStore"] = None
     placement_runtime_binding: Optional["PlacementRuntimeBinding"] = None
+    distributed_runtime_binding: Optional["DistributedRuntimeBinding"] = None
+    distributed_plan_store: Optional["DistributedPlanSnapshotStore"] = None
+    distributed_prepared_step_id: int = -1
     physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
     physical_prepared_step_id: int = -1
     producer_executor: Optional["ProducerExecutor"] = None

@@ -21,6 +21,17 @@ from tllm.runtime.scheduling.phase3_transfer import (
     PlacementRuntimeBinding,
     TorchTensorCopyAdapter,
 )
+from tllm.runtime.scheduling.phase4_collective import (
+    CollectiveAdapter,
+    CollectiveFenceLike,
+    CollectiveHandle,
+    DistributedPlanExecutor,
+    DistributedPlanResources,
+    DistributedPlanSnapshotStore,
+    DistributedRuntimeBinding,
+    TorchCollectivePayload,
+    TorchDistributedCollectiveAdapter,
+)
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
     PhysicalExecutionError,
@@ -38,8 +49,15 @@ __all__ = [
     "BufferLease",
     "CopyExecutor",
     "CopyHandle",
+    "CollectiveAdapter",
+    "CollectiveFenceLike",
+    "CollectiveHandle",
     "DeferredWork",
     "DeferredWorkQueue",
+    "DistributedPlanExecutor",
+    "DistributedPlanResources",
+    "DistributedPlanSnapshotStore",
+    "DistributedRuntimeBinding",
     "Fence",
     "PlanResources",
     "PlanSnapshotStore",
@@ -61,6 +79,8 @@ __all__ = [
     "RuntimeGraph",
     "RuntimeStream",
     "TorchTensorCopyAdapter",
+    "TorchCollectivePayload",
+    "TorchDistributedCollectiveAdapter",
     "select_buffer_bucket",
     "runtime_stats_from_executor",
 ]

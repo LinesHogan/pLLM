@@ -66,6 +66,7 @@ Start here if you want to add ports, change runtime hooks, or contribute to the 
 5. [WorkGraph Phase 1 Typed Front End](developer-guides/workgraph-phase1.md)
 6. [WorkGraph Phase 2 Physical Planning](developer-guides/workgraph-phase2.md)
 7. [WorkGraph Phase 3 Local Placement](developer-guides/workgraph-phase3.md)
+8. [WorkGraph Phase 4 Distributed Planning](developer-guides/workgraph-phase4.md)
 
 ---
 

@@ -91,6 +91,22 @@ from tllm.workgraph.phase3 import (
     ValueFlowDesc,
     ValueKey,
 )
+from tllm.workgraph.phase4 import (
+    CollectiveDesc,
+    CollectiveKey,
+    CollectiveRequestDesc,
+    CommunicatorDesc,
+    CommunicatorKey,
+    DistributedFlowPlan,
+    DistributedTopology,
+    LocalCollectiveSchedule,
+    PlacementAffinity,
+    ShardSpec,
+    StateKey,
+    StateRequirementDesc,
+    StateResidenceDesc,
+    TopologyRankDesc,
+)
 
 
 def _unsupported(value: Any) -> TypeError:
@@ -313,6 +329,111 @@ def _canonical(value: Any) -> Any:
             "moves": _canonical(value.moves),
             "leases": _canonical(value.leases),
             "copy_engines": _canonical(value.copy_engines),
+            "schema_version": value.schema_version,
+        }
+    if isinstance(value, StateKey):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "version": value.version,
+        }
+    if isinstance(value, ShardSpec):
+        return {
+            "kind": _canonical(value.kind),
+            "partitions": value.partitions,
+            "axis": value.axis,
+        }
+    if isinstance(value, PlacementAffinity):
+        return {
+            "ranks": _canonical(value.ranks),
+            "node_ids": _canonical(value.node_ids),
+            "role": _canonical(value.role),
+        }
+    if isinstance(value, StateRequirementDesc):
+        return {
+            "key": _canonical(value.key),
+            "scope": _canonical(value.scope),
+            "shard": _canonical(value.shard),
+            "affinity": _canonical(value.affinity),
+        }
+    if isinstance(value, TopologyRankDesc):
+        return {
+            "rank": value.rank,
+            "node_id": value.node_id,
+            "local_rank": value.local_rank,
+            "placement": _canonical(value.placement),
+            "role": _canonical(value.role),
+            "tp_rank": value.tp_rank,
+            "pp_rank": value.pp_rank,
+            "dp_rank": value.dp_rank,
+        }
+    if isinstance(value, DistributedTopology):
+        return {
+            "ranks": _canonical(value.ranks),
+            "tp_size": value.tp_size,
+            "pp_size": value.pp_size,
+            "dp_size": value.dp_size,
+        }
+    if isinstance(value, StateResidenceDesc):
+        return {
+            "key": _canonical(value.key),
+            "rank": value.rank,
+            "placement": _canonical(value.placement),
+            "shard_index": value.shard_index,
+            "replica_index": value.replica_index,
+        }
+    if isinstance(value, CommunicatorKey):
+        return {"kind": _canonical(value.kind), "group_index": value.group_index}
+    if isinstance(value, CommunicatorDesc):
+        return {
+            "key": _canonical(value.key),
+            "ranks": _canonical(value.ranks),
+            "backend": _canonical(value.backend),
+        }
+    if isinstance(value, CollectiveKey):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "ordinal": value.ordinal,
+        }
+    if isinstance(value, CollectiveRequestDesc):
+        return {
+            "key": _canonical(value.key),
+            "kind": _canonical(value.kind),
+            "group": _canonical(value.group),
+            "group_index": value.group_index,
+            "backend": _canonical(value.backend),
+            "window": _canonical(value.window),
+            "value": _canonical(value.value),
+            "depends_on": _canonical(value.depends_on),
+            "root_rank": value.root_rank,
+        }
+    if isinstance(value, CollectiveDesc):
+        return {
+            "key": _canonical(value.key),
+            "kind": _canonical(value.kind),
+            "communicator": _canonical(value.communicator),
+            "sequence": value.sequence,
+            "window": _canonical(value.window),
+            "value": _canonical(value.value),
+            "depends_on": _canonical(value.depends_on),
+            "root_rank": value.root_rank,
+        }
+    if isinstance(value, LocalCollectiveSchedule):
+        return {
+            "rank": value.rank,
+            "collectives": _canonical(value.collectives),
+        }
+    if isinstance(value, DistributedFlowPlan):
+        return {
+            "plan_epoch": value.plan_epoch,
+            "topology": _canonical(value.topology),
+            "state_requirements": _canonical(value.state_requirements),
+            "state_residences": _canonical(value.state_residences),
+            "collective_requests": _canonical(value.collective_requests),
+            "communicators": _canonical(value.communicators),
+            "collectives": _canonical(value.collectives),
+            "local_schedules": _canonical(value.local_schedules),
             "schema_version": value.schema_version,
         }
     if isinstance(value, SourceSpan):

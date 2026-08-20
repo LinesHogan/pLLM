@@ -922,6 +922,206 @@ struct PlacementPlanV3Desc {
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct StateKeyV4Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    version: i64,
+}
+
+impl StateKeyV4Desc {
+    fn text(&self) -> String {
+        format!("{}:{}@{}", self.namespace, self.name, self.version)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ShardSpecV4Desc {
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    partitions: i64,
+    #[pyo3(attribute)]
+    axis: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct PlacementAffinityV4Desc {
+    #[pyo3(attribute)]
+    ranks: Vec<i64>,
+    #[pyo3(attribute)]
+    node_ids: Vec<String>,
+    #[pyo3(attribute)]
+    role: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct StateRequirementV4Desc {
+    #[pyo3(attribute)]
+    key: StateKeyV4Desc,
+    #[pyo3(attribute)]
+    scope: String,
+    #[pyo3(attribute)]
+    shard: ShardSpecV4Desc,
+    #[pyo3(attribute)]
+    affinity: PlacementAffinityV4Desc,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct TopologyRankV4Desc {
+    #[pyo3(attribute)]
+    rank: i64,
+    #[pyo3(attribute)]
+    node_id: String,
+    #[pyo3(attribute)]
+    local_rank: i64,
+    #[pyo3(attribute)]
+    placement: PlacementV3Desc,
+    #[pyo3(attribute)]
+    role: String,
+    #[pyo3(attribute)]
+    tp_rank: Option<i64>,
+    #[pyo3(attribute)]
+    pp_rank: Option<i64>,
+    #[pyo3(attribute)]
+    dp_rank: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct DistributedTopologyV4Desc {
+    #[pyo3(attribute)]
+    ranks: Vec<TopologyRankV4Desc>,
+    #[pyo3(attribute)]
+    tp_size: i64,
+    #[pyo3(attribute)]
+    pp_size: i64,
+    #[pyo3(attribute)]
+    dp_size: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct StateResidenceV4Desc {
+    #[pyo3(attribute)]
+    key: StateKeyV4Desc,
+    #[pyo3(attribute)]
+    rank: i64,
+    #[pyo3(attribute)]
+    placement: PlacementV3Desc,
+    #[pyo3(attribute)]
+    shard_index: i64,
+    #[pyo3(attribute)]
+    replica_index: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
+struct CommunicatorKeyV4Desc {
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    group_index: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CommunicatorV4Desc {
+    #[pyo3(attribute)]
+    key: CommunicatorKeyV4Desc,
+    #[pyo3(attribute)]
+    ranks: Vec<i64>,
+    #[pyo3(attribute)]
+    backend: String,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
+struct CollectiveKeyV4Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    ordinal: i64,
+}
+
+impl CollectiveKeyV4Desc {
+    fn text(&self) -> String {
+        format!("{}:{}/{}", self.namespace, self.name, self.ordinal)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CollectiveRequestV4Desc {
+    #[pyo3(attribute)]
+    key: CollectiveKeyV4Desc,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    group: String,
+    #[pyo3(attribute)]
+    group_index: i64,
+    #[pyo3(attribute)]
+    backend: String,
+    #[pyo3(attribute)]
+    window: String,
+    #[pyo3(attribute)]
+    value: Option<ValueKeyV3Desc>,
+    #[pyo3(attribute)]
+    depends_on: Vec<CollectiveKeyV4Desc>,
+    #[pyo3(attribute)]
+    root_rank: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CollectiveV4Desc {
+    #[pyo3(attribute)]
+    key: CollectiveKeyV4Desc,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    communicator: CommunicatorKeyV4Desc,
+    #[pyo3(attribute)]
+    sequence: i64,
+    #[pyo3(attribute)]
+    window: String,
+    #[pyo3(attribute)]
+    value: Option<ValueKeyV3Desc>,
+    #[pyo3(attribute)]
+    depends_on: Vec<CollectiveKeyV4Desc>,
+    #[pyo3(attribute)]
+    root_rank: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct LocalCollectiveScheduleV4Desc {
+    #[pyo3(attribute)]
+    rank: i64,
+    #[pyo3(attribute)]
+    collectives: Vec<CollectiveKeyV4Desc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct DistributedFlowPlanV4Desc {
+    #[pyo3(attribute)]
+    plan_epoch: i64,
+    #[pyo3(attribute)]
+    topology: DistributedTopologyV4Desc,
+    #[pyo3(attribute)]
+    state_requirements: Vec<StateRequirementV4Desc>,
+    #[pyo3(attribute)]
+    state_residences: Vec<StateResidenceV4Desc>,
+    #[pyo3(attribute)]
+    collective_requests: Vec<CollectiveRequestV4Desc>,
+    #[pyo3(attribute)]
+    communicators: Vec<CommunicatorV4Desc>,
+    #[pyo3(attribute)]
+    collectives: Vec<CollectiveV4Desc>,
+    #[pyo3(attribute)]
+    local_schedules: Vec<LocalCollectiveScheduleV4Desc>,
+    #[pyo3(attribute)]
+    schema_version: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
 struct UseDefV2Desc {
     #[pyo3(attribute)]
     producer: i64,
@@ -3364,6 +3564,442 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
         .collect())
 }
 
+fn validate_v4_segment(value: &str, layer: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.contains('/')
+        || value.contains('\\')
+        || contains_runtime_text(value)
+    {
+        return Err(format!("{} has an invalid stable segment", layer));
+    }
+    Ok(())
+}
+
+fn distributed_groups(
+    topology: &DistributedTopologyV4Desc,
+    kind: &str,
+) -> Result<Vec<Vec<i64>>, String> {
+    let model: Vec<&TopologyRankV4Desc> = topology
+        .ranks
+        .iter()
+        .filter(|rank| rank.role == "model")
+        .collect();
+    if kind == "global" {
+        return Ok(vec![model.iter().map(|rank| rank.rank).collect()]);
+    }
+    if kind == "helper" {
+        let helpers: Vec<i64> = topology
+            .ranks
+            .iter()
+            .filter(|rank| rank.role == "helper")
+            .map(|rank| rank.rank)
+            .collect();
+        return Ok(if helpers.is_empty() {
+            Vec::new()
+        } else {
+            vec![helpers]
+        });
+    }
+    let mut grouped: HashMap<(i64, i64), Vec<&TopologyRankV4Desc>> = HashMap::new();
+    for rank in model {
+        let (group_key, order) = match kind {
+            "tensor_parallel" => (
+                (
+                    rank.dp_rank.expect("model coordinates validated"),
+                    rank.pp_rank.expect("model coordinates validated"),
+                ),
+                rank.tp_rank.expect("model coordinates validated"),
+            ),
+            "pipeline_parallel" => (
+                (
+                    rank.dp_rank.expect("model coordinates validated"),
+                    rank.tp_rank.expect("model coordinates validated"),
+                ),
+                rank.pp_rank.expect("model coordinates validated"),
+            ),
+            "data_parallel" => (
+                (
+                    rank.pp_rank.expect("model coordinates validated"),
+                    rank.tp_rank.expect("model coordinates validated"),
+                ),
+                rank.dp_rank.expect("model coordinates validated"),
+            ),
+            _ => return Err("distributed plan has an unsupported group kind".to_string()),
+        };
+        let values = grouped.entry(group_key).or_default();
+        values.push(rank);
+        values.sort_by_key(|candidate| {
+            let candidate_order = match kind {
+                "tensor_parallel" => candidate.tp_rank,
+                "pipeline_parallel" => candidate.pp_rank,
+                _ => candidate.dp_rank,
+            }
+            .expect("model coordinates validated");
+            (candidate_order, candidate.rank)
+        });
+        let _ = order;
+    }
+    let mut keys: Vec<(i64, i64)> = grouped.keys().copied().collect();
+    keys.sort_unstable();
+    Ok(keys
+        .iter()
+        .map(|key| grouped[key].iter().map(|rank| rank.rank).collect())
+        .collect())
+}
+
+fn validate_distributed_topology_v4(topology: &DistributedTopologyV4Desc) -> Result<(), String> {
+    if topology.ranks.is_empty()
+        || topology.tp_size < 1
+        || topology.pp_size < 1
+        || topology.dp_size < 1
+    {
+        return Err("DistributedTopology has invalid dimensions".to_string());
+    }
+    let mut local_devices = HashSet::new();
+    let mut coordinates = HashSet::new();
+    let mut model_count = 0_i64;
+    for (position, rank) in topology.ranks.iter().enumerate() {
+        if rank.rank != position as i64 || rank.local_rank < 0 {
+            return Err("DistributedTopology ranks must be contiguous".to_string());
+        }
+        validate_v4_segment(&rank.node_id, "distributed node id")?;
+        validate_v3_placement(&rank.placement, "distributed rank placement")?;
+        if !local_devices.insert((rank.node_id.clone(), rank.local_rank)) {
+            return Err("DistributedTopology local rank identities must be unique".to_string());
+        }
+        match rank.role.as_str() {
+            "model" => {
+                model_count += 1;
+                let coordinate = match (rank.tp_rank, rank.pp_rank, rank.dp_rank) {
+                    (Some(tp), Some(pp), Some(dp))
+                        if tp >= 0
+                            && tp < topology.tp_size
+                            && pp >= 0
+                            && pp < topology.pp_size
+                            && dp >= 0
+                            && dp < topology.dp_size =>
+                    {
+                        (tp, pp, dp)
+                    }
+                    _ => return Err("model rank has invalid TP/PP/DP coordinates".to_string()),
+                };
+                if !coordinates.insert(coordinate) {
+                    return Err("DistributedTopology has duplicate model coordinates".to_string());
+                }
+            }
+            "helper" => {
+                if rank.tp_rank.is_some() || rank.pp_rank.is_some() || rank.dp_rank.is_some() {
+                    return Err("helper ranks must not declare model coordinates".to_string());
+                }
+            }
+            _ => return Err("DistributedTopology has an unsupported rank role".to_string()),
+        }
+    }
+    if model_count != topology.tp_size * topology.pp_size * topology.dp_size {
+        return Err("DistributedTopology model mesh is incomplete".to_string());
+    }
+    for dp in 0..topology.dp_size {
+        for pp in 0..topology.pp_size {
+            for tp in 0..topology.tp_size {
+                if !coordinates.contains(&(tp, pp, dp)) {
+                    return Err("DistributedTopology model mesh is incomplete".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<String>, String> {
+    if plan.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported DistributedFlowPlan schema version {}",
+            plan.schema_version
+        ));
+    }
+    if plan.plan_epoch < 1 {
+        return Err("DistributedFlowPlan plan_epoch must be >= 1".to_string());
+    }
+    validate_distributed_topology_v4(&plan.topology)?;
+
+    let mut requirement_keys = HashSet::new();
+    let mut expected_residences = Vec::new();
+    let mut last_state_key: Option<String> = None;
+    for requirement in &plan.state_requirements {
+        validate_v4_segment(&requirement.key.namespace, "distributed state namespace")?;
+        validate_v4_segment(&requirement.key.name, "distributed state name")?;
+        if requirement.key.version < 1 || !requirement_keys.insert(requirement.key.clone()) {
+            return Err(
+                "distributed state requirement has an invalid or duplicate key".to_string(),
+            );
+        }
+        let state_text = requirement.key.text();
+        if last_state_key.as_ref().is_some_and(|key| key > &state_text) {
+            return Err("distributed state requirements must use canonical order".to_string());
+        }
+        last_state_key = Some(state_text);
+        if !["replica", "shard", "global"].contains(&requirement.scope.as_str()) {
+            return Err("distributed state has an unsupported scope".to_string());
+        }
+        let expected_partitions = match requirement.shard.kind.as_str() {
+            "replicated" => 1,
+            "tensor" => plan.topology.tp_size,
+            "pipeline" => plan.topology.pp_size,
+            "data" => plan.topology.dp_size,
+            _ => return Err("distributed state has an unsupported shard kind".to_string()),
+        };
+        if requirement.shard.partitions != expected_partitions
+            || requirement.shard.partitions < 1
+            || matches!(requirement.shard.kind.as_str(), "tensor" | "data")
+                && requirement.shard.axis.is_none_or(|axis| axis < 0)
+            || requirement.shard.kind == "pipeline" && requirement.shard.axis.is_some()
+            || requirement.shard.kind == "replicated"
+                && (requirement.shard.axis.is_some() || requirement.scope == "shard")
+        {
+            return Err("distributed state shard does not match topology or scope".to_string());
+        }
+        let role = requirement.affinity.role.as_deref().unwrap_or("model");
+        if !["model", "helper"].contains(&role) {
+            return Err("distributed state affinity has an unsupported role".to_string());
+        }
+        let rank_filter: HashSet<i64> = requirement.affinity.ranks.iter().copied().collect();
+        let node_filter: HashSet<&str> = requirement
+            .affinity
+            .node_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if rank_filter.len() != requirement.affinity.ranks.len()
+            || node_filter.len() != requirement.affinity.node_ids.len()
+            || rank_filter
+                .iter()
+                .any(|rank| *rank < 0 || *rank >= plan.topology.ranks.len() as i64)
+        {
+            return Err("distributed state affinity is invalid".to_string());
+        }
+        let eligible: Vec<&TopologyRankV4Desc> = plan
+            .topology
+            .ranks
+            .iter()
+            .filter(|rank| {
+                (rank_filter.is_empty() || rank_filter.contains(&rank.rank))
+                    && (node_filter.is_empty() || node_filter.contains(rank.node_id.as_str()))
+                    && rank.role == role
+            })
+            .collect();
+        if eligible.is_empty() || eligible.len() % expected_partitions as usize != 0 {
+            return Err("distributed state affinity cannot form complete shards".to_string());
+        }
+        for (ordinal, rank) in eligible.iter().enumerate() {
+            expected_residences.push(StateResidenceV4Desc {
+                key: requirement.key.clone(),
+                rank: rank.rank,
+                placement: rank.placement.clone(),
+                shard_index: if requirement.shard.kind == "replicated" {
+                    0
+                } else {
+                    ordinal as i64 % expected_partitions
+                },
+                replica_index: if requirement.shard.kind == "replicated" {
+                    ordinal as i64
+                } else {
+                    ordinal as i64 / expected_partitions
+                },
+            });
+        }
+    }
+    if plan.state_residences != expected_residences {
+        return Err(
+            "DistributedFlowPlan state residences must exactly match requirements".to_string(),
+        );
+    }
+
+    let mut request_by_key = HashMap::new();
+    for request in &plan.collective_requests {
+        validate_v4_segment(&request.key.namespace, "collective namespace")?;
+        validate_v4_segment(&request.key.name, "collective name")?;
+        if request.key.ordinal < 0
+            || request_by_key
+                .insert(request.key.clone(), request)
+                .is_some()
+        {
+            return Err("distributed plan has duplicate or invalid collective keys".to_string());
+        }
+        if ![
+            "all_reduce",
+            "all_gather",
+            "reduce_scatter",
+            "broadcast",
+            "send_recv",
+            "barrier",
+        ]
+        .contains(&request.kind.as_str())
+            || !["nccl", "gloo"].contains(&request.backend.as_str())
+            || !["prepare", "before_compute", "after_compute", "step_end"]
+                .contains(&request.window.as_str())
+            || request.group_index < 0
+        {
+            return Err("distributed collective request has invalid typed facts".to_string());
+        }
+        if request
+            .value
+            .as_ref()
+            .is_some_and(|value| validate_v3_value(value, "collective value").is_err())
+        {
+            return Err("distributed collective request has an invalid value".to_string());
+        }
+        let groups = distributed_groups(&plan.topology, &request.group)?;
+        let ranks = groups
+            .get(request.group_index as usize)
+            .ok_or_else(|| "collective group index is outside topology".to_string())?;
+        if request.kind == "send_recv" && ranks.len() != 2 {
+            return Err("send_recv requires an exact two-rank communicator".to_string());
+        }
+        match (request.kind.as_str(), request.root_rank) {
+            ("broadcast" | "send_recv", Some(root)) if ranks.contains(&root) => {}
+            ("broadcast" | "send_recv", _) => {
+                return Err("broadcast/send_recv requires a root in its communicator".to_string())
+            }
+            (_, None) => {}
+            _ => return Err("only broadcast/send_recv may declare a root".to_string()),
+        }
+        if request.backend == "nccl"
+            && ranks
+                .iter()
+                .any(|rank| plan.topology.ranks[*rank as usize].placement.kind != "cuda")
+        {
+            return Err("NCCL communicators require CUDA ranks".to_string());
+        }
+        let dependency_set: HashSet<&CollectiveKeyV4Desc> = request.depends_on.iter().collect();
+        if dependency_set.len() != request.depends_on.len() || dependency_set.contains(&request.key)
+        {
+            return Err("collective dependencies must be unique and non-self".to_string());
+        }
+    }
+    if plan.collective_requests.iter().any(|request| {
+        request
+            .depends_on
+            .iter()
+            .any(|dependency| !request_by_key.contains_key(dependency))
+    }) {
+        return Err("collective request references an unknown dependency".to_string());
+    }
+    let mut remaining: HashMap<CollectiveKeyV4Desc, HashSet<CollectiveKeyV4Desc>> = plan
+        .collective_requests
+        .iter()
+        .map(|request| {
+            (
+                request.key.clone(),
+                request.depends_on.iter().cloned().collect(),
+            )
+        })
+        .collect();
+    let mut ordered_keys = Vec::new();
+    while !remaining.is_empty() {
+        let mut ready: Vec<CollectiveKeyV4Desc> = remaining
+            .iter()
+            .filter(|(_, dependencies)| dependencies.is_empty())
+            .map(|(key, _)| key.clone())
+            .collect();
+        ready.sort_by_key(CollectiveKeyV4Desc::text);
+        let key = ready
+            .first()
+            .ok_or_else(|| "collective dependencies contain a cycle".to_string())?
+            .clone();
+        remaining.remove(&key);
+        for dependencies in remaining.values_mut() {
+            dependencies.remove(&key);
+        }
+        ordered_keys.push(key);
+    }
+    let declared_keys: Vec<CollectiveKeyV4Desc> = plan
+        .collective_requests
+        .iter()
+        .map(|request| request.key.clone())
+        .collect();
+    if declared_keys != ordered_keys {
+        return Err("collective requests must use canonical global order".to_string());
+    }
+
+    let mut expected_communicators: HashMap<CommunicatorKeyV4Desc, CommunicatorV4Desc> =
+        HashMap::new();
+    for key in &ordered_keys {
+        let request = request_by_key[key];
+        let communicator_key = CommunicatorKeyV4Desc {
+            kind: request.group.clone(),
+            group_index: request.group_index,
+        };
+        let ranks = distributed_groups(&plan.topology, &request.group)?
+            [request.group_index as usize]
+            .clone();
+        let descriptor = CommunicatorV4Desc {
+            key: communicator_key.clone(),
+            ranks,
+            backend: request.backend.clone(),
+        };
+        if expected_communicators
+            .insert(communicator_key.clone(), descriptor.clone())
+            .is_some_and(|previous| previous != descriptor)
+        {
+            return Err("one communicator cannot use conflicting backends".to_string());
+        }
+    }
+    let actual_communicators: HashMap<CommunicatorKeyV4Desc, CommunicatorV4Desc> = plan
+        .communicators
+        .iter()
+        .map(|communicator| (communicator.key.clone(), communicator.clone()))
+        .collect();
+    if actual_communicators.len() != plan.communicators.len()
+        || actual_communicators != expected_communicators
+    {
+        return Err("DistributedFlowPlan communicators must exactly match demand".to_string());
+    }
+
+    if plan.collectives.len() != ordered_keys.len() {
+        return Err("DistributedFlowPlan collective count differs from demand".to_string());
+    }
+    for (sequence, (key, collective)) in ordered_keys.iter().zip(&plan.collectives).enumerate() {
+        let request = request_by_key[key];
+        let expected_communicator = CommunicatorKeyV4Desc {
+            kind: request.group.clone(),
+            group_index: request.group_index,
+        };
+        if collective.key != *key
+            || collective.kind != request.kind
+            || collective.communicator != expected_communicator
+            || collective.sequence != sequence as i64
+            || collective.window != request.window
+            || collective.value != request.value
+            || collective.depends_on != request.depends_on
+            || collective.root_rank != request.root_rank
+        {
+            return Err(
+                "DistributedFlowPlan collectives must use canonical global order".to_string(),
+            );
+        }
+    }
+
+    if plan.local_schedules.len() != plan.topology.ranks.len() {
+        return Err("DistributedFlowPlan requires one schedule per rank".to_string());
+    }
+    for (rank, schedule) in plan.local_schedules.iter().enumerate() {
+        let expected: Vec<CollectiveKeyV4Desc> = plan
+            .collectives
+            .iter()
+            .filter(|collective| {
+                actual_communicators[&collective.communicator]
+                    .ranks
+                    .contains(&(rank as i64))
+            })
+            .map(|collective| collective.key.clone())
+            .collect();
+        if schedule.rank != rank as i64 || schedule.collectives != expected {
+            return Err("rank-local schedule must project the global collective order".to_string());
+        }
+    }
+    Ok(ordered_keys.iter().map(CollectiveKeyV4Desc::text).collect())
+}
+
 /// Validate one frozen, metadata-only physical execution plan. Runtime Tensor,
 /// stream, event, graph, callback, and lease objects remain in Python.
 #[pyfunction]
@@ -3382,12 +4018,24 @@ fn validate_placement_plan(plan: PlacementPlanV3Desc) -> PyResult<WorkGraphValid
     Ok(WorkGraphValidation { topological_order })
 }
 
+/// Validate one frozen Phase 4 global topology/state/collective plan. Runtime
+/// process groups, tensors, streams, events, and async work handles stay in Python.
+#[pyfunction]
+#[pyo3(signature = (plan))]
+fn validate_distributed_flow_plan(
+    plan: DistributedFlowPlanV4Desc,
+) -> PyResult<WorkGraphValidation> {
+    let topological_order = validate_distributed_plan_v4(&plan).map_err(validation_error)?;
+    Ok(WorkGraphValidation { topological_order })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_workgraph, m)?)?;
     m.add_function(wrap_pyfunction!(validate_workgraph_ir, m)?)?;
     m.add_function(wrap_pyfunction!(validate_capture_hierarchy, m)?)?;
     m.add_function(wrap_pyfunction!(validate_physical_flow_plan, m)?)?;
     m.add_function(wrap_pyfunction!(validate_placement_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_distributed_flow_plan, m)?)?;
     m.add_class::<WorkGraphValidation>()?;
     Ok(())
 }
