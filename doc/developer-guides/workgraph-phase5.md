@@ -52,7 +52,9 @@ queues, observations, and mutable profile state never enter Rust or structural
 signatures. Preparing a plan seeds interference EWMAs from its frozen profile
 descriptors and applies their integer alpha and bounds to later observations.
 Static mode ignores EWMA state and always returns the deterministic
-compiler-approved schedule for the same resource context.
+compiler-approved schedule for the same resource context. Execute actions and
+authoritative fallbacks pass the same runtime buffer, deadline, and interference
+feasibility checks before they can reserve resources.
 
 `AdaptiveRuntimeBinding` is a cold-path input. It compiles against the exact
 Phase 3 plan and maps only explicitly migrated legacy flow ids to typed

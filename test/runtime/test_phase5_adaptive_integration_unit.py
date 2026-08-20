@@ -691,6 +691,33 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         self.assertEqual(trace, ["run"])
         self.assertEqual(store.collect_retired(), 1)
 
+    def test_legacy_enqueue_is_not_retroactively_adapted_by_new_epoch(self) -> None:
+        legacy_resources = PlanResources(
+            plan=PhysicalFlowPlan(plan_epoch=1, nodes=()),
+        )
+        adaptive_resources, adapter = _transfer_resources(epoch=2)
+        state = self._state(legacy_resources)
+        trace: list[str] = []
+        _enqueue_production_transfer(state, trace)
+
+        store = state.physical_plan_store
+        assert store is not None
+        store.finish_step(7)
+        store.stage(adaptive_resources)
+        store.prepare_step(8)
+        state.physical_prepared_step_id = 8
+
+        self.assertEqual(
+            drain_deferred_port_bundles(
+                runtime=state,
+                step_id=8,
+                hook="sampler.pre_draw",
+            ),
+            1,
+        )
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(trace, ["run"])
+
     def test_queued_transfer_retains_enqueue_epoch_before_first_drain(self) -> None:
         old_resources, old_adapter = _transfer_resources()
         new_resources, new_adapter = _transfer_resources(epoch=2)

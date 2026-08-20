@@ -768,30 +768,30 @@ class Phase5AdaptiveScheduler:
                 raise ValueError("candidate action is not approved for this work item")
             actions = (canonical,)
 
-        if any(candidate.unknown_bucket for candidate in actions):
-            if item.semantic_key != prepared.fallback_action.semantic_key:
-                raise RuntimeError(
-                    "unknown bucket has no semantic-preserving authoritative fallback"
-                )
-            if reserve:
-                self._reserve(prepared.fallback_action)
-            return self._emit(item.key, AdaptiveDecisionKind.FALLBACK, "unknown bucket", prepared.fallback_action)
-
         last_reason = "admission rejected"
         approved_shed: CandidateActionDesc | None = None
+        fallbacks: list[CandidateActionDesc] = []
         for candidate in actions:
             if candidate.kind == CandidateActionKind.SHED:
                 if approved_shed is None:
                     approved_shed = candidate
                 continue
-            if candidate.kind == CandidateActionKind.AUTHORITATIVE_FALLBACK:
-                if reserve:
-                    self._reserve(candidate)
-                return self._emit(item.key, AdaptiveDecisionKind.FALLBACK, "authoritative fallback", candidate)
             reason = self._admission_reason(candidate, item, facts)
             if reason is None:
                 if reserve:
                     self._reserve(candidate)
+                if candidate.kind == CandidateActionKind.AUTHORITATIVE_FALLBACK:
+                    fallback_reason = (
+                        "unknown bucket"
+                        if candidate.unknown_bucket
+                        else "authoritative fallback"
+                    )
+                    return self._emit(
+                        item.key,
+                        AdaptiveDecisionKind.FALLBACK,
+                        fallback_reason,
+                        candidate,
+                    )
                 return self._emit(
                     item.key,
                     AdaptiveDecisionKind.RUN,
@@ -799,22 +799,25 @@ class Phase5AdaptiveScheduler:
                     candidate,
                 )
             last_reason = reason
-            if must_complete:
-                fallback = self._fallback_for(candidate)
-                if fallback is not None:
-                    if reserve:
-                        self._reserve(fallback)
-                    return self._emit(item.key, AdaptiveDecisionKind.FALLBACK, "required fallback", fallback)
-                # Required work may not become DROP; the executor retains the
-                # compiler-approved action and enforces its declared route.
-                if reserve:
-                    self._reserve(candidate)
-                return self._emit(item.key, AdaptiveDecisionKind.RUN, "required work", candidate)
+            fallback = self._fallback_for(candidate)
+            if fallback is not None and fallback not in fallbacks:
+                fallbacks.append(fallback)
 
         if must_complete:
-            if reserve:
-                self._reserve(actions[0])
-            return self._emit(item.key, AdaptiveDecisionKind.RUN, "required work", actions[0])
+            for fallback in fallbacks:
+                reason = self._admission_reason(fallback, item, facts)
+                if reason is not None:
+                    last_reason = reason
+                    continue
+                if reserve:
+                    self._reserve(fallback)
+                return self._emit(
+                    item.key,
+                    AdaptiveDecisionKind.FALLBACK,
+                    "required fallback",
+                    fallback,
+                )
+
         if allow_defer:
             return self._emit(
                 item.key,
@@ -822,30 +825,31 @@ class Phase5AdaptiveScheduler:
                 last_reason,
                 actions[-1] if actions else None,
             )
-        if approved_shed is None:
-            fallback = next(
-                (
-                    self._fallback_for(candidate)
-                    for candidate in actions
-                    if candidate.kind == CandidateActionKind.EXECUTE
-                    and self._fallback_for(candidate) is not None
-                ),
-                prepared.fallback_action,
-            )
-            assert fallback is not None
-            if reserve:
-                self._reserve(fallback)
+        if not must_complete and approved_shed is not None:
             return self._emit(
                 item.key,
-                AdaptiveDecisionKind.FALLBACK,
-                "shedding not approved",
-                fallback,
+                AdaptiveDecisionKind.DROP,
+                last_reason,
+                approved_shed,
             )
-        return self._emit(
-            item.key,
-            AdaptiveDecisionKind.DROP,
-            last_reason,
-            approved_shed,
+
+        if not must_complete:
+            for fallback in fallbacks:
+                reason = self._admission_reason(fallback, item, facts)
+                if reason is not None:
+                    last_reason = reason
+                    continue
+                if reserve:
+                    self._reserve(fallback)
+                return self._emit(
+                    item.key,
+                    AdaptiveDecisionKind.FALLBACK,
+                    "shedding not approved",
+                    fallback,
+                )
+
+        raise RuntimeError(
+            f"no feasible compiler-approved action for {item.key}: {last_reason}"
         )
 
     def decide_all(

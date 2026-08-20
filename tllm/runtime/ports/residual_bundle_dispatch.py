@@ -552,12 +552,7 @@ def _enqueue_flow_target(
     plan_resources: PlanResources | None = None
     store = runtime.physical_plan_store
     if store is not None and runtime.physical_prepared_step_id == int(step_id):
-        prepared = store.active(int(step_id))
-        if (
-            prepared.adaptive_scheduler is not None
-            and prepared.adaptive_flow_binding(target.flow_id) is not None
-        ):
-            plan_resources = prepared
+        plan_resources = store.active(int(step_id))
     work = DeferredWork(
         flow_id=target.flow_id,
         bundle=bundle,

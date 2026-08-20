@@ -422,10 +422,11 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             mode=plan.mode,
         )
         scheduler = Phase5AdaptiveScheduler(with_fallback_credit)
+        scheduler.observe(execute.key, execute.deadline + 1)
 
         first = scheduler.decide(
             required,
-            context=AdmissionContext(available_buffers=0),
+            context=AdmissionContext(available_buffers=1),
             reserve=True,
         )
         second = scheduler.decide(
@@ -437,6 +438,83 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
         self.assertEqual(first.action, AdaptiveDecisionKind.FALLBACK)
         self.assertEqual(scheduler.state.reserved_buffers, 1)
         self.assertEqual(second.action, AdaptiveDecisionKind.DROP)
+
+    def test_authoritative_fallback_must_pass_runtime_feasibility(self) -> None:
+        plan, optional, required, budget_key = self._plan(with_budget=True)
+        assert budget_key is not None
+        fallback = next(action for action in plan.actions if action.unknown_bucket)
+        execute = next(
+            action
+            for action in plan.actions
+            if action.kind == CandidateActionKind.EXECUTE
+        )
+        constrained_fallback = CandidateActionDesc(
+            key=fallback.key,
+            kind=fallback.kind,
+            semantic_key=fallback.semantic_key,
+            deadline=2,
+            duration=2,
+            buffer_credits=1,
+            budget_uses=(BudgetUseDesc(budget_key, 1),),
+            unknown_bucket=True,
+        )
+        constrained = Phase5ControlPlan(
+            plan_epoch=plan.plan_epoch,
+            placement_plan=plan.placement_plan,
+            scheduled_moves=plan.scheduled_moves,
+            move_sets=plan.move_sets,
+            workload_buckets=plan.workload_buckets,
+            shape_buckets=plan.shape_buckets,
+            budgets=plan.budgets,
+            actions=(constrained_fallback, execute),
+            unknown_bucket_fallback=constrained_fallback.key,
+            buffer_capacity=plan.buffer_capacity,
+            mode=plan.mode,
+        )
+        unknown = WorkItemDesc(
+            key=WorkItemKey("item", "unknown-constrained"),
+            shape=(99,),
+            workload_bucket=optional.workload_bucket,
+        )
+
+        for item, context, selected_action in (
+            (required, AdmissionContext(available_buffers=0), None),
+            (required, AdmissionContext(available_buffers=0), execute.key),
+            (
+                unknown,
+                AdmissionContext(available_buffers=1, deadline_slack=1),
+                None,
+            ),
+            (
+                unknown,
+                AdmissionContext(
+                    available_buffers=1,
+                    interference={budget_key: 1},
+                ),
+                None,
+            ),
+        ):
+            with self.subTest(
+                item=item.key,
+                context=context,
+                selected_action=selected_action,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "no feasible compiler-approved action",
+                ):
+                    Phase5AdaptiveScheduler(constrained).decide(
+                        item,
+                        context=context,
+                        action=selected_action,
+                    )
+
+        deferred = Phase5AdaptiveScheduler(constrained).decide(
+            unknown,
+            context=AdmissionContext(available_buffers=0),
+            allow_defer=True,
+        )
+        self.assertEqual(deferred.action, AdaptiveDecisionKind.KEEP)
 
 
 if __name__ == "__main__":
