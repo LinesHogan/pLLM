@@ -3710,6 +3710,37 @@ fn validate_distributed_topology_v4(topology: &DistributedTopologyV4Desc) -> Res
     Ok(())
 }
 
+fn v4_shard_coordinates(
+    rank: &TopologyRankV4Desc,
+    kind: &str,
+) -> Result<(i64, (i64, i64)), String> {
+    let tp = rank
+        .tp_rank
+        .ok_or_else(|| "sharded state requires model-rank affinity".to_string())?;
+    let pp = rank
+        .pp_rank
+        .ok_or_else(|| "sharded state requires model-rank affinity".to_string())?;
+    let dp = rank
+        .dp_rank
+        .ok_or_else(|| "sharded state requires model-rank affinity".to_string())?;
+    match kind {
+        "tensor" => Ok((tp, (pp, dp))),
+        "pipeline" => Ok((pp, (tp, dp))),
+        "data" => Ok((dp, (tp, pp))),
+        _ => Err("state does not declare a sharded topology axis".to_string()),
+    }
+}
+
+fn v4_collective_window_order(window: &str) -> Result<i64, String> {
+    match window {
+        "prepare" => Ok(0),
+        "before_compute" => Ok(1),
+        "after_compute" => Ok(2),
+        "step_end" => Ok(3),
+        _ => Err("distributed collective has an unsupported lifecycle window".to_string()),
+    }
+}
+
 fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<String>, String> {
     if plan.schema_version != SCHEMA_VERSION {
         return Err(format!(
@@ -3787,24 +3818,55 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
                     && rank.role == role
             })
             .collect();
-        if eligible.is_empty() || eligible.len() % expected_partitions as usize != 0 {
-            return Err("distributed state affinity cannot form complete shards".to_string());
+        if eligible.is_empty() {
+            return Err("distributed state affinity has no eligible rank".to_string());
         }
-        for (ordinal, rank) in eligible.iter().enumerate() {
+        if requirement.shard.kind == "replicated" {
+            for (ordinal, rank) in eligible.iter().enumerate() {
+                expected_residences.push(StateResidenceV4Desc {
+                    key: requirement.key.clone(),
+                    rank: rank.rank,
+                    placement: rank.placement.clone(),
+                    shard_index: 0,
+                    replica_index: ordinal as i64,
+                });
+            }
+            continue;
+        }
+        let mut shard_groups: HashMap<(i64, i64), HashSet<i64>> = HashMap::new();
+        for rank in &eligible {
+            let (shard_index, replica_key) = v4_shard_coordinates(rank, &requirement.shard.kind)?;
+            shard_groups
+                .entry(replica_key)
+                .or_default()
+                .insert(shard_index);
+        }
+        let expected_shards: HashSet<i64> = (0..expected_partitions).collect();
+        if shard_groups
+            .values()
+            .any(|shards| shards != &expected_shards)
+            || eligible.len() != shard_groups.len() * expected_partitions as usize
+        {
+            return Err(
+                "distributed state affinity must exactly cover each topology shard axis"
+                    .to_string(),
+            );
+        }
+        let mut replica_keys: Vec<(i64, i64)> = shard_groups.keys().copied().collect();
+        replica_keys.sort_unstable();
+        let replica_indices: HashMap<(i64, i64), i64> = replica_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (*key, index as i64))
+            .collect();
+        for rank in eligible {
+            let (shard_index, replica_key) = v4_shard_coordinates(rank, &requirement.shard.kind)?;
             expected_residences.push(StateResidenceV4Desc {
                 key: requirement.key.clone(),
                 rank: rank.rank,
                 placement: rank.placement.clone(),
-                shard_index: if requirement.shard.kind == "replicated" {
-                    0
-                } else {
-                    ordinal as i64 % expected_partitions
-                },
-                replica_index: if requirement.shard.kind == "replicated" {
-                    ordinal as i64
-                } else {
-                    ordinal as i64 / expected_partitions
-                },
+                shard_index,
+                replica_index: replica_indices[&replica_key],
             });
         }
     }
@@ -3884,6 +3946,17 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
     }) {
         return Err("collective request references an unknown dependency".to_string());
     }
+    for request in &plan.collective_requests {
+        let request_window = v4_collective_window_order(&request.window)?;
+        if request.depends_on.iter().any(|dependency| {
+            v4_collective_window_order(&request_by_key[dependency].window)
+                .is_ok_and(|dependency_window| dependency_window > request_window)
+        }) {
+            return Err(
+                "collective dependency cannot move backwards in lifecycle time".to_string(),
+            );
+        }
+    }
     let mut remaining: HashMap<CollectiveKeyV4Desc, HashSet<CollectiveKeyV4Desc>> = plan
         .collective_requests
         .iter()
@@ -3901,7 +3974,13 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
             .filter(|(_, dependencies)| dependencies.is_empty())
             .map(|(key, _)| key.clone())
             .collect();
-        ready.sort_by_key(CollectiveKeyV4Desc::text);
+        ready.sort_by_key(|key| {
+            (
+                v4_collective_window_order(&request_by_key[key].window)
+                    .expect("request window validated"),
+                key.text(),
+            )
+        });
         let key = ready
             .first()
             .ok_or_else(|| "collective dependencies contain a cycle".to_string())?

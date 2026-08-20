@@ -23,7 +23,10 @@ group, including cross-node groups and a separate helper group.
 State requirements fail closed when their scope, shard count, or affinity is
 incompatible with the topology. Request-scoped state is not legal in a global
 plan. The compiler derives the complete ordered state-residence set; callers
-cannot inject or omit residences.
+cannot inject or omit residences. Tensor, pipeline, and data shards use the
+rank's actual TP, PP, or DP coordinate as their shard index. Every selected
+replica group must exactly cover that axis, so cardinality-compatible but
+coordinate-incomplete affinities are rejected.
 
 Collective dependencies are topologically sorted with stable key tie-breaking.
 The resulting request tuple, communicator set, collective sequence, and every
@@ -58,13 +61,23 @@ The production residual runtime exposes typed cold-path configuration and
 publication plus prepared-step launch, polling, and finish APIs. When no
 distributed binding is installed, the existing physical and legacy prepare
 behavior is unchanged. WorkGraph does not discover communicators or collective
-order from runtime objects.
+order from runtime objects. Launch does not accept a caller-provided window;
+the executor window advances monotonically from the actual prepare,
+execute-model pre/post, and sample completion runtime events. Passing an
+unlaunched window or moving backwards fails before the next launch.
+
+Before a multi-rank epoch is staged, every rank exchanges a frozen
+`DistributedPlanAgreementDesc`. Core validation requires exact rank coverage
+and matching plan epoch, full structural signature, topology signature,
+communicator projection, and local collective sequence. The Torch agreement
+adapter performs this exchange over the initialized default process group.
+Agreement divergence fails before any collective executor becomes active.
 
 ## Support boundary
 
 Phase 4 covers deterministic TP, PP, DP, helper, global, and cross-node
-descriptor planning and rank-local asynchronous launch. Process-group creation,
-membership agreement, and distributed failure recovery remain deployment
-responsibilities; a mismatch or runtime failure is fail-fast. Online profile
-updates, interference-aware admission, bounded plan densification, and work
-shedding are Phase 5 work.
+descriptor planning, rank agreement, and rank-local asynchronous launch.
+Process-group creation and distributed recovery after a detected failure remain
+deployment responsibilities; membership or plan mismatch and runtime failure
+are fail-fast. Online profile updates, interference-aware admission, bounded
+plan densification, and work shedding are Phase 5 work.

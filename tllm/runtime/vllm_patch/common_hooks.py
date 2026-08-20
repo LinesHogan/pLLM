@@ -22,6 +22,27 @@ class RuntimeWithDispatchPlan(Protocol):
     event_step_id: int
 
 
+def _advance_distributed_collective_window(
+    runtime: RuntimeWithDispatchPlan,
+    event_name: str,
+) -> None:
+    from tllm.runtime.state import ResidualRuntimeState
+    from tllm.workgraph.phase4 import CollectiveWindow
+
+    if not isinstance(runtime, ResidualRuntimeState):
+        return
+    window = {
+        "prepare_inputs.pre": CollectiveWindow.PREPARE,
+        "execute_model.pre": CollectiveWindow.BEFORE_COMPUTE,
+        "execute_model.post": CollectiveWindow.AFTER_COMPUTE,
+        "sample_tokens.post": CollectiveWindow.STEP_END,
+    }.get(event_name)
+    store = runtime.distributed_plan_store
+    step = runtime.distributed_prepared_step_id
+    if window is not None and store is not None and step >= 0:
+        store.executor(step).advance_window(step, window)
+
+
 def _runner_uses_cudagraph(runner: RunnerLike) -> bool:
     use_cuda_graph = getattr(runner, "use_cuda_graph", None)
     if use_cuda_graph is True:
@@ -99,6 +120,7 @@ def dispatch_runtime_event(
     predecessor_events: Sequence[object] = (),
 ) -> int:
     """Dispatch one runtime event to registered consumers, if any."""
+    _advance_distributed_collective_window(runtime, event_name)
     effective_predecessors = tuple(predecessor_events)
     if (
         runtime.deferred_work_queue

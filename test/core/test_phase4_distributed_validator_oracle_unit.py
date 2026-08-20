@@ -282,9 +282,29 @@ def _oracle_validate(plan: object) -> None:
                 raise ValueError("unknown collective dependency")
 
     remaining = {key: {_key(item) for item in _seq(getattr(request, "depends_on"), "dependencies")} for key, request in request_by_key.items()}
+    window_order = {
+        CollectiveWindow.PREPARE.value: 0,
+        CollectiveWindow.BEFORE_COMPUTE.value: 1,
+        CollectiveWindow.AFTER_COMPUTE.value: 2,
+        CollectiveWindow.STEP_END.value: 3,
+    }
+    for request in requests:
+        request_window = window_order[_text(getattr(request, "window"))]
+        if any(
+            window_order[_text(getattr(request_by_key[_key(dependency)], "window"))]
+            > request_window
+            for dependency in _seq(getattr(request, "depends_on"), "dependencies")
+        ):
+            raise ValueError("collective dependency moves backwards in time")
     ordered: list[object] = []
     while remaining:
-        ready = sorted((key for key, deps in remaining.items() if not deps))
+        ready = sorted(
+            (key for key, deps in remaining.items() if not deps),
+            key=lambda key: (
+                window_order[_text(getattr(request_by_key[key], "window"))],
+                _key_value(getattr(request_by_key[key], "key")),
+            ),
+        )
         if not ready:
             raise ValueError("collective dependency cycle")
         chosen = ready[0]

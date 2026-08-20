@@ -23,6 +23,14 @@ from tllm.workgraph.phase4 import (
 )
 
 
+_WINDOW_ORDER = {
+    CollectiveWindow.PREPARE: 0,
+    CollectiveWindow.BEFORE_COMPUTE: 1,
+    CollectiveWindow.AFTER_COMPUTE: 2,
+    CollectiveWindow.STEP_END: 3,
+}
+
+
 @runtime_checkable
 class CollectiveFenceLike(Protocol):
     def query(self) -> bool: ...
@@ -44,6 +52,78 @@ class _TorchWorkLike(Protocol):
     def is_completed(self) -> bool: ...
 
 
+@dataclass(frozen=True, slots=True)
+class DistributedPlanAgreementDesc:
+    """Rank projection exchanged before a distributed epoch may publish."""
+
+    plan_epoch: int
+    plan_signature: str
+    topology_signature: str
+    topology_size: int
+    rank: int
+    communicators: tuple[CommunicatorKey, ...]
+    collectives: tuple[CollectiveKey, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "plan_epoch",
+            _integer(self.plan_epoch, "DistributedPlanAgreementDesc.plan_epoch", minimum=1),
+        )
+        for label, value in (
+            ("plan_signature", self.plan_signature),
+            ("topology_signature", self.topology_signature),
+        ):
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"DistributedPlanAgreementDesc.{label} must be SHA-256")
+        topology_size = _integer(
+            self.topology_size,
+            "DistributedPlanAgreementDesc.topology_size",
+            minimum=1,
+        )
+        rank = _integer(self.rank, "DistributedPlanAgreementDesc.rank")
+        if rank >= topology_size:
+            raise ValueError("distributed agreement rank is outside topology")
+        if not isinstance(self.communicators, tuple) or any(
+            not isinstance(item, CommunicatorKey) for item in self.communicators
+        ):
+            raise TypeError("distributed agreement communicators must be typed tuple")
+        if not isinstance(self.collectives, tuple) or any(
+            not isinstance(item, CollectiveKey) for item in self.collectives
+        ):
+            raise TypeError("distributed agreement collectives must be typed tuple")
+
+
+@runtime_checkable
+class DistributedAgreementAdapter(Protocol):
+    def exchange(
+        self,
+        local: DistributedPlanAgreementDesc,
+    ) -> tuple[DistributedPlanAgreementDesc, ...]: ...
+
+
+class TorchDistributedAgreementAdapter:
+    """Exchange frozen rank projections through the default process group."""
+
+    def exchange(
+        self,
+        local: DistributedPlanAgreementDesc,
+    ) -> tuple[DistributedPlanAgreementDesc, ...]:
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("torch.distributed must be initialized for plan agreement")
+        if int(dist.get_world_size()) != local.topology_size:
+            raise RuntimeError("distributed plan topology differs from process-group size")
+        if int(dist.get_rank()) != local.rank:
+            raise RuntimeError("distributed plan rank differs from process-group rank")
+        gathered: list[object] = [None] * local.topology_size
+        dist.all_gather_object(gathered, local)
+        if any(not isinstance(item, DistributedPlanAgreementDesc) for item in gathered):
+            raise TypeError("distributed agreement exchanged an untyped rank projection")
+        return cast(tuple[DistributedPlanAgreementDesc, ...], tuple(gathered))
+
+
 _T = TypeVar("_T")
 
 
@@ -59,6 +139,53 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     if value < minimum:
         raise ValueError(f"{label} must be >= {minimum}")
     return value
+
+
+def distributed_plan_agreement_desc(
+    plan: DistributedFlowPlan,
+    rank: int,
+) -> DistributedPlanAgreementDesc:
+    """Build the frozen projection that one rank contributes to agreement."""
+
+    from tllm.workgraph.signature import structural_signature
+
+    plan = _instance(plan, DistributedFlowPlan, "distributed agreement plan")
+    rank = _integer(rank, "distributed agreement rank")
+    if rank >= len(plan.topology.ranks):
+        raise ValueError("distributed agreement rank is outside topology")
+    communicators = tuple(
+        item.key for item in plan.communicators if rank in item.ranks
+    )
+    return DistributedPlanAgreementDesc(
+        plan_epoch=plan.plan_epoch,
+        plan_signature=structural_signature(plan),
+        topology_signature=structural_signature(plan.topology),
+        topology_size=len(plan.topology.ranks),
+        rank=rank,
+        communicators=communicators,
+        collectives=plan.local_schedules[rank].collectives,
+    )
+
+
+def validate_distributed_plan_agreement(
+    plan: DistributedFlowPlan,
+    agreements: tuple[DistributedPlanAgreementDesc, ...],
+) -> None:
+    """Require exact epoch, topology, communicator, and order agreement."""
+
+    plan = _instance(plan, DistributedFlowPlan, "distributed agreement plan")
+    if not isinstance(agreements, tuple) or any(
+        not isinstance(item, DistributedPlanAgreementDesc) for item in agreements
+    ):
+        raise TypeError("distributed agreement must contain typed rank projections")
+    by_rank = {item.rank: item for item in agreements}
+    if len(by_rank) != len(agreements) or set(by_rank) != set(range(len(plan.topology.ranks))):
+        raise RuntimeError("distributed agreement must exactly cover topology ranks")
+    for rank in range(len(plan.topology.ranks)):
+        if by_rank[rank] != distributed_plan_agreement_desc(plan, rank):
+            raise RuntimeError(
+                "distributed ranks disagree on plan epoch, topology, communicator, or order"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +324,7 @@ class CollectiveHandle:
 class _PreparedDistributedStep:
     cursor: int = 0
     finished: bool = False
+    window: CollectiveWindow = CollectiveWindow.PREPARE
 
 
 class DistributedPlanExecutor:
@@ -288,7 +416,6 @@ class DistributedPlanExecutor:
         step_id: int,
         *,
         collective: CollectiveKey,
-        window: CollectiveWindow,
         payload: object,
     ) -> CollectiveHandle:
         step = _integer(step_id, "DistributedPlanExecutor.step_id")
@@ -296,11 +423,6 @@ class DistributedPlanExecutor:
             collective,
             CollectiveKey,
             "DistributedPlanExecutor.collective",
-        )
-        window = _instance(
-            window,
-            CollectiveWindow,
-            "DistributedPlanExecutor.window",
         )
         with self._lock:
             self._raise_failed()
@@ -313,7 +435,7 @@ class DistributedPlanExecutor:
             if collective != expected:
                 raise RuntimeError("collective launch differs from frozen local order")
             descriptor = self._collectives[collective]
-            if window != descriptor.window:
+            if prepared.window != descriptor.window:
                 raise RuntimeError("collective launch is outside its frozen window")
             communicator_desc = self._communicator_descs[descriptor.communicator]
             communicator = self._communicators[descriptor.communicator]
@@ -333,6 +455,41 @@ class DistributedPlanExecutor:
             prepared.cursor += 1
             self._in_flight.append(handle)
             return handle
+
+    def advance_window(
+        self,
+        step_id: int,
+        window: CollectiveWindow,
+    ) -> None:
+        """Advance from an actual runtime lifecycle event, never from launch."""
+
+        step = _integer(step_id, "DistributedPlanExecutor.step_id")
+        window = _instance(
+            window,
+            CollectiveWindow,
+            "DistributedPlanExecutor.window",
+        )
+        with self._lock:
+            self._raise_failed()
+            prepared = self._steps.get(step)
+            if prepared is None or prepared.finished:
+                raise RuntimeError("distributed step must be prepared before window advance")
+            current = _WINDOW_ORDER[prepared.window]
+            target = _WINDOW_ORDER[window]
+            if target < current:
+                raise RuntimeError("distributed lifecycle window cannot move backwards")
+            if target == current:
+                return
+            missed = tuple(
+                key
+                for key in self._schedule[prepared.cursor :]
+                if _WINDOW_ORDER[self._collectives[key].window] < target
+            )
+            if missed:
+                raise RuntimeError(
+                    "distributed lifecycle cannot pass an unlaunched collective window"
+                )
+            prepared.window = window
 
     def poll(self) -> int:
         with self._lock:
@@ -384,6 +541,7 @@ class DistributedRuntimeBinding:
     rank: int
     communicators: tuple[tuple[CommunicatorKey, object], ...]
     adapter: CollectiveAdapter
+    agreement: DistributedAgreementAdapter | None = None
     state_requirements: tuple[StateRequirementDesc, ...] = ()
     collective_requests: tuple[CollectiveRequestDesc, ...] = ()
 
@@ -400,6 +558,13 @@ class DistributedRuntimeBinding:
             raise TypeError("DistributedRuntimeBinding.communicators must be tuple")
         if not isinstance(cast(object, self.adapter), CollectiveAdapter):
             raise TypeError("DistributedRuntimeBinding.adapter must implement CollectiveAdapter")
+        agreement = self.agreement
+        if len(self.topology.ranks) > 1 and agreement is None:
+            raise ValueError("multi-rank distributed binding requires plan agreement")
+        if agreement is not None and not isinstance(
+            cast(object, agreement), DistributedAgreementAdapter
+        ):
+            raise TypeError("agreement must implement DistributedAgreementAdapter")
         if not isinstance(self.state_requirements, tuple) or any(
             not isinstance(item, StateRequirementDesc)
             for item in self.state_requirements
@@ -421,6 +586,13 @@ class DistributedRuntimeBinding:
             state_requirements=self.state_requirements,
             collective_requests=self.collective_requests,
         )
+        local_agreement = distributed_plan_agreement_desc(plan, self.rank)
+        agreements = (
+            (local_agreement,)
+            if self.agreement is None
+            else self.agreement.exchange(local_agreement)
+        )
+        validate_distributed_plan_agreement(plan, agreements)
         return plan, DistributedPlanExecutor(
             plan=plan,
             rank=self.rank,
@@ -587,10 +759,15 @@ __all__ = [
     "CollectiveAdapter",
     "CollectiveFenceLike",
     "CollectiveHandle",
+    "DistributedAgreementAdapter",
+    "DistributedPlanAgreementDesc",
     "DistributedPlanResources",
     "DistributedPlanExecutor",
     "DistributedPlanSnapshotStore",
     "DistributedRuntimeBinding",
+    "TorchDistributedAgreementAdapter",
     "TorchCollectivePayload",
     "TorchDistributedCollectiveAdapter",
+    "distributed_plan_agreement_desc",
+    "validate_distributed_plan_agreement",
 ]

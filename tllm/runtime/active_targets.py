@@ -14,6 +14,7 @@ class ActivityPlan(Protocol):
 class RuntimeWithTargets(Protocol):
     dispatch_plan: ActivityPlan | None
     consumer: object | None
+    distributed_runtime_binding: object | None
 
 
 def _has_active_sampler_provider(runtime: RuntimeWithTargets) -> bool:
@@ -30,4 +31,8 @@ def _has_active_sampler_provider(runtime: RuntimeWithTargets) -> bool:
 
 def runtime_has_active_targets(runtime: RuntimeWithTargets) -> bool:
     plan = runtime.dispatch_plan
-    return bool((plan is not None and plan.has_active_targets()) or _has_active_sampler_provider(runtime))
+    return bool(
+        (plan is not None and plan.has_active_targets())
+        or _has_active_sampler_provider(runtime)
+        or runtime.distributed_runtime_binding is not None
+    )

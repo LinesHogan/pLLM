@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     )
     from tllm.workgraph.ir import NodeKey
     from tllm.workgraph.phase3 import ValueKey
-    from tllm.workgraph.phase4 import CollectiveKey, CollectiveWindow
+    from tllm.workgraph.phase4 import CollectiveKey
 
 ensure_v1_env()
 
@@ -468,7 +468,6 @@ def launch_workgraph_collective(
     step_id: int,
     *,
     collective: "CollectiveKey",
-    window: "CollectiveWindow",
     payload: object,
 ) -> "CollectiveHandle":
     """Launch only the next collective approved by the prepared rank plan."""
@@ -482,7 +481,6 @@ def launch_workgraph_collective(
     return store.executor(step).launch(
         step,
         collective=collective,
-        window=window,
         payload=payload,
     )
 

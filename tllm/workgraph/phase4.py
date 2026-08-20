@@ -51,6 +51,14 @@ class ShardKind(StrEnum):
     DATA = "data"
 
 
+_COLLECTIVE_WINDOW_ORDER = {
+    CollectiveWindow.PREPARE: 0,
+    CollectiveWindow.BEFORE_COMPUTE: 1,
+    CollectiveWindow.AFTER_COMPUTE: 2,
+    CollectiveWindow.STEP_END: 3,
+}
+
+
 class DistributedCompilationError(RuntimeError):
     """Raised when Rust rejects a Python-compiled distributed plan."""
 
@@ -627,16 +635,43 @@ def _compile_state_residences(
                     )
                 )
             continue
-        if len(eligible) % shard.partitions != 0:
-            raise ValueError("eligible state ranks must form complete shard replicas")
-        for ordinal, rank in enumerate(eligible):
+        def shard_coordinates(rank: TopologyRankDesc) -> tuple[int, tuple[int, int]]:
+            assert rank.tp_rank is not None
+            assert rank.pp_rank is not None
+            assert rank.dp_rank is not None
+            if shard.kind == ShardKind.TENSOR:
+                return rank.tp_rank, (rank.pp_rank, rank.dp_rank)
+            if shard.kind == ShardKind.PIPELINE:
+                return rank.pp_rank, (rank.tp_rank, rank.dp_rank)
+            return rank.dp_rank, (rank.tp_rank, rank.pp_rank)
+
+        groups: dict[tuple[int, int], list[TopologyRankDesc]] = {}
+        for rank in eligible:
+            if rank.role != RankRole.MODEL:
+                raise ValueError("sharded state requires model-rank affinity")
+            _shard_index, replica_key = shard_coordinates(rank)
+            groups.setdefault(replica_key, []).append(rank)
+        expected_indices = set(range(shard.partitions))
+        for ranks in groups.values():
+            actual_indices = {
+                shard_coordinates(rank)[0] for rank in ranks
+            }
+            if len(ranks) != shard.partitions or actual_indices != expected_indices:
+                raise ValueError(
+                    "eligible state ranks must exactly cover each topology shard axis"
+                )
+        replica_indices = {
+            key: index for index, key in enumerate(sorted(groups))
+        }
+        for rank in eligible:
+            shard_index, replica_key = shard_coordinates(rank)
             result.append(
                 StateResidenceDesc(
                     requirement.key,
                     rank.rank,
                     rank.placement,
-                    ordinal % shard.partitions,
-                    ordinal // shard.partitions,
+                    shard_index,
+                    replica_indices[replica_key],
                 )
             )
     return tuple(result)
@@ -654,12 +689,22 @@ def _collective_order(
         for dependency in item.depends_on
     ):
         raise ValueError("collective request references an unknown dependency")
+    if any(
+        _COLLECTIVE_WINDOW_ORDER[by_key[dependency].window]
+        > _COLLECTIVE_WINDOW_ORDER[item.window]
+        for item in requests
+        for dependency in item.depends_on
+    ):
+        raise ValueError("collective dependency cannot move backwards in lifecycle time")
     remaining = {key: set(item.depends_on) for key, item in by_key.items()}
     ordered: list[CollectiveRequestDesc] = []
     while remaining:
         ready = sorted(
             (key for key, dependencies in remaining.items() if not dependencies),
-            key=lambda key: key.value,
+            key=lambda key: (
+                _COLLECTIVE_WINDOW_ORDER[by_key[key].window],
+                key.value,
+            ),
         )
         if not ready:
             raise ValueError("collective dependencies contain a cycle")

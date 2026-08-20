@@ -7,7 +7,7 @@ in this module so the tests never initialize CUDA or ``torch.distributed``.
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 import importlib
 from types import SimpleNamespace
 import unittest
@@ -69,6 +69,13 @@ class _FakeCollectiveAdapter:
             raise self.error
         self.calls.append((collective, communicator_desc, payload, communicator))
         return self.fence
+
+
+class _FakeAgreement:
+    def exchange(self, local):
+        return tuple(
+            replace(local, rank=rank) for rank in range(local.topology_size)
+        )
 
 
 def _topology(*, helper: bool = False) -> DistributedTopology:
@@ -180,11 +187,11 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
         executor, _ = _executor(self, adapter=adapter)
         payload = _FakeTensor("hidden")
         executor.prepare_step(7)
+        executor.advance_window(7, CollectiveWindow.AFTER_COMPUTE)
         key = executor.plan.local_schedules[0].collectives[0]
         handle = executor.launch(
             7,
             collective=key,
-            window=executor.plan.collectives[0].window,
             payload=payload,
         )
 
@@ -216,26 +223,23 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
             executor.launch(
                 11,
                 collective=second.key,
-                window=second.window,
                 payload=_FakeTensor("out-of-order"),
             )
         executor.launch(
             11,
             collective=first.key,
-            window=first.window,
             payload=_FakeTensor("first"),
         )
         with self.assertRaises(RuntimeError):
             executor.launch(
                 11,
                 collective=second.key,
-                window=first.window,
                 payload=_FakeTensor("wrong-window"),
             )
+        executor.advance_window(11, CollectiveWindow.AFTER_COMPUTE)
         executor.launch(
             11,
             collective=second.key,
-            window=second.window,
             payload=_FakeTensor("second"),
         )
         executor.finish_step(11)
@@ -244,7 +248,6 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
             executor.launch(
                 11,
                 collective=first.key,
-                window=first.window,
                 payload=_FakeTensor("closed"),
             )
 
@@ -267,7 +270,6 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
             executor.launch(
                 1,
                 collective=plan.local_schedules[0].collectives[0],
-                window=plan.collectives[0].window,
                 payload=_FakeTensor("unprepared"),
             )
 
@@ -276,16 +278,18 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
         adapter = _FakeCollectiveAdapter(error=RuntimeError("launch failed"))
         executor, _ = _executor(self, plan=plan, adapter=adapter)
         executor.prepare_step(3)
+        executor.advance_window(3, CollectiveWindow.AFTER_COMPUTE)
         key = plan.local_schedules[0].collectives[0]
         with self.assertRaises(RuntimeError):
-            executor.launch(3, collective=key, window=plan.collectives[0].window, payload=_FakeTensor("x"))
+            executor.launch(3, collective=key, payload=_FakeTensor("x"))
         with self.assertRaises(RuntimeError):
             executor.prepare_step(4)
 
         failing_fence = _FakeFence(error=RuntimeError("fence failed"))
         executor, _ = _executor(self, plan=plan, adapter=_FakeCollectiveAdapter(fence=failing_fence))
         executor.prepare_step(5)
-        executor.launch(5, collective=key, window=plan.collectives[0].window, payload=_FakeTensor("x"))
+        executor.advance_window(5, CollectiveWindow.AFTER_COMPUTE)
+        executor.launch(5, collective=key, payload=_FakeTensor("x"))
         with self.assertRaises(RuntimeError):
             executor.poll()
         with self.assertRaises(RuntimeError):
@@ -296,8 +300,9 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
         fence = _FakeFence(complete=False)
         executor, _ = _executor(self, adapter=_FakeCollectiveAdapter(fence=fence))
         executor.prepare_step(9)
+        executor.advance_window(9, CollectiveWindow.AFTER_COMPUTE)
         key = executor.plan.local_schedules[0].collectives[0]
-        executor.launch(9, collective=key, window=executor.plan.collectives[0].window, payload=_FakeTensor("x"))
+        executor.launch(9, collective=key, payload=_FakeTensor("x"))
         self.assertFalse(executor.reusable)
         self.assertEqual(executor.in_flight, 1)
         fence.complete = True
@@ -341,17 +346,15 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
         # Every rank can execute only its projection, while the projection is
         # still derived from one global order.  The adapter trace is the
         # runtime witness, including the helper-only rank.
-        descriptor_by_key = {item.key: item for item in plan.collectives}
         for rank, schedule in enumerate(plan.local_schedules):
             adapter = _FakeCollectiveAdapter(fence=_FakeFence(complete=True))
             executor, _ = _executor(self, rank=rank, plan=plan, adapter=adapter)
             executor.prepare_step(20 + rank)
+            executor.advance_window(20 + rank, CollectiveWindow.AFTER_COMPUTE)
             for key in schedule.collectives:
-                descriptor = descriptor_by_key[key]
                 executor.launch(
                     20 + rank,
                     collective=key,
-                    window=descriptor.window,
                     payload=_FakeTensor(f"rank-{rank}-{key.name}"),
                 )
             executor.finish_step(20 + rank)
@@ -373,6 +376,7 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
                 SimpleNamespace(owner_rank=0),
             ),),
             adapter=adapter,
+            agreement=_FakeAgreement(),
             collective_requests=(_request("first", ParallelGroupKind.GLOBAL),),
         )
         state = ResidualRuntimeState()
@@ -382,10 +386,12 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
             residual_runtime.prepare_workgraph_step(31)
             plan = state.distributed_plan_store.active(31)
             key = plan.local_schedules[0].collectives[0]
+            state.distributed_plan_store.executor(31).advance_window(
+                31, CollectiveWindow.AFTER_COMPUTE
+            )
             residual_runtime.launch_workgraph_collective(
                 31,
                 collective=key,
-                window=plan.collectives[0].window,
                 payload=_FakeTensor("prepared"),
             )
             self.assertEqual(adapter.calls[0][0].key, key)

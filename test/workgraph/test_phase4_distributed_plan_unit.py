@@ -83,7 +83,7 @@ def _request_set(phase4: object) -> tuple[object, ...]:
             group=phase4.ParallelGroupKind.TENSOR,
             group_index=0,
             backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.AFTER_COMPUTE,
+            window=phase4.CollectiveWindow.BEFORE_COMPUTE,
             value=ValueKey("hidden", 1),
         ),
         phase4.CollectiveRequestDesc(
@@ -92,7 +92,7 @@ def _request_set(phase4: object) -> tuple[object, ...]:
             group=phase4.ParallelGroupKind.PIPELINE,
             group_index=0,
             backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+            window=phase4.CollectiveWindow.AFTER_COMPUTE,
             depends_on=(tp,),
         ),
         phase4.CollectiveRequestDesc(
@@ -213,8 +213,8 @@ class Phase4StatePlanningTest(unittest.TestCase):
             for item in plan.state_requirements
         }
         self.assertEqual(by_name["tensor"], (0, 1, 0, 1))
-        self.assertEqual(by_name["pipeline"], (0, 1, 0, 1))
-        self.assertEqual(by_name["data"], (0, 1, 0, 1, 0, 1, 0, 1))
+        self.assertEqual(by_name["pipeline"], (0, 0, 1, 1))
+        self.assertEqual(by_name["data"], (0, 0, 0, 0, 1, 1, 1, 1))
         self.assertEqual(by_name["replica"], (0, 0, 0, 0))
         self.assertEqual(ranks_by_name["tensor"], (0, 1, 2, 3))
         self.assertEqual(ranks_by_name["pipeline"], (4, 5, 6, 7))
@@ -252,6 +252,43 @@ class Phase4StatePlanningTest(unittest.TestCase):
 
 
 class Phase4CollectivePlanningTest(unittest.TestCase):
+    def test_collective_global_order_is_window_monotonic_and_rejects_time_travel(self) -> None:
+        phase4 = _phase4(self)
+        topology = _topology(phase4)
+        after = phase4.CollectiveRequestDesc(
+            key=phase4.CollectiveKey("window", "after"),
+            kind=phase4.CollectiveKind.ALL_REDUCE,
+            group=phase4.ParallelGroupKind.GLOBAL,
+            backend=phase4.CollectiveBackend.NCCL,
+            window=phase4.CollectiveWindow.AFTER_COMPUTE,
+        )
+        before = phase4.CollectiveRequestDesc(
+            key=phase4.CollectiveKey("window", "before"),
+            kind=phase4.CollectiveKind.ALL_REDUCE,
+            group=phase4.ParallelGroupKind.GLOBAL,
+            backend=phase4.CollectiveBackend.NCCL,
+            window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+        )
+        plan = phase4.compile_distributed_flow_plan(
+            plan_epoch=1,
+            topology=topology,
+            collective_requests=(after, before),
+        )
+        self.assertEqual(
+            tuple(item.key for item in plan.collectives),
+            (before.key, after.key),
+        )
+
+        with self.assertRaises(ValueError):
+            phase4.compile_distributed_flow_plan(
+                plan_epoch=2,
+                topology=topology,
+                collective_requests=(
+                    after,
+                    dataclasses.replace(before, depends_on=(after.key,)),
+                ),
+            )
+
     def test_collective_plan_builds_typed_communicators_and_rank_local_schedules(self) -> None:
         phase4 = _phase4(self)
         topology = _topology(phase4, helper=True)
