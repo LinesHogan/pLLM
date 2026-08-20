@@ -139,6 +139,10 @@ class PlacementStats:
     enqueued_count: int = 0
     bubble_drain_count: int = 0
     deadline_flush_count: int = 0
+    adaptive_run_count: int = 0
+    adaptive_defer_count: int = 0
+    adaptive_fallback_count: int = 0
+    adaptive_shed_count: int = 0
     max_queue_depth: int = 0
     bubble_drain_ms: float = 0.0
     fusion_eligible_count: int = 0
@@ -160,6 +164,10 @@ class PlacementStats:
             enqueued_count=int(payload.get("enqueued_count", 0)),
             bubble_drain_count=int(payload.get("bubble_drain_count", 0)),
             deadline_flush_count=int(payload.get("deadline_flush_count", 0)),
+            adaptive_run_count=int(payload.get("adaptive_run_count", 0)),
+            adaptive_defer_count=int(payload.get("adaptive_defer_count", 0)),
+            adaptive_fallback_count=int(payload.get("adaptive_fallback_count", 0)),
+            adaptive_shed_count=int(payload.get("adaptive_shed_count", 0)),
             max_queue_depth=int(payload.get("max_queue_depth", 0)),
             bubble_drain_ms=float(payload.get("bubble_drain_ms", 0.0)),
             fusion_eligible_count=int(payload.get("fusion_eligible_count", 0)),
@@ -187,6 +195,10 @@ class PlacementStats:
             out.enqueued_count += entry.enqueued_count
             out.bubble_drain_count += entry.bubble_drain_count
             out.deadline_flush_count += entry.deadline_flush_count
+            out.adaptive_run_count += entry.adaptive_run_count
+            out.adaptive_defer_count += entry.adaptive_defer_count
+            out.adaptive_fallback_count += entry.adaptive_fallback_count
+            out.adaptive_shed_count += entry.adaptive_shed_count
             out.max_queue_depth = max(out.max_queue_depth, entry.max_queue_depth)
             out.bubble_drain_ms += entry.bubble_drain_ms
             out.fusion_eligible_count += entry.fusion_eligible_count
@@ -295,6 +307,10 @@ def read_and_reset_placement_stats(state: StatsState) -> PlacementStats:
         enqueued_count=int(current.enqueued_count),
         bubble_drain_count=int(current.bubble_drain_count),
         deadline_flush_count=int(current.deadline_flush_count),
+        adaptive_run_count=int(current.adaptive_run_count),
+        adaptive_defer_count=int(current.adaptive_defer_count),
+        adaptive_fallback_count=int(current.adaptive_fallback_count),
+        adaptive_shed_count=int(current.adaptive_shed_count),
         max_queue_depth=int(current.max_queue_depth),
         bubble_drain_ms=float(current.bubble_drain_ms),
         fusion_eligible_count=int(current.fusion_eligible_count),

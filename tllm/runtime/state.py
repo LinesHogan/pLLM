@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         DistributedPlanSnapshotStore,
         DistributedRuntimeBinding,
     )
+    from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.compiler import Phase1aPlan
@@ -140,6 +141,7 @@ class ResidualRuntimeState:
     # become visible when the next step acquires its prepare-time snapshot.
     physical_plan_store: Optional["PlanSnapshotStore"] = None
     placement_runtime_binding: Optional["PlacementRuntimeBinding"] = None
+    adaptive_runtime_binding: Optional["AdaptiveRuntimeBinding"] = None
     distributed_runtime_binding: Optional["DistributedRuntimeBinding"] = None
     distributed_plan_store: Optional["DistributedPlanSnapshotStore"] = None
     distributed_prepared_step_id: int = -1

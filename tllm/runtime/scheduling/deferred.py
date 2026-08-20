@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from enum import StrEnum
 
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
@@ -40,6 +41,25 @@ class DeferredWork:
     deadline_step: int
     deadline_hook: str
     verify: WorkVerifier | None = None
+
+
+class DeferredWorkDecision(StrEnum):
+    RUN = "run"
+    KEEP = "keep"
+    DROP = "drop"
+
+
+WorkSelector = Callable[[DeferredWork, bool], DeferredWorkDecision]
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredDrainResult:
+    ran: int = 0
+    dropped: int = 0
+
+    @property
+    def resolved(self) -> int:
+        return self.ran + self.dropped
 
 
 class DeferredWorkQueue:
@@ -188,6 +208,76 @@ class DeferredWorkQueue:
             self._items.popleft()
             drained += 1
         return drained
+
+    def drain_selected(
+        self,
+        *,
+        step_id: int,
+        hook: str,
+        select: WorkSelector,
+        expired_only: bool = False,
+        predecessor_events: tuple[object, ...] = (),
+    ) -> DeferredDrainResult:
+        """Resolve ready work through one typed run/keep/drop decision."""
+
+        if not callable(select):
+            raise TypeError("deferred work selector must be callable")
+        if not self._items:
+            return DeferredDrainResult()
+        now = _timeline_key(step_id, hook)
+        last_expired = len(self._items) - 1
+        if expired_only:
+            last_expired = -1
+            for index, work in enumerate(self._items):
+                if _timeline_key(work.deadline_step, work.deadline_hook) <= now:
+                    last_expired = index
+            if last_expired < 0:
+                return DeferredDrainResult()
+
+        ran = 0
+        dropped = 0
+        pending = self._items
+        self._items = deque()
+        index = 0
+        while pending:
+            work = pending.popleft()
+            in_scope = (
+                index <= last_expired
+                and _timeline_key(work.eligible_step, work.eligible_hook) <= now
+            )
+            index += 1
+            if not in_scope:
+                self._items.append(work)
+                continue
+            must_resolve = expired_only or (
+                _timeline_key(work.deadline_step, work.deadline_hook) <= now
+            )
+            try:
+                decision = select(work, must_resolve)
+            except Exception:
+                self._items.append(work)
+                self._items.extend(pending)
+                raise
+            if not isinstance(decision, DeferredWorkDecision):
+                self._items.append(work)
+                self._items.extend(pending)
+                raise TypeError(
+                    "deferred work selector must return DeferredWorkDecision"
+                )
+            if decision == DeferredWorkDecision.KEEP:
+                self._items.append(work)
+                continue
+            if decision == DeferredWorkDecision.DROP:
+                dropped += 1
+                continue
+            try:
+                self._run(work, predecessor_events)
+            except Exception:
+                self._items.append(work)
+                self._items.extend(pending)
+                raise
+            ran += 1
+        return DeferredDrainResult(ran=ran, dropped=dropped)
 
     def clear(self) -> None:
         self._items.clear()

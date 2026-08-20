@@ -19,6 +19,10 @@ from tllm.runtime.scheduling.phase3_transfer import (
     PlacementImplementationBinding,
     PlacementPlanDispatcher,
 )
+from tllm.runtime.scheduling.phase5_adaptive import (
+    AdaptiveFlowBinding,
+    Phase5AdaptiveScheduler,
+)
 from tllm.workgraph.frontend import ArtifactKey, Device
 from tllm.workgraph.physical import (
     BufferBucketDesc,
@@ -28,6 +32,7 @@ from tllm.workgraph.physical import (
     StreamClass,
 )
 from tllm.workgraph.phase3 import PlacementPlan
+from tllm.workgraph.phase5 import Phase5ControlPlan
 
 
 _T = TypeVar("_T")
@@ -103,6 +108,9 @@ class PlanResources:
     placement_plan: PlacementPlan | None = None
     placement_dispatcher: PlacementPlanDispatcher | None = None
     placement_implementations: tuple[PlacementImplementationBinding, ...] = ()
+    adaptive_plan: Phase5ControlPlan | None = None
+    adaptive_scheduler: Phase5AdaptiveScheduler | None = None
+    adaptive_flow_bindings: tuple[AdaptiveFlowBinding, ...] = ()
     leases: tuple[BufferLease, ...] = ()
     streams: tuple[RuntimeStream, ...] = ()
     events: tuple[RuntimeEvent, ...] = ()
@@ -170,6 +178,49 @@ class PlanResources:
         elif placement_implementations:
             raise ValueError(
                 "PlanResources implementation bindings require a placement plan"
+            )
+        adaptive_plan = self.adaptive_plan
+        adaptive_scheduler = self.adaptive_scheduler
+        adaptive_flow_bindings = _typed_tuple(
+            self.adaptive_flow_bindings,
+            AdaptiveFlowBinding,
+            "PlanResources.adaptive_flow_bindings",
+        )
+        if (adaptive_plan is None) != (adaptive_scheduler is None):
+            raise ValueError(
+                "PlanResources adaptive plan and scheduler must be published together"
+            )
+        if adaptive_plan is not None:
+            if not isinstance(cast(object, adaptive_plan), Phase5ControlPlan):
+                raise TypeError("PlanResources.adaptive_plan must be Phase5ControlPlan")
+            if not isinstance(
+                cast(object, adaptive_scheduler), Phase5AdaptiveScheduler
+            ):
+                raise TypeError(
+                    "PlanResources.adaptive_scheduler must be Phase5AdaptiveScheduler"
+                )
+            if placement_plan is None or adaptive_plan.placement_plan != placement_plan:
+                raise ValueError(
+                    "PlanResources adaptive plan must bind its exact placement plan"
+                )
+            if adaptive_plan.plan_epoch != raw_plan.plan_epoch:
+                raise ValueError(
+                    "PlanResources physical and adaptive epochs must match"
+                )
+            assert adaptive_scheduler is not None
+            prepared = adaptive_scheduler.prepared
+            if prepared is None or prepared.plan != adaptive_plan:
+                raise ValueError(
+                    "PlanResources adaptive scheduler must prepare its frozen plan"
+                )
+            flow_ids = tuple(binding.flow_id for binding in adaptive_flow_bindings)
+            if len(set(flow_ids)) != len(flow_ids):
+                raise ValueError(
+                    "PlanResources adaptive flow bindings must use unique flow ids"
+                )
+        elif adaptive_flow_bindings:
+            raise ValueError(
+                "PlanResources adaptive flow bindings require an adaptive plan"
             )
         leases = _typed_tuple(self.leases, BufferLease, "PlanResources.leases")
         streams = _typed_tuple(self.streams, RuntimeStream, "PlanResources.streams")
@@ -254,6 +305,13 @@ class PlanResources:
             "placement_implementations",
             placement_implementations,
         )
+        object.__setattr__(self, "adaptive_plan", adaptive_plan)
+        object.__setattr__(self, "adaptive_scheduler", adaptive_scheduler)
+        object.__setattr__(
+            self,
+            "adaptive_flow_bindings",
+            adaptive_flow_bindings,
+        )
         object.__setattr__(self, "leases", leases)
         object.__setattr__(self, "streams", streams)
         object.__setattr__(self, "events", events)
@@ -276,6 +334,22 @@ class PlanResources:
     def poll_transfers(self) -> None:
         if self.placement_dispatcher is not None:
             self.placement_dispatcher.poll()
+
+    def adaptive_flow_binding(self, flow_id: str) -> AdaptiveFlowBinding | None:
+        if not isinstance(flow_id, str) or not flow_id:
+            raise ValueError("adaptive flow lookup requires a non-empty flow id")
+        return next(
+            (
+                binding
+                for binding in self.adaptive_flow_bindings
+                if binding.flow_id == flow_id
+            ),
+            None,
+        )
+
+    def reset_adaptive_reservations(self) -> None:
+        if self.adaptive_scheduler is not None:
+            self.adaptive_scheduler.reset_reservations()
 
 
 class PlanSnapshotStore:

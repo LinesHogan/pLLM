@@ -27,7 +27,16 @@ from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime.consumer_compat import on_step_end as call_consumer_step_end
 from tllm.contracts.runtime_context import RunnerLike
 from tllm.contracts.runtime_context import RuntimeContext
-from tllm.runtime.scheduling.deferred import DeferredWork, DeferredWorkQueue
+from tllm.runtime.scheduling.deferred import (
+    DeferredWork,
+    DeferredWorkDecision,
+    DeferredWorkQueue,
+)
+from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
+from tllm.runtime.scheduling.phase5_adaptive import (
+    AdaptiveDecisionKind,
+    AdmissionContext,
+)
 from tllm.runtime.fusion import FusionExecutor
 from tllm.runtime.timing_debug import (
     TimingDebugMode,
@@ -53,6 +62,8 @@ class PortDispatchRuntimeLike(Protocol):
     event_step_id: int
     dispatch_plan: DispatchPlan | None
     deferred_work_queue: DeferredWorkQueue
+    physical_plan_store: PlanSnapshotStore | None
+    physical_prepared_step_id: int
     placement_stats: PlacementStats
     fusion_executor: FusionExecutor
     path_hotspot_enabled: bool
@@ -572,6 +583,56 @@ def drain_deferred_port_bundles(
     if not queue:
         return 0
     started = time.perf_counter()
+    resources = None
+    if (
+        runtime.physical_plan_store is not None
+        and runtime.physical_prepared_step_id == int(step_id)
+    ):
+        resources = runtime.physical_plan_store.active(int(step_id))
+    if resources is not None and resources.adaptive_scheduler is not None:
+        scheduler = resources.adaptive_scheduler
+
+        def select(
+            work: DeferredWork,
+            must_resolve: bool,
+        ) -> DeferredWorkDecision:
+            binding = resources.adaptive_flow_binding(work.flow_id)
+            if binding is None:
+                return DeferredWorkDecision.RUN
+            decision = scheduler.decide(
+                binding.work,
+                context=AdmissionContext(step=int(step_id)),
+                reserve=True,
+                allow_defer=not must_resolve,
+            )
+            if decision.action == AdaptiveDecisionKind.RUN:
+                runtime.placement_stats.adaptive_run_count += 1
+                return DeferredWorkDecision.RUN
+            if decision.action == AdaptiveDecisionKind.FALLBACK:
+                runtime.placement_stats.adaptive_fallback_count += 1
+                return DeferredWorkDecision.RUN
+            if decision.action == AdaptiveDecisionKind.KEEP:
+                runtime.placement_stats.adaptive_defer_count += 1
+                return DeferredWorkDecision.KEEP
+            runtime.placement_stats.adaptive_shed_count += 1
+            return DeferredWorkDecision.DROP
+
+        result = queue.drain_selected(
+            step_id=int(step_id),
+            hook=str(hook),
+            select=select,
+            expired_only=expired_only,
+            predecessor_events=predecessor_events,
+        )
+        drained = result.ran
+        if expired_only:
+            runtime.placement_stats.deadline_flush_count += drained
+        else:
+            runtime.placement_stats.bubble_drain_count += drained
+            runtime.placement_stats.bubble_drain_ms += (
+                time.perf_counter() - started
+            ) * 1000.0
+        return drained
     if expired_only:
         drained = queue.flush_expired(
             step_id=int(step_id),

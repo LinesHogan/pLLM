@@ -218,6 +218,7 @@ If you need step-end work, implement `on_step_end(ctx)` as an optional compatibi
 - [WorkGraph Phase 2](workgraph-phase2.md)
 - [WorkGraph Phase 3](workgraph-phase3.md)
 - [WorkGraph Phase 4](workgraph-phase4.md)
+- [WorkGraph Phase 5](workgraph-phase5.md)
 - [Glossary](../reference/glossary.md)
 - [Project Structure](../reference/project-structure.md)
 - [Write Your First Consumer](../getting-started/write-your-first-consumer.md)

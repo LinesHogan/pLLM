@@ -64,6 +64,7 @@ if TYPE_CHECKING:
         CollectiveHandle,
         DistributedRuntimeBinding,
     )
+    from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
     from tllm.workgraph.ir import NodeKey
     from tllm.workgraph.phase3 import ValueKey
     from tllm.workgraph.phase4 import CollectiveKey
@@ -242,6 +243,9 @@ def _stage_physical_workgraph_snapshot() -> None:
     placement_plan = None
     placement_dispatcher = None
     placement_implementations = ()
+    adaptive_plan = None
+    adaptive_scheduler = None
+    adaptive_flow_bindings = ()
     placement_binding = RUNTIME.placement_runtime_binding
     if placement_binding is not None:
         (
@@ -249,11 +253,25 @@ def _stage_physical_workgraph_snapshot() -> None:
             placement_dispatcher,
             placement_implementations,
         ) = placement_binding.compile(physical_plan)
+    adaptive_binding = RUNTIME.adaptive_runtime_binding
+    if adaptive_binding is not None:
+        if placement_plan is None:
+            raise RuntimeError(
+                "adaptive WorkGraph compilation requires a Phase 3 placement binding"
+            )
+        (
+            adaptive_plan,
+            adaptive_scheduler,
+            adaptive_flow_bindings,
+        ) = adaptive_binding.compile(placement_plan)
     resources = PlanResources(
         plan=physical_plan,
         placement_plan=placement_plan,
         placement_dispatcher=placement_dispatcher,
         placement_implementations=placement_implementations,
+        adaptive_plan=adaptive_plan,
+        adaptive_scheduler=adaptive_scheduler,
+        adaptive_flow_bindings=adaptive_flow_bindings,
     )
     store = RUNTIME.physical_plan_store
     if store is None:
@@ -385,6 +403,7 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
         resources = store.prepare_step(step)
         if resources is not None:
             resources.poll_transfers()
+            resources.reset_adaptive_reservations()
     for consumer in _active_dispatch_consumers():
         consumer.prepare_workgraph_step(step)
     if distributed_store is not None:
@@ -410,6 +429,10 @@ def configure_workgraph_placement(
         raise TypeError(
             "configure_workgraph_placement binding must be PlacementRuntimeBinding"
         )
+    if binding is None and RUNTIME.adaptive_runtime_binding is not None:
+        raise RuntimeError(
+            "cannot remove WorkGraph placement while adaptive planning is configured"
+        )
     store = RUNTIME.physical_plan_store
     if store is not None and not store.closeable:
         raise RuntimeError(
@@ -417,6 +440,33 @@ def configure_workgraph_placement(
         )
     _clear_physical_capture_regions()
     RUNTIME.placement_runtime_binding = binding
+    RUNTIME.physical_plan_store = None
+    RUNTIME.physical_prepared_step_id = -1
+    if RUNTIME.workgraph_snapshot is not None:
+        _stage_physical_workgraph_snapshot()
+
+
+def configure_workgraph_adaptive(
+    binding: "AdaptiveRuntimeBinding | None",
+) -> None:
+    """Install typed Phase 5 cold-compilation inputs and explicit flow bindings."""
+
+    from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
+
+    if binding is not None and not isinstance(binding, AdaptiveRuntimeBinding):
+        raise TypeError(
+            "configure_workgraph_adaptive binding must be AdaptiveRuntimeBinding"
+        )
+    if binding is not None and RUNTIME.placement_runtime_binding is None:
+        raise RuntimeError(
+            "adaptive WorkGraph configuration requires a placement binding"
+        )
+    store = RUNTIME.physical_plan_store
+    if store is not None and not store.closeable:
+        raise RuntimeError(
+            "cannot replace WorkGraph adaptive binding while an epoch is active"
+        )
+    RUNTIME.adaptive_runtime_binding = binding
     RUNTIME.physical_plan_store = None
     RUNTIME.physical_prepared_step_id = -1
     if RUNTIME.workgraph_snapshot is not None:
@@ -1073,6 +1123,7 @@ __all__ = [
     "clear_dispatch_consumers",
     "compute_decode_localization",
     "configure_runtime",
+    "configure_workgraph_adaptive",
     "configure_workgraph_distributed",
     "configure_workgraph_placement",
     "dispatch_workgraph_value",

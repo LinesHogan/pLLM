@@ -6,7 +6,10 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use serde_json::{json, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write;
 
 const SCHEMA_VERSION: i64 = 1;
 const VERSION_PREFIX: &str = "0.27.";
@@ -730,7 +733,7 @@ struct DeviceTopologyV3Desc {
     cuda_devices: Vec<i64>,
 }
 
-#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
 struct ValueKeyV3Desc {
     #[pyo3(attribute)]
     name: String,
@@ -815,7 +818,7 @@ struct PlacedNodeV3Desc {
     depends_on: Vec<NodeKeyDesc>,
 }
 
-#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
 struct MoveKeyV3Desc {
     #[pyo3(attribute)]
     value: ValueKeyV3Desc,
@@ -1113,6 +1116,176 @@ struct DistributedFlowPlanV4Desc {
     local_schedules: Vec<LocalCollectiveScheduleV4Desc>,
     #[pyo3(attribute)]
     schema_version: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
+struct VersionKeyV5Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    version: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, Ord, PartialEq, PartialOrd)]
+struct OrdinalKeyV5Desc {
+    #[pyo3(attribute)]
+    namespace: String,
+    #[pyo3(attribute)]
+    name: String,
+    #[pyo3(attribute)]
+    ordinal: i64,
+}
+
+impl OrdinalKeyV5Desc {
+    fn text(&self) -> String {
+        format!("{}:{}/{}", self.namespace, self.name, self.ordinal)
+    }
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct FixedRatioV5Desc {
+    #[pyo3(attribute)]
+    numerator: i64,
+    #[pyo3(attribute)]
+    denominator: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct IntegerEwmaProfileV5Desc {
+    #[pyo3(attribute)]
+    key: VersionKeyV5Desc,
+    #[pyo3(attribute)]
+    estimate: i64,
+    #[pyo3(attribute)]
+    alpha: FixedRatioV5Desc,
+    #[pyo3(attribute)]
+    samples: i64,
+    #[pyo3(attribute)]
+    minimum: i64,
+    #[pyo3(attribute)]
+    maximum: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct ShapeBucketV5Desc {
+    #[pyo3(attribute)]
+    key: VersionKeyV5Desc,
+    #[pyo3(attribute)]
+    shape: Vec<i64>,
+    #[pyo3(attribute)]
+    lower_bounds: Vec<i64>,
+    #[pyo3(attribute)]
+    upper_bounds: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct WorkloadBucketV5Desc {
+    #[pyo3(attribute)]
+    key: VersionKeyV5Desc,
+    #[pyo3(attribute)]
+    shape_buckets: Vec<VersionKeyV5Desc>,
+    #[pyo3(attribute)]
+    required_by_default: bool,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct InterferenceBudgetV5Desc {
+    #[pyo3(attribute)]
+    key: VersionKeyV5Desc,
+    #[pyo3(attribute)]
+    capacity: i64,
+    #[pyo3(attribute)]
+    profile: Option<VersionKeyV5Desc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct BudgetUseV5Desc {
+    #[pyo3(attribute)]
+    key: VersionKeyV5Desc,
+    #[pyo3(attribute)]
+    amount: i64,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct CandidateMoveSetV5Desc {
+    #[pyo3(attribute)]
+    key: OrdinalKeyV5Desc,
+    #[pyo3(attribute)]
+    moves: Vec<ScheduledMoveV3Desc>,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
+struct CandidateActionV5Desc {
+    #[pyo3(attribute)]
+    key: OrdinalKeyV5Desc,
+    #[pyo3(attribute)]
+    kind: String,
+    #[pyo3(attribute)]
+    semantic_key: String,
+    #[pyo3(attribute)]
+    workload_bucket: Option<VersionKeyV5Desc>,
+    #[pyo3(attribute)]
+    shape_bucket: Option<VersionKeyV5Desc>,
+    #[pyo3(attribute)]
+    move_set: Option<OrdinalKeyV5Desc>,
+    #[pyo3(attribute)]
+    fallback_key: Option<OrdinalKeyV5Desc>,
+    #[pyo3(attribute)]
+    deadline: i64,
+    #[pyo3(attribute)]
+    ready_at: i64,
+    #[pyo3(attribute)]
+    duration: i64,
+    #[pyo3(attribute)]
+    buffer_credits: i64,
+    #[pyo3(attribute)]
+    budget_uses: Vec<BudgetUseV5Desc>,
+    #[pyo3(attribute)]
+    priority: i64,
+    #[pyo3(attribute)]
+    utility: i64,
+    #[pyo3(attribute)]
+    required: bool,
+    #[pyo3(attribute)]
+    unknown_bucket: bool,
+    #[pyo3(attribute)]
+    authoritative: bool,
+}
+
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct AdaptiveFlowPlanV5Desc {
+    #[pyo3(attribute)]
+    plan_epoch: i64,
+    #[pyo3(attribute)]
+    placement_plan: PlacementPlanV3Desc,
+    #[pyo3(attribute)]
+    scheduled_moves: Vec<ScheduledMoveV3Desc>,
+    #[pyo3(attribute)]
+    move_sets: Vec<CandidateMoveSetV5Desc>,
+    #[pyo3(attribute)]
+    workload_buckets: Vec<WorkloadBucketV5Desc>,
+    #[pyo3(attribute)]
+    shape_buckets: Vec<ShapeBucketV5Desc>,
+    #[pyo3(attribute)]
+    budgets: Vec<InterferenceBudgetV5Desc>,
+    #[pyo3(attribute)]
+    actions: Vec<CandidateActionV5Desc>,
+    #[pyo3(attribute)]
+    unknown_bucket_fallback: OrdinalKeyV5Desc,
+    #[pyo3(attribute)]
+    buffer_capacity: i64,
+    #[pyo3(attribute)]
+    mode: String,
+    #[pyo3(attribute)]
+    schema_version: i64,
+    #[pyo3(attribute)]
+    profiles: Vec<IntegerEwmaProfileV5Desc>,
+    #[pyo3(attribute)]
+    placement_signature: String,
+    #[pyo3(attribute)]
+    densification_limit: i64,
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
@@ -4106,6 +4279,472 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
     Ok(ordered_keys.iter().map(CollectiveKeyV4Desc::text).collect())
 }
 
+fn node_key_json_v5(value: &NodeKeyDesc) -> JsonValue {
+    json!({
+        "namespace": value.namespace,
+        "owner": value.owner,
+        "ordinal": value.ordinal,
+    })
+}
+
+fn executor_key_json_v5(value: &ExecutorKeyDesc) -> JsonValue {
+    json!({
+        "namespace": value.namespace,
+        "name": value.name,
+        "version": value.version,
+    })
+}
+
+fn placement_json_v5(value: &PlacementV3Desc) -> JsonValue {
+    json!({"kind": value.kind, "index": value.index})
+}
+
+fn value_key_json_v5(value: &ValueKeyV3Desc) -> JsonValue {
+    json!({"name": value.name, "version": value.version})
+}
+
+fn residency_json_v5(value: &ResidencyV3Desc) -> JsonValue {
+    json!({
+        "value": value_key_json_v5(&value.value),
+        "placement": placement_json_v5(&value.placement),
+        "memory": value.memory,
+    })
+}
+
+fn move_key_json_v5(value: &MoveKeyV3Desc) -> JsonValue {
+    json!({
+        "value": value_key_json_v5(&value.value),
+        "ordinal": value.ordinal,
+    })
+}
+
+fn scheduled_move_json_v5(value: &ScheduledMoveV3Desc) -> JsonValue {
+    json!({
+        "key": move_key_json_v5(&value.key),
+        "move": {
+            "value": value_key_json_v5(&value.r#move.value),
+            "source": residency_json_v5(&value.r#move.source),
+            "destination": residency_json_v5(&value.r#move.destination),
+            "kind": value.r#move.kind,
+            "byte_count": value.r#move.byte_count,
+            "asynchronous": value.r#move.asynchronous,
+        },
+        "engine": value.engine,
+        "start_at": value.start_at,
+        "end_at": value.end_at,
+        "producer": value.producer.as_ref().map(node_key_json_v5),
+        "consumer": value.consumer.as_ref().map(node_key_json_v5),
+        "depends_on": value.depends_on.iter().map(move_key_json_v5).collect::<Vec<_>>(),
+        "used_fallback": value.used_fallback,
+    })
+}
+
+fn python_ascii_json_v5(value: &JsonValue) -> Result<Vec<u8>, String> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| format!("failed to serialize PlacementPlan signature: {error}"))?;
+    let mut canonical = String::with_capacity(encoded.len());
+    for character in encoded.chars() {
+        if character.is_ascii() {
+            canonical.push(character);
+            continue;
+        }
+        let scalar = character as u32;
+        if scalar <= 0xffff {
+            write!(&mut canonical, "\\u{scalar:04x}").expect("writing to String cannot fail");
+            continue;
+        }
+        let surrogate = scalar - 0x1_0000;
+        let high = 0xd800 + (surrogate >> 10);
+        let low = 0xdc00 + (surrogate & 0x3ff);
+        write!(&mut canonical, "\\u{high:04x}\\u{low:04x}").expect("writing to String cannot fail");
+    }
+    Ok(canonical.into_bytes())
+}
+
+fn placement_signature_v5(plan: &PlacementPlanV3Desc) -> Result<String, String> {
+    let mut peers: Vec<(i64, i64)> = plan.topology.peer_access.iter().copied().collect();
+    peers.sort_unstable();
+    let selections: Vec<JsonValue> = plan
+        .selections
+        .iter()
+        .map(|selection| {
+            json!({
+                "node_key": node_key_json_v5(&selection.node_key),
+                "logical_executor": executor_key_json_v5(&selection.logical_executor),
+                "key": executor_key_json_v5(&selection.key),
+                "placement": placement_json_v5(&selection.placement),
+                "duration": {
+                    "microseconds": selection.duration.microseconds,
+                    "samples": selection.duration.samples,
+                },
+                "oracle_key": selection.oracle_key.as_ref().map(|key| json!({
+                    "namespace": key.namespace,
+                    "name": key.name,
+                    "version": key.version,
+                })),
+            })
+        })
+        .collect();
+    let schedule: Vec<JsonValue> = plan
+        .schedule
+        .iter()
+        .map(|node| {
+            json!({
+                "node_key": node_key_json_v5(&node.node_key),
+                "implementation": executor_key_json_v5(&node.implementation),
+                "placement": placement_json_v5(&node.placement),
+                "start_at": node.start_at,
+                "end_at": node.end_at,
+                "depends_on": node.depends_on.iter().map(node_key_json_v5).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let payload = json!({
+        "plan_epoch": plan.plan_epoch,
+        "selections": selections,
+        "schedule": schedule,
+        "topology": {
+            "peer_access": peers,
+            "cuda_devices": plan.topology.cuda_devices,
+        },
+        "value_flows": plan.value_flows.iter().map(|flow| json!({
+            "value": value_key_json_v5(&flow.value),
+            "producer": node_key_json_v5(&flow.producer),
+            "consumer": node_key_json_v5(&flow.consumer),
+            "byte_count": flow.byte_count,
+        })).collect::<Vec<_>>(),
+        "residencies": plan.residencies.iter().map(residency_json_v5).collect::<Vec<_>>(),
+        "moves": plan.moves.iter().map(scheduled_move_json_v5).collect::<Vec<_>>(),
+        "leases": plan.leases.iter().map(|lease| json!({
+            "residency": residency_json_v5(&lease.residency),
+            "live_start": lease.live_start,
+            "live_end": lease.live_end,
+        })).collect::<Vec<_>>(),
+        "copy_engines": plan.copy_engines.iter().map(|engine| json!({
+            "engine": engine.engine,
+            "capacity": engine.capacity,
+        })).collect::<Vec<_>>(),
+        "schema_version": plan.schema_version,
+    });
+    let canonical = python_ascii_json_v5(&payload)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+fn validate_v5_version_key(key: &VersionKeyV5Desc, layer: &str) -> Result<(), String> {
+    validate_v4_key_segment(&key.namespace, layer, &[':', '@', '/'])?;
+    validate_v4_key_segment(&key.name, layer, &[':', '@', '/'])?;
+    if key.version < 1 {
+        return Err(format!("{layer} version must be >= 1"));
+    }
+    Ok(())
+}
+
+fn validate_v5_ordinal_key(key: &OrdinalKeyV5Desc, layer: &str) -> Result<(), String> {
+    validate_v4_key_segment(&key.namespace, layer, &[':', '@', '/'])?;
+    validate_v4_key_segment(&key.name, layer, &[':', '@', '/'])?;
+    if key.ordinal < 0 {
+        return Err(format!("{layer} ordinal must be non-negative"));
+    }
+    Ok(())
+}
+
+fn validate_adaptive_plan_v5(plan: &AdaptiveFlowPlanV5Desc) -> Result<Vec<String>, String> {
+    if plan.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported AdaptiveFlowPlan schema version {}",
+            plan.schema_version
+        ));
+    }
+    if plan.plan_epoch < 1 || plan.plan_epoch != plan.placement_plan.plan_epoch {
+        return Err("AdaptiveFlowPlan epoch must match its PlacementPlan".to_string());
+    }
+    validate_placement_plan_v3(&plan.placement_plan)?;
+    if plan.scheduled_moves != plan.placement_plan.moves {
+        return Err("AdaptiveFlowPlan moves must exactly match its PlacementPlan".to_string());
+    }
+    if plan.placement_signature.len() != 64
+        || !plan
+            .placement_signature
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase())
+    {
+        return Err("AdaptiveFlowPlan placement_signature must be lowercase SHA-256".to_string());
+    }
+    if plan.placement_signature != placement_signature_v5(&plan.placement_plan)? {
+        return Err(
+            "AdaptiveFlowPlan placement_signature differs from its PlacementPlan".to_string(),
+        );
+    }
+    if plan.densification_limit < 1
+        || plan.move_sets.len() > plan.densification_limit as usize
+        || plan.actions.len() > plan.densification_limit as usize
+    {
+        return Err("AdaptiveFlowPlan exceeds its densification limit".to_string());
+    }
+    if plan.buffer_capacity < 0 || !matches!(plan.mode.as_str(), "static" | "adaptive") {
+        return Err("AdaptiveFlowPlan has invalid capacity or mode".to_string());
+    }
+
+    let move_universe: HashMap<MoveKeyV3Desc, &ScheduledMoveV3Desc> = plan
+        .scheduled_moves
+        .iter()
+        .map(|item| (item.key.clone(), item))
+        .collect();
+    if move_universe.len() != plan.scheduled_moves.len() {
+        return Err("AdaptiveFlowPlan scheduled Move keys must be unique".to_string());
+    }
+    let mut move_set_keys = HashSet::new();
+    let mut previous_move_set: Option<&OrdinalKeyV5Desc> = None;
+    for move_set in &plan.move_sets {
+        validate_v5_ordinal_key(&move_set.key, "adaptive Move-set key")?;
+        if previous_move_set.is_some_and(|previous| previous >= &move_set.key)
+            || !move_set_keys.insert(move_set.key.clone())
+        {
+            return Err("AdaptiveFlowPlan Move sets must use canonical unique keys".to_string());
+        }
+        previous_move_set = Some(&move_set.key);
+        let selected: HashSet<MoveKeyV3Desc> =
+            move_set.moves.iter().map(|item| item.key.clone()).collect();
+        if selected.len() != move_set.moves.len() {
+            return Err("adaptive Move set contains duplicate Moves".to_string());
+        }
+        let mut previous_move_key: Option<&MoveKeyV3Desc> = None;
+        for scheduled in &move_set.moves {
+            let expected = move_universe
+                .get(&scheduled.key)
+                .ok_or_else(|| "adaptive Move set invents a Phase 3 Move".to_string())?;
+            if *expected != scheduled {
+                return Err("adaptive Move set rewrites a Phase 3 Move".to_string());
+            }
+            if scheduled
+                .depends_on
+                .iter()
+                .any(|dependency| !selected.contains(dependency))
+            {
+                return Err("adaptive Move set must be dependency-closed".to_string());
+            }
+            if previous_move_key.is_some_and(|previous| previous >= &scheduled.key) {
+                return Err("adaptive Move sets must use canonical Move order".to_string());
+            }
+            previous_move_key = Some(&scheduled.key);
+        }
+    }
+
+    let mut shape_keys = HashSet::new();
+    let mut previous_shape: Option<&VersionKeyV5Desc> = None;
+    for bucket in &plan.shape_buckets {
+        validate_v5_version_key(&bucket.key, "adaptive shape-bucket key")?;
+        if previous_shape.is_some_and(|previous| previous >= &bucket.key)
+            || !shape_keys.insert(bucket.key.clone())
+        {
+            return Err("adaptive shape buckets must use canonical unique keys".to_string());
+        }
+        previous_shape = Some(&bucket.key);
+        let exact = !bucket.shape.is_empty();
+        let bounded = !bucket.lower_bounds.is_empty() && !bucket.upper_bounds.is_empty();
+        if exact == bounded
+            || bucket.shape.iter().any(|value| *value < 1)
+            || bucket.lower_bounds.len() != bucket.upper_bounds.len()
+            || bucket.lower_bounds.iter().any(|value| *value < 1)
+            || bucket.upper_bounds.iter().any(|value| *value < 1)
+            || bucket
+                .lower_bounds
+                .iter()
+                .zip(&bucket.upper_bounds)
+                .any(|(lower, upper)| lower > upper)
+        {
+            return Err("adaptive shape bucket has invalid exact/bounded dimensions".to_string());
+        }
+    }
+
+    let mut workload_keys = HashSet::new();
+    let mut previous_workload: Option<&VersionKeyV5Desc> = None;
+    for bucket in &plan.workload_buckets {
+        validate_v5_version_key(&bucket.key, "adaptive workload-bucket key")?;
+        if previous_workload.is_some_and(|previous| previous >= &bucket.key)
+            || !workload_keys.insert(bucket.key.clone())
+        {
+            return Err("adaptive workload buckets must use canonical unique keys".to_string());
+        }
+        previous_workload = Some(&bucket.key);
+        if bucket
+            .shape_buckets
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || bucket
+                .shape_buckets
+                .iter()
+                .any(|key| !shape_keys.contains(key))
+        {
+            return Err("adaptive workload bucket has invalid shape references".to_string());
+        }
+    }
+
+    let mut profile_keys = HashSet::new();
+    let mut previous_profile: Option<&VersionKeyV5Desc> = None;
+    for profile in &plan.profiles {
+        validate_v5_version_key(&profile.key, "adaptive EWMA-profile key")?;
+        if previous_profile.is_some_and(|previous| previous >= &profile.key)
+            || !profile_keys.insert(profile.key.clone())
+        {
+            return Err("adaptive EWMA profiles must use canonical unique keys".to_string());
+        }
+        previous_profile = Some(&profile.key);
+        if profile.alpha.numerator < 1
+            || profile.alpha.denominator < 1
+            || profile.alpha.numerator > profile.alpha.denominator
+            || profile.samples < 0
+            || profile.minimum < 0
+            || profile.estimate < profile.minimum
+            || profile
+                .maximum
+                .is_some_and(|maximum| maximum < profile.minimum || profile.estimate > maximum)
+        {
+            return Err("adaptive EWMA profile has invalid integer bounds".to_string());
+        }
+    }
+
+    let mut budget_keys = HashSet::new();
+    let mut previous_budget: Option<&VersionKeyV5Desc> = None;
+    for budget in &plan.budgets {
+        validate_v5_version_key(&budget.key, "adaptive interference-budget key")?;
+        if previous_budget.is_some_and(|previous| previous >= &budget.key)
+            || !budget_keys.insert(budget.key.clone())
+            || budget.capacity < 0
+            || budget
+                .profile
+                .as_ref()
+                .is_some_and(|key| !profile_keys.contains(key))
+        {
+            return Err("adaptive interference budget is invalid".to_string());
+        }
+        previous_budget = Some(&budget.key);
+    }
+
+    let mut action_keys = HashSet::new();
+    let mut previous_action: Option<&OrdinalKeyV5Desc> = None;
+    for action in &plan.actions {
+        validate_v5_ordinal_key(&action.key, "adaptive action key")?;
+        validate_v4_key_segment(
+            &action.semantic_key,
+            "adaptive semantic key",
+            &[':', '@', '/'],
+        )?;
+        if previous_action.is_some_and(|previous| previous >= &action.key)
+            || !action_keys.insert(action.key.clone())
+        {
+            return Err("adaptive actions must use canonical unique keys".to_string());
+        }
+        previous_action = Some(&action.key);
+    }
+    let action_by_key: HashMap<OrdinalKeyV5Desc, &CandidateActionV5Desc> = plan
+        .actions
+        .iter()
+        .map(|action| (action.key.clone(), action))
+        .collect();
+    let unknown_fallback = action_by_key
+        .get(&plan.unknown_bucket_fallback)
+        .ok_or_else(|| "unknown-bucket fallback is not an approved action".to_string())?;
+    if unknown_fallback.kind != "authoritative_fallback" || !unknown_fallback.unknown_bucket {
+        return Err("unknown-bucket fallback must be authoritative".to_string());
+    }
+    for action in &plan.actions {
+        if !matches!(
+            action.kind.as_str(),
+            "execute" | "authoritative_fallback" | "shed"
+        ) || action.ready_at < 0
+            || action.deadline < 1
+            || action.buffer_credits < 0
+            || action.priority < 0
+            || action.utility < 0
+            || action.buffer_credits > plan.buffer_capacity
+            || action
+                .workload_bucket
+                .as_ref()
+                .is_some_and(|key| !workload_keys.contains(key))
+            || action
+                .shape_bucket
+                .as_ref()
+                .is_some_and(|key| !shape_keys.contains(key))
+            || action
+                .move_set
+                .as_ref()
+                .is_some_and(|key| !move_set_keys.contains(key))
+        {
+            return Err("adaptive action contains an invalid field or reference".to_string());
+        }
+        if action
+            .budget_uses
+            .windows(2)
+            .any(|pair| pair[0].key >= pair[1].key)
+            || action
+                .budget_uses
+                .iter()
+                .any(|usage| usage.amount < 1 || !budget_keys.contains(&usage.key))
+        {
+            return Err("adaptive action has invalid interference-budget use".to_string());
+        }
+        match action.kind.as_str() {
+            "shed" => {
+                if action.required
+                    || action.authoritative
+                    || action.move_set.is_some()
+                    || action.duration != 0
+                    || action.buffer_credits != 0
+                    || !action.budget_uses.is_empty()
+                {
+                    return Err("shedding action cannot represent required work".to_string());
+                }
+            }
+            "authoritative_fallback" => {
+                if !action.authoritative || action.duration < 1 || action.fallback_key.is_some() {
+                    return Err("authoritative fallback action is invalid".to_string());
+                }
+            }
+            "execute" => {
+                if action.authoritative || action.duration < 1 || action.fallback_key.is_none() {
+                    return Err("execute action requires an authoritative fallback".to_string());
+                }
+            }
+            _ => unreachable!(),
+        }
+        if action.unknown_bucket
+            && (action.kind != "authoritative_fallback"
+                || action.workload_bucket.is_some()
+                || action.shape_bucket.is_some())
+        {
+            return Err("unknown-bucket action must be an unscoped fallback".to_string());
+        }
+        if let Some(fallback_key) = &action.fallback_key {
+            let fallback = action_by_key
+                .get(fallback_key)
+                .ok_or_else(|| "adaptive action fallback is unknown".to_string())?;
+            if fallback.kind != "authoritative_fallback"
+                || fallback.semantic_key != action.semantic_key
+            {
+                return Err("adaptive fallback changes action semantics".to_string());
+            }
+        }
+        if let (Some(workload_key), Some(shape_key)) =
+            (&action.workload_bucket, &action.shape_bucket)
+        {
+            let workload = plan
+                .workload_buckets
+                .iter()
+                .find(|bucket| &bucket.key == workload_key)
+                .expect("workload reference was validated");
+            if !workload.shape_buckets.is_empty() && !workload.shape_buckets.contains(shape_key) {
+                return Err("adaptive action shape is outside its workload bucket".to_string());
+            }
+        }
+    }
+    Ok(plan
+        .actions
+        .iter()
+        .map(|action| action.key.text())
+        .collect())
+}
+
 /// Validate one frozen, metadata-only physical execution plan. Runtime Tensor,
 /// stream, event, graph, callback, and lease objects remain in Python.
 #[pyfunction]
@@ -4135,6 +4774,15 @@ fn validate_distributed_flow_plan(
     Ok(WorkGraphValidation { topological_order })
 }
 
+/// Validate one frozen Phase 5 adaptive plan. Mutable EWMAs, observations,
+/// admission reservations, queues, callbacks, and runtime payloads stay in Python.
+#[pyfunction]
+#[pyo3(signature = (plan))]
+fn validate_adaptive_flow_plan(plan: AdaptiveFlowPlanV5Desc) -> PyResult<WorkGraphValidation> {
+    let topological_order = validate_adaptive_plan_v5(&plan).map_err(validation_error)?;
+    Ok(WorkGraphValidation { topological_order })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_workgraph, m)?)?;
     m.add_function(wrap_pyfunction!(validate_workgraph_ir, m)?)?;
@@ -4142,6 +4790,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_physical_flow_plan, m)?)?;
     m.add_function(wrap_pyfunction!(validate_placement_plan, m)?)?;
     m.add_function(wrap_pyfunction!(validate_distributed_flow_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_adaptive_flow_plan, m)?)?;
     m.add_class::<WorkGraphValidation>()?;
     Ok(())
 }

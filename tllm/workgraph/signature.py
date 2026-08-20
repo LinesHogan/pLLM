@@ -107,6 +107,25 @@ from tllm.workgraph.phase4 import (
     StateResidenceDesc,
     TopologyRankDesc,
 )
+from tllm.workgraph.phase5 import (
+    BudgetUseDesc,
+    CandidateActionDesc,
+    CandidateActionKey,
+    CandidateMoveSetDesc,
+    EWMAProfileKey,
+    FixedRatio,
+    IntegerEWMAProfile,
+    InterferenceBudgetDesc,
+    InterferenceBudgetKey,
+    MoveSetKey,
+    Phase5ControlPlan,
+    ShapeBucketDesc,
+    ShapeBucketKey,
+    WorkItemDesc,
+    WorkItemKey,
+    WorkloadBucketDesc,
+    WorkloadBucketKey,
+)
 
 
 def _unsupported(value: Any) -> TypeError:
@@ -434,6 +453,103 @@ def _canonical(value: Any) -> Any:
             "communicators": _canonical(value.communicators),
             "collectives": _canonical(value.collectives),
             "local_schedules": _canonical(value.local_schedules),
+            "schema_version": value.schema_version,
+        }
+    if isinstance(value, (EWMAProfileKey, WorkloadBucketKey, ShapeBucketKey, InterferenceBudgetKey)):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "version": value.version,
+        }
+    if isinstance(value, (MoveSetKey, CandidateActionKey, WorkItemKey)):
+        return {
+            "namespace": value.namespace,
+            "name": value.name,
+            "ordinal": value.ordinal,
+        }
+    if isinstance(value, FixedRatio):
+        return {
+            "numerator": value.numerator,
+            "denominator": value.denominator,
+        }
+    if isinstance(value, IntegerEWMAProfile):
+        return {
+            "key": _canonical(value.key),
+            "estimate": value.estimate,
+            "alpha": _canonical(value.alpha),
+            "samples": value.samples,
+            "minimum": value.minimum,
+            "maximum": value.maximum,
+        }
+    if isinstance(value, ShapeBucketDesc):
+        return {
+            "key": _canonical(value.key),
+            "shape": _canonical(value.shape),
+            "lower_bounds": _canonical(value.lower_bounds),
+            "upper_bounds": _canonical(value.upper_bounds),
+        }
+    if isinstance(value, WorkloadBucketDesc):
+        return {
+            "key": _canonical(value.key),
+            "shape_buckets": _canonical(value.shape_buckets),
+            "required_by_default": value.required_by_default,
+        }
+    if isinstance(value, InterferenceBudgetDesc):
+        return {
+            "key": _canonical(value.key),
+            "capacity": value.capacity,
+            "profile": _canonical(value.profile),
+        }
+    if isinstance(value, BudgetUseDesc):
+        return {"key": _canonical(value.key), "amount": value.amount}
+    if isinstance(value, CandidateMoveSetDesc):
+        return {"key": _canonical(value.key), "moves": _canonical(value.moves)}
+    if isinstance(value, CandidateActionDesc):
+        return {
+            "key": _canonical(value.key),
+            "kind": _canonical(value.kind),
+            "semantic_key": value.semantic_key,
+            "workload_bucket": _canonical(value.workload_bucket),
+            "shape_bucket": _canonical(value.shape_bucket),
+            "move_set": _canonical(value.move_set),
+            "fallback_key": _canonical(value.fallback_key),
+            "deadline": value.deadline,
+            "ready_at": value.ready_at,
+            "duration": value.duration,
+            "buffer_credits": value.buffer_credits,
+            "budget_uses": _canonical(value.budget_uses),
+            "priority": value.priority,
+            "utility": value.utility,
+            "required": value.required,
+            "unknown_bucket": value.unknown_bucket,
+            "authoritative": value.authoritative,
+        }
+    if isinstance(value, WorkItemDesc):
+        return {
+            "key": _canonical(value.key),
+            "shape": _canonical(value.shape),
+            "workload_bucket": _canonical(value.workload_bucket),
+            "semantic_key": value.semantic_key,
+            "required": value.required,
+            "allow_shedding": value.allow_shedding,
+            "deadline": value.deadline,
+        }
+    if isinstance(value, Phase5ControlPlan):
+        return {
+            "plan_epoch": value.plan_epoch,
+            "placement_plan": _canonical(value.placement_plan),
+            "placement_signature": value.placement_signature,
+            "scheduled_moves": _canonical(value.scheduled_moves),
+            "move_sets": _canonical(value.move_sets),
+            "workload_buckets": _canonical(value.workload_buckets),
+            "shape_buckets": _canonical(value.shape_buckets),
+            "budgets": _canonical(value.budgets),
+            "actions": _canonical(value.actions),
+            "unknown_bucket_fallback": _canonical(value.unknown_bucket_fallback),
+            "buffer_capacity": value.buffer_capacity,
+            "mode": _canonical(value.mode),
+            "profiles": _canonical(value.profiles),
+            "densification_limit": value.densification_limit,
             "schema_version": value.schema_version,
         }
     if isinstance(value, SourceSpan):

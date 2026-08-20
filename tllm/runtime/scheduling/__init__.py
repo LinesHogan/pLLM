@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Shared scheduling infrastructure for off-critical-path consumer work."""
 
-from tllm.runtime.scheduling.deferred import DeferredWork, DeferredWorkQueue
+from tllm.runtime.scheduling.deferred import (
+    DeferredDrainResult,
+    DeferredWork,
+    DeferredWorkDecision,
+    DeferredWorkQueue,
+)
 from tllm.runtime.scheduling.physical import BufferLease, Fence
 from tllm.runtime.scheduling.plan_store import (
     PlanResources,
@@ -37,6 +42,19 @@ from tllm.runtime.scheduling.phase4_collective import (
     distributed_plan_agreement_desc,
     validate_distributed_plan_agreement,
 )
+from tllm.runtime.scheduling.phase5_adaptive import (
+    AdaptiveDecision,
+    AdaptiveDecisionKind,
+    AdaptiveFlowBinding,
+    AdaptiveMode,
+    AdaptiveRuntimeBinding,
+    AdmissionContext,
+    IntegerEWMA,
+    Phase5AdaptiveScheduler,
+    PreparedPhase5Plan,
+    RuntimeAdmissionState,
+    prepare_phase5_plan,
+)
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
     PhysicalExecutionError,
@@ -51,6 +69,12 @@ from tllm.runtime.scheduling.workgraph_executor import (
 )
 
 __all__ = [
+    "AdaptiveDecision",
+    "AdaptiveDecisionKind",
+    "AdaptiveFlowBinding",
+    "AdaptiveMode",
+    "AdaptiveRuntimeBinding",
+    "AdmissionContext",
     "BufferLease",
     "CopyExecutor",
     "CopyHandle",
@@ -60,12 +84,15 @@ __all__ = [
     "DistributedAgreementAdapter",
     "DistributedPlanAgreementDesc",
     "DeferredWork",
+    "DeferredDrainResult",
+    "DeferredWorkDecision",
     "DeferredWorkQueue",
     "DistributedPlanExecutor",
     "DistributedPlanResources",
     "DistributedPlanSnapshotStore",
     "DistributedRuntimeBinding",
     "Fence",
+    "IntegerEWMA",
     "PlanResources",
     "PlanSnapshotStore",
     "PhysicalExecutionContext",
@@ -74,6 +101,7 @@ __all__ = [
     "PhysicalExecutionStats",
     "PhysicalExecutor",
     "PhysicalStepResult",
+    "Phase5AdaptiveScheduler",
     "PinnedMemoryPool",
     "PinnedMemorySlot",
     "PlacementImplementationBinding",
@@ -85,6 +113,7 @@ __all__ = [
     "RuntimeEvent",
     "RuntimeGraph",
     "RuntimeStream",
+    "RuntimeAdmissionState",
     "TorchTensorCopyAdapter",
     "TorchDistributedAgreementAdapter",
     "TorchCollectivePayload",
@@ -93,4 +122,6 @@ __all__ = [
     "runtime_stats_from_executor",
     "distributed_plan_agreement_desc",
     "validate_distributed_plan_agreement",
+    "PreparedPhase5Plan",
+    "prepare_phase5_plan",
 ]
