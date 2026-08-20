@@ -312,15 +312,37 @@ def _activate_physical_capture_regions(snapshot: object) -> None:
             for attachment in owned_attachments
             if attachment.artifact_key in executor_descs
         )
-        consumer.activate_workgraph_regions(
-            tuple(
-                compile_physical_capture_region(
-                    snapshot,
-                    attachment.artifact_key,
-                    executor_descs[attachment.artifact_key],
-                )
-                for attachment in executable_attachments
+        regions = tuple(
+            compile_physical_capture_region(
+                snapshot,
+                attachment.artifact_key,
+                executor_descs[attachment.artifact_key],
             )
+            for attachment in executable_attachments
+        )
+        placement_binding = RUNTIME.placement_runtime_binding
+        if placement_binding is None:
+            consumer.activate_workgraph_regions(regions)
+            continue
+        from tllm.runtime.scheduling.plan_store import PlanResources
+
+        placement_resources: list[PlanResources] = []
+        for region in regions:
+            placement_plan, dispatcher, implementations = placement_binding.compile(
+                region.plan,
+                value_flows=(),
+            )
+            placement_resources.append(
+                PlanResources(
+                    plan=region.plan,
+                    placement_plan=placement_plan,
+                    placement_dispatcher=dispatcher,
+                    placement_implementations=implementations,
+                )
+            )
+        consumer.activate_workgraph_region_resources(
+            regions,
+            tuple(placement_resources),
         )
 
 
@@ -377,6 +399,7 @@ def configure_workgraph_placement(
         raise RuntimeError(
             "cannot replace WorkGraph placement binding while an epoch is active"
         )
+    _clear_physical_capture_regions()
     RUNTIME.placement_runtime_binding = binding
     RUNTIME.physical_plan_store = None
     RUNTIME.physical_prepared_step_id = -1

@@ -12,6 +12,7 @@ from tllm.ports.base import ConsumerFlow
 
 if TYPE_CHECKING:
     from tllm.runtime.specialization import RuntimeSpecializationSpec
+    from tllm.runtime.scheduling.plan_store import PlanResources
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
@@ -97,6 +98,19 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         """Atomically replace cold-compiled regions attached to this consumer."""
 
         _ = regions
+
+    def activate_workgraph_region_resources(
+        self,
+        regions: tuple["PhysicalCaptureRegion", ...],
+        resources: tuple["PlanResources", ...],
+    ) -> None:
+        """Install placement-aware resources for explicitly migrated regions."""
+
+        if resources:
+            raise RuntimeError(
+                "consumer does not support WorkGraph placement resources"
+            )
+        self.activate_workgraph_regions(regions)
 
     def drain_workgraph_specializations(self) -> int:
         """Run queued physical specialization work at a prepare safe point."""

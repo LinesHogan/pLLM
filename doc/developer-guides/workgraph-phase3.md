@@ -103,7 +103,12 @@ visible atomically at the next prepare safe point. The cold compiler also
 resolves each selected implementation key into an epoch-owned typed binding;
 `PhysicalExecutor` uses that binding before any legacy logical handler, so the
 frozen CPU/GPU selection controls eager compute without registry lookup on the
-hot path. `dispatch_workgraph_value()`
+hot path. Migrated capture regions receive their own placement-aware
+`PlanResources`; consumers that do not explicitly implement this activation
+boundary fail closed instead of silently running a legacy handler. Region
+compilation explicitly uses an empty internal value-flow set; cross-boundary
+values remain owned by the root plan rather than being silently filtered.
+`dispatch_workgraph_value()`
 can only submit through the dispatcher acquired for that prepared epoch. Old
 resources remain non-reusable while their dispatcher has an in-flight copy,
 and retirement polls its fences before collection.

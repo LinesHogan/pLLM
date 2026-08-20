@@ -649,6 +649,8 @@ class PlacementRuntimeBinding:
     def compile(
         self,
         physical: PhysicalFlowPlan,
+        *,
+        value_flows: tuple[ValueFlowDesc, ...] | None = None,
     ) -> tuple[
         PlacementPlan,
         PlacementPlanDispatcher,
@@ -661,7 +663,7 @@ class PlacementRuntimeBinding:
             physical,
             registry=self.registry,
             topology=self.topology,
-            value_flows=self.value_flows,
+            value_flows=self.value_flows if value_flows is None else value_flows,
             transfer_profile=self.transfer_profile,
             transfer_profiles=self.transfer_profiles,
             copy_engines=self.copy_engines,

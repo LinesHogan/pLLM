@@ -29,11 +29,14 @@ from tllm.runtime.scheduling.plan_store import (
     RuntimeStream,
 )
 from tllm.runtime.scheduling.workgraph_executor import (
+    PhysicalExecutionContext,
     PhysicalExecutionError,
     PhysicalExecutionKind,
     PhysicalExecutor,
 )
+from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
 from tllm.runtime.state import ResidualRuntimeState
+from tllm.workgraph import phase3
 from tllm.workgraph import (
     ArtifactKey,
     Capability,
@@ -51,10 +54,12 @@ from tllm.workgraph import (
 from tllm.workgraph.frontend import ExternContract
 from tllm.workgraph.anchors import BackendResolution, shadow_backend_snapshot
 from tllm.workgraph import physical as physical_module
+from tllm.workgraph.compiler import Phase1aPlan
 from tllm.workgraph.lowering import WorkGraphError
 from tllm.workgraph.physical import (
     CapturePolicy,
     FallbackPolicy,
+    PhysicalCaptureRegion,
     PhysicalFlowPlan,
     FenceKey,
     StreamClass,
@@ -95,6 +100,29 @@ class _RecordingESampConsumer(ESampConsumer):
 
     def activate_workgraph_regions(self, regions: tuple[object, ...]) -> None:
         self.activated_regions.extend(regions)
+
+
+class _PlacementRecordingESampConsumer(ESampConsumer):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.activated_resource_batches: list[tuple[PlanResources, ...]] = []
+
+    def activate_workgraph_region_resources(
+        self,
+        regions: tuple[PhysicalCaptureRegion, ...],
+        resources: tuple[PlanResources, ...],
+    ) -> None:
+        self.activated_resource_batches.append(resources)
+        super().activate_workgraph_region_resources(regions, resources)
+
+
+class _RecordingRuntimeImplementation:
+    def __init__(self, label: str, trace: list[tuple[str, tuple[object, ...]]]) -> None:
+        self._label = label
+        self._trace = trace
+
+    def execute(self, *args: object) -> None:
+        self._trace.append((self._label, args))
 
 
 def _resolution() -> BackendResolution:
@@ -228,6 +256,120 @@ def _step_bundle(
 
 
 class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
+    def test_base_consumer_fails_closed_on_unhandled_placement_resources(self) -> None:
+        class UnsupportedConsumer(BaseConsumer[object]):
+            config = object()
+
+            @property
+            def consumer_id(self) -> str:
+                return "unsupported-placement-consumer"
+
+        resources = PlanResources(plan=PhysicalFlowPlan(plan_epoch=1, nodes=()))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "does not support WorkGraph placement resources",
+        ):
+            UnsupportedConsumer().activate_workgraph_region_resources((), (resources,))
+
+    def test_residual_activation_executes_selected_esamp_region_implementation(self) -> None:
+        engine = mock.Mock()
+        consumer = _PlacementRecordingESampConsumer(
+            ESampConsumerConfig(graph_scratch_rows=8),
+            engine=engine,
+        )
+        _consumer, phase1, _captured = _esamp_phase1(consumer)
+        self.assertIsInstance(phase1, Phase1aPlan)
+        assert isinstance(phase1, Phase1aPlan)
+        root_plan = physical_module.compile_physical_flow_plan(phase1)
+        region_executor = consumer.workgraph_region_executors()[0].executor
+        trace: list[tuple[str, tuple[object, ...]]] = []
+        registry = phase3.ImplementationRegistry()
+        logical_executors = tuple(
+            dict.fromkeys((*tuple(node.executor for node in root_plan.nodes), region_executor))
+        )
+        selected_key: ExecutorKey | None = None
+        for ordinal, logical_executor in enumerate(logical_executors):
+            is_region = logical_executor == region_executor
+            implementation_key = ExecutorKey(
+                "implementation",
+                f"phase3.esamp.region-{ordinal}",
+            )
+            registry.register(
+                phase3.ImplementationSpec(
+                    key=implementation_key,
+                    logical_executor=logical_executor,
+                    placement=phase3.Placement(phase3.DeviceKind.CPU),
+                    implementation=_RecordingRuntimeImplementation(
+                        "selected" if is_region else f"root-{ordinal}",
+                        trace,
+                    ),
+                )
+            )
+            if is_region:
+                selected_key = implementation_key
+        self.assertIsNotNone(selected_key)
+        binding = PlacementRuntimeBinding(
+            registry=registry,
+            topology=phase3.DeviceTopology(peer_access=frozenset()),
+        )
+        state = ResidualRuntimeState()
+        source = torch.randn(2, 4)
+        target = torch.randn(2, 4)
+        legacy_staging = mock.Mock(
+            side_effect=AssertionError("legacy ESamp staging handler executed")
+        )
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(
+                consumer,
+                "_execute_workgraph_staging",
+                legacy_staging,
+            ),
+        ):
+            residual_runtime.configure_workgraph_placement(binding)
+            residual_runtime.register_dispatch_consumer(consumer)
+            residual_runtime.record_workgraph_backend_resolution(
+                resolution=_resolution(),
+            )
+            residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
+
+            self.assertEqual(len(consumer.activated_resource_batches), 1)
+            (activation_resources,) = consumer.activated_resource_batches[0]
+            placement_plan = activation_resources.placement_plan
+            self.assertIsNotNone(placement_plan)
+            assert placement_plan is not None
+            self.assertEqual(
+                placement_plan.selections[0].key,
+                selected_key,
+            )
+            self.assertIsInstance(consumer._workgraph_executor, PhysicalExecutor)
+            self.assertIsNotNone(consumer._workgraph_plan_store)
+            assert consumer._workgraph_plan_store is not None
+            self.assertIs(
+                consumer._workgraph_plan_store.current.placement_plan,
+                activation_resources.placement_plan,
+            )
+
+            residual_runtime.prepare_workgraph_step(1)
+            with mock.patch.object(
+                consumer,
+                "_ensure_runtime_resources",
+                return_value=None,
+            ):
+                consumer.consume_bundle(_bundle(source, target), _context())
+
+        legacy_staging.assert_not_called()
+        engine.launch_step.assert_not_called()
+        self.assertEqual(tuple(label for label, _args in trace), ("selected",))
+        self.assertEqual(len(trace[0][1]), 1)
+        context = trace[0][1][0]
+        self.assertIsInstance(context, PhysicalExecutionContext)
+        assert isinstance(context, PhysicalExecutionContext)
+        self.assertIs(context.tensors[0], source)
+        self.assertIs(context.tensors[1], target)
+
     def test_clear_active_region_defers_destruction_until_the_prepared_step_retires(self) -> None:
         consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
         _consumer, _phase1, _captured = _esamp_phase1(consumer)

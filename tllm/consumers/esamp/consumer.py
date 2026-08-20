@@ -431,12 +431,34 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         self,
         regions: tuple[PhysicalCaptureRegion, ...],
     ) -> None:
+        self._activate_workgraph_region_resources(regions, ())
+
+    def activate_workgraph_region_resources(
+        self,
+        regions: tuple[PhysicalCaptureRegion, ...],
+        resources: tuple[PlanResources, ...],
+    ) -> None:
+        self._activate_workgraph_region_resources(regions, resources)
+
+    def _activate_workgraph_region_resources(
+        self,
+        regions: tuple[PhysicalCaptureRegion, ...],
+        placement_resources: tuple[PlanResources, ...],
+    ) -> None:
         capture = self._workgraph_capture
         attachment = self._workgraph_attachment
         if not regions:
+            if placement_resources:
+                raise ValueError(
+                    "ESamp placement resources require one physical region"
+                )
             self._workgraph_deactivate_pending = True
             self._finalize_workgraph_deactivation()
             return
+        if placement_resources and len(placement_resources) != len(regions):
+            raise ValueError(
+                "ESamp placement resources must exactly cover physical regions"
+            )
         if capture is None or attachment is None:
             raise RuntimeError("ESamp physical region requires a specialized capture")
         matching = tuple(
@@ -461,8 +483,15 @@ class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
         if node.executor != _ESAMP_STAGE_EXECUTOR:
             raise ValueError("ESamp physical region selected an unexpected executor")
         region_stream = _ESampRegionStream(self._engine)
-        resources = PlanResources(
-            plan=plan,
+        base_resources = (
+            PlanResources(plan=plan)
+            if not placement_resources
+            else placement_resources[0]
+        )
+        if base_resources.plan != plan:
+            raise ValueError("ESamp placement resources bind a different region plan")
+        resources = replace(
+            base_resources,
             streams=(
                 RuntimeStream(
                     StreamClass.SIDE_FORWARD,
