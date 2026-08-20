@@ -503,6 +503,7 @@ def finish_workgraph_distributed_step(step_id: int) -> None:
     store = RUNTIME.distributed_plan_store
     if store is None:
         return
+    store.poll()
     store.finish_step(step)
     store.collect_retired()
     if RUNTIME.distributed_prepared_step_id == step:

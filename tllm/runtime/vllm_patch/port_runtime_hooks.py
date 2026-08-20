@@ -792,6 +792,12 @@ def wrapped_execute_model(
             layer_path=None,
             capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )
+        from tllm.runtime import residual_runtime as _residual_runtime
+
+        if core is _residual_runtime:
+            _residual_runtime.finish_workgraph_distributed_step(
+                int(core.RUNTIME.event_step_id)
+            )
     return out
 
 

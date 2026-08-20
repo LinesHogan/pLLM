@@ -584,5 +584,111 @@ class Phase4LegacyGenericLifecycleAuditRedTest(unittest.TestCase):
         self.assertEqual(events, ["execute_model.pre", "execute_model.post"])
 
 
+class Phase4DistributedTerminalCloseAuditRedTest(unittest.TestCase):
+    def _assert_terminal_closes_step(
+        self,
+        wrapper: object,
+        *,
+        sample_result: object = "sampled",
+    ) -> None:
+        binding = _binding(
+            self,
+            request=_request(name="terminal-close", window=CollectiveWindow.STEP_END),
+        )
+        state = ResidualRuntimeState()
+        state.event_step_id = 1
+        runner = SimpleNamespace(model=SimpleNamespace())
+        real_dispatch = common_hooks.dispatch_runtime_event
+
+        def dispatch(**kwargs: object) -> int:
+            result = real_dispatch(**kwargs)
+            if kwargs["event_name"] == "sample_tokens.post":
+                step = state.distributed_prepared_step_id
+                self.assertEqual(step, 1)
+                key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]
+                residual_runtime.launch_workgraph_collective(
+                    step,
+                    collective=key,
+                    payload=object(),
+                )
+            return result
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(common_hooks, "dispatch_runtime_event", side_effect=dispatch),
+        ):
+            residual_runtime.configure_workgraph_distributed(binding)
+            residual_runtime.publish_workgraph_distributed(plan_epoch=1)
+            residual_runtime.prepare_workgraph_step(1)
+            result = wrapper(
+                core=residual_runtime,
+                runner=runner,
+                grammar_output=object(),
+                orig=mock.Mock(return_value=sample_result),
+            )
+
+            self.assertEqual(result, sample_result)
+            self.assertEqual(state.distributed_prepared_step_id, -1)
+            self.assertNotIn(1, state.distributed_plan_store._active)
+            store = state.distributed_plan_store
+            self.assertTrue(store.closeable)
+            self.assertEqual(store.poll(), 0)
+
+    def test_legacy_generic_terminal_closes_prepared_step_and_retires_fence(self) -> None:
+        binding = _binding(
+            self,
+            request=_request(name="terminal-close", window=CollectiveWindow.STEP_END),
+        )
+        state = ResidualRuntimeState()
+        state.event_step_id = 1
+        runner = SimpleNamespace(model=SimpleNamespace())
+        real_dispatch = common_hooks.dispatch_runtime_event
+
+        def orig_execute(_runner: object, *_args: object, **_kwargs: object) -> str:
+            return "executed"
+
+        def dispatch(**kwargs: object) -> int:
+            result = real_dispatch(**kwargs)
+            if kwargs["event_name"] == "sample_tokens.post":
+                step = state.distributed_prepared_step_id
+                self.assertEqual(step, 1)
+                key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]
+                residual_runtime.launch_workgraph_collective(
+                    step,
+                    collective=key,
+                    payload=object(),
+                )
+            return result
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(residual_runtime, "_ORIG_EXECUTE_MODEL", orig_execute),
+            mock.patch.object(port_runtime_hooks._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
+            mock.patch.object(port_runtime_hooks, "setup_runtime_hooks_if_active"),
+        ):
+            residual_runtime.configure_workgraph_distributed(binding)
+            residual_runtime.publish_workgraph_distributed(plan_epoch=1)
+            residual_runtime.prepare_workgraph_step(1)
+            result = port_runtime_hooks.wrapped_execute_model(
+                core=residual_runtime,
+                runner=runner,
+                args=(),
+                kwargs={},
+            )
+
+            self.assertEqual(result, "executed")
+            self.assertEqual(state.distributed_prepared_step_id, -1)
+            self.assertNotIn(1, state.distributed_plan_store._active)
+            store = state.distributed_plan_store
+            self.assertTrue(store.closeable)
+            self.assertEqual(store.poll(), 0)
+
+    def test_mrv1_sample_terminal_closes_prepared_step_and_retires_fence(self) -> None:
+        self._assert_terminal_closes_step(v027_mrv1._wrapped_sample_tokens)
+
+    def test_mrv2_sample_terminal_closes_prepared_step_and_retires_fence(self) -> None:
+        self._assert_terminal_closes_step(v027_mrv2._wrapped_sample_tokens)
+
+
 if __name__ == "__main__":
     unittest.main()
