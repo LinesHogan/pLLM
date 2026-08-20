@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from itertools import product
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
 from tllm.workgraph.ir import ExecutorKey, NodeKey
@@ -36,6 +37,9 @@ class CopyEngine(StrEnum):
 
 class PlacementCompilationError(RuntimeError):
     """Raised when a frozen Phase 3 plan fails cross-language validation."""
+
+
+_MAX_EXACT_PLACEMENT_ASSIGNMENTS = 100_000
 
 
 _T = TypeVar("_T")
@@ -225,6 +229,8 @@ class Move:
             raise ValueError("Move kind does not match its typed placements")
         if not isinstance(cast(object, self.asynchronous), bool):
             raise TypeError("Move.asynchronous must be bool")
+        if not self.asynchronous:
+            raise ValueError("Phase 3 Move must be asynchronous")
         object.__setattr__(self, "value", value)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "destination", destination)
@@ -267,7 +273,9 @@ class DeviceTopology:
         )
         if len(set(devices)) != len(devices):
             raise ValueError("DeviceTopology.cuda_devices must be unique")
-        if devices and any(
+        if not devices and normalized:
+            devices = tuple(sorted({index for edge in normalized for index in edge}))
+        if any(
             source not in devices or destination not in devices
             for source, destination in normalized
         ):
@@ -284,7 +292,7 @@ class DeviceTopology:
 
     def contains(self, placement: Placement) -> bool:
         placement = _instance(placement, Placement, "DeviceTopology.placement")
-        if placement.kind == DeviceKind.CPU or not self.cuda_devices:
+        if placement.kind == DeviceKind.CPU:
             return True
         assert placement.index is not None
         return placement.index in self.cuda_devices
@@ -823,13 +831,22 @@ class ImplementationDesc:
 class ImplementationRegistry:
     """Control-plane registry; runtime callables never enter frozen plans."""
 
-    __slots__ = ("_specs", "_by_logical", "_oracles", "_verified")
+    __slots__ = (
+        "_specs",
+        "_by_logical",
+        "_oracles",
+        "_verified",
+        "_verification_cases",
+    )
 
     def __init__(self) -> None:
         self._specs: dict[ExecutorKey, ImplementationSpec] = {}
         self._by_logical: dict[ExecutorKey, list[ImplementationSpec]] = {}
         self._oracles: dict[SemanticOracleKey, SemanticOracle] = {}
         self._verified: dict[ExecutorKey, SemanticOracleVerificationDesc] = {}
+        self._verification_cases: dict[
+            ExecutorKey, tuple[tuple[object, ...], ...]
+        ] = {}
 
     def register_oracle(self, spec: SemanticOracleSpec) -> None:
         spec = _instance(spec, SemanticOracleSpec, "ImplementationRegistry.oracle")
@@ -852,6 +869,7 @@ class ImplementationRegistry:
             )
         )
         self._verified.pop(spec.logical_executor, None)
+        self._verification_cases.pop(spec.logical_executor, None)
 
     def resolve(self, key: ExecutorKey) -> RuntimeImplementation:
         key = _executor_key(key, "ImplementationRegistry.key")
@@ -872,10 +890,22 @@ class ImplementationRegistry:
                 )
             verification = self._verified.get(logical_executor)
             oracle_key = cast(SemanticOracleKey, next(iter(oracle_keys)))
-            if verification is None or verification.oracle_key != oracle_key:
+            cases = self._verification_cases.get(logical_executor)
+            implementation_keys = tuple(spec.key for spec in specs)
+            if (
+                verification is None
+                or verification.oracle_key != oracle_key
+                or verification.implementations != implementation_keys
+                or cases is None
+            ):
                 raise SemanticOracleMismatch(
                     "cross-placement implementations require semantic oracle verification"
                 )
+            self._verify_current_semantics(
+                specs=specs,
+                oracle_key=oracle_key,
+                cases=cases,
+            )
         return tuple(
             ImplementationDesc(
                 key=spec.key,
@@ -912,6 +942,28 @@ class ImplementationRegistry:
                 "cross-placement implementations require one shared semantic oracle"
             )
         oracle_key = cast(SemanticOracleKey, next(iter(oracle_keys)))
+        self._verify_current_semantics(
+            specs=specs,
+            oracle_key=oracle_key,
+            cases=typed_cases,
+        )
+        verification = SemanticOracleVerificationDesc(
+            logical_executor=logical_executor,
+            oracle_key=oracle_key,
+            implementations=tuple(spec.key for spec in specs),
+            case_count=len(typed_cases),
+        )
+        self._verified[logical_executor] = verification
+        self._verification_cases[logical_executor] = typed_cases
+        return verification
+
+    def _verify_current_semantics(
+        self,
+        *,
+        specs: tuple[ImplementationSpec, ...],
+        oracle_key: SemanticOracleKey,
+        cases: tuple[tuple[object, ...], ...],
+    ) -> None:
         try:
             oracle = self._oracles[oracle_key]
         except KeyError as exc:
@@ -919,7 +971,7 @@ class ImplementationRegistry:
                 f"semantic oracle {oracle_key.value} is not registered"
             ) from exc
         reference = specs[0]
-        for case_index, case in enumerate(typed_cases):
+        for case_index, case in enumerate(cases):
             expected = reference.implementation.execute(*case)
             for candidate in specs[1:]:
                 actual = candidate.implementation.execute(*case)
@@ -928,14 +980,6 @@ class ImplementationRegistry:
                         "semantic oracle mismatch for "
                         f"{candidate.key.value} on case {case_index}"
                     )
-        verification = SemanticOracleVerificationDesc(
-            logical_executor=logical_executor,
-            oracle_key=oracle_key,
-            implementations=tuple(spec.key for spec in specs),
-            case_count=len(typed_cases),
-        )
-        self._verified[logical_executor] = verification
-        return verification
 
     def keys(self) -> tuple[ExecutorKey, ...]:
         return tuple(sorted(self._specs, key=lambda key: key.value))
@@ -1217,12 +1261,23 @@ class PlacementPlan:
                 or selected.placement != item.placement
             ):
                 raise ValueError("PlacementPlan schedule differs from its selection")
+            if item.end_at - item.start_at != selected.duration.microseconds:
+                raise ValueError(
+                    "PlacementPlan schedule duration differs from its selection"
+                )
             if any(
                 dependency not in positions
                 or positions[dependency] >= positions[item.node_key]
                 for dependency in item.depends_on
             ):
                 raise ValueError("PlacementPlan schedule dependencies must be ordered")
+            if any(
+                schedule[positions[dependency]].end_at > item.start_at
+                for dependency in item.depends_on
+            ):
+                raise ValueError(
+                    "PlacementPlan schedule dependencies must finish before launch"
+                )
         if len(set(residencies)) != len(residencies):
             raise ValueError("PlacementPlan residencies must be unique")
         residency_set = set(residencies)
@@ -1407,12 +1462,31 @@ def compile_placement_plan(
     if any(logical not in logical_executors for logical in overrides):
         raise ValueError("placement override references an unknown logical executor")
 
+    candidate_cache: dict[ExecutorKey, tuple[ImplementationDesc, ...]] = {}
+
     def available_candidates(logical: ExecutorKey) -> tuple[ImplementationDesc, ...]:
-        return tuple(
-            candidate
-            for candidate in registry.candidates(logical)
-            if topology.contains(candidate.placement)
+        cached = candidate_cache.get(logical)
+        if cached is not None:
+            return cached
+        available = tuple(
+            sorted(
+                (
+                    candidate
+                    for candidate in registry.candidates(logical)
+                    if topology.contains(candidate.placement)
+                ),
+                key=lambda candidate: (
+                    candidate.key.value,
+                    candidate.placement.kind.value,
+                    -1
+                    if candidate.placement.index is None
+                    else candidate.placement.index,
+                    candidate.duration.microseconds,
+                ),
+            )
         )
+        candidate_cache[logical] = available
+        return available
 
     dependencies: dict[NodeKey, set[NodeKey]] = {
         node.node_key: {fence.producer for fence in node.fences}
@@ -1421,21 +1495,21 @@ def compile_placement_plan(
     for flow in flows:
         dependencies[flow.consumer].add(flow.producer)
 
-    minimum_duration: dict[NodeKey, int] = {}
+    choices_by_node: dict[NodeKey, tuple[ImplementationDesc, ...]] = {}
     for node in physical.nodes:
-        candidates = available_candidates(node.executor)
-        if not candidates:
+        node_choices = available_candidates(node.executor)
+        if not node_choices:
             raise ValueError(f"no implementation registered for {node.executor.value}")
         override = overrides.get(node.executor)
-        if override is not None and all(item.key != override for item in candidates):
+        if override is not None:
+            node_choices = tuple(
+                item for item in node_choices if item.key == override
+            )
+        if not node_choices:
             raise ValueError("placement override is not registered for its logical executor")
-        minimum_duration[node.node_key] = min(
-            item.duration.microseconds
-            for item in candidates
-            if override is None or item.key == override
-        )
+        choices_by_node[node.node_key] = node_choices
 
-    candidates = tuple(
+    schedule_inputs = tuple(
         ScheduleCandidate(
             key=node.node_key.value,
             priority=0,
@@ -1443,80 +1517,103 @@ def compile_placement_plan(
             depends_on=tuple(
                 dependency.value for dependency in sorted(dependencies[node.node_key])
             ),
-            duration=minimum_duration[node.node_key],
+            duration=min(
+                item.duration.microseconds
+                for item in choices_by_node[node.node_key]
+            ),
         )
         for node in physical.nodes
     )
     node_by_text = {node.node_key.value: node for node in physical.nodes}
-    node_order = tuple(node_by_text[item.key] for item in schedule_candidates(candidates))
+    node_order = tuple(
+        node_by_text[item.key] for item in schedule_candidates(schedule_inputs)
+    )
 
-    selections_by_node: dict[NodeKey, ImplementationSelectionDesc] = {}
+    assignment_count = 1
     for node in node_order:
-        choices = available_candidates(node.executor)
-        override = overrides.get(node.executor)
-        if override is not None:
-            choices = tuple(item for item in choices if item.key == override)
-        inbound = tuple(flow for flow in flows if flow.consumer == node.node_key)
+        assignment_count *= len(choices_by_node[node.node_key])
+        if assignment_count > _MAX_EXACT_PLACEMENT_ASSIGNMENTS:
+            raise PlacementCompilationError(
+                "exact placement assignment search exceeds the Phase 3 bound; "
+                "reduce implementation candidates or provide placement overrides"
+            )
 
-        def choice_score(choice: ImplementationDesc) -> tuple[int, str, str]:
-            transfer_cost = 0
-            for flow in inbound:
-                producer = selections_by_node[flow.producer]
-                source = Residency(flow.value, producer.placement)
-                destination = Residency(flow.value, choice.placement)
-                for move in compile_moves(
-                    (TransferRequest(flow.value, source, destination, flow.byte_count),),
+    capacity_by_engine = {item.engine: item.capacity for item in capacities}
+
+    def assignment_score(
+        assignment: tuple[ImplementationDesc, ...],
+    ) -> tuple[int, int, int, tuple[str, ...]]:
+        selected = {
+            node.node_key: choice
+            for node, choice in zip(node_order, assignment, strict=True)
+        }
+        engine_lanes = {
+            engine: [0] * capacity
+            for engine, capacity in capacity_by_engine.items()
+        }
+        placement_available: dict[Placement, int] = {}
+        node_end: dict[NodeKey, int] = {}
+        transfer_work = 0
+        compute_work = 0
+        makespan = 0
+        for node in node_order:
+            choice = selected[node.node_key]
+            dependency_end = max(
+                (node_end[item] for item in dependencies[node.node_key]),
+                default=0,
+            )
+            inbound_end = dependency_end
+            for flow in sorted(
+                (item for item in flows if item.consumer == node.node_key),
+                key=lambda item: (item.value.value, item.producer.value),
+            ):
+                producer = selected[flow.producer]
+                route = compile_moves(
+                    (
+                        TransferRequest(
+                            flow.value,
+                            Residency(flow.value, producer.placement),
+                            Residency(flow.value, choice.placement),
+                            flow.byte_count,
+                        ),
+                    ),
                     topology=topology,
-                ):
-                    duration, _fallback = _profiled_move_duration(
+                )
+                ready = node_end[flow.producer]
+                for move in route:
+                    lanes = engine_lanes[move.engine]
+                    lane = min(
+                        range(len(lanes)), key=lambda index: (lanes[index], index)
+                    )
+                    begin = max(ready, lanes[lane])
+                    duration, _used_fallback = _profiled_move_duration(
                         move,
                         aggregate=transfer_profile,
                         profiles=route_profiles,
                     )
-                    transfer_cost += duration.microseconds
-            outbound = tuple(flow for flow in flows if flow.producer == node.node_key)
-            for flow in outbound:
-                consumer_node = nodes[flow.consumer]
-                consumer_choices = available_candidates(consumer_node.executor)
-                consumer_override = overrides.get(consumer_node.executor)
-                if consumer_override is not None:
-                    consumer_choices = tuple(
-                        item for item in consumer_choices if item.key == consumer_override
-                    )
-                route_costs: list[int] = []
-                for consumer_choice in consumer_choices:
-                    source = Residency(flow.value, choice.placement)
-                    destination = Residency(flow.value, consumer_choice.placement)
-                    route = compile_moves(
-                        (
-                            TransferRequest(
-                                flow.value,
-                                source,
-                                destination,
-                                flow.byte_count,
-                            ),
-                        ),
-                        topology=topology,
-                    )
-                    route_costs.append(
-                        sum(
-                            _profiled_move_duration(
-                                move,
-                                aggregate=transfer_profile,
-                                profiles=route_profiles,
-                            )[0].microseconds
-                            for move in route
-                        )
-                    )
-                if route_costs:
-                    transfer_cost += min(route_costs)
-            return (
-                choice.duration.microseconds + transfer_cost,
-                str(choice.placement),
-                choice.key.value,
+                    ready = begin + duration.microseconds
+                    lanes[lane] = ready
+                    transfer_work += duration.microseconds
+                inbound_end = max(inbound_end, ready)
+            start = max(
+                dependency_end,
+                inbound_end,
+                placement_available.get(choice.placement, 0),
             )
+            end = start + choice.duration.microseconds
+            node_end[node.node_key] = end
+            placement_available[choice.placement] = end
+            compute_work += choice.duration.microseconds
+            makespan = max(makespan, end)
+        signature = tuple(choice.key.value for choice in assignment)
+        return makespan, transfer_work, compute_work, signature
 
-        chosen = min(choices, key=choice_score)
+    assignments = product(
+        *(choices_by_node[node.node_key] for node in node_order)
+    )
+    chosen_assignment = min(assignments, key=assignment_score)
+    selections_by_node: dict[NodeKey, ImplementationSelectionDesc] = {}
+    for node, chosen in zip(node_order, chosen_assignment, strict=True):
         selections_by_node[node.node_key] = ImplementationSelectionDesc(
             node_key=node.node_key,
             logical_executor=node.executor,
@@ -1526,7 +1623,6 @@ def compile_placement_plan(
             oracle_key=chosen.oracle_key,
         )
 
-    capacity_by_engine = {item.engine: item.capacity for item in capacities}
     engine_lanes: dict[CopyEngine, list[int]] = {
         engine: [0] * capacity for engine, capacity in capacity_by_engine.items()
     }

@@ -106,7 +106,9 @@ class Phase3PlacementResidencyTest(unittest.TestCase):
 
         moves = phase3.compile_moves(
             (request,),
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
         )
         self.assertEqual(moves, ())
 
@@ -114,7 +116,9 @@ class Phase3PlacementResidencyTest(unittest.TestCase):
         phase3 = _phase3(self)
         cpu = phase3.Placement("cpu")
         gpu0 = phase3.Placement("cuda", 0)
-        topology = phase3.DeviceTopology(peer_access=frozenset())
+        topology = phase3.DeviceTopology(
+            peer_access=frozenset(), cuda_devices=(0,)
+        )
 
         h2d = phase3.compile_moves(
             (self._request(phase3, source=cpu, destination=gpu0),),
@@ -149,7 +153,9 @@ class Phase3PlacementResidencyTest(unittest.TestCase):
 
         moves = phase3.compile_moves(
             (request,),
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0, 1)
+            ),
         )
         self.assertEqual(tuple(move.kind.value for move in moves), ("d2h", "h2d"))
         self.assertEqual(moves[0].destination.placement, phase3.Placement("cpu"))

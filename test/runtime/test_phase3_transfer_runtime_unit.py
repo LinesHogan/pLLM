@@ -289,7 +289,9 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         )
         moves = phase3.compile_moves(
             (request,),
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0, 1)
+            ),
         )
 
         handle = executor.submit(
@@ -347,7 +349,9 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         )
         moves = phase3.compile_moves(
             (request,),
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0, 1)
+            ),
         )
 
         for failure_index in (0, 1):

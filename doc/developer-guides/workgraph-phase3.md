@@ -17,8 +17,11 @@ When one logical executor has implementations on more than one placement,
 each implementation must name the same `SemanticOracleKey`. The registry must
 run that registered oracle over explicit shared input cases before those
 candidates become eligible. A mismatch, absent oracle, or stale verification
-fails closed; the frozen selection records only the oracle key, never the
-oracle callable or runtime outputs.
+fails closed. Before returning cross-placement candidates, the registry reruns
+the retained verification cases against the current implementation objects, so
+mutating an implementation cannot reuse an older proof. The frozen selection
+records only the oracle key, never the oracle callable, cases, or runtime
+outputs.
 
 `compile_placement_plan()` consumes an already validated `PhysicalFlowPlan`, a
 typed `ImplementationRegistry`, directional `DeviceTopology`, and explicit
@@ -26,6 +29,15 @@ typed `ImplementationRegistry`, directional `DeviceTopology`, and explicit
 critical-path list schedule. Missing duration or transfer measurements use a
 conservative typed fallback; the planner does not invoke CP-SAT without a
 credible profile.
+
+Placement is selected jointly for the whole region. The planner enumerates the
+deterministically ordered Cartesian product of eligible implementations and
+simulates the same dependency, placement, and copy-engine-capacity timeline
+used by the emitted schedule. It minimizes makespan, then transfer work,
+compute work, and finally a stable implementation-key tie breaker. Exact search
+is bounded at 100,000 assignments; a larger space fails closed and requires
+placement overrides or a smaller registry instead of silently falling back to
+a local greedy choice.
 
 Exact `TransferProfileDesc` entries match move kind and directional source /
 destination placement, then derive duration from byte count. Candidate scoring
@@ -59,6 +71,10 @@ The route matrix is explicit and directional:
 
 Peer access is not treated as symmetric. For a staged GPU transfer, the H2D
 move depends on the D2H move and the pinned-host lease covers both intervals.
+`cuda_devices` is a closed device inventory. When it is omitted or empty,
+peer-access endpoints are the only inferred CUDA devices; with no peer edges,
+the topology is CPU-only. Implementations and transfer endpoints outside that
+inventory fail closed.
 
 ## Python runtime ownership
 

@@ -175,7 +175,9 @@ class Phase3PlacementPlanTest(unittest.TestCase):
         first_registry.verify_semantics(source_executor, cases=((1, 4, 9),))
         second_registry.verify_semantics(source_executor, cases=((1, 4, 9),))
 
-        topology = phase3.DeviceTopology(peer_access=frozenset())
+        topology = phase3.DeviceTopology(
+            peer_access=frozenset(), cuda_devices=(0,)
+        )
         first = phase3.compile_placement_plan(  # type: ignore[attr-defined]
             physical,
             registry=first_registry,
@@ -266,7 +268,9 @@ class Phase3PlacementPlanTest(unittest.TestCase):
         plan = phase3.compile_placement_plan(
             physical,
             registry=registry,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
             placement_overrides={source_executor: gpu_key},
         )
         selected = plan.selections[0]
@@ -313,8 +317,153 @@ class Phase3PlacementPlanTest(unittest.TestCase):
             phase3.compile_placement_plan(
                 physical,
                 registry=registry,
-                topology=phase3.DeviceTopology(peer_access=frozenset()),
+                topology=phase3.DeviceTopology(
+                    peer_access=frozenset(), cuda_devices=(0,)
+                ),
             )
+
+    def test_global_placement_cost_keeps_producer_and_consumer_on_the_gpu(self) -> None:
+        """Candidate selection must optimize the connected region, not one node."""
+
+        phase3 = _phase3(self)
+        physical, source_executor, target_executor = _physical_plan()
+        registry = phase3.ImplementationRegistry()
+        oracle_key = _register_equal_oracle(phase3, registry)
+        source_cpu = _implementation(
+            phase3,
+            key=ExecutorKey("implementation", "phase3.global.source.cpu"),
+            logical_executor=source_executor,
+            placement=phase3.Placement("cpu"),
+            duration=1,
+            oracle_key=oracle_key,
+        )
+        source_gpu = _implementation(
+            phase3,
+            key=ExecutorKey("implementation", "phase3.global.source.cuda0"),
+            logical_executor=source_executor,
+            placement=phase3.Placement("cuda", 0),
+            duration=2,
+            oracle_key=oracle_key,
+        )
+        target_cpu = _implementation(
+            phase3,
+            key=ExecutorKey("implementation", "phase3.global.target.cpu"),
+            logical_executor=target_executor,
+            placement=phase3.Placement("cpu"),
+            duration=100,
+            oracle_key=oracle_key,
+        )
+        target_gpu = _implementation(
+            phase3,
+            key=ExecutorKey("implementation", "phase3.global.target.cuda0"),
+            logical_executor=target_executor,
+            placement=phase3.Placement("cuda", 0),
+            duration=1,
+            oracle_key=oracle_key,
+        )
+        for spec in (source_cpu, source_gpu, target_cpu, target_gpu):
+            registry.register(spec)
+        registry.verify_semantics(source_executor, cases=((),))
+        registry.verify_semantics(target_executor, cases=((),))
+
+        value = phase3.ValueKey("global-cost", 1)
+        plan = phase3.compile_placement_plan(
+            physical,
+            registry=registry,
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(),
+                cuda_devices=(0,),
+            ),
+            value_flows=(
+                phase3.ValueFlowDesc(
+                    value=value,
+                    producer=physical.nodes[0].node_key,
+                    consumer=physical.nodes[1].node_key,
+                    byte_count=64,
+                ),
+            ),
+            transfer_profile=phase3.TransferProfile(
+                h2d=phase3.DurationProfile(16),
+            ),
+        )
+
+        self.assertEqual(
+            tuple(selection.placement for selection in plan.selections),
+            (phase3.Placement("cuda", 0), phase3.Placement("cuda", 0)),
+        )
+        self.assertEqual(plan.moves, ())
+
+    def test_peer_endpoints_define_an_implicit_cuda_allowlist_when_devices_are_empty(self) -> None:
+        phase3 = _phase3(self)
+        topology = phase3.DeviceTopology(
+            peer_access=frozenset({(0, 1)}),
+            cuda_devices=(),
+        )
+
+        self.assertTrue(topology.contains(phase3.Placement("cuda", 0)))
+        self.assertTrue(topology.contains(phase3.Placement("cuda", 1)))
+        self.assertFalse(topology.contains(phase3.Placement("cuda", 2)))
+
+        physical, source_executor, target_executor = _physical_plan()
+        registry = phase3.ImplementationRegistry()
+        registry.register(
+            _implementation(
+                phase3,
+                key=ExecutorKey("implementation", "phase3.topology.implicit.cuda2"),
+                logical_executor=source_executor,
+                placement=phase3.Placement("cuda", 2),
+                duration=1,
+            )
+        )
+        registry.register(
+            _implementation(
+                phase3,
+                key=ExecutorKey("implementation", "phase3.topology.implicit.cpu"),
+                logical_executor=target_executor,
+                placement=phase3.Placement("cpu"),
+                duration=1,
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            phase3.compile_placement_plan(
+                physical,
+                registry=registry,
+                topology=topology,
+            )
+
+    def test_semantic_verification_is_invalidated_when_an_implementation_changes(self) -> None:
+        phase3 = _phase3(self)
+        logical = ExecutorKey("logical", "phase3.semantic.revision")
+        registry = phase3.ImplementationRegistry()
+        oracle_key = _register_equal_oracle(phase3, registry)
+        cpu = _SemanticImplementation("cpu")
+        gpu = _SemanticImplementation("cuda0")
+        registry.register(
+            phase3.ImplementationSpec(
+                ExecutorKey("implementation", "phase3.semantic.revision.cpu"),
+                phase3.Placement("cpu"),
+                cpu,
+                logical_executor=logical,
+                oracle_key=oracle_key,
+            )
+        )
+        registry.register(
+            phase3.ImplementationSpec(
+                ExecutorKey("implementation", "phase3.semantic.revision.cuda0"),
+                phase3.Placement("cuda", 0),
+                gpu,
+                logical_executor=logical,
+                oracle_key=oracle_key,
+            )
+        )
+
+        registry.verify_semantics(logical, cases=((1, 4, 9),))
+        self.assertEqual(len(registry.candidates(logical)), 2)
+
+        gpu.increment = 2
+        with self.assertRaises(phase3.SemanticOracleMismatch):
+            registry.candidates(logical)
 
     def test_branching_residencies_and_signature_are_hash_seed_deterministic(self) -> None:
         script = textwrap.dedent(
@@ -494,7 +643,9 @@ class Phase3TransferSchedulingTest(unittest.TestCase):
         )
         moves = phase3.compile_moves(  # type: ignore[attr-defined]
             requests,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0, 1)
+            ),
         )
         profile = phase3.TransferProfile(  # type: ignore[attr-defined]
             h2d=phase3.DurationProfile(7),  # type: ignore[attr-defined]
@@ -530,7 +681,9 @@ class Phase3TransferSchedulingTest(unittest.TestCase):
         )
         move = phase3.compile_moves(  # type: ignore[attr-defined]
             (request,),
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
         )[0]
         known = phase3.schedule_moves(  # type: ignore[attr-defined]
             (move,),
@@ -585,7 +738,9 @@ class Phase3TransferSchedulingTest(unittest.TestCase):
         plan = phase3.compile_placement_plan(
             physical,
             registry=registry,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
             value_flows=(
                 phase3.ValueFlowDesc(
                     value,
@@ -654,13 +809,17 @@ class Phase3SignatureTest(unittest.TestCase):
         cpu_plan = phase3.compile_placement_plan(  # type: ignore[attr-defined]
             physical,
             registry=registry,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
             placement_overrides={source_executor: source_cpu},
         )
         gpu_plan = phase3.compile_placement_plan(  # type: ignore[attr-defined]
             physical,
             registry=registry,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=phase3.DeviceTopology(
+                peer_access=frozenset(), cuda_devices=(0,)
+            ),
             placement_overrides={source_executor: source_gpu},
         )
 

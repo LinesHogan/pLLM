@@ -137,7 +137,9 @@ def _compile(
     return phase3_module.compile_placement_plan(
         physical,
         registry=_registry(phase3_module, source=source, destination=destination),
-        topology=phase3_module.DeviceTopology(peer_access=peer_access),
+        topology=phase3_module.DeviceTopology(
+            peer_access=peer_access, cuda_devices=(0, 1)
+        ),
         value_flows=(
             phase3_module.ValueFlowDesc(
                 value=value,
@@ -227,6 +229,37 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
 
         _assert_rejected(self, _proxy(plan, schedule=tuple(reversed(plan.schedule))))
 
+    def test_python_and_rust_reject_schedule_duration_mismatch(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        selected = plan.selections[1]
+        scheduled = plan.schedule[1]
+        malformed_schedule = _proxy(
+            scheduled,
+            end_at=scheduled.start_at + selected.duration.microseconds + 1,
+        )
+        malformed_plan = _proxy(
+            plan,
+            schedule=(plan.schedule[0], malformed_schedule),
+        )
+
+        with self.assertRaises(ValueError):
+            replace(
+                plan,
+                schedule=(
+                    plan.schedule[0],
+                    replace(
+                        scheduled,
+                        end_at=scheduled.start_at + selected.duration.microseconds + 1,
+                    ),
+                ),
+            )
+        _assert_rejected(self, malformed_plan)
+
     def test_validator_rejects_move_route_engine_and_dependency_order(self) -> None:
         phase3 = _phase3(self)
         staged = _compile(
@@ -264,6 +297,25 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
         )
         late_second = _proxy(second, end_at=consumer.start_at + 1)
         _assert_rejected(self, _proxy(staged, moves=(first, late_second)))
+
+    def test_python_and_rust_reject_synchronous_scheduled_moves(self) -> None:
+        phase3 = _phase3(self)
+        staged = _compile(
+            self,
+            source=phase3.Placement("cuda", 0),
+            destination=phase3.Placement("cuda", 1),
+        )
+        first, second = staged.moves
+        with self.assertRaises(ValueError):
+            replace(first.move, asynchronous=False)
+        synchronous_move = _proxy(first.move, asynchronous=False)
+        malformed_first = _proxy(first, move=synchronous_move)
+        malformed_plan = _proxy(
+            staged,
+            moves=(malformed_first, second),
+        )
+
+        _assert_rejected(self, malformed_plan)
 
     def test_validator_rejects_unknown_lease_residency_and_invalid_lifetime(self) -> None:
         phase3 = _phase3(self)
