@@ -4041,8 +4041,12 @@ fn validate_distributed_plan_v4(plan: &DistributedFlowPlanV4Desc) -> Result<Vec<
         .iter()
         .map(|communicator| (communicator.key.clone(), communicator.clone()))
         .collect();
+    let mut expected_communicator_order: Vec<CommunicatorV4Desc> =
+        expected_communicators.values().cloned().collect();
+    expected_communicator_order.sort_by(|left, right| left.key.cmp(&right.key));
     if actual_communicators.len() != plan.communicators.len()
         || actual_communicators != expected_communicators
+        || plan.communicators != expected_communicator_order
     {
         return Err("DistributedFlowPlan communicators must exactly match demand".to_string());
     }

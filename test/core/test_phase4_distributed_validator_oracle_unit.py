@@ -8,7 +8,7 @@ that a future producer or another process could provide.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import importlib
 from typing import Iterable
 import unittest
@@ -326,6 +326,20 @@ def _oracle_validate(plan: object) -> None:
         if signature[1] >= len(expected_groups) or members != expected_groups[signature[1]]:
             raise ValueError("communicator topology mismatch")
         _text(getattr(communicator, "backend"))
+    expected_communicator_order = tuple(
+        sorted(
+            communicators,
+            key=lambda communicator: (
+                _text(getattr(getattr(communicator, "key"), "kind")),
+                _nonnegative_int(
+                    getattr(getattr(communicator, "key"), "group_index"),
+                    "communicator group",
+                ),
+            ),
+        )
+    )
+    if communicators != expected_communicator_order:
+        raise ValueError("communicators must use canonical order")
 
     collectives = _seq(getattr(plan, "collectives"), "collectives")
     if len(collectives) != len(ordered):
@@ -442,6 +456,16 @@ class Phase4DistributedValidatorOracleUnitTest(unittest.TestCase):
         communicator = plan.communicators[0]
         malformed = _proxy(communicator, ranks=(0,))
         _assert_same(self, _proxy(plan, communicators=(malformed, *plan.communicators[1:])), expected="err")
+
+    def test_python_and_rust_reject_reversed_canonical_communicators(self) -> None:
+        plan = _plan()
+        self.assertGreaterEqual(len(plan.communicators), 2)
+        reversed_communicators = tuple(reversed(plan.communicators))
+
+        with self.assertRaises((TypeError, ValueError, RuntimeError)):
+            replace(plan, communicators=reversed_communicators)
+
+        _assert_same(self, _proxy(plan, communicators=reversed_communicators), expected="err")
 
     def test_python_and_rust_reject_malformed_local_schedule(self) -> None:
         plan = _plan()
