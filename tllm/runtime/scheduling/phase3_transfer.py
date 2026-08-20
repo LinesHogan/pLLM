@@ -12,9 +12,11 @@ from tllm.workgraph.ir import NodeKey
 from tllm.workgraph.phase3 import (
     CopyEngine,
     CopyEngineCapacityDesc,
+    DeviceKind,
     MemoryKind,
     Move,
     MoveKind,
+    Placement,
     PlacementPlan,
     ValueKey,
 )
@@ -75,6 +77,13 @@ def _shape(value: object) -> tuple[int, ...]:
     if not dimensions:
         raise ValueError("tensor shape must be non-empty")
     return dimensions
+
+
+def _tensor_matches_placement(tensor: TensorLike, placement: Placement) -> bool:
+    text = str(tensor.device)
+    if placement.kind == DeviceKind.CPU:
+        return text == "cpu" or text.startswith("cpu:")
+    return text == f"cuda:{placement.index}"
 
 
 @dataclass(slots=True, eq=False)
@@ -361,6 +370,10 @@ class CopyExecutor:
         else:
             source = active.source
             destination = active.destination
+        if not _tensor_matches_placement(source, move.source.placement):
+            raise ValueError("source tensor device does not match scheduled move")
+        if not _tensor_matches_placement(destination, move.destination.placement):
+            raise ValueError("destination tensor device does not match scheduled move")
         fence = self._adapter.copy(
             move.kind.value,
             source,

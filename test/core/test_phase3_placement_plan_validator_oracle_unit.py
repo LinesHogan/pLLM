@@ -171,6 +171,36 @@ def _assert_rejected(test_case: unittest.TestCase, plan: object) -> None:
 
 
 class Phase3PlacementPlanValidatorTest(unittest.TestCase):
+    def test_python_and_rust_reject_runtime_text_in_node_keys(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        original = plan.selections[0].node_key
+        runtime_key = _FrozenAttrs(
+            (
+                ("namespace", "runtime"),
+                ("owner", "<Tensor object at 0xdeadbeef>_runtime_node"),
+                ("ordinal", original.ordinal),
+            )
+        )
+        runtime_selection = _proxy(plan.selections[0], node_key=runtime_key)
+        runtime_schedule = _proxy(plan.schedule[0], node_key=runtime_key)
+        proxy = _proxy(
+            plan,
+            selections=(runtime_selection, plan.selections[1]),
+            schedule=(runtime_schedule, plan.schedule[1]),
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            replace(
+                plan,
+                selections=(runtime_selection, plan.selections[1]),
+                schedule=(runtime_schedule, plan.schedule[1]),
+            )
+        _assert_rejected(self, proxy)
+
     def test_python_and_rust_reject_unstable_value_key_separators(self) -> None:
         phase3 = _phase3(self)
         with self.assertRaises(ValueError):

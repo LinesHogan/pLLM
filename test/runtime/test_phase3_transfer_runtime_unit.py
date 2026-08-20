@@ -425,6 +425,28 @@ class Phase3CopyExecutorTest(unittest.TestCase):
                 adapter=adapter,
             )
 
+    def test_dispatcher_rejects_tensor_devices_that_do_not_match_frozen_route(self) -> None:
+        transfer = _transfer_runtime(self)
+        plan = _placement_plan_with_capacities()
+        adapter = _FakeTensorCopyAdapter()
+        pool = transfer.PinnedMemoryPool(capacity=2, adapter=adapter)
+        dispatcher = transfer.PlacementPlanDispatcher(
+            plan=plan,
+            pool=pool,
+            adapter=adapter,
+        )
+        move = plan.moves[0]
+        source = _FakeTensor((4,), "float32", "cuda:7", [1.0] * 4)
+        destination = _FakeTensor((4,), "float32", "cuda:0", [0.0] * 4)
+        with self.assertRaises(ValueError):
+            dispatcher.submit(
+                producer=move.producer,
+                consumer=move.consumer,
+                value=move.move.value,
+                source=source,
+                destination=destination,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

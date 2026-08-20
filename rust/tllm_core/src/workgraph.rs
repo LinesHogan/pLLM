@@ -2796,6 +2796,14 @@ fn validate_v3_placement(placement: &PlacementV3Desc, layer: &str) -> Result<(),
     }
 }
 
+fn validate_v3_node_key(node_key: &NodeKeyDesc, layer: &str) -> Result<(), String> {
+    validate_node_key(node_key, layer)?;
+    if contains_runtime_text(&node_key.namespace) || contains_runtime_text(&node_key.owner) {
+        return Err(format!("{} key contains runtime identity text", layer));
+    }
+    Ok(())
+}
+
 fn validate_v3_value(value: &ValueKeyV3Desc, layer: &str) -> Result<(), String> {
     if value.name.is_empty()
         || value.version < 1
@@ -2868,7 +2876,7 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     let mut logical_oracles: HashMap<String, (PlacementV3Desc, Option<SemanticOracleKeyV3Desc>)> =
         HashMap::new();
     for selection in &plan.selections {
-        validate_node_key(&selection.node_key, "placement selection")?;
+        validate_v3_node_key(&selection.node_key, "placement selection")?;
         validate_executor(Some(&selection.logical_executor), "placement logical")?;
         validate_executor(Some(&selection.key), "placement implementation")?;
         if contains_runtime_text(&selection.logical_executor.namespace)
@@ -2926,7 +2934,7 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
 
     let mut schedule_positions = HashMap::new();
     for (position, item) in plan.schedule.iter().enumerate() {
-        validate_node_key(&item.node_key, "placed node")?;
+        validate_v3_node_key(&item.node_key, "placed node")?;
         validate_executor(Some(&item.implementation), "placed implementation")?;
         if contains_runtime_text(&item.implementation.namespace)
             || contains_runtime_text(&item.implementation.name)
@@ -2961,7 +2969,7 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     for (position, item) in plan.schedule.iter().enumerate() {
         let mut dependencies = HashSet::new();
         for dependency in &item.depends_on {
-            validate_node_key(dependency, "placed node dependency")?;
+            validate_v3_node_key(dependency, "placed node dependency")?;
             let text = dependency.text();
             if !dependencies.insert(text.clone()) {
                 return Err("placed node dependencies must be unique".to_string());
@@ -3066,8 +3074,8 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             .consumer
             .as_ref()
             .ok_or_else(|| "scheduled move requires a consumer node".to_string())?;
-        validate_node_key(producer, "scheduled move producer")?;
-        validate_node_key(consumer, "scheduled move consumer")?;
+        validate_v3_node_key(producer, "scheduled move producer")?;
+        validate_v3_node_key(consumer, "scheduled move consumer")?;
         let producer_position = schedule_positions
             .get(&producer.text())
             .ok_or_else(|| "scheduled move references an unknown producer".to_string())?;
