@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
@@ -385,14 +385,15 @@ class PlacementPlanDispatcher:
         pool: PinnedMemoryPool,
         adapter: TensorCopyAdapter,
     ) -> None:
-        self.plan = _instance(plan, PlacementPlan, "PlacementPlanDispatcher.plan")
+        raw_plan = _instance(plan, PlacementPlan, "PlacementPlanDispatcher.plan")
+        self.plan = replace(raw_plan)
         self._executor = CopyExecutor(
             pool=pool,
             adapter=adapter,
-            capacities=plan.copy_engines,
+            capacities=self.plan.copy_engines,
         )
         routes: dict[tuple[NodeKey, NodeKey, ValueKey], list[Move]] = {}
-        for scheduled in plan.moves:
+        for scheduled in self.plan.moves:
             if scheduled.producer is None or scheduled.consumer is None:
                 raise ValueError("placement plan move lacks producer/consumer binding")
             key = (scheduled.producer, scheduled.consumer, scheduled.move.value)

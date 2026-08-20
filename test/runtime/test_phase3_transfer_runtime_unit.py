@@ -406,6 +406,25 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         self.assertEqual(destination.payload, [5.0, 6.0])
         self.assertTrue(handle.complete)
 
+    def test_dispatcher_rejects_manual_plan_with_cuda_endpoint_outside_topology(self) -> None:
+        transfer = _transfer_runtime(self)
+        plan = _placement_plan_with_capacities()
+        move = plan.moves[0].move
+        object.__setattr__(
+            move,
+            "destination",
+            phase3.Residency(move.value, phase3.Placement("cuda", 99)),
+        )
+        adapter = _FakeTensorCopyAdapter()
+        pool = transfer.PinnedMemoryPool(capacity=2, adapter=adapter)
+
+        with self.assertRaises((TypeError, ValueError, RuntimeError)):
+            transfer.PlacementPlanDispatcher(
+                plan=plan,
+                pool=pool,
+                adapter=adapter,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

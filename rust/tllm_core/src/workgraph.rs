@@ -722,6 +722,14 @@ impl PlacementV3Desc {
     }
 }
 
+#[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
+struct DeviceTopologyV3Desc {
+    #[pyo3(attribute)]
+    peer_access: HashSet<(i64, i64)>,
+    #[pyo3(attribute)]
+    cuda_devices: Vec<i64>,
+}
+
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
 struct ValueKeyV3Desc {
     #[pyo3(attribute)]
@@ -885,6 +893,8 @@ struct PlacementPlanV3Desc {
     selections: Vec<ImplementationSelectionV3Desc>,
     #[pyo3(attribute)]
     schedule: Vec<PlacedNodeV3Desc>,
+    #[pyo3(attribute)]
+    topology: DeviceTopologyV3Desc,
     #[pyo3(attribute)]
     residencies: Vec<ResidencyV3Desc>,
     #[pyo3(attribute)]
@@ -2798,9 +2808,39 @@ fn validate_v3_value(value: &ValueKeyV3Desc, layer: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn validate_v3_residency(residency: &ResidencyV3Desc, layer: &str) -> Result<(), String> {
+fn validate_v3_topology(topology: &DeviceTopologyV3Desc) -> Result<HashSet<i64>, String> {
+    let mut devices = HashSet::new();
+    for device in &topology.cuda_devices {
+        if *device < 0 || !devices.insert(*device) {
+            return Err("PlacementPlan topology has an invalid CUDA inventory".to_string());
+        }
+    }
+    for (source, destination) in &topology.peer_access {
+        if source == destination || !devices.contains(source) || !devices.contains(destination) {
+            return Err("PlacementPlan topology has an invalid peer-access edge".to_string());
+        }
+    }
+    Ok(devices)
+}
+
+fn topology_contains_v3(placement: &PlacementV3Desc, cuda_devices: &HashSet<i64>) -> bool {
+    match (placement.kind.as_str(), placement.index) {
+        ("cpu", None) => true,
+        ("cuda", Some(index)) => cuda_devices.contains(&index),
+        _ => false,
+    }
+}
+
+fn validate_v3_residency(
+    residency: &ResidencyV3Desc,
+    layer: &str,
+    cuda_devices: &HashSet<i64>,
+) -> Result<(), String> {
     validate_v3_value(&residency.value, layer)?;
     validate_v3_placement(&residency.placement, layer)?;
+    if !topology_contains_v3(&residency.placement, cuda_devices) {
+        return Err(format!("{} references a placement outside topology", layer));
+    }
     let valid_memory = match residency.placement.kind.as_str() {
         "cpu" => ["host", "pinned_host"].contains(&residency.memory.as_str()),
         "cuda" => residency.memory == "device",
@@ -2822,6 +2862,7 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
     if plan.plan_epoch < 1 {
         return Err("PlacementPlan plan_epoch must be >= 1".to_string());
     }
+    let topology_devices = validate_v3_topology(&plan.topology)?;
 
     let mut selections = HashMap::new();
     let mut logical_oracles: HashMap<String, (PlacementV3Desc, Option<SemanticOracleKeyV3Desc>)> =
@@ -2840,6 +2881,9 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             return Err("placement selection contains runtime identity text".to_string());
         }
         validate_v3_placement(&selection.placement, "placement selection")?;
+        if !topology_contains_v3(&selection.placement, &topology_devices) {
+            return Err("placement selection is outside topology".to_string());
+        }
         if selection.duration.microseconds < 1 || selection.duration.samples < 1 {
             return Err("placement selection has an invalid duration profile".to_string());
         }
@@ -2891,6 +2935,9 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             return Err("placed implementation contains runtime identity text".to_string());
         }
         validate_v3_placement(&item.placement, "placed node")?;
+        if !topology_contains_v3(&item.placement, &topology_devices) {
+            return Err("placed node is outside topology".to_string());
+        }
         if item.start_at < 0 || item.end_at <= item.start_at {
             return Err("placed node has an invalid schedule interval".to_string());
         }
@@ -2932,7 +2979,7 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
 
     let mut residencies = HashSet::new();
     for residency in &plan.residencies {
-        validate_v3_residency(residency, "placement residency")?;
+        validate_v3_residency(residency, "placement residency", &topology_devices)?;
         if !residencies.insert(residency.text()) {
             return Err("PlacementPlan contains duplicate residencies".to_string());
         }
@@ -2961,8 +3008,16 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
             return Err("scheduled move has an invalid stable key".to_string());
         }
         validate_v3_value(&item.r#move.value, "scheduled move value")?;
-        validate_v3_residency(&item.r#move.source, "scheduled move source")?;
-        validate_v3_residency(&item.r#move.destination, "scheduled move destination")?;
+        validate_v3_residency(
+            &item.r#move.source,
+            "scheduled move source",
+            &topology_devices,
+        )?;
+        validate_v3_residency(
+            &item.r#move.destination,
+            "scheduled move destination",
+            &topology_devices,
+        )?;
         if item.r#move.source.value != item.r#move.value
             || item.r#move.destination.value != item.r#move.value
             || item.r#move.source.placement == item.r#move.destination.placement
@@ -2982,6 +3037,23 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
         };
         if item.r#move.kind != expected_kind || item.engine != expected_kind {
             return Err("scheduled move kind/engine differs from its placements".to_string());
+        }
+        if item.r#move.kind == "p2p" {
+            let source = item
+                .r#move
+                .source
+                .placement
+                .index
+                .expect("validated CUDA source");
+            let destination = item
+                .r#move
+                .destination
+                .placement
+                .index
+                .expect("validated CUDA destination");
+            if !plan.topology.peer_access.contains(&(source, destination)) {
+                return Err("scheduled P2P move is outside topology".to_string());
+            }
         }
         if item.start_at < 0 || item.end_at <= item.start_at {
             return Err("scheduled move has an invalid interval".to_string());
@@ -3068,7 +3140,7 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
 
     let mut leases = HashMap::new();
     for lease in &plan.leases {
-        validate_v3_residency(&lease.residency, "placement lease")?;
+        validate_v3_residency(&lease.residency, "placement lease", &topology_devices)?;
         if lease.live_start < 0 || lease.live_end < lease.live_start {
             return Err("placement lease has an invalid live range".to_string());
         }

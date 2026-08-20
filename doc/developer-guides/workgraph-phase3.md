@@ -47,6 +47,8 @@ conservative per-engine fallback when no exact measured route exists.
 The resulting plan records:
 
 - the implementation and `Placement` selected for every physical node;
+- the frozen `DeviceTopology` inventory and directional peer-access edges used
+  to validate every selected endpoint and route at runtime;
 - node start/end times and ordered dependencies;
 - all materialized `Residency` values;
 - every `ScheduledMove`, directional copy engine, interval, and dependency;

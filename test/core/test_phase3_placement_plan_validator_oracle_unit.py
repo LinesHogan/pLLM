@@ -130,16 +130,20 @@ def _compile(
     source: object,
     destination: object,
     peer_access: frozenset[tuple[int, int]] = frozenset(),
+    topology: object | None = None,
 ) -> object:
     phase3_module = _phase3(test_case)
     physical, source_node, target_node, _source_executor, _target_executor = _physical_plan()
     value = phase3_module.ValueKey("hidden", 1)
+    compiled_topology = topology
+    if compiled_topology is None:
+        compiled_topology = phase3_module.DeviceTopology(
+            peer_access=peer_access, cuda_devices=(0, 1)
+        )
     return phase3_module.compile_placement_plan(
         physical,
         registry=_registry(phase3_module, source=source, destination=destination),
-        topology=phase3_module.DeviceTopology(
-            peer_access=peer_access, cuda_devices=(0, 1)
-        ),
+        topology=compiled_topology,
         value_flows=(
             phase3_module.ValueFlowDesc(
                 value=value,
@@ -176,6 +180,25 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
         )
         result = _validator(self)(plan)
         self.assertIsNotNone(result)
+
+    def test_compiled_plan_owns_a_frozen_topology_snapshot(self) -> None:
+        phase3 = _phase3(self)
+        source_topology = phase3.DeviceTopology(
+            peer_access=frozenset({(0, 1)}),
+            cuda_devices=(0, 1),
+        )
+        plan = _compile(
+            self,
+            source=phase3.Placement("cuda", 0),
+            destination=phase3.Placement("cuda", 1),
+            topology=source_topology,
+        )
+
+        object.__setattr__(source_topology, "cuda_devices", (99,))
+        object.__setattr__(source_topology, "peer_access", frozenset())
+
+        self.assertEqual(plan.topology.cuda_devices, (0, 1))
+        self.assertEqual(plan.topology.peer_access, frozenset({(0, 1)}))
 
     def test_validator_rejects_schema_and_epoch_corruption(self) -> None:
         phase3 = _phase3(self)
@@ -393,6 +416,137 @@ class Phase3PlacementPlanValidatorTest(unittest.TestCase):
                 schedule=(runtime_schedule, *plan.schedule[1:]),
             ),
         )
+
+    def test_python_and_rust_reject_placements_outside_frozen_topology(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cuda", 0),
+        )
+        cuda99 = phase3.Placement("cuda", 99)
+
+        bad_selection = replace(plan.selections[1], placement=cuda99)
+        bad_schedule = replace(plan.schedule[1], placement=cuda99)
+        with self.assertRaises(ValueError):
+            replace(
+                plan,
+                selections=(plan.selections[0], bad_selection),
+                schedule=(plan.schedule[0], bad_schedule),
+            )
+        _assert_rejected(
+            self,
+            _proxy(
+                plan,
+                selections=(
+                    plan.selections[0],
+                    _proxy(plan.selections[1], placement=cuda99),
+                ),
+                schedule=(
+                    plan.schedule[0],
+                    _proxy(plan.schedule[1], placement=cuda99),
+                ),
+            ),
+        )
+
+        destination = next(
+            item
+            for item in plan.residencies
+            if item.placement == phase3.Placement("cuda", 0)
+        )
+        bad_residency = phase3.Residency(destination.value, cuda99)
+        bad_residencies = tuple(
+            bad_residency if item == destination else item for item in plan.residencies
+        )
+        scheduled = plan.moves[0]
+        bad_move = replace(scheduled.move, destination=bad_residency)
+        bad_scheduled = replace(scheduled, move=bad_move)
+        bad_moves = (bad_scheduled, *plan.moves[1:])
+        bad_leases = tuple(
+            replace(lease, residency=bad_residency)
+            if lease.residency == destination
+            else lease
+            for lease in plan.leases
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                plan,
+                residencies=bad_residencies,
+                moves=bad_moves,
+                leases=bad_leases,
+            )
+        _assert_rejected(
+            self,
+            _proxy(
+                plan,
+                residencies=bad_residencies,
+                moves=tuple(
+                    _proxy(item, move=bad_move) if item is scheduled else item
+                    for item in plan.moves
+                ),
+                leases=bad_leases,
+            ),
+        )
+
+    def test_python_and_rust_reject_reverse_directional_peer_edge(self) -> None:
+        phase3 = _phase3(self)
+        plan = _compile(
+            self,
+            source=phase3.Placement("cuda", 0),
+            destination=phase3.Placement("cuda", 1),
+            peer_access=frozenset({(0, 1)}),
+        )
+        self.assertEqual(
+            tuple(item.move.kind for item in plan.moves),
+            (phase3.MoveKind.P2P,),
+        )
+        reverse_only = phase3.DeviceTopology(
+            peer_access=frozenset({(1, 0)}),
+            cuda_devices=(0, 1),
+        )
+        with self.assertRaises(ValueError):
+            replace(plan, topology=reverse_only)
+        _assert_rejected(self, _proxy(plan, topology=reverse_only))
+
+    def test_python_replace_recursively_rejects_mutated_move_contract(self) -> None:
+        phase3 = _phase3(self)
+
+        synchronous = _compile(
+            self,
+            source=phase3.Placement("cuda", 0),
+            destination=phase3.Placement("cuda", 1),
+        )
+        object.__setattr__(synchronous.moves[0].move, "asynchronous", False)
+        with self.assertRaises(ValueError):
+            replace(synchronous)
+        _assert_rejected(self, synchronous)
+
+        wrong_kind = _compile(
+            self,
+            source=phase3.Placement("cuda", 0),
+            destination=phase3.Placement("cuda", 1),
+        )
+        object.__setattr__(wrong_kind.moves[0].move, "kind", phase3.MoveKind.H2D)
+        with self.assertRaises(ValueError):
+            replace(wrong_kind)
+        _assert_rejected(self, wrong_kind)
+
+        wrong_endpoint = _compile(
+            self,
+            source=phase3.Placement("cuda", 0),
+            destination=phase3.Placement("cuda", 1),
+        )
+        object.__setattr__(
+            wrong_endpoint.moves[0].move,
+            "destination",
+            phase3.Residency(
+                wrong_endpoint.moves[0].move.value,
+                phase3.Placement("cuda", 99),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            replace(wrong_endpoint)
+        _assert_rejected(self, wrong_endpoint)
 
 
 class Phase3PlacementPlanCompilerRouteTest(unittest.TestCase):

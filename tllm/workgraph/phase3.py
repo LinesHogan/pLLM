@@ -81,17 +81,20 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
 
 def _executor_key(value: object, label: str) -> ExecutorKey:
     key = _instance(value, ExecutorKey, label)
-    _text(key.namespace, f"{label}.namespace")
-    _text(key.name, f"{label}.name")
-    _text(key.version, f"{label}.version")
-    return key
+    return ExecutorKey(
+        _text(key.namespace, f"{label}.namespace"),
+        _text(key.name, f"{label}.name"),
+        _text(key.version, f"{label}.version"),
+    )
 
 
 def _node_key(value: object, label: str) -> NodeKey:
     key = _instance(value, NodeKey, label)
-    _text(key.namespace, f"{label}.namespace")
-    _text(key.owner, f"{label}.owner")
-    return key
+    return NodeKey(
+        _text(key.namespace, f"{label}.namespace"),
+        _text(key.owner, f"{label}.owner"),
+        _integer(key.ordinal, f"{label}.ordinal"),
+    )
 
 
 def _tuple_of(value: object, expected: type[_T], label: str) -> tuple[_T, ...]:
@@ -1208,6 +1211,7 @@ class PlacementPlan:
     plan_epoch: int
     selections: tuple[ImplementationSelectionDesc, ...]
     schedule: tuple[PlacedNodeDesc, ...]
+    topology: DeviceTopology
     residencies: tuple[Residency, ...] = ()
     moves: tuple[ScheduledMove, ...] = ()
     leases: tuple[PlacementLeaseDesc, ...] = ()
@@ -1232,6 +1236,100 @@ class PlacementPlan:
             CopyEngineCapacityDesc,
             "PlacementPlan.copy_engines",
         )
+        raw_topology = _instance(
+            self.topology, DeviceTopology, "PlacementPlan.topology"
+        )
+        topology = DeviceTopology(
+            peer_access=raw_topology.peer_access,
+            cuda_devices=raw_topology.cuda_devices,
+        )
+
+        def canonical_placement(value: Placement) -> Placement:
+            return Placement(value.kind, value.index)
+
+        def canonical_value(value: ValueKey) -> ValueKey:
+            return ValueKey(value.name, value.version)
+
+        def canonical_residency(value: Residency) -> Residency:
+            return Residency(
+                canonical_value(value.value),
+                canonical_placement(value.placement),
+                value.memory,
+            )
+
+        def canonical_oracle(
+            value: SemanticOracleKey | None,
+        ) -> SemanticOracleKey | None:
+            if value is None:
+                return None
+            return SemanticOracleKey(value.namespace, value.name, value.version)
+
+        selections = tuple(
+            ImplementationSelectionDesc(
+                node_key=item.node_key,
+                logical_executor=item.logical_executor,
+                key=item.key,
+                placement=canonical_placement(item.placement),
+                duration=DurationProfile(
+                    item.duration.microseconds, item.duration.samples
+                ),
+                oracle_key=canonical_oracle(item.oracle_key),
+            )
+            for item in selections
+        )
+        schedule = tuple(
+            PlacedNodeDesc(
+                node_key=item.node_key,
+                implementation=item.implementation,
+                placement=canonical_placement(item.placement),
+                start_at=item.start_at,
+                end_at=item.end_at,
+                depends_on=tuple(
+                    _node_key(dependency, "PlacedNodeDesc.depends_on")
+                    for dependency in item.depends_on
+                ),
+            )
+            for item in schedule
+        )
+        residencies = tuple(canonical_residency(item) for item in residencies)
+        moves = tuple(
+            ScheduledMove(
+                key=MoveKey(canonical_value(item.key.value), item.key.ordinal),
+                move=Move(
+                    value=canonical_value(item.move.value),
+                    source=canonical_residency(item.move.source),
+                    destination=canonical_residency(item.move.destination),
+                    kind=item.move.kind,
+                    byte_count=item.move.byte_count,
+                    asynchronous=item.move.asynchronous,
+                ),
+                engine=item.engine,
+                start_at=item.start_at,
+                end_at=item.end_at,
+                producer=item.producer,
+                consumer=item.consumer,
+                depends_on=tuple(
+                    MoveKey(
+                        canonical_value(dependency.value), dependency.ordinal
+                    )
+                    for dependency in item.depends_on
+                ),
+                used_fallback=item.used_fallback,
+            )
+            for item in moves
+        )
+        leases = tuple(
+            PlacementLeaseDesc(
+                canonical_residency(item.residency),
+                item.live_start,
+                item.live_end,
+            )
+            for item in leases
+        )
+        copy_engines = tuple(
+            CopyEngineCapacityDesc(item.engine, item.capacity)
+            for item in copy_engines
+        )
         if self.schema_version != 1:
             raise ValueError("PlacementPlan.schema_version must be 1")
         selection_nodes = tuple(item.node_key for item in selections)
@@ -1248,6 +1346,10 @@ class PlacementPlan:
                     raise ValueError(
                         "cross-placement selections require one semantic oracle key"
                     )
+        if any(
+            not topology.contains(item.placement) for item in selections
+        ):
+            raise ValueError("PlacementPlan selection is outside its topology")
         if len(set(schedule_nodes)) != len(schedule_nodes):
             raise ValueError("PlacementPlan schedule must have unique nodes")
         if set(selection_nodes) != set(schedule_nodes):
@@ -1280,6 +1382,10 @@ class PlacementPlan:
                 )
         if len(set(residencies)) != len(residencies):
             raise ValueError("PlacementPlan residencies must be unique")
+        if any(
+            not topology.contains(item.placement) for item in residencies
+        ):
+            raise ValueError("PlacementPlan residency is outside its topology")
         residency_set = set(residencies)
         if any(
             item.move.source not in residency_set
@@ -1292,6 +1398,14 @@ class PlacementPlan:
             raise ValueError("PlacementPlan moves require explicit producer and consumer nodes")
         for item in moves:
             assert item.producer is not None and item.consumer is not None
+            if (
+                item.move.kind == MoveKind.P2P
+                and not topology.supports_peer(
+                    item.move.source.placement,
+                    item.move.destination.placement,
+                )
+            ):
+                raise ValueError("PlacementPlan P2P move is outside its topology")
             producer = schedule_by_node.get(item.producer)
             consumer = schedule_by_node.get(item.consumer)
             if producer is None or consumer is None:
@@ -1359,6 +1473,7 @@ class PlacementPlan:
         object.__setattr__(self, "plan_epoch", epoch)
         object.__setattr__(self, "selections", selections)
         object.__setattr__(self, "schedule", schedule)
+        object.__setattr__(self, "topology", topology)
         object.__setattr__(self, "residencies", residencies)
         object.__setattr__(self, "moves", moves)
         object.__setattr__(self, "leases", leases)
@@ -1734,6 +1849,7 @@ def compile_placement_plan(
             selections_by_node[node.node_key] for node in node_order
         ),
         schedule=tuple(scheduled_nodes),
+        topology=topology,
         residencies=ordered_residencies,
         moves=tuple(scheduled_moves),
         leases=leases,

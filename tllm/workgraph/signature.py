@@ -72,6 +72,7 @@ from tllm.workgraph.physical import (
 )
 from tllm.workgraph.phase3 import (
     CopyEngineCapacityDesc,
+    DeviceTopology,
     DurationProfile,
     ImplementationDesc,
     ImplementationSelectionDesc,
@@ -193,6 +194,11 @@ def _canonical(value: Any) -> Any:
         }
     if isinstance(value, Placement):
         return {"kind": _canonical(value.kind), "index": value.index}
+    if isinstance(value, DeviceTopology):
+        return {
+            "peer_access": _canonical(tuple(sorted(value.peer_access))),
+            "cuda_devices": _canonical(value.cuda_devices),
+        }
     if isinstance(value, ValueKey):
         return {"name": value.name, "version": value.version}
     if isinstance(value, Residency):
@@ -301,6 +307,7 @@ def _canonical(value: Any) -> Any:
             "plan_epoch": value.plan_epoch,
             "selections": _canonical(value.selections),
             "schedule": _canonical(value.schedule),
+            "topology": _canonical(value.topology),
             "residencies": _canonical(value.residencies),
             "moves": _canonical(value.moves),
             "leases": _canonical(value.leases),
