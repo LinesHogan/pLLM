@@ -99,7 +99,11 @@ same frozen plan can dispatch the route again in later runtime steps.
 Production cold paths install a typed `PlacementRuntimeBinding`. The concrete
 WorkGraph compiler publishes its `PlacementPlan` and dispatcher in the same
 `PlanResources` epoch as the `PhysicalFlowPlan`; `PlanSnapshotStore` makes both
-visible atomically at the next prepare safe point. `dispatch_workgraph_value()`
+visible atomically at the next prepare safe point. The cold compiler also
+resolves each selected implementation key into an epoch-owned typed binding;
+`PhysicalExecutor` uses that binding before any legacy logical handler, so the
+frozen CPU/GPU selection controls eager compute without registry lookup on the
+hot path. `dispatch_workgraph_value()`
 can only submit through the dispatcher acquired for that prepared epoch. Old
 resources remain non-reusable while their dispatcher has an in-flight copy,
 and retirement polls its fences before collection.

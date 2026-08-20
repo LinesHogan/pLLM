@@ -236,13 +236,19 @@ def _stage_physical_workgraph_snapshot() -> None:
     physical_plan = compile_physical_flow_plan(snapshot)
     placement_plan = None
     placement_dispatcher = None
+    placement_implementations = ()
     placement_binding = RUNTIME.placement_runtime_binding
     if placement_binding is not None:
-        placement_plan, placement_dispatcher = placement_binding.compile(physical_plan)
+        (
+            placement_plan,
+            placement_dispatcher,
+            placement_implementations,
+        ) = placement_binding.compile(physical_plan)
     resources = PlanResources(
         plan=physical_plan,
         placement_plan=placement_plan,
         placement_dispatcher=placement_dispatcher,
+        placement_implementations=placement_implementations,
     )
     store = RUNTIME.physical_plan_store
     if store is None:

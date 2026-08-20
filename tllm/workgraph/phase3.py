@@ -1414,6 +1414,16 @@ class PlacementPlan:
                 raise ValueError(
                     "PlacementPlan schedule dependencies must finish before launch"
                 )
+        for position, item in enumerate(schedule):
+            if any(
+                other.placement == item.placement
+                and other.start_at < item.end_at
+                and other.end_at > item.start_at
+                for other in schedule[:position]
+            ):
+                raise ValueError(
+                    "PlacementPlan compute intervals must not overlap on one placement"
+                )
         if len(set(residencies)) != len(residencies):
             raise ValueError("PlacementPlan residencies must be unique")
         if any(

@@ -171,6 +171,63 @@ def _assert_rejected(test_case: unittest.TestCase, plan: object) -> None:
 
 
 class Phase3PlacementPlanValidatorTest(unittest.TestCase):
+    def test_python_and_rust_reject_overlapping_compute_on_one_placement(self) -> None:
+        phase3 = _phase3(self)
+        physical, first_node, second_node, _first_executor, _second_executor = _physical_plan()
+        physical = PhysicalFlowPlan(
+            plan_epoch=physical.plan_epoch,
+            nodes=(
+                replace(physical.nodes[0], fences=()),
+                replace(physical.nodes[1], fences=()),
+            ),
+        )
+        registry = _registry(
+            phase3,
+            source=phase3.Placement("cpu"),
+            destination=phase3.Placement("cpu"),
+        )
+        same_placement = phase3.compile_placement_plan(
+            physical,
+            registry=registry,
+            topology=phase3.DeviceTopology(peer_access=frozenset(), cuda_devices=(0,)),
+        )
+        first = next(item for item in same_placement.schedule if item.node_key == first_node)
+        second = next(item for item in same_placement.schedule if item.node_key == second_node)
+        second_duration = next(
+            item.duration.microseconds
+            for item in same_placement.selections
+            if item.node_key == second_node
+        )
+        overlapping_second = replace(
+            second,
+            start_at=first.start_at,
+            end_at=first.start_at + second_duration,
+        )
+
+        with self.assertRaises(ValueError):
+            replace(
+                same_placement,
+                schedule=(first, overlapping_second),
+            )
+        _assert_rejected(
+            self,
+            _proxy(same_placement, schedule=(first, overlapping_second)),
+        )
+
+        different_placements = phase3.compile_placement_plan(
+            physical,
+            registry=_registry(
+                phase3,
+                source=phase3.Placement("cpu"),
+                destination=phase3.Placement("cuda", 0),
+            ),
+            topology=phase3.DeviceTopology(peer_access=frozenset(), cuda_devices=(0,)),
+        )
+        first, second = different_placements.schedule
+        self.assertNotEqual(first.placement, second.placement)
+        self.assertLess(max(first.start_at, second.start_at), min(first.end_at, second.end_at))
+        self.assertIsNotNone(_validator(self)(different_placements))
+
     def test_python_and_rust_require_routes_for_frozen_cross_placement_flows(self) -> None:
         phase3 = _phase3(self)
         plan = _compile(

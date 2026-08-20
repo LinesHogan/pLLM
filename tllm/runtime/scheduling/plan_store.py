@@ -15,7 +15,10 @@ from tllm.runtime.scheduling.physical import (
     GraphLike,
     StreamLike,
 )
-from tllm.runtime.scheduling.phase3_transfer import PlacementPlanDispatcher
+from tllm.runtime.scheduling.phase3_transfer import (
+    PlacementImplementationBinding,
+    PlacementPlanDispatcher,
+)
 from tllm.workgraph.frontend import ArtifactKey, Device
 from tllm.workgraph.physical import (
     BufferBucketDesc,
@@ -99,6 +102,7 @@ class PlanResources:
     plan: PhysicalFlowPlan
     placement_plan: PlacementPlan | None = None
     placement_dispatcher: PlacementPlanDispatcher | None = None
+    placement_implementations: tuple[PlacementImplementationBinding, ...] = ()
     leases: tuple[BufferLease, ...] = ()
     streams: tuple[RuntimeStream, ...] = ()
     events: tuple[RuntimeEvent, ...] = ()
@@ -110,6 +114,11 @@ class PlanResources:
             raise TypeError("PlanResources.plan must be PhysicalFlowPlan")
         placement_plan = self.placement_plan
         placement_dispatcher = self.placement_dispatcher
+        placement_implementations = _typed_tuple(
+            self.placement_implementations,
+            PlacementImplementationBinding,
+            "PlanResources.placement_implementations",
+        )
         if (placement_plan is None) != (placement_dispatcher is None):
             raise ValueError(
                 "PlanResources placement plan and dispatcher must be published together"
@@ -132,6 +141,36 @@ class PlanResources:
                 raise ValueError(
                     "PlanResources dispatcher must bind its frozen placement plan"
                 )
+            physical_executors = {
+                node.node_key: node.executor for node in raw_plan.nodes
+            }
+            placement_executors = {
+                selection.node_key: selection.logical_executor
+                for selection in placement_plan.selections
+            }
+            if placement_executors != physical_executors:
+                raise ValueError(
+                    "PlanResources placement selections must match physical nodes and executors"
+                )
+            expected_implementations = {
+                (selection.node_key, selection.key)
+                for selection in placement_plan.selections
+            }
+            actual_implementations = {
+                (binding.node_key, binding.implementation_key)
+                for binding in placement_implementations
+            }
+            if (
+                len(actual_implementations) != len(placement_implementations)
+                or actual_implementations != expected_implementations
+            ):
+                raise ValueError(
+                    "PlanResources implementation bindings must exactly cover placement selections"
+                )
+        elif placement_implementations:
+            raise ValueError(
+                "PlanResources implementation bindings require a placement plan"
+            )
         leases = _typed_tuple(self.leases, BufferLease, "PlanResources.leases")
         streams = _typed_tuple(self.streams, RuntimeStream, "PlanResources.streams")
         events = _typed_tuple(self.events, RuntimeEvent, "PlanResources.events")
@@ -210,6 +249,11 @@ class PlanResources:
         object.__setattr__(self, "plan", raw_plan)
         object.__setattr__(self, "placement_plan", placement_plan)
         object.__setattr__(self, "placement_dispatcher", placement_dispatcher)
+        object.__setattr__(
+            self,
+            "placement_implementations",
+            placement_implementations,
+        )
         object.__setattr__(self, "leases", leases)
         object.__setattr__(self, "streams", streams)
         object.__setattr__(self, "events", events)

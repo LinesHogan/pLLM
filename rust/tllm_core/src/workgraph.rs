@@ -2997,6 +2997,15 @@ fn validate_placement_plan_v3(plan: &PlacementPlanV3Desc) -> Result<Vec<String>,
                 return Err("placed node dependencies must be ordered before launch".to_string());
             }
         }
+        if plan.schedule[..position].iter().any(|other| {
+            other.placement == item.placement
+                && other.start_at < item.end_at
+                && other.end_at > item.start_at
+        }) {
+            return Err(
+                "PlacementPlan compute intervals must not overlap on one placement".to_string(),
+            );
+        }
     }
 
     let mut flow_keys = HashSet::new();

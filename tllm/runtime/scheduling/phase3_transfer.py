@@ -21,6 +21,7 @@ from tllm.workgraph.phase3 import (
     MoveKind,
     Placement,
     PlacementPlan,
+    RuntimeImplementation,
     TransferProfile,
     TransferProfileDesc,
     ValueFlowDesc,
@@ -549,6 +550,34 @@ class TorchTensorCopyAdapter:
 
 
 @dataclass(frozen=True, slots=True)
+class PlacementImplementationBinding:
+    """One selected implementation object owned by a prepared plan epoch."""
+
+    node_key: NodeKey
+    implementation_key: ExecutorKey
+    implementation: RuntimeImplementation
+
+    def __post_init__(self) -> None:
+        _instance(
+            self.node_key,
+            NodeKey,
+            "PlacementImplementationBinding.node_key",
+        )
+        _instance(
+            self.implementation_key,
+            ExecutorKey,
+            "PlacementImplementationBinding.implementation_key",
+        )
+        if not isinstance(cast(object, self.implementation), RuntimeImplementation):
+            raise TypeError(
+                "PlacementImplementationBinding.implementation must implement execute"
+            )
+
+    def execute(self, context: object) -> None:
+        self.implementation.execute(context)
+
+
+@dataclass(frozen=True, slots=True)
 class PlacementRuntimeBinding:
     """Cold-path inputs and Python-owned resources for Phase 3 publication."""
 
@@ -620,7 +649,11 @@ class PlacementRuntimeBinding:
     def compile(
         self,
         physical: PhysicalFlowPlan,
-    ) -> tuple[PlacementPlan, PlacementPlanDispatcher]:
+    ) -> tuple[
+        PlacementPlan,
+        PlacementPlanDispatcher,
+        tuple[PlacementImplementationBinding, ...],
+    ]:
         physical = _instance(
             physical, PhysicalFlowPlan, "PlacementRuntimeBinding.physical"
         )
@@ -638,10 +671,21 @@ class PlacementRuntimeBinding:
             capacity=self.pinned_pool_capacity,
             adapter=self.adapter,
         )
-        return plan, PlacementPlanDispatcher(
-            plan=plan,
-            pool=pool,
-            adapter=self.adapter,
+        return (
+            plan,
+            PlacementPlanDispatcher(
+                plan=plan,
+                pool=pool,
+                adapter=self.adapter,
+            ),
+            tuple(
+                PlacementImplementationBinding(
+                    node_key=selection.node_key,
+                    implementation_key=selection.key,
+                    implementation=self.registry.resolve(selection.key),
+                )
+                for selection in plan.selections
+            ),
         )
 
 
@@ -652,6 +696,7 @@ __all__ = [
     "PinnedMemoryPool",
     "PinnedMemorySlot",
     "PlacementPlanDispatcher",
+    "PlacementImplementationBinding",
     "PlacementRuntimeBinding",
     "TensorCopyAdapter",
     "TorchTensorCopyAdapter",

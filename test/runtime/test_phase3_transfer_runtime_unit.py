@@ -14,6 +14,13 @@ import unittest
 from unittest import mock
 
 from tllm.runtime import residual_runtime
+from tllm.runtime.scheduling.physical import Fence
+from tllm.runtime.scheduling.plan_store import (
+    PlanResources,
+    PlanSnapshotStore,
+    RuntimeStream,
+)
+from tllm.runtime.scheduling.workgraph_executor import PhysicalExecutor
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import phase3
 from tllm.workgraph.ir import ExecutorKey, NodeKey
@@ -55,6 +62,15 @@ class _FakeFence:
 
     def query(self) -> bool:
         return self.complete
+
+    def record(self, stream: object) -> None:
+        del stream
+        self.complete = True
+
+
+class _FakeStream:
+    def wait_event(self, event: object) -> None:
+        del event
 
 
 class _FakeTensorCopyAdapter:
@@ -178,6 +194,15 @@ class _FakeImplementation:
         del args
 
 
+@dataclass
+class _RecordingImplementation:
+    trace: list[str]
+
+    def execute(self, *args: object) -> None:
+        del args
+        self.trace.append("selected")
+
+
 class Phase3PinnedMemoryPoolTest(unittest.TestCase):
     def test_pool_is_bounded_and_uses_typed_pinned_allocations(self) -> None:
         transfer = _transfer_runtime(self)
@@ -223,6 +248,56 @@ class Phase3CopyAdmissionTest(unittest.TestCase):
 
 
 class Phase3CopyExecutorTest(unittest.TestCase):
+    def test_physical_epoch_executes_selected_placement_implementation(self) -> None:
+        transfer = _transfer_runtime(self)
+        node = NodeKey.consumer_flow("phase3.selected.runtime", 0)
+        logical = ExecutorKey("logical", "phase3.selected.runtime")
+        selected = ExecutorKey("implementation", "phase3.selected.runtime.cpu")
+        physical = PhysicalFlowPlan(
+            plan_epoch=29,
+            nodes=(PhysicalNodePlan(node, logical, StreamClass.DEFAULT),),
+        )
+        trace: list[str] = []
+        registry = phase3.ImplementationRegistry()
+        registry.register(
+            phase3.ImplementationSpec(
+                selected,
+                phase3.Placement("cpu"),
+                _RecordingImplementation(trace),
+                logical_executor=logical,
+            )
+        )
+        placement_plan, dispatcher, implementations = transfer.PlacementRuntimeBinding(
+            registry=registry,
+            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            adapter=_FakeTensorCopyAdapter(),
+        ).compile(physical)
+        resources = PlanResources(
+            plan=physical,
+            placement_plan=placement_plan,
+            placement_dispatcher=dispatcher,
+            placement_implementations=implementations,
+            streams=(
+                RuntimeStream(
+                    StreamClass.DEFAULT,
+                    _FakeStream(),
+                    Fence(
+                        FenceKey("phase3", "selected-runtime-retire"),
+                        _FakeFence("selected-runtime-retire", complete=True),
+                    ),
+                ),
+            ),
+        )
+        executor = PhysicalExecutor(
+            snapshots=PlanSnapshotStore(resources),
+            handlers={logical: lambda _context: trace.append("legacy")},
+        )
+
+        executor.prepare_step(0)
+        executor.execute_step(0)
+
+        self.assertEqual(trace, ["selected"])
+
     def test_cold_runtime_publishes_and_dispatches_typed_placement_snapshot(self) -> None:
         transfer = _transfer_runtime(self)
         source = NodeKey.producer("phase3.production.source")
