@@ -134,7 +134,10 @@ class ValueKey:
     version: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _text(self.name, "ValueKey.name"))
+        name = _text(self.name, "ValueKey.name")
+        if "/" in name or "\\" in name:
+            raise ValueError("ValueKey.name must not contain '/' or '\\'")
+        object.__setattr__(self, "name", name)
         object.__setattr__(
             self,
             "version",

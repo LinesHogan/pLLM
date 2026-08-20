@@ -171,6 +171,13 @@ def _assert_rejected(test_case: unittest.TestCase, plan: object) -> None:
 
 
 class Phase3PlacementPlanValidatorTest(unittest.TestCase):
+    def test_python_and_rust_reject_unstable_value_key_separators(self) -> None:
+        phase3 = _phase3(self)
+        with self.assertRaises(ValueError):
+            phase3.ValueKey("value/with/slash", 1)
+        with self.assertRaises(ValueError):
+            phase3.ValueKey("value\\with\\slash", 1)
+
     def test_validator_accepts_real_compiled_placement_plan(self) -> None:
         phase3 = _phase3(self)
         plan = _compile(
