@@ -80,14 +80,6 @@ def resolve_graph_mode(runner: Any) -> GraphMode:
     return GraphMode.PIECEWISE
 
 
-def may_launch_from_hooks(mode: GraphMode) -> bool:
-    """Whether arbitrary consumer Python may launch during the step.
-
-    Only eager mode runs hook Python on every step; under piecewise/full
-    replay, launches must go through persistent buffers (the capture lane).
-    """
-    return mode == GraphMode.EAGER
-
 
 _SAFETY_RANK = {
     GraphSafety.EAGER_ONLY: 0,

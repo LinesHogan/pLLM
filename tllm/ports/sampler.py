@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Mapping, Protocol, runtime_checkable
+from typing import Literal, Mapping
 
 import torch
 
@@ -28,7 +28,6 @@ SAMPLER_BACKEND_CHOICES: tuple[str, ...] = (
     "post_filter_dense_cache",
 )
 TemperatureMode = Literal["all_random", "all_greedy", "mixed"]
-CandidateSamplingMode = Literal["random", "greedy", "mixed"]
 
 
 @dataclass(frozen=True)
@@ -38,26 +37,6 @@ class SamplerFilterSpec:
     min_p: torch.Tensor | None
     temperature_mode: TemperatureMode
     has_generators: bool = False
-
-    @property
-    def has_top_k(self) -> bool:
-        return self.top_k is not None
-
-    @property
-    def has_top_p(self) -> bool:
-        return self.top_p is not None
-
-    @property
-    def has_min_p(self) -> bool:
-        return self.min_p is not None
-
-
-@dataclass(frozen=True)
-class CandidateModifierRequest:
-    logits: torch.Tensor
-    affected_row_ids: torch.Tensor
-    filter_spec: SamplerFilterSpec
-    sampling_mode: CandidateSamplingMode
 
 
 @dataclass(frozen=True)
@@ -103,17 +82,3 @@ class Sampler:
     @staticmethod
     def read(*, step_scope: SamplerStepScope = "current") -> PortRead:
         return PortRead(kind=Sampler.KIND, locator=SamplerLocator(step_scope=step_scope))
-
-
-@runtime_checkable
-class CandidateModifierProvider(Protocol):
-    """Public sampler-port provider contract for candidate-level modifiers."""
-
-    def is_active(self) -> bool:
-        ...
-
-    def prepare_candidate_state(
-        self,
-        request: CandidateModifierRequest,
-    ) -> CandidateModifierState | None:
-        ...

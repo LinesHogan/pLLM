@@ -150,22 +150,6 @@ class DynamicsStore:
             and (not action_filter or event.action == action_filter)
         )
 
-    def export_text(self, *, task_id: str = "", state_signature: str = "", action: str = "", max_records: int = 0) -> tuple[str, ...]:
-        limit = _require_int(max_records, field_name="max_records")
-        if limit < 0:
-            raise ValueError("max_records must be non-negative")
-        records = self.query(task_id=task_id, state_signature=state_signature, action=action)
-        if limit > 0:
-            records = records[:limit]
-        out: list[str] = []
-        for event in records:
-            reward_text = "unknown" if event.reward is None else f"{event.reward:.6g}"
-            out.append(
-                f"task={event.task_id} state={event.state_signature} action={event.action} "
-                f"reward={reward_text} next={event.next_observation}"
-            )
-        return tuple(out)
-
 
 class PromptContextStore:
     def __init__(self) -> None:
@@ -203,15 +187,6 @@ def _prompt_context_store_for_runtime(runtime: object) -> PromptContextStore:
     return store
 
 
-def write_trajectory_events(runtime: object, batch: TrajectoryEventBatch) -> int:
-    if not isinstance(batch, TrajectoryEventBatch):
-        raise TypeError("batch must be TrajectoryEventBatch")
-    setattr(runtime, "last_trajectory_events", batch)
-    return _dynamics_store_for_runtime(runtime).append(batch)
-
-
-def read_trajectory_events(runtime: object) -> TrajectoryEventBatch:
-    return _dynamics_store_for_runtime(runtime).read()
 
 
 def write_prompt_contexts(runtime: object, batch: PromptContextBatch) -> int:
@@ -220,9 +195,6 @@ def write_prompt_contexts(runtime: object, batch: PromptContextBatch) -> int:
     setattr(runtime, "last_prompt_contexts", batch)
     return _prompt_context_store_for_runtime(runtime).append(batch)
 
-
-def read_prompt_contexts(runtime: object) -> PromptContextBatch:
-    return _prompt_context_store_for_runtime(runtime).read()
 
 
 def _prompt_idx_for_row(row_i: int, request_prompt_indices: Sequence[int] | None) -> int:

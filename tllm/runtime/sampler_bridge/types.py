@@ -14,10 +14,8 @@ import torch
 
 from tllm.ports.sampler import (
     SAMPLER_BACKEND_CHOICES,
-    CandidateModifierRequest,
     CandidateModifierState,
     CandidateSampleResult,
-    CandidateSamplingMode,
     CanonicalSamplerBackend,
     SamplerBackend,
     SamplerFilterSpec,
@@ -27,10 +25,8 @@ from tllm.ports.sampler import (
 
 __all__ = [
     "SAMPLER_BACKEND_CHOICES",
-    "CandidateModifierRequest",
     "CandidateModifierState",
     "CandidateSampleResult",
-    "CandidateSamplingMode",
     "CanonicalSamplerBackend",
     "SamplerBackend",
     "SamplerFilterSpec",

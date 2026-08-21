@@ -130,9 +130,6 @@ def _regular_row_view(hidden: torch.Tensor, row_ids: tuple[int, ...]) -> torch.T
     )
 
 
-def _request_meta_payload(core: PortDispatchCoreLike, active: int) -> list[dict[str, object]]:
-    return _request_meta_view(core, active).as_legacy_dicts()
-
 
 def _request_meta_view(core: PortDispatchCoreLike, active: int) -> RowBatchMeta:
     request_ids, prompt_idxs, sample_idxs = active_request_prompt_sample_metadata(core.RUNTIME, active)
@@ -195,71 +192,6 @@ def _request_meta_payload_from_view(view: RowBatchMeta) -> list[dict[str, object
         for row_i in range(len(view.request_ids))
     ]
 
-
-def build_explicit_step_scope_port_bundle(
-    *,
-    flow: ConsumerFlow,
-    phase: str,
-    engine_step_id: int,
-    row_meta: RowBatchMeta,
-    entries: dict[str, object],
-    write_outputs: dict[str, DeviceTensorWriteSink] | None = None,
-) -> PortBundle:
-    """Build a step-scope bundle from explicit entries for any runtime phase."""
-    if tuple(flow.bundle_key) != ("engine_step_id", "phase"):
-        raise RuntimeError("explicit step-scope bundles require bundle_key=('engine_step_id', 'phase')")
-    phase_value = str(phase)
-    if str(row_meta.phase) != phase_value:
-        raise RuntimeError("row metadata phase does not match requested bundle phase")
-    if int(row_meta.engine_step_id) != int(engine_step_id):
-        raise RuntimeError("row metadata engine_step_id does not match requested bundle step")
-
-    out: dict[str, object] = {}
-    lease_entries: dict[str, torch.Tensor] = {}
-    delivery = str(flow.delivery)
-    for read in flow.reads:
-        name = str(read.role).strip() or str(read.kind.value)
-        if read.kind is PortKind.REQUEST_META:
-            out[name] = row_meta
-            continue
-        if read.kind is PortKind.RESIDUAL_STREAM:
-            locator = read.locator
-            if not isinstance(locator, ResidualLocator):
-                raise RuntimeError(f"flow read `{name}` has an invalid residual locator")
-            read_phase = str(locator.phase)
-            if read_phase != phase_value:
-                raise RuntimeError(f"flow read `{name}` is for phase `{read_phase}`, not `{phase_value}`")
-        if name not in entries:
-            raise RuntimeError(f"explicit step-scope bundle missing required entry `{name}`")
-        payload = entries[name]
-        if delivery == "device_lease":
-            if read.kind is not PortKind.RESIDUAL_STREAM or not isinstance(payload, torch.Tensor):
-                raise RuntimeError("device_lease explicit bundle supports residual_stream and request_meta reads")
-            lease_entries[name] = payload
-        else:
-            out[name] = payload
-
-    if delivery == "device_lease":
-        out["device_lease"] = DeviceTensorLease(
-            entries=lease_entries,
-            active_rows=len(row_meta.request_ids),
-            ownership=flow.ownership,
-            lifetime=flow.lease_lifetime,
-            outputs={} if write_outputs is None else write_outputs,
-        )
-
-    request_id = row_meta.request_ids[0] if row_meta.request_ids else ""
-    sample_idx = int(row_meta.sample_idxs[0]) if row_meta.sample_idxs else 0
-    return PortBundle(
-        key=BundleKey(
-            engine_step_id=int(engine_step_id),
-            phase=phase_value,
-            request_id=str(request_id),
-            sample_idx=sample_idx,
-        ),
-        entries=out,
-        version=int(engine_step_id),
-    )
 
 
 def _entry_for_flow_read(

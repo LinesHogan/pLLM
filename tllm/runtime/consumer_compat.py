@@ -15,14 +15,6 @@ class SupportsSubscriptions(Protocol):
         ...
 
 
-class SupportsConsume(Protocol):
-    def consume(self, batch: HiddenBatch, ctx: RuntimeContext) -> None:
-        ...
-
-
-class SupportsTick(Protocol):
-    def on_tick(self, event_name: str, ctx: RuntimeContext) -> None:
-        ...
 
 
 class SupportsStepEnd(Protocol):

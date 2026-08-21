@@ -195,11 +195,3 @@ def port_phase(port: PortRead | PortWrite) -> str:
         if field.path == ("phase",):
             return field.value
     return ""
-
-
-def port_address_phase(address: PortAddressDesc) -> str:
-    """Return a locator's compiler-visible phase constraint, if declared."""
-    for field in address.locator_fields:
-        if field.path == ("phase",) and field.value_type == "str":
-            return field.value
-    return ""

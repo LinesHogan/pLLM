@@ -178,23 +178,3 @@ def dispatch_runtime_event(
     return len(targets)
 
 
-def dispatch_port_bundle(
-    *,
-    runtime: RuntimeWithDispatchPlan,
-    runner: RunnerLike,
-    bundle: PortBundle,
-    window: str,
-) -> int:
-    """Dispatch one assembled bundle to flow-based consumers."""
-    plan = getattr(runtime, "dispatch_plan", None)
-    if plan is None:
-        return 0
-
-    targets = [target for target in plan.flow_targets() if str(target.flow.window) == str(window)]
-    if not targets:
-        return 0
-
-    ctx = build_runtime_context(runner=runner, event_name=f"flow:{window}")
-    for target in targets:
-        target.consumer.consume_flow(target.flow_ordinal, bundle, ctx)
-    return len(targets)

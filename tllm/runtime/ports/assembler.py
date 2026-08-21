@@ -117,8 +117,6 @@ class BundleAssembler:
         self._pending_versions.pop(group_key, None)
         return [bundle]
 
-    def pending_bundle_count(self) -> int:
-        return len(self._pending)
 
     def finalize_pending(self) -> List[PortBundle]:
         bundles: List[PortBundle] = []

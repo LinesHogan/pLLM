@@ -81,9 +81,6 @@ MODEL_HOOK_FLAG = "esamp_hook_installed"
 MODEL_HOOK_SPEC_ATTR = "esamp_hook_spec"
 
 
-def _ensure_runner_binding() -> None:
-    _lifecycle.ensure_runner_binding(sys.modules[__name__])
-
 
 def _ensure_dispatch_registry() -> ConsumerRegistry:
     if RUNTIME.consumer_registry is None:
@@ -814,9 +811,6 @@ def _resolve_prompt_sample_for_req_id(req_id: str) -> tuple[int, int]:
     )
 
 
-    return False
-
-
 def configure_runtime(
     *,
     graph_scratch_rows: int,
@@ -1076,16 +1070,7 @@ def read_graph_debug_stats(*, mode: str = "model_bank") -> GraphDebugStats:
     return _stats.read_graph_debug_stats(getattr(RUNTIME, "consumer", None), mode=mode)
 
 
-def _prepare_decode_localization(runner: RunnerLike, out: tuple[object, ...]) -> None:
-    _hooks.prepare_decode_localization(core=sys.modules[__name__], runner=runner, out=out)
 
-
-def _build_tap_path_list() -> list[str]:
-    return _hooks.build_tap_path_list(core=sys.modules[__name__])
-
-
-def _setup_runtime_hooks_if_active(runner: RunnerLike) -> None:
-    _hooks.setup_runtime_hooks_if_active(core=sys.modules[__name__], runner=runner)
 
 
 def _wrapped_load_model(self: object, *args: object, **kwargs: object) -> object:

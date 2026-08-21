@@ -210,7 +210,7 @@ class CompatCloseoutMatrixTest(unittest.TestCase):
     def test_dispatch_api_does_not_traverse_capture_artifacts_in_hot_path(self) -> None:
         # These APIs are the event/flow dispatch surface. Their implementation
         # must stay independent of capture descriptors and hierarchy traversal.
-        for method_name in ("select", "flow_targets", "flow_targets_for_hook"):
+        for method_name in ("select", "flow_targets"):
             source = inspect.getsource(getattr(DispatchPlan, method_name))
             with self.subTest(method=method_name):
                 self.assertNotIn("CapturedFlow", source)

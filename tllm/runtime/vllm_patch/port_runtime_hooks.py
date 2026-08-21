@@ -30,21 +30,6 @@ from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 
-RUNTIME_EVENT_POINTS = (
-    "load_model.pre",
-    "load_model.post",
-    "prepare_inputs.pre",
-    "prepare_inputs.post",
-    "layer.pre",
-    "layer.post",
-    "block.end",
-    "stack.end",
-    "execute_model.pre",
-    "execute_model.post",
-    "sample_tokens.pre",
-    "sampler.pre_draw",
-    "sample_tokens.post",
-)
 
 _COMPUTE_LOGITS_HOOK_FLAG = "_tllm_compute_logits_wrapped"
 _INPUT_BATCH_MIN_P_PATCHED = False

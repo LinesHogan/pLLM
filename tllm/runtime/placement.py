@@ -210,10 +210,3 @@ def compile_flow_placement(
     )
 
 
-def validate_flow_timing(
-    flows: Sequence[tuple[str, ConsumerFlow]],
-    *,
-    graph_mode: GraphMode = GraphMode.EAGER,
-) -> dict[str, str]:
-    """Compatibility facade returning only the compiled hook table."""
-    return compile_flow_placement(flows, graph_mode=graph_mode).by_flow_id

@@ -277,8 +277,3 @@ def _capture_plan_fingerprint(
     return hashlib.sha256("\n".join(rows).encode("ascii")).hexdigest()[:16]
 
 
-def restore_layer_forward_taps(handles: Dict[str, TapHandle]) -> None:
-    """Symmetric teardown for ``install_layer_forward_taps``."""
-    for handle in handles.values():
-        handle.restore()
-    handles.clear()

@@ -22,8 +22,6 @@ from __future__ import annotations
 from typing import Any, Sequence
 import weakref
 
-from tllm.runtime.config import TllmRuntimeConfig
-
 
 # runner -> owning TllmRuntime. Weak on both sides: runners and runtimes are
 # collected freely; stale entries vanish.
@@ -36,12 +34,6 @@ _ACTIVE_RUNTIME: "TllmRuntime | None" = None
 def bind_runner_runtime(runner: Any, runtime: "TllmRuntime") -> None:
     _RUNNER_RUNTIMES[runner] = runtime
 
-
-def resolve_runner_runtime(runner: Any) -> "TllmRuntime | None":
-    try:
-        return _RUNNER_RUNTIMES.get(runner)
-    except TypeError:
-        return None
 
 
 def active_runtime() -> "TllmRuntime":
@@ -57,14 +49,12 @@ class TllmRuntime:
         backend: str = "auto",
         producers: Sequence[Any] = (),
         consumers: Sequence[Any] = (),
-        config: TllmRuntimeConfig | None = None,
     ) -> None:
         if backend != "auto":
             raise ValueError(
                 f"backend={backend!r}: only 'auto' is supported; backend selection "
                 "is structural (tllm.backends)"
             )
-        self.config = config or TllmRuntimeConfig()
         self.producers = tuple(producers)
         self._consumers: list[Any] = list(consumers)
 

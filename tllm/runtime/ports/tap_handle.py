@@ -25,7 +25,3 @@ class TapHandle:
         self.layer.forward = self.orig_forward  # type: ignore[method-assign]
 
 
-def restore_all(handles: Dict[str, TapHandle]) -> None:
-    for handle in handles.values():
-        handle.restore()
-    handles.clear()

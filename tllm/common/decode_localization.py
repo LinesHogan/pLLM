@@ -11,12 +11,10 @@ from tllm.common.state import (
     STATE,
     find_capture_layer,
     resolve_prompt_sample_for_req_id,
-    set_or_register_buffer,
 )
 
 DECODE_ROW_IDX_BUFFER = "decode_row_idx"
 DECODE_VALID_MASK_BUFFER = "decode_valid_mask"
-DECODE_HIDDEN_ROWS_BUFFER = "decode_hidden_rows_buffer"
 
 
 def compute_decode_localization(
@@ -82,30 +80,6 @@ def compute_decode_localization(
     return row_idx, prompt_idxs, sample_idxs, decode_positions
 
 
-def ensure_decode_buffers(
-    layer: torch.nn.Module,
-    device: torch.device,
-    rows: int,
-    hidden_size: int,
-    hidden_dtype: torch.dtype,
-) -> None:
-    """Ensure fixed decode-localization buffers exist on capture layer.
-
-    These buffers are static across steps and reused, so graph replay does not
-    allocate/free per-step tensors.
-    """
-    decode_row_idx = torch.zeros((rows,), device=device, dtype=torch.long)
-    set_or_register_buffer(layer, DECODE_ROW_IDX_BUFFER, decode_row_idx)
-
-    # Keep mask and decode buffer in activation dtype to avoid implicit casts.
-    decode_valid_mask = torch.zeros((rows, 1), device=device, dtype=hidden_dtype)
-    set_or_register_buffer(layer, DECODE_VALID_MASK_BUFFER, decode_valid_mask)
-
-    decode_hidden_rows_buffer = torch.empty((rows, hidden_size), device=device, dtype=hidden_dtype)
-    set_or_register_buffer(layer, DECODE_HIDDEN_ROWS_BUFFER, decode_hidden_rows_buffer)
-    STATE.decode_hidden_rows = getattr(layer, DECODE_HIDDEN_ROWS_BUFFER)
-
-
 def prepare_decode_localization(runner: Any) -> None:
     """Compute decode row indices from vLLM packed layout.
 
@@ -165,64 +139,3 @@ def prepare_decode_localization(runner: Any) -> None:
     step.decode_count = k
     step.decode_prompt_idxs = [int(x) for x in prompt_idxs]
     step.decode_sample_idxs = [int(x) for x in sample_idxs]
-
-
-def gather_decode_hidden_from_scratch(layer: torch.nn.Module, scratch: torch.Tensor) -> torch.Tensor:
-    """Run decode gather from scratch with precomputed row_idx/mask buffers."""
-    decode_row_idx = getattr(layer, DECODE_ROW_IDX_BUFFER)
-    decode_valid_mask = getattr(layer, DECODE_VALID_MASK_BUFFER)
-    decode_hidden_rows_buffer = getattr(layer, DECODE_HIDDEN_ROWS_BUFFER)
-
-    # Note: scratch.index_select creates a new tensor, then copy_ writes into
-    # decode_hidden_rows_buffer. In CUDA Graph, write directly into fixed memory.
-    torch.index_select(scratch, 0, decode_row_idx, out=decode_hidden_rows_buffer)
-    decode_hidden_rows_buffer.mul_(decode_valid_mask)
-    return decode_hidden_rows_buffer
-
-
-def export_decode_capture() -> None:
-    """Export localized decode hidden rows to capture storage (CPU)."""
-    if not STATE.capture_active:
-        return
-
-    decode_hidden_rows = STATE.decode_hidden_rows
-    if decode_hidden_rows is None:
-        return
-
-    step = STATE.step
-    requested = int(step.decode_count)
-
-    if requested < 0:
-        raise RuntimeError(f"Invalid decode_count={requested}")
-    if requested > len(step.decode_prompt_idxs):
-        raise RuntimeError(
-            "Decode export metadata mismatch: "
-            f"count={requested} prompt_idxs={len(step.decode_prompt_idxs)}"
-        )
-    if requested > len(step.decode_sample_idxs):
-        raise RuntimeError(
-            "Decode export metadata mismatch: "
-            f"count={requested} sample_idxs={len(step.decode_sample_idxs)}"
-        )
-    if requested > int(decode_hidden_rows.shape[0]):
-        raise RuntimeError(
-            "Decode export buffer mismatch: "
-            f"count={requested} decode_hidden_rows={int(decode_hidden_rows.shape[0])}"
-        )
-
-    if requested <= 0:
-        return
-
-    selected = decode_hidden_rows[:requested]
-    # if not bool(torch.isfinite(selected).all().item()):
-    #     raise RuntimeError("Found non-finite hidden in localized decode rows")
-
-    for local_i in range(requested):
-        prompt_idx = int(step.decode_prompt_idxs[local_i])
-        if prompt_idx < 0:
-            continue
-        if prompt_idx not in STATE.captured_decode:
-            STATE.captured_decode[prompt_idx] = []
-        STATE.captured_decode[prompt_idx].append(
-            selected[local_i].detach().to(device="cpu")
-        )

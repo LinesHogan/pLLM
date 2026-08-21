@@ -31,41 +31,6 @@ def _require_non_negative_int(value: object, *, field_name: str) -> int:
     return parsed
 
 
-def estimate_exact_fast_weight_bytes(
-    *,
-    slots: int,
-    layers: int,
-    hidden_size: int,
-    intermediate_size: int,
-    tail_rows: int,
-    bytes_per_element: int,
-) -> int:
-    slot_count = _require_non_negative_int(slots, field_name="slots")
-    layer_count = _require_non_negative_int(layers, field_name="layers")
-    hidden = _require_non_negative_int(hidden_size, field_name="hidden_size")
-    intermediate = _require_non_negative_int(intermediate_size, field_name="intermediate_size")
-    tail = _require_non_negative_int(tail_rows, field_name="tail_rows")
-    element_bytes = _require_non_negative_int(bytes_per_element, field_name="bytes_per_element")
-    per_layer_slot = (hidden * intermediate * element_bytes) + (tail * (hidden + intermediate) * element_bytes)
-    return int(slot_count * layer_count * per_layer_slot)
-
-
-def estimate_low_rank_fast_weight_bytes(
-    *,
-    slots: int,
-    layers: int,
-    hidden_size: int,
-    intermediate_size: int,
-    rank: int,
-    bytes_per_element: int,
-) -> int:
-    slot_count = _require_non_negative_int(slots, field_name="slots")
-    layer_count = _require_non_negative_int(layers, field_name="layers")
-    hidden = _require_non_negative_int(hidden_size, field_name="hidden_size")
-    intermediate = _require_non_negative_int(intermediate_size, field_name="intermediate_size")
-    low_rank = _require_non_negative_int(rank, field_name="rank")
-    element_bytes = _require_non_negative_int(bytes_per_element, field_name="bytes_per_element")
-    return int(slot_count * layer_count * low_rank * (hidden + intermediate) * element_bytes)
 
 
 def _require_str(value: object, *, field_name: str) -> str:
@@ -510,41 +475,6 @@ def run_down_proj_fast_weight_step(
     state.record_step(key, result)
     return result
 
-
-def install_down_proj_fast_weight_overlay(
-    *,
-    module: object,
-    state: FastWeightState,
-    key: FastWeightKey,
-    require_single_tp: bool = True,
-) -> DownProjFastWeightOverlayHandle:
-    if not isinstance(state, FastWeightState):
-        raise TypeError("state must be FastWeightState")
-    if not isinstance(key, FastWeightKey):
-        raise TypeError("key must be FastWeightKey")
-    if require_single_tp:
-        _require_single_tensor_parallel()
-    _require_supported_down_proj(module, require_single_tp=require_single_tp)
-    weight = module_weight_view(module)
-    original_forward = getattr(module, "forward", None)
-    if not callable(original_forward):
-        raise RuntimeError("module must expose callable forward")
-
-    def _forward(self, hidden: torch.Tensor, *args: object, **kwargs: object) -> object:
-        if not isinstance(hidden, torch.Tensor):
-            raise TypeError("down_proj hidden input must be torch.Tensor")
-        base_output = original_forward(hidden, *args, **kwargs)
-        slot = state.get(key)
-        if slot is None:
-            return base_output
-        if tuple(slot.past_w.shape) != tuple(weight.shape):
-            raise RuntimeError("fast-weight overlay shape must match module weight")
-        replacement = F.linear(hidden, slot.past_w.to(device=hidden.device, dtype=hidden.dtype))
-        return _replace_forward_output(base_output, replacement)
-
-    bound_forward = MethodType(_forward, module)
-    setattr(module, "forward", bound_forward)
-    return DownProjFastWeightOverlayHandle(module=module, original_forward=original_forward)
 
 
 def install_mlp_fast_weight_wrapper(

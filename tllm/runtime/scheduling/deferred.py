@@ -94,9 +94,6 @@ class DeferredWorkQueue:
     def depth(self) -> int:
         return len(self._items)
 
-    @property
-    def max_depth(self) -> int:
-        return int(self._max_depth)
 
     def enqueue(self, work: DeferredWork) -> None:
         if not str(work.flow_id).strip():

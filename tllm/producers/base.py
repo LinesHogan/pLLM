@@ -22,7 +22,7 @@ from tllm.ports.port_spec import PortSpec
 class HookPoint(str, Enum):
     """Backend-agnostic hook points a producer can attach to.
 
-    Names mirror ``RUNTIME_EVENT_POINTS`` in
+    Names mirror the runtime event points dispatched by
     ``tllm.runtime.vllm_patch.port_runtime_hooks``.
     """
 

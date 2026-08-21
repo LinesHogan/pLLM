@@ -62,10 +62,6 @@ class TestTimeLoRAService:
     def request_assignments(self) -> Mapping[str, int]:
         return MappingProxyType(dict(self._request_to_lora_id))
 
-    def unbind_request(self, request_id: str) -> bool:
-        if not isinstance(request_id, str):
-            raise TypeError("request_id must be str")
-        return self._request_to_lora_id.pop(request_id, None) is not None
 
     def stage_update(self, update: TestTimeLoRAUpdate) -> None:
         if not isinstance(update, TestTimeLoRAUpdate):

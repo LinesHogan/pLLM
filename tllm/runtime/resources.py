@@ -67,7 +67,7 @@ class SamplerPrecomputeState:
     source_enabled: bool = False
     source_capture_step_id: int = -1
     port_enabled: bool = True
-    port_capture_step_id: int = -1
+
     port_publish_step_id: int = -1
     port_consume_step_id: int = -1
     precomputed_step_id: int = -1
@@ -92,7 +92,7 @@ class SamplerPrecomputeState:
     def reset_step(self) -> None:
         self.source_enabled = False
         self.source_capture_step_id = -1
-        self.port_capture_step_id = -1
+
         self.port_publish_step_id = -1
         self.port_consume_step_id = -1
         self.precomputed_step_id = -1
@@ -102,7 +102,7 @@ class SamplerPrecomputeState:
     def reset_decode_step(self, step_id: int) -> None:
         self.source_enabled = False
         self.source_capture_step_id = -1
-        self.port_capture_step_id = -1
+
         self.port_publish_step_id = -1
         self.port_consume_step_id = -1
         self.precomputed_step_id = int(step_id)

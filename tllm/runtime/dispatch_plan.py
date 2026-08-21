@@ -42,13 +42,6 @@ class DispatchPlan:
         self._fusion_groups: tuple[tuple[str, ...], ...] = ()
         self._fusion_rejections: tuple[tuple[str, str], ...] = ()
         self._placement_metadata_pending = True
-        self._rebuild_flow_hook_table()
-
-    def _rebuild_flow_hook_table(self) -> None:
-        by_hook: dict[str, list[FlowDispatchTarget]] = {}
-        for target in self._flow_targets:
-            by_hook.setdefault(target.placement_hook, []).append(target)
-        self._by_flow_hook = {hook: tuple(targets) for hook, targets in by_hook.items()}
 
     def _install_compiled_placement(self, compiled: CompiledPlacement) -> None:
         order = {flow_id: index for index, flow_id in enumerate(compiled.execution_order)}
@@ -65,7 +58,6 @@ class DispatchPlan:
         self._flow_targets = targets
         self._fusion_groups = compiled.fusion_groups
         self._fusion_rejections = compiled.fusion_rejections
-        self._rebuild_flow_hook_table()
 
     @classmethod
     def build(cls, consumers: Iterable[BaseConsumer]) -> "DispatchPlan":
@@ -150,8 +142,6 @@ class DispatchPlan:
             self._placement_metadata_pending or graph_mode.name.lower() != self._graph_mode
         )
 
-    def flow_targets_for_hook(self, hook: str) -> tuple[FlowDispatchTarget, ...]:
-        return self._by_flow_hook.get(str(hook), ())
 
     @property
     def fusion_groups(self) -> tuple[tuple[str, ...], ...]:

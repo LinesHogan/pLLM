@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -28,38 +28,9 @@ def ensure_v1_env() -> None:
 @dataclass
 class RuntimeConfig:
     graph_scratch_rows: int = 0
-    enable_decode_producer: bool = True
     enable_prefill_producer: bool = False
     capture_layer_path: str = "model.model.layers[0]"
     capture_layer_index: Optional[int] = None
-
-
-class CaptureTapConsumer(Protocol):
-    def ensure_resources(
-        self,
-        *,
-        layer: torch.nn.Module,
-        device: torch.device,
-        rows: int,
-        hidden_size: int,
-        hidden_dtype: torch.dtype,
-    ) -> None:
-        ...
-
-    def launch(
-        self,
-        *,
-        layer: torch.nn.Module,
-        decode_hidden_rows: torch.Tensor,
-        source_device: torch.device,
-    ) -> None:
-        ...
-
-    def synchronize(self) -> None:
-        ...
-
-    def set_enabled(self, enabled: bool) -> None:
-        ...
 
 
 @dataclass
@@ -106,13 +77,9 @@ class RuntimeState:
     capture_active: bool = False
     reqid_to_promptidx: Dict[str, int] = field(default_factory=dict)
 
-    captured_decode: Dict[int, List[torch.Tensor]] = field(default_factory=dict)
     captured_prefill: Dict[int, List[torch.Tensor]] = field(default_factory=dict)
 
-    decode_hidden_rows: Optional[torch.Tensor] = None
     prefill_hidden_rows: Optional[torch.Tensor] = None
-
-    tap_consumer: Optional[CaptureTapConsumer] = None
 
     def configure(
         self,
@@ -142,11 +109,9 @@ class RuntimeState:
     def reset_capture(self) -> None:
         self.capture_active = False
         self.reqid_to_promptidx = {}
-        self.captured_decode = {}
         self.captured_prefill = {}
 
     def reset_runtime_tensors(self) -> None:
-        self.decode_hidden_rows = None
         self.prefill_hidden_rows = None
         self.step.reset_localization_outputs()
 
@@ -218,12 +183,6 @@ def find_capture_layer(model: Any) -> tuple[torch.nn.Module, str]:
             f"(got {type(layer).__name__})."
         )
     return layer, resolved_path
-
-def set_or_register_buffer(module: torch.nn.Module, name: str, tensor: torch.Tensor) -> None:
-    if hasattr(module, name):
-        setattr(module, name, tensor)
-    else:
-        module.register_buffer(name, tensor, persistent=False)
 
 
 def snapshot_step_common_from_prepare_inputs(

@@ -106,13 +106,7 @@ class AdaptiveDecision:
         if self.candidate is not None:
             object.__setattr__(self, "candidate", _instance(self.candidate, CandidateActionDesc, "decision candidate"))
 
-    @property
-    def work_id(self) -> str:
-        return self.work_key.value
 
-    @property
-    def candidate_key(self) -> CandidateActionKey | None:
-        return self.action_key
 
     @property
     def decision(self) -> AdaptiveDecisionKind:
@@ -689,7 +683,7 @@ class AdaptiveAdmissionScheduler:
         self.interference_ewma = self.state.interference_ewma
         self.interference_limit = interference_limit
         self._validate_interference_limit(interference_limit)
-        self._last_decisions: tuple[AdaptiveDecision, ...] = ()
+
         if plan is not None:
             self.prepare(plan)
 
@@ -713,7 +707,7 @@ class AdaptiveAdmissionScheduler:
         self.latency_ewma.clear()
         self.interference_ewma.clear()
         self.interference_ewma.configure_profiles(plan.profiles)
-        self._last_decisions = ()
+
         return self.prepared
 
     def observe(self, key: _RuntimeKey, observation: int, *, interference: int | None = None) -> int | tuple[int, int]:
@@ -852,27 +846,6 @@ class AdaptiveAdmissionScheduler:
             f"no feasible compiler-approved action for {item.key}: {last_reason}"
         )
 
-    def decide_all(
-        self,
-        items: Sequence[WorkItemDesc],
-        *,
-        context: AdmissionContext | None = None,
-        reserve: bool = True,
-    ) -> tuple[AdaptiveDecision, ...]:
-        typed = tuple(_instance(item, WorkItemDesc, "phase-5 work item") for item in items)
-        if len({item.key for item in typed}) != len(typed):
-            raise ValueError("admission work item keys must be unique")
-        prepared = self._require_prepared()
-        ordered = tuple(
-            sorted(
-                typed,
-                key=lambda item: (not _must_complete(prepared, item), item.key),
-            )
-        )
-        self.state.reset()
-        decisions = tuple(self.decide(item, context=context, reserve=reserve) for item in ordered)
-        self._last_decisions = decisions
-        return decisions
 
     def release(self, *, buffers: int = 0, budget: Mapping[InterferenceBudgetKey, int] | None = None) -> None:
         buffers = _integer(buffers, "released buffers")
@@ -910,7 +883,7 @@ class AdaptiveAdmissionScheduler:
             action_key=None if candidate is None else candidate.key,
             candidate=candidate,
         )
-        self._last_decisions = (decision,)
+
         return decision
 
     def _fallback_for(self, action: CandidateActionDesc) -> CandidateActionDesc | None:
