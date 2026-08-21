@@ -33,7 +33,7 @@ from tllm.contracts.request_identity import resolve_prompt_sample
 # Backward-compatible alias: ESamp's stats name, canonical type is TrainingStats.
 ESampStats = TrainingStats
 from tllm.contracts.runtime_context import RunnerLike
-from tllm.producer.decode import compute_decode_localization
+from tllm.common.decode_localization import compute_decode_localization
 from tllm.runtime import lifecycle as _lifecycle
 from tllm.runtime import stats as _stats
 from tllm.runtime.config import normalize_adaptation_stream_mode

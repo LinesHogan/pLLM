@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode producer: localize decode rows and export capture-layer hidden."""
+"""Decode row localization: select decode rows and export capture-layer hidden."""
 
 from __future__ import annotations
 

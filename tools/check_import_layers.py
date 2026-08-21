@@ -48,8 +48,6 @@ RULES: dict[str, frozenset[str]] = {
     "ports": frozenset({"contracts", "core"}),
     "common": frozenset({"contracts", "ports", "core"}),
     "producers": frozenset({"contracts", "ports", "core"}),
-    # Legacy single-generation package; removed in R4. Do not add new imports to it.
-    "producer": frozenset({"common", "contracts", "ports", "core"}),
     "workgraph": frozenset({"contracts", "ports", "producers", "core"}),
     "runtime": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
     # Backend drivers are adapters *above* the runtime: they may import it,

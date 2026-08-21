@@ -30,12 +30,6 @@
       "contracts",
       "core"
     ],
-    "producer": [
-      "common",
-      "contracts",
-      "core",
-      "ports"
-    ],
     "producers": [
       "contracts",
       "core",
@@ -58,8 +52,6 @@
       "producers"
     ]
   },
-  "module_level": {
-    "runtime->producer": 1
-  },
+  "module_level": {},
   "local_level": {}
 }

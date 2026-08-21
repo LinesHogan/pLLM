@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 
 import torch
 
-from tllm.producer.decode import compute_decode_localization
+from tllm.common.decode_localization import compute_decode_localization
 
 
 def _make_resolver(base_map: Dict[str, int]):

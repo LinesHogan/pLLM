@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prefill producer: eager-first prefill row localization and export."""
+"""Prefill row localization: eager-first prefill row planning and export."""
 
 from __future__ import annotations
 

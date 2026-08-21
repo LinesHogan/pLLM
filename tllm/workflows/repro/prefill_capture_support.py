@@ -14,7 +14,7 @@ from tllm.common.state import (
     find_capture_layer,
     snapshot_step_common_from_prepare_inputs,
 )
-from tllm.producer.prefill import (
+from tllm.common.prefill_localization import (
     export_prefill_capture,
     prepare_prefill_localization,
     stash_prefill_hidden_from_layer_output,
