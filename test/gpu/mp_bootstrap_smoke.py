@@ -44,13 +44,14 @@ def main() -> int:
     parent_pid = os.getpid()
 
     from tllm.consumers import registry as consumer_registry
+    from tllm.consumers.base import BaseConsumer
     from tllm.consumers.dummy.config import DummyConsumerConfig
     from tllm.ports.base import ConsumerFlow
     from tllm.ports.request_meta import RequestMeta
     from tllm.runtime import residual_runtime as core
     from tllm.util.tools import shutdown_llm_instance
 
-    class MarkerProbe:
+    class MarkerProbe(BaseConsumer[object]):
         consumer_id = "test.mp_marker_probe"
 
         def flows(self):
