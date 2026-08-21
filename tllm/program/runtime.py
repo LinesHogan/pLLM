@@ -41,6 +41,7 @@ from tllm.program.optim import (
 from tllm.program.stages import FlowStagePlan, StagedFlowExecutor, slice_flow_stages
 from tllm.program.state import ProgramStateBank, StateSlot, group_rows_by_prompt
 from tllm.workgraph.frontend import (
+    DynamicDim,
     ExternProgramDecl,
     FlowProgramDecl,
     ResultRef,
@@ -171,6 +172,8 @@ def _check_oracle(
         if name in trainable
     }
     by_id = {id(param): name for name, param in reference.named_parameters()}
+    # The "step" counter is excluded: the functional transition tracks it on
+    # the state slot (slot.step), not as an optimizer-state tensor.
     reference_state: OptState = {}
     for param, param_state in reference_optimizer.state.items():
         name = by_id.get(id(param))
@@ -179,7 +182,7 @@ def _check_oracle(
         reference_state[name] = {
             key: value
             for key, value in param_state.items()
-            if torch.is_tensor(value)
+            if torch.is_tensor(value) and key != "step"
         }
 
     adapter = _FlowAdapter(instance, flow_node.name)
@@ -230,6 +233,7 @@ def compile_program(
     states: Mapping[str, StateSpec],
     examples: Mapping[str, tuple[torch.Tensor, ...]],
     sinks: Iterable[ProgramSink] = (),
+    dynamic_dims: Mapping[str, tuple[DynamicDim, ...]] = {},
 ) -> ProgramConsumer:
     """Compile a declared Program instance into a consumer.
 
@@ -266,6 +270,7 @@ def compile_program(
             decl=flow_decl,
             function=node.function,
             example_args=tuple(cast(tuple[object, ...], example_args)),
+            dynamic_dims=dynamic_dims.get(node.name, ()),
         )
         plans[node.ordinal] = (node, plan, executor)
 
@@ -380,6 +385,8 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
         self.loss_count = 0
         self.loss_sum = 0.0
         self.read_versions: dict[tuple[str, int], int] = {}
+        self._slot_loss_sums: dict[tuple[str, int], float] = {}
+        self._slot_loss_counts: dict[tuple[str, int], int] = {}
 
     @property
     def consumer_id(self) -> str:
@@ -387,6 +394,47 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
 
     def bank(self, name: str) -> ProgramStateBank:
         return self._banks[name]
+
+    def run_flow(
+        self,
+        flow_name: str,
+        *inputs: torch.Tensor,
+        prompt_idx: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Invoke one flow on demand against the current bank state.
+
+        Read-only: no sink publication, no record stash, no extern scheduling.
+        REQUEST banks require ``prompt_idx``.
+        """
+        entry: tuple[ProgramNode, StagedFlowExecutor] | None = None
+        for node, _plan, executor in self._flows.values():
+            if node.name == flow_name:
+                entry = (node, executor)
+                break
+        if entry is None:
+            raise WorkGraphError(
+                "PG100", f"unknown flow {flow_name!r} for {self.consumer_id}"
+            )
+        node, executor = entry
+        flow_decl = cast(FlowProgramDecl, node.decl)
+        bank = (
+            self._banks.get(flow_decl.state) if flow_decl.state is not None else None
+        )
+        with torch.no_grad():
+            if bank is None:
+                return executor.run(*inputs)
+            slot = bank.slot_for(prompt_idx)
+            return executor.run(*inputs, state_override=self._slot_override(slot))
+
+    def read_and_reset_slot_losses(self) -> dict[tuple[str, int], tuple[float, int]]:
+        """Per-slot (loss_sum, loss_count) since the last read; resets counters."""
+        out = {
+            key: (self._slot_loss_sums[key], self._slot_loss_counts[key])
+            for key in self._slot_loss_sums
+        }
+        self._slot_loss_sums.clear()
+        self._slot_loss_counts.clear()
+        return out
 
     def _groups(
         self, bank: ProgramStateBank, meta: RowBatchMeta | None, rows: int
@@ -515,7 +563,8 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
             extern.source_output
         )
 
-        for prompt_idx, row_ids in groups:
+        loss_values = record.outputs[extern.source_output].detach().float().view(-1)
+        for group_index, (prompt_idx, row_ids) in enumerate(groups):
             slot = bank.slot_for(prompt_idx)
             params = {
                 f"program_instance.{name}": slot.params[name] for name in self._trainable
@@ -545,6 +594,14 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
             )
             bank.publish_update(slot, new_params, new_state)
             self.update_count += 1
+            slot_key = (bank.name, slot.slot_id)
+            self._slot_loss_sums[slot_key] = (
+                self._slot_loss_sums.get(slot_key, 0.0)
+                + float(loss_values[group_index])
+            )
+            self._slot_loss_counts[slot_key] = (
+                self._slot_loss_counts.get(slot_key, 0) + 1
+            )
         self.loss_count += 1
         self.loss_sum += float(loss.detach().float().sum())
 

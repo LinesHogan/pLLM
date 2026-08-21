@@ -3,18 +3,27 @@
 
 from __future__ import annotations
 
-from tllm.consumers.esamp.config import ESampConsumerConfig
+from tllm.consumers.esamp.config import BaseESampConsumer, ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
+from tllm.consumers.esamp.program_consumer import ESampProgramConsumer
 from tllm.consumers.plugin import ConsumerPluginSpec
+from tllm.ports.consumer import BaseConsumer
 
-PLUGIN = ConsumerPluginSpec("esamp", ESampConsumer, ESampConsumerConfig, ESampConsumer)
+
+def _build_esamp(config: ESampConsumerConfig) -> BaseConsumer:
+    if str(config.implementation) == "program":
+        return ESampProgramConsumer(config)
+    return ESampConsumer(config)
+
+
+PLUGIN = ConsumerPluginSpec("esamp", BaseESampConsumer, ESampConsumerConfig, _build_esamp)
 CONSUMER_TYPE = PLUGIN.consumer_type
 CONFIG_TYPE = PLUGIN.config_type
 
 
-def build(config: ESampConsumerConfig | None = None) -> ESampConsumer:
+def build(config: ESampConsumerConfig | None = None) -> BaseConsumer:
     return PLUGIN.build(config)
 
 
-def activate(config: ESampConsumerConfig | None = None, *, primary: bool = False) -> ESampConsumer:
+def activate(config: ESampConsumerConfig | None = None, *, primary: bool = False) -> BaseConsumer:
     return PLUGIN.activate(config, primary=primary)

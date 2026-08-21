@@ -11,23 +11,13 @@ import torch.nn.functional as F
 
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine
+from tllm.consumers.esamp.lm_head import resolve_lm_head as _resolve_lm_head
 from tllm.runtime.resources import SamplerPrecomputeCache
 from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 
 _SAMPLER_PRECOMPUTE_STREAM_PRIORITY = 2
-def _resolve_lm_head(model: Any) -> Any:
-    candidates = [
-        getattr(model, "lm_head", None),
-        getattr(getattr(model, "model", None), "lm_head", None),
-        getattr(getattr(getattr(model, "model", None), "model", None), "lm_head", None),
-        (model.get_output_embeddings() if callable(getattr(model, "get_output_embeddings", None)) else None),
-    ]
-    for candidate in candidates:
-        if candidate is not None and hasattr(candidate, "weight"):
-            return candidate
-    raise RuntimeError("ESamp sampler provider could not resolve lm_head from model")
 
 
 def _project_dense_logits(

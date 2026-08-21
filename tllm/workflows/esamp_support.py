@@ -9,6 +9,7 @@ from typing import Sequence
 import torch
 
 from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
+from tllm.consumers.esamp.program_consumer import ESampProgramConsumer
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
 from tllm.ports.base import RowSelection
 from tllm.runtime import residual_runtime as runtime
@@ -17,6 +18,7 @@ from tllm.runtime.vllm_patch import capture_runner as _capture_runner
 
 def configure_esamp_runtime(
     *,
+    implementation: str = "legacy",
     graph_scratch_rows: int = 0,
     tap_layer_paths: Sequence[str] | None = None,
     source_layer_path: str = "model.model.layers[0].input_layernorm",
@@ -45,9 +47,10 @@ def configure_esamp_runtime(
     distiller_beta: float = 0.0,
     distiller_sampler_backend: str = "post_filter_exact",
     compact_capture_lane: bool = False,
-) -> ESampConsumer:
+) -> ESampConsumer | ESampProgramConsumer:
     tap_layer_paths = tuple(tap_layer_paths or (source_layer_path, target_layer_path))
     config = ESampConsumerConfig(
+        implementation=str(implementation).strip() or "legacy",
         graph_scratch_rows=int(graph_scratch_rows),
         source_layer_path=str(source_layer_path),
         target_layer_path=str(target_layer_path),
@@ -78,10 +81,15 @@ def configure_esamp_runtime(
     )
 
     current = runtime.RUNTIME.consumer
-    if isinstance(current, ESampConsumer):
+    if isinstance(current, ESampProgramConsumer) and config.implementation == "program":
+        consumer = current
+        consumer.update_config(config)
+    elif isinstance(current, ESampConsumer) and config.implementation == "legacy":
         consumer = current
         consumer.synchronize()
         consumer.update_config(config)
+    elif config.implementation == "program":
+        consumer = ESampProgramConsumer(config)
     else:
         consumer = ESampConsumer(config)
     runtime.clear_dispatch_consumers()

@@ -481,6 +481,7 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
                 expanded_local_pos,
                 return_logprobs=return_logprobs,
             )
+        runtime.sampler_precompute.intervention_state_count += 1
 
         from vllm.config.model import PROCESSED_LOGPROBS_MODES
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p

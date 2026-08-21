@@ -11,7 +11,7 @@ import torch
 from tllm.common.path_resolution import candidate_capture_paths
 from tllm.common.state import resolve_object_by_path
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers.esamp.config import ESampConsumerConfig
+from tllm.consumers.esamp.config import BaseESampConsumer, ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine, ESampStats
 from tllm.consumers.esamp.initializers.svd import build_model_bank_initializer
 from tllm.consumers.esamp.sampler_provider import ESampSamplerModifierProvider
@@ -235,7 +235,7 @@ class _ESampFusionGroupHandle:
         return self._consumer.fusion_replay_count()
 
 
-class ESampConsumer(BaseConsumer[ESampConsumerConfig]):
+class ESampConsumer(BaseESampConsumer):
     """Dispatch-plan friendly ESamp wrapper around the formal engine."""
 
     @staticmethod

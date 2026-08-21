@@ -57,7 +57,7 @@ RULES: dict[str, frozenset[str]] = {
     # protocol module, via SANCTIONED_EDGES).
     "backends": frozenset({"contracts", "ports", "workgraph", "runtime", "core"}),
     "consumers": frozenset(
-        {"contracts", "ports", "common", "producers", "workgraph", "runtime", "core"}
+        {"contracts", "ports", "common", "producers", "workgraph", "runtime", "program", "core"}
     ),
     "workflows": None,  # leaf entry points: may import anything
     # Script helpers used by workflows/starter/gpu scripts.

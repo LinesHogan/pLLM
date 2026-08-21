@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
+from tllm.ports.consumer import BaseConsumer
 from tllm.runtime.config import (
     AdaptationStreamMode,
     ModelBankForwardBackendName,
@@ -17,6 +18,7 @@ from tllm.ports.base import RowSelection
 
 __all__ = [
     "AdaptationStreamMode",
+    "BaseESampConsumer",
     "ESampConsumerConfig",
     "ModelBankForwardBackendName",
     "normalize_adaptation_stream_mode",
@@ -27,6 +29,7 @@ __all__ = [
 @dataclass
 class ESampConsumerConfig:
     consumer_id: str = "esamp"
+    implementation: str = "legacy"
     graph_scratch_rows: int = 0
     source_layer_path: str = "model.model.layers[0].input_layernorm"
     target_layer_path: str = "model.model.layers[-1].input_layernorm"
@@ -56,6 +59,11 @@ class ESampConsumerConfig:
     compact_capture_lane: bool = False
 
     def __post_init__(self) -> None:
+        self.implementation = str(self.implementation).strip() or "legacy"
+        if self.implementation not in ("legacy", "program"):
+            raise ValueError(
+                f"implementation must be 'legacy' or 'program', got {self.implementation!r}"
+            )
         if bool(self.per_request_model_bank) and not bool(self.per_request_models):
             raise ValueError("per_request_model_bank=True requires per_request_models=True")
         try:
@@ -68,3 +76,11 @@ class ESampConsumerConfig:
         self.model_bank_forward_backend = normalize_model_bank_forward_backend(self.model_bank_forward_backend)
         self.adaptation_stream_mode = normalize_adaptation_stream_mode(self.adaptation_stream_mode)
         self.adaptation_stream_priority = int(self.adaptation_stream_priority)
+
+
+class BaseESampConsumer(BaseConsumer[ESampConsumerConfig]):
+    """Shared base of the legacy and program ESamp consumers.
+
+    Lives in the engine-free config module so the plugin registry's reverse
+    type lookup stays precise for both implementations.
+    """

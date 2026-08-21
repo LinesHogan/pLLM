@@ -78,6 +78,7 @@ class SamplerPrecomputeState:
     fallback_event_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
     port_publish_attempt_count: int = 0
     port_publish_hit_count: int = 0
+    intervention_state_count: int = 0
     schedule_attempt_count: int = 0
     schedule_hit_count: int = 0
     candidate_sample_count: int = 0

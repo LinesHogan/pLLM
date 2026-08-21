@@ -268,6 +268,12 @@ def sample_with_optional_modifier(
             before_draw()
         if state is None or int(state.affected_row_ids.numel()) <= 0:
             return None
+        try:
+            runtime = view.runner._tllm_runtime
+        except AttributeError:
+            runtime = None
+        if runtime is not None:
+            runtime.sampler_precompute.intervention_state_count += 1
         affected_rows = state.affected_row_ids.to(device=logits.device, dtype=torch.long)
         rows = int(logits.shape[0])
         temperature_mode = _classify_temperature_mode(sampling_metadata)

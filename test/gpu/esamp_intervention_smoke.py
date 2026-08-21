@@ -24,6 +24,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--beta", type=float, default=0.5)
     parser.add_argument("--sampler-backend", type=str, default="post_filter_exact")
+    parser.add_argument("--implementation", type=str, default="legacy", choices=["legacy", "program"])
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--out", type=str, default="")
@@ -39,6 +40,7 @@ def main() -> int:
     )
 
     esamp_workflow_support.configure_esamp_runtime(
+        implementation=str(args.implementation),
         graph_scratch_rows=max(64, len(prompts)),
         enable_esamp_training=True,
         enable_distiller_intervention=True,
@@ -107,6 +109,20 @@ def main() -> int:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
 
+    if str(args.implementation) == "program":
+        applied = int(getattr(stats, "intervention_state_count", 0))
+        loss_count = int(getattr(esamp_stats, "loss_count", 0))
+        if applied <= 0 or loss_count <= 0:
+            raise RuntimeError(
+                "program intervention never engaged: "
+                f"intervention_states={applied} loss_count={loss_count} "
+                f"(publish attempts={attempts} hits={hits})"
+            )
+        print(
+            "esamp program intervention smoke OK: "
+            f"intervention_states={applied} loss_count={loss_count}"
+        )
+        return 0
     if attempts <= 0 or hits <= 0:
         raise RuntimeError(
             f"intervention never engaged: publish attempts={attempts} hits={hits}. "

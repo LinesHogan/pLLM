@@ -20,6 +20,7 @@ from tllm.runtime.resources import SamplerPrecomputeState
 class DistillerTimingStats:
     port_publish_attempt_count: int = 0
     port_publish_hit_count: int = 0
+    intervention_state_count: int = 0
     precompute_ms_total: float = 0.0
     precompute_count: int = 0
     wait_ms_total: float = 0.0
@@ -53,6 +54,7 @@ class DistillerTimingStats:
         return cls(
             port_publish_attempt_count=int(payload.get("port_publish_attempt_count", 0)),
             port_publish_hit_count=int(payload.get("port_publish_hit_count", 0)),
+            intervention_state_count=int(payload.get("intervention_state_count", 0)),
             precompute_ms_total=float(payload.get("precompute_ms_total", 0.0)),
             precompute_count=int(payload.get("precompute_count", 0)),
             wait_ms_total=float(payload.get("wait_ms_total", 0.0)),
@@ -76,6 +78,7 @@ class DistillerTimingStats:
         for entry in entries:
             out.port_publish_attempt_count += entry.port_publish_attempt_count
             out.port_publish_hit_count += entry.port_publish_hit_count
+            out.intervention_state_count += entry.intervention_state_count
             out.precompute_ms_total += entry.precompute_ms_total
             out.precompute_count += entry.precompute_count
             out.wait_ms_total += entry.wait_ms_total
@@ -251,6 +254,7 @@ def read_and_reset_distiller_timing_stats(state: StatsState, sync: bool = True) 
     out.fallback_ms_total, out.fallback_count = _accumulate(precompute.fallback_event_pairs)
     out.port_publish_attempt_count = int(precompute.port_publish_attempt_count)
     out.port_publish_hit_count = int(precompute.port_publish_hit_count)
+    out.intervention_state_count = int(precompute.intervention_state_count)
     out.schedule_attempt_count = int(precompute.schedule_attempt_count)
     out.schedule_hit_count = int(precompute.schedule_hit_count)
     out.candidate_sample_count = int(precompute.candidate_sample_count)
@@ -265,6 +269,7 @@ def read_and_reset_distiller_timing_stats(state: StatsState, sync: bool = True) 
     precompute.fallback_event_pairs = []
     precompute.port_publish_attempt_count = 0
     precompute.port_publish_hit_count = 0
+    precompute.intervention_state_count = 0
     precompute.schedule_attempt_count = 0
     precompute.schedule_hit_count = 0
     precompute.candidate_sample_count = 0
