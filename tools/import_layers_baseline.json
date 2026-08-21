@@ -59,7 +59,6 @@
     ]
   },
   "module_level": {
-    "contracts->ports": 1,
     "ports->runtime": 1,
     "runtime->backends": 1,
     "runtime->consumers": 7,

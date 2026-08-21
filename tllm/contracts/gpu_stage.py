@@ -8,7 +8,7 @@ from typing import Literal, Mapping, Protocol, runtime_checkable
 
 import torch
 
-from tllm.ports.base import BufferOwnership
+from tllm.contracts.ownership import BufferOwnership
 
 LeaseLifetime = Literal["consume_call", "step"]
 

@@ -8,6 +8,10 @@ from enum import Enum
 from enum import StrEnum
 from typing import Literal, Sequence
 
+# Canonical home: tllm.contracts.ownership (contracts layer). Re-exported here
+# because BufferOwnership is part of the port contract vocabulary.
+from tllm.contracts.ownership import BufferOwnership
+
 
 class PortKind(str, Enum):
     RESIDUAL_STREAM = "residual_stream"
@@ -38,12 +42,6 @@ class FlowWindow(StrEnum):
 class FlowDelivery(StrEnum):
     BUNDLE = "bundle"
     DEVICE_LEASE = "device_lease"
-
-
-class BufferOwnership(StrEnum):
-    BORROWED = "borrowed"
-    RUNTIME_LEASE = "runtime_lease"
-
 
 class RowSelection(StrEnum):
     ALL = "none"
