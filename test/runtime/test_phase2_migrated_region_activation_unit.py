@@ -34,7 +34,7 @@ from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionKind,
     PhysicalExecutor,
 )
-from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
+from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import placement
 from tllm.workgraph import (

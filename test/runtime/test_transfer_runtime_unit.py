@@ -38,11 +38,11 @@ def _transfer_runtime(test_case: unittest.TestCase):
     """Import the future runtime surface as an explicit per-test red failure."""
 
     try:
-        return importlib.import_module("tllm.runtime.scheduling.phase3_transfer")
+        return importlib.import_module("tllm.runtime.scheduling.transfer")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
             "Phase 3 transfer runtime is not implemented: "
-            "tllm.runtime.scheduling.phase3_transfer is required"
+            "tllm.runtime.scheduling.transfer is required"
         )
         raise AssertionError from exc
 
@@ -247,7 +247,7 @@ class Phase3CopyAdmissionTest(unittest.TestCase):
         self.assertFalse(admission.admit(copy, leases=()))
 
 
-class Phase3CopyExecutorTest(unittest.TestCase):
+class CopyExecutorRuntimeTest(unittest.TestCase):
     def test_physical_epoch_executes_selected_placement_implementation(self) -> None:
         transfer = _transfer_runtime(self)
         node = NodeKey.consumer_flow("placement.selected.runtime", 0)

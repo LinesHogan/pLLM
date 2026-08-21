@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from tllm.workgraph.hierarchy import CaptureAttachment
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
     from tllm.runtime.specialization import RuntimeSpecializationSpec
-    from tllm.runtime.scheduling.phase3_transfer import (
+    from tllm.runtime.scheduling.transfer import (
         CopyHandle,
         PlacementRuntimeBinding,
         TensorLike,
@@ -423,7 +423,7 @@ def configure_workgraph_placement(
 ) -> None:
     """Install or remove typed Phase 3 cold-compilation inputs."""
 
-    from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
+    from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
 
     if binding is not None and not isinstance(binding, PlacementRuntimeBinding):
         raise TypeError(

@@ -20,7 +20,7 @@ from tllm.runtime.ports.residual_bundle_dispatch import (
     synchronize_deferred_port_bundles,
 )
 from tllm.runtime.scheduling.deferred import DeferredWork
-from tllm.runtime.scheduling.phase3_transfer import (
+from tllm.runtime.scheduling.transfer import (
     PinnedMemoryPool,
     PlacementPlanDispatcher,
     PlacementRuntimeBinding,

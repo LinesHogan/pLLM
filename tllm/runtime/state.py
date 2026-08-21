@@ -37,7 +37,7 @@ from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrie
 if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
-    from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
+    from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
     from tllm.runtime.scheduling.phase4_collective import (
         DistributedPlanSnapshotStore,
         DistributedRuntimeBinding,

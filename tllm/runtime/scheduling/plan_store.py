@@ -16,7 +16,7 @@ from tllm.runtime.scheduling.physical import (
     GraphLike,
     StreamLike,
 )
-from tllm.runtime.scheduling.phase3_transfer import (
+from tllm.runtime.scheduling.transfer import (
     CopyHandle,
     PlacementImplementationBinding,
     PlacementPlanDispatcher,

@@ -1,4 +1,4 @@
-"""Python-owned pinned buffers and asynchronous transfers for Phase 3."""
+"""Python-owned pinned buffers and asynchronous transfers for placement plans."""
 
 from __future__ import annotations
 

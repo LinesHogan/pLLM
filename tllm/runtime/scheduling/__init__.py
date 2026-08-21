@@ -16,7 +16,7 @@ from tllm.runtime.scheduling.plan_store import (
     RuntimeStream,
     select_buffer_bucket,
 )
-from tllm.runtime.scheduling.phase3_transfer import (
+from tllm.runtime.scheduling.transfer import (
     CopyExecutor,
     CopyHandle,
     PinnedMemoryPool,
