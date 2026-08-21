@@ -127,6 +127,13 @@ class PhysicalExecutionStats:
     last_plan_epoch: int = 0
 
 
+def _wire_int(payload: Mapping[str, object], key: str) -> int:
+    value = payload.get(key, 0)
+    if not isinstance(value, (int, float, str)):
+        raise TypeError(f"{key} must be an int-compatible wire value, got {type(value).__name__}")
+    return int(value)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkGraphRuntimeStats:
     active_plan_epoch: int = 0
@@ -149,20 +156,20 @@ class WorkGraphRuntimeStats:
         """Decode a worker-side numeric snapshot from the control plane."""
 
         return cls(
-            active_plan_epoch=int(payload.get("active_plan_epoch", 0)),
-            prepare_count=int(payload.get("prepare_count", 0)),
-            execute_count=int(payload.get("execute_count", 0)),
-            finish_count=int(payload.get("finish_count", 0)),
-            replay_count=int(payload.get("replay_count", 0)),
-            eager_count=int(payload.get("eager_count", 0)),
-            fallback_count=int(payload.get("fallback_count", 0)),
-            fence_wait_count=int(payload.get("fence_wait_count", 0)),
-            fence_record_count=int(payload.get("fence_record_count", 0)),
-            bucket_miss_count=int(payload.get("bucket_miss_count", 0)),
-            specialization_request_count=int(payload.get("specialization_request_count", 0)),
-            active_leases=int(payload.get("active_leases", 0)),
-            retired_plans=int(payload.get("retired_plans", 0)),
-            deadline_flush_count=int(payload.get("deadline_flush_count", 0)),
+            active_plan_epoch=_wire_int(payload, "active_plan_epoch"),
+            prepare_count=_wire_int(payload, "prepare_count"),
+            execute_count=_wire_int(payload, "execute_count"),
+            finish_count=_wire_int(payload, "finish_count"),
+            replay_count=_wire_int(payload, "replay_count"),
+            eager_count=_wire_int(payload, "eager_count"),
+            fallback_count=_wire_int(payload, "fallback_count"),
+            fence_wait_count=_wire_int(payload, "fence_wait_count"),
+            fence_record_count=_wire_int(payload, "fence_record_count"),
+            bucket_miss_count=_wire_int(payload, "bucket_miss_count"),
+            specialization_request_count=_wire_int(payload, "specialization_request_count"),
+            active_leases=_wire_int(payload, "active_leases"),
+            retired_plans=_wire_int(payload, "retired_plans"),
+            deadline_flush_count=_wire_int(payload, "deadline_flush_count"),
         )
 
     @classmethod

@@ -19,12 +19,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence, cast
+from typing import Any, Dict, List, Sequence, cast
 
 import torch
 from vllm import SamplingParams
 
-from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
+from tllm.consumers.esamp.initializers.svd import SVDInitMethod, SVDModelBankInitializerConfig
 from tllm.consumers.esamp.model_bank_backend import normalize_model_bank_forward_backend
 from tllm.workflows.common import (
     build_sampling_params as _build_sampling_params,
@@ -263,7 +263,7 @@ def _build_model_bank_initializer_config(args: argparse.Namespace) -> SVDModelBa
     if str(args.model_bank_initializer).strip().lower() != "svd":
         return None
     return SVDModelBankInitializerConfig(
-        method=str(args.model_bank_initializer_svd_method).strip().lower(),
+        method=cast(SVDInitMethod, str(args.model_bank_initializer_svd_method).strip().lower()),
         ridge_lambda=float(args.model_bank_initializer_svd_ridge_lambda),
         min_rows=int(args.model_bank_initializer_svd_min_rows),
         max_wait_steps=int(args.model_bank_initializer_svd_max_wait_steps),
@@ -567,7 +567,7 @@ def _run_case(
                 request_prompt_indices=pidx_slice,
                 request_sample_indices=sidx_slice,
             )
-            outputs_all.extend(outputs)
+            outputs_all.extend(cast(List[object], outputs))
         return outputs_all
 
     for _ in range(int(warmup_rounds)):
@@ -726,7 +726,7 @@ def _run_per_request_trajectory(
     request_sample_indices: Sequence[int] | None,
     effective_batch_cap: int,
     rows: int,
-) -> None:
+) -> Dict[str, List[Dict[str, float]]]:
     esamp_workflow_support.configure_esamp_runtime(
         graph_scratch_rows=int(rows),
         tap_layer_paths=[args.source_layer_path, args.target_layer_path],
@@ -880,7 +880,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
         sampling_per_request_seed=bool(args.sampling_per_request_seed),
     )
 
-    common = dict(
+    common: Dict[str, Any] = dict(
         graph_scratch_rows=int(rows),
         source_layer_path=args.source_layer_path,
         target_layer_path=args.target_layer_path,

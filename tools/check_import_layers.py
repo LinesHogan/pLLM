@@ -55,9 +55,8 @@ RULES: dict[str, frozenset[str]] = {
         {"contracts", "ports", "common", "producers", "workgraph", "runtime", "core"}
     ),
     "workflows": None,  # leaf entry points: may import anything
-    # Script collections pending the move to tools/ in R1.
+    # Script helpers used by workflows/starter/gpu scripts.
     "util": None,
-    "verification": None,
 }
 
 # runtime may touch exactly this one backends module.

@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List, cast
+
+if TYPE_CHECKING:
+    from vllm import LLM
 
 from tllm.runtime import residual_runtime as core
 from tllm.workflows import esamp_support as esamp_workflow_support
@@ -145,7 +148,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
                     f"loss_avg={result['loss_avg']:.6e} loss_count={int(result['loss_count'])}"
                 )
     finally:
-        shutdown_llm_instance(llm, cooldown_s=float(args.benchmark_case_cooldown_s))
+        shutdown_llm_instance(cast("LLM", llm), cooldown_s=float(args.benchmark_case_cooldown_s))
         if args.benchmark_log_memory:
             print_gpu_mem(f"[{implementation}] after_llm_shutdown")
 

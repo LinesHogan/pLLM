@@ -28,6 +28,7 @@ def clear_consumers() -> None:
 
 
 __all__ = [
+    "BaseConsumer",
     "BeforeNextUse",
     "TllmRuntime",
     "clear_consumers",

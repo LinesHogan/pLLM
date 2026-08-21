@@ -294,7 +294,7 @@ class CopyExecutor:
         ):
             raise TypeError("CopyExecutor.moves must be tuple[Move, ...]")
         typed_moves = cast(tuple[Move, ...], raw_moves)
-        if not typed_moves or len(typed_moves) > 2:
+        if len(typed_moves) not in (1, 2):
             raise ValueError("CopyExecutor accepts one direct or two staged moves")
         if len(typed_moves) == 2 and not (
             typed_moves[0].kind == MoveKind.D2H
@@ -384,10 +384,10 @@ class CopyExecutor:
             if slot is None:
                 raise RuntimeError("host-staged transfer requires a pinned slot")
             if active.index == 0:
-                source: object = active.source
-                destination: object = slot.tensor
+                source: TensorLike = active.source
+                destination: TensorLike = cast(TensorLike, slot.tensor)
             else:
-                source = slot.tensor
+                source = cast(TensorLike, slot.tensor)
                 destination = active.destination
         else:
             source = active.source

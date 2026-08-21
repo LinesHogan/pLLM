@@ -239,20 +239,21 @@ class TorchDistributedCollectiveAdapter:
 
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before launch")
+        group = cast(dist.ProcessGroup | None, communicator)
         input_tensor = payload.input
         output_tensor = payload.output
         kind = collective.kind
         if kind == CollectiveKind.ALL_REDUCE:
             if input_tensor is None:
                 raise ValueError("all_reduce requires an input tensor")
-            work = dist.all_reduce(input_tensor, group=communicator, async_op=True)
+            work = dist.all_reduce(input_tensor, group=group, async_op=True)
         elif kind == CollectiveKind.ALL_GATHER:
             if input_tensor is None or output_tensor is None:
                 raise ValueError("all_gather requires input and output tensors")
             work = dist.all_gather_into_tensor(
                 output_tensor,
                 input_tensor,
-                group=communicator,
+                group=group,
                 async_op=True,
             )
         elif kind == CollectiveKind.REDUCE_SCATTER:
@@ -261,7 +262,7 @@ class TorchDistributedCollectiveAdapter:
             work = dist.reduce_scatter_tensor(
                 output_tensor,
                 input_tensor,
-                group=communicator,
+                group=group,
                 async_op=True,
             )
         elif kind == CollectiveKind.BROADCAST:
@@ -270,11 +271,11 @@ class TorchDistributedCollectiveAdapter:
             work = dist.broadcast(
                 input_tensor,
                 src=collective.root_rank,
-                group=communicator,
+                group=group,
                 async_op=True,
             )
         elif kind == CollectiveKind.BARRIER:
-            work = dist.barrier(group=communicator, async_op=True)
+            work = dist.barrier(group=group, async_op=True)
         else:
             if collective.root_rank is None:
                 raise ValueError("send_recv requires a sender rank")
@@ -287,7 +288,7 @@ class TorchDistributedCollectiveAdapter:
                 work = dist.isend(
                     input_tensor,
                     dst=destination,
-                    group=communicator,
+                    group=group,
                 )
             else:
                 if output_tensor is None:
@@ -295,9 +296,9 @@ class TorchDistributedCollectiveAdapter:
                 work = dist.irecv(
                     output_tensor,
                     src=collective.root_rank,
-                    group=communicator,
+                    group=group,
                 )
-        if not isinstance(cast(object, work), _TorchWorkLike):
+        if work is None or not isinstance(cast(object, work), _TorchWorkLike):
             raise TypeError("torch.distributed work must provide is_completed()")
         return _TorchWorkFence(work)
 
