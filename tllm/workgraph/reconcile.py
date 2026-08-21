@@ -129,4 +129,3 @@ def reconcile(
     )
 
 
-plan_diff = reconcile

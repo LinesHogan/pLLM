@@ -841,6 +841,15 @@ class HiddenSource:
 
 
 @dataclass(frozen=True, slots=True)
+class ProvidedSource:
+    """flow/extern input source: a tensor the caller supplies in the bundle.
+
+    Unlike ``hidden()``, no engine tap is declared — the consumer hands the
+    value over directly (device_lease entry key = declared input name).
+    """
+
+
+@dataclass(frozen=True, slots=True)
 class SinkRef:
     """flow named output handed to a registered sink (e.g. ``guidance``)."""
 
@@ -876,6 +885,10 @@ def hidden(layer: int, site: str, phase: str) -> HiddenSource:
     return HiddenSource(layer=layer, site=site, phase=phase)
 
 
+def provided() -> ProvidedSource:
+    return ProvidedSource()
+
+
 def sink(name: str) -> SinkRef:
     return SinkRef(name=name)
 
@@ -896,7 +909,7 @@ def request_prompt_idx() -> PromptIdxKey:
 class FlowProgramDecl:
     """Program-mode metadata recorded by ``@flow(inputs/outputs/state)``."""
 
-    inputs: tuple[tuple[str, HiddenSource], ...]
+    inputs: tuple[tuple[str, HiddenSource | ProvidedSource], ...]
     outputs: tuple[tuple[str, SinkRef | LocalRef], ...]
     state: str | None
 
@@ -905,7 +918,7 @@ class FlowProgramDecl:
 class ExternProgramDecl:
     """Program-mode metadata recorded by ``@extern(inputs/after/deadline)``."""
 
-    inputs: tuple[tuple[str, ResultRef | HiddenSource], ...]
+    inputs: tuple[tuple[str, ResultRef | HiddenSource | ProvidedSource], ...]
     after: tuple[str, ...]
     state: str | None
     deadline: TimingDeadline | None
@@ -956,7 +969,7 @@ def flow(
     freshness: _BeforeNextUse = BeforeNextUse,
     bindings: tuple[PortBindingDesc, ...] = (),
     dynamic_dims: tuple[DynamicDim, ...] = (),
-    inputs: Mapping[str, HiddenSource] | None = None,
+    inputs: Mapping[str, HiddenSource | ProvidedSource] | None = None,
     outputs: Mapping[str, SinkRef | LocalRef] | None = None,
     state: str | None = None,
 ) -> Callable[[Callable[_P, _R]], FlowCallable[_P, _R]]: ...
@@ -969,7 +982,7 @@ def flow(
     freshness: _BeforeNextUse = BeforeNextUse,
     bindings: tuple[PortBindingDesc, ...] = (),
     dynamic_dims: tuple[DynamicDim, ...] = (),
-    inputs: Mapping[str, HiddenSource] | None = None,
+    inputs: Mapping[str, HiddenSource | ProvidedSource] | None = None,
     outputs: Mapping[str, SinkRef | LocalRef] | None = None,
     state: str | None = None,
 ) -> FlowCallable[_P, _R] | Callable[[Callable[_P, _R]], FlowCallable[_P, _R]]:
@@ -987,7 +1000,7 @@ def flow(
     program_inputs: tuple[tuple[str, object], ...] = ()
     program_outputs: tuple[tuple[str, object], ...] = ()
     if inputs is not None:
-        program_inputs = _program_mapping(inputs, (HiddenSource,), "flow.inputs")
+        program_inputs = _program_mapping(inputs, (HiddenSource, ProvidedSource), "flow.inputs")
     if outputs is not None:
         program_outputs = _program_mapping(outputs, (SinkRef, LocalRef), "flow.outputs")
     if state is not None:
@@ -1001,7 +1014,7 @@ def flow(
         if program_mode:
             _check_param_names(program_inputs, target, "flow.inputs")
             program_decl = FlowProgramDecl(
-                inputs=cast(tuple[tuple[str, HiddenSource], ...], program_inputs),
+                inputs=cast(tuple[tuple[str, HiddenSource | ProvidedSource], ...], program_inputs),
                 outputs=cast(tuple[tuple[str, SinkRef | LocalRef], ...], program_outputs),
                 state=state,
             )
@@ -1064,7 +1077,7 @@ def extern(
     device: Device | None = None,
     capability: Capability | None = None,
     bindings: tuple[PortBindingDesc, ...] = (),
-    inputs: Mapping[str, ResultRef | HiddenSource] | None = None,
+    inputs: Mapping[str, ResultRef | HiddenSource | ProvidedSource] | None = None,
     after: tuple[str, ...] = (),
     deadline: TimingDeadline | None = None,
 ) -> Callable[[Callable[_P, _R]], ExternCallable[_P, _R]]:
@@ -1091,7 +1104,7 @@ def extern(
     program_after: tuple[str, ...] = ()
     if program_mode:
         if inputs is not None:
-            program_inputs = _program_mapping(inputs, (ResultRef, HiddenSource), "extern.inputs")
+            program_inputs = _program_mapping(inputs, (ResultRef, HiddenSource, ProvidedSource), "extern.inputs")
         if after:
             if not isinstance(cast(object, after), tuple):
                 raise TypeError("extern.after must be a tuple of flow names")
@@ -1133,7 +1146,7 @@ def extern(
         if program_mode:
             _check_param_names(program_inputs, function, "extern.inputs")
             program_decl = ExternProgramDecl(
-                inputs=cast(tuple[tuple[str, ResultRef | HiddenSource], ...], program_inputs),
+                inputs=cast(tuple[tuple[str, ResultRef | HiddenSource | ProvidedSource], ...], program_inputs),
                 after=program_after,
                 state=cast(str | None, state),
                 deadline=deadline,
@@ -1205,6 +1218,7 @@ __all__ = [
     "ExternProgramDecl",
     "FlowProgramDecl",
     "HiddenSource",
+    "ProvidedSource",
     "LocalRef",
     "PromptIdxKey",
     "ResultRef",
@@ -1213,6 +1227,7 @@ __all__ = [
     "flow",
     "hidden",
     "local",
+    "provided",
     "request_prompt_idx",
     "result",
     "sink",

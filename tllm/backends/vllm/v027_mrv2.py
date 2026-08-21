@@ -32,7 +32,6 @@ from tllm.backends.vllm.workgraph_runtime import (
 )
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
-from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.step_session import (
     StepSession,
     StepState,
@@ -42,13 +41,6 @@ from tllm.runtime.step_session import (
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
-
-
-def _test_time_lora_enabled(runtime: Any) -> bool:
-    return bool(
-        getattr(runtime, "test_time_lora_enabled", False)
-        or getattr(runtime, "test_time_lora_service", None) is not None
-    )
 
 
 def _decode_localization_from_mrv2(*, core: Any, runner: Any, input_batch: Any) -> tuple:
@@ -138,8 +130,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         runtime.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
-    _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=runtime, runner=runner)
-
     try:
         out = orig(runner, *args, **kwargs)
     except Exception as exc:
@@ -240,8 +230,6 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
 
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, *args, **kwargs)
-        if _test_time_lora_enabled(runtime):
-            _test_time_lora.maybe_bind_test_time_lora_service(runtime=runtime, runner=runner)
         _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
         _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
         _record_workgraph_resolution()
@@ -256,7 +244,6 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
     )
     out = orig(runner, *args, **kwargs)
     _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
-    _test_time_lora.maybe_bind_test_time_lora_service(runtime=runtime, runner=runner)
     _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
     _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
     _record_workgraph_resolution()

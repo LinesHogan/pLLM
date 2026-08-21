@@ -422,8 +422,6 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
             if int(cache.row_ids.numel()) <= 0:
                 return None
             lm_head = self._get_lm_head(view.model)
-            if runtime is not None:
-                runtime.sampler_precompute.port_consume_step_id = int(view.engine_step_id)
             return CandidateModifierState(
                 beta=float(self.config.distiller_beta),
                 backend=self.config.distiller_sampler_backend,

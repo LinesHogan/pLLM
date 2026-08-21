@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""TTRL-inspired reward grouping and lightweight update consumer."""
+"""TTRL consumer: majority-vote rewards plus a Program-backed reward model.
+
+The verifier/vote/retry/barrier logic is plain Python (``rewards.py``); the
+tensor training is a compiled ``TTRLProgram`` driven with caller-supplied
+hidden rows and rewards.
+"""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import torch
 
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers._common.bundle_inputs import post_generate_input
+from tllm.consumers._common.bundle_inputs import post_generate_input, provided_bundle
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
-from tllm.consumers.ttrl.engine import (
+from tllm.consumers.ttrl.program import TTRLProgram
+from tllm.consumers.ttrl.rewards import (
     TTRLClosedLoopIntent,
-    TTRLEngine,
     TTRLRewardResult,
     TTRLSample,
-    TTRLStats,
     build_ttrl_closed_loop_intent,
     build_ttrl_reward_outcome_batch,
     build_ttrl_reward_result,
@@ -28,6 +32,16 @@ from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.reward_outcome import RewardOutcome
 from tllm.ports.retry_control import RetryControl
 from tllm.ports.update_barrier import UpdateBarrier
+from tllm.program import ProgramConsumer, StateSpec, compile_program
+from tllm.workgraph.frontend import DynamicDim, StateScope
+
+
+@dataclass(frozen=True)
+class TTRLStats:
+    update_count: int = 0
+    loss_count: int = 0
+    reward_count: int = 0
+    last_loss: float = 0.0
 
 
 class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
@@ -37,16 +51,23 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
         self,
         config: TTRLConsumerConfig,
         *,
-        engine: TTRLEngine | None = None,
         verifier: TTRLVerifier | None = None,
     ) -> None:
         self.config = config
-        self.engine = engine or TTRLEngine(config)
         self.verifier = verifier or _default_ttrl_verifier()
+        self._compiled: ProgramConsumer | None = None
+        self._step_id = 0
+        self._reward_count = 0
+        self._loss_sum_seen = 0.0
+        self._last_loss = 0.0
 
     @property
     def consumer_id(self) -> str:
         return self.config.consumer_id
+
+    @property
+    def compiled(self) -> ProgramConsumer | None:
+        return self._compiled
 
     def flows(self) -> Sequence[ConsumerFlow]:
         if not bool(self.config.enabled):
@@ -62,6 +83,8 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
                 window="out_of_band",
             ),
         )
+
+    # -- rewards (pure Python) ---------------------------------------------
 
     def rewards_for_samples(self, samples: Sequence[TTRLSample]) -> torch.Tensor:
         rewards = majority_vote_rewards(samples, verifier=self.verifier)
@@ -97,7 +120,7 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
             n_votes_per_prompt=n_votes_per_prompt,
             n_samples_per_prompt=n_samples_per_prompt,
             verifier=self.verifier,
-            adapter_version_id=self.engine.adapter_version_id(consumer_id=self.consumer_id),
+            adapter_version_id=self.adapter_version_id(),
         )
 
     def write_reward_outcomes_for_trace(self, runtime: object, trace: object) -> int:
@@ -115,52 +138,86 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
         if inputs.update_barrier is not None:
             inputs.update_barrier.append(intent.update_barriers)
 
-    def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
-        reward_tensor = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)
-        self.engine.update(hidden, reward_tensor)
+    # -- training (compiled program) ----------------------------------------
 
-    def submit_grpo_training_batch(
-        self,
-        batch: object,
-        *,
-        trainer_bridge: object,
-        lora_service: object | None = None,
-        adapter_key: str = "ttrl-grpo",
-        target_modules: tuple[str, ...] = (),
-        scope: str = "request",
-        request_ids: tuple[str, ...] | None = None,
-    ) -> object:
-        from tllm.contracts.test_time_training import TestTimeTrainerRequest, TestTimeTrainingBatch
-        from tllm.runtime.test_time.lora import TestTimeLoRAService
-        from tllm.runtime.test_time.trainer import stage_trainer_result_updates
-
-        if not isinstance(batch, TestTimeTrainingBatch):
-            raise TypeError("batch must be TestTimeTrainingBatch")
-        if not target_modules:
-            raise ValueError("target_modules must be non-empty")
-        train = getattr(trainer_bridge, "train", None)
-        if not callable(train):
-            raise TypeError("trainer_bridge must provide train")
-        resolved_request_ids = tuple(batch.request_ids if request_ids is None else request_ids)
-        request = TestTimeTrainerRequest(
-            algorithm_id="ttrl_grpo",
-            adapter_key=str(adapter_key),
-            target_modules=tuple(str(module_name) for module_name in target_modules),
+    def _ensure_compiled(self, hidden: torch.Tensor) -> None:
+        if self._compiled is not None:
+            return
+        if hidden.ndim != 2:
+            raise RuntimeError("TTRL update expects 2D hidden rows")
+        program = TTRLProgram(
+            hidden_size=int(hidden.shape[1]),
             rank=int(self.config.rank),
-            scope=scope,  # type: ignore[arg-type]
-            request_ids=resolved_request_ids,
-            examples=batch,
-            metadata={"consumer_id": self.consumer_id},
+            lr=float(self.config.learning_rate),
+            device=hidden.device,
+            dtype=hidden.dtype,
         )
-        result = train(request)
-        if lora_service is not None:
-            if not isinstance(lora_service, TestTimeLoRAService):
-                raise TypeError("lora_service must be TestTimeLoRAService")
-            stage_trainer_result_updates(request, result, lora_service)
-        return result
+        rows = 2  # export requires example rows strictly above the lower bound
+        forward_ex = (
+            torch.zeros((rows, int(hidden.shape[1])), device=hidden.device, dtype=hidden.dtype),
+            torch.zeros((rows, 1), device=hidden.device, dtype=hidden.dtype),
+        )
+        predict_ex = (forward_ex[0],)
+        row_dims = tuple(
+            DynamicDim(value_path=(i,), dimension=0, lower_bound=1, upper_bound=65536)
+            for i in range(2)
+        )
+        self._compiled = compile_program(
+            program,
+            states={
+                "reward_model": StateSpec(scope=StateScope.REPLICA, optimizer=torch.optim.Adam)
+            },
+            examples={"forward": forward_ex, "predict": predict_ex},
+            dynamic_dims={"forward": row_dims, "predict": row_dims[:1]},
+        )
+
+    def update_from_rewards(self, hidden: torch.Tensor, rewards: torch.Tensor | Iterable[float]) -> None:
+        if not bool(self.config.enabled):
+            return
+        reward_tensor = (
+            rewards
+            if isinstance(rewards, torch.Tensor)
+            else torch.tensor(list(rewards), dtype=torch.float32)
+        )
+        rows = int(hidden.shape[0])
+        if rows <= 0:
+            return
+        if int(reward_tensor.reshape(-1).shape[0]) != rows:
+            raise RuntimeError("TTRL update requires one reward per hidden row")
+        self._ensure_compiled(hidden)
+        assert self._compiled is not None
+        self._step_id += 1
+        bundle = provided_bundle(
+            consumer_id=self.consumer_id,
+            step_id=self._step_id,
+            entries={"hidden": hidden, "rewards": reward_tensor.reshape(-1, 1)},
+        )
+        self._compiled.consume_flow(0, bundle, None)
+        self._reward_count += rows
+        loss_sum = float(self._compiled.loss_sum)
+        self._last_loss = loss_sum - self._loss_sum_seen
+        self._loss_sum_seen = loss_sum
+
+    def predict_scores(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Read-only reward predictions against the current bank state."""
+        self._ensure_compiled(hidden)
+        assert self._compiled is not None
+        return self._compiled.run_flow("predict", hidden)["score"]
+
+    def adapter_version_id(self) -> str:
+        updates = 0 if self._compiled is None else int(self._compiled.update_count)
+        if updates <= 0:
+            return f"{self.consumer_id}:base"
+        return f"{self.consumer_id}:update:{updates}"
 
     def read_stats(self) -> TTRLStats:
-        return self.engine.read_stats()
+        compiled = self._compiled
+        return TTRLStats(
+            update_count=0 if compiled is None else int(compiled.update_count),
+            loss_count=0 if compiled is None else int(compiled.loss_count),
+            reward_count=int(self._reward_count),
+            last_loss=float(self._last_loss),
+        )
 
 
 def run_ttrl_toy_closed_loop(
@@ -171,6 +228,8 @@ def run_ttrl_toy_closed_loop(
     n_votes_per_prompt: int | None = None,
     n_samples_per_prompt: int | None = None,
 ) -> TTRLClosedLoopIntent:
+    from dataclasses import replace
+
     intent = consumer.closed_loop_intent_for_trace(
         trace,
         n_votes_per_prompt=n_votes_per_prompt,
@@ -185,7 +244,7 @@ def run_ttrl_toy_closed_loop(
         else:
             raise RuntimeError("hidden rows must align with selected TTRL rewards")
         consumer.update_from_rewards(train_hidden, rewards)
-    adapter_version_id = consumer.engine.adapter_version_id(consumer_id=consumer.consumer_id)
+    adapter_version_id = consumer.adapter_version_id()
     retry_schedule = tuple(
         replace(entry, adapter_version_id=adapter_version_id)
         for entry in intent.retry_schedule

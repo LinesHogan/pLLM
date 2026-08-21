@@ -37,6 +37,21 @@ class FTTTConsumerUnitTest(unittest.TestCase):
 
         self.assertFalse(torch.allclose(arithmetic_delta, notation_delta))
 
+    def test_training_actually_updates_bank_params(self) -> None:
+        from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FeedbackRecord
+
+        torch.manual_seed(0)
+        consumer = FTTTConsumer(FTTTConsumerConfig(hidden_size=4, rank=2, learning_rate=0.2))
+        hidden = torch.randn(2, 4)
+        feedback = [FeedbackRecord(prompt_idx=0, feedback="wrong arithmetic carry", reward=0.0)] * 2
+        consumer.apply_feedback_update(hidden, feedback)
+        compiled = consumer.compiled
+        assert compiled is not None
+        slot = compiled.bank("edit_adapter").slot_for(None)
+        up = slot.params["adapter.up.weight"]
+        self.assertGreater(float(up.abs().max()), 0.0)
+        self.assertEqual(consumer.read_stats().update_count, 1)
+
     def test_consume_bundle_writes_closed_loop_retry_and_update_barrier_sinks(self) -> None:
         from tllm.consumers.fttt import FTTTConsumer, FTTTConsumerConfig, FTTTJudgeResult
         from tllm.contracts.port_bundle import BundleKey, PortBundle

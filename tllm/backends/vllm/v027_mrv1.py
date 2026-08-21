@@ -33,7 +33,6 @@ from tllm.backends.vllm.workgraph_runtime import (
 )
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
-from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.step_session import (
     StepSession,
     StepState,
@@ -46,13 +45,6 @@ from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch.adapters.v027 import V027PrepareInputsAdapter
 
 _ADAPTER = V027PrepareInputsAdapter()
-
-
-def _test_time_lora_enabled(runtime: Any) -> bool:
-    return bool(
-        getattr(runtime, "test_time_lora_enabled", False)
-        or getattr(runtime, "test_time_lora_service", None) is not None
-    )
 
 
 def _new_step_session(*, core: Any, runner: Any, view: Any, num_scheduled_tokens: Any) -> StepSession:
@@ -182,8 +174,6 @@ def _wrapped_prepare_inputs(
             "Refusing to guess: install a matching backend driver."
         )
     if not active_targets.runtime_has_active_targets(runtime):
-        if _test_time_lora_enabled(runtime):
-            _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=runtime, runner=runner)
         out = orig(runner, scheduler_output, num_scheduled_tokens)
         view = _ADAPTER.unpack_prepare_inputs_output(
             runner=runner,
@@ -219,8 +209,6 @@ def _wrapped_prepare_inputs(
         runtime.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
-    _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=runtime, runner=runner)
-
     out = orig(runner, scheduler_output, num_scheduled_tokens)
     runtime.event_step_id += 1
     view = _ADAPTER.unpack_prepare_inputs_output(

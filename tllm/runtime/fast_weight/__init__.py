@@ -10,7 +10,6 @@ consumer drives this through configuration; other consumers may too.
 from tllm.runtime.fast_weight.state import (  # noqa: F401
     FastWeightKey,
     FastWeightState,
-    apply_down_proj_fast_weight,
     module_weight_view,
     normalize_fast_weight_mode,
     run_down_proj_fast_weight_step,

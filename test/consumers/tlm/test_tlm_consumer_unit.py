@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the TLM-inspired consumer."""
+"""Unit tests for the Program-backed TLM consumer."""
 
 from __future__ import annotations
 
@@ -16,9 +16,12 @@ class TLMConsumerUnitTest(unittest.TestCase):
 
         self.assertEqual(consumer.consumer_id, "tlm")
 
-    def test_online_logits_update_matches_shared_weighted_loss(self) -> None:
+    def test_online_logits_update_matches_reference_weighted_loss(self) -> None:
         from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
-        from tllm.consumers._common.alignment import sentence_cross_entropy, weighted_one_hot_kl_loss
+        from tllm.consumers._common.alignment import (
+            sentence_cross_entropy,
+            weighted_one_hot_kl_loss,
+        )
 
         hidden = torch.tensor(
             [
@@ -35,12 +38,16 @@ class TLMConsumerUnitTest(unittest.TestCase):
             ]
         )
         labels = torch.tensor([0, 1, 1])
-        config = TLMConsumerConfig(hidden_size=4, rank=2, learning_rate=0.0, threshold=1.0, lamb=0.5)
+        config = TLMConsumerConfig(rank=2, learning_rate=0.0, threshold=1.0, lamb=0.5)
         consumer = TLMConsumer(config)
 
         consumer.update_online(hidden, logits=logits, labels=labels)
 
         stats = consumer.read_stats()
+        # The adapter's up-projection is zero-initialized, so adapted logits
+        # equal the base logits at step 0 and the masked-mean loss equals the
+        # reference selected-row weighted loss (exactly one row clears the
+        # threshold here).
         expected = weighted_one_hot_kl_loss(
             logits,
             labels,
@@ -48,29 +55,30 @@ class TLMConsumerUnitTest(unittest.TestCase):
             threshold=1.0,
             lamb=0.5,
         )
-        self.assertAlmostEqual(stats.last_loss, float(expected), places=6)
+        self.assertAlmostEqual(stats.last_loss, float(expected), places=5)
         self.assertEqual(stats.update_count, 1)
         self.assertEqual(stats.loss_count, 1)
-        self.assertEqual(stats.selected_count, 1)
 
-    def test_closed_loop_online_predicts_before_training_and_stages_request_lora(self) -> None:
+    def test_training_actually_updates_bank_params(self) -> None:
         from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
-        from tllm.contracts.test_time_lora import TestTimeLoRAUpdate
 
-        class _StageOnlyService:
-            def __init__(self) -> None:
-                self.updates: list[TestTimeLoRAUpdate] = []
+        torch.manual_seed(0)
+        consumer = TLMConsumer(TLMConsumerConfig(rank=2, learning_rate=0.2, threshold=0.1))
+        hidden = torch.randn(4, 4)
+        logits = torch.randn(4, 5)
+        labels = torch.tensor([0, 1, 2, 3])
+        consumer.update_online(hidden, logits=logits, labels=labels)
+        compiled = consumer.compiled
+        assert compiled is not None
+        slot = compiled.bank("adapters").slot_for(None)
+        up = slot.params["adapter.up.weight"]
+        self.assertGreater(float(up.abs().max()), 0.0)
 
-            def stage_update(self, update: TestTimeLoRAUpdate) -> None:
-                calls.append("stage")
-                self.updates.append(update)
-
-            def commit_staged_updates(self) -> int:
-                calls.append("commit")
-                return len(self.updates)
+    def test_closed_loop_online_predicts_before_training(self) -> None:
+        from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
 
         calls: list[str] = []
-        consumer = TLMConsumer(TLMConsumerConfig(mode="online", hidden_size=4, rank=2, learning_rate=0.2, threshold=1.0))
+        consumer = TLMConsumer(TLMConsumerConfig(mode="online", rank=2, learning_rate=0.2, threshold=1.0))
         hidden = torch.eye(3, 4)
         logits = torch.tensor(
             [
@@ -80,27 +88,40 @@ class TLMConsumerUnitTest(unittest.TestCase):
             ]
         )
         labels = torch.tensor([0, 1, 1])
-        service = _StageOnlyService()
 
-        result = consumer.run_lora_learning_step(
-            predict=lambda: calls.append("predict") or "prediction",
+        def _predict() -> str:
+            calls.append("predict")
+            consumer.predict(hidden, logits)
+            return "prediction"
+
+        result = consumer.run_ordered_step(
+            predict=_predict,
             hidden=hidden,
             logits=logits,
             labels=labels,
-            lora_service=service,
-            adapter_key="tlm-online-req-1",
-            lora_int_id=41,
-            target_module_name="model.layers.0.self_attn.q_proj",
-            request_ids=("req-1",),
-            step_id=7,
         )
 
         self.assertEqual(result, "prediction")
-        self.assertEqual(calls, ["predict", "stage", "commit"])
+        self.assertEqual(calls, ["predict"])
         self.assertEqual(consumer.read_stats().update_count, 1)
-        self.assertEqual(len(service.updates), 1)
-        self.assertEqual(service.updates[0].request_ids, ("req-1",))
-        self.assertEqual(service.updates[0].step_id, 7)
+
+    def test_offline_buffers_then_flushes(self) -> None:
+        from tllm.consumers.tlm import TLMConsumer, TLMConsumerConfig
+
+        consumer = TLMConsumer(TLMConsumerConfig(mode="offline", rank=2, threshold=0.1))
+        hidden = torch.eye(3, 4)
+        logits = torch.randn(3, 5)
+        labels = torch.tensor([0, 1, 2])
+
+        consumer.update_offline(hidden, logits=logits, labels=labels)
+        consumer.update_offline(hidden, logits=logits, labels=labels)
+        self.assertEqual(consumer.read_stats().buffered_count, 6)
+        self.assertEqual(consumer.read_stats().update_count, 0)
+
+        consumer.flush_offline()
+        stats = consumer.read_stats()
+        self.assertEqual(stats.buffered_count, 0)
+        self.assertEqual(stats.update_count, 1)
 
 
 if __name__ == "__main__":

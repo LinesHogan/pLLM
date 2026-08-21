@@ -69,7 +69,7 @@ class SamplerPrecomputeState:
     port_enabled: bool = True
 
     port_publish_step_id: int = -1
-    port_consume_step_id: int = -1
+
     precomputed_step_id: int = -1
     all_rows: bool = False
     timing_enabled: bool = False
@@ -94,7 +94,7 @@ class SamplerPrecomputeState:
         self.source_capture_step_id = -1
 
         self.port_publish_step_id = -1
-        self.port_consume_step_id = -1
+
         self.precomputed_step_id = -1
         self.cache = None
         self.all_rows = False
@@ -104,7 +104,7 @@ class SamplerPrecomputeState:
         self.source_capture_step_id = -1
 
         self.port_publish_step_id = -1
-        self.port_consume_step_id = -1
+
         self.precomputed_step_id = int(step_id)
         self.cache = None
         self.all_rows = False

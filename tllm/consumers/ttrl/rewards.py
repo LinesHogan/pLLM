@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""TTRL reward grouping, closed-loop intent building, GRPO math, and update engine."""
+"""TTRL reward grouping and closed-loop intent building (pure Python).
+
+Majority-vote rewards over completed generations, plus the RewardOutcome /
+RetryControl / UpdateBarrier intents derived from them. All tensor training
+lives in ``program.py``.
+"""
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
-import torch
-from torch import nn
-from torch.nn import functional as F
-
-from tllm.consumers._common.alignment import (
-    LowRankAdapter,
-    detached_train_input,
-    select_top_k_per_prompt,
-)
-from tllm.consumers.ttrl.config import TTRLConsumerConfig
+from tllm.consumers._common.alignment import select_top_k_per_prompt
 from tllm.consumers.ttrl.verifier import (
     _MISSING_BOXED_ANSWER,
     _TTRL_DEFAULT_VERIFIER_JUDGE,
@@ -69,13 +64,6 @@ class TTRLRewardResult:
 
 
 @dataclass(frozen=True)
-class TTRLGRPOTrainerBridgeUnavailable:
-    """Placeholder for optional external GRPO trainer integrations."""
-
-    reason: str
-
-
-@dataclass(frozen=True)
 class TTRLRetryScheduleEntry:
     request_id: str
     prompt_idx: int
@@ -100,14 +88,6 @@ class TTRLClosedLoopIntent:
         return [float(reward) for reward in self.training_reward_values]
 
 
-@dataclass(frozen=True)
-class TTRLStats:
-    update_count: int = 0
-    loss_count: int = 0
-    reward_count: int = 0
-    last_loss: float = 0.0
-
-
 def select_ttrl_training_indices(
     *,
     num_prompts: int,
@@ -129,8 +109,8 @@ def build_ttrl_reward_result(
     verifier: TTRLVerifier | None = None,
 ) -> TTRLRewardResult:
     resolved_verifier = verifier or _default_ttrl_verifier()
-    judge_name = str(getattr(resolved_verifier, "judge_name", _TTRL_DEFAULT_VERIFIER_JUDGE))
-    missing_reason = str(getattr(resolved_verifier, "missing_reason", _MISSING_BOXED_ANSWER))
+    judge_name = str(resolved_verifier.judge_name)
+    missing_reason = str(resolved_verifier.missing_reason)
     grouped: dict[int, list[tuple[int, TTRLSample, str, str]]] = defaultdict(list)
     for idx, sample in enumerate(samples):
         label = str(resolved_verifier.label_for_completion(sample.completion))
@@ -358,273 +338,3 @@ def build_ttrl_closed_loop_intent(
 
 def majority_vote_rewards(samples: Sequence[TTRLSample], *, verifier: TTRLVerifier | None = None) -> list[float]:
     return build_ttrl_reward_result(samples, verifier=verifier).rewards
-
-
-def _tuple_float_values(values: object, *, field_name: str) -> tuple[float, ...]:
-    if values is None:
-        return ()
-    if hasattr(values, "detach") and callable(getattr(values, "detach")):
-        values = values.detach().cpu().reshape(-1).tolist()
-    try:
-        return tuple(float(value) for value in values)  # type: ignore[union-attr]
-    except TypeError as exc:
-        raise TypeError(f"{field_name} must be an iterable of real values") from exc
-
-
-def _logprobs_for_index(
-    trace_entry: object,
-    index: int,
-    mapping: Mapping[int, Sequence[float]] | None,
-    *,
-    attr_name: str,
-    field_name: str,
-) -> tuple[float, ...] | None:
-    values: object | None = None
-    if mapping is not None and int(index) in mapping:
-        values = mapping[int(index)]
-    elif hasattr(trace_entry, attr_name):
-        values = getattr(trace_entry, attr_name)
-    if values is None:
-        return None
-    normalized = _tuple_float_values(values, field_name=field_name)
-    if not normalized:
-        raise ValueError(f"{field_name} must be non-empty when provided")
-    return normalized
-
-
-def build_ttrl_grpo_training_batch(
-    trace: object,
-    *,
-    n_votes_per_prompt: int | None = None,
-    n_samples_per_prompt: int | None = None,
-    verifier: TTRLVerifier | None = None,
-    current_logprobs_by_index: Mapping[int, Sequence[float]] | None = None,
-    reference_logprobs_by_index: Mapping[int, Sequence[float]] | None = None,
-) -> object:
-    """Build dependency-light GRPO examples from a completed generation trace."""
-
-    from tllm.contracts.test_time_training import TestTimeTrainingBatch, TestTimeTrainingExample
-    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
-
-    if not isinstance(trace, GenerationTraceBatch):
-        raise TypeError("trace must be GenerationTraceBatch")
-
-    samples = [
-        TTRLSample(
-            prompt_idx=int(entry.prompt_idx),
-            sample_idx=int(entry.sample_idx),
-            completion=str(entry.text),
-        )
-        for entry in trace.entries
-    ]
-    reward_result = build_ttrl_reward_result(
-        samples,
-        n_votes_per_prompt=n_votes_per_prompt,
-        n_samples_per_prompt=n_samples_per_prompt,
-        verifier=verifier,
-    )
-
-    examples: list[TestTimeTrainingExample] = []
-    selected_training_indices: list[int] = []
-    for training_order, sample_index in enumerate(reward_result.selected_indices):
-        trace_entry = trace.entries[int(sample_index)]
-        token_ids = tuple(int(token_id) for token_id in trace_entry.token_ids)
-        if not token_ids:
-            raise ValueError("GRPO training examples require non-empty token_ids")
-        sample_result = reward_result.sample_results[int(training_order)]
-        current_logprobs = _logprobs_for_index(
-            trace_entry,
-            int(sample_index),
-            current_logprobs_by_index,
-            attr_name="logprobs",
-            field_name="current_logprobs",
-        )
-        reference_logprobs = _logprobs_for_index(
-            trace_entry,
-            int(sample_index),
-            reference_logprobs_by_index,
-            attr_name="reference_logprobs",
-            field_name="reference_logprobs",
-        )
-        if current_logprobs is not None and len(current_logprobs) != len(token_ids):
-            raise ValueError("current_logprobs length must match token_ids")
-        if reference_logprobs is not None and len(reference_logprobs) != len(token_ids):
-            raise ValueError("reference_logprobs length must match token_ids")
-        metadata: dict[str, object] = {
-            "group_id": str(trace_entry.group_id),
-            "training_index": int(sample_index),
-            "prompt_idx": int(trace_entry.prompt_idx),
-            "sample_idx": int(trace_entry.sample_idx),
-            "output_index": int(trace_entry.output_index),
-            "majority_label": str(sample_result.majority_label),
-            "sample_label": str(sample_result.label),
-            "majority_ratio": float(sample_result.majority_ratio),
-            "finish_reason": str(trace_entry.finish_reason),
-        }
-        if reference_logprobs is not None:
-            metadata["reference_logprobs"] = reference_logprobs
-        examples.append(
-            TestTimeTrainingExample(
-                request_id=str(trace_entry.request_id),
-                prompt_id=str(trace_entry.prompt_idx),
-                sample_id=str(trace_entry.sample_idx),
-                output_id=str(trace_entry.output_index),
-                objective_kind="grpo",
-                token_ids=token_ids,
-                rewards=(float(sample_result.reward),),
-                logprobs=current_logprobs,
-                metadata=metadata,
-            )
-        )
-        selected_training_indices.append(int(sample_index))
-
-    return TestTimeTrainingBatch(
-        examples=tuple(examples),
-        metadata={
-            "algorithm_id": "ttrl_grpo",
-            "selected_training_indices": tuple(selected_training_indices),
-            "verifier_name": str(reward_result.verifier_name),
-        },
-    )
-
-
-def ttrl_grpo_group_normalized_advantages(
-    rewards: torch.Tensor,
-    group_ids: Sequence[object],
-    *,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Normalize scalar rewards within each group for toy GRPO tests."""
-
-    reward_values = rewards.reshape(-1)
-    if not torch.is_floating_point(reward_values):
-        reward_values = reward_values.to(dtype=torch.float32)
-    if len(group_ids) != int(reward_values.shape[0]):
-        raise ValueError("group_ids length must match rewards")
-    advantages = torch.zeros_like(reward_values)
-    grouped_indices: dict[object, list[int]] = defaultdict(list)
-    for idx, group_id in enumerate(group_ids):
-        grouped_indices[group_id].append(int(idx))
-    for indices in grouped_indices.values():
-        index_tensor = torch.tensor(indices, device=reward_values.device)
-        group_rewards = reward_values.index_select(0, index_tensor)
-        centered = group_rewards - group_rewards.mean()
-        std = group_rewards.std(unbiased=False)
-        if float(std.detach().cpu()) <= float(eps):
-            group_advantages = torch.zeros_like(group_rewards)
-        else:
-            group_advantages = centered / (std + float(eps))
-        advantages.index_copy_(0, index_tensor, group_advantages)
-    return advantages.reshape_as(rewards)
-
-
-def ttrl_grpo_clipped_ratio_loss(
-    *,
-    current_logprobs: torch.Tensor,
-    old_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
-    clip_epsilon: float = 0.2,
-    mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return a PPO/GRPO-style clipped ratio loss for small logprob tensors."""
-
-    if current_logprobs.shape != old_logprobs.shape:
-        raise ValueError("current_logprobs and old_logprobs must have the same shape")
-    if current_logprobs.ndim == 0:
-        raise ValueError("logprob tensors must have at least one dimension")
-    token_delta = current_logprobs - old_logprobs
-    if mask is not None:
-        if mask.shape != current_logprobs.shape:
-            raise ValueError("mask shape must match logprob tensors")
-        token_delta = token_delta * mask.to(device=current_logprobs.device, dtype=current_logprobs.dtype)
-    sample_log_ratio = token_delta.reshape(int(token_delta.shape[0]), -1).sum(dim=1)
-    flat_advantages = advantages.reshape(-1).to(device=current_logprobs.device, dtype=current_logprobs.dtype)
-    if int(flat_advantages.shape[0]) != int(sample_log_ratio.shape[0]):
-        raise ValueError("advantages length must match logprob batch size")
-    ratio = torch.exp(sample_log_ratio)
-    clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_epsilon), 1.0 + float(clip_epsilon))
-    surrogate = torch.minimum(ratio * flat_advantages, clipped_ratio * flat_advantages)
-    return -surrogate.mean()
-
-
-def create_optional_verl_grpo_bridge(*args: object, **kwargs: object) -> TTRLGRPOTrainerBridgeUnavailable:
-    """Placeholder factory for optional verl-backed GRPO training.
-
-    Core TTRL code intentionally does not import verl. A real integration should
-    live in an optional package and supply the shared TestTimeTrainerBridge
-    protocol.
-    """
-
-    _ = args, kwargs
-    raise RuntimeError("optional verl integration is unavailable; install and load an external trainer bridge")
-
-
-class TTRLEngine(nn.Module):
-    def __init__(self, config: TTRLConsumerConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.adapter: LowRankAdapter | None = None
-        self.optimizer: torch.optim.Optimizer | None = None
-        self._update_count = 0
-        self._loss_count = 0
-        self._reward_count = 0
-        self._last_loss = 0.0
-        if int(config.hidden_size) > 0:
-            self._build_adapter(int(config.hidden_size))
-
-    @staticmethod
-    def _detached_train_input(tensor: torch.Tensor) -> torch.Tensor:
-        return detached_train_input(tensor)
-
-    def _build_adapter(self, hidden_size: int) -> None:
-        self.config.hidden_size = int(hidden_size)
-        self.adapter = LowRankAdapter(in_dim=int(hidden_size), out_dim=1, rank=int(self.config.rank))
-        self.optimizer = torch.optim.Adam(self.adapter.parameters(), lr=float(self.config.learning_rate))
-
-    def ensure_shape(self, hidden: torch.Tensor) -> None:
-        if hidden.ndim != 2:
-            raise RuntimeError("TTRL update expects 2D hidden rows")
-        hidden_size = int(hidden.shape[1])
-        if self.adapter is None:
-            self._build_adapter(hidden_size)
-        elif int(self.config.hidden_size) != hidden_size:
-            raise RuntimeError("TTRL hidden size changed after adapter initialization")
-        assert self.adapter is not None
-        first_param = next(self.adapter.parameters(), None)
-        if first_param is not None and (first_param.device != hidden.device or first_param.dtype != hidden.dtype):
-            self.to(device=hidden.device, dtype=hidden.dtype)
-
-    def update(self, hidden: torch.Tensor, rewards: torch.Tensor) -> None:
-        if not bool(self.config.enabled):
-            return
-        if int(hidden.shape[0]) != int(rewards.reshape(-1).shape[0]):
-            raise RuntimeError("TTRL update requires one reward per hidden row")
-        if int(hidden.shape[0]) <= 0:
-            return
-        self.ensure_shape(hidden)
-        assert self.adapter is not None
-        assert self.optimizer is not None
-        hidden_train = self._detached_train_input(hidden)
-        rewards_train = self._detached_train_input(rewards.reshape(-1, 1).to(device=hidden.device, dtype=hidden.dtype))
-        pred = self.adapter(hidden_train)
-        loss = F.mse_loss(pred, rewards_train)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self._update_count += 1
-        self._loss_count += 1
-        self._reward_count += int(rewards_train.shape[0])
-        self._last_loss = float(loss.detach().cpu())
-
-    def read_stats(self) -> TTRLStats:
-        return TTRLStats(
-            update_count=int(self._update_count),
-            loss_count=int(self._loss_count),
-            reward_count=int(self._reward_count),
-            last_loss=float(self._last_loss),
-        )
-
-    def adapter_version_id(self, *, consumer_id: str = "ttrl") -> str:
-        if int(self._update_count) <= 0:
-            return f"{consumer_id}:base"
-        return f"{consumer_id}:update:{int(self._update_count)}"

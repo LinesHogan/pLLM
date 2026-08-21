@@ -84,7 +84,6 @@ class BootstrapSpecUnitTest(unittest.TestCase):
             runtime.consumer_registry,
             runtime.dispatch_plan,
             runtime.execution_plan,
-            runtime.test_time_lora_enabled,
         )
 
     def tearDown(self) -> None:
@@ -95,7 +94,6 @@ class BootstrapSpecUnitTest(unittest.TestCase):
             runtime.consumer_registry,
             runtime.dispatch_plan,
             runtime.execution_plan,
-            runtime.test_time_lora_enabled,
         ) = self._saved
         os.environ.pop(bootstrap.TLLM_BOOTSTRAP_SPEC_ENV, None)
 
@@ -130,7 +128,7 @@ class BootstrapSpecUnitTest(unittest.TestCase):
             runtime_config={"graph_scratch_rows": 4},
             primary_consumer=ConsumerSpec(name="dummy", config={"consumer_id": "d"}),
             consumers=(ConsumerSpec(name="gtta", config={"consumer_id": "g"}),),
-            enable_flags={"test_time_lora_enabled": True},
+            enable_flags={"fast_weight_enabled": True},
         )
         path = bootstrap.write_bootstrap_spec(spec)
         try:
@@ -162,7 +160,7 @@ class BootstrapSpecUnitTest(unittest.TestCase):
         self.assertEqual(residual_runtime.RUNTIME.config.graph_scratch_rows, 4)
         self.assertEqual(
             spec.enable_flags,
-            {"test_time_lora_enabled": False, "fast_weight_enabled": False},
+            {"fast_weight_enabled": False},
         )
 
     def test_plugin_no_spec_is_noop(self) -> None:

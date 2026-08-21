@@ -185,14 +185,6 @@ class StagedFlowExecutor:
             return constant
         raise WorkGraphError("PG130", f"cannot resolve lifted state target {name!r}")
 
-    @property
-    def state_targets(self) -> tuple[str, ...]:
-        """Lifted parameter/buffer target names (for bank wiring)."""
-        return tuple(
-            str(source)
-            for kind, source in self._placeholder_sources.values()
-            if kind == "state"
-        )
 
     def run(
         self,

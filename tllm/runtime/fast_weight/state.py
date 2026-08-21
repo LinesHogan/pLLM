@@ -24,14 +24,6 @@ def normalize_fast_weight_mode(mode: object) -> FastWeightMode:
     return normalized
 
 
-def _require_non_negative_int(value: object, *, field_name: str) -> int:
-    parsed = _require_int(value, field_name=field_name)
-    if parsed < 0:
-        raise ValueError(f"{field_name} must be non-negative")
-    return parsed
-
-
-
 
 def _require_str(value: object, *, field_name: str) -> str:
     if not isinstance(value, str):
@@ -126,9 +118,6 @@ class FastWeightState:
     def _tensor_bytes(*tensors: torch.Tensor) -> int:
         return sum(int(tensor.numel() * tensor.element_size()) for tensor in tensors)
 
-    @property
-    def slot_count(self) -> int:
-        return len(self._slots)
 
     @property
     def estimated_bytes(self) -> int:
@@ -261,14 +250,6 @@ def _require_supported_down_proj(module: object, *, require_single_tp: bool) -> 
     if getattr(module, "bias", None) is not None:
         raise RuntimeError("In-Place TTT fast-weight overlay currently requires biasless down_proj")
 
-
-def _replace_forward_output(base_output: object, replacement: torch.Tensor) -> object:
-    if isinstance(base_output, torch.Tensor):
-        return replacement.to(device=base_output.device, dtype=base_output.dtype)
-    if isinstance(base_output, tuple) and base_output and isinstance(base_output[0], torch.Tensor):
-        first = replacement.to(device=base_output[0].device, dtype=base_output[0].dtype)
-        return (first, *base_output[1:])
-    raise RuntimeError("down_proj forward output must be a tensor or tuple starting with a tensor")
 
 
 def _first_forward_tensor(output: object, *, field_name: str) -> torch.Tensor:
@@ -565,21 +546,3 @@ def install_mlp_fast_weight_wrapper(
     return DownProjFastWeightOverlayHandle(module=module, original_forward=original_forward)
 
 
-def apply_down_proj_fast_weight(
-    *,
-    hidden: torch.Tensor,
-    base_weight: torch.Tensor,
-    state: FastWeightState,
-    key: FastWeightKey,
-) -> torch.Tensor:
-    h = _require_2d_tensor(hidden, field_name="hidden")
-    w = _require_2d_tensor(base_weight, field_name="base_weight")
-    if int(h.shape[1]) != int(w.shape[1]):
-        raise RuntimeError("hidden width must match base_weight input width")
-    slot = state.get(key)
-    effective_weight = w
-    if slot is not None:
-        if tuple(slot.past_w.shape) != tuple(w.shape):
-            raise RuntimeError("fast-weight overlay shape must match base_weight")
-        effective_weight = slot.past_w.to(device=w.device, dtype=w.dtype)
-    return torch.nn.functional.linear(h, effective_weight)

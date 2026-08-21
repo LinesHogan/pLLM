@@ -9,7 +9,7 @@ from typing import Generic, Protocol, TypeVar, cast, runtime_checkable
 import torch
 
 from tllm.contracts.gpu_stage import DeviceTensorLease
-from tllm.contracts.port_bundle import PortBundle
+from tllm.contracts.port_bundle import BundleKey, PortBundle
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
@@ -87,4 +87,42 @@ def post_generate_input(bundle: PortBundle) -> PostGenerateInput:
         reward_outcome=cast(AppendSink[RewardOutcomeBatch], reward_sink),
         retry_control=cast(AppendSink[RetryControlBatch] | None, retry_sink),
         update_barrier=cast(AppendSink[UpdateBarrierBatch] | None, barrier_sink),
+    )
+
+
+def provided_bundle(
+    *,
+    consumer_id: str,
+    step_id: int,
+    entries: dict[str, torch.Tensor],
+) -> PortBundle:
+    """Build a PortBundle carrying caller-supplied (``provided()``) tensors.
+
+    Entry keys must equal the program's declared input names; every tensor is
+    detached here so the program's grad mode starts from clean leaves.
+    """
+    rows = int(next(iter(entries.values())).shape[0])
+    for name, value in entries.items():
+        if int(value.shape[0]) != rows:
+            raise RuntimeError(f"provided input {name!r} row count differs from the batch")
+    return PortBundle(
+        key=BundleKey(
+            engine_step_id=int(step_id),
+            phase="decode",
+            request_id=consumer_id,
+            sample_idx=0,
+        ),
+        entries={
+            "device_lease": DeviceTensorLease(
+                entries={name: value.detach() for name, value in entries.items()},
+                active_rows=rows,
+            ),
+            "request_meta": RowBatchMeta(
+                request_ids=tuple(f"{consumer_id}-{i}" for i in range(rows)),
+                prompt_idxs=tuple(0 for _ in range(rows)),
+                sample_idxs=tuple(0 for _ in range(rows)),
+                phase="decode",
+                engine_step_id=int(step_id),
+            ),
+        },
     )

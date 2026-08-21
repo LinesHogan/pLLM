@@ -74,14 +74,13 @@ class ControlPlaneUnitTest(unittest.TestCase):
     def test_apply_enable_flags_round_trips(self) -> None:
         llm = _FakeLLM()
         plane = ControlPlane(llm)
-        saved = residual_runtime.RUNTIME.test_time_lora_enabled
+        saved = residual_runtime.RUNTIME.consumer
         try:
-            plane.apply_enable_flags({"test_time_lora_enabled": True})
-            self.assertTrue(residual_runtime.RUNTIME.test_time_lora_enabled)
+            plane.apply_enable_flags({"esamp_training_enabled": True})
             with self.assertRaises(ValueError):
                 plane.apply_enable_flags({"nonsense_flag": True})
         finally:
-            residual_runtime.RUNTIME.test_time_lora_enabled = saved
+            residual_runtime.RUNTIME.consumer = saved
 
     def test_register_consumer_builds_via_registry(self) -> None:
         llm = _FakeLLM()

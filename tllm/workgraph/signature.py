@@ -924,10 +924,4 @@ def structural_signature(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def signature_payload(value: Any) -> Any:
-    """Return the canonical payload used by the signature oracle."""
 
-    return canonical_value(value)
-
-
-sha256_signature = structural_signature

@@ -26,7 +26,6 @@ from tllm.runtime.vllm_patch.adapters import (
 )
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
-from tllm.runtime.vllm_patch import test_time_lora_hooks as _test_time_lora
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 
@@ -138,10 +137,6 @@ def _needs_device_decode_metadata(runtime: PortRuntimeStateLike) -> bool:
     if bool(plan.requires_device_decode_metadata()):
         return True
     return _sampler_patch.runtime_has_active_sampler_provider(runtime)
-
-
-def _test_time_lora_enabled(runtime: object) -> bool:
-    return bool(getattr(runtime, "test_time_lora_enabled", False) or getattr(runtime, "test_time_lora_service", None) is not None)
 
 
 def _check_fast_weight_static_key_request_count(*, core: Any, runner: Any) -> None:
@@ -377,28 +372,6 @@ def run_prepare_inputs_post_producers(
         localize_decode()  # type: ignore[operator]
 
 
-def build_tap_path_list(*, core: PortDispatchCoreLike) -> List[str]:
-    cfg = core.RUNTIME.config
-    plan = getattr(core.RUNTIME, "dispatch_plan", None)
-    required = set(plan.required_residual_layers()) if plan is not None and hasattr(plan, "required_residual_layers") else set()
-    raw_paths_by_locator = _residual_bindings.raw_paths_from_runtime(core.RUNTIME)
-    paths = _residual_bindings.build_raw_tap_paths(
-        raw_paths_by_locator=raw_paths_by_locator,
-        required=required,
-    )
-    if paths:
-        return paths
-
-    fallback: List[str] = []
-    for p in cfg.tap_layer_paths:
-        if p not in fallback:
-            fallback.append(p)
-    if cfg.source_layer_path not in fallback:
-        fallback.append(cfg.source_layer_path)
-    if cfg.target_layer_path not in fallback:
-        fallback.append(cfg.target_layer_path)
-    return fallback
-
 
 def build_decode_port_frames(*, core: PortDispatchCoreLike, layer_path: str) -> List[PortFrame]:
     return _residual_bundle_dispatch.build_decode_port_frames(core=core, layer_path=layer_path)
@@ -597,8 +570,6 @@ def install_input_batch_min_p_patch() -> None:
 def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
-        if _test_time_lora_enabled(core.RUNTIME):
-            _test_time_lora.maybe_bind_test_time_lora_service(runtime=core.RUNTIME, runner=runner)
         _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
         return out
     _common_hooks.dispatch_runtime_event(
@@ -611,7 +582,6 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
     )
     out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
     _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
-    _test_time_lora.maybe_bind_test_time_lora_service(runtime=core.RUNTIME, runner=runner)
     _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
     setup_runtime_hooks_if_active(core=core, runner=runner)
     _common_hooks.dispatch_runtime_event(
@@ -627,8 +597,6 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
 
 def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
-        if _test_time_lora_enabled(core.RUNTIME):
-            _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
         out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
         if isinstance(out, tuple):
             view = _prepare_inputs_adapter().unpack_prepare_inputs_output(
@@ -666,7 +634,6 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         setup_runtime_hooks_if_active(core=core, runner=runner)
-    _test_time_lora.maybe_commit_and_apply_request_mapping(runtime=core.RUNTIME, runner=runner)
     trace_hotspots = path_hotspots_enabled(core)
     t0 = time.perf_counter() if trace_hotspots else 0.0
     out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)

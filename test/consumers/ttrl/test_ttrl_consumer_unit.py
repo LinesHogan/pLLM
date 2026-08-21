@@ -36,3 +36,28 @@ class TTRLConsumerUnitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TTRLProgramTrainingTest(unittest.TestCase):
+    def test_update_from_rewards_trains_bank_params(self) -> None:
+        import torch
+
+        from tllm.consumers.ttrl import TTRLConsumer, TTRLConsumerConfig
+
+        torch.manual_seed(0)
+        consumer = TTRLConsumer(TTRLConsumerConfig(rank=2, learning_rate=0.2))
+        hidden = torch.randn(4, 8)
+        rewards = [1.0, 1.0, 0.0, 1.0]
+        consumer.update_from_rewards(hidden, rewards)
+
+        stats = consumer.read_stats()
+        self.assertEqual(stats.update_count, 1)
+        self.assertEqual(stats.reward_count, 4)
+        compiled = consumer.compiled
+        assert compiled is not None
+        slot = compiled.bank("reward_model").slot_for(None)
+        self.assertGreater(float(slot.params["adapter.up.weight"].abs().max()), 0.0)
+        self.assertEqual(consumer.adapter_version_id(), "ttrl:update:1")
+
+        # zero-init up-proj means step-0 predictions are exactly zero
+        scores = consumer.predict_scores(hidden)
+        self.assertEqual(tuple(scores.shape), (4, 1))

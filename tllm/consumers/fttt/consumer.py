@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""FTTT-inspired feedback edit consumer."""
+"""FTTT-inspired feedback edit consumer.
+
+The judge, feedback queue, and per-(prompt, request) lifecycle are plain
+Python; the tensor edit adapter is a compiled ``FTTTProgram`` driven with
+caller-supplied edit inputs and target deltas.
+"""
 
 from __future__ import annotations
 
@@ -10,39 +15,46 @@ import re
 from typing import Iterable, Sequence
 
 import torch
+from torch.nn import functional as F
 
-from tllm.contracts.test_time_lora import LoRAScope, TestTimeLoRAUpdate
-from tllm.contracts.test_time_training import (
-    TestTimeTrainerRequest,
-    TestTimeTrainerResult,
-    TestTimeTrainingBatch,
-    TestTimeTrainingExample,
-)
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers._common.bundle_inputs import post_generate_input
+from tllm.consumers._common.bundle_inputs import post_generate_input, provided_bundle
 from tllm.consumers.fttt.config import FTTTConsumerConfig
-from tllm.consumers.fttt.engine import (
-    FeedbackRecord,
-    FTTTEngine,
+from tllm.consumers.fttt.feedback import (
     FTTTInstanceState,
     FTTTJudge,
     FTTTJudgeResult,
-    FTTTStats,
+    FeedbackRecord,
     _default_trace_judge,
-    _FTTTInstanceKey,
-    _FTTTLifecycleDecision,
+    edit_inputs,
+    is_positive_feedback,
+    target_delta,
 )
+from tllm.consumers.fttt.program import FTTTProgram
 from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.base import ConsumerFlow
 from tllm.ports.reward_outcome import RewardOutcome
 from tllm.ports.retry_control import RetryControl
 from tllm.ports.update_barrier import UpdateBarrier
+from tllm.program import ProgramConsumer, StateSpec, compile_program
 from tllm.runtime.generation_trace_runtime import CompletionTraceEntry, GenerationTraceBatch
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
-from tllm.runtime.test_time.lora import TestTimeLoRAService
-from tllm.runtime.test_time.trainer import TestTimeTrainerBridge, stage_trainer_result_updates
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry
+from tllm.workgraph.frontend import DynamicDim, StateScope
+
+
+@dataclass(frozen=True)
+class FTTTStats:
+    queued_feedback: int = 0
+    dropped_feedback: int = 0
+    feedback_count: int = 0
+    update_count: int = 0
+    loss_count: int = 0
+    last_loss: float = 0.0
+    skipped_feedback: int = 0
+    stopped_instances: int = 0
+    adapter_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -55,28 +67,21 @@ class FTTTClosedLoopIntent:
 
 
 @dataclass(frozen=True)
-class FTTTToyClosedLoopResult:
-    reward_outcomes: RewardOutcomeBatch
-    retry_controls: RetryControlBatch
-    update_barriers: UpdateBarrierBatch
-    feedback_records: tuple[FeedbackRecord, ...]
-    update_count: int
-    adapter_version: int
-    instance_states: dict[int, FTTTInstanceState]
-    lora_update: TestTimeLoRAUpdate | None = None
+class _FTTTInstanceKey:
+    prompt_idx: int
+    request_id: str = ""
 
 
 @dataclass(frozen=True)
-class FTTTTrainerBridgeClosedLoopResult:
-    reward_outcomes: RewardOutcomeBatch
-    retry_controls: RetryControlBatch
-    update_barriers: UpdateBarrierBatch
-    feedback_records: tuple[FeedbackRecord, ...]
-    update_count: int
-    training_batch: TestTimeTrainingBatch | None = None
-    trainer_request: TestTimeTrainerRequest | None = None
-    trainer_result: TestTimeTrainerResult | None = None
-    staged_update_count: int = 0
+class _FTTTLifecycleDecision:
+    adaptable: bool
+    next_state: FTTTInstanceState
+    retry_action: str
+    retry_reason: str
+    retry_after_update: bool
+    barrier_state: str
+    barrier_reason: str
+    ready_count: int
 
 
 class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
@@ -86,18 +91,27 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
         self,
         config: FTTTConsumerConfig,
         *,
-        engine: FTTTEngine | None = None,
         judge: FTTTJudge | None = None,
     ) -> None:
         self.config = config
-        self.engine = engine or FTTTEngine(config)
         self._judge = judge or _default_trace_judge
         self._queue: deque[FeedbackRecord] = deque()
         self._dropped_feedback = 0
+        self._compiled: ProgramConsumer | None = None
+        self._step_id = 0
+        self._feedback_count = 0
+        self._skipped_feedback = 0
+        self._loss_sum_seen = 0.0
+        self._last_loss = 0.0
+        self._instances: dict[_FTTTInstanceKey, FTTTInstanceState] = {}
 
     @property
     def consumer_id(self) -> str:
         return self.config.consumer_id
+
+    @property
+    def compiled(self) -> ProgramConsumer | None:
+        return self._compiled
 
     def flows(self) -> Sequence[ConsumerFlow]:
         return (
@@ -112,6 +126,8 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
             ),
         )
 
+    # -- feedback queue ------------------------------------------------------
+
     def enqueue_feedback(self, feedback: FeedbackRecord) -> bool:
         if len(self._queue) >= max(0, int(self.config.max_queue_size)):
             self._dropped_feedback += 1
@@ -122,6 +138,130 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
     def drain_feedback(self, *, limit: int = 0) -> list[FeedbackRecord]:
         max_items = len(self._queue) if int(limit) <= 0 else min(int(limit), len(self._queue))
         return [self._queue.popleft() for _ in range(max_items)]
+
+    # -- per-instance lifecycle ----------------------------------------------
+
+    def _instance_key(self, *, prompt_idx: int, request_id: str = "") -> _FTTTInstanceKey:
+        request_id = str(request_id)
+        if not request_id:
+            return _FTTTInstanceKey(prompt_idx=int(prompt_idx))
+        return _FTTTInstanceKey(prompt_idx=int(prompt_idx), request_id=request_id)
+
+    def _instance_key_for_record(self, record: FeedbackRecord) -> _FTTTInstanceKey:
+        return self._instance_key(prompt_idx=int(record.prompt_idx), request_id=record.request_id)
+
+    def _state_for_key(self, key: _FTTTInstanceKey) -> FTTTInstanceState:
+        return self._instances.get(key, FTTTInstanceState())
+
+    def _aggregate_state_for_prompt(self, prompt_idx: int) -> FTTTInstanceState:
+        prompt_idx = int(prompt_idx)
+        legacy_key = self._instance_key(prompt_idx=prompt_idx)
+        if legacy_key in self._instances:
+            return self._instances[legacy_key]
+        states = [state for key, state in self._instances.items() if int(key.prompt_idx) == prompt_idx]
+        if not states:
+            return FTTTInstanceState()
+        return FTTTInstanceState(
+            retries=max(int(state.retries) for state in states),
+            stopped=any(bool(state.stopped) for state in states),
+            adapter_version=max(int(state.adapter_version) for state in states),
+        )
+
+    def instance_state(self, prompt_idx: int, *, request_id: str = "") -> FTTTInstanceState:
+        if request_id:
+            return self._state_for_key(self._instance_key(prompt_idx=int(prompt_idx), request_id=request_id))
+        return self._aggregate_state_for_prompt(int(prompt_idx))
+
+    def reset_instance(self, prompt_idx: int, *, request_id: str = "") -> None:
+        prompt_idx = int(prompt_idx)
+        if request_id:
+            self._instances.pop(self._instance_key(prompt_idx=prompt_idx, request_id=request_id), None)
+            return
+        for key in tuple(self._instances):
+            if int(key.prompt_idx) == prompt_idx:
+                self._instances.pop(key, None)
+
+    def _lifecycle_decision(
+        self,
+        record: FeedbackRecord,
+        state: FTTTInstanceState,
+    ) -> _FTTTLifecycleDecision:
+        if bool(state.stopped):
+            return _FTTTLifecycleDecision(
+                adaptable=False,
+                next_state=state,
+                retry_action="stop",
+                retry_reason="instance-stopped",
+                retry_after_update=False,
+                barrier_state="blocked",
+                barrier_reason="instance-stopped",
+                ready_count=0,
+            )
+        if is_positive_feedback(record, positive_reward_threshold=float(self.config.positive_reward_threshold)):
+            next_state = FTTTInstanceState(
+                retries=int(state.retries),
+                stopped=True,
+                adapter_version=int(state.adapter_version),
+            )
+            return _FTTTLifecycleDecision(
+                adaptable=False,
+                next_state=next_state,
+                retry_action="accept",
+                retry_reason="positive-feedback",
+                retry_after_update=False,
+                barrier_state="blocked",
+                barrier_reason="positive-feedback",
+                ready_count=0,
+            )
+        next_retries = int(state.retries) + 1
+        retry_limit_reached = int(self.config.max_retries) > 0 and next_retries >= int(self.config.max_retries)
+        next_state = FTTTInstanceState(
+            retries=next_retries,
+            stopped=retry_limit_reached,
+            adapter_version=int(state.adapter_version),
+        )
+        return _FTTTLifecycleDecision(
+            adaptable=True,
+            next_state=next_state,
+            retry_action="stop" if retry_limit_reached else "retry",
+            retry_reason="retry-limit" if retry_limit_reached else "feedback-update",
+            retry_after_update=not retry_limit_reached,
+            barrier_state="ready",
+            barrier_reason="feedback-update-ready",
+            ready_count=1,
+        )
+
+    def _record_is_adaptable(self, record: FeedbackRecord) -> bool:
+        key = self._instance_key_for_record(record)
+        decision = self._lifecycle_decision(record, self._state_for_key(key))
+        self._instances[key] = decision.next_state
+        if not decision.adaptable:
+            self._skipped_feedback += 1
+            return False
+        return True
+
+    def _mark_records_updated(self, feedback: Sequence[FeedbackRecord]) -> None:
+        adapter_version = 0 if self._compiled is None else int(self._compiled.update_count)
+        for record in feedback:
+            key = self._instance_key_for_record(record)
+            state = self._state_for_key(key)
+            self._instances[key] = FTTTInstanceState(
+                retries=int(state.retries),
+                stopped=bool(state.stopped),
+                adapter_version=adapter_version,
+            )
+
+    # -- trace judging and closed-loop intents (pure Python) ------------------
+
+    def _toy_feedback_token_ids(self, feedback_text: str) -> tuple[int, ...]:
+        tokens = re.findall(r"[a-z0-9_]+", feedback_text.lower())
+        if not tokens:
+            tokens = [feedback_text]
+        out: list[int] = []
+        for token in tokens:
+            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest()
+            out.append(int.from_bytes(digest, byteorder="little", signed=False))
+        return tuple(out)
 
     def _outcome_for_trace_entry(
         self,
@@ -146,16 +286,6 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
             is_correct=result.is_correct,
         )
 
-    def _toy_feedback_token_ids(self, feedback_text: str) -> tuple[int, ...]:
-        tokens = re.findall(r"[a-z0-9_]+", feedback_text.lower())
-        if not tokens:
-            tokens = [feedback_text]
-        out: list[int] = []
-        for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest()
-            out.append(int.from_bytes(digest, byteorder="little", signed=False))
-        return tuple(out)
-
     def _feedback_record_for_trace_entry(
         self,
         entry: CompletionTraceEntry,
@@ -175,43 +305,6 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
             failed_text=str(entry.text),
             failed_token_ids=tuple(int(token_id) for token_id in entry.token_ids),
             feedback_token_ids=feedback_token_ids,
-        )
-
-    def process_generation_trace(
-        self,
-        trace: GenerationTraceBatch,
-        *,
-        judge: FTTTJudge | None = None,
-        enqueue_failures: bool = True,
-    ) -> RewardOutcomeBatch:
-        if not isinstance(trace, GenerationTraceBatch):
-            raise TypeError("trace must be GenerationTraceBatch")
-        judge_fn = judge or self._judge
-        outcomes: list[RewardOutcomeEntry] = []
-        for entry in trace.entries:
-            result = judge_fn(entry)
-            if not isinstance(result, FTTTJudgeResult):
-                raise TypeError("FTTT judge must return FTTTJudgeResult")
-            outcome = self._outcome_for_trace_entry(entry, result)
-            outcomes.append(outcome)
-            if enqueue_failures and result.is_correct is False:
-                self.enqueue_feedback(self._feedback_record_for_trace_entry(entry, outcome, result))
-        return RewardOutcomeBatch(entries=tuple(outcomes))
-
-    def _retry_entry_for_lifecycle_decision(
-        self,
-        entry: RewardOutcomeEntry,
-        decision: _FTTTLifecycleDecision,
-    ) -> RetryControlEntry:
-        return RetryControlEntry(
-            request_id=str(entry.request_id),
-            prompt_idx=int(entry.prompt_idx),
-            sample_idx=int(entry.sample_idx),
-            output_index=int(entry.output_index),
-            group_id=str(entry.group_id),
-            action=decision.retry_action,
-            reason=decision.retry_reason,
-            retry_after_update=decision.retry_after_update,
         )
 
     def closed_loop_intent_for_trace(self, trace: GenerationTraceBatch) -> FTTTClosedLoopIntent:
@@ -246,13 +339,24 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
                 reason = "correct-output"
             else:
                 record = self._feedback_record_for_trace_entry(trace_entry, entry, result)
-                key = self.engine._instance_key_for_record(record)
-                current_state = simulated_states.get(key, self.engine._state_for_key(key))
-                decision = self.engine._lifecycle_decision(record, current_state)
+                key = self._instance_key_for_record(record)
+                current_state = simulated_states.get(key, self._state_for_key(key))
+                decision = self._lifecycle_decision(record, current_state)
                 simulated_states[key] = decision.next_state
                 if decision.adaptable:
                     feedback_records.append(record)
-                retry_entries.append(self._retry_entry_for_lifecycle_decision(entry, decision))
+                retry_entries.append(
+                    RetryControlEntry(
+                        request_id=str(entry.request_id),
+                        prompt_idx=int(entry.prompt_idx),
+                        sample_idx=int(entry.sample_idx),
+                        output_index=int(entry.output_index),
+                        group_id=str(entry.group_id),
+                        action=decision.retry_action,
+                        reason=decision.retry_reason,
+                        retry_after_update=decision.retry_after_update,
+                    )
+                )
                 ready_count = decision.ready_count
                 state = decision.barrier_state
                 reason = decision.barrier_reason
@@ -275,303 +379,6 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
             update_count=len(feedback_records),
         )
 
-    def _retry_controls_after_toy_update(
-        self,
-        batch: RetryControlBatch,
-        *,
-        adapter_version: int,
-    ) -> RetryControlBatch:
-        entries: list[RetryControlEntry] = []
-        for entry in batch.entries:
-            reason = entry.reason
-            if entry.retry_after_update:
-                suffix = f"adapter-version={int(adapter_version)}"
-                reason = f"{reason};{suffix}" if reason else suffix
-            entries.append(
-                RetryControlEntry(
-                    request_id=entry.request_id,
-                    prompt_idx=entry.prompt_idx,
-                    sample_idx=entry.sample_idx,
-                    output_index=entry.output_index,
-                    group_id=entry.group_id,
-                    action=entry.action,
-                    reason=reason,
-                    retry_after_update=entry.retry_after_update,
-                )
-            )
-        return RetryControlBatch(entries=tuple(entries))
-
-    def feedback_training_batch(
-        self,
-        feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord],
-    ) -> TestTimeTrainingBatch:
-        records = tuple(feedback)
-        examples: list[TestTimeTrainingExample] = []
-        for record in records:
-            if not isinstance(record, FeedbackRecord):
-                raise TypeError("feedback must contain FeedbackRecord")
-            if not record.request_id:
-                raise ValueError("feedback training batch requires request_id")
-            feedback_token_ids = record.feedback_token_ids or self._toy_feedback_token_ids(record.feedback)
-            token_ids = tuple(record.failed_token_ids) + tuple(feedback_token_ids)
-            labels = tuple(-100 for _ in record.failed_token_ids) + tuple(feedback_token_ids)
-            examples.append(
-                TestTimeTrainingExample(
-                    request_id=record.request_id,
-                    prompt_id=str(int(record.prompt_idx)),
-                    sample_id=str(int(record.sample_idx)),
-                    output_id=str(int(record.output_index)),
-                    objective_kind="feedback_lm",
-                    token_ids=token_ids,
-                    labels=labels,
-                    rewards=(float(record.reward),),
-                    metadata={
-                        "consumer_id": self.consumer_id,
-                        "feedback_text": record.feedback,
-                        "failed_text": record.failed_text,
-                        "failed_token_ids": tuple(record.failed_token_ids),
-                        "feedback_token_ids": tuple(feedback_token_ids),
-                        "group_id": record.group_id,
-                    },
-                )
-            )
-        return TestTimeTrainingBatch(
-            examples=tuple(examples),
-            metadata={
-                "consumer_id": self.consumer_id,
-                "objective_kind": "feedback_lm",
-            },
-        )
-
-    def submit_feedback_training_batch(
-        self,
-        batch: TestTimeTrainingBatch,
-        *,
-        trainer_bridge: TestTimeTrainerBridge,
-        adapter_key: str,
-        target_modules: tuple[str, ...],
-        rank: int,
-        scope: LoRAScope = "request",
-        request_ids: tuple[str, ...] | None = None,
-        lora_service: TestTimeLoRAService | None = None,
-        algorithm_id: str = "fttt",
-        metadata: dict[str, object] | None = None,
-    ) -> tuple[TestTimeTrainerRequest, TestTimeTrainerResult, int]:
-        if not isinstance(batch, TestTimeTrainingBatch):
-            raise TypeError("batch must be TestTimeTrainingBatch")
-        train = getattr(trainer_bridge, "train", None)
-        if not callable(train):
-            raise TypeError("trainer_bridge must provide train")
-        if request_ids is None:
-            request_ids = batch.request_ids if scope == "request" else ()
-        request = TestTimeTrainerRequest(
-            algorithm_id=algorithm_id,
-            adapter_key=adapter_key,
-            target_modules=target_modules,
-            rank=rank,
-            scope=scope,
-            request_ids=tuple(request_ids),
-            examples=batch,
-            metadata=metadata or {},
-        )
-        result = train(request)
-        if not isinstance(result, TestTimeTrainerResult):
-            raise TypeError("trainer bridge must return TestTimeTrainerResult")
-        staged_count = 0
-        if lora_service is not None:
-            staged_count = stage_trainer_result_updates(request, result, lora_service)
-        return request, result, staged_count
-
-    def _adapter_key_for_feedback_training(
-        self,
-        feedback_records: Sequence[FeedbackRecord],
-        *,
-        adapter_key_prefix: str,
-        step_id: int,
-    ) -> str:
-        first_record = feedback_records[0]
-        group_id = first_record.group_id or "ungrouped"
-        version = int(step_id) if int(step_id) >= 0 else int(self.engine.adapter_version) + 1
-        return f"{adapter_key_prefix}:{group_id}:{int(first_record.prompt_idx)}:v{version}"
-
-    def _retry_controls_after_trainer_update(
-        self,
-        batch: RetryControlBatch,
-        result: TestTimeTrainerResult | None,
-        *,
-        staged_update_count: int,
-    ) -> RetryControlBatch:
-        updates = () if result is None else result.updates
-        first_update = updates[0] if updates else None
-        entries: list[RetryControlEntry] = []
-        for entry in batch.entries:
-            reason = entry.reason
-            retry_after_update = bool(entry.retry_after_update)
-            if entry.retry_after_update:
-                if staged_update_count > 0 and first_update is not None:
-                    suffix = (
-                        f"adapter-key={first_update.adapter_key};"
-                        f"adapter-version={int(first_update.step_id)}"
-                    )
-                    reason = f"{reason};{suffix}" if reason else suffix
-                else:
-                    retry_after_update = False
-                    suffix = "trainer-no-update"
-                    reason = f"{reason};{suffix}" if reason else suffix
-            entries.append(
-                RetryControlEntry(
-                    request_id=entry.request_id,
-                    prompt_idx=entry.prompt_idx,
-                    sample_idx=entry.sample_idx,
-                    output_index=entry.output_index,
-                    group_id=entry.group_id,
-                    action=entry.action,
-                    reason=reason,
-                    retry_after_update=retry_after_update,
-                )
-            )
-        return RetryControlBatch(entries=tuple(entries))
-
-    def _update_barriers_after_trainer_update(
-        self,
-        batch: UpdateBarrierBatch,
-        *,
-        staged_update_count: int,
-    ) -> UpdateBarrierBatch:
-        if staged_update_count > 0:
-            return batch
-        entries: list[UpdateBarrierEntry] = []
-        for entry in batch.entries:
-            if entry.state == "ready":
-                reason = f"{entry.reason};trainer-no-update" if entry.reason else "trainer-no-update"
-                entries.append(
-                    UpdateBarrierEntry(
-                        barrier_id=entry.barrier_id,
-                        group_id=entry.group_id,
-                        consumer_id=entry.consumer_id,
-                        state="blocked",
-                        request_ids=entry.request_ids,
-                        ready_count=0,
-                        reason=reason,
-                    )
-                )
-            else:
-                entries.append(entry)
-        return UpdateBarrierBatch(entries=tuple(entries))
-
-    def run_trainer_bridge_closed_loop_step(
-        self,
-        trace: GenerationTraceBatch,
-        *,
-        trainer_bridge: TestTimeTrainerBridge,
-        target_modules: tuple[str, ...],
-        rank: int,
-        lora_service: TestTimeLoRAService | None = None,
-        adapter_key_prefix: str = "fttt",
-        step_id: int = -1,
-        algorithm_id: str = "fttt",
-    ) -> FTTTTrainerBridgeClosedLoopResult:
-        intent = self.closed_loop_intent_for_trace(trace)
-        if not intent.feedback_records:
-            return FTTTTrainerBridgeClosedLoopResult(
-                reward_outcomes=intent.reward_outcomes,
-                retry_controls=intent.retry_controls,
-                update_barriers=intent.update_barriers,
-                feedback_records=intent.feedback_records,
-                update_count=intent.update_count,
-            )
-        training_batch = self.feedback_training_batch(intent.feedback_records)
-        adapter_key = self._adapter_key_for_feedback_training(
-            intent.feedback_records,
-            adapter_key_prefix=adapter_key_prefix,
-            step_id=step_id,
-        )
-        trainer_request, trainer_result, staged_count = self.submit_feedback_training_batch(
-            training_batch,
-            trainer_bridge=trainer_bridge,
-            adapter_key=adapter_key,
-            target_modules=target_modules,
-            rank=rank,
-            scope="request",
-            lora_service=lora_service,
-            algorithm_id=algorithm_id,
-            metadata={
-                "consumer_id": self.consumer_id,
-                "step_id": int(step_id),
-            },
-        )
-        retry_controls = self._retry_controls_after_trainer_update(
-            intent.retry_controls,
-            trainer_result,
-            staged_update_count=staged_count,
-        )
-        update_barriers = self._update_barriers_after_trainer_update(
-            intent.update_barriers,
-            staged_update_count=staged_count,
-        )
-        return FTTTTrainerBridgeClosedLoopResult(
-            reward_outcomes=intent.reward_outcomes,
-            retry_controls=retry_controls,
-            update_barriers=update_barriers,
-            feedback_records=intent.feedback_records,
-            update_count=intent.update_count,
-            training_batch=training_batch,
-            trainer_request=trainer_request,
-            trainer_result=trainer_result,
-            staged_update_count=staged_count,
-        )
-
-    def run_toy_closed_loop_step(
-        self,
-        trace: GenerationTraceBatch,
-        hidden: torch.Tensor,
-        *,
-        target_module_name: str | None = None,
-        lora_int_id: int | None = None,
-        adapter_key_prefix: str = "fttt",
-        alpha: float = 1.0,
-        step_id: int = -1,
-    ) -> FTTTToyClosedLoopResult:
-        intent = self.closed_loop_intent_for_trace(trace)
-        if intent.feedback_records:
-            self.apply_feedback_update(hidden, intent.feedback_records)
-        adapter_version = self.engine.adapter_version
-        retry_controls = self._retry_controls_after_toy_update(
-            intent.retry_controls,
-            adapter_version=adapter_version,
-        )
-        lora_update: TestTimeLoRAUpdate | None = None
-        if target_module_name is not None or lora_int_id is not None:
-            if target_module_name is None or lora_int_id is None:
-                raise ValueError("target_module_name and lora_int_id must be provided together")
-            if not intent.feedback_records:
-                raise RuntimeError("cannot export FTTT LoRA update without feedback records")
-            first_record = intent.feedback_records[0]
-            group_id = first_record.group_id or "ungrouped"
-            adapter_key = f"{adapter_key_prefix}:{group_id}:{int(first_record.prompt_idx)}:v{int(adapter_version)}"
-            request_ids = tuple(dict.fromkeys(record.request_id for record in intent.feedback_records if record.request_id))
-            lora_update = self.export_test_time_lora_update(
-                adapter_key=adapter_key,
-                lora_int_id=lora_int_id,
-                target_module_name=target_module_name,
-                rank=int(self.config.rank),
-                scope="request",
-                request_ids=request_ids,
-                step_id=step_id,
-                alpha=alpha,
-            )
-        prompt_indices = {int(record.prompt_idx) for record in intent.feedback_records}
-        return FTTTToyClosedLoopResult(
-            reward_outcomes=intent.reward_outcomes,
-            retry_controls=retry_controls,
-            update_barriers=intent.update_barriers,
-            feedback_records=intent.feedback_records,
-            update_count=intent.update_count,
-            adapter_version=adapter_version,
-            instance_states={prompt_idx: self.instance_state(prompt_idx) for prompt_idx in prompt_indices},
-            lora_update=lora_update,
-        )
-
     def consume_bundle(self, bundle, ctx) -> None:
         _ = ctx
         inputs = post_generate_input(bundle)
@@ -584,21 +391,115 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
         if inputs.update_barrier is not None:
             inputs.update_barrier.append(intent.update_barriers)
 
-    def apply_feedback_update(self, hidden: torch.Tensor, feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord]) -> None:
-        records = list(feedback)
-        self.engine.update(hidden, records)
+    # -- tensor training and editing (compiled program) -----------------------
 
-    def edit_delta(self, hidden: torch.Tensor, feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord]) -> torch.Tensor:
+    def _ensure_compiled(self, hidden: torch.Tensor) -> None:
+        if self._compiled is not None:
+            return
+        if hidden.ndim != 2:
+            raise RuntimeError("FTTT update expects 2D hidden rows")
+        hidden_size = int(hidden.shape[1])
+        if int(self.config.hidden_size) > 0 and int(self.config.hidden_size) != hidden_size:
+            raise RuntimeError("FTTT hidden size does not match configured hidden_size")
+        program = FTTTProgram(
+            hidden_size=hidden_size,
+            feedback_feature_size=int(self.config.feedback_feature_size),
+            rank=int(self.config.rank),
+            lr=float(self.config.learning_rate),
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+        rows = 2  # export requires example rows strictly above the lower bound
+        edit_input_size = hidden_size + max(1, int(self.config.feedback_feature_size)) + 1
+        forward_ex = (
+            torch.zeros((rows, edit_input_size), device=hidden.device, dtype=hidden.dtype),
+            torch.zeros((rows, hidden_size), device=hidden.device, dtype=hidden.dtype),
+        )
+        predict_ex = (forward_ex[0],)
+        row_dims = tuple(
+            DynamicDim(value_path=(i,), dimension=0, lower_bound=1, upper_bound=65536)
+            for i in range(2)
+        )
+        self._compiled = compile_program(
+            program,
+            states={
+                "edit_adapter": StateSpec(scope=StateScope.REPLICA, optimizer=torch.optim.Adam)
+            },
+            examples={"forward": forward_ex, "predict": predict_ex},
+            dynamic_dims={"forward": row_dims, "predict": row_dims[:1]},
+        )
+
+    def apply_feedback_update(
+        self,
+        hidden: torch.Tensor,
+        feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord],
+    ) -> None:
+        if not bool(self.config.enabled):
+            return
         records = list(feedback)
-        return self.engine.edit_delta(hidden, records)
+        if int(hidden.shape[0]) != len(records):
+            raise RuntimeError("FTTT update requires one feedback record per hidden row")
+        if not records:
+            return
+        self._ensure_compiled(hidden)
+        assert self._compiled is not None
+        adaptable_indices = [idx for idx, record in enumerate(records) if self._record_is_adaptable(record)]
+        if not adaptable_indices:
+            return
+        index = torch.tensor(adaptable_indices, device=hidden.device, dtype=torch.long)
+        train_feedback = [records[idx] for idx in adaptable_indices]
+        train_hidden = hidden.detach().index_select(0, index)
+        edit_input = edit_inputs(
+            train_hidden, train_feedback, feature_size=int(self.config.feedback_feature_size)
+        )
+        target = target_delta(
+            train_hidden,
+            train_feedback,
+            feature_size=int(self.config.feedback_feature_size),
+            edit_scale=float(self.config.edit_scale),
+        )
+        self._step_id += 1
+        bundle = provided_bundle(
+            consumer_id=self.consumer_id,
+            step_id=self._step_id,
+            entries={"edit_input": edit_input, "target": target},
+        )
+        self._compiled.consume_flow(0, bundle, None)
+        self._feedback_count += len(train_feedback)
+        loss_sum = float(self._compiled.loss_sum)
+        self._last_loss = loss_sum - self._loss_sum_seen
+        self._loss_sum_seen = loss_sum
+        self._mark_records_updated(train_feedback)
+
+    def edit_delta(
+        self,
+        hidden: torch.Tensor,
+        feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord],
+    ) -> torch.Tensor:
+        if not bool(self.config.enabled):
+            return torch.zeros_like(hidden)
+        records = list(feedback)
+        if not records:
+            return torch.zeros_like(hidden)
+        self._ensure_compiled(hidden)
+        assert self._compiled is not None
+        edit_input = edit_inputs(
+            hidden.detach(), records, feature_size=int(self.config.feedback_feature_size)
+        )
+        delta = self._compiled.run_flow("predict", edit_input)["delta"]
+        masks = [
+            0.0 if self._state_for_key(self._instance_key_for_record(record)).stopped else 1.0
+            for record in records
+        ]
+        mask = torch.tensor(masks, device=hidden.device, dtype=hidden.dtype).reshape(-1, 1)
+        return delta * mask
 
     def apply_edit_to_hidden(
         self,
         hidden: torch.Tensor,
         feedback: Sequence[FeedbackRecord] | Iterable[FeedbackRecord],
     ) -> torch.Tensor:
-        records = list(feedback)
-        return self.engine.apply_edit_to_hidden(hidden, records)
+        return hidden + self.edit_delta(hidden, feedback)
 
     def apply_edit_to_logits(
         self,
@@ -608,37 +509,29 @@ class FTTTConsumer(BaseConsumer[FTTTConsumerConfig]):
         *,
         output_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        records = list(feedback)
-        return self.engine.apply_edit_to_logits(logits, hidden, records, output_weight=output_weight)
-
-    def instance_state(self, prompt_idx: int, *, request_id: str = "", sample_idx: int = 0) -> FTTTInstanceState:
-        return self.engine.instance_state(prompt_idx, request_id=request_id, sample_idx=sample_idx)
-
-    def reset_instance(self, prompt_idx: int, *, request_id: str = "", sample_idx: int = 0) -> None:
-        self.engine.reset_instance(prompt_idx, request_id=request_id, sample_idx=sample_idx)
+        delta = self.edit_delta(hidden, feedback)
+        if output_weight is not None:
+            logit_delta = F.linear(delta, output_weight.to(device=delta.device, dtype=delta.dtype))
+        else:
+            if int(logits.shape[-1]) != int(delta.shape[-1]):
+                raise RuntimeError("FTTT logits edit without output_weight requires logits and hidden to share width")
+            logit_delta = delta
+        return logits + logit_delta.to(device=logits.device, dtype=logits.dtype)
 
     def read_stats(self) -> FTTTStats:
-        return self.engine.read_stats(queued_feedback=len(self._queue), dropped_feedback=self._dropped_feedback)
-
-    def export_test_time_lora_update(
-        self,
-        *,
-        adapter_key: str,
-        lora_int_id: int,
-        target_module_name: str,
-        rank: int,
-        scope: LoRAScope = "global",
-        request_ids: tuple[str, ...] = (),
-        step_id: int = -1,
-        alpha: float = 1.0,
-    ) -> TestTimeLoRAUpdate:
-        return self.engine.export_test_time_lora_update(
-            adapter_key=adapter_key,
-            lora_int_id=lora_int_id,
-            target_module_name=target_module_name,
-            rank=rank,
-            scope=scope,
-            request_ids=request_ids,
-            step_id=step_id,
-            alpha=alpha,
+        compiled = self._compiled
+        update_count = 0 if compiled is None else int(compiled.update_count)
+        return FTTTStats(
+            queued_feedback=len(self._queue),
+            dropped_feedback=int(self._dropped_feedback),
+            feedback_count=int(self._feedback_count),
+            update_count=update_count,
+            loss_count=0 if compiled is None else int(compiled.loss_count),
+            last_loss=float(self._last_loss),
+            skipped_feedback=int(self._skipped_feedback),
+            stopped_instances=sum(1 for state in self._instances.values() if state.stopped),
+            adapter_version=update_count,
         )
+
+
+__all__ = ["FTTTClosedLoopIntent", "FTTTConsumer", "FTTTStats"]

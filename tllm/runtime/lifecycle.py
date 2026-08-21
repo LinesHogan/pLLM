@@ -19,22 +19,6 @@ from typing import Any, cast
 _BACKEND_DRIVER_MODULES = {"vllm": "tllm.backends.vllm"}
 
 
-def ensure_runner_binding(core: Any) -> None:
-    if (
-        core.GPUModelRunner is not None
-        and core._ORIG_LOAD_MODEL is not None
-        and core._ORIG_PREPARE_INPUTS is not None
-        and core._ORIG_EXECUTE_MODEL is not None
-    ):
-        return
-
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as _GPUModelRunner  # noqa: E402
-
-    core.GPUModelRunner = _GPUModelRunner
-    core._ORIG_LOAD_MODEL = _GPUModelRunner.load_model
-    core._ORIG_PREPARE_INPUTS = _GPUModelRunner._prepare_inputs
-    core._ORIG_EXECUTE_MODEL = _GPUModelRunner.execute_model
-
 
 def install_runner_patch(core: Any, *, backend: str = "vllm") -> None:
     if core._PATCH_INSTALLED:

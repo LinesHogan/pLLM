@@ -61,7 +61,6 @@ class TllmWorkerExtension:
             "patch_installed": bool(core._PATCH_INSTALLED),
             "consumer": None if core.RUNTIME.consumer is None else str(core.RUNTIME.consumer.consumer_id),
             "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
-            "test_time_lora_enabled": bool(core.RUNTIME.test_time_lora_enabled),
             "fast_weight_enabled": bool(core.RUNTIME.config.fast_weight_enabled),
             "fast_weight_chunk_size": int(core.RUNTIME.config.fast_weight_chunk_size),
         }
@@ -130,14 +129,12 @@ class TllmWorkerExtension:
         """Apply supported enable flags to this process's runtime."""
         from tllm.runtime import residual_runtime as core
 
-        supported = ("esamp_training_enabled", "test_time_lora_enabled")
+        supported = ("esamp_training_enabled",)
         unknown = sorted(set(flags) - set(supported))
         if unknown:
             raise ValueError(f"unsupported enable flag(s) {unknown}; supported: {list(supported)}")
         if "esamp_training_enabled" in flags:
             core.set_esamp_training_enabled(bool(flags["esamp_training_enabled"]))
-        if "test_time_lora_enabled" in flags:
-            core.set_test_time_lora_enabled(bool(flags["test_time_lora_enabled"]))
 
     def tllm_set_fast_weight_enabled(
         self,

@@ -169,14 +169,6 @@ class PromptContextStore:
         return tuple(entry for entry in self._entries if entry.prompt_idx == prompt_idx_i)
 
 
-def _dynamics_store_for_runtime(runtime: object) -> DynamicsStore:
-    store = getattr(runtime, "dynamics_store", None)
-    if isinstance(store, DynamicsStore):
-        return store
-    store = DynamicsStore()
-    setattr(runtime, "dynamics_store", store)
-    return store
-
 
 def _prompt_context_store_for_runtime(runtime: object) -> PromptContextStore:
     store = getattr(runtime, "prompt_context_store", None)

@@ -908,17 +908,6 @@ def set_esamp_training_enabled(enabled: bool) -> None:
         plane.apply_enable_flags({"esamp_training_enabled": bool(enabled)})
 
 
-def set_test_time_lora_enabled(enabled: bool) -> None:
-    RUNTIME.test_time_lora_enabled = bool(enabled)
-    from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
-    from tllm.runtime.mp.control import active_control_plane
-
-    refresh_exported_bootstrap_spec()
-    plane = active_control_plane()
-    if plane is not None:
-        plane.apply_enable_flags({"test_time_lora_enabled": bool(enabled)})
-
-
 def set_fast_weight_enabled(
     enabled: bool,
     *,
@@ -1139,6 +1128,5 @@ __all__ = [
     "set_runtime_consumer",
     "set_esamp_training_enabled",
     "set_fast_weight_enabled",
-    "set_test_time_lora_enabled",
     "synchronize_esamp",
 ]

@@ -24,7 +24,6 @@ from tllm.runtime.fast_weight.state import FastWeightState
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeStore
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlStore
-from tllm.runtime.test_time.lora import TestTimeLoRAService
 from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
@@ -157,8 +156,6 @@ class ResidualRuntimeState:
     last_reward_outcomes: RewardOutcomeBatch | None = None
     last_retry_controls: RetryControlBatch | None = None
     last_update_barriers: UpdateBarrierBatch | None = None
-    test_time_lora_enabled: bool = False
-    test_time_lora_service: Optional[TestTimeLoRAService] = None
     fast_weight_state: Optional[FastWeightState] = None
     fast_weight_handles: dict[str, object] = field(default_factory=dict)
     fast_weight_hook_spec: Optional[tuple[object, ...]] = None

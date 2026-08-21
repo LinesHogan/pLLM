@@ -38,12 +38,6 @@ class _SVDRuntimeState:
     slot_tgt_cache: dict[int, list[torch.Tensor]] = field(default_factory=dict)
 
 
-def model_bank_uses_ffn_fast_svd(cfg: Any) -> bool:
-    method = str(getattr(cfg, "method", getattr(cfg, "model_bank_init_method", ""))).strip().lower()
-    if method in {"ffn-fast-svd", "ffn+svd"}:
-        method = "ffn_fast_svd"
-    return method == "ffn_fast_svd"
-
 
 def resolve_linear_weight(module: Any, names: Sequence[str]) -> torch.Tensor | None:
     for name in names:
@@ -203,8 +197,6 @@ class SVDModelBankInitializer:
         self.state.slot_src_cache = {}
         self.state.slot_tgt_cache = {}
 
-    def reset_all(self) -> None:
-        self.state = _SVDRuntimeState()
 
     def set_template(self, *, a: torch.Tensor | None, b: torch.Tensor | None, key: str = "") -> None:
         if a is None or b is None or a.ndim != 2 or b.ndim != 2:

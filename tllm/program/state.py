@@ -127,11 +127,5 @@ class ProgramStateBank:
         slot.step += 1
         return slot.version
 
-    @property
-    def slot_count(self) -> int:
-        if self.scope is StateScope.REPLICA:
-            return 1 if self._replica is not None else 0
-        return len(self._request_slots)
-
 
 __all__ = ["ProgramStateBank", "StateSlot", "group_rows_by_prompt"]

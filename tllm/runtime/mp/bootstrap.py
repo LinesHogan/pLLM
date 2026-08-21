@@ -123,7 +123,6 @@ def capture_bootstrap_spec() -> BootstrapSpec:
             else:
                 consumers.append(spec)
     enable_flags = {
-        "test_time_lora_enabled": bool(runtime.test_time_lora_enabled),
         "fast_weight_enabled": bool(runtime.config.fast_weight_enabled),
     }
     if primary is not None and primary.name == "esamp":
@@ -162,8 +161,6 @@ def apply_bootstrap_spec(spec: BootstrapSpec) -> None:
     residual_runtime.replace_dispatch_consumers([build_consumer_from_spec(s) for s in spec.consumers])
     if "esamp_training_enabled" in spec.enable_flags:
         residual_runtime.set_esamp_training_enabled(spec.enable_flags["esamp_training_enabled"])
-    if "test_time_lora_enabled" in spec.enable_flags:
-        residual_runtime.set_test_time_lora_enabled(spec.enable_flags["test_time_lora_enabled"])
     if "fast_weight_enabled" in spec.enable_flags:
         residual_runtime.set_fast_weight_enabled(spec.enable_flags["fast_weight_enabled"])
 

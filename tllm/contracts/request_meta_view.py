@@ -43,14 +43,3 @@ class RowBatchMeta:
         if self.row_ids and len(self.row_ids) != len(self.request_ids):
             raise ValueError("RowBatchMeta row_ids must have the same length as request metadata")
 
-    def as_legacy_dicts(self) -> list[dict[str, object]]:
-        return [
-            {
-                "request_id": request_id,
-                "prompt_idx": int(prompt_idx),
-                "sample_idx": int(sample_idx),
-                "phase": self.phase,
-                "engine_step_id": int(self.engine_step_id),
-            }
-            for request_id, prompt_idx, sample_idx in zip(self.request_ids, self.prompt_idxs, self.sample_idxs)
-        ]

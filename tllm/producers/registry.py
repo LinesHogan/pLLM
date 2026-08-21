@@ -75,18 +75,7 @@ class ProducerRegistry:
     def entries(self) -> tuple[ProducerEntry, ...]:
         return tuple(self._entries)
 
-    def candidates_for_kind(self, kind: PortKind) -> list[ProducerEntry]:
-        return [
-            entry
-            for entry in self._entries
-            if any(spec.kind == kind for spec in entry.producer.outputs)
-        ]
 
-    def provider_of(self, port: PortId) -> ProducerEntry | None:
-        for entry in self._entries:
-            if any(spec.id == port for spec in entry.producer.outputs):
-                return entry
-        return None
 
     def clear(self) -> None:
         self._entries.clear()
@@ -109,9 +98,6 @@ class ExecutionPlan:
     producers: tuple[PlannedProducer, ...]
     port_sources: dict[PortId, str]  # port -> producer_id
     capture_resident_producer_ids: tuple[str, ...] = ()
-
-    def producers_for_hook(self, hook: HookPoint) -> list[PlannedProducer]:
-        return [p for p in self.producers if hook in p.emits_at]
 
 
 def compile_execution_plan(

@@ -462,7 +462,6 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
             mock.patch.object(v027_mrv2.active_targets, "runtime_has_active_targets", return_value=True),
             mock.patch.object(v027_mrv2._hooks, "setup_runtime_hooks_if_active"),
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
-            mock.patch.object(v027_mrv2._test_time_lora, "maybe_commit_and_apply_request_mapping"),
         ):
             residual_runtime.configure_workgraph_distributed(binding)
             residual_runtime.publish_workgraph_distributed(plan_epoch=1)

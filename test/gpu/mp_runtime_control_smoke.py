@@ -76,12 +76,8 @@ def main() -> int:
             print(f"FAIL: live worker enable did not produce training stats: {enabled}")
             return 1
 
-        core.set_test_time_lora_enabled(True)
         core.set_fast_weight_enabled(False, chunk_size=123)
         replies = ControlPlane(llm).ping(timeout=60.0)
-        if not replies or not all(bool(reply["test_time_lora_enabled"]) for reply in replies):
-            print(f"FAIL: LoRA enable flag did not reach every worker: {replies}")
-            return 1
         if any(bool(reply["fast_weight_enabled"]) for reply in replies):
             print(f"FAIL: fast-weight disable flag did not reach every worker: {replies}")
             return 1

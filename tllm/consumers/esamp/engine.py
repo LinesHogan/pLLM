@@ -26,14 +26,10 @@ from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.contracts.consumer_stats import TrainingStats
 from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.scheduling.capture_lane import (
-    MISSING_REPLAY_GRAPH as _MISSING_REPLAY_GRAPH,
     CaptureBuffers as _GraphBuffers,
     CaptureSlotBuffers as _GraphSlotBuffers,
-    CaptureState as _CaptureState,
     GraphCaptureLane,
     GraphCopyPair,
-    ReplayGraphMissing as _ReplayGraphMissing,
-    ReplayGraphRef as _ReplayGraphRef,
 )
 from tllm.runtime.scheduling.streams import (
     PipelineBuffers,
@@ -139,16 +135,6 @@ class _ModelBankParams:
     out_ln_weight: torch.nn.Parameter
     out_ln_bias: torch.nn.Parameter
 
-    def as_dict(self) -> dict[str, torch.Tensor | torch.nn.Parameter]:
-        return {
-            "a": self.a,
-            "g": self.g,
-            "b": self.b,
-            "gate_bias": self.gate_bias,
-            "out_ln_weight": self.out_ln_weight,
-            "out_ln_bias": self.out_ln_bias,
-        }
-
 
 @dataclass(slots=True)
 class _SharedTrainResources:
@@ -200,7 +186,7 @@ class _EngineState:
     sampling_lookup_keys: torch.Tensor | None = None
     sampling_lookup_values: torch.Tensor | None = None
     sampling_lookup_dense: torch.Tensor | None = None
-    sampling_lookup_capacity: int = 0
+
     model_bank_slot_tensor_cache: dict[tuple[int, ...], torch.Tensor] = field(default_factory=dict)
     model_bank: _ModelBankParams | None = None
     model_bank_optimizer: torch.optim.Optimizer | None = None
@@ -310,7 +296,7 @@ class _ESampEngineCore:
         s.sampling_lookup_keys = None
         s.sampling_lookup_values = None
         s.sampling_lookup_dense = None
-        s.sampling_lookup_capacity = 0
+
         s.shared = None
         s.model_bank = None
         s.model_bank_optimizer = None
@@ -612,7 +598,6 @@ class _ESampEngineCore:
             s.sampling_lookup_dense = torch.full((capacity,), fill_value=-1, device=s.device, dtype=torch.long)
         else:
             s.sampling_lookup_dense.fill_(-1)
-        s.sampling_lookup_capacity = int(s.sampling_lookup_dense.numel())
 
     def _model_bank_forward(self, slot_ids: torch.Tensor, src: torch.Tensor, *, require_grad: bool = True) -> torch.Tensor:
         s = self.state
@@ -1247,46 +1232,6 @@ class _ESampEngineCore:
             sum(graph.replay_hit_count for graph in s.model_bank_slot_graphs.values())
         )
 
-    def launch_external_backward(
-        self,
-        source_hidden: torch.Tensor,
-        target_hidden: torch.Tensor,
-        active_rows: int,
-        *,
-        prompt_idxs: Sequence[int] | None = None,
-        wait_ready: object | None = None,
-        release: object | None = None,
-    ) -> None:
-        s = self.state
-        if not s.enabled:
-            return
-        if int(source_hidden.shape[0]) != int(target_hidden.shape[0]):
-            raise RuntimeError("ESamp external backward requires source/target hidden batches with the same row count")
-        serial = s.streams.serial
-        train_stream = s.streams.train_stream
-        if train_stream is None and not serial:
-            raise RuntimeError("ESamp train stream is unavailable before ensure_resources initializes it")
-        if serial:
-            current_stream = torch.cuda.current_stream(device=source_hidden.device)
-            try:
-                if callable(wait_ready):
-                    wait_ready(current_stream)
-                with _grad_context():
-                    self._train_external(source_hidden, target_hidden, int(active_rows), tuple(int(x) for x in (prompt_idxs or ())))
-            finally:
-                if callable(release):
-                    release(current_stream)
-            return
-        assert train_stream is not None
-        with torch.cuda.stream(train_stream):
-            try:
-                if callable(wait_ready):
-                    wait_ready(train_stream)
-                with _grad_context():
-                    self._train_external(source_hidden, target_hidden, int(active_rows), tuple(int(x) for x in (prompt_idxs or ())))
-            finally:
-                if callable(release):
-                    release(train_stream)
 
     def synchronize(self) -> None:
         self.state.streams.synchronize()
@@ -1347,8 +1292,6 @@ class ESampTrainEngine(_ESampEngineCore):
             object.__setattr__(self, name, value)
             return
         raise AttributeError(f"{name} is not part of the supported ESamp engine surface")
-    def _model_bank_forward_locked(self, slot_ids: torch.Tensor, src: torch.Tensor, *, require_grad: bool = True) -> torch.Tensor:
-        return super()._model_bank_forward(slot_ids, src, require_grad=bool(require_grad))
 
     def predict_hidden_for_sampling_capture(
         self,
@@ -1506,16 +1449,6 @@ class ESampTrainEngine(_ESampEngineCore):
             tgt=tgt,
             active_rows=active_rows,
             count_delta=1,
-        )
-
-    def _train_model_bank_batch_graph_locked(self, slot_ids: torch.Tensor, src: torch.Tensor, tgt: torch.Tensor) -> bool:
-        return self._replay_graph_with_disable_fallback(
-            "model_bank",
-            src=src,
-            tgt=tgt,
-            active_rows=int(slot_ids.numel()),
-            count_delta=self._count_active_model_bank_slots(slot_ids, int(slot_ids.numel())),
-            slot_ids=slot_ids,
         )
 
 

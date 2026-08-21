@@ -75,7 +75,13 @@ class _FlowAdapter(torch.nn.Module):
 
     def forward(self, *args: torch.Tensor) -> object:
         method = getattr(self.program_instance, self._method_name)
-        return method(*args)
+        out = method(*args)
+        # A flow with one declared output may return a bare tensor; the
+        # training/oracle paths index outputs positionally, so normalize.
+        decl = method.flow_program  # type: ignore[attr-defined]
+        if len(decl.outputs) == 1 and isinstance(out, torch.Tensor):
+            return (out,)
+        return out
 
 
 @dataclass(slots=True)
@@ -280,7 +286,9 @@ def _check_oracle(
         )
         with torch.enable_grad():
             reference_out = getattr(reference, flow_node.name)(*normal_args)
-            loss_ref = reference_out[loss_position]
+            if len(output_names) == 1 and isinstance(reference_out, torch.Tensor):
+                reference_out = (reference_out,)
+            loss_ref = cast(tuple[torch.Tensor, ...], reference_out)[loss_position]
             if not torch.is_tensor(loss_ref) or loss_ref.numel() != 1:
                 raise WorkGraphError(
                     "PG130", "extern training requires a scalar loss output"

@@ -8,8 +8,7 @@ from tllm.consumers.gtta.bfcl_toy import (
     load_bfcl_toy_tasks,
 )
 from tllm.consumers.gtta.config import GTTAConsumerConfig, TrajectoryFeedback, parse_reward
-from tllm.consumers.gtta.consumer import GTTAConsumer
-from tllm.consumers.gtta.engine import DynamicsEvent, GTTAStats
+from tllm.consumers.gtta.consumer import DynamicsEvent, GTTAConsumer, GTTAStats
 
 __all__ = [
     "BFCLToyStepResult",

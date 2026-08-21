@@ -47,8 +47,6 @@ class WorkGraphExplain:
         # from the strict structural serializer (which rejects mappings).
         return result
 
-    def as_dict(self) -> dict[str, Any]:
-        return self.to_dict()
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
