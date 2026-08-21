@@ -12,12 +12,12 @@ from typing import TYPE_CHECKING, Generic, Mapping, Protocol, Sequence, TypeVar
 
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
+from tllm.contracts.runtime_stats import WorkGraphRuntimeStats
 from tllm.ports.base import ConsumerFlow
 
 if TYPE_CHECKING:
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.scheduling.plan_store import PlanResources
-    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
     from tllm.workgraph.physical import PhysicalCaptureRegion, PhysicalRegionExecutorDesc
@@ -131,10 +131,8 @@ class BaseConsumer(ABC, Generic[ConfigT]):
 
         _ = step_id
 
-    def read_workgraph_runtime_stats(self) -> "WorkGraphRuntimeStats":
+    def read_workgraph_runtime_stats(self) -> WorkGraphRuntimeStats:
         """Return a non-resetting snapshot for physical execution gates."""
-
-        from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
 
         return WorkGraphRuntimeStats()
 

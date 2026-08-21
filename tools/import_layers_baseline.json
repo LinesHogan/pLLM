@@ -62,7 +62,6 @@
     "runtime->producer": 1
   },
   "local_level": {
-    "ports->runtime": 1,
     "runtime->backends": 1,
     "runtime->consumers": 4,
     "runtime->util": 1
