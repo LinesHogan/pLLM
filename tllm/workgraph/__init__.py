@@ -1,4 +1,4 @@
-"""Phase 1a WorkGraph descriptors and compatibility lowering."""
+"""WorkGraph descriptors, shadow-parity lowering, and admission contracts."""
 
 from tllm.workgraph.anchors import (
     Anchor,

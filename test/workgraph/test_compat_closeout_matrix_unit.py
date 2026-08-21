@@ -104,7 +104,7 @@ def _backend(runner: str, mode: str) -> BackendSnapshot:
     )
 
 
-class Phase1CloseoutMatrixTest(unittest.TestCase):
+class CompatCloseoutMatrixTest(unittest.TestCase):
     def test_mrv1_mrv2_eager_piecewise_keep_capture_as_shadow_only(self) -> None:
         consumer, dispatch, execution, captured, attachment = _fixture()
         before_flow_calls = consumer.flow_calls

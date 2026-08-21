@@ -1,4 +1,4 @@
-"""Typed Phase 1a WorkGraph handoff for concrete vLLM drivers."""
+"""Typed WorkGraph handoff for concrete vLLM drivers."""
 
 from __future__ import annotations
 

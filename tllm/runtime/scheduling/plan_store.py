@@ -429,7 +429,7 @@ class PlanResources:
         candidate: CandidateActionDesc,
         must_resolve: bool,
     ) -> AdaptiveTransferStatus:
-        """Start or poll the exact Phase 3 MoveSet selected for one bundle."""
+        """Start or poll the exact placement MoveSet selected for one bundle."""
 
         if not isinstance(binding, AdaptiveFlowBinding):
             raise TypeError("adaptive transfer requires AdaptiveFlowBinding")
@@ -481,12 +481,12 @@ class PlanResources:
         failed = next((handle.error for handle in handles if handle.error is not None), None)
         if failed is not None:
             self._adaptive_transfers.pop(token, None)
-            raise RuntimeError("adaptive Phase 3 transfer failed") from failed
+            raise RuntimeError("adaptive placement transfer failed") from failed
         if all(handle.complete for handle in handles):
             self._adaptive_transfers.pop(token, None)
             return AdaptiveTransferStatus.READY
         if must_resolve:
-            raise RuntimeError("adaptive Phase 3 transfer missed the bundle deadline")
+            raise RuntimeError("adaptive placement transfer missed the bundle deadline")
         return AdaptiveTransferStatus.PENDING
 
     def reset_adaptive_reservations(self) -> None:

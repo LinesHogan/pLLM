@@ -56,7 +56,7 @@ def _stats(**overrides: int) -> WorkGraphRuntimeStats:
     return WorkGraphRuntimeStats(**values)
 
 
-class Phase2GpuGateStatsUnitTest(unittest.TestCase):
+class GpuGateGpuGateStatsUnitTest(unittest.TestCase):
     def test_workgraph_runtime_stats_is_public_frozen_and_covers_the_gpu_gate_fields(self) -> None:
         stats = _stats(
             active_plan_epoch=11,

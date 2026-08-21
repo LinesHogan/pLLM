@@ -1,4 +1,4 @@
-"""Production-path CPU contracts for Phase 5 adaptive queue admission."""
+"""Production-path CPU contracts for adaptive queue admission."""
 
 from __future__ import annotations
 
@@ -769,7 +769,7 @@ class AdaptiveAdmissionIntegrationUnitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "adaptive Phase 3 transfer missed the bundle deadline",
+            "adaptive placement transfer missed the bundle deadline",
         ):
             drain_deferred_port_bundles(
                 runtime=state,

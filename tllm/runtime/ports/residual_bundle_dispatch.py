@@ -679,7 +679,7 @@ def _select_adaptive_deferred_work(
     must_resolve: bool,
     wait_for_transfer: bool,
 ) -> DeferredWorkDecision:
-    """Resolve one queue item through its owning frozen Phase 5 epoch."""
+    """Resolve one queue item through its owning frozen admission epoch."""
 
     work_resources = (
         work.plan_resources if work.plan_resources is not None else resources
@@ -763,7 +763,7 @@ def synchronize_deferred_port_bundles(
     *,
     runtime: PortDispatchRuntimeLike,
 ) -> int:
-    """Resolve all queued work while polling, rather than bypassing, Phase 5."""
+    """Resolve all queued work while polling, rather than bypassing, admission control."""
 
     queue = runtime.deferred_work_queue
     if not queue:

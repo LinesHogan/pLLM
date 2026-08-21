@@ -255,7 +255,7 @@ def _step_bundle(
     )
 
 
-class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
+class MigratedRegionMigratedRegionActivationUnitTest(unittest.TestCase):
     def test_base_consumer_fails_closed_on_unhandled_placement_resources(self) -> None:
         class UnsupportedConsumer(BaseConsumer[object]):
             config = object()

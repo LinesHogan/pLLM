@@ -1,4 +1,4 @@
-"""Red CPU-only contracts for Phase 4 distributed collective execution.
+"""Red CPU-only contracts for distributed collective execution.
 
 The distributed plan is frozen control-plane metadata.  Communicator handles,
 payload tensors, and asynchronous fences are deliberately fake Python objects
@@ -34,7 +34,7 @@ def _runtime(test_case: unittest.TestCase):
         return importlib.import_module("tllm.runtime.scheduling.collective")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
-            "Phase 4 collective runtime is required: "
+            "distributed collective runtime is required: "
             "tllm.runtime.scheduling.collective"
         )
         raise AssertionError from exc

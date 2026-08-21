@@ -1,6 +1,6 @@
 """Red tests for the Phase 3 WorkGraph placement/execution contracts.
 
-Phase 1/2 deliberately stop at a single-device physical plan.  These tests
+The compatibility layers deliberately stop at a single-device physical plan.  These tests
 specify the next boundary in terms of small, typed values so they can run on
 CPU-only builders.  The test module imports the planned Phase 3 surface from
 inside each test: on the Phase 2 baseline this is an explicit red failure,
@@ -24,7 +24,7 @@ def _phase3(test_case: unittest.TestCase):
         return importlib.import_module("tllm.workgraph.placement")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
-            "Phase 3 WorkGraph contracts are not implemented: "
+            "placement WorkGraph contracts are not implemented: "
             "tllm.workgraph.placement is required"
         )
         raise AssertionError from exc

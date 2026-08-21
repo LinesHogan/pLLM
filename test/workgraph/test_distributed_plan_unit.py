@@ -1,4 +1,4 @@
-"""Red contracts for Phase 4 global distributed WorkGraph planning.
+"""Red contracts for global distributed WorkGraph planning.
 
 The phase-4 module is intentionally imported from inside each test.  This
 keeps collection useful on the pre-Phase-4 baseline while making each missing
@@ -21,7 +21,7 @@ def _phase4(test_case: unittest.TestCase):
         return importlib.import_module("tllm.workgraph.distributed")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
-            "Phase 4 WorkGraph contracts are not implemented: "
+            "distributed WorkGraph contracts are not implemented: "
             "tllm.workgraph.distributed is required"
         )
         raise AssertionError from exc

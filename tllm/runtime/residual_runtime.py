@@ -230,7 +230,7 @@ def _stage_physical_workgraph_snapshot() -> None:
         return
     backend = snapshot.backend
     if backend is None or backend.graph_mode == "full":
-        # FULL remains a typed Phase 1 diagnostic and an explicit legacy
+        # FULL remains a typed shadow-parity diagnostic and an explicit legacy
         # boundary.  It must never acquire a partially usable physical plan.
         RUNTIME.physical_plan_store = None
         _clear_physical_capture_regions()
@@ -257,7 +257,7 @@ def _stage_physical_workgraph_snapshot() -> None:
     if adaptive_binding is not None:
         if placement_plan is None:
             raise RuntimeError(
-                "adaptive WorkGraph compilation requires a Phase 3 placement binding"
+                "adaptive WorkGraph compilation requires a placement binding"
             )
         (
             adaptive_plan,
@@ -421,7 +421,7 @@ def prepare_workgraph_step(step_id: int) -> None:
 def configure_workgraph_placement(
     binding: "PlacementRuntimeBinding | None",
 ) -> None:
-    """Install or remove typed Phase 3 cold-compilation inputs."""
+    """Install or remove typed placement cold-compilation inputs."""
 
     from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
 
@@ -449,7 +449,7 @@ def configure_workgraph_placement(
 def configure_workgraph_adaptive(
     binding: "AdaptiveRuntimeBinding | None",
 ) -> None:
-    """Install typed Phase 5 cold-compilation inputs and explicit flow bindings."""
+    """Install typed adaptive-admission cold-compilation inputs and explicit flow bindings."""
 
     from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
 
@@ -476,7 +476,7 @@ def configure_workgraph_adaptive(
 def configure_workgraph_distributed(
     binding: "DistributedRuntimeBinding | None",
 ) -> None:
-    """Install typed Phase 4 topology and rank-local runtime bindings."""
+    """Install typed distributed topology and rank-local runtime bindings."""
 
     from tllm.runtime.scheduling.collective import DistributedRuntimeBinding
 

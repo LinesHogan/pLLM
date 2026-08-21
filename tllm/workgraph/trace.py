@@ -1,4 +1,4 @@
-"""Cold-path event equivalence oracle for the Phase 1 compatibility plan.
+"""Cold-path event equivalence oracle for the compatibility plan.
 
 The trace is deliberately a pure descriptor.  It records the stable facts
 that can change runtime ordering or binding, while leaving all execution

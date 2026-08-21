@@ -1,4 +1,4 @@
-"""Unit contracts for the immutable Phase 5 adaptive admission plan."""
+"""Unit contracts for the immutable adaptive admission plan."""
 
 from __future__ import annotations
 

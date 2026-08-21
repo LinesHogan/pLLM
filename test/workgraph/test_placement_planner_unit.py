@@ -1,4 +1,4 @@
-"""Red contracts for the Phase 3 placement planner.
+"""Red contracts for the placement planner.
 
 These tests deliberately stay on the metadata side of the WorkGraph boundary.
 They exercise implementation selection, residency routing, copy-engine timing,

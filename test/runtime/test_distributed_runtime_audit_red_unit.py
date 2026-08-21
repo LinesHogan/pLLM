@@ -1,4 +1,4 @@
-"""RED contracts for the Phase 4 runtime audit.
+"""RED contracts for the distributed runtime audit.
 
 These tests intentionally stay at the Python control-plane boundary.  The
 communicator, adapter, lifecycle, and rank-agreement objects are fakes, so a

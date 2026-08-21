@@ -1,4 +1,4 @@
-"""Failing contracts for Phase 2 WorkGraph runtime activation.
+"""Failing contracts for WorkGraph runtime activation.
 
 These tests deliberately exercise the cold-path handoff only.  The runtime
 must publish a physical ``PlanResources`` snapshot without changing the
@@ -72,7 +72,7 @@ def _activate_concrete(
         return dispatch_plan, execution_plan
 
 
-class Phase2RuntimeActivationUnitTest(unittest.TestCase):
+class WorkGraphRuntimeActivationUnitTest(unittest.TestCase):
     def test_prepare_drains_consumer_specializations_before_acquiring_new_snapshot(self) -> None:
         order: list[tuple[str, int]] = []
 

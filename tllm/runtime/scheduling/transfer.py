@@ -627,7 +627,7 @@ class PlacementImplementationBinding:
 
 @dataclass(frozen=True, slots=True)
 class PlacementRuntimeBinding:
-    """Cold-path inputs and Python-owned resources for Phase 3 publication."""
+    """Cold-path inputs and Python-owned resources for placement publication."""
 
     registry: ImplementationRegistry
     topology: DeviceTopology

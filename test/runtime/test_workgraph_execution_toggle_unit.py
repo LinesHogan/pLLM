@@ -13,7 +13,7 @@ from tllm.workflows import esamp_support
 from tllm.workflows.benchmarks import per_request_esamp_benchmark
 
 
-class Phase2WorkGraphExecutionToggleUnitTest(unittest.TestCase):
+class WorkGraphWorkGraphExecutionToggleUnitTest(unittest.TestCase):
     def test_disabled_config_skips_cold_specialization_and_keeps_legacy_engine_path(self) -> None:
         default = ESampConsumerConfig()
         self.assertIs(default.enable_workgraph_execution, True)

@@ -1,4 +1,4 @@
-"""Focused unit contracts for the Python-owned Phase 5 adaptive runtime."""
+"""Focused unit contracts for the Python-owned adaptive admission runtime."""
 
 from __future__ import annotations
 

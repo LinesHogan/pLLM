@@ -458,7 +458,7 @@ def compile_physical_flow_plan(plan: ShadowParityPlan) -> PhysicalFlowPlan:
         raise TypeError("compile_physical_flow_plan.plan must be ShadowParityPlan")
     plan = raw_plan
     if plan.epoch < 1:
-        raise ValueError("physical plan requires a compiled Phase 1 epoch")
+        raise ValueError("physical plan requires a compiled workgraph epoch")
     if plan.backend is None or plan.backend.graph_mode == "full":
         raise WorkGraphError(
             "WG120_UNSUPPORTED_GRAPH_MODE",
