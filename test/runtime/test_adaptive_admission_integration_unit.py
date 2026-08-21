@@ -25,11 +25,11 @@ from tllm.runtime.scheduling.transfer import (
     PlacementPlanDispatcher,
     PlacementRuntimeBinding,
 )
-from tllm.runtime.scheduling.phase5_adaptive import (
+from tllm.runtime.scheduling.adaptive import (
     AdaptiveFlowBinding,
     AdaptiveRuntimeBinding,
     AdaptiveTransferBinding,
-    Phase5AdaptiveScheduler,
+    AdaptiveAdmissionScheduler,
 )
 from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
 from tllm.runtime.state import ResidualRuntimeState
@@ -127,7 +127,7 @@ def _runtime_resources(
     *,
     item: WorkItemDesc,
     mode: AdmissionMode,
-    flow_id: str = "phase5.flow",
+    flow_id: str = "admission.flow",
     include_shed: bool = False,
 ) -> tuple[PlanResources, CandidateActionKey]:
     placement = PlacementPlan(
@@ -142,10 +142,10 @@ def _runtime_resources(
         pool=PinnedMemoryPool(capacity=1, adapter=adapter),
         adapter=adapter,
     )
-    shape_key = ShapeBucketKey("phase5", "shape")
-    workload_key = WorkloadBucketKey("phase5", "decode")
-    fallback_key = CandidateActionKey("phase5", "fallback")
-    execute_key = CandidateActionKey("phase5", "execute")
+    shape_key = ShapeBucketKey("admission", "shape")
+    workload_key = WorkloadBucketKey("admission", "decode")
+    fallback_key = CandidateActionKey("admission", "fallback")
+    execute_key = CandidateActionKey("admission", "execute")
     fallback = CandidateActionDesc(
         fallback_key,
         CandidateActionKind.AUTHORITATIVE_FALLBACK,
@@ -161,7 +161,7 @@ def _runtime_resources(
         duration=1,
     )
     shed = CandidateActionDesc(
-        CandidateActionKey("phase5", "shed"),
+        CandidateActionKey("admission", "shed"),
         CandidateActionKind.SHED,
         workload_bucket=workload_key,
         shape_bucket=shape_key,
@@ -181,7 +181,7 @@ def _runtime_resources(
         buffer_capacity=1,
         mode=mode,
     )
-    scheduler = Phase5AdaptiveScheduler(plan)
+    scheduler = AdaptiveAdmissionScheduler(plan)
     return (
         PlanResources(
             plan=PhysicalFlowPlan(plan_epoch=1, nodes=()),
@@ -217,7 +217,7 @@ def _queued(
             main_stream=None,
             is_compiling=False,
             uses_cudagraph=False,
-            event_name="phase5",
+            event_name="admission",
         ),
         run=lambda _bundle, _context: trace.append("run"),
         enqueued_step=7,
@@ -238,12 +238,12 @@ def _transfer_resources(
 ) -> tuple[PlanResources, _TrackingCopyAdapter]:
     """Build one cold adaptive resource epoch with a two-hop transfer route."""
 
-    source_node = NodeKey.producer("phase5.transfer.source")
-    target_node = NodeKey.consumer_flow("phase5.transfer.target", 0)
-    source_logical = ExecutorKey("logical", "phase5.transfer.source")
-    target_logical = ExecutorKey("logical", "phase5.transfer.target")
-    source_impl = ExecutorKey("implementation", "phase5.transfer.source.cuda0")
-    target_impl = ExecutorKey("implementation", "phase5.transfer.target.cuda1")
+    source_node = NodeKey.producer("admission.transfer.source")
+    target_node = NodeKey.consumer_flow("admission.transfer.target", 0)
+    source_logical = ExecutorKey("logical", "admission.transfer.source")
+    target_logical = ExecutorKey("logical", "admission.transfer.target")
+    source_impl = ExecutorKey("implementation", "admission.transfer.source.cuda0")
+    target_impl = ExecutorKey("implementation", "admission.transfer.target.cuda1")
     physical = PhysicalFlowPlan(
         plan_epoch=epoch,
         nodes=(
@@ -268,7 +268,7 @@ def _transfer_resources(
             logical_executor=target_logical,
         )
     )
-    value = placement_contracts.ValueKey("phase5-transfer", 1)
+    value = placement_contracts.ValueKey("admission-transfer", 1)
     if adapter is None:
         adapter = _TrackingCopyAdapter()
     placement, dispatcher, implementations = PlacementRuntimeBinding(
@@ -278,14 +278,14 @@ def _transfer_resources(
         adapter=adapter,
     ).compile(physical)
     move_set = CandidateMoveSetDesc(
-        MoveSetKey("phase5", "transfer"),
+        MoveSetKey("admission", "transfer"),
         placement.moves,
     )
     route_deadline = max(move.end_at for move in placement.moves) + 1
-    shape_key = ShapeBucketKey("phase5", "transfer-shape")
-    workload_key = WorkloadBucketKey("phase5", "transfer-work")
-    fallback_key = CandidateActionKey("phase5", "transfer-fallback")
-    execute_key = CandidateActionKey("phase5", "transfer-execute")
+    shape_key = ShapeBucketKey("admission", "transfer-shape")
+    workload_key = WorkloadBucketKey("admission", "transfer-work")
+    fallback_key = CandidateActionKey("admission", "transfer-fallback")
+    execute_key = CandidateActionKey("admission", "transfer-execute")
     fallback = CandidateActionDesc(
         fallback_key,
         CandidateActionKind.AUTHORITATIVE_FALLBACK,
@@ -316,12 +316,12 @@ def _transfer_resources(
         mode=AdmissionMode.ADAPTIVE,
     )
     item = WorkItemDesc(
-        WorkItemKey("phase5", "transfer-item"),
+        WorkItemKey("admission", "transfer-item"),
         (99,) if fallback_move_set else (4,),
         workload_key,
     )
     flow_binding = AdaptiveFlowBinding(
-        "phase5.transfer.flow",
+        "admission.transfer.flow",
         item,
         ()
         if not include_binding
@@ -342,7 +342,7 @@ def _transfer_resources(
         placement_dispatcher=dispatcher,
         placement_implementations=implementations,
         adaptive_plan=plan,
-        adaptive_scheduler=Phase5AdaptiveScheduler(plan),
+        adaptive_scheduler=AdaptiveAdmissionScheduler(plan),
         adaptive_flow_bindings=(flow_binding,),
     )
     return resources, adapter
@@ -367,7 +367,7 @@ def _enqueue_production_transfer(
         "QueuedTransferConsumer",
         (BaseConsumer,),
         {
-            "consumer_id": property(lambda self: "phase5.transfer.consumer"),
+            "consumer_id": property(lambda self: "admission.transfer.consumer"),
             "consume_bundle": lambda self, bundle, ctx: trace.append("run"),
             "flows": lambda self: (flow,),
         },
@@ -375,7 +375,7 @@ def _enqueue_production_transfer(
     target = FlowDispatchTarget(
         consumer=consumer,
         flow=flow,
-        flow_id="phase5.transfer.flow",
+        flow_id="admission.transfer.flow",
         placement_hook="sampler.pre_draw",
     )
     queued = _queued(
@@ -396,7 +396,7 @@ def _enqueue_production_transfer(
     )
 
 
-class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
+class AdaptiveAdmissionIntegrationUnitTest(unittest.TestCase):
     def _state(self, resources: PlanResources) -> ResidualRuntimeState:
         state = ResidualRuntimeState()
         state.physical_plan_store = PlanSnapshotStore(resources)
@@ -406,9 +406,9 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
 
     def test_cold_configuration_atomically_publishes_adaptive_resources(self) -> None:
         item = WorkItemDesc(
-            WorkItemKey("phase5", "configured"),
+            WorkItemKey("admission", "configured"),
             (2,),
-            WorkloadBucketKey("phase5", "decode"),
+            WorkloadBucketKey("admission", "decode"),
         )
         template, _execute_key = _runtime_resources(
             item=item,
@@ -425,7 +425,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
             budgets=plan.budgets,
             actions=plan.actions,
             unknown_bucket_fallback=plan.unknown_bucket_fallback,
-            flow_bindings=(AdaptiveFlowBinding("phase5.flow", item),),
+            flow_bindings=(AdaptiveFlowBinding("admission.flow", item),),
             profiles=plan.profiles,
             buffer_capacity=plan.buffer_capacity,
             mode=plan.mode,
@@ -470,9 +470,9 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
 
     def test_static_prepared_epoch_ignores_ewma_and_runs_bound_flow(self) -> None:
         item = WorkItemDesc(
-            WorkItemKey("phase5", "optional"),
+            WorkItemKey("admission", "optional"),
             (2,),
-            WorkloadBucketKey("phase5", "decode"),
+            WorkloadBucketKey("admission", "decode"),
         )
         resources, execute_key = _runtime_resources(
             item=item,
@@ -482,7 +482,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         resources.adaptive_scheduler.observe(execute_key, 100)
         state = self._state(resources)
         trace: list[str] = []
-        state.deferred_work_queue.enqueue(_queued("phase5.flow", trace))
+        state.deferred_work_queue.enqueue(_queued("admission.flow", trace))
 
         drained = drain_deferred_port_bundles(
             runtime=state,
@@ -496,9 +496,9 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
 
     def test_adaptive_optional_work_defers_then_sheds_at_deadline(self) -> None:
         item = WorkItemDesc(
-            WorkItemKey("phase5", "optional"),
+            WorkItemKey("admission", "optional"),
             (2,),
-            WorkloadBucketKey("phase5", "decode"),
+            WorkloadBucketKey("admission", "decode"),
         )
         resources, execute_key = _runtime_resources(
             item=item,
@@ -509,7 +509,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         resources.adaptive_scheduler.observe(execute_key, 100)
         state = self._state(resources)
         trace: list[str] = []
-        state.deferred_work_queue.enqueue(_queued("phase5.flow", trace))
+        state.deferred_work_queue.enqueue(_queued("admission.flow", trace))
 
         self.assertEqual(
             drain_deferred_port_bundles(
@@ -540,9 +540,9 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
 
     def test_optional_work_falls_back_when_shedding_was_not_approved(self) -> None:
         item = WorkItemDesc(
-            WorkItemKey("phase5", "optional-fallback"),
+            WorkItemKey("admission", "optional-fallback"),
             (2,),
-            WorkloadBucketKey("phase5", "decode"),
+            WorkloadBucketKey("admission", "decode"),
         )
         resources, execute_key = _runtime_resources(
             item=item,
@@ -552,7 +552,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         resources.adaptive_scheduler.observe(execute_key, 100)
         state = self._state(resources)
         trace: list[str] = []
-        state.deferred_work_queue.enqueue(_queued("phase5.flow", trace))
+        state.deferred_work_queue.enqueue(_queued("admission.flow", trace))
 
         drained = drain_deferred_port_bundles(
             runtime=state,
@@ -581,9 +581,9 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
 
     def test_required_work_uses_authoritative_fallback_instead_of_drop(self) -> None:
         item = WorkItemDesc(
-            WorkItemKey("phase5", "required"),
+            WorkItemKey("admission", "required"),
             (2,),
-            WorkloadBucketKey("phase5", "decode"),
+            WorkloadBucketKey("admission", "decode"),
             required=True,
         )
         resources, execute_key = _runtime_resources(
@@ -594,7 +594,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         resources.adaptive_scheduler.observe(execute_key, 100)
         state = self._state(resources)
         trace: list[str] = []
-        state.deferred_work_queue.enqueue(_queued("phase5.flow", trace))
+        state.deferred_work_queue.enqueue(_queued("admission.flow", trace))
 
         self.assertEqual(
             drain_deferred_port_bundles(
@@ -619,7 +619,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         trace: list[str] = []
         state.deferred_work_queue.enqueue(
             _queued(
-                "phase5.transfer.flow",
+                "admission.transfer.flow",
                 trace,
                 entries={
                     "source": _FakeTensor((4,), "float32", "cuda:0"),
@@ -646,7 +646,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         store.stage(new_resources)
         store.prepare_step(8)
         state.physical_prepared_step_id = 8
-        binding = old_resources.adaptive_flow_binding("phase5.transfer.flow")
+        binding = old_resources.adaptive_flow_binding("admission.transfer.flow")
         assert binding is not None
         self.assertIs(
             store.adaptive_transfer_owner(
@@ -789,7 +789,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         old_resources.retain_deferred_handoff()
         state.deferred_work_queue.enqueue(
             _queued(
-                "phase5.transfer.flow",
+                "admission.transfer.flow",
                 trace,
                 entries={
                     "source": _FakeTensor((4,), "float32", "cuda:0"),
@@ -830,7 +830,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         trace: list[str] = []
         state.deferred_work_queue.enqueue(
             _queued(
-                "phase5.transfer.flow",
+                "admission.transfer.flow",
                 trace,
                 entries={
                     "source": _FakeTensor((4,), "float32", "cuda:0"),
@@ -881,7 +881,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         trace: list[str] = []
         state.deferred_work_queue.enqueue(
             _queued(
-                "phase5.transfer.flow",
+                "admission.transfer.flow",
                 trace,
                 entries={
                     "source": _FakeTensor((4,), "float32", "cuda:0"),
@@ -933,7 +933,7 @@ class Phase5AdaptiveIntegrationUnitTest(unittest.TestCase):
         destination = _FakeTensor((4,), "float32", "cuda:1")
         state.deferred_work_queue.enqueue(
             _queued(
-                "phase5.transfer.flow",
+                "admission.transfer.flow",
                 trace,
                 entries={"source": source, "destination": destination},
             )

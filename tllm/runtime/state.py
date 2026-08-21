@@ -42,7 +42,7 @@ if TYPE_CHECKING:
         DistributedPlanSnapshotStore,
         DistributedRuntimeBinding,
     )
-    from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
+    from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.shadow import ShadowParityPlan

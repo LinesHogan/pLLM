@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import unittest
 
-from tllm.runtime.scheduling.phase5_adaptive import (
+from tllm.runtime.scheduling.adaptive import (
     AdaptiveDecisionKind,
     AdaptiveMode,
     AdmissionContext,
-    Phase5AdaptiveScheduler,
+    AdaptiveAdmissionScheduler,
 )
 from tllm.workgraph.admission import (
     AdmissionMode,
@@ -96,7 +96,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
 
     def test_required_work_is_never_shed_when_admission_is_full(self) -> None:
         plan, _optional, required, _budget = self._plan()
-        scheduler = Phase5AdaptiveScheduler(plan)
+        scheduler = AdaptiveAdmissionScheduler(plan)
 
         decision = scheduler.decide(required, context=AdmissionContext(available_buffers=0))
 
@@ -132,11 +132,11 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             mode=plan.mode,
         )
 
-        first = Phase5AdaptiveScheduler(plan).decide(
+        first = AdaptiveAdmissionScheduler(plan).decide(
             non_sheddable,
             context=AdmissionContext(available_buffers=0),
         )
-        second = Phase5AdaptiveScheduler(required_by_default).decide(
+        second = AdaptiveAdmissionScheduler(required_by_default).decide(
             optional,
             context=AdmissionContext(available_buffers=0),
         )
@@ -167,7 +167,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             shape=(99,),
             workload_bucket=optional.workload_bucket,
         )
-        scheduler = Phase5AdaptiveScheduler(plan)
+        scheduler = AdaptiveAdmissionScheduler(plan)
 
         with self.assertRaises(ValueError):
             scheduler.decide(optional, action=rewritten)
@@ -181,7 +181,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             shape=(99,),
             workload_bucket=WorkloadBucketKey("work", "decode"),
         )
-        decision = Phase5AdaptiveScheduler(plan).decide(unknown)
+        decision = AdaptiveAdmissionScheduler(plan).decide(unknown)
 
         self.assertEqual(decision.action, AdaptiveDecisionKind.FALLBACK)
         self.assertIsNotNone(decision.candidate)
@@ -197,15 +197,15 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
         self.assertIsNotNone(budget_key)
         assert budget_key is not None
 
-        buffer_drop = Phase5AdaptiveScheduler(plan).decide(
+        buffer_drop = AdaptiveAdmissionScheduler(plan).decide(
             optional,
             context=AdmissionContext(available_buffers=0),
         )
-        deadline_drop = Phase5AdaptiveScheduler(plan).decide(
+        deadline_drop = AdaptiveAdmissionScheduler(plan).decide(
             optional,
             context=AdmissionContext(available_buffers=1, step=1, deadline_step=2),
         )
-        interference_drop = Phase5AdaptiveScheduler(plan).decide(
+        interference_drop = AdaptiveAdmissionScheduler(plan).decide(
             optional,
             context=AdmissionContext(
                 available_buffers=1,
@@ -259,7 +259,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             mode=plan.mode,
         )
 
-        decision = Phase5AdaptiveScheduler(required_plan).decide(
+        decision = AdaptiveAdmissionScheduler(required_plan).decide(
             optional,
             context=AdmissionContext(available_buffers=0),
         )
@@ -297,7 +297,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             mode=plan.mode,
         )
 
-        decision = Phase5AdaptiveScheduler(plan_with_shed).decide(
+        decision = AdaptiveAdmissionScheduler(plan_with_shed).decide(
             optional,
             context=AdmissionContext(available_buffers=0),
             allow_defer=False,
@@ -311,12 +311,12 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
 
     def test_runtime_never_adds_or_rewrites_phase3_moves(self) -> None:
         plan, optional, _required, _budget = self._plan()
-        prepared = Phase5AdaptiveScheduler(plan).prepared
+        prepared = AdaptiveAdmissionScheduler(plan).prepared
         assert prepared is not None
 
         self.assertEqual(prepared.move_keys, ())
         self.assertEqual(plan.scheduled_moves, ())
-        decision = Phase5AdaptiveScheduler(plan).decide(
+        decision = AdaptiveAdmissionScheduler(plan).decide(
             optional,
             context=AdmissionContext(available_buffers=1),
         )
@@ -324,7 +324,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
 
     def test_static_mode_is_deterministic_and_ignores_observations(self) -> None:
         plan, optional, _required, budget = self._plan(with_budget=True)
-        scheduler = Phase5AdaptiveScheduler(plan, mode=AdaptiveMode.STATIC)
+        scheduler = AdaptiveAdmissionScheduler(plan, mode=AdaptiveMode.STATIC)
         first = scheduler.decide(optional, context=AdmissionContext(available_buffers=1))
         assert budget is not None
         scheduler.observe_interference(budget, 10_000)
@@ -335,7 +335,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
 
     def test_integer_ewma_observation_is_python_owned(self) -> None:
         plan, optional, _required, _budget = self._plan()
-        scheduler = Phase5AdaptiveScheduler(plan)
+        scheduler = AdaptiveAdmissionScheduler(plan)
         action_key = next(iter(scheduler.prepared.action_by_key))  # type: ignore[union-attr]
 
         self.assertEqual(scheduler.observe(action_key, 7), 7)
@@ -370,7 +370,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             mode=plan.mode,
             profiles=(profile,),
         )
-        scheduler = Phase5AdaptiveScheduler(profiled)
+        scheduler = AdaptiveAdmissionScheduler(profiled)
 
         self.assertEqual(scheduler.interference[profile_key], 4)
         self.assertEqual(scheduler.observe_interference(profile_key, 8), 5)
@@ -421,7 +421,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             buffer_capacity=1,
             mode=plan.mode,
         )
-        scheduler = Phase5AdaptiveScheduler(with_fallback_credit)
+        scheduler = AdaptiveAdmissionScheduler(with_fallback_credit)
         scheduler.observe(execute.key, execute.deadline + 1)
 
         first = scheduler.decide(
@@ -503,13 +503,13 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
                     RuntimeError,
                     "no feasible compiler-approved action",
                 ):
-                    Phase5AdaptiveScheduler(constrained).decide(
+                    AdaptiveAdmissionScheduler(constrained).decide(
                         item,
                         context=context,
                         action=selected_action,
                     )
 
-        deferred = Phase5AdaptiveScheduler(constrained).decide(
+        deferred = AdaptiveAdmissionScheduler(constrained).decide(
             unknown,
             context=AdmissionContext(available_buffers=0),
             allow_defer=True,

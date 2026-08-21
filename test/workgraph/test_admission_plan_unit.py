@@ -53,9 +53,9 @@ from tllm.workgraph.admission import (
     validate_candidate_move_sets,
 )
 from tllm.workgraph.signature import structural_signature
-from tllm.runtime.scheduling.phase5_adaptive import (
+from tllm.runtime.scheduling.adaptive import (
     AdaptiveDecisionKind,
-    Phase5AdaptiveScheduler,
+    AdaptiveAdmissionScheduler,
 )
 
 
@@ -69,14 +69,14 @@ def _empty_placement(epoch: int = 1) -> PlacementPlan:
 
 
 def _two_hop_placement(epoch: int = 1) -> tuple[PlacementPlan, ScheduledMove, ScheduledMove]:
-    source_node = NodeKey.consumer_flow("phase5.source", 0)
-    target_node = NodeKey.consumer_flow("phase5.target", 0)
-    source_impl = ExecutorKey("phase5", "source")
-    target_impl = ExecutorKey("phase5", "target")
+    source_node = NodeKey.consumer_flow("admission.source", 0)
+    target_node = NodeKey.consumer_flow("admission.target", 0)
+    source_impl = ExecutorKey("admission", "source")
+    target_impl = ExecutorKey("admission", "target")
     source = Placement(DeviceKind.CUDA, 0)
     target = Placement(DeviceKind.CUDA, 1)
     host = Placement(DeviceKind.CPU)
-    value = ValueKey("phase5-value", 1)
+    value = ValueKey("admission-value", 1)
     source_residency = Residency(value, source)
     host_residency = Residency(value, host, MemoryKind.PINNED_HOST)
     target_residency = Residency(value, target)
@@ -446,7 +446,7 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
 
         greedy = greedy_admission(plan, (item,))
         oracle = exhaustive_admission_oracle(plan, (item,))
-        runtime = Phase5AdaptiveScheduler(plan).decide(item)
+        runtime = AdaptiveAdmissionScheduler(plan).decide(item)
 
         self.assertEqual(greedy.selected, ((item.key, execute.key),))
         self.assertEqual(oracle.selected, ((item.key, execute.key),))

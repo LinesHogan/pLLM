@@ -64,7 +64,7 @@ if TYPE_CHECKING:
         CollectiveHandle,
         DistributedRuntimeBinding,
     )
-    from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
+    from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
     from tllm.workgraph.ir import NodeKey
     from tllm.workgraph.placement import ValueKey
     from tllm.workgraph.distributed import CollectiveKey
@@ -451,7 +451,7 @@ def configure_workgraph_adaptive(
 ) -> None:
     """Install typed Phase 5 cold-compilation inputs and explicit flow bindings."""
 
-    from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
+    from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
 
     if binding is not None and not isinstance(binding, AdaptiveRuntimeBinding):
         raise TypeError(

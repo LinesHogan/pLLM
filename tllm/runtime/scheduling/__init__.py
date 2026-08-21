@@ -42,7 +42,7 @@ from tllm.runtime.scheduling.collective import (
     distributed_plan_agreement_desc,
     validate_distributed_plan_agreement,
 )
-from tllm.runtime.scheduling.phase5_adaptive import (
+from tllm.runtime.scheduling.adaptive import (
     AdaptiveDecision,
     AdaptiveDecisionKind,
     AdaptiveFlowBinding,
@@ -52,10 +52,10 @@ from tllm.runtime.scheduling.phase5_adaptive import (
     AdaptiveTransferStatus,
     AdmissionContext,
     IntegerEWMA,
-    Phase5AdaptiveScheduler,
-    PreparedPhase5Plan,
+    AdaptiveAdmissionScheduler,
+    PreparedAdmissionPlan,
     RuntimeAdmissionState,
-    prepare_phase5_plan,
+    prepare_admission_plan,
 )
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
@@ -105,7 +105,7 @@ __all__ = [
     "PhysicalExecutionStats",
     "PhysicalExecutor",
     "PhysicalStepResult",
-    "Phase5AdaptiveScheduler",
+    "AdaptiveAdmissionScheduler",
     "PinnedMemoryPool",
     "PinnedMemorySlot",
     "PlacementImplementationBinding",
@@ -126,6 +126,6 @@ __all__ = [
     "runtime_stats_from_executor",
     "distributed_plan_agreement_desc",
     "validate_distributed_plan_agreement",
-    "PreparedPhase5Plan",
-    "prepare_phase5_plan",
+    "PreparedAdmissionPlan",
+    "prepare_admission_plan",
 ]

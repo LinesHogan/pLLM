@@ -22,10 +22,10 @@ from tllm.runtime.scheduling.transfer import (
     PlacementPlanDispatcher,
     TensorLike,
 )
-from tllm.runtime.scheduling.phase5_adaptive import (
+from tllm.runtime.scheduling.adaptive import (
     AdaptiveFlowBinding,
     AdaptiveTransferStatus,
-    Phase5AdaptiveScheduler,
+    AdaptiveAdmissionScheduler,
     validate_adaptive_flow_bindings,
 )
 from tllm.workgraph.frontend import ArtifactKey, Device
@@ -114,7 +114,7 @@ class PlanResources:
     placement_dispatcher: PlacementPlanDispatcher | None = None
     placement_implementations: tuple[PlacementImplementationBinding, ...] = ()
     adaptive_plan: AdmissionControlPlan | None = None
-    adaptive_scheduler: Phase5AdaptiveScheduler | None = None
+    adaptive_scheduler: AdaptiveAdmissionScheduler | None = None
     adaptive_flow_bindings: tuple[AdaptiveFlowBinding, ...] = ()
     leases: tuple[BufferLease, ...] = ()
     streams: tuple[RuntimeStream, ...] = ()
@@ -204,10 +204,10 @@ class PlanResources:
             if not isinstance(cast(object, adaptive_plan), AdmissionControlPlan):
                 raise TypeError("PlanResources.adaptive_plan must be AdmissionControlPlan")
             if not isinstance(
-                cast(object, adaptive_scheduler), Phase5AdaptiveScheduler
+                cast(object, adaptive_scheduler), AdaptiveAdmissionScheduler
             ):
                 raise TypeError(
-                    "PlanResources.adaptive_scheduler must be Phase5AdaptiveScheduler"
+                    "PlanResources.adaptive_scheduler must be AdaptiveAdmissionScheduler"
                 )
             if placement_plan is None or adaptive_plan.placement_plan != placement_plan:
                 raise ValueError(

@@ -33,7 +33,7 @@ from tllm.runtime.scheduling.deferred import (
     DeferredWorkQueue,
 )
 from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
-from tllm.runtime.scheduling.phase5_adaptive import (
+from tllm.runtime.scheduling.adaptive import (
     AdaptiveDecisionKind,
     AdaptiveTransferStatus,
     AdmissionContext,

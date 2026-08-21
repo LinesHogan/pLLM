@@ -1,7 +1,7 @@
-"""Python-owned adaptive admission for frozen WorkGraph Phase 5 plans.
+"""Mutable adaptive admission runtime driven by frozen admission plans.
 
-The phase-5 control plane owns candidate actions, bucket identities, budgets,
-deadlines, and the Phase 3 move universe.  This module owns only mutable
+The admission control plane owns candidate actions, bucket identities, budgets,
+deadlines, and the placement move universe.  This module owns only mutable
 runtime facts: integer EWMAs and current admission reservations.  It never
 creates or edits a ``Move`` or ``ScheduledMove``.
 """
@@ -421,7 +421,7 @@ class AdaptiveRuntimeBinding:
         placement_plan: PlacementPlan,
     ) -> tuple[
         AdmissionControlPlan,
-        Phase5AdaptiveScheduler,
+        AdaptiveAdmissionScheduler,
         tuple[AdaptiveFlowBinding, ...],
     ]:
         plan = compile_admission_plan(
@@ -453,11 +453,11 @@ class AdaptiveRuntimeBinding:
             plan,
             self.flow_bindings,
         )
-        return plan, Phase5AdaptiveScheduler(plan), validated_bindings
+        return plan, AdaptiveAdmissionScheduler(plan), validated_bindings
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedPhase5Plan:
+class PreparedAdmissionPlan:
     """Immutable runtime index over one AdmissionControlPlan."""
 
     plan: AdmissionControlPlan
@@ -480,7 +480,7 @@ class PreparedPhase5Plan:
         object.__setattr__(self, "buffer_capacity", _integer(self.buffer_capacity, "buffer capacity"))
 
 
-def prepare_phase5_plan(plan: AdmissionControlPlan) -> PreparedPhase5Plan:
+def prepare_admission_plan(plan: AdmissionControlPlan) -> PreparedAdmissionPlan:
     """Prepare one frozen control plan without modifying it."""
 
     plan = _instance(plan, AdmissionControlPlan, "phase-5 plan")
@@ -491,7 +491,7 @@ def prepare_phase5_plan(plan: AdmissionControlPlan) -> PreparedPhase5Plan:
         raise ValueError("phase-5 fallback is not an approved action")
     budgets = {budget.key: budget for budget in plan.budgets}
     move_sets = {move_set.key: move_set for move_set in plan.move_sets}
-    return PreparedPhase5Plan(
+    return PreparedAdmissionPlan(
         plan=plan,
         actions=actions,
         action_by_key=action_by_key,
@@ -506,12 +506,12 @@ def prepare_phase5_plan(plan: AdmissionControlPlan) -> PreparedPhase5Plan:
     )
 
 
-def _shape_bucket(prepared: PreparedPhase5Plan, shape: tuple[int, ...]) -> ShapeBucketKey | None:
+def _shape_bucket(prepared: PreparedAdmissionPlan, shape: tuple[int, ...]) -> ShapeBucketKey | None:
     matches = tuple(bucket.key for bucket in prepared.shape_buckets if bucket.matches(shape))
     return min(matches) if matches else None
 
 
-def _approved_actions(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> tuple[CandidateActionDesc, ...]:
+def _approved_actions(prepared: PreparedAdmissionPlan, item: WorkItemDesc) -> tuple[CandidateActionDesc, ...]:
     shape_key = _shape_bucket(prepared, item.shape)
     workload_key = item.workload_bucket
     workload_keys = {bucket.key for bucket in prepared.workload_buckets}
@@ -533,7 +533,7 @@ def _approved_actions(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> tuple
 
 
 def _semantic_fallback(
-    prepared: PreparedPhase5Plan,
+    prepared: PreparedAdmissionPlan,
     item: WorkItemDesc,
     *,
     unknown_bucket: bool,
@@ -547,7 +547,7 @@ def _semantic_fallback(
     return fallback
 
 
-def _must_complete(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> bool:
+def _must_complete(prepared: PreparedAdmissionPlan, item: WorkItemDesc) -> bool:
     workload_required = any(
         bucket.key == item.workload_bucket and bucket.required_by_default
         for bucket in prepared.workload_buckets
@@ -578,7 +578,7 @@ def _must_complete(prepared: PreparedPhase5Plan, item: WorkItemDesc) -> bool:
 
 
 def _action_is_approved(
-    prepared: PreparedPhase5Plan,
+    prepared: PreparedAdmissionPlan,
     item: WorkItemDesc,
     candidate: CandidateActionDesc,
 ) -> bool:
@@ -604,7 +604,7 @@ def validate_adaptive_flow_bindings(
         not isinstance(binding, AdaptiveFlowBinding) for binding in bindings
     ):
         raise TypeError("adaptive flow bindings must be AdaptiveFlowBinding tuple")
-    prepared = prepare_phase5_plan(plan)
+    prepared = prepare_admission_plan(plan)
     action_by_key = prepared.action_by_key
     move_sets = prepared.move_sets
     for binding in bindings:
@@ -651,7 +651,7 @@ def validate_adaptive_flow_bindings(
     return tuple(bindings)
 
 
-class Phase5AdaptiveScheduler:
+class AdaptiveAdmissionScheduler:
     """Admit compiler-approved actions from one prepared immutable plan."""
 
     __slots__ = (
@@ -680,7 +680,7 @@ class Phase5AdaptiveScheduler:
             self.mode = AdaptiveMode(mode_value)
         except ValueError as exc:
             raise ValueError("phase-5 mode must be static or adaptive") from exc
-        self.prepared: PreparedPhase5Plan | None = None
+        self.prepared: PreparedAdmissionPlan | None = None
         self.state = RuntimeAdmissionState(
             latency_ewma=IntegerEWMA(alpha_num, alpha_den),
             interference_ewma=IntegerEWMA(alpha_num, alpha_den),
@@ -707,8 +707,8 @@ class Phase5AdaptiveScheduler:
         for item in value.values():
             _integer(item, "interference_limit value")
 
-    def prepare(self, plan: AdmissionControlPlan) -> PreparedPhase5Plan:
-        self.prepared = prepare_phase5_plan(plan)
+    def prepare(self, plan: AdmissionControlPlan) -> PreparedAdmissionPlan:
+        self.prepared = prepare_admission_plan(plan)
         self.state.reset()
         self.latency_ewma.clear()
         self.interference_ewma.clear()
@@ -980,7 +980,7 @@ class Phase5AdaptiveScheduler:
         for use in action.budget_uses:
             self.state.reserved_budgets[use.key] = self.state.reserved_budgets.get(use.key, 0) + use.amount
 
-    def _require_prepared(self) -> PreparedPhase5Plan:
+    def _require_prepared(self) -> PreparedAdmissionPlan:
         if self.prepared is None:
             raise RuntimeError("phase-5 scheduler has no prepared plan")
         return self.prepared
@@ -996,9 +996,9 @@ __all__ = [
     "AdaptiveMode",
     "AdmissionContext",
     "IntegerEWMA",
-    "Phase5AdaptiveScheduler",
-    "PreparedPhase5Plan",
+    "AdaptiveAdmissionScheduler",
+    "PreparedAdmissionPlan",
     "RuntimeAdmissionState",
-    "prepare_phase5_plan",
+    "prepare_admission_plan",
     "validate_adaptive_flow_bindings",
 ]
