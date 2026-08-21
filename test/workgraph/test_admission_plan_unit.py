@@ -26,7 +26,7 @@ from tllm.workgraph.placement import (
     ValueFlowDesc,
     ValueKey,
 )
-from tllm.workgraph.phase5 import (
+from tllm.workgraph.admission import (
     AdmissionMode,
     BudgetUseDesc,
     CandidateActionDesc,
@@ -39,7 +39,7 @@ from tllm.workgraph.phase5 import (
     InterferenceBudgetDesc,
     InterferenceBudgetKey,
     MoveSetKey,
-    Phase5ControlPlan,
+    AdmissionControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
     WorkItemDesc,
@@ -150,7 +150,7 @@ def _plan(
     buffer_capacity: int = 2,
     densification_limit: int = 64,
     mode: AdmissionMode = AdmissionMode.STATIC,
-) -> Phase5ControlPlan:
+) -> AdmissionControlPlan:
     shape = ShapeBucketKey("shape", "pair")
     workload = WorkloadBucketKey("work", "decode")
     fallback_key = CandidateActionKey("action", "fallback")
@@ -181,7 +181,7 @@ def _plan(
         shape_buckets = (ShapeBucketDesc(shape, shape=(2, 4)),)
     if workload_buckets is None:
         workload_buckets = (WorkloadBucketDesc(workload, (shape,)),)
-    return Phase5ControlPlan(
+    return AdmissionControlPlan(
         plan_epoch=(placement or _empty_placement()).plan_epoch,
         placement_plan=placement or _empty_placement(),
         scheduled_moves=(placement or _empty_placement()).moves,
@@ -321,7 +321,7 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
         placement, first, second = _two_hop_placement(epoch=7)
         move_set = CandidateMoveSetDesc(MoveSetKey("moves", "chain"), (second, first))
         plan = _plan(placement=placement)
-        anchored = Phase5ControlPlan(
+        anchored = AdmissionControlPlan(
             plan_epoch=7,
             placement_plan=placement,
             scheduled_moves=placement.moves,
@@ -337,7 +337,7 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
         self.assertEqual(anchored.scheduled_moves, placement.moves)
         self.assertEqual(anchored.move_sets[0].moves, (first, second))
         with self.assertRaises(ValueError):
-            Phase5ControlPlan(
+            AdmissionControlPlan(
                 plan_epoch=8,
                 placement_plan=placement,
                 scheduled_moves=placement.moves,
@@ -350,7 +350,7 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
                 buffer_capacity=2,
             )
         with self.assertRaises(ValueError):
-            Phase5ControlPlan(
+            AdmissionControlPlan(
                 plan_epoch=7,
                 placement_plan=placement,
                 scheduled_moves=(replace(first, end_at=4), second),
@@ -382,7 +382,7 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            Phase5ControlPlan(
+            AdmissionControlPlan(
                 plan_epoch=base.plan_epoch,
                 placement_plan=placement,
                 scheduled_moves=placement.moves,
@@ -425,7 +425,7 @@ class Phase5AdaptivePlanUnitTest(unittest.TestCase):
             duration=1,
             deadline=7,
         )
-        plan = Phase5ControlPlan(
+        plan = AdmissionControlPlan(
             plan_epoch=base.plan_epoch,
             placement_plan=placement,
             scheduled_moves=placement.moves,

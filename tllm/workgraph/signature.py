@@ -107,7 +107,7 @@ from tllm.workgraph.distributed import (
     StateResidenceDesc,
     TopologyRankDesc,
 )
-from tllm.workgraph.phase5 import (
+from tllm.workgraph.admission import (
     BudgetUseDesc,
     CandidateActionDesc,
     CandidateActionKey,
@@ -118,7 +118,7 @@ from tllm.workgraph.phase5 import (
     InterferenceBudgetDesc,
     InterferenceBudgetKey,
     MoveSetKey,
-    Phase5ControlPlan,
+    AdmissionControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
     WorkItemDesc,
@@ -534,7 +534,7 @@ def _canonical(value: Any) -> Any:
             "allow_shedding": value.allow_shedding,
             "deadline": value.deadline,
         }
-    if isinstance(value, Phase5ControlPlan):
+    if isinstance(value, AdmissionControlPlan):
         return {
             "plan_epoch": value.plan_epoch,
             "placement_plan": _canonical(value.placement_plan),

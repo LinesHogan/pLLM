@@ -27,7 +27,7 @@ from tllm.workgraph.placement import (
     ValueFlowDesc,
     ValueKey,
 )
-from tllm.workgraph.phase5 import (
+from tllm.workgraph.admission import (
     AdmissionMode,
     BudgetUseDesc,
     CandidateActionDesc,
@@ -37,7 +37,7 @@ from tllm.workgraph.phase5 import (
     InterferenceBudgetDesc,
     InterferenceBudgetKey,
     MoveSetKey,
-    Phase5ControlPlan,
+    AdmissionControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
     WorkloadBucketDesc,
@@ -140,7 +140,7 @@ def _phase5(
     workload_buckets: tuple[WorkloadBucketDesc, ...] | None = None,
     buffer_capacity: int = 2,
     densification_limit: int = 64,
-) -> Phase5ControlPlan:
+) -> AdmissionControlPlan:
     placement = placement or _empty_placement()
     shape = ShapeBucketKey("shape", "pair")
     workload = WorkloadBucketKey("work", "decode")
@@ -164,7 +164,7 @@ def _phase5(
         buffer_credits=1,
         utility=2,
     )
-    return Phase5ControlPlan(
+    return AdmissionControlPlan(
         plan_epoch=placement.plan_epoch,
         placement_plan=placement,
         scheduled_moves=placement.moves,

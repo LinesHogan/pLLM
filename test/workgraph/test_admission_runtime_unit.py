@@ -10,7 +10,7 @@ from tllm.runtime.scheduling.phase5_adaptive import (
     AdmissionContext,
     Phase5AdaptiveScheduler,
 )
-from tllm.workgraph.phase5 import (
+from tllm.workgraph.admission import (
     AdmissionMode,
     BudgetUseDesc,
     CandidateActionDesc,
@@ -21,7 +21,7 @@ from tllm.workgraph.phase5 import (
     IntegerEWMAProfile,
     InterferenceBudgetDesc,
     InterferenceBudgetKey,
-    Phase5ControlPlan,
+    AdmissionControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
     WorkItemDesc,
@@ -34,7 +34,7 @@ from tllm.workgraph.placement import DeviceTopology, PlacementPlan
 
 class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
     @staticmethod
-    def _plan(*, with_budget: bool = False, deadline: int = 8, duration: int = 1) -> tuple[Phase5ControlPlan, WorkItemDesc, WorkItemDesc, InterferenceBudgetKey | None]:
+    def _plan(*, with_budget: bool = False, deadline: int = 8, duration: int = 1) -> tuple[AdmissionControlPlan, WorkItemDesc, WorkItemDesc, InterferenceBudgetKey | None]:
         shape_key = ShapeBucketKey("shape", "two")
         workload_key = WorkloadBucketKey("work", "decode")
         fallback_key = CandidateActionKey("action", "fallback")
@@ -68,7 +68,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             schedule=(),
             topology=DeviceTopology(frozenset()),
         )
-        plan = Phase5ControlPlan(
+        plan = AdmissionControlPlan(
             plan_epoch=1,
             placement_plan=placement_plan,
             scheduled_moves=(),
@@ -112,7 +112,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             allow_shedding=False,
         )
         workload = plan.workload_buckets[0]
-        required_by_default = Phase5ControlPlan(
+        required_by_default = AdmissionControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
             scheduled_moves=plan.scheduled_moves,
@@ -245,7 +245,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             shape_bucket=execute.shape_bucket,
             duration=0,
         )
-        required_plan = Phase5ControlPlan(
+        required_plan = AdmissionControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
             scheduled_moves=plan.scheduled_moves,
@@ -283,7 +283,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             duration=0,
             priority=100,
         )
-        plan_with_shed = Phase5ControlPlan(
+        plan_with_shed = AdmissionControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
             scheduled_moves=plan.scheduled_moves,
@@ -356,7 +356,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             maximum=10,
         )
         budget = InterferenceBudgetDesc(budget_key, capacity=10, profile=profile_key)
-        profiled = Phase5ControlPlan(
+        profiled = AdmissionControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
             scheduled_moves=plan.scheduled_moves,
@@ -408,7 +408,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             shape_bucket=execute.shape_bucket,
             duration=0,
         )
-        with_fallback_credit = Phase5ControlPlan(
+        with_fallback_credit = AdmissionControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
             scheduled_moves=plan.scheduled_moves,
@@ -458,7 +458,7 @@ class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):
             budget_uses=(BudgetUseDesc(budget_key, 1),),
             unknown_bucket=True,
         )
-        constrained = Phase5ControlPlan(
+        constrained = AdmissionControlPlan(
             plan_epoch=plan.plan_epoch,
             placement_plan=plan.placement_plan,
             scheduled_moves=plan.scheduled_moves,

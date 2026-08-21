@@ -16,7 +16,7 @@ from typing import TypeVar, cast
 
 from tllm.workgraph.ir import NodeKey
 from tllm.workgraph.placement import MoveKey, PlacementPlan, ValueKey
-from tllm.workgraph.phase5 import (
+from tllm.workgraph.admission import (
     AdmissionMode,
     CandidateActionDesc,
     CandidateActionKey,
@@ -27,13 +27,13 @@ from tllm.workgraph.phase5 import (
     EWMAProfileKey,
     InterferenceBudgetDesc,
     InterferenceBudgetKey,
-    Phase5ControlPlan,
+    AdmissionControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
     WorkItemDesc,
     WorkItemKey,
     WorkloadBucketDesc,
-    compile_phase5_plan,
+    compile_admission_plan,
 )
 
 
@@ -420,11 +420,11 @@ class AdaptiveRuntimeBinding:
         self,
         placement_plan: PlacementPlan,
     ) -> tuple[
-        Phase5ControlPlan,
+        AdmissionControlPlan,
         Phase5AdaptiveScheduler,
         tuple[AdaptiveFlowBinding, ...],
     ]:
-        plan = compile_phase5_plan(
+        plan = compile_admission_plan(
             placement_plan=placement_plan,
             move_sets=self.move_sets,
             workload_buckets=self.workload_buckets,
@@ -458,9 +458,9 @@ class AdaptiveRuntimeBinding:
 
 @dataclass(frozen=True, slots=True)
 class PreparedPhase5Plan:
-    """Immutable runtime index over one Phase5ControlPlan."""
+    """Immutable runtime index over one AdmissionControlPlan."""
 
-    plan: Phase5ControlPlan
+    plan: AdmissionControlPlan
     actions: tuple[CandidateActionDesc, ...]
     action_by_key: Mapping[CandidateActionKey, CandidateActionDesc]
     fallback_action: CandidateActionDesc
@@ -480,10 +480,10 @@ class PreparedPhase5Plan:
         object.__setattr__(self, "buffer_capacity", _integer(self.buffer_capacity, "buffer capacity"))
 
 
-def prepare_phase5_plan(plan: Phase5ControlPlan) -> PreparedPhase5Plan:
+def prepare_phase5_plan(plan: AdmissionControlPlan) -> PreparedPhase5Plan:
     """Prepare one frozen control plan without modifying it."""
 
-    plan = _instance(plan, Phase5ControlPlan, "phase-5 plan")
+    plan = _instance(plan, AdmissionControlPlan, "phase-5 plan")
     actions = tuple(plan.actions)
     action_by_key = {action.key: action for action in actions}
     fallback = action_by_key.get(plan.unknown_bucket_fallback)
@@ -594,12 +594,12 @@ def _action_is_approved(
 
 
 def validate_adaptive_flow_bindings(
-    plan: Phase5ControlPlan,
+    plan: AdmissionControlPlan,
     bindings: tuple[AdaptiveFlowBinding, ...],
 ) -> tuple[AdaptiveFlowBinding, ...]:
     """Require explicit exact runtime bindings for every selectable MoveSet."""
 
-    plan = _instance(plan, Phase5ControlPlan, "adaptive binding plan")
+    plan = _instance(plan, AdmissionControlPlan, "adaptive binding plan")
     if not isinstance(bindings, tuple) or any(
         not isinstance(binding, AdaptiveFlowBinding) for binding in bindings
     ):
@@ -666,7 +666,7 @@ class Phase5AdaptiveScheduler:
 
     def __init__(
         self,
-        plan: Phase5ControlPlan | None = None,
+        plan: AdmissionControlPlan | None = None,
         *,
         mode: AdaptiveMode | AdmissionMode | str | None = None,
         alpha_num: int = 1,
@@ -707,7 +707,7 @@ class Phase5AdaptiveScheduler:
         for item in value.values():
             _integer(item, "interference_limit value")
 
-    def prepare(self, plan: Phase5ControlPlan) -> PreparedPhase5Plan:
+    def prepare(self, plan: AdmissionControlPlan) -> PreparedPhase5Plan:
         self.prepared = prepare_phase5_plan(plan)
         self.state.reset()
         self.latency_ewma.clear()

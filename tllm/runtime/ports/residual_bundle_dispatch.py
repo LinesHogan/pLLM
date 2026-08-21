@@ -38,7 +38,7 @@ from tllm.runtime.scheduling.phase5_adaptive import (
     AdaptiveTransferStatus,
     AdmissionContext,
 )
-from tllm.workgraph.phase5 import CandidateActionKind
+from tllm.workgraph.admission import CandidateActionKind
 from tllm.runtime.fusion import FusionExecutor
 from tllm.runtime.timing_debug import (
     TimingDebugMode,

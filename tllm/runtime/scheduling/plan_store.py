@@ -37,7 +37,7 @@ from tllm.workgraph.physical import (
     StreamClass,
 )
 from tllm.workgraph.placement import PlacementPlan
-from tllm.workgraph.phase5 import CandidateActionDesc, Phase5ControlPlan
+from tllm.workgraph.admission import CandidateActionDesc, AdmissionControlPlan
 
 
 _T = TypeVar("_T")
@@ -113,7 +113,7 @@ class PlanResources:
     placement_plan: PlacementPlan | None = None
     placement_dispatcher: PlacementPlanDispatcher | None = None
     placement_implementations: tuple[PlacementImplementationBinding, ...] = ()
-    adaptive_plan: Phase5ControlPlan | None = None
+    adaptive_plan: AdmissionControlPlan | None = None
     adaptive_scheduler: Phase5AdaptiveScheduler | None = None
     adaptive_flow_bindings: tuple[AdaptiveFlowBinding, ...] = ()
     leases: tuple[BufferLease, ...] = ()
@@ -201,8 +201,8 @@ class PlanResources:
                 "PlanResources adaptive plan and scheduler must be published together"
             )
         if adaptive_plan is not None:
-            if not isinstance(cast(object, adaptive_plan), Phase5ControlPlan):
-                raise TypeError("PlanResources.adaptive_plan must be Phase5ControlPlan")
+            if not isinstance(cast(object, adaptive_plan), AdmissionControlPlan):
+                raise TypeError("PlanResources.adaptive_plan must be AdmissionControlPlan")
             if not isinstance(
                 cast(object, adaptive_scheduler), Phase5AdaptiveScheduler
             ):

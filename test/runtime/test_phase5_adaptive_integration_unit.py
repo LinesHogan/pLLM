@@ -36,14 +36,14 @@ from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import placement as placement_contracts
 from tllm.workgraph.ir import ExecutorKey, NodeKey
 from tllm.workgraph.placement import DeviceTopology, PlacementPlan
-from tllm.workgraph.phase5 import (
+from tllm.workgraph.admission import (
     AdmissionMode,
     CandidateActionDesc,
     CandidateActionKey,
     CandidateActionKind,
     CandidateMoveSetDesc,
     MoveSetKey,
-    Phase5ControlPlan,
+    AdmissionControlPlan,
     ShapeBucketDesc,
     ShapeBucketKey,
     WorkItemDesc,
@@ -168,7 +168,7 @@ def _runtime_resources(
         duration=0,
     )
     actions = (fallback, execute, shed) if include_shed else (fallback, execute)
-    plan = Phase5ControlPlan(
+    plan = AdmissionControlPlan(
         plan_epoch=1,
         placement_plan=placement,
         scheduled_moves=(),
@@ -302,7 +302,7 @@ def _transfer_resources(
         fallback_key=fallback_key,
         deadline=route_deadline,
     )
-    plan = Phase5ControlPlan(
+    plan = AdmissionControlPlan(
         plan_epoch=epoch,
         placement_plan=placement,
         scheduled_moves=placement.moves,

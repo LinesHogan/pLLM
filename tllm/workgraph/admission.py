@@ -398,7 +398,7 @@ class CandidateActionKind(StrEnum):
     SHED = "shed"
 
 
-class Phase5CompilationError(RuntimeError):
+class AdmissionCompilationError(RuntimeError):
     """Raised when Phase 5 cannot anchor to a valid Phase 3 placement plan."""
 
 
@@ -543,7 +543,7 @@ class WorkItemDesc:
 
 
 @dataclass(frozen=True, slots=True)
-class Phase5ControlPlan:
+class AdmissionControlPlan:
     """Complete immutable Phase 5 compiler output."""
 
     plan_epoch: int
@@ -563,42 +563,42 @@ class Phase5ControlPlan:
     densification_limit: int = _DEFAULT_DENSIFICATION_LIMIT
 
     def __post_init__(self) -> None:
-        moves = _tuple_of(self.scheduled_moves, ScheduledMove, "Phase5ControlPlan.scheduled_moves")
+        moves = _tuple_of(self.scheduled_moves, ScheduledMove, "AdmissionControlPlan.scheduled_moves")
         move_keys = tuple(item.key for item in moves)
         if len(set(move_keys)) != len(move_keys):
-            raise ValueError("Phase5ControlPlan scheduled move keys must be unique")
-        move_sets = _tuple_of(self.move_sets, CandidateMoveSetDesc, "Phase5ControlPlan.move_sets")
-        workload = _tuple_of(self.workload_buckets, WorkloadBucketDesc, "Phase5ControlPlan.workload_buckets")
-        shapes = _tuple_of(self.shape_buckets, ShapeBucketDesc, "Phase5ControlPlan.shape_buckets")
-        budgets = _tuple_of(self.budgets, InterferenceBudgetDesc, "Phase5ControlPlan.budgets")
-        actions = _tuple_of(self.actions, CandidateActionDesc, "Phase5ControlPlan.actions")
-        profiles = _tuple_of(self.profiles, IntegerEWMAProfile, "Phase5ControlPlan.profiles")
-        epoch = _integer(self.plan_epoch, "Phase5ControlPlan.plan_epoch", minimum=1)
+            raise ValueError("AdmissionControlPlan scheduled move keys must be unique")
+        move_sets = _tuple_of(self.move_sets, CandidateMoveSetDesc, "AdmissionControlPlan.move_sets")
+        workload = _tuple_of(self.workload_buckets, WorkloadBucketDesc, "AdmissionControlPlan.workload_buckets")
+        shapes = _tuple_of(self.shape_buckets, ShapeBucketDesc, "AdmissionControlPlan.shape_buckets")
+        budgets = _tuple_of(self.budgets, InterferenceBudgetDesc, "AdmissionControlPlan.budgets")
+        actions = _tuple_of(self.actions, CandidateActionDesc, "AdmissionControlPlan.actions")
+        profiles = _tuple_of(self.profiles, IntegerEWMAProfile, "AdmissionControlPlan.profiles")
+        epoch = _integer(self.plan_epoch, "AdmissionControlPlan.plan_epoch", minimum=1)
         placement_plan = _instance(
             self.placement_plan,
             PlacementPlan,
-            "Phase5ControlPlan.placement_plan",
+            "AdmissionControlPlan.placement_plan",
         )
         placement_signature = self.placement_signature
         if epoch != placement_plan.plan_epoch:
-            raise ValueError("Phase5ControlPlan epoch differs from its PlacementPlan")
+            raise ValueError("AdmissionControlPlan epoch differs from its PlacementPlan")
         if tuple(moves) != placement_plan.moves:
-            raise ValueError("Phase5ControlPlan moves must come from its PlacementPlan")
+            raise ValueError("AdmissionControlPlan moves must come from its PlacementPlan")
         expected_signature = _placement_signature(placement_plan)
         if placement_signature and placement_signature != expected_signature:
-            raise ValueError("Phase5ControlPlan placement signature differs from its PlacementPlan")
+            raise ValueError("AdmissionControlPlan placement signature differs from its PlacementPlan")
         placement_signature = expected_signature
         densification_limit = _integer(
             self.densification_limit,
-            "Phase5ControlPlan.densification_limit",
+            "AdmissionControlPlan.densification_limit",
             minimum=1,
         )
         if self.schema_version != 1:
-            raise ValueError("Phase5ControlPlan.schema_version must be 1")
+            raise ValueError("AdmissionControlPlan.schema_version must be 1")
         if len({item.key for item in move_sets}) != len(move_sets):
-            raise ValueError("Phase5ControlPlan move-set keys must be unique")
+            raise ValueError("AdmissionControlPlan move-set keys must be unique")
         if len(move_sets) > densification_limit or len(actions) > densification_limit:
-            raise ValueError("Phase5ControlPlan exceeds its densification limit")
+            raise ValueError("AdmissionControlPlan exceeds its densification limit")
         move_by_key = {item.key: item for item in moves}
         for move_set in move_sets:
             for item in move_set.moves:
@@ -621,7 +621,7 @@ class Phase5ControlPlan:
             or len(budget_keys) != len(budgets)
             or len(profile_keys) != len(profiles)
         ):
-            raise ValueError("Phase5ControlPlan descriptor keys must be unique")
+            raise ValueError("AdmissionControlPlan descriptor keys must be unique")
         if any(budget.profile is not None and budget.profile not in profile_keys for budget in budgets):
             raise ValueError("interference budget references an unknown EWMA profile")
         shape_by_key = {item.key: item for item in shapes}
@@ -630,15 +630,15 @@ class Phase5ControlPlan:
                 raise ValueError("workload bucket references an unknown shape bucket")
         action_keys = {item.key for item in actions}
         if len(action_keys) != len(actions):
-            raise ValueError("Phase5ControlPlan action keys must be unique")
-        fallback = _instance(self.unknown_bucket_fallback, CandidateActionKey, "Phase5ControlPlan.unknown_bucket_fallback")
+            raise ValueError("AdmissionControlPlan action keys must be unique")
+        fallback = _instance(self.unknown_bucket_fallback, CandidateActionKey, "AdmissionControlPlan.unknown_bucket_fallback")
         if fallback not in action_keys:
             raise ValueError("unknown_bucket_fallback is not an approved action")
         fallback_action = next(item for item in actions if item.key == fallback)
         if fallback_action.kind != CandidateActionKind.AUTHORITATIVE_FALLBACK or not fallback_action.unknown_bucket:
             raise ValueError("unknown_bucket_fallback must be an unknown-bucket authoritative fallback")
-        capacity = _integer(self.buffer_capacity, "Phase5ControlPlan.buffer_capacity")
-        object.__setattr__(self, "mode", _enum(cast(object, self.mode), AdmissionMode, "Phase5ControlPlan.mode"))
+        capacity = _integer(self.buffer_capacity, "AdmissionControlPlan.buffer_capacity")
+        object.__setattr__(self, "mode", _enum(cast(object, self.mode), AdmissionMode, "AdmissionControlPlan.mode"))
         for action in actions:
             if action.workload_bucket is not None and action.workload_bucket not in workload_keys:
                 raise ValueError("action references an unknown workload bucket")
@@ -734,12 +734,12 @@ def validate_candidate_move_sets(
     return tuple(sorted(candidates, key=lambda item: item.key))
 
 
-def _shape_bucket(plan: Phase5ControlPlan, shape: tuple[int, ...]) -> ShapeBucketKey | None:
+def _shape_bucket(plan: AdmissionControlPlan, shape: tuple[int, ...]) -> ShapeBucketKey | None:
     matching = [bucket.key for bucket in plan.shape_buckets if bucket.matches(shape)]
     return min(matching) if matching else None
 
 
-def _must_complete(plan: Phase5ControlPlan, item: WorkItemDesc) -> bool:
+def _must_complete(plan: AdmissionControlPlan, item: WorkItemDesc) -> bool:
     workload_required = any(
         bucket.key == item.workload_bucket and bucket.required_by_default
         for bucket in plan.workload_buckets
@@ -769,10 +769,10 @@ def _must_complete(plan: Phase5ControlPlan, item: WorkItemDesc) -> bool:
     )
 
 
-def approved_actions(plan: Phase5ControlPlan, item: WorkItemDesc) -> tuple[CandidateActionDesc, ...]:
+def approved_actions(plan: AdmissionControlPlan, item: WorkItemDesc) -> tuple[CandidateActionDesc, ...]:
     """Resolve a request to compiler-approved actions, failing closed on misses."""
 
-    plan = _instance(plan, Phase5ControlPlan, "approved_actions.plan")
+    plan = _instance(plan, AdmissionControlPlan, "approved_actions.plan")
     item = _instance(item, WorkItemDesc, "approved_actions.item")
     shape_key = _shape_bucket(plan, item.shape)
     known_workload = item.workload_bucket in {bucket.key for bucket in plan.workload_buckets}
@@ -822,7 +822,7 @@ def approved_actions(plan: Phase5ControlPlan, item: WorkItemDesc) -> tuple[Candi
     return tuple(sorted(approved, key=lambda action: (-action.priority, action.key)))
 
 
-def _can_shed(plan: Phase5ControlPlan, item: WorkItemDesc) -> bool:
+def _can_shed(plan: AdmissionControlPlan, item: WorkItemDesc) -> bool:
     if _must_complete(plan, item):
         return False
     return any(
@@ -839,7 +839,7 @@ class _EvaluatedSelection:
 
 
 def _evaluate_selection(
-    plan: Phase5ControlPlan,
+    plan: AdmissionControlPlan,
     selection: tuple[tuple[WorkItemDesc, CandidateActionDesc], ...],
     *,
     items: tuple[WorkItemDesc, ...],
@@ -905,12 +905,12 @@ def _result(evaluated: _EvaluatedSelection) -> AdmissionResult:
 
 
 def greedy_admission(
-    plan: Phase5ControlPlan,
+    plan: AdmissionControlPlan,
     items: Sequence[WorkItemDesc],
 ) -> AdmissionResult:
     """Deterministically admit approved actions in required-first order."""
 
-    plan = _instance(plan, Phase5ControlPlan, "greedy_admission.plan")
+    plan = _instance(plan, AdmissionControlPlan, "greedy_admission.plan")
     typed = _tuple_of(tuple(items), WorkItemDesc, "greedy_admission.items")
     if len({item.key for item in typed}) != len(typed):
         raise ValueError("admission work item keys must be unique")
@@ -952,14 +952,14 @@ def greedy_admission(
 
 
 def exhaustive_admission_oracle(
-    plan: Phase5ControlPlan,
+    plan: AdmissionControlPlan,
     items: Sequence[WorkItemDesc],
     *,
     max_items: int = 10,
 ) -> AdmissionResult:
     """Exhaustive small-graph oracle using the greedy feasibility/objective."""
 
-    plan = _instance(plan, Phase5ControlPlan, "exhaustive_admission_oracle.plan")
+    plan = _instance(plan, AdmissionControlPlan, "exhaustive_admission_oracle.plan")
     typed = _tuple_of(tuple(items), WorkItemDesc, "exhaustive_admission_oracle.items")
     max_items = _integer(max_items, "exhaustive_admission_oracle.max_items", minimum=1)
     if len(typed) > max_items:
@@ -987,19 +987,19 @@ def exhaustive_admission_oracle(
     return _result(best)
 
 
-def static_admission(plan: Phase5ControlPlan, items: Sequence[WorkItemDesc]) -> AdmissionResult:
+def static_admission(plan: AdmissionControlPlan, items: Sequence[WorkItemDesc]) -> AdmissionResult:
     """Use the deterministic compiler-approved order, with no profile adaptation."""
 
-    plan = _instance(plan, Phase5ControlPlan, "static_admission.plan")
+    plan = _instance(plan, AdmissionControlPlan, "static_admission.plan")
     return greedy_admission(plan, items)
 
 
-def admit_greedy(plan: Phase5ControlPlan, items: Sequence[WorkItemDesc]) -> AdmissionResult:
+def admit_greedy(plan: AdmissionControlPlan, items: Sequence[WorkItemDesc]) -> AdmissionResult:
     return greedy_admission(plan, items)
 
 
 def admit_exhaustive_oracle(
-    plan: Phase5ControlPlan,
+    plan: AdmissionControlPlan,
     items: Sequence[WorkItemDesc],
     *,
     max_items: int = 10,
@@ -1007,7 +1007,7 @@ def admit_exhaustive_oracle(
     return exhaustive_admission_oracle(plan, items, max_items=max_items)
 
 
-def compile_phase5_plan(
+def compile_admission_plan(
     *,
     placement_plan: PlacementPlan,
     move_sets: tuple[CandidateMoveSetDesc, ...],
@@ -1020,21 +1020,21 @@ def compile_phase5_plan(
     buffer_capacity: int = 0,
     mode: AdmissionMode = AdmissionMode.STATIC,
     densification_limit: int = _DEFAULT_DENSIFICATION_LIMIT,
-) -> Phase5ControlPlan:
+) -> AdmissionControlPlan:
     """Compile and validate the pure Phase 5 control-plane plan."""
 
-    placement_plan = _instance(placement_plan, PlacementPlan, "compile_phase5_plan.placement_plan")
+    placement_plan = _instance(placement_plan, PlacementPlan, "compile_admission_plan.placement_plan")
     try:
         from tllm import core as _core
 
         _core.validate_placement_plan(placement_plan)
     except (ImportError, TypeError, ValueError, RuntimeError) as exc:
-        raise Phase5CompilationError(
+        raise AdmissionCompilationError(
             "Rust placement-plan descriptor validation failed"
         ) from exc
     scheduled_moves = placement_plan.moves
     validate_candidate_move_sets(scheduled_moves, move_sets)
-    result = Phase5ControlPlan(
+    result = AdmissionControlPlan(
         plan_epoch=placement_plan.plan_epoch,
         placement_plan=placement_plan,
         scheduled_moves=scheduled_moves,
@@ -1053,7 +1053,7 @@ def compile_phase5_plan(
     try:
         _core.validate_adaptive_flow_plan(result)
     except (TypeError, ValueError, RuntimeError) as exc:
-        raise Phase5CompilationError(
+        raise AdmissionCompilationError(
             "Rust adaptive-plan descriptor validation failed"
         ) from exc
     return result
@@ -1073,8 +1073,8 @@ __all__ = [
     "InterferenceBudgetDesc",
     "InterferenceBudgetKey",
     "MoveSetKey",
-    "Phase5CompilationError",
-    "Phase5ControlPlan",
+    "AdmissionCompilationError",
+    "AdmissionControlPlan",
     "ShapeBucketDesc",
     "ShapeBucketKey",
     "WorkItemDesc",
@@ -1084,7 +1084,7 @@ __all__ = [
     "admit_exhaustive_oracle",
     "admit_greedy",
     "approved_actions",
-    "compile_phase5_plan",
+    "compile_admission_plan",
     "exhaustive_admission_oracle",
     "greedy_admission",
     "static_admission",
