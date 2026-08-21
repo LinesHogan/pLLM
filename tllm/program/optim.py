@@ -149,12 +149,52 @@ def functional_step(
     return adam_step(params, grads, state, scalars, step=step)
 
 
+def adam_step_inplace_(
+    params: Mapping[str, torch.Tensor],
+    grads: Mapping[str, torch.Tensor],
+    state: OptState,
+    scalars: AdamScalars,
+    *,
+    step: torch.Tensor,
+    beta1: torch.Tensor,
+    beta2: torch.Tensor,
+) -> None:
+    """In-place tensorized Adam/AdamW step for CUDA-graph-captured updates.
+
+    Same update math as :func:`adam_step` but with the step-dependent scalars
+    computed on device from 0-dim tensors, so the whole step is capturable and
+    replayable without host involvement. ``step``/``beta1``/``beta2`` are
+    float32 device scalars; ``step`` holds the 1-based step count. Operates in
+    place on the persistent slot buffers (params and exp_avg/exp_avg_sq).
+    """
+    beta1_f, beta2_f = scalars.betas
+    one = beta1.new_ones(())
+    bias_correction1 = one - torch.pow(beta1, step)
+    bias_correction2_sqrt = torch.sqrt(one - torch.pow(beta2, step))
+    step_size = scalars.lr / bias_correction1
+    decay = scalars.lr * scalars.weight_decay
+    for name, param in params.items():
+        grad = grads[name]
+        if scalars.weight_decay != 0.0 and not scalars.decoupled:
+            grad = grad.add(param, alpha=scalars.weight_decay)
+        buffers = state[name]
+        exp_avg = buffers["exp_avg"]
+        exp_avg_sq = buffers["exp_avg_sq"]
+        exp_avg.mul_(beta1_f).add_(grad, alpha=1.0 - beta1_f)
+        exp_avg_sq.mul_(beta2_f).addcmul_(grad, grad, value=1.0 - beta2_f)
+        denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(scalars.eps)
+        if scalars.weight_decay != 0.0 and scalars.decoupled:
+            param.mul_(1.0 - decay)
+        param.sub_(exp_avg.div(denom).mul_(step_size))
+
+
 __all__ = [
     "AdamScalars",
     "OptState",
     "SGDScalars",
     "TensorMap",
     "adam_step",
+    "adam_step_inplace_",
     "functional_step",
     "sgd_step",
     "validate_optimizer",
