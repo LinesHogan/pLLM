@@ -12,15 +12,24 @@ from tllm.program.decl import (
     StateSpec,
     declare_program,
 )
+from tllm.program.runtime import ProgramConsumer, ProgramSink, compile_program
+from tllm.program.stages import FlowStagePlan, ProgramStage, StageValueDesc, slice_flow_stages
 
 __all__ = [
     "EdgeKind",
+    "FlowStagePlan",
+    "ProgramConsumer",
     "ProgramDecl",
     "ProgramDiagnostic",
     "ProgramEdge",
     "ProgramNode",
+    "ProgramSink",
+    "ProgramStage",
     "ProgramState",
     "ProgramValue",
+    "StageValueDesc",
     "StateSpec",
+    "compile_program",
     "declare_program",
+    "slice_flow_stages",
 ]

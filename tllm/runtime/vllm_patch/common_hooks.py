@@ -196,5 +196,5 @@ def dispatch_port_bundle(
 
     ctx = build_runtime_context(runner=runner, event_name=f"flow:{window}")
     for target in targets:
-        target.consumer.consume_bundle(bundle, ctx)
+        target.consumer.consume_flow(target.flow_ordinal, bundle, ctx)
     return len(targets)

@@ -23,6 +23,7 @@ Failure is fail-closed: any export/declaration mismatch raises
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import FunctionType, MethodType
 from typing import cast
@@ -151,6 +152,7 @@ class StagedFlowExecutor:
         self._aliases = aliases
         self._constants = exported_program.constants
         self._instance = instance
+        self._state_override: Mapping[str, torch.Tensor] | None = None
         signature = exported_program.graph_signature
         # Placeholder node name -> ("input", position) | ("state", target).
         self._placeholder_sources: dict[str, tuple[str, object]] = {}
@@ -169,6 +171,8 @@ class StagedFlowExecutor:
 
     def _resolve_state(self, target: object) -> torch.Tensor:
         name = str(target)
+        if self._state_override is not None and name in self._state_override:
+            return self._state_override[name]
         prefix = "_program_instance."
         if name.startswith(prefix):
             value: object = self._instance
@@ -181,13 +185,34 @@ class StagedFlowExecutor:
             return constant
         raise WorkGraphError("PG130", f"cannot resolve lifted state target {name!r}")
 
-    def run(self, *user_inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+    @property
+    def state_targets(self) -> tuple[str, ...]:
+        """Lifted parameter/buffer target names (for bank wiring)."""
+        return tuple(
+            str(source)
+            for kind, source in self._placeholder_sources.values()
+            if kind == "state"
+        )
+
+    def run(
+        self,
+        *user_inputs: torch.Tensor,
+        state_override: Mapping[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Execute all stages eagerly; returns declared outputs by name.
 
         Each stage loads only the placeholders arriving at its hook level and
         evaluates its owned operators plus its recomputed pure chain, so the
         execution genuinely re-runs recomputed operators.
         """
+        plan = self._plan
+        self._state_override = state_override
+        try:
+            return self._run_stages(user_inputs)
+        finally:
+            self._state_override = None
+
+    def _run_stages(self, user_inputs: tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor]:
         plan = self._plan
         input_count = sum(
             1 for source in self._placeholder_sources.values() if source[0] == "input"

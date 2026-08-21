@@ -514,7 +514,7 @@ def _consume_flow_target(
         stats=runtime.placement_stats,
     ):
         return
-    target.consumer.consume_bundle(bundle, ctx)
+    target.consumer.consume_flow(target.flow_ordinal, bundle, ctx)
     if str(target.flow.window) != "background":
         call_consumer_step_end(target.consumer, ctx)
 
@@ -929,7 +929,7 @@ def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLi
             for bundle in bundles:
                 if target.placement_hook == "execute_model.post":
                     core.RUNTIME.placement_stats.pinned_dispatch_count += 1
-                    target.consumer.consume_bundle(bundle, ctx)
+                    target.consumer.consume_flow(target.flow_ordinal, bundle, ctx)
                 else:
                     core.RUNTIME.placement_stats.moved_dispatch_count += 1
                     _enqueue_flow_target(
@@ -949,7 +949,7 @@ def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLi
         for bundle in assembler.finalize_pending():
             if target.placement_hook == "execute_model.post":
                 core.RUNTIME.placement_stats.pinned_dispatch_count += 1
-                target.consumer.consume_bundle(bundle, ctx)
+                target.consumer.consume_flow(target.flow_ordinal, bundle, ctx)
             else:
                 core.RUNTIME.placement_stats.moved_dispatch_count += 1
                 _enqueue_flow_target(

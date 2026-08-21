@@ -163,7 +163,7 @@ def dispatch_post_generate_port_bundles(*, runtime: PostGenerateRuntimeLike, run
     dispatched = 0
     for target in targets:
         bundle = build_post_generate_port_bundle(runtime=runtime, flow=target.flow)
-        target.consumer.consume_bundle(bundle, ctx)
+        target.consumer.consume_flow(target.flow_ordinal, bundle, ctx)
         dispatched += 1
         if str(target.flow.window) != "background":
             call_consumer_step_end(target.consumer, ctx)

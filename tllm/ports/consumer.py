@@ -55,6 +55,16 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         """Public flow-based consumption surface."""
         _ = (bundle, ctx)
 
+    def consume_flow(self, flow_ordinal: int, bundle: PortBundle, ctx: RuntimeContext) -> None:
+        """Per-flow entry point; defaults to the legacy whole-bundle surface.
+
+        Program-generated consumers override this and dispatch on
+        ``flow_ordinal`` (carried by ``FlowDispatchTarget``); legacy consumers
+        keep working unchanged.
+        """
+        _ = flow_ordinal
+        self.consume_bundle(bundle, ctx)
+
     def on_step_end(self, ctx: RuntimeContext) -> None:
         """Optional hook called after the model step is complete."""
         _ = ctx
