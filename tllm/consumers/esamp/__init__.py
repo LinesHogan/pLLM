@@ -7,6 +7,7 @@ from typing import Any
 
 __all__ = [
     "ESampConsumer",
+    "activate",
     "ESampConsumerConfig",
     "ESampProgram",
     "ESampProgramConsumer",
@@ -15,6 +16,7 @@ __all__ = [
 
 _MODULE_BY_NAME = {
     "ESampConsumer": "tllm.consumers.esamp.consumer",
+    "activate": "tllm.consumers.esamp.register",
     "ESampConsumerConfig": "tllm.consumers.esamp.config",
     "ESampProgram": "tllm.consumers.esamp.program",
     "ESampProgramConsumer": "tllm.consumers.esamp.program_consumer",

@@ -1,28 +1,103 @@
+<div align="center">
+
 # tLLM
 
-tLLM is a runtime layer for building producer/consumer extensions on top of the vLLM v1 inference engine.
+**A test-time intervention layer for vLLM — declare what your algorithm computes, and the compiler makes it fast.**
 
-It lets you capture model-internal data such as hidden states, route that data through public ports, and run custom consumers during generation without maintaining a fork of vLLM.
+[Quick Start](#quick-start) · [Documentation](#documentation) · [Performance](#performance) · [中文文档](doc_zh/README.md)
 
-## Why tLLM
+</div>
 
-Most research ideas around runtime adaptation start out in a friendly stack, then become painful when moved into a high-throughput inference engine. tLLM is designed for the migration step: keep vLLM's serving performance, but add a stable producer/consumer surface for hidden-state capture, async side work, and sampler guidance.
+tLLM is a runtime layer on top of the vLLM v1 inference engine for building producer/consumer extensions: capture model-internal data such as hidden states, route it through stable public ports, and run custom consumers during generation — without maintaining a fork of vLLM.
 
-| Task | Direct vLLM modification | With tLLM |
-|------|--------------------------|-----------|
-| Read hidden states during decode | Patch runner internals and keep up with vLLM changes | Declare a `ConsumerFlow` over public ports |
-| Add async CPU/GPU side work | Own stream/event timing by hand | Use consumer `synchronize()` and runtime-managed bundles |
-| Add sampler guidance | Patch logits/sampler code directly | Implement a sampler provider behind tLLM's bridge |
-| Keep throughput measurable | Easy to accidentally benchmark a broken no-op | Standard ratio checks plus functional counters |
-| Make you algorithm fast | Hard to understand how vLLM works and introduce latency | Clear ports / contracts and show be easy to write a fast pipeline |
+Its core is a **program compiler**: you declare your algorithm as a small dataflow graph (`@flow` nodes and `@extern` training steps over named state), and tLLM derives the execution strategy from those declarations — stream placement, gradient mode, batching, and whole-step CUDA graph capture all fall out of the dependency edges, not from hand-written orchestration code.
 
-### From vLLM Generation to tLLM Algorithms
+## Latest News
 
-If you already have a vLLM generation script, tLLM lets you keep the same prompts and `SamplingParams` while adding a consumer-provided algorithm before `generate`.
+- **[2026-08-21]** The ESamp algorithm is re-implemented as a tLLM Program in ~80 lines. The compiled path runs the full train step in ~3–5 kernel launches per step via whole-step CUDA graph capture, faster than the hand-tuned legacy pipeline in host probes.
+- **[2026-08-18]** tLLM reorganized into a strict layered architecture (`core ← contracts ← ports ← workgraph ← runtime ← backends`), enforced by an AST-level import gate; all phase-numbered module names replaced with functional names.
 
-For example, ESamp is the algorithm proposed in *Large Language Models Explore by Latent Distilling*: it captures shallow and deep hidden states, trains a distiller during generation, and can use that distiller to modify candidate-token logits after top-k/top-p/min-p filtering.
+## Quick Start
 
-The migration is only a few lines:
+ESamp — an algorithm that trains a low-rank distiller *during* generation to predict final-layer hidden states from first-layer ones, then uses the predictions to guide sampling — is the reference consumer. Expressed as a tLLM Program, this is the **entire algorithm**:
+
+```python
+import torch
+import torch.nn.functional as F
+
+from tllm.ports.base import TimingDeadline
+from tllm.workgraph.frontend import extern, flow, hidden, local, result, sink
+
+
+class ESampProgram(torch.nn.Module):
+    """Predict the final-layer hidden state from the first-layer one."""
+
+    def __init__(self, *, hidden_size: int, rank: int, lr: float,
+                 device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.model = LowRankGatedResidualModel(
+            hidden_size=hidden_size, rank=rank,
+            use_output_layernorm=True, device=device, dtype=dtype,
+        )
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=lr, foreach=False
+        )
+
+    @flow(
+        inputs={
+            "source": hidden(layer=0, site="block_output", phase="decode"),
+            "target": hidden(layer=-1, site="block_output", phase="decode"),
+        },
+        outputs={"prediction": sink("guidance"), "loss": local()},
+        state="distiller",
+    )
+    def forward(self, source, target):
+        prediction = self.model(source)
+        return prediction, F.mse_loss(prediction.float(), target.float())
+
+    @flow(
+        inputs={"source": hidden(layer=0, site="block_output", phase="decode")},
+        outputs={"prediction": local()},
+        state="distiller",
+    )
+    def predict(self, source):
+        # Invoked on demand by the sampler bridge against the current
+        # bank state.
+        return self.model(source)
+
+    @extern(
+        inputs={"loss": result("forward", "loss")},
+        after=("forward",),
+        state="distiller",
+        deadline=TimingDeadline.NEXT_PREPARE,
+    )
+    def backward(self, loss):
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+```
+
+There is no stream, buffer, event, lease, or graph-capture code here. From these declarations the compiler derives:
+
+- **Gradient mode from dataflow.** The `result("forward", "loss")` edge asks for a value *with* its autograd graph, so when the training extern is due, `forward` runs once in grad mode; the outputs serve the sink and the loss serves `autograd.grad` — no double forward.
+- **Lane placement from node roles.** State-writing externs run on a dedicated training lane; read-only `run_flow` calls (sampler predictions) run on a low-priority reader lane fenced by events; the decode stream only ever waits on the single output event it consumes.
+- **Whole-step CUDA graph capture.** When a step is a fixed DAG over persistent state buffers, the runtime captures it once per batch shape and replays it thereafter — one input copy plus one `graph.replay()` per step.
+- **Functional optimizer transitions.** The declared AdamW step is lowered to a pure-tensor functional update, verified at compile time against the Python body (error code `PG145` on divergence), so updates can be versioned, fenced, and captured.
+
+Run it against vLLM:
+
+```python
+from tllm import make_llm
+from tllm.consumers.esamp import ESampConsumerConfig, activate
+
+activate(ESampConsumerConfig(implementation="program"))
+llm = make_llm(model_name="Qwen/Qwen2.5-7B-Instruct", dtype="bfloat16")
+outputs = llm.generate(prompts, sampling_params)
+```
+
+## From vLLM Generation to tLLM Algorithms
+
+If you already have a vLLM generation script, tLLM keeps the same prompts and `SamplingParams` and adds your algorithm before `generate`:
 
 ```diff
 - from vllm import LLM, SamplingParams
@@ -33,57 +108,65 @@ The migration is only a few lines:
 + register_consumer(ESampConsumer(ESampConsumerConfig()))
 + llm = make_llm(model_name="Qwen/Qwen2.5-7B-Instruct", dtype="bfloat16")
   outputs = llm.generate(
-      [f"Suprise me an unexpectedly story about {i} evil sorcerers and the brave hero." for i in range(2, 16)],
+      [f"Surprise me with an unexpected story about {i} evil sorcerers." for i in range(2, 16)],
       SamplingParams(max_tokens=64, temperature=0.8, n=8),
   )
 ```
 
-`make_llm` installs tLLM's vLLM v1 runtime hooks; `register_consumer(...)` attaches the consumer that actually uses those hooks. ESamp workflow helpers still exist for benchmarks and one-line demos.
+`make_llm` installs tLLM's vLLM v1 runtime hooks; `register_consumer` (or `activate`, which builds from config) attaches the consumer that uses them.
 
-In the aligned 7B min-p ESamp benchmark, with RTX 4090 GPU, the optimized ESamp has measured about **98.8% of a vLLM baseline with modern inference optimizations enabled**. That baseline uses the vLLM V1 engine with CUDA Graph execution, FlashInfer sampling, bfloat16 weights, prefix-cache control for fair measurement, and the same sampling workload.
+## Why tLLM
 
-Representative run:
+| Task | Direct vLLM modification | With tLLM |
+|------|--------------------------|-----------|
+| Read hidden states during decode | Patch runner internals, chase vLLM releases | Declare a `@flow` over public ports |
+| Train a model during generation | Hand-own streams, events, buffers, CUDA graphs | Declare an `@extern`; the compiler derives lanes and capture |
+| Add sampler guidance | Patch logits/sampler code directly | Implement a sampler provider behind tLLM's bridge |
+| Keep throughput measurable | Easy to accidentally benchmark a broken no-op | Standard ratio checks plus functional counters |
+| Stay fast | Deep vLLM internals knowledge required | Declared DAG → compiler-derived optimization |
 
-| Model/workload | Optimized vLLM baseline | ESamp (triton kernel) | Ratio |
-|----------------|-----------------------------------------|------------------|-------|
-| Qwen2.5-7B, batch=8, n=16, min-p active path | 5370.616 tok/s | 5304.855 tok/s | 0.9878 |
+## Performance
 
+**Legacy hand-tuned pipeline** (measured, RTX 4090): in the aligned 7B min-p ESamp benchmark, optimized ESamp reaches **98.8% of a vLLM baseline** with modern inference optimizations enabled (vLLM V1 engine, CUDA graph execution, FlashInfer sampling, bfloat16, prefix-cache control for fairness, identical sampling workload):
+
+| Model / workload | Optimized vLLM baseline | ESamp (legacy, Triton kernel) | Ratio |
+|------------------|-------------------------|-------------------------------|-------|
+| Qwen2.5-7B, batch=8, n=16, min-p active path | 5370.6 tok/s | 5304.9 tok/s | 0.9878 |
+
+**Program path** (measured, RTX 4090, synthetic probe: 128 rows × hidden 896, bf16, 50 decode steps): the compiled consumer's train step costs **0.082 ms/step host time vs 0.51 ms/step** for the legacy eager pipeline, and 0.35 ms/step vs 0.55 ms/step wall time — the whole step replays as one captured CUDA graph instead of ~70–90 kernel launches.
+
+The full paired in-engine benchmark (5 alternating rounds, gate: program/legacy ≥ 0.98 output tok/s) is scripted and pending GPU availability; results land in `docs/p5_paired_benchmark_report.json`.
 
 ## What You Can Build
 
-- Activation or hidden-state export/editing pipelines.
-- LLM Runtime analysis.
-- Test time training algorithms that learn during generation.
+- Activation / hidden-state export and editing pipelines.
+- Runtime analysis of LLM internals.
+- Test-time training algorithms that learn during generation.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
 
-## Quick Start
+## Installation
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-minimal.txt
-pip install -e .
+pip install -e ".[vllm027]"
 
 python starter.py --max-new-tokens 32
 ```
 
-The starter runs ESamp with `Qwen/Qwen2.5-7B-Instruct`, generates 16 answers in parallel, and prints runtime adaptation statistics.
-It defaults to `--seed-mode shared`, which avoids vLLM's per-request generator path and keeps FlashInfer sampler acceleration available when supported. Use `--seed-mode per-request` if independent `seed + i` request streams matter more than that sampler backend.
+The starter runs ESamp with `Qwen/Qwen2.5-7B-Instruct`, generates 16 answers in parallel, and prints runtime adaptation statistics. It defaults to `--seed-mode shared`, which keeps the FlashInfer sampler backend available; use `--seed-mode per-request` if independent `seed + i` request streams matter more.
 
 ## Documentation
 
-- English docs: [doc/README.md](doc/README.md)
-- Chinese docs: [doc_zh/README.md](doc_zh/README.md)
-- Write a consumer: [doc/getting-started/write-your-first-consumer.md](doc/getting-started/write-your-first-consumer.md)
-- ESamp usage: [doc/reference/esamp-usage.md](doc/reference/esamp-usage.md)
+- English: [doc/README.md](doc/README.md) — [quickstart](doc/quickstart.md) · [write a consumer](doc/write-a-consumer.md) · [architecture](doc/architecture.md) · [ESamp reference](doc/esamp.md)
+- 中文: [doc_zh/README.md](doc_zh/README.md)
 
 ## Requirements
 
-- Python >= 3.10
-- vLLM v1 engine
+- Python ≥ 3.11
+- vLLM v1 engine (validated on `vllm==0.27.1`)
 - PyTorch with CUDA
-
-The current development environment is validated primarily with `vllm==0.10.x`.
 
 ## FAQ
 
@@ -91,6 +174,10 @@ The current development environment is validated primarily with `vllm==0.10.x`.
 
 tLLM is a test-time intervention layer for vLLM. The name is a recursive-style abbreviation: **tLLM is a test-time intervention layer for vLLM**.
 
-> I have a test time training algorithm. How can I implement it with tLLM?
+> I have a test-time training algorithm. How do I implement it with tLLM?
 
-You can contact us, and we will offer advice and technical support to help you achieve efficient implementation under the tLLM framework, enabling your algorithm to reach production-level throughput!
+Write it as a `torch.nn.Module` with `@flow` and `@extern` declarations — see [write a consumer](doc/write-a-consumer.md). If your algorithm needs something the program language rejects, the compiler fails loudly with a stable error code (`PG###`) instead of silently falling back, so you always know what is and isn't supported.
+
+## License
+
+Apache-2.0.
