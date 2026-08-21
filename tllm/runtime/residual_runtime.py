@@ -60,7 +60,7 @@ if TYPE_CHECKING:
         PlacementRuntimeBinding,
         TensorLike,
     )
-    from tllm.runtime.scheduling.phase4_collective import (
+    from tllm.runtime.scheduling.collective import (
         CollectiveHandle,
         DistributedRuntimeBinding,
     )
@@ -478,7 +478,7 @@ def configure_workgraph_distributed(
 ) -> None:
     """Install typed Phase 4 topology and rank-local runtime bindings."""
 
-    from tllm.runtime.scheduling.phase4_collective import DistributedRuntimeBinding
+    from tllm.runtime.scheduling.collective import DistributedRuntimeBinding
 
     if binding is not None and not isinstance(binding, DistributedRuntimeBinding):
         raise TypeError(
@@ -497,7 +497,7 @@ def configure_workgraph_distributed(
 def publish_workgraph_distributed(*, plan_epoch: int) -> None:
     """Compile and stage one distributed plan on the explicit cold path."""
 
-    from tllm.runtime.scheduling.phase4_collective import (
+    from tllm.runtime.scheduling.collective import (
         DistributedPlanResources,
         DistributedPlanSnapshotStore,
     )

@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
     from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
-    from tllm.runtime.scheduling.phase4_collective import (
+    from tllm.runtime.scheduling.collective import (
         DistributedPlanSnapshotStore,
         DistributedRuntimeBinding,
     )

@@ -31,11 +31,11 @@ from tllm.workgraph.distributed import (
 
 def _runtime(test_case: unittest.TestCase):
     try:
-        return importlib.import_module("tllm.runtime.scheduling.phase4_collective")
+        return importlib.import_module("tllm.runtime.scheduling.collective")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
             "Phase 4 collective runtime is required: "
-            "tllm.runtime.scheduling.phase4_collective"
+            "tllm.runtime.scheduling.collective"
         )
         raise AssertionError from exc
 
@@ -123,7 +123,7 @@ def _request(
     depends_on: tuple[CollectiveKey, ...] = (),
 ) -> CollectiveRequestDesc:
     return CollectiveRequestDesc(
-        key=CollectiveKey("phase4.runtime", name, ordinal),
+        key=CollectiveKey("collective.runtime", name, ordinal),
         kind=CollectiveKind.ALL_REDUCE,
         group=group,
         backend=CollectiveBackend.GLOO,
@@ -180,7 +180,7 @@ def _executor(
     ), adapter
 
 
-class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
+class CollectiveRuntimeUnitTest(unittest.TestCase):
     def test_runtime_handles_keep_communicators_payloads_and_fences_python_owned(self) -> None:
         runtime = _runtime(self)
         adapter = _FakeCollectiveAdapter(fence=_FakeFence(complete=False))
@@ -340,7 +340,7 @@ class Phase4CollectiveRuntimeUnitTest(unittest.TestCase):
         self.assertEqual(helper_schedule.rank, 8)
         self.assertEqual(
             helper_schedule.collectives,
-            (CollectiveKey("phase4.runtime", "helper", 0),),
+            (CollectiveKey("collective.runtime", "helper", 0),),
         )
 
         # Every rank can execute only its projection, while the projection is

@@ -1,4 +1,4 @@
-"""Python-owned collective execution for frozen Phase 4 plans."""
+"""Python-owned collective execution for frozen distributed plans."""
 
 from __future__ import annotations
 

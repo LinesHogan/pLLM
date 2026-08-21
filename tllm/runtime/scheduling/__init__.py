@@ -26,7 +26,7 @@ from tllm.runtime.scheduling.transfer import (
     PlacementRuntimeBinding,
     TorchTensorCopyAdapter,
 )
-from tllm.runtime.scheduling.phase4_collective import (
+from tllm.runtime.scheduling.collective import (
     CollectiveAdapter,
     CollectiveFenceLike,
     CollectiveHandle,

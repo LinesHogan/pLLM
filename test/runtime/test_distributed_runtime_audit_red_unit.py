@@ -15,7 +15,7 @@ from unittest import mock
 
 from tllm.backends.vllm import v027_mrv1, v027_mrv2
 from tllm.runtime import active_targets, residual_runtime
-from tllm.runtime.scheduling import phase4_collective as phase4_runtime
+from tllm.runtime.scheduling import collective as collective_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks
 from tllm.runtime.vllm_patch import port_runtime_hooks
@@ -152,7 +152,7 @@ def _binding(
     }
     if agreement is not None:
         try:
-            binding = phase4_runtime.DistributedRuntimeBinding(
+            binding = collective_runtime.DistributedRuntimeBinding(
                 **kwargs,
                 agreement=agreement,
             )
@@ -163,7 +163,7 @@ def _binding(
             )
         else:
             return binding
-    return phase4_runtime.DistributedRuntimeBinding(**kwargs)
+    return collective_runtime.DistributedRuntimeBinding(**kwargs)
 
 
 class Phase4CollectiveLifecycleAuditRedTest(unittest.TestCase):
@@ -174,20 +174,20 @@ class Phase4CollectiveLifecycleAuditRedTest(unittest.TestCase):
             window=CollectiveWindow.AFTER_COMPUTE,
             depends_on=(first.key,),
         )
-        plan = phase4_runtime.compile_distributed_flow_plan(
+        plan = collective_runtime.compile_distributed_flow_plan(
             plan_epoch=1,
             topology=_topology(),
             collective_requests=(first, second),
         )
         adapter = _FakeCollectiveAdapter()
-        executor = phase4_runtime.DistributedPlanExecutor(
+        executor = collective_runtime.DistributedPlanExecutor(
             plan=plan,
             rank=0,
             communicators=((CommunicatorKey(ParallelGroupKind.GLOBAL, 0), SimpleNamespace()),),
             adapter=adapter,
         )
-        resources = phase4_runtime.DistributedPlanResources(plan, executor)
-        store = phase4_runtime.DistributedPlanSnapshotStore(resources)
+        resources = collective_runtime.DistributedPlanResources(plan, executor)
+        store = collective_runtime.DistributedPlanSnapshotStore(resources)
         state = ResidualRuntimeState()
         state.distributed_plan_store = store
         state.distributed_prepared_step_id = 4
@@ -238,24 +238,24 @@ class Phase4CollectiveLifecycleAuditRedTest(unittest.TestCase):
 
 class Phase4CrossRankAgreementAuditRedTest(unittest.TestCase):
     def test_multi_rank_agreement_requires_exact_rank_projections(self) -> None:
-        plan = phase4_runtime.compile_distributed_flow_plan(
+        plan = collective_runtime.compile_distributed_flow_plan(
             plan_epoch=8,
             topology=_two_rank_topology(),
             collective_requests=(_request(),),
         )
         agreements = tuple(
-            phase4_runtime.distributed_plan_agreement_desc(plan, rank)
+            collective_runtime.distributed_plan_agreement_desc(plan, rank)
             for rank in range(2)
         )
-        phase4_runtime.validate_distributed_plan_agreement(plan, agreements)
+        collective_runtime.validate_distributed_plan_agreement(plan, agreements)
 
         with self.assertRaises(RuntimeError):
-            phase4_runtime.validate_distributed_plan_agreement(
+            collective_runtime.validate_distributed_plan_agreement(
                 plan,
                 (agreements[0], replace(agreements[1], plan_signature="f" * 64)),
             )
         with self.assertRaises(ValueError):
-            phase4_runtime.DistributedRuntimeBinding(
+            collective_runtime.DistributedRuntimeBinding(
                 topology=plan.topology,
                 rank=0,
                 communicators=((plan.communicators[0].key, SimpleNamespace()),),
