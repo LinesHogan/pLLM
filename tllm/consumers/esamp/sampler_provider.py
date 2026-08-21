@@ -146,7 +146,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
 
     def maybe_prepare_decode_step(self, *, runtime: Any, runner: Any) -> None:
         runtime.sampler_precompute.reset_decode_step(int(getattr(runtime, "event_step_id", -1)))
-        if not self.is_active():
+        if not self.is_active() or not self.engine.prediction_ready:
             return
         self.ensure_runtime_buffers(runtime=runtime, runner=runner)
         decode_count = int(getattr(runtime, "decode_count", 0) or 0)
@@ -173,7 +173,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
     ) -> None:
         if str(layer_path).strip() != str(getattr(runtime, "source_resolved_path", "") or "").strip():
             return
-        if not self.is_active():
+        if not self.is_active() or not self.engine.prediction_ready:
             return
         if not bool(getattr(runtime, "sampler_allow_source_capture", False)):
             return
@@ -245,7 +245,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
         with maybe_record_function("distiller.schedule_precompute"):
             if bool(getattr(runtime.sampler_precompute, "timing_enabled", False)):
                 runtime.sampler_precompute.schedule_attempt_count += 1
-            if not self.is_active():
+            if not self.is_active() or not self.engine.prediction_ready:
                 return
             decode_count = int(getattr(runtime, "decode_count", 0) or 0)
             source_path = str(getattr(runtime, "source_resolved_path", "") or "").strip()
@@ -391,6 +391,8 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                         decode_count=int(view.decode_count),
                     )
             if cache is None:
+                if not self.engine.prediction_ready:
+                    return None
                 prompt_input = (
                     view.prompt_idx_tensor.to(device=view.device, dtype=torch.long)
                     if view.prompt_idx_tensor is not None

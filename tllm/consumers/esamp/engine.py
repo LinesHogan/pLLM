@@ -364,6 +364,20 @@ class _ESampEngineCore:
         s = self.state
         return s.per_request_models and s.per_request_model_bank
 
+    @property
+    def prediction_ready(self) -> bool:
+        """Whether shared-mode prediction can run (resources initialized).
+
+        Deferrable training (TimingContract) may deliver the first bundle
+        after the step-0 sampler hooks; prediction/intervention must skip
+        until ``ensure_resources`` has run. Per-request and model-bank paths
+        already tolerate empty trainer banks/lookups.
+        """
+        s = self.state
+        if s.per_request_models:
+            return True
+        return s.shared is not None
+
     def _build_model(self, *, hidden_size: int, device: torch.device, hidden_dtype: torch.dtype) -> _ResidualModel:
         rank = max(1, min(self.state.hidden_dim, hidden_size))
         return LowRankGatedResidualModel(
