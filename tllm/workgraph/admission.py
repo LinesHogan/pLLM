@@ -994,19 +994,6 @@ def static_admission(plan: AdmissionControlPlan, items: Sequence[WorkItemDesc]) 
     return greedy_admission(plan, items)
 
 
-def admit_greedy(plan: AdmissionControlPlan, items: Sequence[WorkItemDesc]) -> AdmissionResult:
-    return greedy_admission(plan, items)
-
-
-def admit_exhaustive_oracle(
-    plan: AdmissionControlPlan,
-    items: Sequence[WorkItemDesc],
-    *,
-    max_items: int = 10,
-) -> AdmissionResult:
-    return exhaustive_admission_oracle(plan, items, max_items=max_items)
-
-
 def compile_admission_plan(
     *,
     placement_plan: PlacementPlan,
@@ -1081,8 +1068,6 @@ __all__ = [
     "WorkItemKey",
     "WorkloadBucketDesc",
     "WorkloadBucketKey",
-    "admit_exhaustive_oracle",
-    "admit_greedy",
     "approved_actions",
     "compile_admission_plan",
     "exhaustive_admission_oracle",
