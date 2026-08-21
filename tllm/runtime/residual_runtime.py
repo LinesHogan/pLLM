@@ -154,7 +154,7 @@ def _refresh_dispatch_plan() -> None:
         RUNTIME.workgraph_snapshot = None
         RUNTIME.workgraph_refresh_pending = False
     elif RUNTIME.workgraph_backend_resolution is None:
-        from tllm.workgraph.compiler import compile_shadow_snapshot
+        from tllm.workgraph.shadow import compile_shadow_snapshot
 
         RUNTIME.workgraph_snapshot = compile_shadow_snapshot(
             consumers=consumers,
@@ -197,11 +197,11 @@ def _compile_concrete_workgraph_snapshot() -> None:
         raise RuntimeError("WorkGraph refresh requires DispatchPlan and ExecutionPlan")
 
     from tllm.workgraph.anchors import backend_snapshot_from_resolution
-    from tllm.workgraph.compiler import compile_phase1a
+    from tllm.workgraph.shadow import compile_shadow_parity
 
     # ``lower_plans`` binds the existing authoritative plans directly; it
     # intentionally does not inspect consumer instances at this boundary.
-    RUNTIME.workgraph_snapshot = compile_phase1a(
+    RUNTIME.workgraph_snapshot = compile_shadow_parity(
         consumers=(),
         dispatch_plan=plan,
         execution_plan=execution_plan,
@@ -289,12 +289,12 @@ def _stage_physical_workgraph_snapshot() -> None:
 def _activate_physical_capture_regions(snapshot: object) -> None:
     """Publish migrated regions through the typed consumer interface."""
 
-    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.shadow import ShadowParityPlan
     from tllm.workgraph.ir import NodeKey
     from tllm.workgraph.physical import compile_physical_capture_region
 
-    if not isinstance(snapshot, Phase1aPlan):
-        raise TypeError("physical capture activation requires Phase1aPlan")
+    if not isinstance(snapshot, ShadowParityPlan):
+        raise TypeError("physical capture activation requires ShadowParityPlan")
     hierarchy = snapshot.hierarchy
     if hierarchy is None:
         return
@@ -695,7 +695,7 @@ def refresh_workgraph_capture_metadata() -> None:
 
     resolution = RUNTIME.workgraph_backend_resolution
     if resolution is None:
-        from tllm.workgraph.compiler import compile_shadow_snapshot
+        from tllm.workgraph.shadow import compile_shadow_snapshot
 
         RUNTIME.workgraph_snapshot = compile_shadow_snapshot(
             consumers=consumers,

@@ -8,7 +8,7 @@ from tllm.ports.base import ConsumerFlow, TimingContract
 from tllm.ports.request_meta import RequestMeta
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.producers.registry import ExecutionPlan
-from tllm.workgraph.compiler import compile_phase1a
+from tllm.workgraph.shadow import compile_shadow_parity
 from tllm.workgraph.ir import BackendSnapshot, EdgeKind, NodeKind
 from tllm.workgraph.lowering import WorkGraphError
 
@@ -39,7 +39,7 @@ class _FlowConsumer(BaseConsumer[object]):
 
 def _compile(consumer: _FlowConsumer, *, strict_native: bool = False, graph_mode: str = "eager"):
     dispatch = DispatchPlan.build([consumer])
-    return compile_phase1a(
+    return compile_shadow_parity(
         consumers=[consumer],
         dispatch_plan=dispatch,
         execution_plan=ExecutionPlan(producers=(), port_sources={}),
@@ -53,7 +53,7 @@ def _compile(consumer: _FlowConsumer, *, strict_native: bool = False, graph_mode
     )
 
 
-class Phase1aLoweringTest(unittest.TestCase):
+class ShadowLoweringTest(unittest.TestCase):
     def test_pinned_flow_is_native_but_effect_is_conservative(self) -> None:
         plan = _compile(_FlowConsumer("native"), strict_native=True)
         node = plan.semantic.nodes[0]
@@ -128,10 +128,10 @@ class Phase1aLoweringTest(unittest.TestCase):
                 backend_version="0.27.1",
             ),
         )
-        plan = compile_phase1a(**kwargs, strict_native=False)
+        plan = compile_shadow_parity(**kwargs, strict_native=False)
         self.assertIn("non_declared_version_observation", plan.lowering_notes[0])
         with self.assertRaisesRegex(WorkGraphError, "WG110_UNSUPPORTED_VERSION"):
-            compile_phase1a(**kwargs, strict_native=True)
+            compile_shadow_parity(**kwargs, strict_native=True)
 
     def test_full_mode_is_legacy_only(self) -> None:
         plan = _compile(_FlowConsumer("full"), graph_mode="full")
@@ -145,7 +145,7 @@ class Phase1aLoweringTest(unittest.TestCase):
         dispatch = DispatchPlan.build([consumer])
         object.__setattr__(dispatch._flow_targets[0], "placement_hook", "future.hook")
         with self.assertRaisesRegex(WorkGraphError, "WG121_UNSUPPORTED_ANCHOR"):
-            compile_phase1a(
+            compile_shadow_parity(
                 consumers=[consumer],
                 dispatch_plan=dispatch,
                 execution_plan=ExecutionPlan(producers=(), port_sources={}),

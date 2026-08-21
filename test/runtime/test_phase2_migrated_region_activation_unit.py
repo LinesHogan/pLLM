@@ -48,13 +48,13 @@ from tllm.workgraph import (
     ExecutorKey,
     NodeKey,
     StateScope,
-    compile_phase1a,
+    compile_shadow_parity,
     flow,
 )
 from tllm.workgraph.frontend import ExternContract
 from tllm.workgraph.anchors import BackendResolution, shadow_backend_snapshot
 from tllm.workgraph import physical as physical_module
-from tllm.workgraph.compiler import Phase1aPlan
+from tllm.workgraph.shadow import ShadowParityPlan
 from tllm.workgraph.lowering import WorkGraphError
 from tllm.workgraph.physical import (
     CapturePolicy,
@@ -150,7 +150,7 @@ def _esamp_phase1(
     )
     dispatch_plan = DispatchPlan.build([actual])
     execution_plan = compile_default_plan(consumers=[actual])
-    phase1 = compile_phase1a(
+    phase1 = compile_shadow_parity(
         consumers=(actual,),
         dispatch_plan=dispatch_plan,
         execution_plan=execution_plan,
@@ -279,8 +279,8 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
             engine=engine,
         )
         _consumer, phase1, _captured = _esamp_phase1(consumer)
-        self.assertIsInstance(phase1, Phase1aPlan)
-        assert isinstance(phase1, Phase1aPlan)
+        self.assertIsInstance(phase1, ShadowParityPlan)
+        assert isinstance(phase1, ShadowParityPlan)
         root_plan = physical_module.compile_physical_flow_plan(phase1)
         region_executor = consumer.workgraph_region_executors()[0].executor
         trace: list[tuple[str, tuple[object, ...]]] = []
@@ -577,7 +577,7 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
         # it must not manufacture a partial capture task.
         opaque_consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=8))
         opaque_dispatch = DispatchPlan.build([opaque_consumer])
-        opaque_phase1 = compile_phase1a(
+        opaque_phase1 = compile_shadow_parity(
             consumers=(opaque_consumer,),
             dispatch_plan=opaque_dispatch,
             execution_plan=ExecutionPlan(producers=(), port_sources={}),

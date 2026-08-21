@@ -28,7 +28,7 @@ from tllm.workgraph.ir import (
 )
 
 if TYPE_CHECKING:
-    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.shadow import ShadowParityPlan
 
 
 _T = TypeVar("_T")
@@ -447,15 +447,15 @@ def _execution_order(
     return tuple(ordered)
 
 
-def compile_physical_flow_plan(plan: Phase1aPlan) -> PhysicalFlowPlan:
+def compile_physical_flow_plan(plan: ShadowParityPlan) -> PhysicalFlowPlan:
     """Lower one verified shadow plan into frozen single-device descriptors."""
 
-    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.shadow import ShadowParityPlan
     from tllm.workgraph.lowering import WorkGraphError
 
     raw_plan = cast(object, plan)
-    if not isinstance(raw_plan, Phase1aPlan):
-        raise TypeError("compile_physical_flow_plan.plan must be Phase1aPlan")
+    if not isinstance(raw_plan, ShadowParityPlan):
+        raise TypeError("compile_physical_flow_plan.plan must be ShadowParityPlan")
     plan = raw_plan
     if plan.epoch < 1:
         raise ValueError("physical plan requires a compiled Phase 1 epoch")
@@ -588,7 +588,7 @@ def compile_physical_flow_plan(plan: Phase1aPlan) -> PhysicalFlowPlan:
 
 
 def compile_physical_capture_region(
-    plan: Phase1aPlan,
+    plan: ShadowParityPlan,
     artifact_key: ArtifactKey,
     executor_desc: PhysicalRegionExecutorDesc | None = None,
 ) -> PhysicalCaptureRegion:
@@ -599,12 +599,12 @@ def compile_physical_capture_region(
     explicitly migrated capture task.
     """
 
-    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.shadow import ShadowParityPlan
     from tllm.workgraph.lowering import WorkGraphError
 
     raw_plan = cast(object, plan)
-    if not isinstance(raw_plan, Phase1aPlan):
-        raise TypeError("compile_physical_capture_region.plan must be Phase1aPlan")
+    if not isinstance(raw_plan, ShadowParityPlan):
+        raise TypeError("compile_physical_capture_region.plan must be ShadowParityPlan")
     key = _instance(
         artifact_key,
         ArtifactKey,

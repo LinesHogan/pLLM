@@ -28,7 +28,7 @@ from tllm.workgraph import (
     PortBindingDirection,
     RegionKind,
     build_hierarchy,
-    compile_phase1a,
+    compile_shadow_parity,
     flow,
 )
 
@@ -437,7 +437,7 @@ class WorkGraphHierarchicalCaptureTest(unittest.TestCase):
             data_centric=hierarchy.data_centric,
             schema_version=1,
         )
-        semantic_plan = compile_phase1a(
+        semantic_plan = compile_shadow_parity(
             consumers=(_Consumer("consumer"),),
             dispatch_plan=dispatch,
             execution_plan=execution,
@@ -501,7 +501,7 @@ class WorkGraphHierarchicalCaptureTest(unittest.TestCase):
         )
         consumer = _Consumer("consumer")
         dispatch = DispatchPlan.build([consumer])
-        plan = compile_phase1a(
+        plan = compile_shadow_parity(
             consumers=(consumer,),
             dispatch_plan=dispatch,
             execution_plan=execution,
@@ -583,7 +583,7 @@ class WorkGraphHierarchicalCaptureTest(unittest.TestCase):
                 artifact_key=captured.artifact_key,
                 bindings=(binding,),
             )
-            return compile_phase1a(
+            return compile_shadow_parity(
                 consumers=(consumer,),
                 dispatch_plan=dispatch,
                 execution_plan=execution,
@@ -621,7 +621,7 @@ class WorkGraphHierarchicalCaptureTest(unittest.TestCase):
         )
 
         def compile_capture(captured: CapturedFlow, previous: object = None):
-            return compile_phase1a(
+            return compile_shadow_parity(
                 consumers=(consumer,),
                 dispatch_plan=dispatch,
                 execution_plan=execution,

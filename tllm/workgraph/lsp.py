@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias, cast
 
-from tllm.workgraph.compiler import Phase1aPlan
+from tllm.workgraph.shadow import ShadowParityPlan
 from tllm.workgraph.frontend import (
     ArtifactKey,
     Capability,
@@ -555,7 +555,7 @@ def _snapshot_from_capture(capture: CapturedFlow) -> LspSnapshot:
     )
 
 
-def _snapshot_from_plan(plan: Phase1aPlan) -> LspSnapshot:
+def _snapshot_from_plan(plan: ShadowParityPlan) -> LspSnapshot:
     hierarchy = plan.hierarchy
     if hierarchy is None:
         source_span = None
@@ -595,17 +595,17 @@ def _snapshot_from_plan(plan: Phase1aPlan) -> LspSnapshot:
     )
 
 
-def build_lsp_snapshot(snapshot: CapturedFlow | Phase1aPlan) -> LspSnapshot:
+def build_lsp_snapshot(snapshot: CapturedFlow | ShadowParityPlan) -> LspSnapshot:
     """Build a frozen read-only LSP view from a pure WorkGraph snapshot."""
 
     if isinstance(snapshot, CapturedFlow):
         return _snapshot_from_capture(snapshot)
-    if isinstance(cast(object, snapshot), Phase1aPlan):
+    if isinstance(cast(object, snapshot), ShadowParityPlan):
         return _snapshot_from_plan(snapshot)
-    raise TypeError("build_lsp_snapshot expects CapturedFlow or Phase1aPlan")
+    raise TypeError("build_lsp_snapshot expects CapturedFlow or ShadowParityPlan")
 
 
-def adapt_lsp(snapshot: CapturedFlow | Phase1aPlan) -> LspSnapshot:
+def adapt_lsp(snapshot: CapturedFlow | ShadowParityPlan) -> LspSnapshot:
     """Alias for callers that name the adapter operation directly."""
 
     return build_lsp_snapshot(snapshot)

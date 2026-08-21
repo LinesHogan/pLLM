@@ -20,7 +20,7 @@ from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime.ports.residual_bundle_dispatch import dispatch_decode_port_bundles
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph.anchors import BackendResolution, shadow_backend_snapshot
-from tllm.workgraph.compiler import compile_phase1a, compile_shadow_snapshot
+from tllm.workgraph.shadow import compile_shadow_parity, compile_shadow_snapshot
 from tllm.workgraph.frontend import CapturedFlow
 from tllm.workgraph.hierarchy import CaptureAttachment
 from tllm.workgraph.ir import NodeKey, WorkGraphDiagnosticCode
@@ -118,7 +118,7 @@ def _specialized_esamp() -> tuple[ESampConsumer, CapturedFlow, CaptureAttachment
     return consumer, captured, attachment
 
 
-class Phase1aRuntimeRefreshTest(unittest.TestCase):
+class ShadowRuntimeRefreshTest(unittest.TestCase):
     def test_base_consumer_defaults_to_typed_empty_capture_metadata(self) -> None:
         consumer = _FlowConsumer("capture.defaults")
 
@@ -196,7 +196,7 @@ class Phase1aRuntimeRefreshTest(unittest.TestCase):
         consumer, captured, attachment = _specialized_esamp()
         dispatch_plan = DispatchPlan.build([consumer])
         execution_plan = compile_default_plan(consumers=[consumer])
-        phase1a = compile_phase1a(
+        shadow = compile_shadow_parity(
             consumers=(consumer,),
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
@@ -205,7 +205,7 @@ class Phase1aRuntimeRefreshTest(unittest.TestCase):
             attachments=(attachment,),
         )
 
-        physical = compile_physical_flow_plan(phase1a)
+        physical = compile_physical_flow_plan(shadow)
         node = next(
             node
             for node in physical.nodes

@@ -11,7 +11,7 @@ from tllm.workgraph.anchors import (
 from tllm.workgraph.ir import BackendSnapshot
 
 
-class Phase1aAnchorTest(unittest.TestCase):
+class ShadowAnchorTest(unittest.TestCase):
     def test_supported_backend_matrix_has_stable_anchor(self) -> None:
         for family in ("mrv1", "mrv2"):
             for mode in ("eager", "piecewise"):

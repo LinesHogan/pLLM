@@ -9,7 +9,7 @@ from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.execution_plan import compile_default_plan
 from tllm.workgraph.anchors import shadow_backend_snapshot
-from tllm.workgraph.compiler import compile_phase1a
+from tllm.workgraph.shadow import compile_shadow_parity
 from tllm.workgraph.ir import BoundaryKind, NodeKind, TimingDeadlineKind, TimingMobilityKind
 
 
@@ -54,7 +54,7 @@ def _execution_facts(execution_plan: ExecutionPlan) -> tuple[object, ...]:
     )
 
 
-class Phase1aEsampLegacyUnitTest(unittest.TestCase):
+class ShadowEsampLegacyUnitTest(unittest.TestCase):
     def test_real_esamp_timing_is_conservatively_lowered_and_plans_remain_authoritative(self) -> None:
         consumer, dispatch_plan, execution_plan = _build_real_esamp_plans()
         flow = consumer.flows()[0]
@@ -66,14 +66,14 @@ class Phase1aEsampLegacyUnitTest(unittest.TestCase):
         dispatch_before = _dispatch_facts(dispatch_plan)
         execution_before = _execution_facts(execution_plan)
 
-        phase1a = compile_phase1a(
+        shadow = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
             backend=shadow_backend_snapshot(),
         )
 
-        node = next(node for node in phase1a.semantic.nodes if node.source == "esamp#0")
+        node = next(node for node in shadow.semantic.nodes if node.source == "esamp#0")
         self.assertEqual(node.kind, NodeKind.COMPUTE)
         self.assertEqual(node.legacy_boundary, BoundaryKind.LEGACY)
         self.assertEqual(node.effects, ("opaque_legacy_effect",))
@@ -82,11 +82,11 @@ class Phase1aEsampLegacyUnitTest(unittest.TestCase):
         self.assertEqual(node.timing.mobility, TimingMobilityKind.DEFERRABLE)
         self.assertEqual(node.timing.deadline, TimingDeadlineKind.NEXT_PREPARE)
         self.assertEqual(node.timing.max_defer_steps, 1)
-        self.assertIn("esamp#0", phase1a.legacy_boundaries)
+        self.assertIn("esamp#0", shadow.legacy_boundaries)
         self.assertTrue(
-            any(note.startswith("esamp#0:legacy_boundary:") for note in phase1a.lowering_notes)
+            any(note.startswith("esamp#0:legacy_boundary:") for note in shadow.lowering_notes)
         )
-        self.assertEqual(phase1a.data.moves, ())
+        self.assertEqual(shadow.data.moves, ())
 
         self.assertEqual(dispatch_before, _dispatch_facts(dispatch_plan))
         self.assertEqual(execution_before, _execution_facts(execution_plan))

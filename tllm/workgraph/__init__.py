@@ -13,7 +13,7 @@ from tllm.workgraph.anchors import (
     shadow_backend_snapshot,
     validate_backend_snapshot,
 )
-from tllm.workgraph.compiler import Phase1aPlan, compile_phase1a, compile_shadow_snapshot
+from tllm.workgraph.shadow import ShadowParityPlan, compile_shadow_parity, compile_shadow_snapshot
 from tllm.workgraph.frontend import (
     ArtifactKey,
     BeforeNextUse,
@@ -332,7 +332,7 @@ __all__ = [
     "MoveSetKey",
     "NodeKey",
     "NodeKind",
-    "Phase1aPlan",
+    "ShadowParityPlan",
     "PhysicalFlowPlan",
     "PhysicalCaptureRegion",
     "PhysicalNodePlan",
@@ -416,7 +416,7 @@ __all__ = [
     "build_hierarchy",
     "build_capture_root",
     "build_lsp_snapshot",
-    "compile_phase1a",
+    "compile_shadow_parity",
     "compile_admission_plan",
     "compile_distributed_flow_plan",
     "compile_moves",

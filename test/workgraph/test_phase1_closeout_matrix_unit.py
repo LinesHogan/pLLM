@@ -21,7 +21,7 @@ from tllm.workgraph import (
     PortBindingDesc,
     PortBindingDirection,
     WorkGraphDiagnosticCode,
-    compile_phase1a,
+    compile_shadow_parity,
     flow,
 )
 
@@ -123,7 +123,7 @@ class Phase1CloseoutMatrixTest(unittest.TestCase):
         for runner in ("mrv1", "mrv2"):
             for mode in ("eager", "piecewise"):
                 with self.subTest(runner=runner, mode=mode):
-                    plan = compile_phase1a(
+                    plan = compile_shadow_parity(
                         consumers=(consumer,),
                         dispatch_plan=dispatch,
                         execution_plan=execution,
@@ -171,7 +171,7 @@ class Phase1CloseoutMatrixTest(unittest.TestCase):
         consumer, dispatch, execution, captured, attachment = _fixture()
         for runner in ("mrv1", "mrv2"):
             with self.subTest(runner=runner):
-                plan = compile_phase1a(
+                plan = compile_shadow_parity(
                     consumers=(consumer,),
                     dispatch_plan=dispatch,
                     execution_plan=execution,

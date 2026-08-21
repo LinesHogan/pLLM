@@ -16,7 +16,7 @@ from tllm.producers.base import HookPoint
 from tllm.producers.registry import ProducerRegistry, compile_execution_plan
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.workgraph.anchors import BackendSnapshot, shadow_backend_snapshot
-from tllm.workgraph.compiler import compile_phase1a
+from tllm.workgraph.shadow import compile_shadow_parity
 from tllm.workgraph.frontend import (
     ArtifactKey,
     CaptureStatus,
@@ -114,7 +114,7 @@ def _phase1a_plan_with(
     registry = ProducerRegistry()
     registry.register(_PhysicalProducer())
     execution_plan = compile_execution_plan(registry=registry, consumers=[consumer])
-    return compile_phase1a(
+    return compile_shadow_parity(
         consumers=[consumer],
         dispatch_plan=dispatch_plan,
         execution_plan=execution_plan,

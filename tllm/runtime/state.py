@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
     from tllm.workgraph.anchors import BackendResolution
-    from tllm.workgraph.compiler import Phase1aPlan
+    from tllm.workgraph.shadow import ShadowParityPlan
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
 
@@ -130,7 +130,7 @@ class ResidualRuntimeState:
     execution_plan: Optional[ExecutionPlan] = None
     # Startup-only WorkGraph shadow metadata. Runtime dispatch does not read
     # this field; the existing plans above remain authoritative.
-    workgraph_snapshot: Optional["Phase1aPlan"] = None
+    workgraph_snapshot: Optional["ShadowParityPlan"] = None
     workgraph_captures: tuple["CapturedFlow", ...] = ()
     workgraph_attachments: tuple["CaptureAttachment", ...] = ()
     # The latest concrete backend context is captured at the backend boundary

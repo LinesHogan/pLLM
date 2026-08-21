@@ -39,7 +39,7 @@ from tllm.workgraph.trace import (
 
 
 @dataclass(frozen=True, slots=True)
-class Phase1aPlan:
+class ShadowParityPlan:
     compiled: CompiledWorkGraph
     binding: RuntimePlanBinding
     hierarchy: CaptureHierarchy | None = None
@@ -111,17 +111,17 @@ def _current_signature(
     return structural_signature((graph, data, binding, hierarchy))
 
 
-def compile_phase1a(
+def compile_shadow_parity(
     *,
     consumers: Sequence[BaseConsumer[object]],
     dispatch_plan: DispatchPlan,
     execution_plan: ExecutionPlan,
     backend: BackendSnapshot,
-    previous: Phase1aPlan | None = None,
+    previous: ShadowParityPlan | None = None,
     strict_native: bool = False,
     captures: tuple[CapturedFlow, ...] = (),
     attachments: tuple[CaptureAttachment, ...] = (),
-) -> Phase1aPlan:
+) -> ShadowParityPlan:
     """Build a shadow IR and verify its binding to existing runtime plans."""
     if backend.graph_mode not in {"eager", "piecewise", "full"}:
         raise WorkGraphError(
@@ -217,7 +217,7 @@ def compile_phase1a(
     previous_compiled = None if previous is None else previous.compiled
     diff = reconcile(previous_compiled, candidate)
     compiled = replace(candidate, epoch=diff.epoch)
-    return Phase1aPlan(
+    return ShadowParityPlan(
         compiled=compiled,
         binding=binding,
         hierarchy=hierarchy,
@@ -234,12 +234,12 @@ def compile_shadow_snapshot(
     consumers: Sequence[BaseConsumer[object]],
     dispatch_plan: DispatchPlan,
     execution_plan: ExecutionPlan,
-    previous: Phase1aPlan | None = None,
+    previous: ShadowParityPlan | None = None,
     captures: tuple[CapturedFlow, ...] = (),
     attachments: tuple[CaptureAttachment, ...] = (),
-) -> Phase1aPlan:
+) -> ShadowParityPlan:
     """Compile startup metadata before a concrete vLLM runner is selected."""
-    return compile_phase1a(
+    return compile_shadow_parity(
         consumers=consumers,
         dispatch_plan=dispatch_plan,
         execution_plan=execution_plan,
@@ -251,4 +251,4 @@ def compile_shadow_snapshot(
     )
 
 
-__all__ = ["Phase1aPlan", "PlanDiff", "compile_phase1a", "compile_shadow_snapshot"]
+__all__ = ["ShadowParityPlan", "PlanDiff", "compile_shadow_parity", "compile_shadow_snapshot"]

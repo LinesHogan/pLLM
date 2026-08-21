@@ -18,7 +18,7 @@ from tllm.producers.residual import default_residual_producers
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.graph_policy import GraphMode
 from tllm.workgraph.anchors import shadow_backend_snapshot
-from tllm.workgraph.compiler import Phase1aPlan, compile_phase1a
+from tllm.workgraph.shadow import ShadowParityPlan, compile_shadow_parity
 from tllm.workgraph.ir import BackendSnapshot, BoundaryKind, EdgeKind, GraphSafetyKind, NodeKind
 from tllm.workgraph.lowering import WorkGraphError
 from tllm.workgraph.signature import structural_signature
@@ -129,12 +129,12 @@ def _compile(
     flows: tuple[ConsumerFlow, ...],
     *,
     backend: BackendSnapshot | None = None,
-    previous: Phase1aPlan | None = None,
+    previous: ShadowParityPlan | None = None,
     strict_native: bool = False,
     consumer_id: str = "blackbox",
-) -> tuple[Phase1aPlan, DispatchPlan, object]:
+) -> tuple[ShadowParityPlan, DispatchPlan, object]:
     consumer, dispatch_plan, execution_plan = _real_plans(flows, consumer_id=consumer_id)
-    plan = compile_phase1a(
+    plan = compile_shadow_parity(
         consumers=[consumer],
         dispatch_plan=dispatch_plan,
         execution_plan=execution_plan,
@@ -145,7 +145,7 @@ def _compile(
     return plan, dispatch_plan, execution_plan
 
 
-class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
+class ShadowRuntimeBlackBoxTest(unittest.TestCase):
     def test_real_runtime_plans_remain_authoritative_and_ir_is_observation_only(self) -> None:
         consumer, dispatch_plan, execution_plan = _real_plans((_pinned_flow(),))
         before_flows = tuple(
@@ -160,7 +160,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
         )
         backend = shadow_backend_snapshot()
 
-        plan = compile_phase1a(
+        plan = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
@@ -191,7 +191,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
             backend_version="0.27.1",
             capabilities=("test",),
         )
-        plan = compile_phase1a(
+        plan = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
@@ -243,7 +243,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
     def test_actual_esamp_deferrable_declaration_stays_a_legacy_boundary(self) -> None:
         consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=4), engine=mock.Mock())
         dispatch_plan = DispatchPlan.build([consumer])
-        plan = compile_phase1a(
+        plan = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=ExecutionPlan(producers=(), port_sources={}),
@@ -275,7 +275,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
         consumer = _BlackBoxConsumer((_pinned_flow(), _prefill_flow()), consumer_id="residual-default")
         execution_plan = compile_execution_plan(registry=registry, consumers=[consumer])
         dispatch_plan = DispatchPlan.build([consumer])
-        plan = compile_phase1a(
+        plan = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
@@ -324,12 +324,12 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
                 # Build the real runtime plans while the declaration is
                 # executable, then mutate only the existing flow's version
                 # observation to model a plan supplied by an older boundary.
-                # Phase1a must retain this flow conservatively instead of
+                # Shadow must retain this flow conservatively instead of
                 # requiring DispatchPlan to understand the new resolver.
                 declared_flow = _deferrable_flow()
                 consumer, dispatch_plan, execution_plan = _real_plans((declared_flow,))
                 object.__setattr__(declared_flow, "timing", flow.timing)
-                plan = compile_phase1a(
+                plan = compile_shadow_parity(
                     consumers=[consumer],
                     dispatch_plan=dispatch_plan,
                     execution_plan=execution_plan,
@@ -339,7 +339,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
                 self.assertEqual(node.legacy_boundary, BoundaryKind.LEGACY)
                 self.assertIn("non_declared_version_observation", plan.lowering_notes[0] if plan.lowering_notes else "")
                 with self.assertRaisesRegex(WorkGraphError, "WG110_UNSUPPORTED_VERSION"):
-                    compile_phase1a(
+                    compile_shadow_parity(
                         consumers=[_BlackBoxConsumer((flow,))],
                         dispatch_plan=dispatch_plan,
                         execution_plan=execution_plan,
@@ -365,14 +365,14 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
         consumer, dispatch_plan, execution_plan = _real_plans((_pinned_flow(),))
         target = dispatch_plan.flow_targets()[0]
         object.__setattr__(target, "placement_hook", "layer.pre")
-        first = compile_phase1a(
+        first = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
             backend=shadow_backend_snapshot(),
         )
         object.__setattr__(target, "placement_hook", "layer.post")
-        changed = compile_phase1a(
+        changed = compile_shadow_parity(
             consumers=[consumer],
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
@@ -388,7 +388,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
 
     def test_capture_resident_binding_change_rebuilds_the_shadow_epoch(self) -> None:
         consumer, dispatch_plan, execution_plan = _real_plans((_pinned_flow(),))
-        first = compile_phase1a(
+        first = compile_shadow_parity(
             consumers=(consumer,),
             dispatch_plan=dispatch_plan,
             execution_plan=execution_plan,
@@ -398,7 +398,7 @@ class Phase1aRuntimeBlackBoxTest(unittest.TestCase):
             execution_plan,
             capture_resident_producer_ids=("blackbox.producer",),
         )
-        changed = compile_phase1a(
+        changed = compile_shadow_parity(
             consumers=(consumer,),
             dispatch_plan=dispatch_plan,
             execution_plan=changed_execution_plan,

@@ -23,7 +23,7 @@ from tllm.workgraph import (
     PortBindingDirection,
     NodeKey,
     build_hierarchy,
-    compile_phase1a,
+    compile_shadow_parity,
     flow,
 )
 from test.core.oracles.capture_hierarchy_validator import validate_capture_hierarchy
@@ -105,7 +105,7 @@ def _fixture() -> tuple[object, object]:
         dispatch_plan=dispatch,
         execution_plan=execution,
     )
-    plan = compile_phase1a(
+    plan = compile_shadow_parity(
         consumers=(consumer,),
         dispatch_plan=dispatch,
         execution_plan=execution,

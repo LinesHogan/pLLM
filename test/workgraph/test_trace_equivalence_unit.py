@@ -15,7 +15,7 @@ from tllm.producers.base import HookPoint
 from tllm.producers.registry import ExecutionPlan, PlannedProducer, ProducerEntry
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.graph_policy import GraphMode
-from tllm.workgraph.compiler import compile_phase1a
+from tllm.workgraph.shadow import compile_shadow_parity
 from tllm.workgraph.ir import BackendSnapshot, RuntimePlanBinding
 from tllm.workgraph.trace import (
     TraceEventKind,
@@ -132,7 +132,7 @@ class TraceEquivalenceTest(unittest.TestCase):
         dispatch, execution = _plans()
         consumer = cast(_Consumer, dispatch.flow_targets()[0].consumer)
 
-        plan = compile_phase1a(
+        plan = compile_shadow_parity(
             consumers=(consumer,),
             dispatch_plan=dispatch,
             execution_plan=execution,

@@ -9,7 +9,7 @@ import torch
 
 from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.workgraph.compiler import compile_shadow_snapshot
+from tllm.workgraph.shadow import compile_shadow_snapshot
 from tllm.workgraph.frontend import (
     CaptureStatus,
     DynamicDim,
@@ -145,7 +145,7 @@ class WorkGraphLspAdapterTest(unittest.TestCase):
             "tllm.workgraph.capture.capture_flow",
             side_effect=AssertionError("LSP adapter must not capture"),
         ), mock.patch(
-            "tllm.workgraph.compiler.compile_phase1a",
+            "tllm.workgraph.shadow.compile_shadow_parity",
             side_effect=AssertionError("LSP adapter must not compile"),
         ):
             report = build_lsp_snapshot(plan)
