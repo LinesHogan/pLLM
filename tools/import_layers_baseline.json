@@ -5,6 +5,7 @@
       "contracts",
       "core",
       "ports",
+      "runtime",
       "workgraph"
     ],
     "common": [
@@ -49,7 +50,6 @@
       "workgraph"
     ],
     "util": "leaf (any)",
-    "verification": "leaf (any)",
     "workflows": "leaf (any)",
     "workgraph": [
       "contracts",
@@ -59,20 +59,16 @@
     ]
   },
   "module_level": {
-    "backends->runtime": 36,
     "contracts->ports": 1,
     "ports->runtime": 1,
-    "producers->backends": 3,
     "runtime->backends": 1,
     "runtime->consumers": 7,
     "runtime->producer": 1,
     "runtime->util": 1,
-    "workgraph->backends": 1,
     "workgraph->consumers": 2,
     "workgraph->runtime": 5
   },
   "local_level": {
-    "backends->runtime": 7,
     "runtime->consumers": 2
   }
 }

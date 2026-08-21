@@ -19,6 +19,8 @@ Two tiers, mirroring tools/check_typing.py:
   - function-local imports: a ledger; still circular at call time, so they are
     counted separately and must only decrease until R3 eliminates them.
 
+Imports under ``if TYPE_CHECKING:`` are erased at runtime and exempt.
+
 ``runtime -> backends`` is exempt only for ``tllm.backends.protocol`` (the
 sanctioned protocol seam); imports of concrete backend drivers fail.
 
@@ -50,7 +52,10 @@ RULES: dict[str, frozenset[str]] = {
     "producer": frozenset({"common", "contracts", "ports", "core"}),
     "workgraph": frozenset({"contracts", "ports", "producers", "core"}),
     "runtime": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
-    "backends": frozenset({"contracts", "ports", "workgraph", "core"}),
+    # Backend drivers are adapters *above* the runtime: they may import it,
+    # but the runtime must never import a concrete driver (only the pure
+    # protocol module, via SANCTIONED_EDGES).
+    "backends": frozenset({"contracts", "ports", "workgraph", "runtime", "core"}),
     "consumers": frozenset(
         {"contracts", "ports", "common", "producers", "workgraph", "runtime", "core"}
     ),
@@ -59,8 +64,15 @@ RULES: dict[str, frozenset[str]] = {
     "util": None,
 }
 
-# runtime may touch exactly this one backends module.
-SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset({("runtime", "tllm.backends.protocol")})
+# Any package may import the pure backend contract module (it has zero
+# internal imports); the runtime may touch nothing else under backends/.
+SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("runtime", "tllm.backends.protocol"),
+        ("producers", "tllm.backends.protocol"),
+        ("workgraph", "tllm.backends.protocol"),
+    }
+)
 
 # Compiled Rust artifact and other top-level extension modules are not packages.
 NON_PACKAGE_MODULES: frozenset[str] = frozenset({"_core"})
@@ -99,6 +111,15 @@ def _resolve_from(current: list[str], level: int, module: str | None) -> list[st
     return base + (module.split(".") if module else [])
 
 
+def _is_type_checking_block(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+
+
 def _scan_file(path: Path) -> list[Violation]:
     rel_parts = path.relative_to(PKG_ROOT).parts
     if len(rel_parts) == 1:
@@ -112,15 +133,21 @@ def _scan_file(path: Path) -> list[Violation]:
 
     violations: list[Violation] = []
 
-    def visit(node: ast.AST, top_level: bool) -> None:
+    def visit(node: ast.AST, top_level: bool, type_only: bool = False) -> None:
         for child in ast.iter_child_nodes(node):
+            if type_only and isinstance(child, (ast.Import, ast.ImportFrom)):
+                continue  # erased at runtime
             targets: list[list[str] | None] = []
             if isinstance(child, ast.Import):
                 targets = [alias.name.split(".") for alias in child.names]
             elif isinstance(child, ast.ImportFrom):
                 targets = [_resolve_from(current, child.level, child.module)]
             else:
-                visit(child, top_level and isinstance(node, ast.Module))
+                visit(
+                    child,
+                    top_level and isinstance(node, ast.Module),
+                    type_only or _is_type_checking_block(child),
+                )
                 continue
             for parts in targets:
                 if parts is None or len(parts) < 2 or parts[0] != "tllm":
