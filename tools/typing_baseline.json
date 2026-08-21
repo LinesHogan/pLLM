@@ -1,6 +1,6 @@
 {
   "comment": "Basic-tier pyright baseline (only-decrease). Regenerate with `python tools/check_typing.py --rebase`.",
-  "total": 198,
+  "total": 197,
   "buckets": {
     "tllm/common/state.py": 1,
     "tllm/consumers/esamp": 20,
@@ -19,7 +19,6 @@
     "tllm/runtime/sampler_bridge": 102,
     "tllm/runtime/state.py": 3,
     "tllm/runtime/test_time": 1,
-    "tllm/util/tools.py": 1,
     "tllm/workflows/benchmarks": 19,
     "tllm/workflows/common.py": 1,
     "tllm/workflows/esamp_support.py": 4,

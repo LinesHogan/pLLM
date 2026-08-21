@@ -10,7 +10,13 @@ lives here.
 
 from __future__ import annotations
 
-from typing import Any
+import importlib
+from typing import Any, cast
+
+#: Backend drivers are plugins loaded by id at patch-install time. The
+#: runtime never statically imports a concrete backend — backends are
+#: adapters *above* the runtime, discovered by name like consumer plugins.
+_BACKEND_DRIVER_MODULES = {"vllm": "tllm.backends.vllm"}
 
 
 def ensure_runner_binding(core: Any) -> None:
@@ -30,12 +36,52 @@ def ensure_runner_binding(core: Any) -> None:
     core._ORIG_EXECUTE_MODEL = _GPUModelRunner.execute_model
 
 
-def install_runner_patch(core: Any) -> None:
+def install_runner_patch(core: Any, *, backend: str = "vllm") -> None:
     if core._PATCH_INSTALLED:
         return
-    from tllm.backends.vllm import install_backend
+    driver = importlib.import_module(_BACKEND_DRIVER_MODULES[str(backend)])
+    driver.install_backend(core=core)
 
-    install_backend(core=core)
+
+def make_plain_llm(
+    model_name: str,
+    dtype: str,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+    enable_prefix_caching: bool,
+    enforce_eager: bool = False,
+    seed: int | None = None,
+    worker_extension_cls: str | None = None,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
+) -> Any:
+    """Construct a plain vLLM LLM with tLLM's standard single-GPU defaults.
+
+    Canonical home for engine construction (previously ``tllm.util.tools``,
+    which re-exports this). The vLLM import stays function-local so importing
+    the runtime never pays for vLLM.
+    """
+    from vllm import LLM
+
+    kwargs: dict[str, Any] = {}
+    if seed is not None:
+        kwargs["seed"] = int(seed)
+    if worker_extension_cls:
+        kwargs["worker_extension_cls"] = str(worker_extension_cls)
+    if max_num_seqs is not None:
+        kwargs["max_num_seqs"] = int(max_num_seqs)
+    if max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    return LLM(
+        model=model_name,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=float(gpu_memory_utilization),
+        max_model_len=int(max_model_len),
+        enforce_eager=bool(enforce_eager),
+        dtype=cast(Any, dtype),  # vLLM's ModelDType union; validated by vLLM itself
+        enable_prefix_caching=bool(enable_prefix_caching),
+        **kwargs,
+    )
 
 
 def make_llm(core: Any, *args: object, **kwargs: object) -> object:
@@ -50,9 +96,7 @@ def make_llm(core: Any, *args: object, **kwargs: object) -> object:
     # multiprocess modes, so ControlPlane str-method RPCs resolve identically
     # (in-process under mp=0, EngineCore child under mp=1).
     kwargs.setdefault("worker_extension_cls", TLLM_WORKER_EXTENSION_QUALNAME)
-    from tllm.util import tools as _tool_helpers
-
-    llm = _tool_helpers.make_plain_llm(*args, **kwargs)  # pyright: ignore[reportArgumentType] — untyped passthrough by design
+    llm = make_plain_llm(*args, **kwargs)  # pyright: ignore[reportArgumentType] — untyped passthrough by design
     # The legacy ``residual_runtime.make_llm`` entry point bypasses
     # ``TllmRuntime._bind_engine_runners``. Bind its parent-side stats/control
     # channel here so mp=1 callers do not silently read the empty parent state.

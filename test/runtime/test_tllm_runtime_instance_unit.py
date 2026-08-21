@@ -71,7 +71,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         with mock.patch.object(lifecycle, "install_runner_patch"), mock.patch(
             "tllm.runtime.mp.bootstrap.export_bootstrap_spec_env"
         ), mock.patch(
-            "tllm.util.tools.make_plain_llm", return_value=llm
+            "tllm.runtime.lifecycle.make_plain_llm", return_value=llm
         ) as make_plain, mock.patch(
             "tllm.runtime.mp.control.ControlPlane.try_bind", return_value=plane
         ) as try_bind, mock.patch(
@@ -92,7 +92,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         from tllm.util.tools import make_plain_llm
 
         llm = object()
-        with mock.patch("tllm.util.tools.LLM", return_value=llm) as llm_cls:
+        with mock.patch("vllm.LLM", return_value=llm) as llm_cls:
             result = make_plain_llm(
                 model_name="model",
                 dtype="bfloat16",
@@ -110,7 +110,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
     def test_plain_llm_preserves_vllm_scheduler_defaults(self) -> None:
         from tllm.util.tools import make_plain_llm
 
-        with mock.patch("tllm.util.tools.LLM") as llm_cls:
+        with mock.patch("vllm.LLM") as llm_cls:
             make_plain_llm(
                 model_name="model",
                 dtype="bfloat16",

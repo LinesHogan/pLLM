@@ -10,6 +10,10 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from vllm import LLM, SamplingParams
 
+# Canonical home: tllm.runtime.lifecycle (engine construction is runtime
+# business). Re-exported here for existing benchmark/verification scripts.
+from tllm.runtime.lifecycle import make_plain_llm
+
 
 def build_greedy_params(max_new_tokens: int, seed: int, ignore_eos: bool = False) -> SamplingParams:
     return SamplingParams(
@@ -67,39 +71,6 @@ def build_prompt_batch(base_prompts: List[str], batch_size: int) -> List[str]:
         base = base_prompts[i % len(base_prompts)]
         prompts.append(f"{base} [bench-{i}]")
     return prompts
-
-
-def make_plain_llm(
-    model_name: str,
-    dtype: str,
-    gpu_memory_utilization: float,
-    max_model_len: int,
-    enable_prefix_caching: bool,
-    enforce_eager: bool = False,
-    seed: int | None = None,
-    worker_extension_cls: str | None = None,
-    max_num_seqs: int | None = None,
-    max_num_batched_tokens: int | None = None,
-) -> LLM:
-    kwargs: dict[str, Any] = {}
-    if seed is not None:
-        kwargs["seed"] = int(seed)
-    if worker_extension_cls:
-        kwargs["worker_extension_cls"] = str(worker_extension_cls)
-    if max_num_seqs is not None:
-        kwargs["max_num_seqs"] = int(max_num_seqs)
-    if max_num_batched_tokens is not None:
-        kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
-    return LLM(
-        model=model_name,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=float(gpu_memory_utilization),
-        max_model_len=int(max_model_len),
-        enforce_eager=bool(enforce_eager),
-        dtype=dtype,
-        enable_prefix_caching=bool(enable_prefix_caching),
-        **kwargs,
-    )
 
 
 def run_throughput_case(

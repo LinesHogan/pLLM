@@ -61,8 +61,5 @@
   "module_level": {
     "runtime->producer": 1
   },
-  "local_level": {
-    "runtime->backends": 1,
-    "runtime->util": 1
-  }
+  "local_level": {}
 }
