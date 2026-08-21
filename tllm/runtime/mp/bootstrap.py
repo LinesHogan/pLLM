@@ -103,7 +103,7 @@ def capture_bootstrap_spec() -> BootstrapSpec:
     from tllm.runtime import residual_runtime
 
     runtime = residual_runtime.RUNTIME
-    from tllm.consumers.registry import describe_consumer_or_none, spec_for_consumer
+    from tllm.runtime.consumer_plugins import describe_consumer_or_none, spec_for_consumer
 
     primary = None
     skipped: list[str] = []
@@ -153,7 +153,7 @@ def runtime_matches_spec(spec: BootstrapSpec) -> bool:
 
 def apply_bootstrap_spec(spec: BootstrapSpec) -> None:
     """Rehydrate runtime config + consumers from the spec (child side)."""
-    from tllm.consumers.registry import build_consumer_from_spec
+    from tllm.runtime.consumer_plugins import build_consumer_from_spec
     from tllm.runtime import residual_runtime
 
     residual_runtime.configure_runtime(**spec.runtime_config)

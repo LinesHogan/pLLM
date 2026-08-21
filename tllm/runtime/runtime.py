@@ -80,7 +80,7 @@ class TllmRuntime:
 
             plane = active_control_plane()
             if plane is not None:
-                from tllm.consumers.registry import spec_for_consumer
+                from tllm.runtime.consumer_plugins import spec_for_consumer
 
                 spec = spec_for_consumer(consumer)
         self._consumers.append(consumer)

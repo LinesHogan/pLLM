@@ -17,6 +17,7 @@ from tllm.consumers.registry import (
     registered_consumers,
     unregister_consumer_plugin,
 )
+from tllm.runtime import consumer_plugins
 from tllm.runtime.execution_plan import compile_default_plan
 
 
@@ -32,7 +33,7 @@ class ConsumerRegistryUnitTest(unittest.TestCase):
         plugin = ConsumerPluginSpec("declared_name", Consumer, Config, Consumer)
         entry_point = SimpleNamespace(load=lambda: plugin)
         with mock.patch.object(
-            consumer_registry,
+            consumer_plugins,
             "_consumer_entry_points",
             return_value={"requested_name": entry_point},
         ):

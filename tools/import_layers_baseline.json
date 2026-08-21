@@ -63,7 +63,6 @@
   },
   "local_level": {
     "runtime->backends": 1,
-    "runtime->consumers": 4,
     "runtime->util": 1
   }
 }

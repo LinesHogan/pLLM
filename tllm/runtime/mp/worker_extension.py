@@ -169,7 +169,7 @@ class TllmWorkerExtension:
 
     def tllm_register_consumer(self, name: str, config: dict[str, Any], primary: bool = False) -> None:
         """Rebuild a consumer from its spec and activate it in this process."""
-        from tllm.consumers import registry as consumer_registry
+        from tllm.runtime import consumer_plugins as consumer_registry
         from tllm.runtime.mp.bootstrap import ConsumerSpec
 
         consumer = consumer_registry.build_consumer_from_spec(ConsumerSpec(name=str(name), config=dict(config)))
