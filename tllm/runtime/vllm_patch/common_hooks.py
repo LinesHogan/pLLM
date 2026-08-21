@@ -27,7 +27,7 @@ def _advance_distributed_collective_window(
     event_name: str,
 ) -> None:
     from tllm.runtime.state import ResidualRuntimeState
-    from tllm.workgraph.phase4 import CollectiveWindow
+    from tllm.workgraph.distributed import CollectiveWindow
 
     if not isinstance(runtime, ResidualRuntimeState):
         return

@@ -91,7 +91,7 @@ from tllm.workgraph.placement import (
     ValueFlowDesc,
     ValueKey,
 )
-from tllm.workgraph.phase4 import (
+from tllm.workgraph.distributed import (
     CollectiveDesc,
     CollectiveKey,
     CollectiveRequestDesc,

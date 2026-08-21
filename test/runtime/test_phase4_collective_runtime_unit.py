@@ -16,7 +16,7 @@ from unittest import mock
 from tllm.runtime import residual_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import placement
-from tllm.workgraph.phase4 import (
+from tllm.workgraph.distributed import (
     CollectiveBackend,
     CollectiveKey,
     CollectiveKind,
@@ -138,7 +138,7 @@ def _plan(
     topology: DistributedTopology | None = None,
     requests: tuple[CollectiveRequestDesc, ...] | None = None,
 ):
-    runtime = importlib.import_module("tllm.workgraph.phase4")
+    runtime = importlib.import_module("tllm.workgraph.distributed")
     topology = _topology() if topology is None else topology
     requests = (
         (_request("first", ParallelGroupKind.GLOBAL),)

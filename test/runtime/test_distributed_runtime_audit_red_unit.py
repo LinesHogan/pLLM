@@ -20,7 +20,7 @@ from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks
 from tllm.runtime.vllm_patch import port_runtime_hooks
 from tllm.workgraph import placement
-from tllm.workgraph.phase4 import (
+from tllm.workgraph.distributed import (
     CollectiveBackend,
     CollectiveKey,
     CollectiveKind,
@@ -120,7 +120,7 @@ def _request(
     depends_on: tuple[CollectiveKey, ...] = (),
 ) -> CollectiveRequestDesc:
     return CollectiveRequestDesc(
-        key=CollectiveKey("phase4.audit", name, 0),
+        key=CollectiveKey("distributed.audit", name, 0),
         kind=CollectiveKind.ALL_REDUCE,
         group=ParallelGroupKind.GLOBAL,
         backend=CollectiveBackend.GLOO,

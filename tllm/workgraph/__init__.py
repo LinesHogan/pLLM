@@ -159,7 +159,7 @@ from tllm.workgraph.placement import (
     schedule_candidates,
     schedule_moves,
 )
-from tllm.workgraph.phase4 import (
+from tllm.workgraph.distributed import (
     CollectiveBackend,
     CollectiveDesc,
     CollectiveKey,

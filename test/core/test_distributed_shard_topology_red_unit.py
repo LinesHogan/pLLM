@@ -14,7 +14,7 @@ from typing import Iterable
 
 import pytest
 
-from tllm.workgraph import phase4
+from tllm.workgraph import distributed
 from tllm.workgraph.frontend import StateScope
 from tllm.workgraph.placement import Placement
 
@@ -44,7 +44,7 @@ def _proxy(value: object, **changes: object) -> _FrozenAttrs:
     return _FrozenAttrs(tuple(raw.items()))
 
 
-def _topology(*, permute_tensor_order: bool = False) -> phase4.DistributedTopology:
+def _topology(*, permute_tensor_order: bool = False) -> distributed.DistributedTopology:
     coordinates = [
         (tp, pp, dp)
         for dp in range(2)
@@ -65,7 +65,7 @@ def _topology(*, permute_tensor_order: bool = False) -> phase4.DistributedTopolo
             (0, 1, 1),
         ]
     ranks = tuple(
-        phase4.TopologyRankDesc(
+        distributed.TopologyRankDesc(
             rank=rank,
             node_id=f"node-{rank}",
             local_rank=0,
@@ -76,7 +76,7 @@ def _topology(*, permute_tensor_order: bool = False) -> phase4.DistributedTopolo
         )
         for rank, (tp, pp, dp) in enumerate(coordinates)
     )
-    return phase4.DistributedTopology(
+    return distributed.DistributedTopology(
         ranks=ranks,
         tp_size=2,
         pp_size=2,
@@ -85,36 +85,36 @@ def _topology(*, permute_tensor_order: bool = False) -> phase4.DistributedTopolo
 
 
 def _requirement(
-    kind: phase4.ShardKind,
-    affinity: phase4.PlacementAffinity | None = None,
-) -> phase4.StateRequirementDesc:
-    return phase4.StateRequirementDesc(
-        key=phase4.StateKey("phase4", f"{kind.value}-weights"),
+    kind: distributed.ShardKind,
+    affinity: distributed.PlacementAffinity | None = None,
+) -> distributed.StateRequirementDesc:
+    return distributed.StateRequirementDesc(
+        key=distributed.StateKey("phase4", f"{kind.value}-weights"),
         scope=StateScope.SHARD,
-        shard=phase4.ShardSpec(
+        shard=distributed.ShardSpec(
             kind=kind,
             partitions=2,
-            axis=None if kind == phase4.ShardKind.PIPELINE else 0,
+            axis=None if kind == distributed.ShardKind.PIPELINE else 0,
         ),
-        affinity=affinity or phase4.PlacementAffinity(),
+        affinity=affinity or distributed.PlacementAffinity(),
     )
 
 
 def _state_plan(
-    kind: phase4.ShardKind,
+    kind: distributed.ShardKind,
     *,
-    topology: phase4.DistributedTopology | None = None,
-) -> phase4.DistributedFlowPlan:
+    topology: distributed.DistributedTopology | None = None,
+) -> distributed.DistributedFlowPlan:
     topology = topology or _topology()
     requirement = _requirement(kind)
-    residences = phase4._compile_state_residences(topology, (requirement,))
-    return phase4.DistributedFlowPlan(
+    residences = distributed._compile_state_residences(topology, (requirement,))
+    return distributed.DistributedFlowPlan(
         plan_epoch=1,
         topology=topology,
         state_requirements=(requirement,),
         state_residences=residences,
         local_schedules=tuple(
-            phase4.LocalCollectiveSchedule(rank.rank, ())
+            distributed.LocalCollectiveSchedule(rank.rank, ())
             for rank in topology.ranks
         ),
     )
@@ -122,7 +122,7 @@ def _state_plan(
 
 def _ordinal_residences(
     requirement: object,
-    topology: phase4.DistributedTopology,
+    topology: distributed.DistributedTopology,
     ranks: Iterable[int],
 ) -> tuple[_FrozenAttrs, ...]:
     key = getattr(requirement, "key")
@@ -146,18 +146,18 @@ def _ordinal_residences(
 
 
 def _ordinal_dataclass_residences(
-    requirement: phase4.StateRequirementDesc,
-    topology: phase4.DistributedTopology,
+    requirement: distributed.StateRequirementDesc,
+    topology: distributed.DistributedTopology,
     ranks: Iterable[int],
-) -> tuple[phase4.StateResidenceDesc, ...]:
+) -> tuple[distributed.StateResidenceDesc, ...]:
     kind = requirement.shard.kind
     return tuple(
-        phase4.StateResidenceDesc(
+        distributed.StateResidenceDesc(
             key=requirement.key,
             rank=rank_id,
             placement=topology.rank(rank_id).placement,
-            shard_index=0 if kind == phase4.ShardKind.REPLICATED else ordinal % 2,
-            replica_index=ordinal if kind == phase4.ShardKind.REPLICATED else ordinal // 2,
+            shard_index=0 if kind == distributed.ShardKind.REPLICATED else ordinal % 2,
+            replica_index=ordinal if kind == distributed.ShardKind.REPLICATED else ordinal // 2,
         )
         for ordinal, rank_id in enumerate(ranks)
     )
@@ -172,13 +172,13 @@ def _rust_validate(candidate: object) -> object:
 @pytest.mark.parametrize(
     ("kind", "candidate_ranks"),
     (
-        (phase4.ShardKind.TENSOR, (0, 2)),
-        (phase4.ShardKind.PIPELINE, (0, 1)),
-        (phase4.ShardKind.DATA, (0, 1)),
+        (distributed.ShardKind.TENSOR, (0, 2)),
+        (distributed.ShardKind.PIPELINE, (0, 1)),
+        (distributed.ShardKind.DATA, (0, 1)),
     ),
 )
 def test_python_compiler_rejects_affinity_that_is_not_coordinate_complete(
-    kind: phase4.ShardKind,
+    kind: distributed.ShardKind,
     candidate_ranks: tuple[int, ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,11 +190,11 @@ def test_python_compiler_rejects_affinity_that_is_not_coordinate_complete(
     topology = _topology()
     requirement = _requirement(
         kind,
-        phase4.PlacementAffinity(ranks=candidate_ranks),
+        distributed.PlacementAffinity(ranks=candidate_ranks),
     )
 
     with pytest.raises(ValueError):
-        phase4.compile_distributed_flow_plan(
+        distributed.compile_distributed_flow_plan(
             plan_epoch=1,
             topology=topology,
             state_requirements=(requirement,),
@@ -204,14 +204,14 @@ def test_python_compiler_rejects_affinity_that_is_not_coordinate_complete(
 @pytest.mark.parametrize(
     ("kind", "topology"),
     (
-        (phase4.ShardKind.TENSOR, _topology(permute_tensor_order=True)),
-        (phase4.ShardKind.PIPELINE, _topology()),
-        (phase4.ShardKind.DATA, _topology()),
+        (distributed.ShardKind.TENSOR, _topology(permute_tensor_order=True)),
+        (distributed.ShardKind.PIPELINE, _topology()),
+        (distributed.ShardKind.DATA, _topology()),
     ),
 )
 def test_python_plan_rejects_ordinal_residences_for_coordinate_shards(
-    kind: phase4.ShardKind,
-    topology: phase4.DistributedTopology,
+    kind: distributed.ShardKind,
+    topology: distributed.DistributedTopology,
 ) -> None:
     plan = _state_plan(kind, topology=topology)
     requirement = plan.state_requirements[0]
@@ -222,7 +222,7 @@ def test_python_plan_rejects_ordinal_residences_for_coordinate_shards(
     )
 
     with pytest.raises(ValueError):
-        phase4.DistributedFlowPlan(
+        distributed.DistributedFlowPlan(
             plan_epoch=plan.plan_epoch,
             topology=topology,
             state_requirements=plan.state_requirements,
@@ -233,30 +233,30 @@ def test_python_plan_rejects_ordinal_residences_for_coordinate_shards(
 def test_python_and_rust_reject_noncanonical_state_requirement_order() -> None:
     topology = _topology()
     requirements = (
-        _requirement(phase4.ShardKind.TENSOR),
-        _requirement(phase4.ShardKind.PIPELINE),
+        _requirement(distributed.ShardKind.TENSOR),
+        _requirement(distributed.ShardKind.PIPELINE),
     )
     canonical_requirements = tuple(
         sorted(requirements, key=lambda item: item.key.value)
     )
-    canonical_residences = phase4._compile_state_residences(
+    canonical_residences = distributed._compile_state_residences(
         topology,
         canonical_requirements,
     )
-    canonical_plan = phase4.DistributedFlowPlan(
+    canonical_plan = distributed.DistributedFlowPlan(
         plan_epoch=1,
         topology=topology,
         state_requirements=canonical_requirements,
         state_residences=canonical_residences,
         local_schedules=tuple(
-            phase4.LocalCollectiveSchedule(rank.rank, ())
+            distributed.LocalCollectiveSchedule(rank.rank, ())
             for rank in topology.ranks
         ),
     )
     shuffled_requirements = tuple(reversed(canonical_requirements))
 
     with pytest.raises((TypeError, ValueError, RuntimeError)):
-        phase4.DistributedFlowPlan(
+        distributed.DistributedFlowPlan(
             plan_epoch=canonical_plan.plan_epoch,
             topology=topology,
             state_requirements=shuffled_requirements,
@@ -272,13 +272,13 @@ def test_python_and_rust_reject_noncanonical_state_requirement_order() -> None:
 @pytest.mark.parametrize(
     ("kind", "candidate_ranks"),
     (
-        (phase4.ShardKind.TENSOR, (0, 2)),
-        (phase4.ShardKind.PIPELINE, (0, 1)),
-        (phase4.ShardKind.DATA, (0, 1)),
+        (distributed.ShardKind.TENSOR, (0, 2)),
+        (distributed.ShardKind.PIPELINE, (0, 1)),
+        (distributed.ShardKind.DATA, (0, 1)),
     ),
 )
 def test_rust_attribute_only_validator_rejects_malformed_affinity_and_residences(
-    kind: phase4.ShardKind,
+    kind: distributed.ShardKind,
     candidate_ranks: tuple[int, ...],
 ) -> None:
     topology = _topology()
@@ -312,14 +312,14 @@ def test_rust_attribute_only_validator_rejects_malformed_affinity_and_residences
 @pytest.mark.parametrize(
     ("kind", "topology"),
     (
-        (phase4.ShardKind.TENSOR, _topology(permute_tensor_order=True)),
-        (phase4.ShardKind.PIPELINE, _topology()),
-        (phase4.ShardKind.DATA, _topology()),
+        (distributed.ShardKind.TENSOR, _topology(permute_tensor_order=True)),
+        (distributed.ShardKind.PIPELINE, _topology()),
+        (distributed.ShardKind.DATA, _topology()),
     ),
 )
 def test_rust_attribute_only_validator_rejects_coordinate_mismatch_in_residences(
-    kind: phase4.ShardKind,
-    topology: phase4.DistributedTopology,
+    kind: distributed.ShardKind,
+    topology: distributed.DistributedTopology,
 ) -> None:
     plan = _state_plan(kind, topology=topology)
     requirement = plan.state_requirements[0]
@@ -337,10 +337,10 @@ def test_rust_attribute_only_validator_rejects_coordinate_mismatch_in_residences
 def test_rust_rejects_noncanonical_extra_affinity_node_id() -> None:
     topology = _topology()
     requirement = _requirement(
-        phase4.ShardKind.TENSOR,
-        phase4.PlacementAffinity(node_ids=("node-0", "node-1")),
+        distributed.ShardKind.TENSOR,
+        distributed.PlacementAffinity(node_ids=("node-0", "node-1")),
     )
-    plan = phase4.compile_distributed_flow_plan(
+    plan = distributed.compile_distributed_flow_plan(
         plan_epoch=1,
         topology=topology,
         state_requirements=(requirement,),

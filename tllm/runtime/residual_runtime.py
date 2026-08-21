@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     from tllm.runtime.scheduling.phase5_adaptive import AdaptiveRuntimeBinding
     from tllm.workgraph.ir import NodeKey
     from tllm.workgraph.placement import ValueKey
-    from tllm.workgraph.phase4 import CollectiveKey
+    from tllm.workgraph.distributed import CollectiveKey
 
 ensure_v1_env()
 

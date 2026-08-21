@@ -8,7 +8,7 @@ from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import torch
 
-from tllm.workgraph.phase4 import (
+from tllm.workgraph.distributed import (
     CollectiveDesc,
     CollectiveKey,
     CollectiveKind,

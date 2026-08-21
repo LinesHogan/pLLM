@@ -13,9 +13,9 @@ import importlib
 from typing import Iterable
 import unittest
 
-from tllm.workgraph import placement, phase4
+from tllm.workgraph import distributed, placement
 from tllm.workgraph.frontend import StateScope
-from tllm.workgraph.phase4 import (
+from tllm.workgraph.distributed import (
     CollectiveBackend,
     CollectiveKey,
     CollectiveKind,
@@ -83,7 +83,7 @@ def _request(
     depends_on: tuple[CollectiveKey, ...] = (),
 ) -> CollectiveRequestDesc:
     return CollectiveRequestDesc(
-        key=CollectiveKey("phase4.oracle", name, ordinal),
+        key=CollectiveKey("distributed.oracle", name, ordinal),
         kind=CollectiveKind.ALL_REDUCE,
         group=group,
         backend=CollectiveBackend.GLOO,
@@ -93,11 +93,11 @@ def _request(
 
 
 def _plan():
-    return importlib.import_module("tllm.workgraph.phase4").compile_distributed_flow_plan(
+    return importlib.import_module("tllm.workgraph.distributed").compile_distributed_flow_plan(
         plan_epoch=12,
         topology=_topology(),
         collective_requests=(
-            _request("second", ParallelGroupKind.GLOBAL, depends_on=(CollectiveKey("phase4.oracle", "first", 0),)),
+            _request("second", ParallelGroupKind.GLOBAL, depends_on=(CollectiveKey("distributed.oracle", "first", 0),)),
             _request("first", ParallelGroupKind.TENSOR, window=CollectiveWindow.PREPARE),
         ),
     )
@@ -463,12 +463,12 @@ class Phase4DistributedValidatorOracleUnitTest(unittest.TestCase):
 
     def test_python_and_rust_reject_reserved_delimiters_in_state_keys(self) -> None:
         base_plan = _plan()
-        plan = phase4.compile_distributed_flow_plan(
+        plan = distributed.compile_distributed_flow_plan(
             plan_epoch=base_plan.plan_epoch,
             topology=base_plan.topology,
             state_requirements=(
                 StateRequirementDesc(
-                    key=StateKey("phase4.oracle", "weights"),
+                    key=StateKey("distributed.oracle", "weights"),
                     scope=StateScope.REPLICA,
                     shard=ShardSpec(ShardKind.REPLICATED),
                 ),

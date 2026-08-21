@@ -18,16 +18,16 @@ from tllm.workgraph.signature import structural_signature
 
 def _phase4(test_case: unittest.TestCase):
     try:
-        return importlib.import_module("tllm.workgraph.phase4")
+        return importlib.import_module("tllm.workgraph.distributed")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
             "Phase 4 WorkGraph contracts are not implemented: "
-            "tllm.workgraph.phase4 is required"
+            "tllm.workgraph.distributed is required"
         )
         raise AssertionError from exc
 
 
-def _topology(phase4: object, *, helper: bool = False) -> object:
+def _topology(distributed: object, *, helper: bool = False) -> object:
     """Build a two-node 2x2x2 model mesh, optionally with one helper GPU."""
 
     ranks = []
@@ -38,7 +38,7 @@ def _topology(phase4: object, *, helper: bool = False) -> object:
                 node_id = "node-a" if rank < 4 else "node-b"
                 local_rank = rank if rank < 4 else rank - 4
                 ranks.append(
-                    phase4.TopologyRankDesc(
+                    distributed.TopologyRankDesc(
                         rank=rank,
                         node_id=node_id,
                         local_rank=local_rank,
@@ -50,18 +50,18 @@ def _topology(phase4: object, *, helper: bool = False) -> object:
                 )
     if helper:
         ranks.append(
-            phase4.TopologyRankDesc(
+            distributed.TopologyRankDesc(
                 rank=8,
                 node_id="node-b",
                 local_rank=4,
                 placement=Placement("cuda", 4),
-                role=phase4.RankRole.HELPER,
+                role=distributed.RankRole.HELPER,
                 tp_rank=None,
                 pp_rank=None,
                 dp_rank=None,
             )
         )
-    return phase4.DistributedTopology(
+    return distributed.DistributedTopology(
         ranks=tuple(ranks),
         tp_size=2,
         pp_size=2,
@@ -69,48 +69,48 @@ def _topology(phase4: object, *, helper: bool = False) -> object:
     )
 
 
-def _request_set(phase4: object) -> tuple[object, ...]:
+def _request_set(distributed: object) -> tuple[object, ...]:
     """A dependency chain touching TP, PP, DP, and helper communicators."""
 
-    tp = phase4.CollectiveKey("train", "tp", 0)
-    pp = phase4.CollectiveKey("train", "pp", 0)
-    dp = phase4.CollectiveKey("train", "dp", 0)
-    helper = phase4.CollectiveKey("train", "helper", 0)
+    tp = distributed.CollectiveKey("train", "tp", 0)
+    pp = distributed.CollectiveKey("train", "pp", 0)
+    dp = distributed.CollectiveKey("train", "dp", 0)
+    helper = distributed.CollectiveKey("train", "helper", 0)
     return (
-        phase4.CollectiveRequestDesc(
+        distributed.CollectiveRequestDesc(
             key=tp,
-            kind=phase4.CollectiveKind.ALL_REDUCE,
-            group=phase4.ParallelGroupKind.TENSOR,
+            kind=distributed.CollectiveKind.ALL_REDUCE,
+            group=distributed.ParallelGroupKind.TENSOR,
             group_index=0,
-            backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+            backend=distributed.CollectiveBackend.NCCL,
+            window=distributed.CollectiveWindow.BEFORE_COMPUTE,
             value=ValueKey("hidden", 1),
         ),
-        phase4.CollectiveRequestDesc(
+        distributed.CollectiveRequestDesc(
             key=pp,
-            kind=phase4.CollectiveKind.ALL_GATHER,
-            group=phase4.ParallelGroupKind.PIPELINE,
+            kind=distributed.CollectiveKind.ALL_GATHER,
+            group=distributed.ParallelGroupKind.PIPELINE,
             group_index=0,
-            backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.AFTER_COMPUTE,
+            backend=distributed.CollectiveBackend.NCCL,
+            window=distributed.CollectiveWindow.AFTER_COMPUTE,
             depends_on=(tp,),
         ),
-        phase4.CollectiveRequestDesc(
+        distributed.CollectiveRequestDesc(
             key=dp,
-            kind=phase4.CollectiveKind.REDUCE_SCATTER,
-            group=phase4.ParallelGroupKind.DATA,
+            kind=distributed.CollectiveKind.REDUCE_SCATTER,
+            group=distributed.ParallelGroupKind.DATA,
             group_index=0,
-            backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.STEP_END,
+            backend=distributed.CollectiveBackend.NCCL,
+            window=distributed.CollectiveWindow.STEP_END,
             depends_on=(pp,),
         ),
-        phase4.CollectiveRequestDesc(
+        distributed.CollectiveRequestDesc(
             key=helper,
-            kind=phase4.CollectiveKind.BARRIER,
-            group=phase4.ParallelGroupKind.HELPER,
+            kind=distributed.CollectiveKind.BARRIER,
+            group=distributed.ParallelGroupKind.HELPER,
             group_index=0,
-            backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.STEP_END,
+            backend=distributed.CollectiveBackend.NCCL,
+            window=distributed.CollectiveWindow.STEP_END,
             depends_on=(dp,),
         ),
     )
@@ -118,9 +118,9 @@ def _request_set(phase4: object) -> tuple[object, ...]:
 
 class Phase4TopologyTest(unittest.TestCase):
     def test_tp_pp_dp_groups_are_complete_and_canonically_ordered(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4)
-        reordered = phase4.DistributedTopology(
+        distributed = _phase4(self)
+        topology = _topology(distributed)
+        reordered = distributed.DistributedTopology(
             ranks=tuple(reversed(topology.ranks)),
             tp_size=topology.tp_size,
             pp_size=topology.pp_size,
@@ -128,36 +128,36 @@ class Phase4TopologyTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            topology.groups(phase4.ParallelGroupKind.TENSOR),
+            topology.groups(distributed.ParallelGroupKind.TENSOR),
             ((0, 1), (2, 3), (4, 5), (6, 7)),
         )
         self.assertEqual(
-            reordered.groups(phase4.ParallelGroupKind.TENSOR),
-            topology.groups(phase4.ParallelGroupKind.TENSOR),
+            reordered.groups(distributed.ParallelGroupKind.TENSOR),
+            topology.groups(distributed.ParallelGroupKind.TENSOR),
         )
         self.assertEqual(
-            reordered.groups(phase4.ParallelGroupKind.PIPELINE),
-            topology.groups(phase4.ParallelGroupKind.PIPELINE),
+            reordered.groups(distributed.ParallelGroupKind.PIPELINE),
+            topology.groups(distributed.ParallelGroupKind.PIPELINE),
         )
         self.assertEqual(
-            reordered.groups(phase4.ParallelGroupKind.DATA),
-            topology.groups(phase4.ParallelGroupKind.DATA),
+            reordered.groups(distributed.ParallelGroupKind.DATA),
+            topology.groups(distributed.ParallelGroupKind.DATA),
         )
         self.assertEqual(
-            topology.groups(phase4.ParallelGroupKind.PIPELINE),
+            topology.groups(distributed.ParallelGroupKind.PIPELINE),
             ((0, 2), (1, 3), (4, 6), (5, 7)),
         )
         self.assertEqual(
-            topology.groups(phase4.ParallelGroupKind.DATA),
+            topology.groups(distributed.ParallelGroupKind.DATA),
             ((0, 4), (1, 5), (2, 6), (3, 7)),
         )
-        self.assertEqual(topology.groups(phase4.ParallelGroupKind.GLOBAL), (tuple(range(8)),))
+        self.assertEqual(topology.groups(distributed.ParallelGroupKind.GLOBAL), (tuple(range(8)),))
 
     def test_helper_gpu_has_a_separate_group_and_cross_node_model_mesh_is_preserved(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4, helper=True)
+        distributed = _phase4(self)
+        topology = _topology(distributed, helper=True)
 
-        self.assertEqual(topology.groups(phase4.ParallelGroupKind.HELPER), ((8,),))
+        self.assertEqual(topology.groups(distributed.ParallelGroupKind.HELPER), ((8,),))
         self.assertEqual(topology.rank(0).node_id, "node-a")
         self.assertEqual(topology.rank(4).node_id, "node-b")
         self.assertNotEqual(topology.rank(0).node_id, topology.rank(4).node_id)
@@ -166,7 +166,7 @@ class Phase4TopologyTest(unittest.TestCase):
 
 class Phase4StatePlanningTest(unittest.TestCase):
     def test_state_key_rejects_value_delimiters_in_namespace_and_name(self) -> None:
-        phase4 = _phase4(self)
+        distributed = _phase4(self)
 
         for field in ("namespace", "name"):
             for delimiter in (":", "@"):
@@ -174,37 +174,37 @@ class Phase4StatePlanningTest(unittest.TestCase):
                     values = {"namespace": "model", "name": "weights"}
                     values[field] = f"{values[field]}{delimiter}part"
                     with self.assertRaises(ValueError):
-                        phase4.StateKey(**values)
+                        distributed.StateKey(**values)
 
     def test_frontend_state_scope_and_all_shard_residences_are_typed(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4)
+        distributed = _phase4(self)
+        topology = _topology(distributed)
         requirements = (
-            phase4.StateRequirementDesc(
-                key=phase4.StateKey("model", "tensor"),
+            distributed.StateRequirementDesc(
+                key=distributed.StateKey("model", "tensor"),
                 scope=StateScope.SHARD,
-                shard=phase4.ShardSpec(phase4.ShardKind.TENSOR, partitions=2, axis=0),
-                affinity=phase4.PlacementAffinity(ranks=(0, 1, 2, 3)),
+                shard=distributed.ShardSpec(distributed.ShardKind.TENSOR, partitions=2, axis=0),
+                affinity=distributed.PlacementAffinity(ranks=(0, 1, 2, 3)),
             ),
-            phase4.StateRequirementDesc(
-                key=phase4.StateKey("model", "pipeline"),
+            distributed.StateRequirementDesc(
+                key=distributed.StateKey("model", "pipeline"),
                 scope=StateScope.SHARD,
-                shard=phase4.ShardSpec(phase4.ShardKind.PIPELINE, partitions=2),
-                affinity=phase4.PlacementAffinity(node_ids=("node-b",)),
+                shard=distributed.ShardSpec(distributed.ShardKind.PIPELINE, partitions=2),
+                affinity=distributed.PlacementAffinity(node_ids=("node-b",)),
             ),
-            phase4.StateRequirementDesc(
-                key=phase4.StateKey("model", "data"),
+            distributed.StateRequirementDesc(
+                key=distributed.StateKey("model", "data"),
                 scope=StateScope.SHARD,
-                shard=phase4.ShardSpec(phase4.ShardKind.DATA, partitions=2, axis=0),
+                shard=distributed.ShardSpec(distributed.ShardKind.DATA, partitions=2, axis=0),
             ),
-            phase4.StateRequirementDesc(
-                key=phase4.StateKey("model", "replica"),
+            distributed.StateRequirementDesc(
+                key=distributed.StateKey("model", "replica"),
                 scope=StateScope.REPLICA,
-                shard=phase4.ShardSpec(phase4.ShardKind.REPLICATED),
-                affinity=phase4.PlacementAffinity(node_ids=("node-a",)),
+                shard=distributed.ShardSpec(distributed.ShardKind.REPLICATED),
+                affinity=distributed.PlacementAffinity(node_ids=("node-a",)),
             ),
         )
-        plan = phase4.compile_distributed_flow_plan(
+        plan = distributed.compile_distributed_flow_plan(
             plan_epoch=1,
             topology=topology,
             state_requirements=requirements,
@@ -234,37 +234,37 @@ class Phase4StatePlanningTest(unittest.TestCase):
         self.assertTrue(all(isinstance(item.placement, Placement) for item in plan.state_residences))
 
     def test_state_scope_and_shard_contracts_reject_untyped_or_incompatible_declarations(self) -> None:
-        phase4 = _phase4(self)
-        typed_requirement = phase4.StateRequirementDesc(
-            phase4.StateKey("model", "typed-scope"),
+        distributed = _phase4(self)
+        typed_requirement = distributed.StateRequirementDesc(
+            distributed.StateKey("model", "typed-scope"),
             StateScope.SHARD,
-            phase4.ShardSpec(phase4.ShardKind.TENSOR, partitions=2, axis=0),
+            distributed.ShardSpec(distributed.ShardKind.TENSOR, partitions=2, axis=0),
         )
         self.assertIsInstance(typed_requirement.scope, StateScope)
-        topology = _topology(phase4)
+        topology = _topology(distributed)
         with self.assertRaises((TypeError, ValueError)):
-            phase4.compile_distributed_flow_plan(
+            distributed.compile_distributed_flow_plan(
                 plan_epoch=1,
                 topology=topology,
                 state_requirements=(
-                    phase4.StateRequirementDesc(
-                        phase4.StateKey("model", "request"),
+                    distributed.StateRequirementDesc(
+                        distributed.StateKey("model", "request"),
                         StateScope.REQUEST,
-                        phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+                        distributed.ShardSpec(distributed.ShardKind.REPLICATED),
                     ),
                 ),
             )
         with self.assertRaises((TypeError, ValueError)):
-            phase4.StateRequirementDesc(
-                phase4.StateKey("model", "replicated-shard"),
+            distributed.StateRequirementDesc(
+                distributed.StateKey("model", "replicated-shard"),
                 StateScope.SHARD,
-                phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+                distributed.ShardSpec(distributed.ShardKind.REPLICATED),
             )
 
 
 class Phase4CollectivePlanningTest(unittest.TestCase):
     def test_collective_key_rejects_value_delimiters_in_namespace_and_name(self) -> None:
-        phase4 = _phase4(self)
+        distributed = _phase4(self)
 
         for field in ("namespace", "name"):
             for delimiter in (":", "/"):
@@ -272,26 +272,26 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
                     values = {"namespace": "train", "name": "hidden"}
                     values[field] = f"{values[field]}{delimiter}part"
                     with self.assertRaises(ValueError):
-                        phase4.CollectiveKey(**values)
+                        distributed.CollectiveKey(**values)
 
     def test_collective_global_order_is_window_monotonic_and_rejects_time_travel(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4)
-        after = phase4.CollectiveRequestDesc(
-            key=phase4.CollectiveKey("window", "after"),
-            kind=phase4.CollectiveKind.ALL_REDUCE,
-            group=phase4.ParallelGroupKind.GLOBAL,
-            backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.AFTER_COMPUTE,
+        distributed = _phase4(self)
+        topology = _topology(distributed)
+        after = distributed.CollectiveRequestDesc(
+            key=distributed.CollectiveKey("window", "after"),
+            kind=distributed.CollectiveKind.ALL_REDUCE,
+            group=distributed.ParallelGroupKind.GLOBAL,
+            backend=distributed.CollectiveBackend.NCCL,
+            window=distributed.CollectiveWindow.AFTER_COMPUTE,
         )
-        before = phase4.CollectiveRequestDesc(
-            key=phase4.CollectiveKey("window", "before"),
-            kind=phase4.CollectiveKind.ALL_REDUCE,
-            group=phase4.ParallelGroupKind.GLOBAL,
-            backend=phase4.CollectiveBackend.NCCL,
-            window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+        before = distributed.CollectiveRequestDesc(
+            key=distributed.CollectiveKey("window", "before"),
+            kind=distributed.CollectiveKind.ALL_REDUCE,
+            group=distributed.ParallelGroupKind.GLOBAL,
+            backend=distributed.CollectiveBackend.NCCL,
+            window=distributed.CollectiveWindow.BEFORE_COMPUTE,
         )
-        plan = phase4.compile_distributed_flow_plan(
+        plan = distributed.compile_distributed_flow_plan(
             plan_epoch=1,
             topology=topology,
             collective_requests=(after, before),
@@ -302,7 +302,7 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            phase4.compile_distributed_flow_plan(
+            distributed.compile_distributed_flow_plan(
                 plan_epoch=2,
                 topology=topology,
                 collective_requests=(
@@ -312,17 +312,17 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
             )
 
     def test_collective_plan_builds_typed_communicators_and_rank_local_schedules(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4, helper=True)
-        plan = phase4.compile_distributed_flow_plan(
+        distributed = _phase4(self)
+        topology = _topology(distributed, helper=True)
+        plan = distributed.compile_distributed_flow_plan(
             plan_epoch=2,
             topology=topology,
-            collective_requests=_request_set(phase4),
+            collective_requests=_request_set(distributed),
         )
 
         self.assertEqual(
             tuple(item.key for item in plan.collectives),
-            tuple(item.key for item in _request_set(phase4)),
+            tuple(item.key for item in _request_set(distributed)),
         )
         self.assertEqual(
             {
@@ -330,10 +330,10 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
                 for item in plan.communicators
             },
             {
-                phase4.ParallelGroupKind.TENSOR: ((0, 1), phase4.CollectiveBackend.NCCL),
-                phase4.ParallelGroupKind.PIPELINE: ((0, 2), phase4.CollectiveBackend.NCCL),
-                phase4.ParallelGroupKind.DATA: ((0, 4), phase4.CollectiveBackend.NCCL),
-                phase4.ParallelGroupKind.HELPER: ((8,), phase4.CollectiveBackend.NCCL),
+                distributed.ParallelGroupKind.TENSOR: ((0, 1), distributed.CollectiveBackend.NCCL),
+                distributed.ParallelGroupKind.PIPELINE: ((0, 2), distributed.CollectiveBackend.NCCL),
+                distributed.ParallelGroupKind.DATA: ((0, 4), distributed.CollectiveBackend.NCCL),
+                distributed.ParallelGroupKind.HELPER: ((8,), distributed.CollectiveBackend.NCCL),
             },
         )
         schedules = {item.rank: item.collectives for item in plan.local_schedules}
@@ -343,15 +343,15 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
         self.assertEqual(schedules[7], ())
 
     def test_different_declaration_order_has_one_structural_plan_and_signature(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4, helper=True)
-        requests = _request_set(phase4)
-        first = phase4.compile_distributed_flow_plan(
+        distributed = _phase4(self)
+        topology = _topology(distributed, helper=True)
+        requests = _request_set(distributed)
+        first = distributed.compile_distributed_flow_plan(
             plan_epoch=3,
             topology=topology,
             collective_requests=requests,
         )
-        second = phase4.compile_distributed_flow_plan(
+        second = distributed.compile_distributed_flow_plan(
             plan_epoch=3,
             topology=topology,
             collective_requests=tuple(reversed(requests)),
@@ -360,42 +360,42 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
         self.assertEqual(structural_signature(first), structural_signature(second))
 
     def test_compile_plan_is_independent_of_state_and_collective_declaration_order(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4, helper=True)
+        distributed = _phase4(self)
+        topology = _topology(distributed, helper=True)
         requirements = (
-            phase4.StateRequirementDesc(
-                phase4.StateKey("model", "a"),
+            distributed.StateRequirementDesc(
+                distributed.StateKey("model", "a"),
                 StateScope.REPLICA,
-                phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+                distributed.ShardSpec(distributed.ShardKind.REPLICATED),
             ),
-            phase4.StateRequirementDesc(
-                phase4.StateKey("model-x", "a"),
+            distributed.StateRequirementDesc(
+                distributed.StateKey("model-x", "a"),
                 StateScope.REPLICA,
-                phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+                distributed.ShardSpec(distributed.ShardKind.REPLICATED),
             ),
         )
         requests = (
-            *_request_set(phase4),
-            phase4.CollectiveRequestDesc(
-                key=phase4.CollectiveKey("train", "a"),
-                kind=phase4.CollectiveKind.ALL_REDUCE,
-                group=phase4.ParallelGroupKind.GLOBAL,
-                window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+            *_request_set(distributed),
+            distributed.CollectiveRequestDesc(
+                key=distributed.CollectiveKey("train", "a"),
+                kind=distributed.CollectiveKind.ALL_REDUCE,
+                group=distributed.ParallelGroupKind.GLOBAL,
+                window=distributed.CollectiveWindow.BEFORE_COMPUTE,
             ),
-            phase4.CollectiveRequestDesc(
-                key=phase4.CollectiveKey("train-x", "a"),
-                kind=phase4.CollectiveKind.ALL_REDUCE,
-                group=phase4.ParallelGroupKind.GLOBAL,
-                window=phase4.CollectiveWindow.BEFORE_COMPUTE,
+            distributed.CollectiveRequestDesc(
+                key=distributed.CollectiveKey("train-x", "a"),
+                kind=distributed.CollectiveKind.ALL_REDUCE,
+                group=distributed.ParallelGroupKind.GLOBAL,
+                window=distributed.CollectiveWindow.BEFORE_COMPUTE,
             ),
         )
-        first = phase4.compile_distributed_flow_plan(
+        first = distributed.compile_distributed_flow_plan(
             plan_epoch=5,
             topology=topology,
             state_requirements=requirements,
             collective_requests=requests,
         )
-        second = phase4.compile_distributed_flow_plan(
+        second = distributed.compile_distributed_flow_plan(
             plan_epoch=5,
             topology=topology,
             state_requirements=tuple(reversed(requirements)),
@@ -411,20 +411,20 @@ class Phase4CollectivePlanningTest(unittest.TestCase):
         self.assertEqual(
             tuple(item.key for item in first.collectives[:3]),
             (
-                phase4.CollectiveKey("train", "a"),
-                phase4.CollectiveKey("train", "tp"),
-                phase4.CollectiveKey("train-x", "a"),
+                distributed.CollectiveKey("train", "a"),
+                distributed.CollectiveKey("train", "tp"),
+                distributed.CollectiveKey("train-x", "a"),
             ),
         )
 
 
 class Phase4FailFastTest(unittest.TestCase):
     def test_bad_or_missing_topology_rank_fails_fast(self) -> None:
-        phase4 = _phase4(self)
+        distributed = _phase4(self)
         with self.assertRaises((TypeError, ValueError)):
-            phase4.DistributedTopology(
+            distributed.DistributedTopology(
                 ranks=(
-                    phase4.TopologyRankDesc(
+                    distributed.TopologyRankDesc(
                         rank=1,
                         node_id="node-a",
                         local_rank=0,
@@ -433,15 +433,15 @@ class Phase4FailFastTest(unittest.TestCase):
                 ),
             )
         with self.assertRaises((TypeError, ValueError)):
-            phase4.DistributedTopology(
+            distributed.DistributedTopology(
                 ranks=(
-                    phase4.TopologyRankDesc(
+                    distributed.TopologyRankDesc(
                         rank=0,
                         node_id="node-a",
                         local_rank=0,
                         placement=Placement("cuda", 0),
                     ),
-                    phase4.TopologyRankDesc(
+                    distributed.TopologyRankDesc(
                         rank=1,
                         node_id="node-a",
                         local_rank=0,
@@ -451,62 +451,62 @@ class Phase4FailFastTest(unittest.TestCase):
             )
 
     def test_bad_group_dependency_and_shard_fail_fast(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4)
-        unknown_dependency = phase4.CollectiveRequestDesc(
-            key=phase4.CollectiveKey("bad", "dependent"),
-            kind=phase4.CollectiveKind.ALL_REDUCE,
-            group=phase4.ParallelGroupKind.TENSOR,
-            depends_on=(phase4.CollectiveKey("bad", "missing"),),
+        distributed = _phase4(self)
+        topology = _topology(distributed)
+        unknown_dependency = distributed.CollectiveRequestDesc(
+            key=distributed.CollectiveKey("bad", "dependent"),
+            kind=distributed.CollectiveKind.ALL_REDUCE,
+            group=distributed.ParallelGroupKind.TENSOR,
+            depends_on=(distributed.CollectiveKey("bad", "missing"),),
         )
-        bad_group = phase4.CollectiveRequestDesc(
-            key=phase4.CollectiveKey("bad", "group"),
-            kind=phase4.CollectiveKind.ALL_REDUCE,
-            group=phase4.ParallelGroupKind.TENSOR,
+        bad_group = distributed.CollectiveRequestDesc(
+            key=distributed.CollectiveKey("bad", "group"),
+            kind=distributed.CollectiveKind.ALL_REDUCE,
+            group=distributed.ParallelGroupKind.TENSOR,
             group_index=99,
         )
         with self.assertRaises((TypeError, ValueError, RuntimeError)):
-            phase4.compile_distributed_flow_plan(
+            distributed.compile_distributed_flow_plan(
                 plan_epoch=1,
                 topology=topology,
                 collective_requests=(unknown_dependency,),
             )
         with self.assertRaises((TypeError, ValueError, RuntimeError)):
-            phase4.compile_distributed_flow_plan(
+            distributed.compile_distributed_flow_plan(
                 plan_epoch=1,
                 topology=topology,
                 collective_requests=(bad_group,),
             )
         with self.assertRaises((TypeError, ValueError, RuntimeError)):
-            phase4.compile_distributed_flow_plan(
+            distributed.compile_distributed_flow_plan(
                 plan_epoch=1,
                 topology=topology,
                 state_requirements=(
-                    phase4.StateRequirementDesc(
-                        phase4.StateKey("bad", "shard"),
+                    distributed.StateRequirementDesc(
+                        distributed.StateKey("bad", "shard"),
                         StateScope.SHARD,
-                        phase4.ShardSpec(phase4.ShardKind.TENSOR, partitions=3, axis=0),
+                        distributed.ShardSpec(distributed.ShardKind.TENSOR, partitions=3, axis=0),
                     ),
                 ),
             )
 
     def test_direct_plan_rejects_phantom_or_omitted_residences_communicators_collectives_and_schedules(self) -> None:
-        phase4 = _phase4(self)
-        topology = _topology(phase4, helper=True)
-        plan = phase4.compile_distributed_flow_plan(
+        distributed = _phase4(self)
+        topology = _topology(distributed, helper=True)
+        plan = distributed.compile_distributed_flow_plan(
             plan_epoch=4,
             topology=topology,
             state_requirements=(
-                phase4.StateRequirementDesc(
-                    phase4.StateKey("model", "weights"),
+                distributed.StateRequirementDesc(
+                    distributed.StateKey("model", "weights"),
                     StateScope.REPLICA,
-                    phase4.ShardSpec(phase4.ShardKind.REPLICATED),
+                    distributed.ShardSpec(distributed.ShardKind.REPLICATED),
                 ),
             ),
-            collective_requests=_request_set(phase4),
+            collective_requests=_request_set(distributed),
         )
-        phantom_residence = phase4.StateResidenceDesc(
-            phase4.StateKey("phantom", "state"),
+        phantom_residence = distributed.StateResidenceDesc(
+            distributed.StateKey("phantom", "state"),
             rank=0,
             placement=Placement("cuda", 0),
             shard_index=0,
