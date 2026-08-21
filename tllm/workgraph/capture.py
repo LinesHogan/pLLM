@@ -7,6 +7,7 @@ import builtins
 import hashlib
 import inspect
 import json
+import operator
 import textwrap
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
@@ -101,6 +102,23 @@ class _ExportModule(torch.nn.Module):
 
     def forward(self, *args: object, **kwargs: object) -> object:
         return self._function(*args, **kwargs)
+
+
+class _BoundMethodExportModule(torch.nn.Module):
+    """Export root for one Program flow method.
+
+    The Program instance is registered as a submodule so torch.export lifts
+    its parameters and buffers as typed placeholders (visible in
+    ``graph_signature``) instead of baking them in as constants.
+    """
+
+    def __init__(self, instance: torch.nn.Module, function: FunctionType) -> None:
+        super().__init__()
+        self._program_instance = instance
+        self._function = function
+
+    def forward(self, *args: object, **kwargs: object) -> object:
+        return self._function(self._program_instance, *args, **kwargs)
 
 
 class _CaptureRejected(RuntimeError):
@@ -417,6 +435,9 @@ def _dynamic_shapes(
     if not dimensions:
         return None
     specs: list[dict[int, object] | None] = [None] * len(args)
+    # Inputs with the same bounded spec (e.g. source/target batch rows) share
+    # one Dim so export records their equality instead of rejecting it.
+    shared: dict[tuple[int, int, int], object] = {}
     for dimension in dimensions:
         argument_index = dimension.value_path[0]
         if argument_index >= len(args) or not torch.is_tensor(args[argument_index]):
@@ -441,11 +462,14 @@ def _dynamic_shapes(
                 "dynamic dimension is declared more than once",
                 source_span,
             )
-        spec[dimension.dimension] = torch.export.Dim(
-            f"d_{argument_index}_{dimension.dimension}",
-            min=dimension.lower_bound,
-            max=dimension.upper_bound,
-        )
+        shared_key = (dimension.dimension, dimension.lower_bound, dimension.upper_bound)
+        if shared_key not in shared:
+            shared[shared_key] = torch.export.Dim(
+                f"d_{argument_index}_{dimension.dimension}",
+                min=dimension.lower_bound,
+                max=dimension.upper_bound,
+            )
+        spec[dimension.dimension] = shared[shared_key]
     return {"args": tuple(specs)}
 
 
@@ -700,6 +724,31 @@ def _lower_exported_program(
             schema = target._schema  # pyright: ignore[reportPrivateUsage]
             namespace = target.namespace
         except AttributeError as exc:
+            if node.target is operator.getitem:
+                # Pure pytree selector emitted by multi-return ATen ops; it has
+                # no OpSchema but is a typed, pure, capture-safe projection.
+                output_ordinal = ordinal_by_node[node]
+                input_ordinals = tuple(ordinal_by_node[item] for item in node.all_input_nodes)
+                output_ids = (
+                    (f"leaf/{output_ordinal}@1",) if node in tensor_by_node else ()
+                )
+                effect_by_ordinal[output_ordinal] = Effect.PURE
+                operators.append(
+                    LeafOperatorDesc(
+                        ordinal=output_ordinal,
+                        namespace="operator",
+                        name="getitem",
+                        overload="",
+                        inputs=input_ordinals,
+                        outputs=output_ids,
+                        module_path=_operator_module_path(node.meta),
+                        operator_kind=OperatorKind.CUSTOM,
+                        effects=(Effect.PURE,),
+                        capabilities=(Capability.CAPTURE_SAFE,),
+                        attributes=_operator_attributes(node, source_span),
+                    )
+                )
+                continue
             raise _CaptureRejected(
                 FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
                 "export produced an operator without a typed schema",
@@ -979,4 +1028,69 @@ def capture_flow(
     return captured, exported_program
 
 
-__all__ = ["capture_flow"]
+def capture_module_flow(
+    instance: torch.nn.Module,
+    function: FunctionType,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    *,
+    bindings: tuple[PortBindingDesc, ...] = (),
+    dynamic_dims: tuple[DynamicDim, ...] = (),
+) -> tuple[CapturedFlow, torch.export.ExportedProgram | None]:
+    """Capture one module-bound Program flow with parameters lifted.
+
+    Mirrors ``capture_flow`` but exports through a wrapper module that owns
+    the Program instance, so ``ExportedProgram.graph_signature`` separates
+    user inputs from parameters and buffers. ``function`` is the raw
+    (unwrapped) method function; ``args`` exclude ``self``.
+    """
+
+    if not isinstance(cast(object, instance), torch.nn.Module):
+        raise TypeError("capture_module_flow.instance must be an nn.Module")
+    if not isinstance(cast(object, function), FunctionType):
+        raise TypeError("capture_module_flow.function must be a Python function")
+    if any(not _is_supported_input(value) for value in (*args, *kwargs.values())):
+        source_span = SourceSpan.from_callable(function)
+        return _opaque_capture(
+            function,
+            bindings,
+            (
+                _Evidence(
+                    FlowCaptureCode.UNKNOWN_SIDE_EFFECT,
+                    "capture inputs contain an unsupported runtime object",
+                    source_span,
+                ),
+            ),
+        ), None
+    evidence = _preflight(function)
+    if evidence:
+        return _opaque_capture(function, bindings, evidence), None
+    source_span = SourceSpan.from_callable(function)
+    try:
+        dynamic_shapes = _dynamic_shapes(args, dynamic_dims, source_span)
+        exported_program = torch.export.export(
+            _BoundMethodExportModule(instance, function),
+            args,
+            kwargs,
+            dynamic_shapes=dynamic_shapes,
+            strict=True,
+        )
+        captured = _lower_exported_program(function, exported_program, bindings)
+    except _CaptureRejected as exc:
+        return _opaque_capture(
+            function, bindings, (_Evidence(exc.code, str(exc), exc.source_span),)
+        ), None
+    except Exception as exc:
+        evidence = (
+            _Evidence(
+                FlowCaptureCode.STRICT_EXPORT_FAILURE,
+                "strict torch.export capture failed",
+                source_span,
+            ),
+        )
+        _ = exc
+        return _opaque_capture(function, bindings, evidence), None
+    return captured, exported_program
+
+
+__all__ = ["capture_flow", "capture_module_flow"]

@@ -413,8 +413,8 @@ class CapturedValueDesc:
             cast(object, self.alias_set), "CapturedValueDesc.alias_set", nonempty=True
         )
         effect = _require_instance(cast(object, self.effect), Effect, "CapturedValueDesc.effect")
-        if version < 1 or not shape or not stride:
-            raise ValueError("CapturedValueDesc requires version, shape, and stride facts")
+        if version < 1:
+            raise ValueError("CapturedValueDesc requires version >= 1")
         object.__setattr__(self, "value_id", value_id)
         object.__setattr__(self, "version", version)
         object.__setattr__(self, "shape", shape)

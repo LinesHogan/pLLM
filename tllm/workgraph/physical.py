@@ -591,12 +591,20 @@ def compile_physical_capture_region(
     plan: ShadowParityPlan,
     artifact_key: ArtifactKey,
     executor_desc: PhysicalRegionExecutorDesc | None = None,
+    *,
+    allow_task_partition: bool = False,
 ) -> PhysicalCaptureRegion:
     """Lower one complete hierarchy root into an independently runnable plan.
 
     Compatibility producer/consumer nodes are intentionally absent.  They
     remain authoritative legacy boundaries while this plan owns only the
     explicitly migrated capture task.
+
+    ``allow_task_partition`` is the Program-lowering escape hatch: stage
+    slicing (``tllm.program``) produces one capture task per hook stage, so
+    Program callers opt in and receive one physical node per task in
+    dependency order. The legacy path keeps requiring exactly one complete
+    capture task (``WG421_UNSUPPORTED_CAPTURE_PARTITION``).
     """
 
     from tllm.workgraph.shadow import ShadowParityPlan
@@ -651,6 +659,11 @@ def compile_physical_capture_region(
         raise WorkGraphError(
             "WG422_OPAQUE_CAPTURE_REGION",
             "opaque capture artifacts cannot become physical regions",
+        )
+    if allow_task_partition:
+        # Program lowering: one physical node per stage capture task.
+        return _compile_partitioned_region(
+            raw_plan, root, attachment, key, implementation
         )
     if len(root.children) != 1:
         raise WorkGraphError(
@@ -707,6 +720,81 @@ def compile_physical_capture_region(
         executor_contract=(
             None if implementation is None else implementation.contract
         ),
+    )
+
+
+def _compile_partitioned_region(
+    plan: ShadowParityPlan,
+    root: RootFlowDesc,
+    attachment: CaptureAttachment,
+    key: ArtifactKey,
+    implementation: PhysicalRegionExecutorDesc | None,
+) -> PhysicalCaptureRegion:
+    """Program-only lowering: one physical node per stage capture task.
+
+    Reachable only via ``allow_task_partition=True``; the legacy single-task
+    rule (WG421) is untouched for direct captures.
+    """
+    from tllm.workgraph.lowering import WorkGraphError
+
+    policy = _capture_policy(root)
+    if implementation is not None and implementation.contract.capability == Capability.EAGER_ONLY:
+        policy = CapturePolicy.DISABLED
+    task_node_by_region = {task.key: task.node_key for task in root.children}
+    nodes: list[PhysicalNodePlan] = []
+    fence_ordinal = 0
+    for task in root.children:
+        leaf = task.children[0]
+        task_policy = policy
+        if leaf.leaf_artifact is None or not leaf.leaf_artifact.operators:
+            task_policy = CapturePolicy.DISABLED
+        fences: list[FenceDependencyDesc] = []
+        for dependency in task.dependencies:
+            producer = task_node_by_region.get(dependency)
+            if producer is None:
+                raise WorkGraphError(
+                    "WG420_UNKNOWN_CAPTURE_REGION",
+                    "program stage depends on a task outside its capture root",
+                )
+            fences.append(
+                FenceDependencyDesc(
+                    fence=FenceKey("workgraph", "partition", fence_ordinal),
+                    producer=producer,
+                    consumer=task.node_key,
+                    kind=FenceKind.READY,
+                )
+            )
+            fence_ordinal += 1
+        nodes.append(
+            PhysicalNodePlan(
+                node_key=task.node_key,
+                executor=(
+                    task.executor if implementation is None else implementation.executor
+                ),
+                stream=StreamClass.SIDE_FORWARD,
+                artifact_key=key,
+                fences=tuple(fences),
+                capture_policy=task_policy,
+                fallback_policy=FallbackPolicy.EAGER,
+            )
+        )
+    physical = PhysicalFlowPlan(
+        plan_epoch=plan.epoch,
+        nodes=tuple(nodes),
+    )
+    try:
+        from tllm import core as _core
+
+        _core.validate_physical_flow_plan(physical)
+    except (TypeError, ValueError) as exc:
+        raise WorkGraphError(
+            "WG400_RUST_PHYSICAL_VALIDATION",
+            "Rust partitioned capture-region descriptor validation failed",
+        ) from exc
+    return PhysicalCaptureRegion(
+        attachment=attachment,
+        plan=physical,
+        executor_contract=None if implementation is None else implementation.contract,
     )
 
 
