@@ -15,18 +15,14 @@ persistent buffers and be declared ``GraphSafety.CAPTURE_SAFE`` (or
 from __future__ import annotations
 
 import os
-from enum import Enum, auto
 from typing import Any
 
 from tllm.backends.protocol import GraphSafety
+# Canonical home: tllm.workgraph.graph_mode. Re-exported here; existing
+# runtime/backends users keep importing it from this module.
+from tllm.workgraph.graph_mode import GraphMode
 
 DEBUG_GRAPH_MODE_ENV = "TLLM_DEBUG_GRAPH_MODE"
-
-
-class GraphMode(Enum):
-    EAGER = auto()
-    PIECEWISE = auto()  # attention eager, the rest captured/replayed
-    FULL = auto()  # whole-step capture/replay
 
 
 class GraphPolicyError(RuntimeError):

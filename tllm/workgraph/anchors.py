@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from tllm.backends.protocol import BackendCapabilities, GraphSafety, SamplerStage
-from tllm.runtime.graph_policy import GraphMode
+from tllm.workgraph.graph_mode import GraphMode
 from tllm.workgraph.ir import AnchorDesc, BackendSnapshot
 
 

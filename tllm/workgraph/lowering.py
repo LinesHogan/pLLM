@@ -17,7 +17,7 @@ from tllm.ports.base import (
 )
 from tllm.ports.port_id import PortId
 from tllm.producers.registry import ExecutionPlan, PlannedProducer
-from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.workgraph.dispatch import DispatchPlanLike
 from tllm.workgraph.anchors import (
     BackendCompatibilityError,
     anchor_desc,
@@ -277,7 +277,7 @@ def _producer_node(
 def lower_plans(
     *,
     consumers: Sequence[BaseConsumer[object]],
-    dispatch_plan: DispatchPlan,
+    dispatch_plan: DispatchPlanLike,
     execution_plan: ExecutionPlan,
     backend: BackendSnapshot,
     strict_native: bool = False,

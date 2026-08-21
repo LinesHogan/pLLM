@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import cast
 
 from tllm.producers.registry import ExecutionPlan
-from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.workgraph.dispatch import DispatchPlanLike
 from tllm.workgraph.ir import RuntimePlanBinding
 
 
@@ -199,7 +199,7 @@ def _event(
     )
 
 
-def legacy_event_trace(dispatch_plan: DispatchPlan, execution_plan: ExecutionPlan) -> EventTrace:
+def legacy_event_trace(dispatch_plan: DispatchPlanLike, execution_plan: ExecutionPlan) -> EventTrace:
     """Lower authoritative runtime plans into their stable event sequence."""
 
     events: list[TraceEvent] = []

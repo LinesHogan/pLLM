@@ -63,8 +63,7 @@
     "runtime->consumers": 7,
     "runtime->producer": 1,
     "runtime->util": 1,
-    "workgraph->consumers": 2,
-    "workgraph->runtime": 5
+    "workgraph->consumers": 2
   },
   "local_level": {
     "runtime->consumers": 2

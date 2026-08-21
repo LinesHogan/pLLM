@@ -7,7 +7,7 @@ from typing import Any, Sequence, cast
 
 from tllm.consumers.base import BaseConsumer
 from tllm.producers.registry import ExecutionPlan
-from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.workgraph.dispatch import DispatchPlanLike
 from tllm.workgraph.anchors import shadow_backend_snapshot
 from tllm.workgraph.explain import explain_workgraph
 from tllm.workgraph.frontend import CapturedFlow
@@ -114,7 +114,7 @@ def _current_signature(
 def compile_shadow_parity(
     *,
     consumers: Sequence[BaseConsumer[object]],
-    dispatch_plan: DispatchPlan,
+    dispatch_plan: DispatchPlanLike,
     execution_plan: ExecutionPlan,
     backend: BackendSnapshot,
     previous: ShadowParityPlan | None = None,
@@ -232,7 +232,7 @@ def compile_shadow_parity(
 def compile_shadow_snapshot(
     *,
     consumers: Sequence[BaseConsumer[object]],
-    dispatch_plan: DispatchPlan,
+    dispatch_plan: DispatchPlanLike,
     execution_plan: ExecutionPlan,
     previous: ShadowParityPlan | None = None,
     captures: tuple[CapturedFlow, ...] = (),

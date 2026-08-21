@@ -14,7 +14,7 @@ from typing import cast
 from tllm.ports.address import PortAddressDesc, port_address_desc
 from tllm.ports.port_id import PortId
 from tllm.producers.registry import ExecutionPlan
-from tllm.runtime.dispatch_plan import DispatchPlan
+from tllm.workgraph.dispatch import DispatchPlanLike
 from tllm.workgraph.frontend import (
     ArtifactKey,
     Capability,
@@ -905,13 +905,13 @@ def _capture_leases(
 def _validate_attachments(
     captures: tuple[CapturedFlow, ...],
     attachments: tuple[CaptureAttachment, ...],
-    dispatch_plan: DispatchPlan,
+    dispatch_plan: DispatchPlanLike,
     execution_plan: ExecutionPlan,
     semantic: SemanticGraph | None,
 ) -> None:
     capture_by_artifact = {capture.artifact_key: capture for capture in captures}
     flow_by_node = {
-        NodeKey.consumer_flow(target.flow_id.rsplit("#", 1)[0], int(target.flow_id.rsplit("#", 1)[1])): target.flow
+        NodeKey.consumer_flow(target.consumer_id, target.flow_ordinal): target.flow
         for target in dispatch_plan.flow_targets()
     }
     producer_nodes = {
@@ -968,7 +968,7 @@ def build_hierarchy(
     *,
     captures: tuple[CapturedFlow, ...],
     attachments: tuple[CaptureAttachment, ...],
-    dispatch_plan: DispatchPlan,
+    dispatch_plan: DispatchPlanLike,
     execution_plan: ExecutionPlan,
     semantic: SemanticGraph | None = None,
 ) -> CaptureHierarchy:

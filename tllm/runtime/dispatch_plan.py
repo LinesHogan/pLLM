@@ -27,6 +27,11 @@ class FlowDispatchTarget:
     flow: ConsumerFlow
     flow_id: str = ""
     placement_hook: str = "execute_model.post"
+    flow_ordinal: int = 0
+
+    @property
+    def consumer_id(self) -> str:
+        return str(self.consumer.consumer_id)
 
 
 class DispatchPlan:
@@ -84,6 +89,7 @@ class DispatchPlan:
                 consumer=consumer,
                 flow=flow,
                 flow_id=flow_id,
+                flow_ordinal=int(flow_id.rsplit("#", 1)[1]),
             )
             for flow_id, consumer, flow in flow_records
         ]
