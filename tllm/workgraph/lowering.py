@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence, cast
 
-from tllm.consumers.base import BaseConsumer
+from tllm.ports.consumer import BaseConsumer
 from tllm.ports.address import PortAddressDesc, port_address_desc
 from tllm.ports.base import (
     ConsumerFlow,

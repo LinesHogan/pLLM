@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
-from tllm.consumers.base import BaseConsumer
+from tllm.ports.consumer import BaseConsumer
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Sequence
 import torch
 
 from tllm.common.state import ensure_v1_env, pick_common_attn_metadata, resolve_object_by_path
-from tllm.consumers.base import BaseConsumer
+from tllm.ports.consumer import BaseConsumer
 from tllm.contracts.consumer_stats import TrainingStats, merge_training_stats_maps
 from tllm.contracts.request_identity import resolve_prompt_sample
 

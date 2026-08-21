@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Sequence, cast
 
-from tllm.consumers.base import BaseConsumer
+from tllm.ports.consumer import BaseConsumer
 from tllm.producers.registry import ExecutionPlan
 from tllm.workgraph.dispatch import DispatchPlanLike
 from tllm.workgraph.anchors import shadow_backend_snapshot

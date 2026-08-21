@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional
 
-from tllm.consumers.base import BaseConsumer
+from tllm.ports.consumer import BaseConsumer
 from tllm.ports.base import ConsumerFlow
 from tllm.ports.base import PortKind
 from tllm.contracts.subscription import ConsumerSubscription

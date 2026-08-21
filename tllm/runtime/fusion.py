@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from tllm.consumers.base import FusionGroupHandle
+from tllm.ports.consumer import FusionGroupHandle
 from tllm.contracts.port_bundle import BundleKey, PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 

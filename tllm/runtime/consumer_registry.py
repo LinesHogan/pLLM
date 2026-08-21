@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Iterable, List
 
-from tllm.consumers.base import BaseConsumer
+from tllm.ports.consumer import BaseConsumer
 
 
 class ConsumerRegistry:

@@ -60,12 +60,12 @@
   },
   "module_level": {
     "runtime->backends": 1,
-    "runtime->consumers": 7,
+    "runtime->consumers": 2,
     "runtime->producer": 1,
-    "runtime->util": 1,
-    "workgraph->consumers": 2
+    "runtime->util": 1
   },
   "local_level": {
+    "ports->runtime": 1,
     "runtime->consumers": 2
   }
 }
