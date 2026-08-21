@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import wraps
@@ -10,6 +11,7 @@ from types import FunctionType
 from typing import Callable, ParamSpec, Protocol, TypeVar, cast, get_type_hints, overload
 
 from tllm.ports.address import PortAddressDesc
+from tllm.ports.base import TimingDeadline
 from tllm.ports.port_id import PortId
 from tllm.workgraph.ir import (
     GraphSafetyKind,
@@ -804,6 +806,138 @@ class ExternCallable(Protocol[_P, _R_co]):
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R_co: ...
 
 
+# ---------------------------------------------------------------------------
+# Program declaration vocabulary (plan: ESamp program compiler).
+#
+# These descriptors extend ``flow``/``extern`` with the Program-level
+# declaration surface: where inputs come from, which named outputs escape to
+# sinks, cross-function value references, and state keys. They are pure
+# control-plane data; ``tllm.program`` lowers them.
+# ---------------------------------------------------------------------------
+
+
+def _program_str(value: object, label: str) -> str:
+    """Program-name validator: TypeError for non-str, ValueError for empty."""
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be str, got {type(value).__name__}")
+    if not value:
+        raise ValueError(f"{label} must be a non-empty str")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenSource:
+    """flow input source: hidden rows from one layer/site/phase port."""
+
+    layer: int
+    site: str
+    phase: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layer, int) or isinstance(self.layer, bool):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard
+            raise TypeError("hidden layer must be an int")
+        _program_str(cast(object, self.site), "hidden.site")
+        _program_str(cast(object, self.phase), "hidden.phase")
+
+
+@dataclass(frozen=True, slots=True)
+class SinkRef:
+    """flow named output handed to a registered sink (e.g. ``guidance``)."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        _program_str(cast(object, self.name), "sink.name")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalRef:
+    """flow named output used only by Program-internal data edges."""
+
+
+@dataclass(frozen=True, slots=True)
+class ResultRef:
+    """extern input source: one named output of another flow."""
+
+    flow: str
+    output: str
+
+    def __post_init__(self) -> None:
+        _program_str(cast(object, self.flow), "result.flow")
+        _program_str(cast(object, self.output), "result.output")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptIdxKey:
+    """State key source: prompt identity from bundle metadata."""
+
+
+def hidden(layer: int, site: str, phase: str) -> HiddenSource:
+    return HiddenSource(layer=layer, site=site, phase=phase)
+
+
+def sink(name: str) -> SinkRef:
+    return SinkRef(name=name)
+
+
+def local() -> LocalRef:
+    return LocalRef()
+
+
+def result(flow_name: str, output_name: str) -> ResultRef:
+    return ResultRef(flow=flow_name, output=output_name)
+
+
+def request_prompt_idx() -> PromptIdxKey:
+    return PromptIdxKey()
+
+
+@dataclass(frozen=True, slots=True)
+class FlowProgramDecl:
+    """Program-mode metadata recorded by ``@flow(inputs/outputs/state)``."""
+
+    inputs: tuple[tuple[str, HiddenSource], ...]
+    outputs: tuple[tuple[str, SinkRef | LocalRef], ...]
+    state: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExternProgramDecl:
+    """Program-mode metadata recorded by ``@extern(inputs/after/deadline)``."""
+
+    inputs: tuple[tuple[str, ResultRef | HiddenSource], ...]
+    after: tuple[str, ...]
+    state: str | None
+    deadline: TimingDeadline | None
+
+
+def _program_mapping(
+    value: object,
+    value_types: tuple[type, ...],
+    label: str,
+) -> tuple[tuple[str, object], ...]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping of name to descriptor")
+    items: list[tuple[str, object]] = []
+    for key, item in cast(Mapping[object, object], value).items():
+        key_str = _require_str(key, f"{label} key", nonempty=True)
+        if not isinstance(item, value_types):
+            raise TypeError(
+                f"{label}[{key_str!r}] must be {'/'.join(t.__name__ for t in value_types)}, "
+                f"got {type(item).__name__}"
+            )
+        items.append((key_str, item))
+    return tuple(items)
+
+
+def _check_param_names(pairs: tuple[tuple[str, object], ...], function: Callable[..., object], label: str) -> None:
+    params = set(inspect.signature(function).parameters)
+    params.discard("self")
+    for key, _ in pairs:
+        if key not in params:
+            raise ValueError(f"{label} key {key!r} is not a parameter of {function.__name__}")
+
+
 class FlowCallable(Protocol[_P, _R_co]):
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R_co: ...
 
@@ -822,6 +956,9 @@ def flow(
     freshness: _BeforeNextUse = BeforeNextUse,
     bindings: tuple[PortBindingDesc, ...] = (),
     dynamic_dims: tuple[DynamicDim, ...] = (),
+    inputs: Mapping[str, HiddenSource] | None = None,
+    outputs: Mapping[str, SinkRef | LocalRef] | None = None,
+    state: str | None = None,
 ) -> Callable[[Callable[_P, _R]], FlowCallable[_P, _R]]: ...
 
 
@@ -832,17 +969,42 @@ def flow(
     freshness: _BeforeNextUse = BeforeNextUse,
     bindings: tuple[PortBindingDesc, ...] = (),
     dynamic_dims: tuple[DynamicDim, ...] = (),
+    inputs: Mapping[str, HiddenSource] | None = None,
+    outputs: Mapping[str, SinkRef | LocalRef] | None = None,
+    state: str | None = None,
 ) -> FlowCallable[_P, _R] | Callable[[Callable[_P, _R]], FlowCallable[_P, _R]]:
-    """Wrap a function transparently; only ``.capture`` enters control-plane capture."""
+    """Wrap a function transparently; only ``.capture`` enters control-plane capture.
+
+    ``inputs``/``outputs``/``state`` are the keyword-only Program declaration
+    surface (see ``tllm.program``); omitting all three preserves the legacy
+    decorator exactly.
+    """
 
     if freshness is not BeforeNextUse:
         raise TypeError("flow.freshness must be the BeforeNextUse singleton")
     bindings = _require_tuple(cast(object, bindings), PortBindingDesc, "flow.bindings")
     dynamic_dims = _require_tuple(cast(object, dynamic_dims), DynamicDim, "flow.dynamic_dims")
+    program_inputs: tuple[tuple[str, object], ...] = ()
+    program_outputs: tuple[tuple[str, object], ...] = ()
+    if inputs is not None:
+        program_inputs = _program_mapping(inputs, (HiddenSource,), "flow.inputs")
+    if outputs is not None:
+        program_outputs = _program_mapping(outputs, (SinkRef, LocalRef), "flow.outputs")
+    if state is not None:
+        _require_str(cast(object, state), "flow.state", nonempty=True)
+    program_mode = inputs is not None or outputs is not None or state is not None
 
     def decorate(target: Callable[_P, _R]) -> FlowCallable[_P, _R]:
         if not isinstance(target, FunctionType):
             raise TypeError("flow currently requires a Python function")
+        program_decl: FlowProgramDecl | None = None
+        if program_mode:
+            _check_param_names(program_inputs, target, "flow.inputs")
+            program_decl = FlowProgramDecl(
+                inputs=cast(tuple[tuple[str, HiddenSource], ...], program_inputs),
+                outputs=cast(tuple[tuple[str, SinkRef | LocalRef], ...], program_outputs),
+                state=state,
+            )
 
         @wraps(target)
         def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -868,6 +1030,7 @@ def flow(
         setattr(wrapped, "flow_freshness", freshness)
         setattr(wrapped, "flow_bindings", bindings)
         setattr(wrapped, "flow_dynamic_dims", dynamic_dims)
+        setattr(wrapped, "flow_program", program_decl)
         return cast(FlowCallable[_P, _R], wrapped)
 
     if function is None:
@@ -883,6 +1046,9 @@ def _resolved_signature(function: Callable[..., object]) -> inspect.Signature:
         raise TypeError("extern annotations must resolve to concrete types") from exc
     parameters: list[inspect.Parameter] = []
     for parameter in signature.parameters.values():
+        if parameter.name in ("self", "cls"):
+            # Method receivers carry the Program instance, not an extern input.
+            continue
         if parameter.annotation is inspect.Parameter.empty or parameter.name not in hints:
             raise TypeError(f"extern input {parameter.name!r} requires a concrete annotation")
         parameters.append(parameter.replace(annotation=hints[parameter.name]))
@@ -893,25 +1059,87 @@ def _resolved_signature(function: Callable[..., object]) -> inspect.Signature:
 
 def extern(
     *,
-    effect: Effect,
-    state: StateScope,
-    device: Device,
-    capability: Capability,
+    effect: Effect | None = None,
+    state: StateScope | str | None = None,
+    device: Device | None = None,
+    capability: Capability | None = None,
     bindings: tuple[PortBindingDesc, ...] = (),
+    inputs: Mapping[str, ResultRef | HiddenSource] | None = None,
+    after: tuple[str, ...] = (),
+    deadline: TimingDeadline | None = None,
 ) -> Callable[[Callable[_P, _R]], ExternCallable[_P, _R]]:
-    """Declare a typed opaque implementation while retaining normal Python calls."""
+    """Declare a typed opaque implementation while retaining normal Python calls.
 
+    Two surfaces share this decorator:
+
+    - legacy: ``effect``/``state``(StateScope)/``device``/``capability`` are all
+      required and no Program metadata is recorded;
+    - Program: ``inputs``/``after``/``deadline`` and a string ``state`` name
+      declare cross-function data edges and timing; the contract fields default
+      to ``WRITE_STATE``/``CUDA``/``CAPTURE_SAFE``.
+    """
+
+    bindings = _require_tuple(cast(object, bindings), PortBindingDesc, "extern.bindings")
+    program_mode = (
+        inputs is not None
+        or bool(after)
+        or deadline is not None
+        # StateScope is a StrEnum; a plain str state name means Program mode.
+        or (isinstance(state, str) and not isinstance(state, StateScope))
+    )
+    program_inputs: tuple[tuple[str, object], ...] = ()
+    program_after: tuple[str, ...] = ()
+    if program_mode:
+        if inputs is not None:
+            program_inputs = _program_mapping(inputs, (ResultRef, HiddenSource), "extern.inputs")
+        if after:
+            if not isinstance(cast(object, after), tuple):
+                raise TypeError("extern.after must be a tuple of flow names")
+            for name in after:
+                _require_str(cast(object, name), "extern.after entry", nonempty=True)
+            program_after = after
+        if deadline is not None and not isinstance(cast(object, deadline), TimingDeadline):
+            raise TypeError("extern.deadline must be a TimingDeadline")
+        if state is not None:
+            _require_str(cast(object, state), "extern.state", nonempty=True)
+        if effect is None:
+            effect = Effect.WRITE_STATE
+        if device is None:
+            device = Device.CUDA
+        if capability is None:
+            capability = Capability.CAPTURE_SAFE
+        if state is None:
+            raise ValueError("extern Program mode requires a state name")
+    else:
+        if effect is None or state is None or device is None or capability is None:
+            raise TypeError(
+                "extern requires effect/state/device/capability in legacy mode"
+            )
     effect = _require_instance(cast(object, effect), Effect, "extern.effect")
-    state = _require_instance(cast(object, state), StateScope, "extern.state")
     device = _require_instance(cast(object, device), Device, "extern.device")
     capability = _require_instance(cast(object, capability), Capability, "extern.capability")
-    bindings = _require_tuple(cast(object, bindings), PortBindingDesc, "extern.bindings")
+    state_scope: StateScope
+    if program_mode:
+        # Program state ownership is carried by ExternProgramDecl.state; the
+        # contract scope is a placeholder until tllm.program lowers the node.
+        state_scope = StateScope.NONE
+    else:
+        state_scope = _require_instance(cast(object, state), StateScope, "extern.state")
 
     def decorate(function: Callable[_P, _R]) -> ExternCallable[_P, _R]:
         if not isinstance(function, FunctionType):
             raise TypeError("extern currently requires a Python function")
+        program_decl: ExternProgramDecl | None = None
+        if program_mode:
+            _check_param_names(program_inputs, function, "extern.inputs")
+            program_decl = ExternProgramDecl(
+                inputs=cast(tuple[tuple[str, ResultRef | HiddenSource], ...], program_inputs),
+                after=program_after,
+                state=cast(str | None, state),
+                deadline=deadline,
+            )
         signature = _resolved_signature(function)
-        inputs = tuple(
+        inputs_desc = tuple(
             ExternInputDesc(
                 position=position,
                 name=parameter.name,
@@ -920,10 +1148,10 @@ def extern(
             for position, parameter in enumerate(signature.parameters.values())
         )
         contract = ExternContract(
-            inputs=inputs,
+            inputs=inputs_desc,
             output=TypeDesc.from_annotation(signature.return_annotation),
             effect=effect,
-            state=state,
+            state=state_scope,
             device=device,
             capability=capability,
             bindings=bindings,
@@ -935,6 +1163,7 @@ def extern(
 
         setattr(wrapped, "__signature__", signature)
         setattr(wrapped, "extern_contract", contract)
+        setattr(wrapped, "extern_program", program_decl)
         return cast(ExternCallable[_P, _R], wrapped)
 
     return decorate
@@ -973,6 +1202,18 @@ __all__ = [
     "TensorLayout",
     "TypeDesc",
     "UseDefDesc",
+    "ExternProgramDecl",
+    "FlowProgramDecl",
+    "HiddenSource",
+    "LocalRef",
+    "PromptIdxKey",
+    "ResultRef",
+    "SinkRef",
     "extern",
     "flow",
+    "hidden",
+    "local",
+    "request_prompt_idx",
+    "result",
+    "sink",
 ]

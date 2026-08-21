@@ -50,6 +50,8 @@ RULES: dict[str, frozenset[str]] = {
     "producers": frozenset({"contracts", "ports", "core"}),
     "workgraph": frozenset({"contracts", "ports", "producers", "core"}),
     "runtime": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
+    # Program compiler: lowers frontend declarations into static IR.
+    "program": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
     # Backend drivers are adapters *above* the runtime: they may import it,
     # but the runtime must never import a concrete driver (only the pure
     # protocol module, via SANCTIONED_EDGES).
