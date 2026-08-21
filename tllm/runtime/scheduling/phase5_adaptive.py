@@ -15,7 +15,7 @@ from types import MappingProxyType
 from typing import TypeVar, cast
 
 from tllm.workgraph.ir import NodeKey
-from tllm.workgraph.phase3 import MoveKey, PlacementPlan, ValueKey
+from tllm.workgraph.placement import MoveKey, PlacementPlan, ValueKey
 from tllm.workgraph.phase5 import (
     AdmissionMode,
     CandidateActionDesc,

@@ -36,7 +36,7 @@ from tllm.workgraph.physical import (
     PhysicalFlowPlan,
     StreamClass,
 )
-from tllm.workgraph.phase3 import PlacementPlan
+from tllm.workgraph.placement import PlacementPlan
 from tllm.workgraph.phase5 import CandidateActionDesc, Phase5ControlPlan
 
 

@@ -16,7 +16,7 @@ from enum import StrEnum
 from itertools import product
 from typing import TypeVar, cast
 
-from tllm.workgraph.phase3 import MoveKey, PlacementPlan, ScheduledMove
+from tllm.workgraph.placement import MoveKey, PlacementPlan, ScheduledMove
 
 
 _T = TypeVar("_T")

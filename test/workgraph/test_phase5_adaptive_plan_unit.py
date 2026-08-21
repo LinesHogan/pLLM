@@ -6,7 +6,7 @@ from dataclasses import FrozenInstanceError, replace
 import unittest
 
 from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph.phase3 import (
+from tllm.workgraph.placement import (
     CopyEngine,
     CopyEngineCapacityDesc,
     DeviceKind,

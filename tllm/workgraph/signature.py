@@ -70,7 +70,7 @@ from tllm.workgraph.physical import (
     PhysicalFlowPlan,
     PhysicalNodePlan,
 )
-from tllm.workgraph.phase3 import (
+from tllm.workgraph.placement import (
     CopyEngineCapacityDesc,
     DeviceTopology,
     DurationProfile,

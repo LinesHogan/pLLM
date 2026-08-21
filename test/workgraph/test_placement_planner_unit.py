@@ -34,9 +34,9 @@ def _phase3(test_case: unittest.TestCase):
     """Load Phase 3 while keeping the baseline failure explicit."""
 
     try:
-        return importlib.import_module("tllm.workgraph.phase3")
+        return importlib.import_module("tllm.workgraph.placement")
     except (ImportError, ModuleNotFoundError) as exc:
-        test_case.fail("Phase 3 module tllm.workgraph.phase3 is required")
+        test_case.fail("Phase 3 module tllm.workgraph.placement is required")
         raise AssertionError from exc
 
 
@@ -537,7 +537,7 @@ class Phase3PlacementPlanTest(unittest.TestCase):
                 FenceDependencyDesc, FenceKey, FenceKind, PhysicalFlowPlan,
                 PhysicalNodePlan, StreamClass,
             )
-            from tllm.workgraph.phase3 import (
+            from tllm.workgraph.placement import (
                 DeviceTopology, DurationProfile, ImplementationRegistry,
                 ImplementationSpec, Placement, ValueFlowDesc, ValueKey,
                 compile_placement_plan,

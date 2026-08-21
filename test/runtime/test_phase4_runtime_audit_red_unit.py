@@ -19,7 +19,7 @@ from tllm.runtime.scheduling import phase4_collective as phase4_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks
 from tllm.runtime.vllm_patch import port_runtime_hooks
-from tllm.workgraph import phase3
+from tllm.workgraph import placement
 from tllm.workgraph.phase4 import (
     CollectiveBackend,
     CollectiveKey,
@@ -81,7 +81,7 @@ def _topology() -> DistributedTopology:
                 rank=0,
                 node_id="cpu-node",
                 local_rank=0,
-                placement=phase3.Placement("cpu"),
+                placement=placement.Placement("cpu"),
                 tp_rank=0,
                 pp_rank=0,
                 dp_rank=0,
@@ -100,7 +100,7 @@ def _two_rank_topology() -> DistributedTopology:
                 rank=rank,
                 node_id=f"cpu-node-{rank}",
                 local_rank=0,
-                placement=phase3.Placement("cpu"),
+                placement=placement.Placement("cpu"),
                 tp_rank=rank,
                 pp_rank=0,
                 dp_rank=0,

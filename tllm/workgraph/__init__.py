@@ -116,7 +116,7 @@ from tllm.workgraph.physical import (
     compile_physical_capture_region,
     compile_physical_flow_plan,
 )
-from tllm.workgraph.phase3 import (
+from tllm.workgraph.placement import (
     CopyAdmission,
     CopyEngine,
     CopyEngineAdmission,

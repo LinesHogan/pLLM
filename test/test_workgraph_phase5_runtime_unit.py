@@ -29,7 +29,7 @@ from tllm.workgraph.phase5 import (
     WorkloadBucketDesc,
     WorkloadBucketKey,
 )
-from tllm.workgraph.phase3 import DeviceTopology, PlacementPlan
+from tllm.workgraph.placement import DeviceTopology, PlacementPlan
 
 
 class WorkGraphPhase5RuntimeUnitTest(unittest.TestCase):

@@ -15,7 +15,7 @@ from unittest import mock
 
 from tllm.runtime import residual_runtime
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.workgraph import phase3
+from tllm.workgraph import placement
 from tllm.workgraph.phase4 import (
     CollectiveBackend,
     CollectiveKey,
@@ -91,7 +91,7 @@ def _topology(*, helper: bool = False) -> DistributedTopology:
                         rank=rank,
                         node_id=f"node-{rank // 4}",
                         local_rank=rank % 4,
-                        placement=phase3.Placement("cpu"),
+                        placement=placement.Placement("cpu"),
                         tp_rank=tp,
                         pp_rank=pp,
                         dp_rank=dp,
@@ -104,7 +104,7 @@ def _topology(*, helper: bool = False) -> DistributedTopology:
                 rank=rank,
                 node_id="helper-node",
                 local_rank=0,
-                placement=phase3.Placement("cpu"),
+                placement=placement.Placement("cpu"),
                 role=RankRole.HELPER,
                 tp_rank=None,
                 pp_rank=None,

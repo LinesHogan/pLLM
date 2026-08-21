@@ -21,11 +21,11 @@ def _phase3(test_case: unittest.TestCase):
     """Load the future Phase 3 module and turn a missing surface into a red test."""
 
     try:
-        return importlib.import_module("tllm.workgraph.phase3")
+        return importlib.import_module("tllm.workgraph.placement")
     except (ImportError, ModuleNotFoundError) as exc:
         test_case.fail(
             "Phase 3 WorkGraph contracts are not implemented: "
-            "tllm.workgraph.phase3 is required"
+            "tllm.workgraph.placement is required"
         )
         raise AssertionError from exc
 

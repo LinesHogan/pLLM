@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import TypeVar, cast
 
 from tllm.workgraph.frontend import StateScope
-from tllm.workgraph.phase3 import Placement, ValueKey
+from tllm.workgraph.placement import Placement, ValueKey
 
 
 class RankRole(StrEnum):

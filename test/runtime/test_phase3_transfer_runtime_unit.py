@@ -1,6 +1,6 @@
 """Red CPU-only contracts for Phase 3 pinned-memory transfer execution.
 
-The metadata planner lives in :mod:`tllm.workgraph.phase3`; this module pins
+The metadata planner lives in :mod:`tllm.workgraph.placement`; this module pins
 the runtime side of that boundary.  Every tensor, fence, and copy operation is
 fake so the tests exercise ownership and ordering without requiring CUDA.
 """
@@ -22,7 +22,7 @@ from tllm.runtime.scheduling.plan_store import (
 )
 from tllm.runtime.scheduling.workgraph_executor import PhysicalExecutor
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.workgraph import phase3
+from tllm.workgraph import placement
 from tllm.workgraph.ir import ExecutorKey, NodeKey
 from tllm.workgraph.physical import (
     FenceDependencyDesc,
@@ -116,22 +116,22 @@ def _size(shape: tuple[int, ...]) -> int:
     return size
 
 
-def _move(source: object, destination: object, kind: phase3.MoveKind) -> phase3.Move:
-    value = phase3.ValueKey("hidden", 1)
-    return phase3.Move(
+def _move(source: object, destination: object, kind: placement.MoveKind) -> placement.Move:
+    value = placement.ValueKey("hidden", 1)
+    return placement.Move(
         value=value,
-        source=phase3.Residency(value, source),
-        destination=phase3.Residency(value, destination),
+        source=placement.Residency(value, source),
+        destination=placement.Residency(value, destination),
         kind=kind,
         byte_count=16,
     )
 
 
-def _placement_plan_with_capacities() -> phase3.PlacementPlan:
-    source = NodeKey.producer("phase3.runtime.source")
-    target = NodeKey.consumer_flow("phase3.runtime.target", 0)
-    source_executor = ExecutorKey("logical", "phase3.runtime.source")
-    target_executor = ExecutorKey("logical", "phase3.runtime.target")
+def _placement_plan_with_capacities() -> placement.PlacementPlan:
+    source = NodeKey.producer("placement.runtime.source")
+    target = NodeKey.consumer_flow("placement.runtime.target", 0)
+    source_executor = ExecutorKey("logical", "placement.runtime.source")
+    target_executor = ExecutorKey("logical", "placement.runtime.target")
     physical = PhysicalFlowPlan(
         plan_epoch=19,
         nodes=(
@@ -149,41 +149,41 @@ def _placement_plan_with_capacities() -> phase3.PlacementPlan:
             ),
         ),
     )
-    registry = phase3.ImplementationRegistry()
+    registry = placement.ImplementationRegistry()
     registry.register(
-        phase3.ImplementationSpec(
-            ExecutorKey("implementation", "phase3.runtime.source.cpu"),
-            phase3.Placement("cpu"),
+        placement.ImplementationSpec(
+            ExecutorKey("implementation", "placement.runtime.source.cpu"),
+            placement.Placement("cpu"),
             _FakeImplementation(),
             logical_executor=source_executor,
-            duration=phase3.DurationProfile(1),
+            duration=placement.DurationProfile(1),
         )
     )
     registry.register(
-        phase3.ImplementationSpec(
-            ExecutorKey("implementation", "phase3.runtime.target.cuda0"),
-            phase3.Placement("cuda", 0),
+        placement.ImplementationSpec(
+            ExecutorKey("implementation", "placement.runtime.target.cuda0"),
+            placement.Placement("cuda", 0),
             _FakeImplementation(),
             logical_executor=target_executor,
-            duration=phase3.DurationProfile(1),
+            duration=placement.DurationProfile(1),
         )
     )
-    value = phase3.ValueKey("runtime", 1)
+    value = placement.ValueKey("runtime", 1)
     capacities = tuple(
-        phase3.CopyEngineCapacityDesc(engine, capacity)
+        placement.CopyEngineCapacityDesc(engine, capacity)
         for engine, capacity in (
-            (phase3.CopyEngine.H2D, 2),
-            (phase3.CopyEngine.D2H, 3),
-            (phase3.CopyEngine.P2P, 4),
+            (placement.CopyEngine.H2D, 2),
+            (placement.CopyEngine.D2H, 3),
+            (placement.CopyEngine.P2P, 4),
         )
     )
-    return phase3.compile_placement_plan(
+    return placement.compile_placement_plan(
         physical,
         registry=registry,
-        topology=phase3.DeviceTopology(
+        topology=placement.DeviceTopology(
             peer_access=frozenset(), cuda_devices=(0,)
         ),
-        value_flows=(phase3.ValueFlowDesc(value, source, target, 16),),
+        value_flows=(placement.ValueFlowDesc(value, source, target, 16),),
         copy_engines=capacities,
     )
 
@@ -238,8 +238,8 @@ class Phase3PinnedMemoryPoolTest(unittest.TestCase):
 
 class Phase3CopyAdmissionTest(unittest.TestCase):
     def test_copy_engine_admission_fails_closed_without_destination_lease(self) -> None:
-        admission = phase3.CopyEngineAdmission(capacity=1)
-        copy = phase3.CopyAdmission(
+        admission = placement.CopyEngineAdmission(capacity=1)
+        copy = placement.CopyAdmission(
             source="cpu.source",
             destination="pinned.destination",
             at_step=3,
@@ -250,26 +250,26 @@ class Phase3CopyAdmissionTest(unittest.TestCase):
 class Phase3CopyExecutorTest(unittest.TestCase):
     def test_physical_epoch_executes_selected_placement_implementation(self) -> None:
         transfer = _transfer_runtime(self)
-        node = NodeKey.consumer_flow("phase3.selected.runtime", 0)
-        logical = ExecutorKey("logical", "phase3.selected.runtime")
-        selected = ExecutorKey("implementation", "phase3.selected.runtime.cpu")
+        node = NodeKey.consumer_flow("placement.selected.runtime", 0)
+        logical = ExecutorKey("logical", "placement.selected.runtime")
+        selected = ExecutorKey("implementation", "placement.selected.runtime.cpu")
         physical = PhysicalFlowPlan(
             plan_epoch=29,
             nodes=(PhysicalNodePlan(node, logical, StreamClass.DEFAULT),),
         )
         trace: list[str] = []
-        registry = phase3.ImplementationRegistry()
+        registry = placement.ImplementationRegistry()
         registry.register(
-            phase3.ImplementationSpec(
+            placement.ImplementationSpec(
                 selected,
-                phase3.Placement("cpu"),
+                placement.Placement("cpu"),
                 _RecordingImplementation(trace),
                 logical_executor=logical,
             )
         )
         placement_plan, dispatcher, implementations = transfer.PlacementRuntimeBinding(
             registry=registry,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=placement.DeviceTopology(peer_access=frozenset()),
             adapter=_FakeTensorCopyAdapter(),
         ).compile(physical)
         resources = PlanResources(
@@ -300,10 +300,10 @@ class Phase3CopyExecutorTest(unittest.TestCase):
 
     def test_cold_runtime_publishes_and_dispatches_typed_placement_snapshot(self) -> None:
         transfer = _transfer_runtime(self)
-        source = NodeKey.producer("phase3.production.source")
-        target = NodeKey.consumer_flow("phase3.production.target", 0)
-        source_executor = ExecutorKey("logical", "phase3.production.source")
-        target_executor = ExecutorKey("logical", "phase3.production.target")
+        source = NodeKey.producer("placement.production.source")
+        target = NodeKey.consumer_flow("placement.production.target", 0)
+        source_executor = ExecutorKey("logical", "placement.production.source")
+        target_executor = ExecutorKey("logical", "placement.production.target")
         physical = PhysicalFlowPlan(
             plan_epoch=23,
             nodes=(
@@ -323,31 +323,31 @@ class Phase3CopyExecutorTest(unittest.TestCase):
                 ),
             ),
         )
-        registry = phase3.ImplementationRegistry()
+        registry = placement.ImplementationRegistry()
         registry.register(
-            phase3.ImplementationSpec(
-                ExecutorKey("implementation", "phase3.production.source.cpu"),
-                phase3.Placement("cpu"),
+            placement.ImplementationSpec(
+                ExecutorKey("implementation", "placement.production.source.cpu"),
+                placement.Placement("cpu"),
                 _FakeImplementation(),
                 logical_executor=source_executor,
             )
         )
         registry.register(
-            phase3.ImplementationSpec(
-                ExecutorKey("implementation", "phase3.production.target.cuda0"),
-                phase3.Placement("cuda", 0),
+            placement.ImplementationSpec(
+                ExecutorKey("implementation", "placement.production.target.cuda0"),
+                placement.Placement("cuda", 0),
                 _FakeImplementation(),
                 logical_executor=target_executor,
             )
         )
-        value = phase3.ValueKey("production", 1)
+        value = placement.ValueKey("production", 1)
         adapter = _FakeTensorCopyAdapter()
         binding = transfer.PlacementRuntimeBinding(
             registry=registry,
-            topology=phase3.DeviceTopology(
+            topology=placement.DeviceTopology(
                 peer_access=frozenset(), cuda_devices=(0,)
             ),
-            value_flows=(phase3.ValueFlowDesc(value, source, target, 16),),
+            value_flows=(placement.ValueFlowDesc(value, source, target, 16),),
             adapter=adapter,
         )
         state = ResidualRuntimeState()
@@ -403,12 +403,12 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         cpu_destination = _FakeTensor((2,), "float32", "cpu", [0.0, 0.0])
 
         h2d = executor.submit(
-            (_move(phase3.Placement("cpu"), phase3.Placement("cuda", 0), phase3.MoveKind.H2D),),
+            (_move(placement.Placement("cpu"), placement.Placement("cuda", 0), placement.MoveKind.H2D),),
             source=cpu,
             destination=gpu_destination,
         )
         d2h = executor.submit(
-            (_move(phase3.Placement("cuda", 0), phase3.Placement("cpu"), phase3.MoveKind.D2H),),
+            (_move(placement.Placement("cuda", 0), placement.Placement("cpu"), placement.MoveKind.D2H),),
             source=gpu,
             destination=cpu_destination,
         )
@@ -453,16 +453,16 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         executor = transfer.CopyExecutor(pool=pool, adapter=adapter, capacity=1)
         source = _FakeTensor((4,), "float32", "cuda:0", [1.0, 2.0, 3.0, 4.0])
         destination = _FakeTensor((4,), "float32", "cuda:1", [0.0] * 4)
-        value = phase3.ValueKey("hidden", 1)
-        request = phase3.TransferRequest(
+        value = placement.ValueKey("hidden", 1)
+        request = placement.TransferRequest(
             value=value,
-            source=phase3.Residency(value, phase3.Placement("cuda", 0)),
-            destination=phase3.Residency(value, phase3.Placement("cuda", 1)),
+            source=placement.Residency(value, placement.Placement("cuda", 0)),
+            destination=placement.Residency(value, placement.Placement("cuda", 1)),
             byte_count=16,
         )
-        moves = phase3.compile_moves(
+        moves = placement.compile_moves(
             (request,),
-            topology=phase3.DeviceTopology(
+            topology=placement.DeviceTopology(
                 peer_access=frozenset(), cuda_devices=(0, 1)
             ),
         )
@@ -472,7 +472,7 @@ class Phase3CopyExecutorTest(unittest.TestCase):
             source=source,
             destination=destination,
         )
-        self.assertEqual(tuple(move.kind for move in moves), (phase3.MoveKind.D2H, phase3.MoveKind.H2D))
+        self.assertEqual(tuple(move.kind for move in moves), (placement.MoveKind.D2H, placement.MoveKind.H2D))
         self.assertEqual(len(adapter.calls), 1)
         self.assertEqual(adapter.calls[0][0], "d2h")
         self.assertEqual(pool.in_use, 1)
@@ -498,8 +498,8 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         source = _FakeTensor((2,), "float32", "cpu", [1.0, 2.0])
         destination_a = _FakeTensor((2,), "float32", "cuda:0", [0.0, 0.0])
         destination_b = _FakeTensor((2,), "float32", "cuda:0", [0.0, 0.0])
-        h2d_a = (_move(phase3.Placement("cpu"), phase3.Placement("cuda", 0), phase3.MoveKind.H2D),)
-        h2d_b = (_move(phase3.Placement("cpu"), phase3.Placement("cuda", 0), phase3.MoveKind.H2D),)
+        h2d_a = (_move(placement.Placement("cpu"), placement.Placement("cuda", 0), placement.MoveKind.H2D),)
+        h2d_b = (_move(placement.Placement("cpu"), placement.Placement("cuda", 0), placement.MoveKind.H2D),)
 
         first = executor.submit(h2d_a, source=source, destination=destination_a)
         with self.assertRaises((BufferError, RuntimeError)):
@@ -513,16 +513,16 @@ class Phase3CopyExecutorTest(unittest.TestCase):
 
     def test_adapter_failure_on_each_staged_segment_releases_slot_and_credit(self) -> None:
         transfer = _transfer_runtime(self)
-        value = phase3.ValueKey("exception", 1)
-        request = phase3.TransferRequest(
+        value = placement.ValueKey("exception", 1)
+        request = placement.TransferRequest(
             value=value,
-            source=phase3.Residency(value, phase3.Placement("cuda", 0)),
-            destination=phase3.Residency(value, phase3.Placement("cuda", 1)),
+            source=placement.Residency(value, placement.Placement("cuda", 0)),
+            destination=placement.Residency(value, placement.Placement("cuda", 1)),
             byte_count=16,
         )
-        moves = phase3.compile_moves(
+        moves = placement.compile_moves(
             (request,),
-            topology=phase3.DeviceTopology(
+            topology=placement.DeviceTopology(
                 peer_access=frozenset(), cuda_devices=(0, 1)
             ),
         )
@@ -569,7 +569,7 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         executor = transfer.CopyExecutor(pool=pool, adapter=adapter, capacity=1)
         source = _FakeTensor((2,), "float32", "cpu", [5.0, 6.0])
         destination = _FakeTensor((2,), "float32", "cuda:0", [0.0, 0.0])
-        move = (_move(phase3.Placement("cpu"), phase3.Placement("cuda", 0), phase3.MoveKind.H2D),)
+        move = (_move(placement.Placement("cpu"), placement.Placement("cuda", 0), placement.MoveKind.H2D),)
 
         handle = executor.submit(move, source=source, destination=destination)
         self.assertEqual(adapter.calls, [("h2d", "cpu", "cuda:0", 0)])
@@ -586,7 +586,7 @@ class Phase3CopyExecutorTest(unittest.TestCase):
         object.__setattr__(
             move,
             "destination",
-            phase3.Residency(move.value, phase3.Placement("cuda", 99)),
+            placement.Residency(move.value, placement.Placement("cuda", 99)),
         )
         adapter = _FakeTensorCopyAdapter()
         pool = transfer.PinnedMemoryPool(capacity=2, adapter=adapter)

@@ -36,7 +36,7 @@ from tllm.runtime.scheduling.workgraph_executor import (
 )
 from tllm.runtime.scheduling.phase3_transfer import PlacementRuntimeBinding
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.workgraph import phase3
+from tllm.workgraph import placement
 from tllm.workgraph import (
     ArtifactKey,
     Capability,
@@ -284,7 +284,7 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
         root_plan = physical_module.compile_physical_flow_plan(phase1)
         region_executor = consumer.workgraph_region_executors()[0].executor
         trace: list[tuple[str, tuple[object, ...]]] = []
-        registry = phase3.ImplementationRegistry()
+        registry = placement.ImplementationRegistry()
         logical_executors = tuple(
             dict.fromkeys((*tuple(node.executor for node in root_plan.nodes), region_executor))
         )
@@ -293,13 +293,13 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
             is_region = logical_executor == region_executor
             implementation_key = ExecutorKey(
                 "implementation",
-                f"phase3.esamp.region-{ordinal}",
+                f"placement.esamp.region-{ordinal}",
             )
             registry.register(
-                phase3.ImplementationSpec(
+                placement.ImplementationSpec(
                     key=implementation_key,
                     logical_executor=logical_executor,
-                    placement=phase3.Placement(phase3.DeviceKind.CPU),
+                    placement=placement.Placement(placement.DeviceKind.CPU),
                     implementation=_RecordingRuntimeImplementation(
                         "selected" if is_region else f"root-{ordinal}",
                         trace,
@@ -311,7 +311,7 @@ class Phase2MigratedRegionActivationUnitTest(unittest.TestCase):
         self.assertIsNotNone(selected_key)
         binding = PlacementRuntimeBinding(
             registry=registry,
-            topology=phase3.DeviceTopology(peer_access=frozenset()),
+            topology=placement.DeviceTopology(peer_access=frozenset()),
         )
         state = ResidualRuntimeState()
         source = torch.randn(2, 4)

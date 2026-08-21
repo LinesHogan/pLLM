@@ -13,7 +13,7 @@ import importlib
 from typing import Iterable
 import unittest
 
-from tllm.workgraph import phase3, phase4
+from tllm.workgraph import placement, phase4
 from tllm.workgraph.frontend import StateScope
 from tllm.workgraph.phase4 import (
     CollectiveBackend,
@@ -63,7 +63,7 @@ def _topology() -> DistributedTopology:
             rank=index,
             node_id=f"node-{index}",
             local_rank=0,
-            placement=phase3.Placement("cpu"),
+            placement=placement.Placement("cpu"),
             role=RankRole.MODEL,
             tp_rank=index,
             pp_rank=0,

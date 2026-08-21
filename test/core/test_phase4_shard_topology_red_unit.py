@@ -16,7 +16,7 @@ import pytest
 
 from tllm.workgraph import phase4
 from tllm.workgraph.frontend import StateScope
-from tllm.workgraph.phase3 import Placement
+from tllm.workgraph.placement import Placement
 
 
 @dataclass(frozen=True, slots=True)

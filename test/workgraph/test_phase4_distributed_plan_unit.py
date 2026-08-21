@@ -12,7 +12,7 @@ import importlib
 import unittest
 
 from tllm.workgraph.frontend import StateScope
-from tllm.workgraph.phase3 import Placement, ValueKey
+from tllm.workgraph.placement import Placement, ValueKey
 from tllm.workgraph.signature import structural_signature
 
 

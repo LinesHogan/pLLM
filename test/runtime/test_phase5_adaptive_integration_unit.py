@@ -33,9 +33,9 @@ from tllm.runtime.scheduling.phase5_adaptive import (
 )
 from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.workgraph import phase3
+from tllm.workgraph import placement as placement_contracts
 from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph.phase3 import DeviceTopology, PlacementPlan
+from tllm.workgraph.placement import DeviceTopology, PlacementPlan
 from tllm.workgraph.phase5 import (
     AdmissionMode,
     CandidateActionDesc,
@@ -251,30 +251,30 @@ def _transfer_resources(
             PhysicalNodePlan(target_node, target_logical, StreamClass.SIDE_TRAIN),
         ),
     )
-    registry = phase3.ImplementationRegistry()
+    registry = placement_contracts.ImplementationRegistry()
     registry.register(
-        phase3.ImplementationSpec(
+        placement_contracts.ImplementationSpec(
             source_impl,
-            phase3.Placement("cuda", 0),
+            placement_contracts.Placement("cuda", 0),
             _Implementation(),
             logical_executor=source_logical,
         )
     )
     registry.register(
-        phase3.ImplementationSpec(
+        placement_contracts.ImplementationSpec(
             target_impl,
-            phase3.Placement("cuda", 1),
+            placement_contracts.Placement("cuda", 1),
             _Implementation(),
             logical_executor=target_logical,
         )
     )
-    value = phase3.ValueKey("phase5-transfer", 1)
+    value = placement_contracts.ValueKey("phase5-transfer", 1)
     if adapter is None:
         adapter = _TrackingCopyAdapter()
     placement, dispatcher, implementations = PlacementRuntimeBinding(
         registry=registry,
-        topology=phase3.DeviceTopology(frozenset(), (0, 1)),
-        value_flows=(phase3.ValueFlowDesc(value, source_node, target_node, 16),),
+        topology=placement_contracts.DeviceTopology(frozenset(), (0, 1)),
+        value_flows=(placement_contracts.ValueFlowDesc(value, source_node, target_node, 16),),
         adapter=adapter,
     ).compile(physical)
     move_set = CandidateMoveSetDesc(

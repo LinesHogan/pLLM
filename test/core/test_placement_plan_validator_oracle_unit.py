@@ -13,7 +13,7 @@ import importlib
 import unittest
 
 from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph import phase3
+from tllm.workgraph import placement
 from tllm.workgraph.physical import (
     FenceDependencyDesc,
     FenceKey,
@@ -59,9 +59,9 @@ class _FakeImplementation:
 
 def _phase3(test_case: unittest.TestCase):
     try:
-        return importlib.import_module("tllm.workgraph.phase3")
+        return importlib.import_module("tllm.workgraph.placement")
     except (ImportError, ModuleNotFoundError) as exc:
-        test_case.fail("tllm.workgraph.phase3 is required for Phase 3 placement tests")
+        test_case.fail("tllm.workgraph.placement is required for Phase 3 placement tests")
         raise AssertionError from exc
 
 

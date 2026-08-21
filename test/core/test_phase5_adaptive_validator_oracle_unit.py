@@ -7,7 +7,7 @@ import unittest
 
 from tllm import core
 from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph.phase3 import (
+from tllm.workgraph.placement import (
     CopyEngine,
     CopyEngineCapacityDesc,
     DeviceKind,
