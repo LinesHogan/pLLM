@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ import torch
 from tllm.workgraph.frontend import (
     ExternProgramDecl,
     FlowProgramDecl,
+    LocalRef,
     PromptIdxKey,
     ResultRef,
     SinkRef,
@@ -85,12 +87,57 @@ class ProgramNode:
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramValue:
+    """One named flow output and the externs that consume it."""
+
+    name: str
+    producer: str  # node name
+    ref: SinkRef | LocalRef
+    consumers: tuple[str, ...]  # extern node names, ordinal order
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramState:
+    """One named state bank and the nodes bound to it."""
+
+    name: str
+    spec: StateSpec
+    nodes: tuple[str, ...]  # node names declaring this state, ordinal order
+
+
+class EdgeKind(StrEnum):
+    DATA = "data"  # flow named output -> extern input (result ref)
+    CONTROL = "control"  # extern.after ordering constraint
+    STATE = "state"  # node -> state bank binding
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramEdge:
+    kind: EdgeKind
+    source: str  # node name (STATE: the bound node)
+    target: str  # node name (STATE: the state name)
+    detail: str = ""  # DATA: "<output>-><param>"; CONTROL/STATE: ""
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramDiagnostic:
+    """Non-fatal observation (PG3xx); fatal validation raises WorkGraphError."""
+
+    code: str
+    message: str
+    node: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ProgramDecl:
-    """Validated static IR for one Program instance."""
+    """Validated static IR for one Program instance (no CUDA objects)."""
 
     nodes: tuple[ProgramNode, ...]
-    states: tuple[tuple[str, StateSpec], ...]
+    values: tuple[ProgramValue, ...]
+    states: tuple[ProgramState, ...]
+    edges: tuple[ProgramEdge, ...]
     schedule: tuple[str, ...]  # deterministic topological order of node names
+    diagnostics: tuple[ProgramDiagnostic, ...]
 
 
 def _discover_nodes(instance: object) -> tuple[ProgramNode, ...]:
@@ -232,16 +279,100 @@ def declare_program(
             f"dependency cycle among externs: {', '.join(remaining)}",
         )
 
+    # Named values: every flow output, with its extern consumers in ordinal
+    # order.
+    consumers_of: dict[tuple[str, str], list[str]] = {}
+    edges: list[ProgramEdge] = []
+    for node in nodes:
+        if not isinstance(node.decl, ExternProgramDecl):
+            continue
+        for dep in node.decl.after:
+            edges.append(ProgramEdge(kind=EdgeKind.CONTROL, source=dep, target=node.name))
+        for param, value in node.decl.inputs:
+            if isinstance(value, ResultRef):
+                consumers_of.setdefault((value.flow, value.output), []).append(node.name)
+                edges.append(
+                    ProgramEdge(
+                        kind=EdgeKind.DATA,
+                        source=value.flow,
+                        target=node.name,
+                        detail=f"{value.output}->{param}",
+                    )
+                )
+    values: list[ProgramValue] = []
+    for node in nodes:
+        if not isinstance(node.decl, FlowProgramDecl):
+            continue
+        for output_name, ref in node.decl.outputs:
+            consumers = tuple(
+                sorted(
+                    consumers_of.get((node.name, output_name), ()),
+                    key=lambda name: by_name[name].ordinal,
+                )
+            )
+            values.append(
+                ProgramValue(
+                    name=output_name,
+                    producer=node.name,
+                    ref=ref,
+                    consumers=consumers,
+                )
+            )
+
+    # State banks with their bound nodes; STATE edges record the binding.
+    state_nodes: dict[str, list[str]] = {name: [] for name in state_map}
+    for node in nodes:
+        decl_state = node.decl.state
+        if decl_state is not None:
+            state_nodes[decl_state].append(node.name)
+            edges.append(
+                ProgramEdge(kind=EdgeKind.STATE, source=node.name, target=decl_state)
+            )
+    program_states = tuple(
+        ProgramState(name=name, spec=state_map[name], nodes=tuple(members))
+        for name, members in state_nodes.items()
+    )
+
+    diagnostics: list[ProgramDiagnostic] = []
+    for value in values:
+        if isinstance(value.ref, LocalRef) and not value.consumers:
+            diagnostics.append(
+                ProgramDiagnostic(
+                    code="PG300",
+                    message=(
+                        f"flow {value.producer!r} output {value.name!r} is local "
+                        "and never consumed"
+                    ),
+                    node=value.producer,
+                )
+            )
+    for state in program_states:
+        if not state.nodes:
+            diagnostics.append(
+                ProgramDiagnostic(
+                    code="PG301",
+                    message=f"state {state.name!r} is declared but no node uses it",
+                )
+            )
+
     return ProgramDecl(
         nodes=nodes,
-        states=tuple(state_map.items()),
+        values=tuple(values),
+        states=program_states,
+        edges=tuple(edges),
         schedule=tuple(schedule),
+        diagnostics=tuple(diagnostics),
     )
 
 
 __all__ = [
+    "EdgeKind",
     "ProgramDecl",
+    "ProgramDiagnostic",
+    "ProgramEdge",
     "ProgramNode",
+    "ProgramState",
+    "ProgramValue",
     "StateSpec",
     "declare_program",
 ]
