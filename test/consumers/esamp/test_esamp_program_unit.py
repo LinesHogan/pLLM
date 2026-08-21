@@ -136,6 +136,24 @@ class ReplicaTrainingTest(unittest.TestCase):
         # Reading resets the counters.
         self.assertEqual(consumer.read_and_reset_stats().loss_count, 0)
 
+    def test_trains_under_inference_mode(self) -> None:
+        """vLLM executes consumers under inference_mode; training must still run."""
+        torch.manual_seed(0)
+        consumer = _consumer()
+        with torch.inference_mode():
+            for step in (1, 2):
+                consumer.consume_flow(
+                    0,
+                    _bundle(
+                        torch.randn(3, _HIDDEN),
+                        torch.randn(3, _HIDDEN),
+                        (0, 0, 0),
+                        step_id=step,
+                    ),
+                    None,
+                )
+        self.assertEqual(consumer.read_and_reset_stats().loss_count, 2)
+
     def test_matches_handrolled_adamw_reference(self) -> None:
         hidden, rank, lr = _HIDDEN, 8, 1e-2
         consumer = _consumer()

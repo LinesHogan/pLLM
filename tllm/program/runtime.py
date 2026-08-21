@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Protocol, cast, runtime_checkable
 
 import torch
@@ -97,6 +98,56 @@ class _ExternBinding:
     last_step: int = -1
 
 
+class _StreamLane:
+    """Side-stream execution lane for CUDA bundles.
+
+    Flow execution and functional updates run on a dedicated stream so they
+    overlap the main decode stream. Ordering is event-based: the lane waits
+    on the producing stream before reading bundle tensors; readers
+    (``retire_device_lease`` at lease end, ``run_flow`` at sampler time) wait
+    on the lane's latest completion event. All entry points run on the engine
+    thread, so no host locking is involved.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._stream = torch.cuda.Stream(device=device)
+        self._event = torch.cuda.Event(blocking=False)
+        self._context: torch.cuda.StreamContext | None = None
+
+    def __enter__(self) -> "_StreamLane":
+        self._stream.wait_stream(torch.cuda.current_stream(device=self._device))
+        context = torch.cuda.stream(self._stream)
+        context.__enter__()
+        self._context = context
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        assert self._context is not None
+        self._context.__exit__(exc_type, exc, tb)
+        self._context = None
+        self._event.record(self._stream)
+
+    def wait_for_completion(self) -> None:
+        """Order the current stream after the lane's latest recorded work."""
+        torch.cuda.current_stream(device=self._device).wait_event(self._event)
+
+
+def _is_identity_group(row_ids: tuple[int, ...], rows: int) -> bool:
+    """True when one group spans the whole batch in order (no slicing needed)."""
+    return (
+        len(row_ids) == rows
+        and rows > 0
+        and row_ids[0] == 0
+        and row_ids[-1] == rows - 1
+    )
+
+
 def _dtype_tolerance(dtype: torch.dtype) -> float:
     if dtype in (torch.float64,):
         return 1e-10
@@ -157,14 +208,37 @@ def _check_oracle(
         ) from exc
 
     reference = copy.deepcopy(instance)
-    with torch.enable_grad():
-        reference_out = getattr(reference, flow_node.name)(*example_args)
-        loss_ref = reference_out[loss_position]
-        if not torch.is_tensor(loss_ref) or loss_ref.numel() != 1:
-            raise WorkGraphError(
-                "PG130", "extern training requires a scalar loss output"
-            )
-        getattr(reference, extern.node.name)(loss_ref)
+    # Compile may run under the engine's inference_mode; deepcopy preserves
+    # inference tensors, which cannot be saved for backward. Rebuild the
+    # reference's parameters as plain tensors before the oracle step and
+    # rebind the (deepcopied) optimizer's param groups to them.
+    with torch.inference_mode(False):
+        replaced: dict[int, torch.nn.Parameter] = {}
+        for module in reference.modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                if param.is_inference():
+                    new_param = torch.nn.Parameter(
+                        param.detach().clone(), requires_grad=param.requires_grad
+                    )
+                    module._parameters[param_name] = new_param
+                    replaced[id(param)] = new_param
+        if replaced:
+            for group in _optimizer_of(reference).param_groups:
+                group["params"] = [
+                    replaced.get(id(param), param) for param in group["params"]
+                ]
+        normal_args = tuple(
+            arg.clone() if torch.is_tensor(arg) and arg.is_inference() else arg
+            for arg in example_args
+        )
+        with torch.enable_grad():
+            reference_out = getattr(reference, flow_node.name)(*normal_args)
+            loss_ref = reference_out[loss_position]
+            if not torch.is_tensor(loss_ref) or loss_ref.numel() != 1:
+                raise WorkGraphError(
+                    "PG130", "extern training requires a scalar loss output"
+                )
+            getattr(reference, extern.node.name)(loss_ref)
     reference_optimizer = _optimizer_of(reference)
     reference_params = {
         name: param.detach().clone()
@@ -186,24 +260,31 @@ def _check_oracle(
         }
 
     adapter = _FlowAdapter(instance, flow_node.name)
-    params0 = {
-        f"program_instance.{name}": param.detach().clone()
-        for name, param in instance.named_parameters()
-        if name in trainable
-    }
+    with torch.inference_mode(False):
+        params0 = {
+            f"program_instance.{name}": (
+                param.detach().clone()
+                if not param.is_inference()
+                else param.clone()
+            )
+            for name, param in instance.named_parameters()
+            if name in trainable
+        }
 
-    def loss_fn(params: dict[str, torch.Tensor], *args: torch.Tensor) -> torch.Tensor:
-        out = torch.func.functional_call(adapter, params, args)
-        return cast(tuple[torch.Tensor, ...], out)[loss_position]
+        def loss_fn(
+            params: dict[str, torch.Tensor], *args: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.func.functional_call(adapter, params, args)
+            return cast(tuple[torch.Tensor, ...], out)[loss_position]
 
-    grads = torch.func.grad(loss_fn)(params0, *example_args)
-    new_params, new_state = functional_step(
-        scalars,
-        {name[len("program_instance."):]: value for name, value in params0.items()},
-        {name[len("program_instance."):]: value for name, value in grads.items()},
-        {},
-        step=1,
-    )
+        grads = torch.func.grad(loss_fn)(params0, *normal_args)
+        new_params, new_state = functional_step(
+            scalars,
+            {name[len("program_instance."):]: value for name, value in params0.items()},
+            {name[len("program_instance."):]: value for name, value in grads.items()},
+            {},
+            step=1,
+        )
 
     for name in trainable:
         tolerance = _dtype_tolerance(new_params[name].dtype)
@@ -383,10 +464,19 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
         self._records: dict[str, _FlowRecord] = {}
         self.update_count = 0
         self.loss_count = 0
-        self.loss_sum = 0.0
+        self._loss_sum: torch.Tensor | None = None
         self.read_versions: dict[tuple[str, int], int] = {}
-        self._slot_loss_sums: dict[tuple[str, int], float] = {}
+        self._slot_loss_sums: dict[tuple[str, int], torch.Tensor] = {}
         self._slot_loss_counts: dict[tuple[str, int], int] = {}
+        self._lane: _StreamLane | None = None
+        self._adapters: dict[str, _FlowAdapter] = {}
+
+    @property
+    def loss_sum(self) -> float:
+        # Syncs the device accumulator on read (control plane only).
+        if self._loss_sum is None:
+            return 0.0
+        return float(self._loss_sum)
 
     @property
     def consumer_id(self) -> str:
@@ -420,6 +510,10 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
         bank = (
             self._banks.get(flow_decl.state) if flow_decl.state is not None else None
         )
+        if self._lane is not None:
+            # Slot params may be written by in-flight lane updates; order this
+            # read after the latest published update.
+            self._lane.wait_for_completion()
         with torch.no_grad():
             if bank is None:
                 return executor.run(*inputs)
@@ -429,7 +523,7 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
     def read_and_reset_slot_losses(self) -> dict[tuple[str, int], tuple[float, int]]:
         """Per-slot (loss_sum, loss_count) since the last read; resets counters."""
         out = {
-            key: (self._slot_loss_sums[key], self._slot_loss_counts[key])
+            key: (float(self._slot_loss_sums[key]), self._slot_loss_counts[key])
             for key in self._slot_loss_sums
         }
         self._slot_loss_sums.clear()
@@ -480,6 +574,33 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
                 "PG100", f"flow {node.name!r} input {exc} missing from device_lease"
             ) from exc
 
+        device = next(iter(inputs.values())).device
+        step_id = int(bundle.key.engine_step_id)
+        if device.type == "cuda":
+            if self._lane is None:
+                self._lane = _StreamLane(device)
+            with self._lane:
+                self._consume_inner(node, executor, flow_decl, inputs, meta, rows, step_id)
+        else:
+            self._consume_inner(node, executor, flow_decl, inputs, meta, rows, step_id)
+
+    def retire_device_lease(self, ctx: object) -> None:
+        del ctx
+        # Lease buffers may be reused by the producer after retirement; order
+        # the current stream after the lane's pending reads first.
+        if self._lane is not None:
+            self._lane.wait_for_completion()
+
+    def _consume_inner(
+        self,
+        node: ProgramNode,
+        executor: StagedFlowExecutor,
+        flow_decl: FlowProgramDecl,
+        inputs: dict[str, torch.Tensor],
+        meta: RowBatchMeta | None,
+        rows: int,
+        step_id: int,
+    ) -> None:
         outputs: dict[str, torch.Tensor] = {}
         bank = self._banks.get(flow_decl.state) if flow_decl.state is not None else None
         if bank is None:
@@ -492,15 +613,23 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
                 for prompt_idx, row_ids in groups:
                     slot = bank.slot_for(prompt_idx)
                     self.read_versions[(bank.name, slot.slot_id)] = slot.version
-                    group_inputs = tuple(
-                        value.index_select(
-                            0, torch.as_tensor(row_ids, device=value.device)
+                    if _is_identity_group(row_ids, rows):
+                        group_inputs = tuple(inputs.values())
+                    else:
+                        group_inputs = tuple(
+                            value.index_select(
+                                0, torch.as_tensor(row_ids, device=value.device)
+                            )
+                            for value in inputs.values()
                         )
-                        for value in inputs.values()
-                    )
                     group_out = executor.run(
                         *group_inputs, state_override=self._slot_override(slot)
                     )
+                    if _is_identity_group(row_ids, rows):
+                        # Single group spanning the whole batch: group outputs
+                        # already are the merged outputs.
+                        outputs = group_out
+                        continue
                     for name, value in group_out.items():
                         row_outputs.setdefault(name, []).append((row_ids, value))
             for name, pieces in row_outputs.items():
@@ -524,12 +653,12 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
                 self._sinks[ref.name].publish(value, meta)
 
         self._records[node.name] = _FlowRecord(
-            step_id=int(bundle.key.engine_step_id),
+            step_id=step_id,
             inputs=inputs,
             outputs=outputs,
             meta=meta,
         )
-        self._run_due_externs(int(bundle.key.engine_step_id))
+        self._run_due_externs(step_id)
 
     def _run_due_externs(self, step_id: int) -> None:
         for extern in self._externs:
@@ -557,7 +686,10 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
         source_node, _source_plan, _executor = self._flows[extern.source_ordinal]
         rows = next(iter(record.inputs.values())).shape[0]
         groups = self._groups(bank, record.meta, int(rows))
-        adapter = _FlowAdapter(self._instance, source_node.name)
+        adapter = self._adapters.get(source_node.name)
+        if adapter is None:
+            adapter = _FlowAdapter(self._instance, source_node.name)
+            self._adapters[source_node.name] = adapter
         flow_decl = cast(FlowProgramDecl, source_node.decl)
         loss_position = tuple(name for name, _ in flow_decl.outputs).index(
             extern.source_output
@@ -566,44 +698,64 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
         loss_values = record.outputs[extern.source_output].detach().float().view(-1)
         for group_index, (prompt_idx, row_ids) in enumerate(groups):
             slot = bank.slot_for(prompt_idx)
-            params = {
-                f"program_instance.{name}": slot.params[name] for name in self._trainable
-            }
-            group_inputs = tuple(
-                value.index_select(0, torch.as_tensor(row_ids, device=value.device))
-                for value in record.inputs.values()
-            )
+            if _is_identity_group(row_ids, int(rows)):
+                group_inputs = tuple(record.inputs.values())
+            else:
+                group_inputs = tuple(
+                    value.index_select(0, torch.as_tensor(row_ids, device=value.device))
+                    for value in record.inputs.values()
+                )
 
-            def loss_fn(
-                fn_params: dict[str, torch.Tensor], *args: torch.Tensor
-            ) -> torch.Tensor:
-                out = torch.func.functional_call(adapter, fn_params, args)
-                return cast(tuple[torch.Tensor, ...], out)[loss_position]
-
-            with torch.enable_grad():
-                grads = torch.func.grad(loss_fn)(params, *group_inputs)
-            new_params, new_state = functional_step(
-                self._scalars,
-                {name: params[f"program_instance.{name}"] for name in self._trainable},
-                {
-                    name: grads[f"program_instance.{name}"]
-                    for name in self._trainable
-                },
-                slot.opt_state,
-                step=slot.step + 1,
-            )
+            # Single forward pass: run the flow on grad-enabled views of the
+            # slot params, then reverse-mode straight to those views.
+            # Equivalent to torch.func.grad over a re-invoked loss_fn but
+            # skips the grad-transform wrapper. The whole region lifts
+            # inference_mode explicitly: the engine executes consumers under
+            # inference_mode, where enable_grad alone records no autograd
+            # graph and inference tensors cannot be saved for backward.
+            with torch.inference_mode(False):
+                with torch.enable_grad():
+                    grad_params = {
+                        f"program_instance.{name}": slot.params[name]
+                        .detach()
+                        .requires_grad_(True)
+                        for name in self._trainable
+                    }
+                    grad_inputs = tuple(
+                        value.clone() if value.is_inference() else value
+                        for value in group_inputs
+                    )
+                    out = torch.func.functional_call(adapter, grad_params, grad_inputs)
+                    group_loss = cast(tuple[torch.Tensor, ...], out)[loss_position]
+                    grad_list = torch.autograd.grad(
+                        group_loss, tuple(grad_params.values())
+                    )
+                grads = dict(zip(self._trainable, grad_list, strict=True))
+                with torch.no_grad():
+                    new_params, new_state = functional_step(
+                        self._scalars,
+                        {
+                            name: grad_params[f"program_instance.{name}"].detach()
+                            for name in self._trainable
+                        },
+                        grads,
+                        slot.opt_state,
+                        step=slot.step + 1,
+                    )
             bank.publish_update(slot, new_params, new_state)
             self.update_count += 1
             slot_key = (bank.name, slot.slot_id)
+            slot_loss = loss_values[group_index]
+            prior = self._slot_loss_sums.get(slot_key)
             self._slot_loss_sums[slot_key] = (
-                self._slot_loss_sums.get(slot_key, 0.0)
-                + float(loss_values[group_index])
+                slot_loss if prior is None else prior + slot_loss
             )
             self._slot_loss_counts[slot_key] = (
                 self._slot_loss_counts.get(slot_key, 0) + 1
             )
         self.loss_count += 1
-        self.loss_sum += float(loss.detach().float().sum())
+        step_loss = loss.detach().float().sum()
+        self._loss_sum = step_loss if self._loss_sum is None else self._loss_sum + step_loss
 
 
 __all__ = ["ProgramConsumer", "ProgramSink", "compile_program"]

@@ -332,7 +332,7 @@ class ESampProgramConsumer(BaseESampConsumer):
             loss_avg=compiled.loss_sum / max(1, compiled.loss_count),
             loss_count=compiled.loss_count,
         )
-        compiled.loss_sum = 0.0
+        compiled._loss_sum = None
         compiled.loss_count = 0
         return stats
 

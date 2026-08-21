@@ -30,6 +30,27 @@ class StateSlot:
     step: int = 0
 
 
+def _normal_clone(value: torch.Tensor) -> torch.Tensor:
+    """Return an owned copy that is NOT an inference tensor.
+
+    Consumers execute under the engine's ``inference_mode``; tensors created
+    there cannot participate in autograd later. Slot tensors must be plain
+    tensors so functional updates can differentiate through them, so the copy
+    runs with inference mode lifted even when the source is a normal tensor.
+    """
+    if torch.is_inference_mode_enabled():
+        with torch.inference_mode(False):
+            return value.clone()
+    return value.detach().clone()
+
+
+def _ensure_normal(value: torch.Tensor) -> torch.Tensor:
+    """Return ``value`` if usable in autograd, else a normal-mode clone."""
+    if value.is_inference():
+        return _normal_clone(value)
+    return value
+
+
 def group_rows_by_prompt(prompt_idxs: tuple[int, ...]) -> tuple[tuple[int, tuple[int, ...]], ...]:
     """Group batch rows by prompt identity, first appearance first.
 
@@ -64,7 +85,7 @@ class ProgramStateBank:
         self.name = name
         self.scope = scope
         self._initial = {
-            key: value.detach().clone() for key, value in initial_params.items()
+            key: _normal_clone(value) for key, value in initial_params.items()
         }
         self._replica: StateSlot | None = None
         self._request_slots: dict[int, StateSlot] = {}
@@ -72,7 +93,7 @@ class ProgramStateBank:
     def _fresh_slot(self, slot_id: int) -> StateSlot:
         return StateSlot(
             slot_id=slot_id,
-            params={key: value.clone() for key, value in self._initial.items()},
+            params={key: _normal_clone(value) for key, value in self._initial.items()},
         )
 
     def slot_for(self, prompt_idx: int | None) -> StateSlot:
@@ -97,8 +118,11 @@ class ProgramStateBank:
         opt_state: OptState,
     ) -> int:
         """Install one functional update; returns the new version."""
-        slot.params = dict(params)
-        slot.opt_state = dict(opt_state)
+        slot.params = {key: _ensure_normal(value) for key, value in params.items()}
+        slot.opt_state = {
+            key: {sk: _ensure_normal(sv) for sk, sv in state.items()}
+            for key, state in opt_state.items()
+        }
         slot.version += 1
         slot.step += 1
         return slot.version

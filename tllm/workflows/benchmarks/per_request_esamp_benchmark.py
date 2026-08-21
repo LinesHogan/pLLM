@@ -197,6 +197,13 @@ def _parse_args() -> argparse.Namespace:
         help="Chunk size for effective expanded batch in V1 n>1 emulation; <=0 means full effective batch.",
     )
     parser.add_argument(
+        "--implementation",
+        type=str,
+        default="legacy",
+        choices=["legacy", "program"],
+        help="ESamp consumer implementation under test.",
+    )
+    parser.add_argument(
         "--case-filter",
         type=str,
         default="all",
@@ -399,6 +406,8 @@ def _build_isolated_case_subprocess_cmd(
         str(args.effective_batch_cap),
         "--case-filter",
         str(case_filter),
+        "--implementation",
+        str(args.implementation),
         "--emit-json-summary",
     ]
     if skip_trajectory:
@@ -483,6 +492,7 @@ def _run_isolated_case_subprocess(
 def _run_case(
     *,
     case_id: str,
+    implementation: str,
     llm,
     graph_scratch_rows: int,
     source_layer_path: str,
@@ -516,6 +526,7 @@ def _run_case(
     rounds: int,
 ) -> Dict[str, float]:
     esamp_workflow_support.configure_esamp_runtime(
+        implementation=implementation,
         graph_scratch_rows=int(graph_scratch_rows),
         tap_layer_paths=[source_layer_path, target_layer_path],
         source_layer_path=source_layer_path,
@@ -627,6 +638,7 @@ def _run_case(
         "distiller_wait_count": float(distiller_timing.wait_count),
         "distiller_fallback_ms_avg": float(distiller_timing.fallback_ms_avg),
         "distiller_fallback_count": float(distiller_timing.fallback_count),
+        "distiller_intervention_state_count": float(distiller_timing.intervention_state_count),
         "distiller_port_publish_attempt_count": float(distiller_timing.port_publish_attempt_count),
         "distiller_port_publish_hit_count": float(distiller_timing.port_publish_hit_count),
         "distiller_schedule_attempt_count": float(distiller_timing.schedule_attempt_count),
@@ -664,6 +676,7 @@ def _run_case(
 
 def _configure_case_runtime(
     *,
+    implementation: str,
     graph_scratch_rows: int,
     source_layer_path: str,
     target_layer_path: str,
@@ -689,6 +702,7 @@ def _configure_case_runtime(
     workgraph_execution: bool,
 ) -> None:
     esamp_workflow_support.configure_esamp_runtime(
+        implementation=implementation,
         graph_scratch_rows=int(graph_scratch_rows),
         tap_layer_paths=[source_layer_path, target_layer_path],
         source_layer_path=source_layer_path,
@@ -881,6 +895,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
     )
 
     common: Dict[str, Any] = dict(
+        implementation=str(implementation),
         graph_scratch_rows=int(rows),
         source_layer_path=args.source_layer_path,
         target_layer_path=args.target_layer_path,
@@ -953,7 +968,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
             cases.update(cast(Dict[str, Dict[str, float]], payload["cases"]))
         trajectory = {"rounds": [], "top_models": []}
         return {
-            "implementation": str(implementation),
+            "implementation": f"esamp-{implementation}",
             "cases": cases,
             "trajectory": trajectory,
         }
@@ -963,6 +978,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
         # before constructing the LLM, so load_model-time hook/cudagraph setup is
         # compatible with the later training cases in this same implementation run.
         esamp_workflow_support.configure_esamp_runtime(
+            implementation=str(implementation),
             graph_scratch_rows=int(rows),
             tap_layer_paths=[args.source_layer_path, args.target_layer_path],
             source_layer_path=args.source_layer_path,
@@ -975,7 +991,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
             distiller_beta=float(args.distiller_beta),
             distiller_sampler_backend=str(args.distiller_sampler_backend),
             per_request_models=True,
-            per_request_model_bank=bool(args.run_model_bank_case),
+            per_request_model_bank=bool(args.run_model_bank_case) and str(implementation) == "legacy",
             model_bank_slots=common["model_bank_slots"],
             model_bank_flush_interval=int(args.model_bank_flush_interval),
             model_bank_rank=int(args.model_bank_rank),
@@ -1012,6 +1028,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
                     **common,
                 )
             _configure_case_runtime(
+                implementation=str(implementation),
                 graph_scratch_rows=common["graph_scratch_rows"],
                 source_layer_path=common["source_layer_path"],
                 target_layer_path=common["target_layer_path"],
@@ -1162,6 +1179,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
             )
         else:
             _configure_case_runtime(
+                implementation=str(args.implementation),
                 graph_scratch_rows=common["graph_scratch_rows"],
                 source_layer_path=common["source_layer_path"],
                 target_layer_path=common["target_layer_path"],
@@ -1205,7 +1223,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
             shutdown_llm_instance(llm, cooldown_s=float(args.cooldown_s))
 
     return {
-        "implementation": str(implementation),
+        "implementation": f"esamp-{implementation}",
         "cases": cases,
         "trajectory": trajectory,
     }
@@ -1213,7 +1231,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
 
 def main() -> int:
     args = _parse_args()
-    payload = _run_one_implementation(args, "esamp")
+    payload = _run_one_implementation(args, str(args.implementation))
     if args.emit_json_summary:
         print(JSON_SUMMARY_PREFIX + json.dumps(payload, sort_keys=True))
     return 0
