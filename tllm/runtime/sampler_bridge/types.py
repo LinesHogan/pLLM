@@ -1,28 +1,46 @@
 #!/usr/bin/env python3
-"""Typed internal contracts for same-step sampler intervention."""
+"""Runtime-internal sampler step view and sampling-metadata adapters.
+
+The public modifier contract vocabulary lives in ``tllm.ports.sampler`` and is
+re-exported here for the bridge's internal users.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import Any
 
 import torch
 
-CanonicalSamplerBackend = Literal["post_filter_exact", "pre_filter_dense", "post_filter_dense_cache"]
-SamplerBackend = Literal[
-    "post_filter_exact",
-    "post_filter_exact_minp",
-    "post_filter_exact_torch",
-    "pre_filter_dense",
-    "post_filter_dense_cache",
-]
-SAMPLER_BACKEND_CHOICES: tuple[str, ...] = (
-    "post_filter_exact",
-    "post_filter_exact_minp",
-    "post_filter_exact_torch",
-    "pre_filter_dense",
-    "post_filter_dense_cache",
+from tllm.ports.sampler import (
+    SAMPLER_BACKEND_CHOICES,
+    CandidateModifierRequest,
+    CandidateModifierState,
+    CandidateSampleResult,
+    CandidateSamplingMode,
+    CanonicalSamplerBackend,
+    SamplerBackend,
+    SamplerFilterSpec,
+    SamplerModifierState,
+    TemperatureMode,
 )
+
+__all__ = [
+    "SAMPLER_BACKEND_CHOICES",
+    "CandidateModifierRequest",
+    "CandidateModifierState",
+    "CandidateSampleResult",
+    "CandidateSamplingMode",
+    "CanonicalSamplerBackend",
+    "SamplerBackend",
+    "SamplerFilterSpec",
+    "SamplerModifierState",
+    "SamplerStepView",
+    "TemperatureMode",
+    "filter_spec_from_sampling_metadata",
+    "normalize_sampler_backend",
+]
+
 _SAMPLER_BACKEND_ALIASES: dict[str, CanonicalSamplerBackend] = {
     "post_filter_exact": "post_filter_exact",
     "post_filter_exact_minp": "post_filter_exact",
@@ -30,8 +48,6 @@ _SAMPLER_BACKEND_ALIASES: dict[str, CanonicalSamplerBackend] = {
     "pre_filter_dense": "pre_filter_dense",
     "post_filter_dense_cache": "post_filter_dense_cache",
 }
-TemperatureMode = Literal["all_random", "all_greedy", "mixed"]
-CandidateSamplingMode = Literal["random", "greedy", "mixed"]
 
 
 def normalize_sampler_backend(backend: str | None) -> CanonicalSamplerBackend:
@@ -108,27 +124,6 @@ class SamplerStepView:
     runner: Any
 
 
-@dataclass(frozen=True)
-class SamplerFilterSpec:
-    top_k: torch.Tensor | None
-    top_p: torch.Tensor | None
-    min_p: torch.Tensor | None
-    temperature_mode: TemperatureMode
-    has_generators: bool = False
-
-    @property
-    def has_top_k(self) -> bool:
-        return self.top_k is not None
-
-    @property
-    def has_top_p(self) -> bool:
-        return self.top_p is not None
-
-    @property
-    def has_min_p(self) -> bool:
-        return self.min_p is not None
-
-
 def filter_spec_from_sampling_metadata(
     sampling_metadata: Any,
     *,
@@ -142,32 +137,3 @@ def filter_spec_from_sampling_metadata(
         temperature_mode=_metadata_temperature_mode(sampling_metadata),
         has_generators=bool(generators),
     )
-
-
-@dataclass(frozen=True)
-class CandidateModifierRequest:
-    logits: torch.Tensor
-    affected_row_ids: torch.Tensor
-    filter_spec: SamplerFilterSpec
-    sampling_mode: CandidateSamplingMode
-
-
-@dataclass(frozen=True)
-class CandidateModifierState:
-    beta: float
-    backend: SamplerBackend
-    affected_row_ids: torch.Tensor
-    pred_hidden: torch.Tensor
-    lm_head_weight: torch.Tensor
-    lm_head_bias: torch.Tensor | None
-    precomputed_dense_logits: torch.Tensor | None = None
-    pred_hidden_row_map: torch.Tensor | None = None
-
-
-@dataclass(frozen=True)
-class CandidateSampleResult:
-    sampled_token_ids: torch.Tensor
-    debug_stats: Mapping[str, int | float | str] | None = None
-
-
-SamplerModifierState = CandidateModifierState
