@@ -133,7 +133,7 @@ def _scan_file(path: Path) -> list[Violation]:
 
     violations: list[Violation] = []
 
-    def visit(node: ast.AST, top_level: bool, type_only: bool = False) -> None:
+    def visit(node: ast.AST, in_function: bool, type_only: bool = False) -> None:
         for child in ast.iter_child_nodes(node):
             if type_only and isinstance(child, (ast.Import, ast.ImportFrom)):
                 continue  # erased at runtime
@@ -145,7 +145,7 @@ def _scan_file(path: Path) -> list[Violation]:
             else:
                 visit(
                     child,
-                    top_level and isinstance(node, ast.Module),
+                    in_function or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)),
                     type_only or _is_type_checking_block(child),
                 )
                 continue
@@ -170,13 +170,13 @@ def _scan_file(path: Path) -> list[Violation]:
                         importer,
                         module_name,
                         target_pkg,
-                        "module" if top_level else "local",
+                        "local" if in_function else "module",
                         str(path.relative_to(REPO_ROOT)),
                         child.lineno,
                     )
                 )
 
-    visit(tree, True)
+    visit(tree, False)
     return violations
 
 

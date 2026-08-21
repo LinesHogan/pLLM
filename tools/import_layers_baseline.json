@@ -59,13 +59,12 @@
     ]
   },
   "module_level": {
-    "runtime->backends": 1,
-    "runtime->consumers": 2,
-    "runtime->producer": 1,
-    "runtime->util": 1
+    "runtime->producer": 1
   },
   "local_level": {
     "ports->runtime": 1,
-    "runtime->consumers": 2
+    "runtime->backends": 1,
+    "runtime->consumers": 4,
+    "runtime->util": 1
   }
 }
