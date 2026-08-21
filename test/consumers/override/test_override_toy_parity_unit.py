@@ -70,20 +70,31 @@ class _ToyOverRIDEReference(nn.Module):
         return reweighted, q_logits_next
 
 
+_DOWN_WEIGHTS = (
+    torch.tensor([[0.5, -1.0], [1.5, 0.25]], dtype=torch.float32),
+    torch.tensor([[1.0, 0.5], [-0.25, 2.0]], dtype=torch.float32),
+)
+_UP_WEIGHTS = (
+    torch.tensor([[2.0, -0.5], [0.25, 1.0], [-1.0, 0.75]], dtype=torch.float32),
+    torch.tensor([[0.5, 1.25], [-1.5, 0.5], [0.75, -0.25]], dtype=torch.float32),
+)
+
+
 def _set_fixed_weights(consumer: object, reference: _ToyOverRIDEReference) -> None:
-    heads = getattr(consumer, "engine").heads
-    down_weights = (
-        torch.tensor([[0.5, -1.0], [1.5, 0.25]], dtype=torch.float32),
-        torch.tensor([[1.0, 0.5], [-0.25, 2.0]], dtype=torch.float32),
-    )
-    up_weights = (
-        torch.tensor([[2.0, -0.5], [0.25, 1.0], [-1.0, 0.75]], dtype=torch.float32),
-        torch.tensor([[0.5, 1.25], [-1.5, 0.5], [0.75, -0.25]], dtype=torch.float32),
-    )
+    from tllm.consumers.override import OverRIDEConsumer
+
+    assert isinstance(consumer, OverRIDEConsumer)
+    # Warm up so the program is compiled and the state bank exists.
+    hidden = torch.zeros((2, 2), dtype=torch.float32)
+    logits = torch.zeros((2, 3), dtype=torch.float32)
+    consumer.reweight_logits(hidden, logits, iteration=2)
+    compiled = consumer.compiled
+    assert compiled is not None
+    params = compiled.bank("heads").slot_for(None).params
     with torch.no_grad():
-        for idx, (down_weight, up_weight) in enumerate(zip(down_weights, up_weights, strict=True)):
-            heads[idx].down.weight.copy_(down_weight)
-            heads[idx].up.weight.copy_(up_weight)
+        for idx, (down_weight, up_weight) in enumerate(zip(_DOWN_WEIGHTS, _UP_WEIGHTS, strict=True)):
+            params["down"][idx].copy_(down_weight)
+            params["up"][idx].copy_(up_weight)
             reference.heads[idx].down.weight.copy_(down_weight)
             reference.heads[idx].up.weight.copy_(up_weight)
 
@@ -112,12 +123,47 @@ class OverRIDEToyParityUnitTest(unittest.TestCase):
         hidden = torch.tensor([[2.0, -1.0], [0.5, 3.0]], dtype=torch.float32)
         logits = torch.tensor([[10.0, 20.0, 30.0], [1.5, -2.0, 4.0]], dtype=torch.float32)
 
-        result = consumer.reweight_logits(hidden, logits, iteration=2)
+        reweighted = consumer.reweight_logits(hidden, logits, iteration=2)
         expected_logits, _expected_q = reference.compute(hidden, logits, iteration=2, lambd=config.lambd)
-        explicit_residual = consumer.engine.heads[0](hidden.detach())
+        explicit_residual = reference.heads[0](hidden.detach())
 
         self.assertTrue(torch.equal(expected_logits, logits - config.lambd * explicit_residual))
-        self.assertEqual(float((result.logits - expected_logits).abs().max()), 0.0)
+        self.assertEqual(float((reweighted - expected_logits).abs().max()), 0.0)
+
+    def test_batch_reweight_then_update_trains_bank_params(self) -> None:
+        from tllm.consumers.override import OverRIDEConsumer, OverRIDEConsumerConfig
+
+        torch.manual_seed(0)
+        consumer = OverRIDEConsumer(
+            OverRIDEConsumerConfig(
+                hidden_size=2,
+                vocab_size=3,
+                rank=2,
+                num_iterations=3,
+                lambd=0.75,
+                learning_rate=0.2,
+            )
+        )
+        _set_fixed_weights(consumer, _ToyOverRIDEReference(
+            hidden_size=2, vocab_size=3, rank=2, num_iterations=3, learning_rate=0.2
+        ))
+        compiled = consumer.compiled
+        assert compiled is not None
+        up_before = compiled.bank("heads").slot_for(None).params["up"].clone()
+
+        hidden = torch.tensor([[2.0, -1.0], [0.5, 3.0]], dtype=torch.float32)
+        logits = torch.tensor([[10.0, 20.0, 30.0], [1.5, -2.0, 4.0]], dtype=torch.float32)
+        consumer.reweight_logits_batch(hidden, logits, iterations=(2, 2))
+        consumer.update_from_sampled_tokens(torch.tensor([0, 2], dtype=torch.long))
+
+        stats = consumer.read_stats()
+        self.assertEqual(stats.update_count, 1)
+        self.assertEqual(stats.loss_count, 1)
+        self.assertGreater(stats.last_loss, 0.0)
+        up_after = compiled.bank("heads").slot_for(None).params["up"]
+        # Only the current-iteration head (index 1) receives gradient.
+        self.assertFalse(torch.equal(up_after[1], up_before[1]))
+        self.assertTrue(torch.equal(up_after[0], up_before[0]))
 
 
 if __name__ == "__main__":

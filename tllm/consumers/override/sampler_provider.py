@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""OverRIDE-owned provider for same-step sampler intervention."""
+"""OverRIDE-owned provider for same-step sampler intervention.
+
+Thin shell over the consumer: ``prepare_step`` reweights the step's logits
+through the compiled program (read-only), ``after_sample`` trains the
+stashed current-iteration heads against the sampled tokens.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
-from tllm.consumers.override.consumer import OverRIDEReweightEngine
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
+
+if TYPE_CHECKING:
+    from tllm.consumers.override.consumer import OverRIDEConsumer
 
 
 @dataclass
@@ -20,15 +28,11 @@ class _PreparedSamplerStep:
 
 @dataclass
 class OverRIDESamplerModifierProvider:
-    engine: OverRIDEReweightEngine
+    consumer: OverRIDEConsumer
     _prepared_step: _PreparedSamplerStep | None = None
 
     def is_active(self) -> bool:
-        return bool(self.engine.config.enabled)
-
-    @staticmethod
-    def _internal_decode_row_ids(row_count: int) -> tuple[int, ...]:
-        return tuple(range(int(row_count)))
+        return bool(self.consumer.config.enabled)
 
     def prepare_step(self, view: SamplerStepView) -> CandidateModifierState | None:
         if not self.is_active():
@@ -38,8 +42,8 @@ class OverRIDESamplerModifierProvider:
             return None
         if len(view.request_ids) != row_count:
             raise RuntimeError("OverRIDE sampler provider requires one request id per decode row")
-        row_ids = self._internal_decode_row_ids(row_count)
-        result = self.engine.reweight_logits_batch(
+        row_ids = tuple(range(row_count))
+        reweighted = self.consumer.reweight_logits_batch(
             view.source_hidden,
             view.logits,
             request_ids=view.request_ids,
@@ -51,7 +55,7 @@ class OverRIDESamplerModifierProvider:
             row_ids=row_ids,
         )
         affected_row_ids = torch.arange(row_count, device=view.logits.device, dtype=torch.long)
-        dense_logits = ((2.0 * view.logits) - result.logits).detach()
+        dense_logits = ((2.0 * view.logits) - reweighted).detach()
         return CandidateModifierState(
             beta=1.0,
             backend="pre_filter_dense",
@@ -71,7 +75,7 @@ class OverRIDESamplerModifierProvider:
         row_count = int(sampled_token_ids.reshape(-1).numel())
         if row_count != prepared.row_count:
             raise RuntimeError("OverRIDE sampler provider requires one sampled token per prepared decode row")
-        self.engine.update_from_sampled_tokens_batch(
+        self.consumer.update_from_sampled_tokens(
             sampled_token_ids,
             row_ids=prepared.row_ids,
         )

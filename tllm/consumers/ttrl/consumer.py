@@ -192,7 +192,7 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
             step_id=self._step_id,
             entries={"hidden": hidden, "rewards": reward_tensor.reshape(-1, 1)},
         )
-        self._compiled.consume_flow(0, bundle, None)
+        self._compiled.consume_flow(self._compiled.flow_ordinal("forward"), bundle, None)
         self._reward_count += rows
         loss_sum = float(self._compiled.loss_sum)
         self._last_loss = loss_sum - self._loss_sum_seen

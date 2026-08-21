@@ -140,7 +140,7 @@ class TLMConsumer(BaseConsumer[TLMConsumerConfig]):
                 ),
             },
         )
-        self._compiled.consume_flow(0, bundle, None)
+        self._compiled.consume_flow(self._compiled.flow_ordinal("forward"), bundle, None)
         loss_sum = float(self._compiled.loss_sum)
         self._last_loss = loss_sum - self._loss_sum_seen
         self._loss_sum_seen = loss_sum

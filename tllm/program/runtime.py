@@ -545,6 +545,15 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
     def bank(self, name: str) -> ProgramStateBank:
         return self._banks[name]
 
+    def flow_ordinal(self, flow_name: str) -> int:
+        """Resolve a declared flow name to its class-definition ordinal."""
+        for ordinal, (node, _plan, _executor) in self._flows.items():
+            if node.name == flow_name:
+                return ordinal
+        raise WorkGraphError(
+            "PG100", f"unknown flow {flow_name!r} for {self.consumer_id}"
+        )
+
     def run_flow(
         self,
         flow_name: str,
