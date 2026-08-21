@@ -21,13 +21,17 @@ from tllm.ports.base import PortKind
 from tllm.ports.residual_stream import ResidualLocator, ResidualStream
 from tllm.runtime import residual_runtime as esamp_runtime
 from tllm.workflows import esamp_support
-from tllm.workgraph import (
-    CaptureAttachment,
+from tllm.workgraph.frontend import (
     CaptureStatus,
     CapturedFlow,
-    NodeKey,
     PortBindingDesc,
     PortBindingDirection,
+)
+from tllm.workgraph.hierarchy import (
+    CaptureAttachment,
+)
+from tllm.workgraph.ir import (
+    NodeKey,
 )
 
 

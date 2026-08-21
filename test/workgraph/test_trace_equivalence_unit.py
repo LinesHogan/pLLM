@@ -124,9 +124,9 @@ def _binding(dispatch: DispatchPlan, execution: ExecutionPlan) -> RuntimePlanBin
 
 class TraceEquivalenceTest(unittest.TestCase):
     def test_trace_oracle_is_exported_from_workgraph_control_plane(self) -> None:
-        import tllm.workgraph as workgraph
+        from tllm.workgraph import trace as trace_module
 
-        self.assertIs(workgraph.compare_event_traces, compare_event_traces)
+        self.assertIs(trace_module.compare_event_traces, compare_event_traces)
 
     def test_compiler_records_equivalent_event_trace_in_explain(self) -> None:
         dispatch, execution = _plans()

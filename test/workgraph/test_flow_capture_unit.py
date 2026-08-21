@@ -7,7 +7,7 @@ from unittest import mock
 
 import torch
 
-from tllm.workgraph import (
+from tllm.workgraph.frontend import (
     BeforeNextUse,
     CaptureStatus,
     CapturedFlow,

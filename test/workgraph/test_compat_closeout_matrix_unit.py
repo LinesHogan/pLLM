@@ -13,16 +13,24 @@ from tllm.ports.port_spec import PortSpec
 from tllm.producers.base import HookPoint
 from tllm.producers.registry import ExecutionPlan, PlannedProducer, ProducerEntry
 from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.workgraph import (
+from tllm.workgraph.anchors import (
     BackendSnapshot,
-    BoundaryKind,
-    CaptureAttachment,
-    NodeKey,
+)
+from tllm.workgraph.frontend import (
     PortBindingDesc,
     PortBindingDirection,
-    WorkGraphDiagnosticCode,
-    compile_shadow_parity,
     flow,
+)
+from tllm.workgraph.hierarchy import (
+    CaptureAttachment,
+)
+from tllm.workgraph.ir import (
+    BoundaryKind,
+    NodeKey,
+    WorkGraphDiagnosticCode,
+)
+from tllm.workgraph.shadow import (
+    compile_shadow_parity,
 )
 
 

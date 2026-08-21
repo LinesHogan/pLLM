@@ -16,15 +16,23 @@ from tllm.ports.port_spec import PortSpec
 from tllm.producers.base import HookPoint
 from tllm.producers.registry import ExecutionPlan, PlannedProducer, ProducerEntry
 from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.workgraph import (
+from tllm.workgraph.anchors import (
     BackendSnapshot,
-    CaptureAttachment,
+)
+from tllm.workgraph.frontend import (
     PortBindingDesc,
     PortBindingDirection,
-    NodeKey,
-    build_hierarchy,
-    compile_shadow_parity,
     flow,
+)
+from tllm.workgraph.hierarchy import (
+    CaptureAttachment,
+    build_hierarchy,
+)
+from tllm.workgraph.ir import (
+    NodeKey,
+)
+from tllm.workgraph.shadow import (
+    compile_shadow_parity,
 )
 from test.core.oracles.capture_hierarchy_validator import validate_capture_hierarchy
 

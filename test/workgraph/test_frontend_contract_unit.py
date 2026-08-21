@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from tllm.workgraph import (
+from tllm.workgraph.frontend import (
     ArtifactKey,
     BeforeNextUse,
     Capability,

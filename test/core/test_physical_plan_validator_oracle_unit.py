@@ -7,24 +7,28 @@ from dataclasses import dataclass, replace
 import pytest
 
 from tllm import core
-from tllm.workgraph import (
+from tllm.workgraph.frontend import (
     ArtifactKey,
+    Device,
+    TensorDTypeDesc,
+    TensorDeviceDesc,
+)
+from tllm.workgraph.ir import (
+    ExecutorKey,
+    NodeKey,
+)
+from tllm.workgraph.physical import (
     BufferBucketDesc,
     BufferBucketKey,
     BufferOwnershipKind,
     CapturePolicy,
-    Device,
-    ExecutorKey,
     FallbackPolicy,
     FenceDependencyDesc,
     FenceKey,
     FenceKind,
-    NodeKey,
     PhysicalFlowPlan,
     PhysicalNodePlan,
     StreamClass,
-    TensorDTypeDesc,
-    TensorDeviceDesc,
 )
 
 

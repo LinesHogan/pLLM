@@ -29,9 +29,9 @@ from tllm.workgraph.lsp import (
 
 class WorkGraphLspAdapterTest(unittest.TestCase):
     def test_adapter_is_exported_from_workgraph_control_plane(self) -> None:
-        import tllm.workgraph as workgraph
+        from tllm.workgraph import lsp as lsp_module
 
-        self.assertIs(workgraph.build_lsp_snapshot, build_lsp_snapshot)
+        self.assertIs(lsp_module.build_lsp_snapshot, build_lsp_snapshot)
 
     def test_successful_capture_exposes_typed_hover_and_regions(self) -> None:
         @flow(dynamic_dims=(DynamicDim(value_path=(0,), dimension=0, upper_bound=4),))

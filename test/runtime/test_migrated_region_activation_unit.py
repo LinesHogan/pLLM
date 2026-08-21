@@ -37,19 +37,25 @@ from tllm.runtime.scheduling.workgraph_executor import (
 from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.workgraph import placement
-from tllm.workgraph import (
+from tllm.workgraph.frontend import (
     ArtifactKey,
     Capability,
-    CaptureAttachment,
     CaptureStatus,
     CapturedFlow,
     Device,
     Effect,
+    StateScope,
+    flow,
+)
+from tllm.workgraph.hierarchy import (
+    CaptureAttachment,
+)
+from tllm.workgraph.ir import (
     ExecutorKey,
     NodeKey,
-    StateScope,
+)
+from tllm.workgraph.shadow import (
     compile_shadow_parity,
-    flow,
 )
 from tllm.workgraph.frontend import ExternContract
 from tllm.workgraph.anchors import BackendResolution, shadow_backend_snapshot
