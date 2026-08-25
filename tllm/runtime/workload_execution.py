@@ -751,6 +751,22 @@ class NativeWorkloadExecution:
     )
     _prepared_step: int = -1
     _executed_nodes: set[NodeKey] = field(default_factory=set)
+    _side_streams: tuple[object, ...] = ()
+
+    def _join_side_streams(self) -> None:
+        """Order the main stream after all side-stream work enqueued so far.
+
+        Called at every signed advance and at step retirement: side Regions
+        overlap with the main workload between two signed events, and any
+        main-path consumption at the next event (sinks, backend binders)
+        observes their results.  This is an async event wait, not a host
+        synchronization.
+        """
+        if not self._side_streams or not torch.cuda.is_available():
+            return
+        current = torch.cuda.current_stream()
+        for stream in self._side_streams:
+            current.wait_stream(cast(torch.cuda.Stream, stream))
 
     def owns_consumer(self, consumer: object) -> bool:
         return any(owner is consumer for owner in self._owned_consumers)
@@ -799,6 +815,7 @@ class NativeWorkloadExecution:
             return
         if self._prepared_step != step:
             raise RuntimeError("cannot retire a native workload step from another epoch")
+        self._join_side_streams()
         self.executor.finish_step(step)
         if self._value_store is not None:
             self._value_store.finish_step(step)
@@ -838,6 +855,9 @@ class NativeWorkloadExecution:
             # vLLM kernel warmup calls sampler methods without opening a
             # logical engine step. It has no workload values to execute.
             return False
+        # Join side-stream work from earlier signed events before this
+        # event's nodes or main-path consumers observe their outputs.
+        self._join_side_streams()
         pending = tuple(node for node in nodes if node not in self._executed_nodes)
         if not pending:
             return False
@@ -1705,9 +1725,54 @@ def _plan_resources(
         raise RuntimeError("native Region workload has no materialized physical plan")
     if physical.buffer_buckets:
         raise RuntimeError("native Region buffer registry is not installed")
-    if any(node.stream is not StreamClass.DEFAULT for node in physical.nodes):
-        raise RuntimeError("native Region plan selected an unbound stream class")
-    stream = _SerialStream()
+    unsupported = tuple(
+        sorted(
+            {
+                node.stream.value
+                for node in physical.nodes
+                if node.stream
+                not in (StreamClass.DEFAULT, StreamClass.SIDE_FORWARD)
+            }
+        )
+    )
+    if unsupported:
+        raise RuntimeError(
+            f"native Region plan selected an unbound stream class: {unsupported}"
+        )
+    side_classes = tuple(
+        sorted(
+            {
+                node.stream
+                for node in physical.nodes
+                if node.stream is not StreamClass.DEFAULT
+            }
+        )
+    )
+    used_classes = tuple(
+        sorted({node.stream for node in physical.nodes})
+    )
+    cuda = torch.cuda.is_available()
+    # Without CUDA there is no stream to overlap on; serial tokens keep the
+    # signed order, which is trivially correct for synchronous host execution.
+    real_side_streams = cuda and bool(side_classes)
+    streams = [
+        RuntimeStream(
+            stream_class,
+            (
+                _SerialStream()
+                if stream_class is StreamClass.DEFAULT or not cuda
+                else torch.cuda.Stream()
+            ),
+            retire_fence=Fence(
+                FenceKey(
+                    "workload",
+                    f"retire-epoch-{physical.plan_epoch}-{stream_class.value}",
+                ),
+                _ImmediateEvent(),
+            ),
+        )
+        for stream_class in used_classes
+    ]
     event_keys = tuple(
         dependency.fence
         for node in physical.nodes
@@ -1717,21 +1782,13 @@ def _plan_resources(
         raise RuntimeError("native Region plan contains duplicate fence identities")
     return PlanResources(
         plan=physical,
-        streams=(
-            RuntimeStream(
-                StreamClass.DEFAULT,
-                stream,
-                retire_fence=Fence(
-                    FenceKey(
-                        "workload",
-                        f"retire-epoch-{physical.plan_epoch}",
-                    ),
-                    _ImmediateEvent(),
-                ),
-            ),
-        ),
+        streams=tuple(streams),
         events=tuple(
-            RuntimeEvent(key, _ImmediateEvent()) for key in event_keys
+            RuntimeEvent(
+                key,
+                torch.cuda.Event() if real_side_streams else _ImmediateEvent(),
+            )
+            for key in event_keys
         ),
         graphs=graphs,
     )
@@ -1998,6 +2055,12 @@ def _region_workload_execution(
         snapshots=PlanSnapshotStore(resources),
         handlers=handlers,
     )
+    side_streams = tuple(
+        resource.stream
+        for resource in resources.streams
+        if resource.key is not StreamClass.DEFAULT
+        and isinstance(resource.stream, torch.cuda.Stream)
+    )
     frozen_anchor_nodes = MappingProxyType(
         {anchor: tuple(nodes) for anchor, nodes in anchor_nodes.items()}
     )
@@ -2028,6 +2091,7 @@ def _region_workload_execution(
         _backend_region_binders=bindings.backend_region_binders,
         _requires_decode_hidden=bool(hidden_bindings),
         _shape_specializations=shape_specializations,
+        _side_streams=side_streams,
     )
 
 

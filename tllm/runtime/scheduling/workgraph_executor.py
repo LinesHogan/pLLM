@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping
+import contextlib
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Condition, Lock
@@ -315,6 +316,7 @@ class PhysicalExecutor:
 
         eager_nodes: list[str] = []
         replayed_nodes: list[str] = []
+        main_snapshot: torch.cuda.Event | None = None
         try:
             # A miss must abort an entire backend event group before a prior
             # Region can mutate state, publish a sink, or record a fence.
@@ -322,6 +324,18 @@ class PhysicalExecutor:
             for node in ordered_nodes:
                 stream_resource = prepared.streams[node.stream]
                 stream = cast(StreamLike, stream_resource.stream)
+                if node.stream is not StreamClass.DEFAULT and isinstance(
+                    stream, torch.cuda.Stream
+                ):
+                    # Side-stream nodes may read main-path outputs (hidden
+                    # activations, provided values) produced before this
+                    # advance.  Host-side hook ordering does not imply GPU
+                    # completion, so the side stream first waits a snapshot
+                    # of everything the main stream has enqueued so far.
+                    if main_snapshot is None:
+                        main_snapshot = torch.cuda.Event()
+                        main_snapshot.record()
+                    stream.wait_event(main_snapshot)
                 node_leases = (
                     ()
                     if node.buffer_bucket is None
@@ -341,42 +355,50 @@ class PhysicalExecutor:
                     if node.artifact_key is None
                     else prepared.graphs.get(node.artifact_key)
                 )
-                if (
-                    node.capture_policy != CapturePolicy.DISABLED
-                    and graph_resource is not None
-                ):
-                    replay_context = PhysicalExecutionContext(
-                        step_id=step,
-                        plan_epoch=prepared.resources.plan.plan_epoch,
-                        node=node,
-                        kind=PhysicalExecutionKind.REPLAY,
-                        stream=stream,
-                        tensors=inputs,
-                        leases=node_leases,
-                    )
-                    graph_resource.replay(replay_context)
-                    replayed_nodes.append(str(node.node_key))
-                    self.stats.replay_count += 1
-                else:
-                    if node.capture_policy != CapturePolicy.DISABLED:
-                        if node.fallback_policy == FallbackPolicy.REJECT:
-                            reason = "capture graph"
-                            raise PhysicalExecutionError(
-                                f"physical node {node.node_key} requires {reason}"
-                            )
-                        self.stats.fallback_count += 1
-                    context = PhysicalExecutionContext(
-                        step_id=step,
-                        plan_epoch=prepared.resources.plan.plan_epoch,
-                        node=node,
-                        kind=PhysicalExecutionKind.EAGER,
-                        stream=stream,
-                        tensors=inputs,
-                        leases=node_leases,
-                    )
-                    prepared.handlers[node.node_key](context)
-                    eager_nodes.append(str(node.node_key))
-                    self.stats.eager_count += 1
+                # GPU work for a side-stream node must launch on its signed
+                # stream, not on whatever stream the host happens to be on.
+                execution_stream = (
+                    torch.cuda.stream(stream)
+                    if isinstance(stream, torch.cuda.Stream)
+                    else contextlib.nullcontext()
+                )
+                with execution_stream:
+                    if (
+                        node.capture_policy != CapturePolicy.DISABLED
+                        and graph_resource is not None
+                    ):
+                        replay_context = PhysicalExecutionContext(
+                            step_id=step,
+                            plan_epoch=prepared.resources.plan.plan_epoch,
+                            node=node,
+                            kind=PhysicalExecutionKind.REPLAY,
+                            stream=stream,
+                            tensors=inputs,
+                            leases=node_leases,
+                        )
+                        graph_resource.replay(replay_context)
+                        replayed_nodes.append(str(node.node_key))
+                        self.stats.replay_count += 1
+                    else:
+                        if node.capture_policy != CapturePolicy.DISABLED:
+                            if node.fallback_policy == FallbackPolicy.REJECT:
+                                reason = "capture graph"
+                                raise PhysicalExecutionError(
+                                    f"physical node {node.node_key} requires {reason}"
+                                )
+                            self.stats.fallback_count += 1
+                        context = PhysicalExecutionContext(
+                            step_id=step,
+                            plan_epoch=prepared.resources.plan.plan_epoch,
+                            node=node,
+                            kind=PhysicalExecutionKind.EAGER,
+                            stream=stream,
+                            tensors=inputs,
+                            leases=node_leases,
+                        )
+                        prepared.handlers[node.node_key](context)
+                        eager_nodes.append(str(node.node_key))
+                        self.stats.eager_count += 1
 
                 for lease in node_leases:
                     lease.publish_completion(stream)

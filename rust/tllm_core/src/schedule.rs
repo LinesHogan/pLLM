@@ -232,6 +232,7 @@ enum RegionCaptureMode {
 #[serde(rename_all = "snake_case")]
 enum RegionStreamClass {
     Default,
+    SideForward,
 }
 
 /// The closed fallback command for a fully-bound ExecutionRegion.
@@ -501,6 +502,11 @@ struct CompileOptions {
     compile_policy: String,
     #[serde(default = "default_capture_policy")]
     capture_policy: String,
+    /// Permit the planner to place effect-free Regions on a side stream so
+    /// they overlap with the main workload.  Cross-stream ordering stays on
+    /// explicit fences; the planner never predicts GPU timing.
+    #[serde(default)]
+    allow_side_stream: bool,
     schema_version: i64,
 }
 
@@ -3035,6 +3041,20 @@ fn compile_impl(
                 .tasks
                 .iter()
                 .all(|index| selected[*index].capture_safe);
+        let effects: Vec<ScheduleEffect> = draft
+            .tasks
+            .iter()
+            .flat_map(|index| graph.tasks[*index].effects.iter().cloned())
+            .collect();
+        // Side-stream placement only exposes legal parallelism to the GPU
+        // hardware scheduler; every cross-stream dependency remains an
+        // explicit fence.  Regions with any state effect stay on the default
+        // stream so version ordering never depends on hardware timing.
+        let stream = if options.allow_side_stream && effects.is_empty() {
+            RegionStreamClass::SideForward
+        } else {
+            RegionStreamClass::Default
+        };
         execution_regions.push(ExecutionRegion {
             region_id,
             tasks,
@@ -3055,15 +3075,11 @@ fn compile_impl(
             input_bindings: Vec::new(),
             output_bindings: Vec::new(),
             task_invocations: Vec::new(),
-            effects: draft
-                .tasks
-                .iter()
-                .flat_map(|index| graph.tasks[*index].effects.iter().cloned())
-                .collect(),
+            effects,
             compile_safe,
             capture_safe,
             capture_mode: RegionCaptureMode::Disabled,
-            stream: Some(RegionStreamClass::Default),
+            stream: Some(stream),
             fallback_policy: Some(RegionFallbackPolicy::Reject),
             artifact_key: String::new(),
             serial_fallback: draft.serial_fallback,
@@ -3656,6 +3672,13 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         if region.serial_fallback && !options_desc.allow_serial_fallback {
             return Err(schedule_error(
                 "serial fallback region is disabled by CompileOptions",
+            ));
+        }
+        if region.stream == Some(RegionStreamClass::SideForward)
+            && (!options_desc.allow_side_stream || !region.effects.is_empty())
+        {
+            return Err(schedule_error(
+                "side-stream ExecutionRegion requires allow_side_stream and zero state effects",
             ));
         }
         if let Some(command) = &region.compile_command {
@@ -4905,8 +4928,12 @@ mod tests {
         assert!(error.to_string().contains("unknown field `unexpected`"));
         let error = serde_json::from_str::<RegionCaptureMode>(r#""prefer""#).unwrap_err();
         assert!(error.to_string().contains("unknown variant `prefer`"));
-        let error = serde_json::from_str::<RegionStreamClass>(r#""side_forward""#).unwrap_err();
-        assert!(error.to_string().contains("unknown variant `side_forward`"));
+        assert_eq!(
+            serde_json::from_str::<RegionStreamClass>(r#""side_forward""#).unwrap(),
+            RegionStreamClass::SideForward
+        );
+        let error = serde_json::from_str::<RegionStreamClass>(r#""side_train""#).unwrap_err();
+        assert!(error.to_string().contains("unknown variant `side_train`"));
         let error = serde_json::from_str::<RegionFallbackPolicy>(r#""eager""#).unwrap_err();
         assert!(error.to_string().contains("unknown variant `eager`"));
 
@@ -5119,6 +5146,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("artifact metadata"));
+    }
+
+    #[test]
+    fn side_stream_placement_is_signed_and_option_gated() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"side-stream","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":false,"inputs":[{"name":"value","kind":"provided","source":"value"}],"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[],"values":[{"value_id":"side:run:answer","version":1,"producer":"run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let serial_options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+        let side_options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+
+        let serial: Decision =
+            serde_json::from_str(&compile_schedule(graph, timeline, serial_options).unwrap())
+                .unwrap();
+        assert_eq!(
+            serial.execution_regions[0].stream,
+            Some(RegionStreamClass::Default)
+        );
+
+        let side: Decision =
+            serde_json::from_str(&compile_schedule(graph, timeline, side_options).unwrap())
+                .unwrap();
+        assert_eq!(
+            side.execution_regions[0].stream,
+            Some(RegionStreamClass::SideForward)
+        );
+        validate_schedule(
+            graph,
+            timeline,
+            side_options,
+            &serde_json::to_string(&side).unwrap(),
+        )
+        .unwrap();
+
+        // A side-stream decision is not valid under options without the flag.
+        let error = validate_schedule(
+            graph,
+            timeline,
+            serial_options,
+            &serde_json::to_string(&side).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("side-stream"));
     }
 
     #[test]

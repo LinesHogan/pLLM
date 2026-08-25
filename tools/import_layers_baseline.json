@@ -19,6 +19,7 @@
       "core",
       "ports",
       "producers",
+      "program",
       "runtime",
       "workgraph"
     ],
@@ -35,6 +36,14 @@
       "core",
       "ports"
     ],
+    "program": [
+      "common",
+      "contracts",
+      "core",
+      "ports",
+      "producers",
+      "workgraph"
+    ],
     "runtime": [
       "common",
       "contracts",
@@ -45,7 +54,6 @@
     ],
     "schedule": [],
     "util": "leaf (any)",
-    "workload": [],
     "workflows": "leaf (any)",
     "workgraph": [
       "contracts",
@@ -53,6 +61,7 @@
       "ports",
       "producers"
     ],
+    "workload": [],
     "exact_module_edges": [
       "tllm.backends.timeline -> tllm.schedule.timeline",
       "tllm.consumers.dummy.workload -> tllm.workload",
@@ -71,12 +80,14 @@
       "tllm.runtime.workload_execution -> tllm.schedule",
       "tllm.runtime.workload_execution -> tllm.schedule.contracts",
       "tllm.runtime.workload_execution -> tllm.schedule.physical",
+      "tllm.runtime.workload_execution -> tllm.workload",
       "tllm.runtime.workload_execution -> tllm.workload.frontend",
       "tllm.runtime.workload_execution -> tllm.workload.lowering",
       "tllm.runtime.workload_execution -> tllm.workload.region_compiler",
       "tllm.runtime.workload_plugins -> tllm.schedule",
       "tllm.runtime.workload_plugins -> tllm.workload",
       "tllm.runtime.workload_plugins -> tllm.workload.lowering",
+      "tllm.schedule.contracts -> tllm.contracts.hidden_locator",
       "tllm.schedule.coordinator -> tllm.workgraph.physical",
       "tllm.schedule.coordinator -> tllm.workload.frontend",
       "tllm.schedule.coordinator -> tllm.workload.lowering",
@@ -86,10 +97,14 @@
       "tllm.schedule.timeline -> tllm.backends.protocol",
       "tllm.workload.compat -> tllm.program.decl",
       "tllm.workload.compat -> tllm.workgraph.frontend",
+      "tllm.workload.frontend -> tllm.contracts.hidden_locator",
+      "tllm.workload.ir -> tllm.contracts.hidden_locator",
       "tllm.workload.lowering -> tllm.schedule.contracts",
       "tllm.workload.region_compiler -> tllm.schedule.contracts"
     ]
   },
-  "module_level": {},
+  "module_level": {
+    "consumers->backends": 1
+  },
   "local_level": {}
 }

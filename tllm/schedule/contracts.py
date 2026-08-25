@@ -400,6 +400,7 @@ class RegionStreamClass(StrEnum):
     """Closed physical stream command emitted and signed by the Rust planner."""
 
     DEFAULT = "default"
+    SIDE_FORWARD = "side_forward"
 
 
 class RegionFallbackPolicy(StrEnum):
@@ -1020,6 +1021,10 @@ class CompileOptions:
     compiler_fingerprint: str = ""
     compile_policy: str = "torch_compile"
     capture_policy: str = "auto"
+    # Permit the Rust planner to sign effect-free Regions onto a side stream
+    # for overlap with the main workload.  Cross-stream ordering stays on
+    # explicit signed fences; this never relaxes correctness.
+    allow_side_stream: bool = False
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -1085,6 +1090,8 @@ class CompileOptions:
             raise ValueError(
                 "CompileOptions.capture_policy must be auto, disabled, or require"
             )
+        if not isinstance(self.allow_side_stream, bool):
+            raise TypeError("CompileOptions.allow_side_stream must be bool")
         if self.schema_version != 1:
             raise ValueError("unsupported CompileOptions schema version")
 
@@ -1534,7 +1541,9 @@ class ExecutionRegion:
         try:
             stream = RegionStreamClass(self.stream)
         except ValueError as exc:
-            raise ValueError("ExecutionRegion.stream must be default") from exc
+            raise ValueError(
+                "ExecutionRegion.stream must be a signed RegionStreamClass"
+            ) from exc
         object.__setattr__(self, "stream", stream)
         try:
             fallback_policy = RegionFallbackPolicy(self.fallback_policy)
@@ -2248,7 +2257,9 @@ class ScheduleDecision:
             try:
                 return RegionStreamClass(_json_string(raw_value, label))
             except ValueError as exc:
-                raise ValueError("ExecutionRegion.stream must be default") from exc
+                raise ValueError(
+                    "ExecutionRegion.stream must be a signed RegionStreamClass"
+                ) from exc
 
         def region_fallback_policy(
             raw_value: object, label: str

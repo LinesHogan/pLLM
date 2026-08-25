@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -569,8 +570,13 @@ class ScheduleContractUnitTest(unittest.TestCase):
         ):
             type(decision).from_json(json.dumps(missing_compile_command))
 
+        side_stream = json.loads(decision.to_json())
+        side_stream["execution_regions"][0]["stream"] = "side_forward"
+        parsed_side = type(decision).from_json(json.dumps(side_stream))
+        self.assertEqual(parsed_side.execution_regions[0].stream.value, "side_forward")
+
         unknown_stream = json.loads(decision.to_json())
-        unknown_stream["execution_regions"][0]["stream"] = "side_forward"
+        unknown_stream["execution_regions"][0]["stream"] = "side_train"
         with self.assertRaisesRegex(ValueError, "stream"):
             type(decision).from_json(json.dumps(unknown_stream))
 
@@ -1209,9 +1215,14 @@ class ScheduleContractUnitTest(unittest.TestCase):
 
         golden = (
             Path(__file__).with_name("golden") / "schedule_v2_region.json"
-        ).read_text(encoding="utf-8")
-        self.assertEqual(decision.to_json() + "\n", golden)
-        parsed_golden = type(decision).from_json(golden)
+        )
+        if os.environ.get("TLLM_REGEN_GOLDEN") == "1":
+            golden.write_text(decision.to_json() + "\n", encoding="utf-8")
+            print(f"signature={decision.signature}")
+            print(f"artifact_key={decision.execution_regions[0].artifact_key}")
+        golden_text = golden.read_text(encoding="utf-8")
+        self.assertEqual(decision.to_json() + "\n", golden_text)
+        parsed_golden = type(decision).from_json(golden_text)
         with mock.patch(
             "tllm.schedule.compiler.compiler_environment_fingerprint",
             return_value="1" * 64,
@@ -1222,11 +1233,11 @@ class ScheduleContractUnitTest(unittest.TestCase):
             ))
         self.assertEqual(
             decision.signature,
-            "566aac263c7e3108931da7d4702214189ef37f2bb3111ea482218e1545f3a5b5",
+            "7d35b6c1c9b671d7a617a5e10b39dc2acc74800dba03df7b8ae16799bb658374",
         )
         self.assertEqual(
             decision.execution_regions[0].artifact_key,
-            "b76b9fe03be8c874d70646d72c1cdb42c2f39da5e1863c9c1fe27ca417d03dba",
+            "a9a7026e26c3e5fb0ba0d1edda22b470c9d398629f5b8948d96bb4c708566fdf",
         )
 
     def test_schema_v2_complex_region_signature_golden(self) -> None:
@@ -1378,9 +1389,12 @@ class ScheduleContractUnitTest(unittest.TestCase):
 
         golden = (
             Path(__file__).with_name("golden") / "schedule_v2_complex_region.json"
-        ).read_text(encoding="utf-8")
-        self.assertEqual(decision.to_json() + "\n", golden)
-        parsed_golden = type(decision).from_json(golden)
+        )
+        if os.environ.get("TLLM_REGEN_GOLDEN") == "1":
+            golden.write_text(decision.to_json() + "\n", encoding="utf-8")
+        golden_text = golden.read_text(encoding="utf-8")
+        self.assertEqual(decision.to_json() + "\n", golden_text)
+        parsed_golden = type(decision).from_json(golden_text)
         self.assertEqual(parsed_golden, decision)
         with mock.patch(
             "tllm.schedule.compiler.compiler_environment_fingerprint",

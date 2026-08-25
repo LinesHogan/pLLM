@@ -119,6 +119,7 @@ class TllmRuntime:
         workloads: Sequence[Any] = (),
         workload_memory_budget_bytes: int = 0,
         workload_allow_serial_fallback: bool = True,
+        workload_allow_side_stream: bool = False,
         workload_persistent_state_bytes: int = 0,
         workload_provided_inputs: Mapping[str, Callable[[int], object]] | None = None,
         workload_output_sinks: Mapping[
@@ -144,6 +145,7 @@ class TllmRuntime:
         self._workload_compile_options = CompileOptions(
             memory_budget_bytes=workload_memory_budget_bytes,
             allow_serial_fallback=workload_allow_serial_fallback,
+            allow_side_stream=workload_allow_side_stream,
         )
         if (
             not isinstance(workload_persistent_state_bytes, int)
