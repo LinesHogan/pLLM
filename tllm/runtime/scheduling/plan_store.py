@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import TypeVar, cast
@@ -11,9 +11,11 @@ import torch
 
 from tllm.runtime.scheduling.physical import (
     BufferLease,
+    ContextGraphLike,
     EventLike,
     Fence,
     GraphLike,
+    PreflightContextGraphLike,
     StreamLike,
 )
 from tllm.runtime.scheduling.transfer import (
@@ -93,6 +95,12 @@ class RuntimeGraph:
 
     key: ArtifactKey
     graph: object
+    _replay: Callable[[object], None] = field(init=False, repr=False, compare=False)
+    _preflight: Callable[[object], None] | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(cast(object, self.key), ArtifactKey):
@@ -100,9 +108,31 @@ class RuntimeGraph:
         if len(self.key.digest) != 64:
             raise ValueError("RuntimeGraph.key requires a SHA-256 artifact digest")
         graph = cast(object, self.graph)
-        if not isinstance(graph, GraphLike):
-            raise TypeError("RuntimeGraph.graph must implement replay()")
+        if isinstance(graph, ContextGraphLike):
+            replay = graph.replay_context
+        elif isinstance(graph, GraphLike):
+            replay = lambda _context: graph.replay()
+        else:
+            raise TypeError(
+                "RuntimeGraph.graph must implement replay() or replay_context(context)"
+            )
+        preflight = (
+            graph.preflight_context
+            if isinstance(graph, PreflightContextGraphLike)
+            else None
+        )
         object.__setattr__(self, "graph", graph)
+        object.__setattr__(self, "_replay", replay)
+        object.__setattr__(self, "_preflight", preflight)
+
+    def replay(self, context: object) -> None:
+        self._replay(context)
+
+    def preflight(self, context: object) -> None:
+        """Validate a replay without submitting CUDA work or committing output."""
+
+        if self._preflight is not None:
+            self._preflight(context)
 
 
 @dataclass(frozen=True, slots=True, eq=False)

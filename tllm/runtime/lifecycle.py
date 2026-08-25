@@ -38,6 +38,10 @@ def make_plain_llm(
     worker_extension_cls: str | None = None,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
+    enable_lora: bool = False,
+    max_lora_rank: int | None = None,
+    max_loras: int | None = None,
+    max_cpu_loras: int | None = None,
 ) -> Any:
     """Construct a plain vLLM LLM with tLLM's standard single-GPU defaults.
 
@@ -56,6 +60,14 @@ def make_plain_llm(
         kwargs["max_num_seqs"] = int(max_num_seqs)
     if max_num_batched_tokens is not None:
         kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    if enable_lora:
+        kwargs["enable_lora"] = True
+    if max_lora_rank is not None:
+        kwargs["max_lora_rank"] = int(max_lora_rank)
+    if max_loras is not None:
+        kwargs["max_loras"] = int(max_loras)
+    if max_cpu_loras is not None:
+        kwargs["max_cpu_loras"] = int(max_cpu_loras)
     return LLM(
         model=model_name,
         tensor_parallel_size=1,

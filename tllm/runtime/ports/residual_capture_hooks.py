@@ -42,6 +42,7 @@ class ResidualCaptureRuntimeLike(Protocol):
     producer_executor: ProducerExecutorLike | None
     capture_full_residual_rows: bool
     placement_stats: PlacementStats
+    workload_execution: object | None
 
 
 class ResidualCaptureCoreLike(Protocol):
@@ -205,6 +206,15 @@ def install_layer_forward_taps(
                         hidden=tensor,
                     )
                 )
+            elif active_targets.runtime_requires_decode_hidden(
+                cast(active_targets.RuntimeWithTargets, core.RUNTIME)
+            ):
+                materialize_decode_residual(
+                    runtime=core.RUNTIME,
+                    runner=runner,
+                    layer_path=__path,
+                    hidden=tensor,
+                )
             if not active_targets.runtime_has_active_targets(
                 cast(active_targets.RuntimeWithTargets, core.RUNTIME)
             ):
@@ -275,5 +285,4 @@ def _capture_plan_fingerprint(
             )
         )
     return hashlib.sha256("\n".join(rows).encode("ascii")).hexdigest()[:16]
-
 

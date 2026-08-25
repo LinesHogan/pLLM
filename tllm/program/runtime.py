@@ -23,7 +23,7 @@ import copy
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Protocol, cast, runtime_checkable
+from typing import Hashable, Protocol, cast, runtime_checkable
 
 import torch
 
@@ -41,7 +41,7 @@ from tllm.program.optim import (
     validate_optimizer,
 )
 from tllm.program.stages import FlowStagePlan, StagedFlowExecutor, slice_flow_stages
-from tllm.program.state import ProgramStateBank, StateSlot, group_rows_by_prompt
+from tllm.program.state import ProgramStateBank, StateSlot
 from tllm.workgraph.frontend import (
     DynamicDim,
     ExternProgramDecl,
@@ -432,7 +432,9 @@ def compile_program(
             for name, param in instance.named_parameters()
             if name in trainable
         }
-        banks[state.name] = ProgramStateBank(state.name, state.spec.scope, initial)
+        banks[state.name] = ProgramStateBank(
+            state.name, state.spec.scope, initial, key_spec=state.spec.key
+        )
         expected = state.spec.optimizer
         if expected is not None and actual_cls is not None:
             expected_cls = expected if isinstance(expected, type) else type(expected)
@@ -626,7 +628,7 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
 
     def _groups(
         self, bank: ProgramStateBank, meta: RowBatchMeta | None, rows: int
-    ) -> tuple[tuple[int | None, tuple[int, ...]], ...]:
+    ) -> tuple[tuple[Hashable | None, tuple[int, ...]], ...]:
         if bank.scope is StateScope.REPLICA:
             return ((None, tuple(range(rows))),)
         if meta is None:
@@ -634,8 +636,12 @@ class ProgramConsumer(BaseConsumer[Mapping[str, object]]):
                 "PG180", "REQUEST state requires request_meta in the bundle"
             )
         return tuple(
-            (prompt_idx, row_ids)
-            for prompt_idx, row_ids in group_rows_by_prompt(meta.prompt_idxs[:rows])
+            (key, row_ids)
+            for key, row_ids in bank.groups_for_metadata(
+                request_ids=meta.request_ids[:rows],
+                prompt_idxs=meta.prompt_idxs[:rows],
+                sample_idxs=meta.sample_idxs[:rows],
+            )
         )
 
     def _slot_override(self, slot: StateSlot) -> dict[str, torch.Tensor]:

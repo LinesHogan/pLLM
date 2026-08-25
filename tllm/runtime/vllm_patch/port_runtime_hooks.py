@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import time
-from typing import Dict, List, Mapping, Protocol, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence
 
 import torch
 
@@ -28,10 +30,160 @@ from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
+from tllm.runtime.resources import SamplerPrecomputeState
+from tllm.runtime.stats import PlacementStats
+from tllm.runtime.workload_execution import BackendObservableEvent
 
 
 _COMPUTE_LOGITS_HOOK_FLAG = "_tllm_compute_logits_wrapped"
 _INPUT_BATCH_MIN_P_PATCHED = False
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class _ModuleHookSnapshot:
+    module: torch.nn.Module
+    forward: object
+    buffers: dict[str, torch.Tensor | None]
+    non_persistent_buffers: set[str]
+    capture_identity: object
+
+
+@dataclass
+class RuntimeHookTransaction:
+    """Reversible cold-path installation of worker-local hook resources."""
+
+    core: Any
+    runtime_state: dict[str, object]
+    modules: tuple[_ModuleHookSnapshot, ...]
+    model: torch.nn.Module
+    model_attrs: dict[str, object]
+    runner: object
+    runner_attrs: dict[str, object]
+    sampler: object | None
+    sampler_attrs: dict[str, object]
+    active: bool = True
+
+    @staticmethod
+    def _restore_attrs(target: object, attrs: Mapping[str, object]) -> None:
+        namespace = vars(target)
+        for name, value in attrs.items():
+            if value is _MISSING:
+                namespace.pop(name, None)
+            else:
+                setattr(target, name, value)
+
+    def rollback(self) -> None:
+        if not self.active:
+            return
+        runtime_namespace = vars(self.core.RUNTIME)
+        runtime_namespace.clear()
+        runtime_namespace.update(self.runtime_state)
+        for snapshot in self.modules:
+            snapshot.module.forward = snapshot.forward  # type: ignore[method-assign]
+            snapshot.module._buffers.clear()
+            snapshot.module._buffers.update(snapshot.buffers)
+            snapshot.module._non_persistent_buffers_set.clear()
+            snapshot.module._non_persistent_buffers_set.update(
+                snapshot.non_persistent_buffers
+            )
+            self._restore_attrs(
+                snapshot.module,
+                {"_tllm_capture_compile_identity": snapshot.capture_identity},
+            )
+        self._restore_attrs(self.model, self.model_attrs)
+        self._restore_attrs(self.runner, self.runner_attrs)
+        if self.sampler is not None:
+            self._restore_attrs(self.sampler, self.sampler_attrs)
+        self.active = False
+
+    def finalize(self) -> None:
+        self.active = False
+
+
+def _snapshot_runtime_value(value: object) -> object:
+    if not isinstance(value, (PlacementStats, SamplerPrecomputeState)):
+        return value
+    snapshot = copy.copy(value)
+    for name, field_value in vars(value).items():
+        if isinstance(field_value, dict):
+            setattr(snapshot, name, dict(field_value))
+        elif isinstance(field_value, list):
+            setattr(snapshot, name, list(field_value))
+        elif isinstance(field_value, set):
+            setattr(snapshot, name, set(field_value))
+    return snapshot
+
+
+def _capture_runtime_hook_transaction(
+    *, core: Any, runner: RunnerLike
+) -> RuntimeHookTransaction:
+    model = runner.model
+    if model is None:
+        raise RuntimeError("runtime hook installation requires runner.model")
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("runtime hook installation requires a torch.nn.Module model")
+    modules = tuple(
+        _ModuleHookSnapshot(
+            module=module,
+            forward=module.forward,
+            buffers=dict(module._buffers),
+            non_persistent_buffers=set(module._non_persistent_buffers_set),
+            capture_identity=vars(module).get(
+                "_tllm_capture_compile_identity", _MISSING
+            ),
+        )
+        for module in model.modules()
+    )
+    runtime_state = {
+        name: _snapshot_runtime_value(value)
+        for name, value in vars(core.RUNTIME).items()
+    }
+    model_attrs = {
+        core.MODEL_HOOK_FLAG: vars(model).get(core.MODEL_HOOK_FLAG, _MISSING),
+        core.MODEL_HOOK_SPEC_ATTR: vars(model).get(
+            core.MODEL_HOOK_SPEC_ATTR, _MISSING
+        ),
+        _COMPUTE_LOGITS_HOOK_FLAG: vars(model).get(
+            _COMPUTE_LOGITS_HOOK_FLAG, _MISSING
+        ),
+        "compute_logits": vars(model).get("compute_logits", _MISSING),
+    }
+    runner_attrs = {
+        "_tllm_runtime": vars(runner).get("_tllm_runtime", _MISSING),
+    }
+    sampler = getattr(runner, "sampler", None)
+    sampler_attrs = (
+        {}
+        if sampler is None
+        else {
+            "_tllm_runtime": vars(sampler).get("_tllm_runtime", _MISSING),
+            "_tllm_runner": vars(sampler).get("_tllm_runner", _MISSING),
+        }
+    )
+    return RuntimeHookTransaction(
+        core=core,
+        runtime_state=runtime_state,
+        modules=modules,
+        model=model,
+        model_attrs=model_attrs,
+        runner=runner,
+        runner_attrs=runner_attrs,
+        sampler=sampler,
+        sampler_attrs=sampler_attrs,
+    )
+
+
+def setup_runtime_hooks_transactionally(
+    *, core: Any, runner: RunnerLike
+) -> RuntimeHookTransaction:
+    transaction = _capture_runtime_hook_transaction(core=core, runner=runner)
+    try:
+        setup_runtime_hooks_if_active(core=core, runner=runner)
+    except Exception:
+        transaction.rollback()
+        raise
+    return transaction
 
 def _prepare_inputs_adapter():
     return get_prepare_inputs_adapter()
@@ -368,6 +520,8 @@ def run_prepare_inputs_post_producers(
                 runtime=core.RUNTIME,
             )
         )
+    elif active_targets.runtime_requires_decode_hidden(core.RUNTIME):
+        localize_decode()  # type: ignore[operator]
     elif not hasattr(core.RUNTIME, "producer_executor"):
         localize_decode()  # type: ignore[operator]
 
@@ -570,9 +724,8 @@ def install_input_batch_min_p_patch() -> None:
 def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
-        _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
         return out
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
         event_name="load_model.pre",
@@ -582,9 +735,8 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
     )
     out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
     _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
-    _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
     setup_runtime_hooks_if_active(core=core, runner=runner)
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
         event_name="load_model.post",
@@ -609,6 +761,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
                 runner,
                 num_scheduled_tokens_np=view.num_scheduled_tokens_np,
             )
+            _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
         else:
             _fast_weight.update_fast_weight_phase_from_runner(core.RUNTIME, runner)
         return out
@@ -624,7 +777,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
-        event_name="prepare_inputs.pre",
+        event=BackendObservableEvent.PREPARE_INPUTS_PRE,
         phase="decode",
         layer_path=None,
         capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
@@ -662,6 +815,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
             runner,
             num_scheduled_tokens_np=view.num_scheduled_tokens_np,
         )
+        _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
         t3 = time.perf_counter() if trace_hotspots else 0.0
         record_path_hotspot_cpu(core, "prepare_inputs.decode_localization_cpu", t2, t3)
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
@@ -670,7 +824,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
             runner=runner,
-            event_name="prepare_inputs.post",
+            event=BackendObservableEvent.PREPARE_INPUTS_POST,
             phase="decode",
             layer_path=None,
             capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
@@ -689,18 +843,25 @@ def wrapped_execute_model(
     args: tuple,
     kwargs: dict,
     split_execute_and_sample: bool = False,
+    phase: str | None = "decode",
+    before_runtime_event: Callable[[BackendObservableEvent], None] | None = None,
+    execute_pre_already_dispatched: bool = False,
+    phase_after_inputs: Callable[[], str | None] | None = None,
 ) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         _check_fast_weight_static_key_request_count(core=core, runner=runner)
         return core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
-    _common_hooks.dispatch_runtime_event(
-        runtime=core.RUNTIME,
-        runner=runner,
-        event_name="execute_model.pre",
-        phase="decode",
-        layer_path=None,
-        capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
-    )
+    if not execute_pre_already_dispatched:
+        if before_runtime_event is not None:
+            before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_PRE)
+        _common_hooks.dispatch_runtime_event(
+            runtime=core.RUNTIME,
+            runner=runner,
+            event=BackendObservableEvent.EXECUTE_MODEL_PRE,
+            phase=phase,
+            layer_path=None,
+            capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
+        )
     model_hook_flag = getattr(core, "MODEL_HOOK_FLAG", "_tllm_residual_hooks_installed")
     if getattr(getattr(runner, "model", None), model_hook_flag, False):
         core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
@@ -712,6 +873,13 @@ def wrapped_execute_model(
     out = core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
     t1 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.forward_cpu", t0, t1)
+    if phase_after_inputs is not None:
+        phase = phase_after_inputs()
+        # MRv1's original execute_model can return before its nested
+        # _prepare_inputs call for an empty scheduler batch. There is then no
+        # signed logical step and consequently no post-execute work to emit.
+        if phase is None:
+            return out
     if not bool(getattr(getattr(runner, "model", None), _COMPUTE_LOGITS_HOOK_FLAG, False)):
         maybe_launch_post_logits_decode_work(core=core, runner=runner)
     t2 = time.perf_counter() if trace_hotspots else 0.0
@@ -727,20 +895,24 @@ def wrapped_execute_model(
         _hidden_bridge.dispatch_deferred_layer_batches(core=core, runner=runner)
     t4 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.deferred_layers_cpu", t3, t4)
+    if before_runtime_event is not None:
+        before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_POST)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
-        event_name="execute_model.post",
-        phase="decode",
+        event=BackendObservableEvent.EXECUTE_MODEL_POST,
+        phase=phase,
         layer_path=None,
         capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
     )
     if not split_execute_and_sample:
+        if before_runtime_event is not None:
+            before_runtime_event(BackendObservableEvent.SAMPLE_TOKENS_POST)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
             runner=runner,
-            event_name="sample_tokens.post",
-            phase="decode",
+            event=BackendObservableEvent.SAMPLE_TOKENS_POST,
+            phase=phase,
             layer_path=None,
             capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )

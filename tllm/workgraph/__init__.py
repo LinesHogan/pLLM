@@ -36,6 +36,8 @@ from tllm.workgraph.frontend import (
     ShapeGuardExpr,
     ShapeGuardKind,
     SourceSpan,
+    RequestKeyField,
+    RequestStateKey,
     StateScope,
     TensorDTypeDesc,
     TensorDeviceDesc,
@@ -44,6 +46,8 @@ from tllm.workgraph.frontend import (
     UseDefDesc,
     extern,
     flow,
+    request_sample_key,
+    request_state_key,
 )
 
 __all__ = [
@@ -73,6 +77,8 @@ __all__ = [
     "ShapeGuardExpr",
     "ShapeGuardKind",
     "SourceSpan",
+    "RequestKeyField",
+    "RequestStateKey",
     "StateScope",
     "TensorDTypeDesc",
     "TensorDeviceDesc",
@@ -81,4 +87,6 @@ __all__ = [
     "UseDefDesc",
     "extern",
     "flow",
+    "request_sample_key",
+    "request_state_key",
 ]

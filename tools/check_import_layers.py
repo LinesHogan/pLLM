@@ -14,6 +14,16 @@ Target direction (a package may import only the packages listed in RULES)::
     backends (contracts/ports/workgraph only; runtime types arrive via protocols)
     consumers / workflows: leaves, may import anything below
 
+The workload compiler has two deliberately narrow bridges, declared in
+``EXACT_MODULE_EDGES`` rather than at package scope:
+
+    workload.lowering / workload.region_compiler → schedule.contracts
+    schedule.coordinator → workload frontend/lowering
+
+This keeps the frontend independent from the compiler, permits the typed IR
+adapter at its intended boundary, and prevents a new workload or schedule
+module from acquiring runtime or legacy-consumer authority by accident.
+
 Two tiers, mirroring tools/check_typing.py:
   - module-level violations: the red line; any new one fails the gate.
   - function-local imports: a ledger; still circular at call time, so they are
@@ -52,6 +62,12 @@ RULES: dict[str, frozenset[str]] = {
     "runtime": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
     # Program compiler: lowers frontend declarations into static IR.
     "program": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
+    # The workload frontend and schedule middle-end communicate only through
+    # the source-module-specific bridges below.  Neither package gets a broad
+    # cross-package allowance: that would hide an import cycle or permit the
+    # frontend to take runtime/legacy execution authority.
+    "schedule": frozenset(),
+    "workload": frozenset(),
     # Backend drivers are adapters *above* the runtime: they may import it,
     # but the runtime must never import a concrete driver (only the pure
     # protocol module, via SANCTIONED_EDGES).
@@ -71,6 +87,63 @@ SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("runtime", "tllm.backends.protocol"),
         ("producers", "tllm.backends.protocol"),
         ("workgraph", "tllm.backends.protocol"),
+    }
+)
+
+# Source-module-specific compiler integration edges.  These are intentionally
+# not package rules: e.g. allowing ``workload -> schedule`` would let the DSL
+# frontend call the planner, while allowing ``schedule -> workload`` would let
+# arbitrary planner code reach user executors.  Keep the coordinator as the
+# sole composition root and schedule.contracts as the sole reverse dependency.
+EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # Closed locator enums are pure wire vocabulary shared by the DSL and
+        # the signed schedule contract. Keep this narrower than a package-wide
+        # dependency so neither layer can acquire general contract authority.
+        ("tllm.schedule.contracts", "tllm.contracts.hidden_locator"),
+        ("tllm.workload.frontend", "tllm.contracts.hidden_locator"),
+        ("tllm.workload.ir", "tllm.contracts.hidden_locator"),
+        # Workload frontend adapters.
+        ("tllm.workload.compat", "tllm.program.decl"),
+        ("tllm.workload.compat", "tllm.workgraph.frontend"),
+        ("tllm.workload.lowering", "tllm.schedule.contracts"),
+        ("tllm.workload.region_compiler", "tllm.schedule.contracts"),
+        # Compiler composition and mechanical physical lowering.
+        ("tllm.schedule.coordinator", "tllm.workgraph.physical"),
+        ("tllm.schedule.coordinator", "tllm.workload.frontend"),
+        ("tllm.schedule.coordinator", "tllm.workload.lowering"),
+        ("tllm.schedule.physical", "tllm.workgraph.frontend"),
+        ("tllm.schedule.physical", "tllm.workgraph.ir"),
+        ("tllm.schedule.physical", "tllm.workgraph.physical"),
+        ("tllm.schedule.timeline", "tllm.backends.protocol"),
+        # Backends export the typed main-workload timeline, but never import
+        # the coordinator or workload executors.
+        ("tllm.backends.timeline", "tllm.schedule.timeline"),
+        # Runtime consumes signed compiler output and local artifacts.  It is
+        # intentionally a consumer of these packages, never their dependency.
+        ("tllm.runtime.mp.control", "tllm.schedule"),
+        ("tllm.runtime.mp.worker_extension", "tllm.schedule"),
+        ("tllm.runtime.mp.worker_extension", "tllm.schedule.contracts"),
+        ("tllm.runtime.mp.worker_extension", "tllm.schedule.timeline"),
+        ("tllm.runtime.residual_runtime", "tllm.schedule"),
+        ("tllm.runtime.state", "tllm.schedule"),
+        ("tllm.runtime.workload_execution", "tllm.schedule"),
+        ("tllm.runtime.workload_execution", "tllm.schedule.contracts"),
+        ("tllm.runtime.workload_execution", "tllm.schedule.physical"),
+        ("tllm.runtime.workload_execution", "tllm.workload.frontend"),
+        ("tllm.runtime.workload_execution", "tllm.workload.lowering"),
+        ("tllm.runtime.workload_execution", "tllm.workload.region_compiler"),
+        ("tllm.runtime.workload_plugins", "tllm.schedule"),
+        ("tllm.runtime.workload_plugins", "tllm.workload"),
+        ("tllm.runtime.workload_plugins", "tllm.workload.lowering"),
+        ("tllm.runtime.runtime", "tllm.schedule"),
+        ("tllm.runtime.runtime", "tllm.workload"),
+        # Leaf workload implementations may use only the public DSL facade.
+        ("tllm.consumers.dummy.workload", "tllm.workload"),
+        ("tllm.consumers.esamp.region_workload", "tllm.workload"),
+        ("tllm.consumers.esamp.workload", "tllm.workload"),
+        ("tllm.consumers.recirculation.region_workload", "tllm.workload"),
+        ("tllm.consumers.recirculation.vllm_region_workload", "tllm.workload"),
     }
 )
 
@@ -120,6 +193,23 @@ def _is_type_checking_block(node: ast.AST) -> bool:
     return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
 
 
+def _is_allowed_target(
+    importer: str,
+    source_module: str,
+    target_pkg: str,
+    target_module: str,
+) -> bool:
+    """Return whether one resolved cross-package import follows the layer rules."""
+    allowed = RULES.get(importer, "undeclared")
+    if allowed is None:
+        return True
+    if allowed != "undeclared" and target_pkg in allowed:
+        return True
+    if (source_module, target_module) in EXACT_MODULE_EDGES:
+        return True
+    return (importer, target_module) in SANCTIONED_EDGES
+
+
 def _scan_file(path: Path) -> list[Violation]:
     rel_parts = path.relative_to(PKG_ROOT).parts
     if len(rel_parts) == 1:
@@ -129,6 +219,7 @@ def _scan_file(path: Path) -> list[Violation]:
     if allowed is None:
         return []  # leaf packages may import anything
     current = _module_parts(path)
+    source_module = ".".join(current)
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     violations: list[Violation] = []
@@ -160,10 +251,8 @@ def _scan_file(path: Path) -> list[Violation]:
                         Violation(importer, ".".join(parts), target_pkg, "undeclared", str(path), child.lineno)
                     )
                     continue
-                if target_pkg in allowed:
-                    continue
                 module_name = ".".join(parts)
-                if (importer, module_name) in SANCTIONED_EDGES:
+                if _is_allowed_target(importer, source_module, target_pkg, module_name):
                     continue
                 violations.append(
                     Violation(
@@ -198,10 +287,15 @@ def _buckets(violations: list[Violation], level: str) -> dict[str, int]:
 
 
 def _rules_snapshot() -> dict[str, list[str] | str]:
-    return {
+    snapshot: dict[str, list[str] | str] = {
         pkg: ("leaf (any)" if allowed is None else sorted(allowed))
         for pkg, allowed in sorted(RULES.items())
     }
+    snapshot["exact_module_edges"] = [
+        f"{source} -> {target}"
+        for source, target in sorted(EXACT_MODULE_EDGES)
+    ]
+    return snapshot
 
 
 def main() -> int:

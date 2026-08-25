@@ -22,13 +22,24 @@ from typing import Any
 from tllm.backends.protocol import (
     BackendCapabilities,
     GraphSafety,
+    ModelRegionCapabilities,
+    ModuleWeightOverlayCapabilities,
+    OrderedRowFusionCapabilities,
     RunnerBinding,
     SamplerStage,
 )
+from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.backend_capability import BackendCapability
+from tllm.backends.vllm import module_weight_overlay as _module_weight_overlay
+from tllm.backends.vllm import model_region as _model_region
+from tllm.backends.vllm import scheduler_batch_phase as _scheduler_batch_phase
+from tllm.backends.vllm import test_time_lora as _test_time_lora
 from tllm.backends.vllm import sampler_mrv2 as _sampler_mrv2
 from tllm.backends.vllm.workgraph_runtime import (
+    cold_compile_loaded_workloads,
     cold_specialize_loaded_runtime,
     record_resolved_backend,
+    runner_tensor_parallel_size,
 )
 from tllm.runtime import active_targets
 from tllm.runtime.fast_weight import runtime as _fast_weight
@@ -41,6 +52,7 @@ from tllm.runtime.step_session import (
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
+from tllm.runtime.workload_execution import BackendObservableEvent
 
 
 def _decode_localization_from_mrv2(*, core: Any, runner: Any, input_batch: Any) -> tuple:
@@ -56,12 +68,77 @@ def _decode_localization_from_mrv2(*, core: Any, runner: Any, input_batch: Any) 
     return prepare_decode_localization_mrv2(core=core, runner=runner, input_batch=input_batch)
 
 
-def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict, orig: Any) -> Any:
+def _wrapped_prepare_inputs(
+    *,
+    core: Any,
+    runner: Any,
+    args: tuple,
+    kwargs: dict,
+    orig: Any,
+    driver: Any | None = None,
+) -> Any:
     runtime = core.RUNTIME
+    cold_compile_loaded_workloads(core=core, runner=runner)
     input_batch = orig(runner, *args, **kwargs)
-    if not active_targets.runtime_has_active_targets(runtime):
+    has_active_targets = active_targets.runtime_has_active_targets(runtime)
+
+    # MRv2 constructs the persistent InputBatch immediately before model
+    # forward.  Publish the same packed row metadata as MRv1 at this point so
+    # request-keyed fast-weight wrappers see the current batch during forward.
+    _fast_weight.update_fast_weight_metadata_from_runner(
+        runtime,
+        runner,
+        num_scheduled_tokens_np=getattr(input_batch, "num_scheduled_tokens", None),
+        input_batch=input_batch,
+        driver=driver or V027MRv2Driver(),
+    )
+    _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
+    if has_active_targets:
+        # InputBatch is the first point where all three scheduler columns are
+        # available in MRv2. Rust classifies them before any lifecycle event is
+        # visible to a phase-filtered legacy target.
+        active_driver = driver or V027MRv2Driver()
+        batch_columns = active_driver.fast_weight_packed_row_plan_inputs(
+            runner=runner,
+            num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+            input_batch=input_batch,
+        )
+        batch_phase = _scheduler_batch_phase.scheduler_batch_phase(
+            columns=batch_columns
+        )
+        hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
+    _model_region.prepare_model_region_step(
+        runtime=runtime,
+        runner=runner,
+        num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+        input_batch=input_batch,
+    )
+    if not has_active_targets:
         return input_batch
     session = get_step_session(runner)
+    if session is None or session.state is not StepState.CREATED:
+        raise RuntimeError(
+            "MRv2 prepare_inputs requires a newly-created step session before "
+            "Rust-derived batch phase dispatch"
+        )
+    session.batch_phase = batch_phase
+    # MRv2 forms InputBatch inside execute_model. Delay PRE until the exact
+    # scheduler columns exist, while still emitting it before model compute.
+    _model_region.stage_signed_backend_region_event(
+        event=BackendObservableEvent.PREPARE_INPUTS_PRE,
+        runtime=runtime,
+        runner=runner,
+        num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+        input_batch=input_batch,
+    )
+    _common_hooks.dispatch_runtime_event(
+        runtime=runtime,
+        runner=runner,
+        event=BackendObservableEvent.PREPARE_INPUTS_PRE,
+        phase=hook_phase,
+        layer_path=None,
+        capture_enabled=bool(runtime.launch_consumer_from_hooks),
+    )
     spec_rows: tuple = ()
 
     def _localize_decode() -> None:
@@ -78,7 +155,7 @@ def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict
         localize_decode=_localize_decode,
     )
     _sampler_patch.maybe_prepare_sampler_decode_step(runtime=runtime, runner=runner)
-    if session is not None and session.state == StepState.CREATED:
+    if session.state == StepState.CREATED:
         request_ids = tuple(str(x) for x in getattr(runtime, "decode_request_ids", ()))
         session.request_ids = request_ids
         session.request_index = {req_id: i for i, req_id in enumerate(request_ids)}
@@ -89,11 +166,48 @@ def _wrapped_prepare_inputs(*, core: Any, runner: Any, args: tuple, kwargs: dict
 
         session.graph_mode = _graph_policy.resolve_graph_mode(runner)
         session.transition(StepState.INPUTS_READY)
+        # MRv2 prepares its InputBatch inside execute_model.  Keep the typed
+        # lifecycle ordered as PREPARE_INPUTS_PRE -> POST -> EXECUTE_MODEL_PRE
+        # around that construction and its post-prepare producers.
+        _model_region.stage_signed_backend_region_event(
+            event=BackendObservableEvent.PREPARE_INPUTS_POST,
+            runtime=runtime,
+            runner=runner,
+            num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+            input_batch=input_batch,
+        )
+        _common_hooks.dispatch_runtime_event(
+            runtime=runtime,
+            runner=runner,
+            event=BackendObservableEvent.PREPARE_INPUTS_POST,
+            phase=hook_phase,
+            layer_path=None,
+            capture_enabled=bool(runtime.launch_consumer_from_hooks),
+        )
+        _model_region.stage_signed_backend_region_event(
+            event=BackendObservableEvent.EXECUTE_MODEL_PRE,
+            runtime=runtime,
+            runner=runner,
+            num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+            input_batch=input_batch,
+        )
+        _common_hooks.dispatch_runtime_event(
+            runtime=runtime,
+            runner=runner,
+            event=BackendObservableEvent.EXECUTE_MODEL_PRE,
+            phase=hook_phase,
+            layer_path=None,
+            capture_enabled=bool(runtime.launch_consumer_from_hooks),
+        )
     return input_batch
 
 
 def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, orig: Any) -> Any:
     runtime = core.RUNTIME
+    # Publish a cold-compiled native epoch before opening its first logical
+    # step. Otherwise prepare_inputs can stage a Region on an unprepared
+    # execution and PREPARE_INPUTS_POST will silently skip it.
+    cold_compile_loaded_workloads(core=core, runner=runner)
     if not active_targets.runtime_has_active_targets(runtime):
         return orig(runner, *args, **kwargs)
 
@@ -107,24 +221,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         backend_id=V027MRv2Driver.backend_id,
     )
     set_step_session(runner, session)
-    # MRv2 builds inputs inside execute_model, so expose its logical PREPARE
-    # boundary after the new step snapshot exists and before compute begins.
-    _common_hooks.dispatch_runtime_event(
-        runtime=runtime,
-        runner=runner,
-        event_name="prepare_inputs.pre",
-        phase="decode",
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
-    )
-    _common_hooks.dispatch_runtime_event(
-        runtime=runtime,
-        runner=runner,
-        event_name="execute_model.pre",
-        phase="decode",
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
-    )
     model_hook_flag = getattr(core, "MODEL_HOOK_FLAG", "_tllm_residual_hooks_installed")
     if getattr(getattr(runner, "model", None), model_hook_flag, False):
         runtime.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
@@ -134,6 +230,7 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         out = orig(runner, *args, **kwargs)
     except Exception as exc:
         session.fail(str(exc))
+        _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
         raise
 
     state = getattr(runner, "execute_model_state", None)
@@ -164,11 +261,18 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         from tllm.runtime import hidden_event_bridge as _hidden_bridge
 
         _hidden_bridge.dispatch_deferred_layer_batches(core=core, runner=runner)
+    _model_region.stage_signed_backend_region_event(
+        event=BackendObservableEvent.EXECUTE_MODEL_POST,
+        runtime=runtime,
+        runner=runner,
+        num_scheduled_tokens=session.num_scheduled_tokens,
+        input_batch=getattr(getattr(runner, "execute_model_state", None), "input_batch", None),
+    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,
-        event_name="execute_model.post",
-        phase="decode",
+        event=BackendObservableEvent.EXECUTE_MODEL_POST,
+        phase=_scheduler_batch_phase.session_hook_phase(session),
         layer_path=None,
         capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
@@ -180,11 +284,18 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     if not active_targets.runtime_has_active_targets(runtime):
         return orig(runner, grammar_output)
     session = get_step_session(runner)
+    hook_phase = _scheduler_batch_phase.session_hook_phase(session)
+    _model_region.stage_signed_backend_region_event(
+        event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
+        runtime=runtime,
+        runner=runner,
+        num_scheduled_tokens=None,
+    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,
-        event_name="sample_tokens.pre",
-        phase="decode",
+        event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
+        phase=hook_phase,
         layer_path=None,
         capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
@@ -198,11 +309,17 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
         raise
     if session is not None and session.state == StepState.SAMPLING:
         session.transition(StepState.COMPLETED)
+    _model_region.stage_signed_backend_region_event(
+        event=BackendObservableEvent.SAMPLE_TOKENS_POST,
+        runtime=runtime,
+        runner=runner,
+        num_scheduled_tokens=None,
+    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,
-        event_name="sample_tokens.post",
-        phase="decode",
+        event=BackendObservableEvent.SAMPLE_TOKENS_POST,
+        phase=hook_phase,
         layer_path=None,
         capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
@@ -225,16 +342,16 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
             core=core,
             capabilities=V027MRv2Driver().capabilities(),
             graph_mode=resolve_graph_mode(runner),
+            tp_size=runner_tensor_parallel_size(runner),
         )
         cold_specialize_loaded_runtime(core=core, runner=runner)
 
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, *args, **kwargs)
-        _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
         _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
         _record_workgraph_resolution()
         return out
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=runtime,
         runner=runner,
         event_name="load_model.pre",
@@ -244,10 +361,9 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
     )
     out = orig(runner, *args, **kwargs)
     _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
-    _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
     _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
     _record_workgraph_resolution()
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=runtime,
         runner=runner,
         event_name="load_model.post",
@@ -283,6 +399,101 @@ class V027MRv2Driver:
             tuple_sampler_return=True,
             split_execute_and_sample=True,
             graph_safety=GraphSafety.CAPTURE_SAFE,
+            extensions=frozenset(
+                {
+                    BackendCapability.BACKEND_REGION_BINDER,
+                    BackendCapability.RECIRCULATION_PREFILL_BINDING,
+                }
+            ),
+            hidden_locators=frozenset(
+                {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
+            ),
+            module_weight_overlay=ModuleWeightOverlayCapabilities(
+                modules=frozenset({"mlp"}),
+                write_modes=frozenset({"wrapper"}),
+                phases=frozenset({"prefill", "decode"}),
+                request_keyed=True,
+                graph_safety=GraphSafety.EAGER_ONLY,
+                tensor_parallel_sizes=frozenset({1}),
+            ),
+            model_region=ModelRegionCapabilities(
+                phases=frozenset({"prefill"}),
+                replay=True,
+                kv_snapshot=False,
+                kv_overwrite=True,
+                ordered_row_fusion=OrderedRowFusionCapabilities(
+                    internalized_edges=frozenset({"kv_overwrite_read"}),
+                    max_rows=2,
+                ),
+                graph_safety=GraphSafety.EAGER_ONLY,
+                tensor_parallel_sizes=frozenset({1}),
+            ),
+        )
+
+    def export_main_workload_timeline(
+        self, *, graph_mode: str, static_headroom_bytes: int
+    ) -> Any:
+        from tllm.backends.timeline import export_main_workload_timeline
+
+        return export_main_workload_timeline(
+            self.capabilities(),
+            graph_mode=graph_mode,
+            static_headroom_bytes=static_headroom_bytes,
+        )
+
+    def resolve_module_weight_view(self, *, binding: RunnerBinding, locator: Any) -> Any:
+        return _module_weight_overlay.resolve_module_weight_view(binding=binding, locator=locator)
+
+    def install_module_weight_overlay(
+        self,
+        *,
+        binding: RunnerBinding,
+        locator: Any,
+        installer: Any,
+    ) -> Any:
+        return _module_weight_overlay.install_module_weight_overlay(
+            binding=binding,
+            locator=locator,
+            installer=installer,
+        )
+
+    def restore_module_weight_overlays(self, binding: RunnerBinding) -> int:
+        return _module_weight_overlay.restore_module_weight_overlays(binding)
+
+    def install_model_region_executor(
+        self, *, binding: RunnerBinding, runtime: Any
+    ) -> Any:
+        return _model_region.install_model_region_executor(
+            binding=binding,
+            runtime=runtime,
+        )
+
+    def restore_model_region_executors(self, binding: RunnerBinding) -> int:
+        return _model_region.restore_model_region_executors(binding)
+
+    def runner_model_identity(self, runner: Any) -> int:
+        return _module_weight_overlay.runner_model_identity(runner)
+
+    def runner_active_request_count(self, runner: Any) -> int:
+        return _module_weight_overlay.runner_active_request_count(runner)
+
+    def runner_model_layer_count(self, runner: Any) -> int:
+        return _module_weight_overlay.runner_model_layer_count(runner)
+
+    def runner_tensor_parallel_size(self, runner: Any) -> int:
+        return _module_weight_overlay.runner_tensor_parallel_size(runner)
+
+    def fast_weight_packed_row_plan_inputs(
+        self,
+        *,
+        runner: Any,
+        num_scheduled_tokens: Any | None,
+        input_batch: Any | None,
+    ) -> Any:
+        return _module_weight_overlay.mrv2_packed_row_plan_inputs(
+            runner=runner,
+            num_scheduled_tokens=num_scheduled_tokens,
+            input_batch=input_batch,
         )
 
     def install(self, *, core: Any, info: Any) -> None:
@@ -295,10 +506,30 @@ class V027MRv2Driver:
         orig_sample_tokens = cls.sample_tokens
 
         def _load_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            return _wrapped_load_model(core=core, runner=runner, args=args, kwargs=kwargs, orig=orig_load_model)
+            _module_weight_overlay.ensure_runner_binding(driver=self, runner=runner)
+            out = _wrapped_load_model(
+                core=core,
+                runner=runner,
+                args=args,
+                kwargs=kwargs,
+                orig=orig_load_model,
+            )
+            _test_time_lora.maybe_bind_publisher(
+                runtime=core.RUNTIME,
+                runner=runner,
+                runner_family="mrv2",
+            )
+            return out
 
         def _prepare_inputs(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            return _wrapped_prepare_inputs(core=core, runner=runner, args=args, kwargs=kwargs, orig=orig_prepare_inputs)
+            return _wrapped_prepare_inputs(
+                core=core,
+                runner=runner,
+                args=args,
+                kwargs=kwargs,
+                orig=orig_prepare_inputs,
+                driver=self,
+            )
 
         def _execute_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
             return _wrapped_execute_model(core=core, runner=runner, args=args, kwargs=kwargs, orig=orig_execute_model)
@@ -313,4 +544,5 @@ class V027MRv2Driver:
         setattr(cls, self._HOOK_FLAG, True)
 
     def unbind(self, binding: RunnerBinding) -> None:
-        binding.active = False
+        self.restore_model_region_executors(binding)
+        _module_weight_overlay.unbind_runner(binding)

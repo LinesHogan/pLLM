@@ -60,9 +60,10 @@ class ESampConsumerConfig:
 
     def __post_init__(self) -> None:
         self.implementation = str(self.implementation).strip() or "legacy"
-        if self.implementation not in ("legacy", "program"):
+        if self.implementation not in ("legacy", "program", "region"):
             raise ValueError(
-                f"implementation must be 'legacy' or 'program', got {self.implementation!r}"
+                "implementation must be 'legacy', 'program', or 'region', "
+                f"got {self.implementation!r}"
             )
         if bool(self.per_request_model_bank) and not bool(self.per_request_models):
             raise ValueError("per_request_model_bank=True requires per_request_models=True")

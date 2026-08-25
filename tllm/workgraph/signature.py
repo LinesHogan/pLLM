@@ -63,6 +63,7 @@ from tllm.workgraph.hierarchy import (
     TaskRegionDesc,
 )
 from tllm.workgraph.physical import (
+    AnchorPlacementDesc,
     BufferBucketDesc,
     BufferBucketKey,
     FenceDependencyDesc,
@@ -220,11 +221,18 @@ def _canonical(value: Any) -> Any:
             "capture_policy": _canonical(value.capture_policy),
             "fallback_policy": _canonical(value.fallback_policy),
         }
+    if isinstance(value, AnchorPlacementDesc):
+        return {
+            "node_key": _canonical(value.node_key),
+            "after_anchor": value.after_anchor,
+        }
     if isinstance(value, PhysicalFlowPlan):
         return {
             "plan_epoch": value.plan_epoch,
             "nodes": _canonical(value.nodes),
             "buffer_buckets": _canonical(value.buffer_buckets),
+            "anchor_placements": _canonical(value.anchor_placements),
+            "schedule_signature": value.schedule_signature,
             "schema_version": value.schema_version,
         }
     if isinstance(value, Placement):
@@ -922,6 +930,4 @@ def structural_signature(value: Any) -> str:
     """Return the full SHA-256 digest of canonical structural metadata."""
 
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
 

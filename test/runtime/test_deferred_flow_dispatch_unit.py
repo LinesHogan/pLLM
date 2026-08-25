@@ -22,6 +22,7 @@ from tllm.runtime.ports.residual_bundle_dispatch import (
 )
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
+from tllm.schedule.contracts import BackendObservableEvent
 
 
 class _MovableConsumer(BaseConsumer[object]):
@@ -143,7 +144,7 @@ class DeferredFlowDispatchUnitTest(unittest.TestCase):
             _common_hooks.dispatch_runtime_event(
                 runtime=core.RUNTIME,
                 runner=self._runner(),
-                event_name="sample_tokens.pre",
+                event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
                 phase="decode",
             ),
             0,
@@ -154,7 +155,7 @@ class DeferredFlowDispatchUnitTest(unittest.TestCase):
             _common_hooks.dispatch_runtime_event(
                 runtime=core.RUNTIME,
                 runner=self._runner(),
-                event_name="sample_tokens.post",
+                event=BackendObservableEvent.SAMPLE_TOKENS_POST,
                 phase="decode",
             ),
             0,

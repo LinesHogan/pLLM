@@ -11,7 +11,10 @@ import torch.nn.functional as F
 
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine
-from tllm.consumers.esamp.lm_head import resolve_lm_head as _resolve_lm_head
+from tllm.consumers.esamp.lm_head import (
+    ResolvedLMHead,
+    resolve_lm_head as _resolve_lm_head,
+)
 from tllm.runtime.resources import SamplerPrecomputeCache
 from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
@@ -91,7 +94,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
     config: ESampConsumerConfig
     engine: ESampTrainEngine
     _cached_lm_head_owner: Any = None
-    _cached_lm_head: Any = None
+    _cached_lm_head: ResolvedLMHead | None = None
     _cached_lm_head_weight: torch.Tensor | None = None
     _cached_lm_head_bias: torch.Tensor | None = None
 
@@ -102,14 +105,14 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
             and float(getattr(self.config, "distiller_beta", 0.0) or 0.0) != 0.0
         )
 
-    def _get_lm_head(self, model: Any) -> Any:
+    def _get_lm_head(self, model: object) -> ResolvedLMHead:
         if model is self._cached_lm_head_owner and self._cached_lm_head is not None:
             return self._cached_lm_head
         lm_head = _resolve_lm_head(model)
         self._cached_lm_head_owner = model
         self._cached_lm_head = lm_head
         self._cached_lm_head_weight = lm_head.weight
-        self._cached_lm_head_bias = getattr(lm_head, "bias", None)
+        self._cached_lm_head_bias = lm_head.bias
         return lm_head
 
     def _get_lm_head_params(self, model: Any) -> tuple[torch.Tensor, torch.Tensor | None]:

@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
 
 from tllm.ports.consumer import BaseConsumer
-from tllm.ports.base import ConsumerFlow
+from tllm.ports.base import ConsumerFlow, PortWrite
 from tllm.ports.base import PortKind
 from tllm.contracts.subscription import ConsumerSubscription
 from tllm.runtime.consumer_compat import consumer_subscriptions
 from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime.placement import CompiledPlacement
+
+if TYPE_CHECKING:
+    from tllm.backends.protocol import BackendCapabilities
+    from tllm.workgraph.recurrence import CompiledRecurrence, RecurrenceRequirements
 
 
 @dataclass(frozen=True)
@@ -34,10 +38,28 @@ class FlowDispatchTarget:
         return str(self.consumer.consumer_id)
 
 
+@dataclass(frozen=True)
+class RecurrenceDispatchTarget:
+    consumer: BaseConsumer
+    requirements: "RecurrenceRequirements"
+
+    @property
+    def consumer_id(self) -> str:
+        return str(self.consumer.consumer_id)
+
+
 class DispatchPlan:
-    def __init__(self, by_event: Dict[str, List[DispatchTarget]], flow_targets: List[FlowDispatchTarget]) -> None:
+    def __init__(
+        self,
+        by_event: Dict[str, List[DispatchTarget]],
+        flow_targets: List[FlowDispatchTarget],
+        recurrence_targets: List[RecurrenceDispatchTarget] | None = None,
+        adapter_stores: List[object] | None = None,
+    ) -> None:
         self._by_event = by_event
         self._flow_targets = flow_targets
+        self._recurrence_targets = list(recurrence_targets or ())
+        self._adapter_stores = list(adapter_stores or ())
         self._graph_mode = "eager"
         self._fusion_groups: tuple[tuple[str, ...], ...] = ()
         self._fusion_rejections: tuple[tuple[str, str], ...] = ()
@@ -63,7 +85,31 @@ class DispatchPlan:
     def build(cls, consumers: Iterable[BaseConsumer]) -> "DispatchPlan":
         by_event: Dict[str, List[DispatchTarget]] = {}
         flow_records: List[tuple[str, BaseConsumer, ConsumerFlow]] = []
+        recurrence_targets: List[RecurrenceDispatchTarget] = []
+        adapter_stores: List[object] = []
         for consumer in consumers:
+            adapter_store = (
+                consumer.runtime_adapter_store()
+                if isinstance(consumer, BaseConsumer)
+                else None
+            )
+            if adapter_store is not None:
+                adapter_stores.append(adapter_store)
+            recurrence = (
+                consumer.recurrence_requirements()
+                if isinstance(consumer, BaseConsumer)
+                else None
+            )
+            if recurrence is not None:
+                from tllm.workgraph.recurrence import RecurrenceRequirements
+
+                if not isinstance(recurrence, RecurrenceRequirements):
+                    raise TypeError(
+                        f"consumer {consumer.consumer_id!r} returned invalid recurrence requirements"
+                    )
+                recurrence_targets.append(
+                    RecurrenceDispatchTarget(consumer, recurrence)
+                )
             flows = list(consumer.flows())
             for flow_i, flow in enumerate(flows):
                 flow_records.append((f"{consumer.consumer_id}#{flow_i}", consumer, flow))
@@ -85,7 +131,12 @@ class DispatchPlan:
             )
             for flow_id, consumer, flow in flow_records
         ]
-        plan = cls(by_event=by_event, flow_targets=flow_targets)
+        plan = cls(
+            by_event=by_event,
+            flow_targets=flow_targets,
+            recurrence_targets=recurrence_targets,
+            adapter_stores=adapter_stores,
+        )
         # Preserve the public DispatchPlan validation contract before the Rust
         # compiler builds WAW edges from the same descriptors.
         plan.write_conflict_check()
@@ -118,14 +169,76 @@ class DispatchPlan:
             out.append(target)
         return out
 
+    def has_legacy_event_targets(self, event_name: str) -> bool:
+        """Whether an event has compatibility-consumer subscribers.
+
+        Subscription filters can describe one row phase (prefill or decode),
+        but not a scheduler batch containing both.  Callers use this only at
+        the native/legacy boundary to reject an ambiguous mixed batch before
+        a compatibility consumer observes a partial lifecycle.
+        """
+
+        return bool(self._by_event.get(event_name, ()))
+
     def flow_targets(self) -> List[FlowDispatchTarget]:
         return list(self._flow_targets)
+
+    def recurrence_targets(self) -> List[RecurrenceDispatchTarget]:
+        return list(self._recurrence_targets)
+
+    def runtime_adapter_stores(self) -> List[object]:
+        return list(self._adapter_stores)
+
+    def validate_recurrence_admission(
+        self,
+        *,
+        backend_capabilities: "BackendCapabilities",
+        graph_mode: GraphMode,
+        tp_size: int = 1,
+    ) -> None:
+        from tllm.workgraph.recurrence import validate_recurrence_admission
+
+        for target in self._recurrence_targets:
+            validate_recurrence_admission(
+                target.requirements,
+                backend_capabilities.model_region,
+                graph_mode=graph_mode,
+                tp_size=tp_size,
+            )
+
+    def compile_recurrences(
+        self,
+        *,
+        token_count: int,
+        layer_count: int,
+        backend_capabilities: "BackendCapabilities",
+        graph_mode: GraphMode,
+        tp_size: int = 1,
+    ) -> tuple[tuple[str, "CompiledRecurrence"], ...]:
+        from tllm.workgraph.recurrence import compile_recurrence
+
+        return tuple(
+            (
+                target.consumer_id,
+                compile_recurrence(
+                    target.consumer.recurrence_graph(
+                        token_count=token_count,
+                        layer_count=layer_count,
+                    ),
+                    target.requirements,
+                    backend_capabilities.model_region,
+                    graph_mode=graph_mode,
+                    tp_size=tp_size,
+                ),
+            )
+            for target in self._recurrence_targets
+        )
 
     def has_movable_flow_targets(self) -> bool:
         return any(target.placement_hook != "execute_model.post" for target in self._flow_targets)
 
     def requires_graph_mode_resolution(self) -> bool:
-        return any(
+        return bool(self._recurrence_targets) or any(
             str(target.flow.fusion) != "none"
             or any(write.fusion_candidate for write in target.flow.writes)
             for target in self._flow_targets
@@ -177,7 +290,12 @@ class DispatchPlan:
         return not self.is_empty()
 
     def is_empty(self) -> bool:
-        return (not self._flow_targets) and all((not targets) for targets in self._by_event.values())
+        return (
+            (not self._flow_targets)
+            and (not self._recurrence_targets)
+            and (not self._adapter_stores)
+            and all((not targets) for targets in self._by_event.values())
+        )
 
     def requires_device_decode_metadata(self) -> bool:
         return any(bool(targets) for targets in self._by_event.values())
@@ -207,14 +325,26 @@ class DispatchPlan:
                 required.add((layer, site, phase))
         return required
 
-    def residual_writes(self) -> List[tuple[str, ConsumerFlow, object]]:
+    def residual_writes(self) -> List[tuple[str, ConsumerFlow, PortWrite]]:
         """All declared residual-stream writes as (consumer_id, flow, write)."""
-        writes: List[tuple[str, ConsumerFlow, object]] = []
+        writes: List[tuple[str, ConsumerFlow, PortWrite]] = []
         for target in self._flow_targets:
             for write in target.flow.writes:
-                if getattr(write, "kind", None) != PortKind.RESIDUAL_STREAM:
+                if write.kind != PortKind.RESIDUAL_STREAM:
                     continue
-                if getattr(write, "locator", None) is None:
+                if write.locator is None:
+                    continue
+                writes.append((str(target.consumer.consumer_id), target.flow, write))
+        return writes
+
+    def module_weight_writes(self) -> List[tuple[str, ConsumerFlow, PortWrite]]:
+        """All declared module-weight writes as (consumer_id, flow, write)."""
+        writes: List[tuple[str, ConsumerFlow, PortWrite]] = []
+        for target in self._flow_targets:
+            for write in target.flow.writes:
+                if write.kind != PortKind.MODULE_WEIGHT_VIEW:
+                    continue
+                if write.locator is None:
                     continue
                 writes.append((str(target.consumer.consumer_id), target.flow, write))
         return writes
@@ -233,11 +363,10 @@ class DispatchPlan:
         return required
 
     def write_conflict_check(self) -> None:
-        """Writers on one residual locator must be disambiguated by ``order``.
+        """Legacy residual-only check retained for its public error contract.
 
-        ``append`` writes are post-generate sinks and never conflict; every
-        other pair of writers on the same (layer, site, phase) must carry
-        distinct ``order`` values so the runtime applies them deterministically.
+        The Rust placement compiler performs the authoritative structural
+        conflict check for every port kind, including ModuleWeightView.
         """
         by_locator: Dict[tuple[int, str, str], List[tuple[str, int, str]]] = {}
         for consumer_id, _flow, write in self.residual_writes():

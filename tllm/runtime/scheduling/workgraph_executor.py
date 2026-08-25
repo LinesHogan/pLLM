@@ -14,11 +14,11 @@ from typing import Protocol
 import torch
 
 from tllm.contracts.runtime_stats import WorkGraphRuntimeStats
+from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 
 from tllm.runtime.scheduling.physical import (
     BufferLease,
     EventLike,
-    GraphLike,
     StreamLike,
 )
 from tllm.runtime.scheduling.plan_store import (
@@ -45,6 +45,21 @@ class PhysicalExecutionError(RuntimeError):
     """Raised when a frozen plan cannot be executed under its declared policy."""
 
 
+class ShapeSpecializationMiss(PhysicalExecutionError):
+    """Fail a step before Region output commit and request cold specialization."""
+
+    __slots__ = ("request",)
+
+    def __init__(self, request: RegionShapeSpecializationRequest) -> None:
+        if not isinstance(request, RegionShapeSpecializationRequest):
+            raise TypeError("ShapeSpecializationMiss.request must be RegionShapeSpecializationRequest")
+        self.request = request
+        super().__init__(
+            "Region shape specialization miss: "
+            f"region={request.region_id!r}, epoch={request.observed_plan_epoch}"
+        )
+
+
 class PhysicalExecutionKind(StrEnum):
     EAGER = "eager"
     REPLAY = "replay"
@@ -67,50 +82,6 @@ class PhysicalStepResult:
     plan_epoch: int
     eager_nodes: tuple[str, ...]
     replayed_nodes: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class SpecializationRequestDesc:
-    plan_epoch: int
-    node_key: NodeKey
-    buffer_bucket: BufferBucketKey
-    artifact_key: ArtifactKey | None
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-    device: torch.device
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.plan_epoch, int)
-            or isinstance(self.plan_epoch, bool)
-            or self.plan_epoch < 1
-        ):
-            raise ValueError("specialization request plan_epoch must be positive")
-        if not isinstance(cast(object, self.node_key), NodeKey):
-            raise TypeError("specialization request node_key must be NodeKey")
-        if not isinstance(cast(object, self.buffer_bucket), BufferBucketKey):
-            raise TypeError(
-                "specialization request buffer_bucket must be BufferBucketKey"
-            )
-        if self.artifact_key is not None and not isinstance(
-            cast(object, self.artifact_key), ArtifactKey
-        ):
-            raise TypeError(
-                "specialization request artifact_key must be ArtifactKey or None"
-            )
-        if not isinstance(cast(object, self.shape), tuple) or any(
-            not isinstance(dimension, int)
-            or isinstance(dimension, bool)
-            or dimension < 0
-            for dimension in self.shape
-        ):
-            raise TypeError(
-                "specialization request shape must contain non-negative ints"
-            )
-        if not isinstance(cast(object, self.dtype), torch.dtype):
-            raise TypeError("specialization request dtype must be torch.dtype")
-        if not isinstance(cast(object, self.device), torch.device):
-            raise TypeError("specialization request device must be torch.device")
 
 
 @dataclass(slots=True)
@@ -156,7 +127,11 @@ def runtime_stats_from_executor(
 
 
 PhysicalNodeHandler = Callable[[PhysicalExecutionContext], None]
-SpecializationRequest = Callable[[SpecializationRequestDesc], None]
+SpecializationRequest = Callable[[RegionShapeSpecializationRequest], None]
+SpecializationRequestFactory = Callable[
+    [PhysicalNodePlan, int, tuple[torch.Tensor, ...]],
+    RegionShapeSpecializationRequest,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +157,11 @@ class PhysicalExecutor:
         "_snapshots",
         "_bindings",
         "_prepared",
+        "_completed",
         "_requested_specializations",
         "_pending_specializations",
         "_on_specialization_request",
+        "_specialization_request_factory",
         "_lock",
         "_condition",
         "_executing",
@@ -198,6 +175,7 @@ class PhysicalExecutor:
         snapshots: PlanSnapshotStore,
         handlers: Mapping[NodeKey | ExecutorKey, PhysicalNodeHandler],
         on_specialization_request: SpecializationRequest | None = None,
+        specialization_request_factory: SpecializationRequestFactory | None = None,
     ) -> None:
         if not isinstance(cast(object, snapshots), PlanSnapshotStore):
             raise TypeError("snapshots must be PlanSnapshotStore")
@@ -213,12 +191,18 @@ class PhysicalExecutor:
             on_specialization_request
         ):
             raise TypeError("on_specialization_request must be callable")
+        if specialization_request_factory is not None and not callable(
+            specialization_request_factory
+        ):
+            raise TypeError("specialization_request_factory must be callable")
         self._snapshots = snapshots
         self._bindings = MappingProxyType(bindings)
         self._prepared: dict[int, _PreparedStep] = {}
-        self._requested_specializations: set[SpecializationRequestDesc] = set()
-        self._pending_specializations: deque[SpecializationRequestDesc] = deque()
+        self._completed: dict[int, set[NodeKey]] = {}
+        self._requested_specializations: set[str] = set()
+        self._pending_specializations: deque[RegionShapeSpecializationRequest] = deque()
         self._on_specialization_request = on_specialization_request
+        self._specialization_request_factory = specialization_request_factory
         self._lock = Lock()
         self._condition = Condition(self._lock)
         self._executing: set[int] = set()
@@ -238,12 +222,8 @@ class PhysicalExecutor:
             resources = self._snapshots.prepare_step(step)
             prepared = self._prepare(resources)
             self._prepared[step] = prepared
+            self._completed[step] = set()
             self._highest_prepared_step = step
-            self._requested_specializations = {
-                request
-                for request in self._requested_specializations
-                if request.plan_epoch >= resources.plan.plan_epoch
-            }
             self.stats.prepare_count += 1
             self.stats.last_plan_epoch = resources.plan.plan_epoch
             return resources
@@ -255,7 +235,38 @@ class PhysicalExecutor:
         tensors: tuple[torch.Tensor, ...] = (),
     ) -> PhysicalStepResult:
         step = _step_id(step_id)
+        with self._condition:
+            try:
+                prepared = self._prepared[step]
+            except KeyError as exc:
+                raise PhysicalExecutionError(
+                    f"physical step {step} must be prepared before execution"
+                ) from exc
+            nodes = tuple(node.node_key for node in prepared.resources.plan.nodes)
+        return self.execute_nodes(step, nodes, tensors=tensors)
+
+    def execute_nodes(
+        self,
+        step_id: int,
+        node_keys: tuple[NodeKey, ...],
+        *,
+        tensors: tuple[torch.Tensor, ...] = (),
+    ) -> PhysicalStepResult:
+        """Execute an ordered Region subset from one prepared physical plan.
+
+        This is the anchor-facing entry point.  It never derives a new order:
+        callers identify nodes, while execution retains their immutable plan
+        order and rejects missing predecessors or duplicate submission.
+        """
+
+        step = _step_id(step_id)
         inputs = _tensors(tensors)
+        if not isinstance(node_keys, tuple) or not node_keys:
+            raise TypeError("node_keys must be a non-empty tuple[NodeKey, ...]")
+        if any(not isinstance(node_key, NodeKey) for node_key in node_keys):
+            raise TypeError("node_keys must contain only NodeKey")
+        if len(set(node_keys)) != len(node_keys):
+            raise PhysicalExecutionError("physical node subset contains duplicates")
         with self._condition:
             try:
                 prepared = self._prepared[step]
@@ -267,13 +278,48 @@ class PhysicalExecutor:
                 raise PhysicalExecutionError(
                     f"physical step {step} is already executing"
                 )
+            plan_nodes = prepared.resources.plan.nodes
+            node_by_key = {node.node_key: node for node in plan_nodes}
+            unknown = tuple(node_key for node_key in node_keys if node_key not in node_by_key)
+            if unknown:
+                names = ", ".join(str(node_key) for node_key in unknown)
+                raise PhysicalExecutionError(
+                    f"physical node subset references unknown nodes: {names}"
+                )
+            completed = self._completed[step]
+            repeated = tuple(node_key for node_key in node_keys if node_key in completed)
+            if repeated:
+                names = ", ".join(str(node_key) for node_key in repeated)
+                raise PhysicalExecutionError(
+                    f"physical nodes already executed for step {step}: {names}"
+                )
+            selected = set(node_keys)
+            ordered_nodes = tuple(
+                node for node in plan_nodes if node.node_key in selected
+            )
+            available = set(completed)
+            for node in ordered_nodes:
+                missing = tuple(
+                    dependency.producer
+                    for dependency in node.fences
+                    if dependency.producer not in available
+                )
+                if missing:
+                    names = ", ".join(str(node_key) for node_key in missing)
+                    raise PhysicalExecutionError(
+                        f"physical node {node.node_key} has unexecuted predecessors: {names}"
+                    )
+                available.add(node.node_key)
             self._executing.add(step)
             self.stats.execute_count += 1
 
         eager_nodes: list[str] = []
         replayed_nodes: list[str] = []
         try:
-            for node in prepared.resources.plan.nodes:
+            # A miss must abort an entire backend event group before a prior
+            # Region can mutate state, publish a sink, or record a fence.
+            self._preflight_nodes(step, prepared, ordered_nodes, inputs)
+            for node in ordered_nodes:
                 stream_resource = prepared.streams[node.stream]
                 stream = cast(StreamLike, stream_resource.stream)
                 node_leases = (
@@ -290,28 +336,31 @@ class PhysicalExecutor:
                     stream.wait_event(event.event)
                     self.stats.fence_wait_count += 1
 
-                bucket_miss = self._request_specialization_on_miss(
-                    prepared.resources,
-                    node,
-                    inputs,
-                )
                 graph_resource = (
                     None
                     if node.artifact_key is None
                     else prepared.graphs.get(node.artifact_key)
                 )
                 if (
-                    not bucket_miss
-                    and node.capture_policy != CapturePolicy.DISABLED
+                    node.capture_policy != CapturePolicy.DISABLED
                     and graph_resource is not None
                 ):
-                    cast(GraphLike, graph_resource.graph).replay()
+                    replay_context = PhysicalExecutionContext(
+                        step_id=step,
+                        plan_epoch=prepared.resources.plan.plan_epoch,
+                        node=node,
+                        kind=PhysicalExecutionKind.REPLAY,
+                        stream=stream,
+                        tensors=inputs,
+                        leases=node_leases,
+                    )
+                    graph_resource.replay(replay_context)
                     replayed_nodes.append(str(node.node_key))
                     self.stats.replay_count += 1
                 else:
                     if node.capture_policy != CapturePolicy.DISABLED:
                         if node.fallback_policy == FallbackPolicy.REJECT:
-                            reason = "bucket specialization" if bucket_miss else "capture graph"
+                            reason = "capture graph"
                             raise PhysicalExecutionError(
                                 f"physical node {node.node_key} requires {reason}"
                             )
@@ -335,6 +384,8 @@ class PhysicalExecutor:
                 for fence_key in prepared.outgoing_fences.get(node.node_key, ()):
                     cast(EventLike, prepared.events[fence_key].event).record(stream)
                     self.stats.fence_record_count += 1
+                with self._condition:
+                    self._completed[step].add(node.node_key)
         finally:
             with self._condition:
                 self._executing.discard(step)
@@ -347,12 +398,67 @@ class PhysicalExecutor:
             replayed_nodes=tuple(replayed_nodes),
         )
 
+    def _preflight_nodes(
+        self,
+        step: int,
+        prepared: _PreparedStep,
+        nodes: tuple[PhysicalNodePlan, ...],
+        tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Reject all known shape/capture failures before submitting a node.
+
+        A RuntimeGraph may resolve native Region inputs here, but its preflight
+        contract must not replay a graph, invoke a handler, write a sink, or
+        record a fence. Native setup rejects capture inputs that require a
+        materialization from another node in this same invocation.
+        """
+
+        for node in nodes:
+            specialization_request = self._request_specialization_on_miss(
+                prepared.resources,
+                node,
+                tensors,
+            )
+            if specialization_request is not None:
+                raise ShapeSpecializationMiss(specialization_request)
+            graph_resource = (
+                None
+                if node.artifact_key is None
+                else prepared.graphs.get(node.artifact_key)
+            )
+            if node.capture_policy == CapturePolicy.DISABLED:
+                continue
+            if graph_resource is None:
+                if node.fallback_policy == FallbackPolicy.REJECT:
+                    raise PhysicalExecutionError(
+                        f"physical node {node.node_key} requires capture graph"
+                    )
+                continue
+            node_leases = (
+                ()
+                if node.buffer_bucket is None
+                else prepared.leases.get(node.buffer_bucket, ())
+            )
+            stream = cast(StreamLike, prepared.streams[node.stream].stream)
+            graph_resource.preflight(
+                PhysicalExecutionContext(
+                    step_id=step,
+                    plan_epoch=prepared.resources.plan.plan_epoch,
+                    node=node,
+                    kind=PhysicalExecutionKind.REPLAY,
+                    stream=stream,
+                    tensors=tensors,
+                    leases=node_leases,
+                )
+            )
+
     def finish_step(self, step_id: int) -> None:
         step = _step_id(step_id)
         with self._condition:
             while step in self._executing:
                 self._condition.wait()
             prepared = self._prepared.pop(step, None)
+            self._completed.pop(step, None)
         if prepared is None:
             self._snapshots.finish_step(step)
             return
@@ -449,37 +555,37 @@ class PhysicalExecutor:
         resources: PlanResources,
         node: PhysicalNodePlan,
         tensors: tuple[torch.Tensor, ...],
-    ) -> bool:
+    ) -> RegionShapeSpecializationRequest | None:
         if node.buffer_bucket is None or not tensors:
-            return False
+            return None
         tensor = tensors[0]
-        request = SpecializationRequestDesc(
-            plan_epoch=resources.plan.plan_epoch,
-            node_key=node.node_key,
-            buffer_bucket=node.buffer_bucket,
-            artifact_key=node.artifact_key,
-            shape=tuple(int(dimension) for dimension in tensor.shape),
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
         selected = select_buffer_bucket(
             resources.plan,
-            request.shape,
-            request.dtype,
-            request.device,
+            tuple(int(dimension) for dimension in tensor.shape),
+            tensor.dtype,
+            tensor.device,
         )
         if selected is not None and selected.key == node.buffer_bucket:
-            return False
+            return None
+        factory = self._specialization_request_factory
+        if factory is None:
+            raise PhysicalExecutionError(
+                f"physical node {node.node_key} has a shape miss without a Region specialization factory"
+            )
+        request = factory(node, resources.plan.plan_epoch, tensors)
+        if not isinstance(request, RegionShapeSpecializationRequest):
+            raise TypeError(
+                "specialization_request_factory must return RegionShapeSpecializationRequest"
+            )
         with self._lock:
-            if request in self._requested_specializations:
-                return True
-            self._requested_specializations.add(request)
-            self.stats.bucket_miss_count += 1
-            callback = self._on_specialization_request
-            if callback is not None:
-                self.stats.specialization_request_count += 1
-                self._pending_specializations.append(request)
-        return True
+            if request.dedup_key not in self._requested_specializations:
+                self._requested_specializations.add(request.dedup_key)
+                self.stats.bucket_miss_count += 1
+                callback = self._on_specialization_request
+                if callback is not None:
+                    self.stats.specialization_request_count += 1
+                    self._pending_specializations.append(request)
+        return request
 
     def drain_specialization_requests(self) -> int:
         """Run queued specialization callbacks on an explicit cold path."""
@@ -526,8 +632,9 @@ __all__ = [
     "PhysicalExecutor",
     "PhysicalNodeHandler",
     "PhysicalStepResult",
-    "SpecializationRequestDesc",
     "SpecializationRequest",
+    "SpecializationRequestFactory",
+    "ShapeSpecializationMiss",
     "WorkGraphRuntimeStats",
     "WorkGraphRuntimeStatsReader",
     "runtime_stats_from_executor",

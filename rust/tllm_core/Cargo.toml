@@ -9,6 +9,8 @@ name = "tllm_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+isl-rs = "=0.3.1"
 pyo3 = { version = "0.23", features = ["abi3-py311"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

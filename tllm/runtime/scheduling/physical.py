@@ -32,6 +32,18 @@ class GraphLike(Protocol):
     def replay(self) -> None: ...
 
 
+@runtime_checkable
+class ContextGraphLike(Protocol):
+    def replay_context(self, context: object) -> None: ...
+
+
+@runtime_checkable
+class PreflightContextGraphLike(Protocol):
+    """Optional, side-effect-free validation before an event group executes."""
+
+    def preflight_context(self, context: object) -> None: ...
+
+
 _T = TypeVar("_T")
 
 
@@ -172,8 +184,10 @@ class BufferLease:
 
 __all__ = [
     "BufferLease",
+    "ContextGraphLike",
     "EventLike",
     "Fence",
     "GraphLike",
+    "PreflightContextGraphLike",
     "StreamLike",
 ]

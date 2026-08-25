@@ -34,6 +34,13 @@ class RuntimeResidualBindingsUnitTest(unittest.TestCase):
         self.assertEqual(bindings["layers.1"].locator, ResidualLocator(layer=-1, site="block_output", phase="decode"))
         self.assertFalse(bindings["layers.1"].include_request_meta)
 
+    def test_unsupported_logical_locator_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unsupported logical residual locator"):
+            residual_bindings.build_raw_tap_paths(
+                raw_paths_by_locator={},
+                required={(0, "post", "decode")},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

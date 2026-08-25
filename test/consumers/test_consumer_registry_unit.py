@@ -64,7 +64,17 @@ class ConsumerRegistryUnitTest(unittest.TestCase):
     def test_builtin_consumers_are_registered(self) -> None:
         self.assertEqual(
             registered_consumers(),
-            ("dummy", "esamp", "fttt", "gtta", "inplace_ttt", "override", "tlm", "ttrl"),
+            (
+                "dummy",
+                "esamp",
+                "fttt",
+                "gtta",
+                "inplace_ttt",
+                "override",
+                "recirculation",
+                "tlm",
+                "ttrl",
+            ),
         )
 
     def test_every_registered_consumer_flows_compile(self) -> None:

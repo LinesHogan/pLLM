@@ -1,5 +1,24 @@
 # 架构
 
+## 当前执行模型
+
+`tllm.workload` 声明用于细粒度分析的图，但 `ExecutionRegion` 才是粗粒度的物理执行单位。Rust
+推导、校验并签名每个 Region 的 binding、materialization、fence、lifetime、artifact identity 与
+capture policy。Python 不推断 task 语义、不重新调度，也不选择 capture；它只机械物化已签名
+artifact，并在已签名 anchor 提交 Region。event/fence 只能出现在 Region、设备或 backend 边界；
+Region 内依赖是普通 FX/Tensor/CUDA-Graph 边。
+
+`RegionCaptureMode` 是随 decision 签名的 Rust 闭合 enum。它在 Python lowering 前确定允许的
+capture 行为（`disabled` 或 `require`）；Python 不会从 task 类型、stream 或运行期名称推断
+capture。缺 capability、artifact 或 binding 会在 cold install 时拒绝。
+
+在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，GPU 正确性已验证 native Dummy 与 native
+ESamp 的 exact eager in-process 执行，二者均通过 MRv1/MRv2。最新 ESamp 短 smoke：
+`loss_count=6`、`update_count=6`、`state_version=6`、`fallback_count=0`。native ESamp exact
+eager Region 还通过了两种 runner 的 EngineCore MP 正确性：loss、update、state-version、
+intervention 均非零，fallback/replay 均为零。这不是吞吐结论；model-backed native piecewise
+CUDA Graph、真实 vLLM prefill Recirculation 接管和 shape-miss epoch switching 仍未验证或未完成。
+
 ## 分层结构
 
 ```
@@ -7,14 +26,14 @@
 │ workflows/          入口（benchmark、       │
 │                     starter、esamp 支持）   │
 ├─────────────────────────────────────────────┤
-│ consumers/          叶子：esamp（legacy +   │
-│                     program）、你的 consumer│
+│ consumers/          legacy adapter 与       │
+│                     native workload shell   │
 ├─────────────────────────────────────────────┤
 │ backends/           vLLM v1 适配器          │
 ├──────────────────────┬──────────────────────┤
-│ runtime/             │ program/             │
-│ 执行：lane、sampler  │ 编译器：声明 → 切片  │
-│ bridge、统计、插件   │ → 校验 → 生成 consumer│
+│ runtime/             │ workload/            │
+│ Region executor、    │ 声明 → 图 → 已签名   │
+│ sampler bridge、统计 │ Region plan           │
 ├──────────────────────┴──────────────────────┤
 │ workgraph/          声明式语言表面          │
 │                     （frontend、lowering、  │
@@ -38,7 +57,24 @@
 - **Rust 决策，Python 执行。** `core/` 扩展做调度决策；所有张量执行留在 Python/torch，可检查、可调试。
 - **Fail closed。** 每个编译期拒绝都是稳定错误码；不存在静默 fallback 路径（`PG190` 的存在就是为了让这种企图变成显式报错）。
 
-## 程序编译管线
+## Native Region 管线
+
+```
+@workload / @task
+      │ 类型化 value、effect、timing、affine access
+      ▼
+ScheduleGraph ──► Rust 合法性 + 粒度 + memory planning
+      ▼
+已签名 ScheduleDecision v2 ──► ExecutionRegion + RegionCaptureMode
+      ▼
+PhysicalFlowPlan ──► 每个 Region 一个 artifact/callable，在签名 anchor 提交
+```
+
+planner 从最大的合法 Region 开始，仅在 anchor window 无交集、必须可见的 effect/version 或
+typed-extern 边界、backend/device/graph-safety 边界，或硬 memory constraint 时拆分。它最小化
+显式 materialization 与边界；不选择逐 task stream、不预测 kernel 时序，也不分配 SM。
+
+## Legacy Program 兼容管线
 
 ```
 ESampProgram（你的 Module）
@@ -54,7 +90,9 @@ compile_program ──► optimizer 降级为函数式 transition；
 ProgramConsumer ──► 运行期执行（见下）
 ```
 
-## 运行期执行
+## Legacy 运行期执行
+
+以下 lane/state-bank 描述只适用于保留的 Program 兼容路径，不是 native Region 的优化契约。
 
 生成的 consumer 在 vLLM 生成过程中运行。执行策略从声明的 DAG 推导，不硬编码：
 

@@ -1,18 +1,42 @@
 # tLLM Documentation
 
-tLLM is a test-time intervention layer for vLLM: declare your algorithm as a small dataflow program, and the compiler derives fast execution from the declarations.
+tLLM is an auxiliary-workload compiler for vLLM. New work is declared with
+`tllm.workload`; its task graph is fine-grained for analysis, while signed
+`ExecutionRegion`s are the coarse-grained physical execution units. Rust makes
+and signs that decision; Python mechanically binds the signed plan.
+Program/Consumer lanes, streams, and events remain documented as migration
+compatibility, not as the optimization model.
 
 ## Reading order
 
-1. [Quickstart](quickstart.md) — install, run the starter, attach a consumer.
-2. [Write a consumer](write-a-consumer.md) — the program model: `@flow`, `@extern`, state banks, and what the compiler derives.
-3. [Architecture](architecture.md) — the layered stack, the import gate, and how programs are compiled and executed.
-4. [ESamp reference](esamp.md) — the built-in test-time training consumer.
+1. [Auxiliary workload compiler](workload-compiler.md) — the current frontend, signed Region contracts, and migration boundary.
+2. [Quickstart](quickstart.md) — native ESamp orientation and the retained Program example.
+3. [Write a consumer](write-a-consumer.md) — `tllm.workload` guidance plus the legacy Program compatibility API.
+4. [Architecture](architecture.md) — the Region execution stack and compatibility layers.
+5. [ESamp reference](esamp.md) — the built-in test-time training consumer.
+6. [Adapting In-Place TTT](inplace-ttt.md) — algorithms that edit the model's own weights: the learning half is a Program, the application half is a backend-provided weight overlay.
+7. [TLM q/v LoRA](tlm.md) — full HF/PEFT side training and immutable versions through vLLM's native LoRA path.
 
 ## The one-paragraph mental model
 
-You write a `torch.nn.Module` and annotate its methods with `@flow(inputs/outputs/state)` and `@extern(inputs/after/state/deadline)`. `tllm.program.compile_program` slices each flow into torch.export graphs, lowers the optimizer into functional transitions, and verifies the compiled transition against your Python body at compile time. The generated consumer runs inside vLLM generation: state writes go to a training lane, read-only predictions go to a reader lane, and whole steps are captured into CUDA graphs — all derived from the dependency edges you declared.
+For a native workload, declare `@workload` and `@task` nodes with typed inputs,
+outputs, effects, timing, and optional affine access. Rust validates the full
+graph and signs Region boundaries, bindings, materializations, lifetimes, and
+capture policy. The legacy `@flow`/`@extern` Program lane remains available as
+an adapter while workloads migrate; it is not used to make new physical
+scheduling decisions.
 
-If your program uses something the language doesn't support, compilation fails loudly with a stable error code (`PG###`). There is no silent fallback.
+Unsupported native or compatibility declarations fail closed; there is no
+silent fallback.
+
+With `torch==2.13.0+cu129` and `vllm==0.27.1`, GPU correctness covers exact
+eager in-process native Dummy and native ESamp on MRv1/MRv2. The latest ESamp
+short smoke recorded six losses, six updates, state version six, and zero
+fallbacks. Native ESamp exact eager Regions also passed EngineCore MP
+correctness on both runners: loss, update, state-version, and intervention
+counters were nonzero, with zero fallbacks and zero replays. This is not a
+throughput claim. Model-backed native piecewise CUDA Graph execution, real
+native Recirculation prefill takeover, and shape-miss epoch switching are not
+yet claims.
 
 中文文档见 [doc_zh/README.md](../doc_zh/README.md)。

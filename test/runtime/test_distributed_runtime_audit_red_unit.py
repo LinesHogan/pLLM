@@ -10,14 +10,18 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass, replace
 import inspect
 from types import SimpleNamespace
+from typing import cast
 import unittest
 from unittest import mock
 
+from tllm import _core
 from tllm.backends.vllm import v027_mrv1, v027_mrv2
+from tllm.runtime.step_session import StepSession, set_step_session
 from tllm.runtime import active_targets, residual_runtime
 from tllm.runtime.scheduling import collective as collective_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks
+from tllm.schedule.contracts import BackendObservableEvent
 from tllm.runtime.vllm_patch import port_runtime_hooks
 from tllm.workgraph import placement
 from tllm.workgraph.distributed import (
@@ -206,32 +210,32 @@ class Phase4CollectiveLifecycleAuditRedTest(unittest.TestCase):
         common_hooks.dispatch_runtime_event(
             runtime=state,
             runner=runner,
-            event_name="prepare_inputs.pre",
+            event=BackendObservableEvent.PREPARE_INPUTS_PRE,
         )
         with self.assertRaises(RuntimeError):
             common_hooks.dispatch_runtime_event(
                 runtime=state,
                 runner=runner,
-                event_name="execute_model.post",
+                event=BackendObservableEvent.EXECUTE_MODEL_POST,
             )
         common_hooks.dispatch_runtime_event(
             runtime=state,
             runner=runner,
-            event_name="execute_model.pre",
+            event=BackendObservableEvent.EXECUTE_MODEL_PRE,
         )
         executor.launch(4, collective=key, payload=object())
 
         common_hooks.dispatch_runtime_event(
             runtime=state,
             runner=runner,
-            event_name="execute_model.post",
+            event=BackendObservableEvent.EXECUTE_MODEL_POST,
         )
         executor.launch(4, collective=second.key, payload=object())
 
         common_hooks.dispatch_runtime_event(
             runtime=state,
             runner=runner,
-            event_name="sample_tokens.post",
+            event=BackendObservableEvent.SAMPLE_TOKENS_POST,
         )
         executor.finish_step(4)
 
@@ -394,11 +398,15 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
             num_scheduled_tokens_np=(),
         )
         events: list[tuple[str, int]] = []
+        order: list[str] = []
         real_dispatch = common_hooks.dispatch_runtime_event
 
         def dispatch(**kwargs: object) -> int:
-            event_name = str(kwargs["event_name"])
+            event = kwargs["event"]
+            self.assertIsInstance(event, BackendObservableEvent)
+            event_name = event.value
             events.append((event_name, state.distributed_prepared_step_id))
+            order.append(event_name)
             result = real_dispatch(**kwargs)
             if event_name == "prepare_inputs.pre":
                 step = state.distributed_prepared_step_id
@@ -411,12 +419,19 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 )
             return result
 
+        def run_prepare_post_producers(**_kwargs: object) -> None:
+            order.append("prepare_producers")
+
         with (
             mock.patch.object(residual_runtime, "RUNTIME", state),
             mock.patch.object(v027_mrv1._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
             mock.patch.object(v027_mrv1.active_targets, "runtime_has_active_targets", return_value=True),
             mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
-            mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
+            mock.patch.object(
+                v027_mrv1._hooks,
+                "run_prepare_inputs_post_producers",
+                side_effect=run_prepare_post_producers,
+            ),
             mock.patch.object(v027_mrv1._fast_weight, "update_fast_weight_metadata_from_runner"),
             mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
@@ -431,7 +446,23 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 orig=mock.Mock(return_value=(None, None)),
             )
 
-        self.assertEqual(events, [("prepare_inputs.pre", 1), ("prepare_inputs.post", 1)])
+        self.assertEqual(
+            events,
+            [
+                ("prepare_inputs.pre", 1),
+                ("prepare_inputs.post", 1),
+                ("execute_model.pre", 1),
+            ],
+        )
+        self.assertEqual(
+            order,
+            [
+                "prepare_inputs.pre",
+                "prepare_producers",
+                "prepare_inputs.post",
+                "execute_model.pre",
+            ],
+        )
         self.assertEqual(binding.adapter.calls[0][0].key.name, "prepare")
 
     def test_mrv2_dispatches_prepare_lifecycle_before_execute_model_compute_window(self) -> None:
@@ -439,11 +470,15 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
         state = ResidualRuntimeState()
         runner = SimpleNamespace(model=None)
         events: list[tuple[str, int]] = []
+        order: list[str] = []
         real_dispatch = common_hooks.dispatch_runtime_event
 
         def dispatch(**kwargs: object) -> int:
-            event_name = str(kwargs["event_name"])
+            event = kwargs["event"]
+            self.assertIsInstance(event, BackendObservableEvent)
+            event_name = event.value
             events.append((event_name, state.distributed_prepared_step_id))
+            order.append(event_name)
             result = real_dispatch(**kwargs)
             if event_name == "prepare_inputs.pre":
                 step = state.distributed_prepared_step_id
@@ -456,12 +491,44 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 )
             return result
 
+        input_batch = SimpleNamespace(
+            num_scheduled_tokens=(),
+            logits_indices=None,
+        )
+
+        def run_prepare_post_producers(**kwargs: object) -> None:
+            order.append("prepare_producers")
+            localize_decode = kwargs["localize_decode"]
+            self.assertTrue(callable(localize_decode))
+
+        def execute_with_prepared_inputs(_runner: object) -> str:
+            result = v027_mrv2._wrapped_prepare_inputs(
+                core=residual_runtime,
+                runner=runner,
+                args=(),
+                kwargs={},
+                orig=mock.Mock(return_value=input_batch),
+            )
+            self.assertIs(result, input_batch)
+            order.append("forward")
+            return "executed"
+
         with (
             mock.patch.object(residual_runtime, "RUNTIME", state),
             mock.patch.object(v027_mrv2._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
             mock.patch.object(v027_mrv2.active_targets, "runtime_has_active_targets", return_value=True),
             mock.patch.object(v027_mrv2._hooks, "setup_runtime_hooks_if_active"),
+            mock.patch.object(
+                v027_mrv2._hooks,
+                "run_prepare_inputs_post_producers",
+                side_effect=run_prepare_post_producers,
+            ),
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
+            mock.patch.object(v027_mrv2._fast_weight, "update_fast_weight_metadata_from_runner"),
+            mock.patch.object(v027_mrv2._fast_weight, "maybe_install_fast_weight_wrappers"),
+            mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
+            mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
+            mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
         ):
             residual_runtime.configure_workgraph_distributed(binding)
             residual_runtime.publish_workgraph_distributed(plan_epoch=1)
@@ -470,10 +537,29 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 runner=runner,
                 args=(),
                 kwargs={},
-                orig=mock.Mock(return_value="executed"),
+                orig=execute_with_prepared_inputs,
             )
 
-        self.assertEqual(events, [("prepare_inputs.pre", 1), ("execute_model.pre", 1)])
+        self.assertEqual(
+            events,
+            [
+                ("prepare_inputs.pre", 1),
+                ("prepare_inputs.post", 1),
+                ("execute_model.pre", 1),
+                ("execute_model.post", 1),
+            ],
+        )
+        self.assertEqual(
+            order,
+            [
+                "prepare_inputs.pre",
+                "prepare_producers",
+                "prepare_inputs.post",
+                "execute_model.pre",
+                "forward",
+                "execute_model.post",
+            ],
+        )
         self.assertEqual(binding.adapter.calls[0][0].key.name, "prepare")
 
 
@@ -503,7 +589,9 @@ class Phase4LegacyGenericLifecycleAuditRedTest(unittest.TestCase):
         real_dispatch = common_hooks.dispatch_runtime_event
 
         def dispatch(**kwargs: object) -> int:
-            event_name = str(kwargs["event_name"])
+            event = kwargs["event"]
+            self.assertIsInstance(event, BackendObservableEvent)
+            event_name = event.value
             events.append(event_name)
             result = real_dispatch(**kwargs)
             if event_name == "sample_tokens.post":
@@ -568,7 +656,10 @@ class Phase4LegacyGenericLifecycleAuditRedTest(unittest.TestCase):
             mock.patch.object(
                 port_runtime_hooks._common_hooks,
                 "dispatch_runtime_event",
-                side_effect=lambda **kwargs: events.append(str(kwargs["event_name"])) or 0,
+                side_effect=lambda **kwargs: (
+                    events.append(cast(BackendObservableEvent, kwargs["event"]).value)
+                    or 0
+                ),
             ),
         ):
             result = port_runtime_hooks.wrapped_execute_model(
@@ -597,11 +688,19 @@ class Phase4DistributedTerminalCloseAuditRedTest(unittest.TestCase):
         state = ResidualRuntimeState()
         state.event_step_id = 1
         runner = SimpleNamespace(model=SimpleNamespace())
+        set_step_session(
+            runner,
+            StepSession(
+                step_id=1,
+                backend_id="test",
+                batch_phase=_core.SchedulerBatchPhase.Decode,
+            ),
+        )
         real_dispatch = common_hooks.dispatch_runtime_event
 
         def dispatch(**kwargs: object) -> int:
             result = real_dispatch(**kwargs)
-            if kwargs["event_name"] == "sample_tokens.post":
+            if kwargs["event"] is BackendObservableEvent.SAMPLE_TOKENS_POST:
                 step = state.distributed_prepared_step_id
                 self.assertEqual(step, 1)
                 key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]
@@ -648,7 +747,7 @@ class Phase4DistributedTerminalCloseAuditRedTest(unittest.TestCase):
 
         def dispatch(**kwargs: object) -> int:
             result = real_dispatch(**kwargs)
-            if kwargs["event_name"] == "sample_tokens.post":
+            if kwargs["event"] is BackendObservableEvent.SAMPLE_TOKENS_POST:
                 step = state.distributed_prepared_step_id
                 self.assertEqual(step, 1)
                 key = state.distributed_plan_store.active(step).local_schedules[0].collectives[0]

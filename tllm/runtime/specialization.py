@@ -14,6 +14,7 @@ class RuntimeSpecializationSpec:
     hidden_size: int
     dtype: torch.dtype
     device: torch.device
+    model_layer_count: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.rows, int) or isinstance(self.rows, bool) or self.rows < 1:
@@ -30,6 +31,14 @@ class RuntimeSpecializationSpec:
             raise TypeError("RuntimeSpecializationSpec.dtype must be torch.dtype")
         if not isinstance(cast(object, self.device), torch.device):
             raise TypeError("RuntimeSpecializationSpec.device must be torch.device")
+        if self.model_layer_count is not None and (
+            not isinstance(self.model_layer_count, int)
+            or isinstance(self.model_layer_count, bool)
+            or self.model_layer_count < 1
+        ):
+            raise ValueError(
+                "RuntimeSpecializationSpec.model_layer_count must be a positive int or None"
+            )
 
 
 __all__ = ["RuntimeSpecializationSpec"]

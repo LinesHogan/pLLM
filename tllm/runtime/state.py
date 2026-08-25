@@ -20,11 +20,11 @@ from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.runtime.fast_weight.state import FastWeightState
+from tllm.runtime.fast_weight.state import DownProjFastWeightOverlayHandle, FastWeightState
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeStore
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlStore
-from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta
+from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta, RuntimeTokenPhase
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
@@ -34,6 +34,12 @@ from tllm.runtime.stats import PlacementStats
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
 
 if TYPE_CHECKING:
+    from tllm.backends.protocol import RunnerBinding
+    from tllm.schedule import ScheduleGraph, WorkloadCompilation
+    from tllm.runtime.workload_execution import (
+        NativeWorkloadExecution,
+        NativeWorkloadExecutionStore,
+    )
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
     from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
@@ -146,6 +152,14 @@ class ResidualRuntimeState:
     distributed_prepared_step_id: int = -1
     physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
     physical_prepared_step_id: int = -1
+    # Immutable new-middle-end output. Legacy dispatch remains authoritative
+    # until a workload explicitly enters native physical execution.
+    workload_compilation: Optional["WorkloadCompilation"] = None
+    workload_execution: Optional["NativeWorkloadExecution"] = None
+    workload_execution_store: Optional["NativeWorkloadExecutionStore"] = None
+    native_workloads_pending: bool = False
+    native_schedule_graph: Optional["ScheduleGraph"] = None
+    native_hidden_path_aliases: dict[str, str] = field(default_factory=dict)
     producer_executor: Optional["ProducerExecutor"] = None
     deferred_work_queue: DeferredWorkQueue = field(default_factory=DeferredWorkQueue)
     fusion_executor: FusionExecutor = field(default_factory=FusionExecutor)
@@ -157,12 +171,16 @@ class ResidualRuntimeState:
     last_retry_controls: RetryControlBatch | None = None
     last_update_barriers: UpdateBarrierBatch | None = None
     fast_weight_state: Optional[FastWeightState] = None
-    fast_weight_handles: dict[str, object] = field(default_factory=dict)
+    fast_weight_binding: RunnerBinding | None = None
+    fast_weight_handles: dict[str, DownProjFastWeightOverlayHandle] = field(default_factory=dict)
     fast_weight_hook_spec: Optional[tuple[object, ...]] = None
-    fast_weight_phase: str = "prefill"
+    fast_weight_phase: RuntimeTokenPhase = "prefill"
     fast_weight_current_token_batch_meta: Optional[RuntimeTokenBatchMeta] = None
     fast_weight_installed_count: int = 0
     fast_weight_skipped_count: int = 0
+    model_region_binding: object | None = None
+    test_time_lora_store: object | None = None
+    test_time_lora_publisher: object | None = None
 
     def reset_step(self) -> None:
         self.decode_count = 0

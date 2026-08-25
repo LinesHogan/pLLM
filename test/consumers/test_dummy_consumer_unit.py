@@ -69,6 +69,31 @@ class DummyConsumerUnitTest(unittest.TestCase):
         self.assertEqual(stats["processed_batches"], 1.0)
         self.assertEqual(stats["pending"], 0.0)
 
+    def test_legacy_feedback_interval_drains_async_exports_at_step_end(self) -> None:
+        consumer = DummyConsumer(
+            DummyConsumerConfig(
+                enable_async=True,
+                export_every_n_steps=1,
+                feedback_interval=1,
+            )
+        )
+        context = RuntimeContext(
+            runner=None,
+            model=None,
+            device=torch.device("cpu"),
+            main_stream=None,
+            is_compiling=False,
+            uses_cudagraph=False,
+            event_name="step.end",
+        )
+
+        consumer.execute_native_export(torch.randn(2, 4), step_id=1)
+        self.assertEqual(consumer.read_stats()["pending"], 1.0)
+        consumer.on_step_end(context)
+
+        self.assertEqual(consumer.read_stats()["processed_batches"], 1.0)
+        self.assertEqual(consumer.read_stats()["pending"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

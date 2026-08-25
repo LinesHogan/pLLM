@@ -109,18 +109,20 @@ fn plan_err(message: String) -> PyErr {
 }
 
 #[pyfunction]
-#[pyo3(signature = (producers, consumers, enforced_kinds=None, supported_hooks=None, backend=None))]
+#[pyo3(signature = (producers, consumers, enforced_kinds=None, supported_hooks=None, backend=None, backend_capabilities=None))]
 fn compile_execution_plan(
     producers: Vec<ProducerDesc>,
     consumers: Vec<ConsumerDesc>,
     enforced_kinds: Option<Vec<String>>,
     supported_hooks: Option<Vec<String>>,
     backend: Option<(String, String)>,
+    backend_capabilities: Option<Vec<String>>,
 ) -> PyResult<CompiledPlan> {
     let enforced: Option<HashSet<String>> =
         enforced_kinds.map(|values| values.into_iter().collect());
 
     validate_consumers(&producers, &consumers, enforced.as_ref())?;
+    validate_backend_capabilities(&consumers, backend_capabilities.as_ref())?;
 
     let mut selected: HashMap<String, usize> = HashMap::new();
     let mut selected_order: Vec<usize> = Vec::new();
@@ -320,6 +322,32 @@ fn compile_execution_plan(
         port_sources,
         capture_resident_producer_ids,
     })
+}
+
+fn validate_backend_capabilities(
+    consumers: &[ConsumerDesc],
+    backend_capabilities: Option<&Vec<String>>,
+) -> PyResult<()> {
+    let Some(capability_names) = backend_capabilities else {
+        return Ok(());
+    };
+    let capabilities: HashSet<&str> = capability_names.iter().map(String::as_str).collect();
+    for consumer in consumers {
+        for write in consumer.flows.iter().flat_map(|flow| &flow.writes) {
+            if write.kind != "module_weight_view" {
+                continue;
+            }
+            let required = format!("module_weight_view/{}/{}", write.mode, write.phase);
+            if !capabilities.contains(required.as_str()) {
+                return Err(plan_err(format!(
+                    "consumer {} requires backend capability {}, but the backend does not declare it",
+                    qr(&consumer.id),
+                    qr(&required)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_consumers(

@@ -22,6 +22,7 @@ from tllm.workgraph.frontend import (
     FlowProgramDecl,
     LocalRef,
     PromptIdxKey,
+    RequestStateKey,
     ResultRef,
     SinkRef,
     StateScope,
@@ -53,7 +54,7 @@ class StateSpec:
     """One named optimizer/state bank owned by a Program."""
 
     scope: StateScope
-    key: PromptIdxKey | None = None
+    key: PromptIdxKey | RequestStateKey | None = None
     optimizer: object = None
 
     def __post_init__(self) -> None:
@@ -63,9 +64,12 @@ class StateSpec:
             raise WorkGraphError(
                 "PG100", f"StateSpec.scope must be REQUEST or REPLICA, got {self.scope!r}"
             )
-        if self.scope is StateScope.REQUEST and not isinstance(self.key, PromptIdxKey):
+        if self.scope is StateScope.REQUEST and not isinstance(
+            self.key, (PromptIdxKey, RequestStateKey)
+        ):
             raise WorkGraphError(
-                "PG100", "REQUEST-scoped state requires key=request_prompt_idx()"
+                "PG100",
+                "REQUEST-scoped state requires key=request_prompt_idx() or request_state_key(...)"
             )
         kind = _optimizer_kind(self.optimizer)
         if kind is not None and kind not in _SUPPORTED_OPTIMIZERS:

@@ -5,8 +5,14 @@ from __future__ import annotations
 
 import unittest
 
-from tllm.backends.protocol import BackendCapabilities, GraphSafety, SamplerStage
+from tllm.backends.protocol import (
+    BackendCapabilities,
+    GraphSafety,
+    ModuleWeightOverlayCapabilities,
+    SamplerStage,
+)
 from tllm.ports.base import ConsumerFlow, PortKind, PortRead
+from tllm.ports.module_weight_view import ModuleWeightView
 from tllm.ports.port_id import PortId
 from tllm.ports.port_spec import PortSpec
 from tllm.ports.residual_stream import ResidualStream
@@ -59,6 +65,62 @@ class _Consumer:
 
 
 class ExecutionPlanCompilerUnitTest(unittest.TestCase):
+    def test_module_weight_write_requires_exact_backend_capability_name(self) -> None:
+        class _OverlayConsumer:
+            consumer_id = "overlay.consumer"
+
+            def flows(self):
+                return (
+                    ConsumerFlow(
+                        reads=(),
+                        writes=(
+                            ModuleWeightView.write(
+                                layer=0,
+                                module="mlp",
+                                phase="decode",
+                                mode="wrapper",
+                            ),
+                        ),
+                        window="same_step",
+                    ),
+                )
+
+        reg = ProducerRegistry()
+        base = dict(
+            backend_id="overlay-test",
+            runner_family="mrv1",
+            sampler_stages=frozenset(),
+            native_min_p=True,
+            tuple_sampler_return=True,
+            split_execute_and_sample=True,
+        )
+        with self.assertRaisesRegex(
+            ExecutionPlanError,
+            "module_weight_view/wrapper/decode",
+        ):
+            compile_execution_plan(
+                registry=reg,
+                consumers=[_OverlayConsumer()],
+                backend_capabilities=BackendCapabilities(**base),
+                enforced_kinds=frozenset(),
+            )
+
+        plan = compile_execution_plan(
+            registry=reg,
+            consumers=[_OverlayConsumer()],
+            backend_capabilities=BackendCapabilities(
+                **base,
+                module_weight_overlay=ModuleWeightOverlayCapabilities(
+                    modules=frozenset({"mlp"}),
+                    write_modes=frozenset({"wrapper"}),
+                    phases=frozenset({"decode"}),
+                    request_keyed=True,
+                ),
+            ),
+            enforced_kinds=frozenset(),
+        )
+        self.assertEqual(plan.producers, ())
+
     def test_exact_read_phase_selects_only_matching_residual_producer(self) -> None:
         decode = PortSpec(
             id=PortId("tllm", "residual.decode", 1),

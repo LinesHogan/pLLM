@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
+    from tllm.runtime.workload_execution import NativeWorkloadExecution
 
 
 class ActivityPlan(Protocol):
@@ -11,22 +15,38 @@ class ActivityPlan(Protocol):
         ...
 
 
+class SamplerProviderOwner(Protocol):
+    def sampler_modifier_provider(self) -> "SamplerModifierProvider | None":
+        ...
+
+
 class RuntimeWithTargets(Protocol):
     dispatch_plan: ActivityPlan | None
-    consumer: object | None
+    consumer: SamplerProviderOwner | None
     distributed_runtime_binding: object | None
+    workload_execution: "NativeWorkloadExecution | None"
+    native_workloads_pending: bool
 
 
 def _has_active_sampler_provider(runtime: RuntimeWithTargets) -> bool:
-    consumer = getattr(runtime, "consumer", None)
+    provider = _sampler_provider(runtime)
+    if provider is None:
+        return False
+    return bool(provider.is_active())
+
+
+def _sampler_provider(
+    runtime: RuntimeWithTargets,
+) -> "SamplerModifierProvider | None":
+    execution = runtime.workload_execution
+    if execution is not None:
+        provider = execution.sampler_modifier_provider()
+        if provider is not None:
+            return provider
+    consumer = runtime.consumer
     if consumer is None:
-        return False
-    getter = getattr(consumer, "sampler_modifier_provider", None)
-    if not callable(getter):
-        return False
-    provider: Any = getter()
-    is_active = getattr(provider, "is_active", None)
-    return bool(callable(is_active) and is_active())
+        return None
+    return consumer.sampler_modifier_provider()
 
 
 def runtime_has_active_targets(runtime: RuntimeWithTargets) -> bool:
@@ -35,4 +55,13 @@ def runtime_has_active_targets(runtime: RuntimeWithTargets) -> bool:
         (plan is not None and plan.has_active_targets())
         or _has_active_sampler_provider(runtime)
         or runtime.distributed_runtime_binding is not None
+        or runtime.workload_execution is not None
+        or runtime.native_workloads_pending
     )
+
+
+def runtime_requires_decode_hidden(runtime: RuntimeWithTargets) -> bool:
+    """Read the decode-residual requirement projected from the signed Regions."""
+
+    execution = runtime.workload_execution
+    return execution is not None and execution.requires_decode_hidden

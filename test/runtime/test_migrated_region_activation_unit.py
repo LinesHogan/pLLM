@@ -36,6 +36,7 @@ from tllm.runtime.scheduling.workgraph_executor import (
 )
 from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
 from tllm.runtime.state import ResidualRuntimeState
+from tllm.schedule.contracts import BackendObservableEvent
 from tllm.workgraph import placement
 from tllm.workgraph.frontend import (
     ArtifactKey,
@@ -418,7 +419,9 @@ class MigratedRegionMigratedRegionActivationUnitTest(unittest.TestCase):
         runner = SimpleNamespace(model=None)
 
         def _dispatch(**kwargs: object) -> int:
-            order.append(("dispatch", kwargs["event_name"]))
+            event = kwargs["event"]
+            self.assertIsInstance(event, BackendObservableEvent)
+            order.append(("dispatch", event.value))
             return 0
 
         fake_core = SimpleNamespace(

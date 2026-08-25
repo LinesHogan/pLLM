@@ -26,7 +26,10 @@ def _supported_logical_locators(required: set[tuple[int, str, str]]) -> list[Res
     locators: list[ResidualLocator] = []
     for layer, site, phase in sorted(required, key=lambda item: (item[0], item[1], item[2])):
         if str(site) != "block_output" or str(phase) != "decode":
-            continue
+            raise RuntimeError(
+                "unsupported logical residual locator for current runtime binding "
+                f"config: layer={layer}, site={site!r}, phase={phase!r}"
+            )
         locators.append(ResidualLocator(layer=int(layer), site="block_output", phase="decode"))
     return locators
 

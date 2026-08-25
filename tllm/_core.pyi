@@ -179,6 +179,145 @@ class PlacementSchedule:
     fusion_groups: list[list[str]]
     fusion_rejections: list[tuple[str, str]]
 
+class CompiledRecurrenceSchedule:
+    groups: list[list[str]]
+    execution_order: list[str]
+    kind: str
+    fusion_rejections: list[tuple[str, str, str]]
+
+def compile_recurrence_schedule(
+    ops: Sequence[object],
+    edges: Sequence[object],
+    internalized_edges: Sequence[str] | None = None,
+    max_rows: int = 2,
+) -> CompiledRecurrenceSchedule: ...
+
+class RecirculationPrefillOpKind:
+    Normal: RecirculationPrefillOpKind
+    Mix: RecirculationPrefillOpKind
+    Recurrent: RecirculationPrefillOpKind
+
+class RecirculationInputKind:
+    Seed: RecirculationInputKind
+    Ordinal: RecirculationInputKind
+
+class RecirculationPrefillGroupKind:
+    ModelLayer: RecirculationPrefillGroupKind
+    Mix: RecirculationPrefillGroupKind
+
+class RecirculationPrefillOp:
+    ordinal: int
+    kind: RecirculationPrefillOpKind
+    token: int
+    layer: int
+    data_predecessor_ordinals: list[int]
+    model_input_kind: RecirculationInputKind | None
+    model_input_ordinal: int | None
+    mix_source_ordinal: int | None
+    mix_destination_ordinal: int | None
+    mix_final_normal_ordinal: int | None
+
+class RecirculationPrefillGroup:
+    ordinal: int
+    kind: RecirculationPrefillGroupKind
+    model_layer: int | None
+    operations: list[RecirculationPrefillOp]
+    release_after: list[int]
+
+class RecirculationPrefillSchedule:
+    token_count: int
+    layer_count: int
+    source_layer: int
+    destination_layer: int
+    kind: str
+    groups: list[RecirculationPrefillGroup]
+    final_normal_ordinals: list[int]
+    retained_ordinals: list[int]
+    fusion_rejections: list[tuple[int, int, str]]
+
+def compile_recirculation_prefill_schedule(
+    token_count: int,
+    layer_count: int,
+    source_layer: int,
+    destination_layer: int,
+    ordered_row_fusion_policy: str,
+) -> RecirculationPrefillSchedule: ...
+
+class PrefillRowSpan:
+    request_ordinal: int
+    packed_row_start: int
+    packed_row_end: int
+    token_offset_start: int
+    token_offset_end: int
+    prefill_row_count: int
+    decode_row_count: int
+
+class PackedPrefillRowPlan:
+    request_ordinals: list[int]
+    packed_row_indices: list[int]
+    token_offsets: list[int]
+    phases: list[str]
+    request_spans: list[PrefillRowSpan]
+    total_rows: int
+
+class SchedulerBatchPhase:
+    Empty: SchedulerBatchPhase
+    Prefill: SchedulerBatchPhase
+    Decode: SchedulerBatchPhase
+    Mixed: SchedulerBatchPhase
+
+def classify_scheduler_batch_phase(
+    scheduled_tokens: list[int],
+    prompt_tokens: list[int],
+    computed_tokens: list[int],
+) -> SchedulerBatchPhase: ...
+
+def plan_packed_prefill_rows(
+    scheduled_tokens: list[int],
+    prompt_tokens: list[int],
+    computed_tokens: list[int],
+    expected_total_rows: int | None = None,
+) -> PackedPrefillRowPlan: ...
+
+def plan_prefill_rows(
+    scheduled_tokens: list[int],
+    prompt_tokens: list[int],
+    computed_tokens: list[int],
+    expected_total_rows: int | None = None,
+) -> PackedPrefillRowPlan: ...
+
+def normalize_recirculation_prefill_plan(plan_json: str) -> str: ...
+
+class RecirculationPrefillRequest:
+    request_id: str
+    request_ordinal: int
+    scheduled_tokens: int
+    prompt_tokens: int
+    computed_tokens: int
+    packed_row_start: int
+    packed_row_end: int
+    packed_row_indices: list[int]
+    token_position_start: int
+    token_position_end: int
+    token_positions: list[int]
+
+class RecirculationPrefillPlan:
+    schema_version: int
+    phase: str
+    layer_count: int
+    total_rows: int
+    requests: list[RecirculationPrefillRequest]
+
+def parse_recirculation_prefill_plan(plan_json: str) -> RecirculationPrefillPlan: ...
+
+def build_recirculation_prefill_plan(
+    request_ids: list[str],
+    scheduled_tokens: list[int],
+    prompt_tokens: list[int],
+    computed_tokens: list[int],
+    layer_count: int,
+) -> RecirculationPrefillPlan: ...
+
 class WorkGraphNodeKeyDescriptor(Protocol):
     namespace: str
     owner: str
@@ -375,7 +514,57 @@ def compile_execution_plan(
     enforced_kinds: list[str] | None = ...,
     supported_hooks: list[str] | None = ...,
     backend: tuple[str, str] | None = ...,
+    backend_capabilities: list[str] | None = ...,
 ) -> CompiledPlan: ...
+
+def compile_schedule(graph: str, timeline: str, options: str) -> str: ...
+def validate_schedule(graph: str, timeline: str, options: str, decision: str) -> None: ...
+def validate_workload_compilation_wire(
+    cache_key: str,
+    graph_json: str,
+    timeline_json: str,
+    options_json: str,
+    decision_json: str,
+    plan_epoch: int,
+) -> None: ...
+def validate_worker_reconstruction_wire(
+    cache_key: str,
+    graph_json: str,
+    timeline_json: str,
+    options_json: str,
+    decision_json: str,
+    plan_epoch: int,
+    reconstructed_graph_json: str,
+    runtime_specialization_facts_json: str,
+    reconstructed_residual_resource_manifest_json: str,
+    reconstructed_static_binding_manifest_json: str,
+) -> None: ...
+def validate_local_execution_binding_wire(
+    cache_key: str,
+    graph_json: str,
+    timeline_json: str,
+    options_json: str,
+    decision_json: str,
+    plan_epoch: int,
+    reconstructed_graph_json: str,
+    reconstructed_residual_resource_manifest_json: str,
+    reconstructed_static_binding_manifest_json: str,
+) -> None: ...
+def normalize_runtime_specialization_options(
+    options_json: str,
+    facts_json: str,
+) -> str: ...
+def apply_region_shape_specializations(
+    cache_key: str,
+    graph_json: str,
+    timeline_json: str,
+    options_json: str,
+    decision_json: str,
+    plan_epoch: int,
+    requests_json: str,
+) -> str: ...
+def normalize_region_shape_specialization_request(payload: str) -> str: ...
+def validate_region_shape_specialization_request(payload: str) -> None: ...
 
 def validate_workgraph(
     semantic: WorkGraphSemanticDescriptor,

@@ -29,9 +29,6 @@ def build_sampler_step_view(
         return None
     if int(source_hidden.shape[0]) < decode_count:
         return None
-    request_ids: tuple[str, ...] = ()
-    prompt_idxs: tuple[int, ...] = ()
-    sample_idxs: tuple[int, ...] = ()
     prompt_idx_tensor = getattr(runtime, "decode_prompt_idx_tensor", None)
     sample_idx_tensor = getattr(runtime, "decode_sample_idx_tensor", None)
     if isinstance(prompt_idx_tensor, torch.Tensor) and int(prompt_idx_tensor.numel()) >= decode_count:
@@ -42,18 +39,15 @@ def build_sampler_step_view(
         sample_idx_tensor = sample_idx_tensor[:decode_count]
     else:
         sample_idx_tensor = None
-    if prompt_idx_tensor is None:
-        prompt_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_prompt_idxs", []))[:decode_count])
-    if sample_idx_tensor is None:
-        sample_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_sample_idxs", []))[:decode_count])
+    prompt_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_prompt_idxs", []))[:decode_count])
+    sample_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_sample_idxs", []))[:decode_count])
     raw_request_ids = list(getattr(runtime, "decode_request_ids", []))
-    if len(raw_request_ids) >= decode_count:
-        request_ids = tuple(str(x) for x in raw_request_ids[:decode_count])
-    if prompt_idx_tensor is None and len(prompt_idxs) != decode_count:
+    request_ids = tuple(str(x) for x in raw_request_ids[:decode_count])
+    if len(prompt_idxs) != decode_count:
         return None
-    if sample_idx_tensor is None and len(sample_idxs) != decode_count:
+    if len(sample_idxs) != decode_count:
         return None
-    if request_ids and len(request_ids) != decode_count:
+    if len(request_ids) != decode_count:
         return None
     return SamplerStepView(
         engine_step_id=int(getattr(runtime, "event_step_id", 0) or 0),

@@ -118,13 +118,19 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
         runtime.decode_compact_row_idx = None
         runtime.decode_compact_count = 0
         runtime.capture_full_residual_rows = True
-        runtime.producer_executor = _DecodeExecutor()
-        runtime.launch_consumer_from_hooks = True
-        runtime.dispatch_plan = type(
-            "Plan",
+        runtime.producer_executor = None
+        runtime.workload_execution = type(
+            "NativeExecution",
             (),
-            {"has_active_targets": staticmethod(lambda: True)},
+            {
+                "requires_decode_hidden": True,
+                "sampler_modifier_provider": staticmethod(lambda: None),
+            },
         )()
+        runtime.native_workloads_pending = False
+        runtime.distributed_runtime_binding = None
+        runtime.launch_consumer_from_hooks = True
+        runtime.dispatch_plan = None
         runtime.consumer = None
         runtime.source_resolved_path = "layers.0"
         runtime.target_resolved_path = "layers.1"

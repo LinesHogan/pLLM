@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.consumer import DummyConsumer
@@ -32,6 +33,112 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         self.assertIs(active_runtime(), runtime)
         clear.assert_called_once()
         register.assert_called_once()
+
+    def test_workloads_are_instance_scoped_and_legacy_consumers_are_adapted(self) -> None:
+        consumer = _Consumer("workload")
+        runtime = TllmRuntime(workloads=(consumer,))
+
+        self.assertEqual(runtime.workloads, (consumer,))
+        self.assertEqual(runtime.consumers, (consumer,))
+
+    def test_declared_pure_workload_is_admitted_for_native_region_binding(self) -> None:
+        from tllm.workload import Before, task, workload
+
+        @workload(id="no.adapter")
+        class NoAdapter:
+            @task(timing=Before("step.end"))
+            def run(self) -> None:
+                return None
+
+        runtime = TllmRuntime(workloads=(NoAdapter(),))
+        llm = object()
+        with mock.patch(
+            "tllm.runtime.residual_runtime.make_llm", return_value=llm
+        ) as make_llm, mock.patch(
+            "tllm.runtime.mp.control.ControlPlane.try_bind", return_value=None
+        ):
+            result = runtime.make_llm(model_name="model")
+        self.assertIs(result, llm)
+        make_llm.assert_called_once_with(model_name="model")
+        self.assertIsNotNone(runtime.workload_execution_bindings)
+
+    def test_native_authority_rejects_an_unrelated_legacy_sidecar(self) -> None:
+        """Mixed authority remains runtime-wide until resources declare ownership."""
+        from tllm.consumers.esamp.config import ESampConsumerConfig
+        from tllm.consumers.esamp.region_workload import build_esamp_region_workload
+
+        native = build_esamp_region_workload(
+            ESampConsumerConfig(
+                implementation="region",
+                distiller_hidden_dim=3,
+            )
+        )
+        sidecar = _Consumer("gtta")
+
+        with self.assertRaisesRegex(RuntimeError, "native Region authority"):
+            TllmRuntime(workloads=(native,), consumers=(sidecar,))
+
+    def test_backend_cold_path_compiles_declared_workloads_before_forward(self) -> None:
+        from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
+        from tllm.backends.vllm.workgraph_runtime import cold_compile_loaded_workloads
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.graph_policy import GraphMode
+        from tllm.workgraph.anchors import BackendResolution
+        from tllm.workload import Between, task, workload
+
+        @workload(id="cold.compile")
+        class ColdWorkload:
+            @task(timing=Between("model.execute", "step.end"))
+            def run(self) -> None:
+                return None
+
+        runtime = TllmRuntime(
+            workloads=(ColdWorkload(),), workload_memory_budget_bytes=64
+        )
+        previous_resolution = residual_runtime.RUNTIME.workgraph_backend_resolution
+        previous_compilation = residual_runtime.RUNTIME.workload_compilation
+        previous_execution = residual_runtime.RUNTIME.workload_execution
+        previous_physical_executor = residual_runtime.RUNTIME.physical_executor
+        try:
+            residual_runtime.RUNTIME.workgraph_backend_resolution = BackendResolution(
+                capabilities=V027MRv2Driver().capabilities(),
+                graph_mode=GraphMode.EAGER,
+            )
+            with mock.patch(
+                "tllm.runtime.runtime.active_runtime", return_value=runtime
+            ):
+                cold_compile_loaded_workloads(
+                    core=residual_runtime,
+                    runner=SimpleNamespace(device="cpu")
+                )
+
+            compilation = runtime.workload_compilation
+            self.assertIsNotNone(compilation)
+            self.assertIs(residual_runtime.RUNTIME.workload_compilation, compilation)
+            assert compilation is not None
+            self.assertEqual(compilation.timeline.runner_family, "mrv2")
+            self.assertEqual(compilation.timeline.static_headroom_bytes, 64)
+            self.assertIsNotNone(compilation.physical)
+            self.assertIsNotNone(residual_runtime.RUNTIME.workload_execution)
+        finally:
+            current_execution = residual_runtime.RUNTIME.workload_execution
+            if current_execution is not None and current_execution is not previous_execution:
+                current_execution.close()
+            residual_runtime.RUNTIME.workgraph_backend_resolution = previous_resolution
+            residual_runtime.RUNTIME.workload_compilation = previous_compilation
+            residual_runtime.RUNTIME.workload_execution = previous_execution
+            residual_runtime.RUNTIME.physical_executor = previous_physical_executor
+
+    def test_root_make_llm_routes_canonical_workloads_keyword(self) -> None:
+        import tllm
+
+        consumer = _Consumer("root")
+        llm = object()
+        with mock.patch("tllm.runtime.runtime.TllmRuntime.make_llm", return_value=llm) as make:
+            result = tllm.make_llm(model_name="model", workloads=(consumer,))
+
+        self.assertIs(result, llm)
+        self.assertEqual(make.call_args.kwargs, {"model_name": "model"})
 
     def test_runtime_registration_and_clear_forward_to_active_plane(self) -> None:
         runtime = TllmRuntime()

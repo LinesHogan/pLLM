@@ -9,5 +9,22 @@ instance-scoped runtime API.
 from __future__ import annotations
 
 from tllm.runtime.runtime import TllmRuntime, default_runtime
+from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
+from tllm.runtime.workload_execution import StateVersionBinding
+from tllm.runtime.workload_plugins import (
+    NativeWorkload,
+    NativeWorkloadResources,
+    ReconstructedWorkload,
+    WorkloadWorkerSpec,
+)
 
-__all__ = ["TllmRuntime", "default_runtime"]
+__all__ = [
+    "NativeWorkload",
+    "BackendRegionBinderSlot",
+    "NativeWorkloadResources",
+    "ReconstructedWorkload",
+    "StateVersionBinding",
+    "TllmRuntime",
+    "WorkloadWorkerSpec",
+    "default_runtime",
+]

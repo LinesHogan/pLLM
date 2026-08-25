@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from typing import Any, cast
 
 import torch
 
@@ -17,7 +18,11 @@ from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionError,
     PhysicalExecutionKind,
     PhysicalExecutor,
-    SpecializationRequestDesc,
+    ShapeSpecializationMiss,
+)
+from tllm.contracts.shape_specialization import (
+    RegionShapeSpecializationInput,
+    RegionShapeSpecializationRequest,
 )
 from tllm.workgraph.frontend import ArtifactKey, Device, TensorDTypeDesc, TensorDeviceDesc
 from tllm.workgraph.ir import ExecutorKey, NodeKey
@@ -68,6 +73,12 @@ class _FakeGraph:
         self.trace.append("graph:replay")
 
 
+class _ContextFakeGraph(_FakeGraph):
+    def replay_context(self, context: object) -> None:
+        kind = cast(Any, context).kind
+        self.trace.append(f"graph:context:{kind.value}")
+
+
 def _artifact(name: str = "capture") -> ArtifactKey:
     return ArtifactKey("physical", name, digest="a" * 64)
 
@@ -80,6 +91,31 @@ def _bucket() -> BufferBucketDesc:
         device=TensorDeviceDesc(Device.CPU),
         slots=1,
         ownership=BufferOwnershipKind.MANAGED,
+    )
+
+
+def _specialization_request_factory(
+    node: PhysicalNodePlan,
+    epoch: int,
+    tensors: tuple[torch.Tensor, ...],
+) -> RegionShapeSpecializationRequest:
+    artifact = node.artifact_key
+    assert artifact is not None
+    return RegionShapeSpecializationRequest(
+        base_cache_key="d" * 64,
+        base_signature="e" * 64,
+        observed_plan_epoch=epoch,
+        region_id=str(node.node_key),
+        artifact_key=artifact.digest,
+        inputs=tuple(
+            RegionShapeSpecializationInput(
+                binding_id=f"input-{index}",
+                shape=tuple(int(dimension) for dimension in tensor.shape),
+                dtype=str(tensor.dtype),
+                device=str(tensor.device),
+            )
+            for index, tensor in enumerate(tensors)
+        ),
     )
 
 
@@ -140,7 +176,7 @@ def _resources(
     *,
     trace: list[str],
     dependency: FenceKey | None = None,
-    graph: _FakeGraph | None = None,
+    graph: object | None = None,
     artifact: ArtifactKey | None = None,
 ) -> PlanResources:
     events = ()
@@ -456,6 +492,29 @@ class PhysicalFlowExecutorUnitTest(unittest.TestCase):
         self.assertEqual(executor.stats.replay_count, 1)
         self.assertEqual(executor.stats.eager_count, 1)
 
+    def test_context_aware_graph_receives_fixed_replay_context(self) -> None:
+        trace: list[str] = []
+        plan, producer, consumer, _dependency, artifact, _bucket_desc = _plan(
+            capture_policy=CapturePolicy.REQUIRE,
+            fallback_policy=FallbackPolicy.REJECT,
+        )
+        resources = _resources(
+            plan,
+            trace=trace,
+            graph=_ContextFakeGraph(trace),
+            artifact=artifact,
+        )
+        executor = PhysicalExecutor(
+            snapshots=PlanSnapshotStore(resources),
+            handlers={producer: lambda _ctx: None, consumer: lambda _ctx: None},
+        )
+
+        executor.prepare_step(3)
+        result = executor.execute_step(3)
+
+        self.assertEqual(result.replayed_nodes, (str(consumer),))
+        self.assertIn("graph:context:replay", trace)
+
     def test_preferred_capture_without_graph_is_eager_but_reject_policies_fail(self) -> None:
         for fallback_policy in (FallbackPolicy.EAGER, FallbackPolicy.REJECT):
             with self.subTest(fallback_policy=fallback_policy):
@@ -508,17 +567,18 @@ class PhysicalFlowExecutorUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(PhysicalExecutionError, "capture"):
             executor.execute_step(1)
 
-    def test_producer_fence_is_recorded_after_node_and_bucket_miss_requests_once(self) -> None:
+    def test_bucket_miss_preflights_an_event_group_before_any_node_or_fence(self) -> None:
         trace: list[str] = []
         plan, producer, consumer, dependency, _artifact, bucket = _plan(
             with_dependency=True,
             with_bucket=True,
+            capture_policy=CapturePolicy.PREFER,
         )
         assert dependency is not None
         assert bucket is not None
         resources = _resources(plan, trace=trace, dependency=dependency)
         calls: list[PhysicalExecutionKind] = []
-        specialization_requests: list[SpecializationRequestDesc] = []
+        specialization_requests: list[RegionShapeSpecializationRequest] = []
         executor = PhysicalExecutor(
             snapshots=PlanSnapshotStore(resources),
             handlers={
@@ -532,45 +592,127 @@ class PhysicalFlowExecutorUnitTest(unittest.TestCase):
             on_specialization_request=lambda request: specialization_requests.append(
                 request
             ),
+            specialization_request_factory=_specialization_request_factory,
         )
         mismatch = torch.empty((2, 4), dtype=torch.float32)
 
         executor.prepare_step(1)
-        executor.execute_step(1, tensors=(mismatch,))
+        with self.assertRaises(ShapeSpecializationMiss) as first_miss:
+            executor.execute_step(1, tensors=(mismatch,))
+        self.assertEqual(first_miss.exception.request.region_id, str(consumer))
+        self.assertEqual(calls, [])
         executor.finish_step(1)
         executor.prepare_step(2)
-        executor.execute_step(2, tensors=(mismatch,))
+        with self.assertRaises(ShapeSpecializationMiss):
+            executor.execute_step(2, tensors=(mismatch,))
 
-        self.assertEqual(calls, [PhysicalExecutionKind.EAGER] * 4)
-        # A bucket miss is a hot-path fallback plus a deduplicated cold request;
-        # the callback itself must only run when an explicit cold-path drain is
-        # requested.
+        self.assertEqual(calls, [])
+        # A miss never falls through to eager execution or submits the Region.
+        # Requests remain queued until an explicit cold-path safe point.
         self.assertEqual(specialization_requests, [])
         self.assertEqual(executor.stats.bucket_miss_count, 1)
         self.assertEqual(executor.stats.specialization_request_count, 1)
         self.assertEqual(executor.drain_specialization_requests(), 1)
         self.assertEqual(
-            specialization_requests,
             [
-                SpecializationRequestDesc(
-                    plan_epoch=1,
-                    node_key=consumer,
-                    buffer_bucket=bucket.key,
-                    artifact_key=None,
-                    shape=(2, 4),
-                    dtype=torch.float32,
-                    device=torch.device("cpu"),
-                )
+                (request.observed_plan_epoch, request.region_id, request.inputs[0].shape)
+                for request in specialization_requests
             ],
+            [(1, str(consumer), (2, 4))],
         )
         self.assertEqual(executor.drain_specialization_requests(), 0)
-        self.assertEqual(
-            trace[:2],
-            ["record:dependency", "wait:side_train:dependency"],
-        )
-        self.assertEqual(trace.count("record:dependency"), 2)
-        self.assertIn("record:dependency", trace)
+        self.assertNotIn("record:dependency", trace)
+        self.assertNotIn("wait:side_train:dependency", trace)
         self.assertEqual(str(producer), "producer/physical.source/0")
+
+    def test_later_graph_shape_miss_prevents_prior_handler_sink_and_fence_commit(self) -> None:
+        """A group miss is atomic at its public backend-event boundary."""
+
+        trace: list[str] = []
+        committed: list[str] = []
+        plan, producer, consumer, dependency, artifact, _bucket_desc = _plan(
+            with_dependency=True,
+            capture_policy=CapturePolicy.PREFER,
+        )
+        assert dependency is not None
+        assert artifact is not None
+
+        request = RegionShapeSpecializationRequest(
+            base_cache_key="d" * 64,
+            base_signature="e" * 64,
+            observed_plan_epoch=1,
+            region_id=str(consumer),
+            artifact_key=artifact.digest,
+            inputs=(
+                RegionShapeSpecializationInput(
+                    binding_id="hidden",
+                    shape=(2, 4),
+                    dtype="torch.float32",
+                    device="cuda:0",
+                ),
+            ),
+        )
+
+        class MissGraph:
+            def preflight_context(self, _context: object) -> None:
+                trace.append("graph:preflight")
+                raise ShapeSpecializationMiss(request)
+
+            def replay_context(self, _context: object) -> None:
+                self.fail("shape-missed graph must not replay")
+
+        executor = PhysicalExecutor(
+            snapshots=PlanSnapshotStore(
+                _resources(
+                    plan,
+                    trace=trace,
+                    dependency=dependency,
+                    graph=MissGraph(),
+                    artifact=artifact,
+                )
+            ),
+            handlers={
+                producer: lambda _context: committed.append("state"),
+                consumer: lambda _context: committed.append("sink"),
+            },
+        )
+
+        executor.prepare_step(1)
+        with self.assertRaises(ShapeSpecializationMiss) as miss:
+            executor.execute_step(1)
+
+        self.assertIs(miss.exception.request, request)
+        self.assertEqual(committed, [])
+        self.assertEqual(trace, ["graph:preflight"])
+        self.assertEqual(executor.stats.eager_count, 0)
+        self.assertEqual(executor.stats.replay_count, 0)
+        self.assertEqual(executor.stats.fence_record_count, 0)
+
+    def test_shape_miss_without_signed_region_factory_fails_closed(self) -> None:
+        trace: list[str] = []
+        plan, producer, consumer, _dependency, _artifact, _bucket_desc = _plan(
+            with_bucket=True,
+            capture_policy=CapturePolicy.PREFER,
+        )
+        calls: list[PhysicalExecutionKind] = []
+        executor = PhysicalExecutor(
+            snapshots=PlanSnapshotStore(_resources(plan, trace=trace)),
+            handlers={
+                producer: lambda context: calls.append(context.kind),
+                consumer: lambda context: calls.append(context.kind),
+            },
+        )
+
+        executor.prepare_step(1)
+        with self.assertRaisesRegex(PhysicalExecutionError, "without a Region specialization factory"):
+            executor.execute_nodes(
+                1,
+                (consumer,),
+                tensors=(torch.empty((2, 4), dtype=torch.float32),),
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(executor.stats.specialization_request_count, 0)
 
     def test_specialization_requests_are_scoped_to_epoch_node_bucket_and_artifact(self) -> None:
         """Equal Tensor shapes must not coalesce distinct physical misses."""
@@ -630,32 +772,36 @@ class PhysicalFlowExecutorUnitTest(unittest.TestCase):
             # The cold path needs the complete request identity to construct
             # a correct per-region replacement plan.
             on_specialization_request=lambda request: observed.append(request),  # type: ignore[arg-type]
+            specialization_request_factory=_specialization_request_factory,
         )
         mismatch = torch.empty((2, 4), dtype=torch.float32)
 
         executor.prepare_step(1)
-        executor.execute_step(1, tensors=(mismatch,))
+        for node in (first_node, second_node):
+            with self.assertRaises(ShapeSpecializationMiss):
+                executor.execute_nodes(1, (node,), tensors=(mismatch,))
         executor.finish_step(1)
         snapshots.stage(replacement)
         executor.prepare_step(2)
-        executor.execute_step(2, tensors=(mismatch,))
+        for node in (first_node, second_node):
+            with self.assertRaises(ShapeSpecializationMiss):
+                executor.execute_nodes(2, (node,), tensors=(mismatch,))
 
         self.assertEqual(executor.drain_specialization_requests(), 4)
         self.assertEqual(
             [
                 (
-                    request.plan_epoch,
-                    request.node_key,
-                    request.buffer_bucket,
+                    request.observed_plan_epoch,
+                    request.region_id,
                     request.artifact_key,
                 )
                 for request in observed
             ],
             [
-                (1, first_node, first_bucket.key, first_artifact),
-                (1, second_node, second_bucket.key, second_artifact),
-                (2, first_node, first_bucket.key, first_artifact),
-                (2, second_node, second_bucket.key, second_artifact),
+                (1, str(first_node), first_artifact.digest),
+                (1, str(second_node), second_artifact.digest),
+                (2, str(first_node), first_artifact.digest),
+                (2, str(second_node), second_artifact.digest),
             ],
         )
 

@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Protocol
+from typing import TYPE_CHECKING, Dict, Protocol, cast
 
 import torch
 
+from tllm.contracts.runtime_context import RunnerLike
 from tllm.ports.base import WriteMode, WriteRows
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.dispatch_plan import DispatchPlan
@@ -18,6 +19,9 @@ from tllm.runtime.ports import residual_write as _residual_write
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
+
+if TYPE_CHECKING:
+    from tllm.schedule import ScheduleGraph
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class ResidualRuntimeSetup:
     hidden_dtype: torch.dtype
     source_resolved: str
     target_resolved: str
+    native_hidden_path_aliases: Dict[str, str]
 
 
 class ConfigLike(Protocol):
@@ -62,6 +67,8 @@ class RuntimeLike(Protocol):
     source_resolved_path: str
     target_resolved_path: str
     launch_consumer_from_hooks: bool
+    native_schedule_graph: "ScheduleGraph | None"
+    native_hidden_path_aliases: dict[str, str]
 
 
 class CoreLike(Protocol):
@@ -88,10 +95,27 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
         required |= set(plan.required_residual_writes())
 
     raw_paths_by_locator = _residual_bindings.raw_paths_from_runtime(core.RUNTIME)
+    native_graph = core.RUNTIME.native_schedule_graph
+    if not required and native_graph is not None:
+        # Native resources declare the exact logical locators they can bind.
+        # The empty legacy plan must not expand that contract to the historical
+        # ESamp source/target pair before the backend timeline is compiled.
+        required = {
+            (locator.layer, locator.site, locator.phase)
+            for locator in raw_paths_by_locator
+        }
     tap_paths = _residual_bindings.build_raw_tap_paths(
         raw_paths_by_locator=raw_paths_by_locator,
         required=required,
     )
+    native_paths = (
+        []
+        if native_graph is None
+        else list(dict.fromkeys(raw_paths_by_locator.values()))
+    )
+    for path in native_paths:
+        if path not in tap_paths:
+            tap_paths.append(path)
     if not tap_paths:
         fallback: list[str] = []
         for path in cfg.tap_layer_paths:
@@ -160,6 +184,9 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
         hidden_dtype=hidden_dtype,
         source_resolved=source_resolved,
         target_resolved=target_resolved,
+        native_hidden_path_aliases={
+            raw_path: resolve_alias[raw_path] for raw_path in native_paths
+        },
     )
 
 
@@ -199,11 +226,14 @@ def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntim
     core.RUNTIME.residual_bindings = setup.runtime_bindings
     core.RUNTIME.source_resolved_path = setup.source_resolved
     core.RUNTIME.target_resolved_path = setup.target_resolved
+    core.RUNTIME.native_hidden_path_aliases = dict(
+        setup.native_hidden_path_aliases
+    )
     core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
 
     handles = _residual_capture_hooks.install_layer_forward_taps(
-        core=core,
-        runner=runner,
+        core=cast(_residual_capture_hooks.ResidualCaptureCoreLike, core),
+        runner=cast(RunnerLike, runner),
         resolved_layers=setup.resolved_layers,
     )
     core.RUNTIME.tap_handles = dict(handles)

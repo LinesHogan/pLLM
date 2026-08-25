@@ -148,10 +148,6 @@ class _ProgramSamplerModifierProvider(SamplerModifierProvider):
                 f"predict flow returned {tuple(prediction.shape)} for {rows} decode rows",
             )
         lm_head = resolve_lm_head(view.model)
-        try:
-            lm_head_bias = lm_head.bias
-        except AttributeError:
-            lm_head_bias = None
         self.published_state_count += 1
         return CandidateModifierState(
             beta=float(self._config.distiller_beta),
@@ -159,7 +155,7 @@ class _ProgramSamplerModifierProvider(SamplerModifierProvider):
             affected_row_ids=torch.arange(rows, device=prediction.device, dtype=torch.long),
             pred_hidden=prediction,
             lm_head_weight=lm_head.weight,
-            lm_head_bias=lm_head_bias,
+            lm_head_bias=lm_head.bias,
         )
 
 
@@ -345,7 +341,12 @@ class ESampProgramConsumer(BaseESampConsumer):
         for (bank, slot_id), (loss_sum, loss_count) in compiled.read_and_reset_slot_losses().items():
             if bank != _STATE_NAME:
                 continue
-            out[int(slot_id)] = TrainingStats(
+            public_key = compiled.bank(bank).key_for_slot_id(slot_id)
+            if isinstance(public_key, bool) or not isinstance(public_key, int):
+                raise RuntimeError(
+                    f"ESamp request state expected an integer prompt key, got {public_key!r}"
+                )
+            out[public_key] = TrainingStats(
                 loss_avg=loss_sum / max(1, loss_count),
                 loss_count=loss_count,
             )

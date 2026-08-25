@@ -10,6 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Generic, Mapping, Protocol, Sequence, TypeVar
 
+from tllm.contracts.consumer_stats import TrainingStats
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.contracts.runtime_stats import WorkGraphRuntimeStats
@@ -17,10 +18,12 @@ from tllm.ports.base import ConsumerFlow
 
 if TYPE_CHECKING:
     from tllm.runtime.specialization import RuntimeSpecializationSpec
+    from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.scheduling.plan_store import PlanResources
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
     from tllm.workgraph.physical import PhysicalCaptureRegion, PhysicalRegionExecutorDesc
+    from tllm.workgraph.recurrence import RecurrenceGraph, RecurrenceRequirements
 
 ConfigT = TypeVar("ConfigT")
 
@@ -51,6 +54,35 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         """Public consumer declaration surface."""
         return ()
 
+    def recurrence_requirements(self) -> "RecurrenceRequirements | None":
+        """Declare recurrent effects; the compiler owns schedule selection."""
+
+        return None
+
+    def recurrence_graph(
+        self, *, token_count: int, layer_count: int
+    ) -> "RecurrenceGraph":
+        """Instantiate a finite recurrence after token/layer sizes are known."""
+
+        _ = (token_count, layer_count)
+        raise RuntimeError("consumer does not declare a recurrence graph")
+
+    def recurrence_runtime_adapter(self, *, layer_count: int) -> object | None:
+        """Return pure non-model op implementations for a recurrence graph.
+
+        Model-layer execution and state materialization remain backend-owned.
+        The adapter only evaluates consumer-declared executors such as a mix
+        operation after the compiler has selected their order.
+        """
+
+        _ = layer_count
+        return None
+
+    def runtime_adapter_store(self) -> object | None:
+        """Optionally expose a backend-neutral immutable adapter store."""
+
+        return None
+
     def consume_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
         """Public flow-based consumption surface."""
         _ = (bundle, ctx)
@@ -68,6 +100,11 @@ class BaseConsumer(ABC, Generic[ConfigT]):
     def on_step_end(self, ctx: RuntimeContext) -> None:
         """Optional hook called after the model step is complete."""
         _ = ctx
+
+    def sampler_modifier_provider(self) -> "SamplerModifierProvider | None":
+        """Optionally expose the provider for same-step sampler intervention."""
+
+        return None
 
     def retire_device_lease(self, ctx: RuntimeContext) -> None:
         """Fence any step-lifetime device inputs before producer reuse."""
@@ -149,3 +186,25 @@ class BaseConsumer(ABC, Generic[ConfigT]):
     def synchronize(self) -> None:
         """Optional flush hook for async/background consumers."""
         return None
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Apply the runtime training toggle when this consumer supports it."""
+
+        _ = enabled
+        raise RuntimeError("consumer does not support runtime enable updates")
+
+    def read_and_reset_stats(self, *, sync: bool = True) -> TrainingStats:
+        """Return training statistics for the shared runtime control plane."""
+
+        _ = sync
+        return TrainingStats(loss_avg=0.0, loss_count=0)
+
+    def read_and_reset_per_request_stats(
+        self,
+        *,
+        sync: bool = True,
+    ) -> Mapping[int, TrainingStats]:
+        """Return request-scoped training statistics when the consumer has them."""
+
+        _ = sync
+        return {}

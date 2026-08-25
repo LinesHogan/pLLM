@@ -10,12 +10,74 @@ from unittest import mock
 import torch
 
 from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
-from tllm.backends.vllm.sampler_mrv2 import _record_mrv2_candidate_stats
+from tllm.backends.vllm.sampler_mrv2 import (
+    _build_mrv2_step_view,
+    _record_mrv2_candidate_stats,
+)
 from tllm.runtime.residual_runtime import SamplerPrecomputeState
+from tllm.runtime.sampler_bridge.runtime_view import build_sampler_step_view
 from tllm.runtime.vllm_patch import sampler_patch
 
 
 class SamplerPrecomputeUnitTest(unittest.TestCase):
+    def test_mrv1_step_view_keeps_host_identity_with_device_index_tensors(self) -> None:
+        runtime = self._runtime(
+            decode_count=2,
+            source_resolved_path="layers.0",
+            tap_decode_hidden={"layers.0": torch.ones((2, 4))},
+            decode_prompt_idx_tensor=torch.tensor([7, 8]),
+            decode_sample_idx_tensor=torch.tensor([0, 1]),
+            decode_prompt_idxs=[7, 8],
+            decode_sample_idxs=[0, 1],
+            decode_request_ids=["req-a", "req-b"],
+            event_step_id=11,
+        )
+        runner = SimpleNamespace(model=object())
+
+        view = build_sampler_step_view(
+            runtime=runtime,
+            runner=runner,
+            model=runner.model,
+            logits=torch.ones((2, 16)),
+            sampling_metadata=object(),
+        )
+
+        self.assertIsNotNone(view)
+        assert view is not None
+        self.assertEqual(view.request_ids, ("req-a", "req-b"))
+        self.assertEqual(view.prompt_idxs, (7, 8))
+        self.assertEqual(view.sample_idxs, (0, 1))
+        self.assertIsNotNone(view.prompt_idx_tensor)
+        self.assertIsNotNone(view.sample_idx_tensor)
+
+    def test_mrv2_step_view_keeps_host_identity_with_device_index_tensors(self) -> None:
+        runtime = self._runtime(
+            decode_count=2,
+            source_resolved_path="layers.0",
+            tap_decode_hidden={"layers.0": torch.ones((2, 4))},
+            decode_prompt_idx_tensor=torch.tensor([7, 8]),
+            decode_sample_idx_tensor=torch.tensor([0, 1]),
+            decode_prompt_idxs=[7, 8],
+            decode_sample_idxs=[0, 1],
+            decode_request_ids=["req-a", "req-b"],
+            event_step_id=11,
+        )
+        runner = SimpleNamespace(model=object())
+
+        view = _build_mrv2_step_view(
+            runtime=runtime,
+            runner=runner,
+            logits=torch.ones((2, 16)),
+        )
+
+        self.assertIsNotNone(view)
+        assert view is not None
+        self.assertEqual(view.request_ids, ("req-a", "req-b"))
+        self.assertEqual(view.prompt_idxs, (7, 8))
+        self.assertEqual(view.sample_idxs, (0, 1))
+        self.assertIsNotNone(view.prompt_idx_tensor)
+        self.assertIsNotNone(view.sample_idx_tensor)
+
     def tearDown(self) -> None:
         sampler_patch._ORIG_VLLM_SAMPLER_SAMPLE = None
 

@@ -12,6 +12,8 @@ from opt_einsum import contract
 import torch
 from torch.nn import functional as F
 
+from tllm.runtime.versioned_state import VersionedRequestStateBank, VersionedStateSlot
+
 __test__ = False
 
 FastWeightMode = str
@@ -99,14 +101,23 @@ class FastWeightState:
                 "In-Place TTT fast-weight low_rank mode is not implemented yet; "
                 "exact mode keeps the past_h/past_t/past_w state contract."
             )
-        self._slots: dict[FastWeightKey, FastWeightSlot] = {}
-        self._stats: dict[FastWeightKey, FastWeightStats] = {}
-        self._max_slots = None if max_slots is None else max(0, int(max_slots))
-        self._max_bytes = None if max_bytes is None else max(0, int(max_bytes))
+        self._bank = VersionedRequestStateBank(
+            "fast_weight",
+            max_slots=None if max_slots is None else max(0, int(max_slots)),
+            max_bytes=None if max_bytes is None else max(0, int(max_bytes)),
+        )
+
+    @property
+    def bank(self) -> VersionedRequestStateBank:
+        """The generic versioned bank that owns all fast-weight tensors."""
+
+        return self._bank
 
     def set_limits(self, *, max_slots: int | None = None, max_bytes: int | None = None) -> None:
-        self._max_slots = None if max_slots is None else max(0, int(max_slots))
-        self._max_bytes = None if max_bytes is None else max(0, int(max_bytes))
+        self._bank.set_limits(
+            max_slots=None if max_slots is None else max(0, int(max_slots)),
+            max_bytes=None if max_bytes is None else max(0, int(max_bytes)),
+        )
 
     @staticmethod
     def _slot_bytes(slot: FastWeightSlot) -> int:
@@ -121,7 +132,22 @@ class FastWeightState:
 
     @property
     def estimated_bytes(self) -> int:
-        return sum(self._slot_bytes(slot) for slot in self._slots.values())
+        return self._bank.estimated_bytes
+
+    def keys(self) -> tuple[FastWeightKey, ...]:
+        """Return a stable snapshot of currently materialized request slots."""
+
+        return tuple(key for key in self._bank.keys() if isinstance(key, FastWeightKey))
+
+    @staticmethod
+    def _value_from_slot(slot: VersionedStateSlot) -> FastWeightSlot:
+        try:
+            h = slot.buffers["past_h"]
+            t = slot.buffers["past_t"]
+            w = slot.buffers["past_w"]
+        except KeyError as exc:
+            raise RuntimeError("fast-weight bank slot is missing a required tensor") from exc
+        return FastWeightSlot(past_h=h, past_t=t, past_w=w)
 
     def write(
         self,
@@ -142,63 +168,75 @@ class FastWeightState:
             raise RuntimeError("past_h width must match past_w input width")
         if int(t.shape[1]) != int(w.shape[0]):
             raise RuntimeError("past_t width must match past_w output width")
-        is_new_slot = key not in self._slots
-        if is_new_slot and self._max_slots is not None and len(self._slots) >= int(self._max_slots):
-            raise RuntimeError(
-                f"fast-weight slot limit exceeded: slots={len(self._slots) + 1} max_slots={int(self._max_slots)}"
+        is_new = self._bank.get_slot(key) is None
+        slot = self._bank.slot_for_key(key)
+        try:
+            self._bank.publish_buffers(
+                slot,
+                {"past_h": h, "past_t": t, "past_w": w},
             )
-        old_bytes = self._slot_bytes(self._slots[key]) if key in self._slots else 0
-        next_bytes = self.estimated_bytes - old_bytes + self._tensor_bytes(h, t, w)
-        if self._max_bytes is not None and next_bytes > int(self._max_bytes):
-            raise RuntimeError(f"fast-weight byte limit exceeded: bytes={next_bytes} max_bytes={int(self._max_bytes)}")
-        self._slots[key] = FastWeightSlot(
-            past_h=h.detach().clone(),
-            past_t=t.detach().clone(),
-            past_w=w.detach().clone(),
-        )
+        except Exception:
+            if is_new:
+                self._bank.clear(key)
+            raise
 
     def read(self, key: FastWeightKey) -> FastWeightSlot:
         if not isinstance(key, FastWeightKey):
             raise TypeError("key must be FastWeightKey")
-        slot = self._slots.get(key)
+        slot = self._bank.get_slot(key)
         if slot is None:
             raise KeyError(key)
+        value = self._value_from_slot(slot)
         return FastWeightSlot(
-            past_h=slot.past_h.detach().clone(),
-            past_t=slot.past_t.detach().clone(),
-            past_w=slot.past_w.detach().clone(),
+            past_h=value.past_h.detach().clone(),
+            past_t=value.past_t.detach().clone(),
+            past_w=value.past_w.detach().clone(),
         )
 
     def get(self, key: FastWeightKey) -> FastWeightSlot | None:
         if not isinstance(key, FastWeightKey):
             raise TypeError("key must be FastWeightKey")
-        slot = self._slots.get(key)
+        slot = self._bank.get_slot(key)
         if slot is None:
             return None
+        value = self._value_from_slot(slot)
         return FastWeightSlot(
-            past_h=slot.past_h.detach().clone(),
-            past_t=slot.past_t.detach().clone(),
-            past_w=slot.past_w.detach().clone(),
+            past_h=value.past_h.detach().clone(),
+            past_t=value.past_t.detach().clone(),
+            past_w=value.past_w.detach().clone(),
         )
 
     def clear(self, key: FastWeightKey) -> None:
         if not isinstance(key, FastWeightKey):
             raise TypeError("key must be FastWeightKey")
-        self._slots.pop(key, None)
-        self._stats.pop(key, None)
+        self._bank.clear(key)
 
     def stats(self, key: FastWeightKey) -> FastWeightStats:
         if not isinstance(key, FastWeightKey):
             raise TypeError("key must be FastWeightKey")
-        return self._stats.get(key, FastWeightStats())
+        slot = self._bank.get_slot(key)
+        if slot is None:
+            return FastWeightStats()
+        stats = slot.metadata.get("fast_weight_stats")
+        return stats if isinstance(stats, FastWeightStats) else FastWeightStats()
 
     def record_step(self, key: FastWeightKey, result: FastWeightStepResult) -> None:
         if not isinstance(key, FastWeightKey):
             raise TypeError("key must be FastWeightKey")
         if not isinstance(result, FastWeightStepResult):
             raise TypeError("result must be FastWeightStepResult")
+        slot = self._bank.get_slot(key)
+        if slot is None:
+            if not (
+                result.update_count
+                or result.trained_rows
+                or result.tail_rows
+                or result.applied_weight
+            ):
+                return
+            slot = self._bank.slot_for_key(key)
         current = self.stats(key)
-        self._stats[key] = FastWeightStats(
+        slot.metadata["fast_weight_stats"] = FastWeightStats(
             update_count=int(current.update_count) + int(result.update_count),
             apply_count=int(current.apply_count) + (1 if bool(result.applied_weight) else 0),
             trained_rows=int(current.trained_rows) + int(result.trained_rows),
@@ -321,9 +359,11 @@ def _run_grouped_down_proj_fast_weight_step(
     base_weight: torch.Tensor,
     state: FastWeightState,
     row_keys: tuple[FastWeightKey, ...],
+    row_phases: tuple[str, ...] | None,
     chunk_size: int,
     learning_rate: float,
     update_enabled: bool,
+    decode_update_enabled: bool,
     cache_tail: bool,
     ttt_proj_weight: torch.Tensor | None = None,
     ttt_conv_weight: torch.Tensor | None = None,
@@ -331,10 +371,21 @@ def _run_grouped_down_proj_fast_weight_step(
     if int(hidden.shape[0]) != len(row_keys):
         raise RuntimeError("row key count must match hidden row count")
     output = hidden.new_empty((int(hidden.shape[0]), int(base_weight.shape[0])))
-    grouped_rows: dict[FastWeightKey, list[int]] = {}
+    if row_phases is not None and len(row_phases) != len(row_keys):
+        raise RuntimeError("row phase count must match row key count")
+    groups: list[tuple[FastWeightKey, bool, list[int]]] = []
     for row_idx, key in enumerate(row_keys):
-        grouped_rows.setdefault(key, []).append(int(row_idx))
-    for group_key, rows in grouped_rows.items():
+        phase = "prefill" if row_phases is None else row_phases[row_idx]
+        if phase not in {"prefill", "decode"}:
+            raise ValueError("row phases must be 'prefill' or 'decode'")
+        row_update_enabled = bool(update_enabled) and (
+            phase != "decode" or bool(decode_update_enabled)
+        )
+        if groups and groups[-1][0] == key and groups[-1][1] == row_update_enabled:
+            groups[-1][2].append(int(row_idx))
+        else:
+            groups.append((key, row_update_enabled, [int(row_idx)]))
+    for group_key, group_update_enabled, rows in groups:
         row_tensor = torch.as_tensor(rows, device=hidden.device, dtype=torch.long)
         step = run_down_proj_fast_weight_step(
             hidden=hidden.index_select(0, row_tensor),
@@ -344,8 +395,8 @@ def _run_grouped_down_proj_fast_weight_step(
             key=group_key,
             chunk_size=chunk_size,
             learning_rate=learning_rate,
-            update_enabled=update_enabled,
-            cache_tail=cache_tail,
+            update_enabled=group_update_enabled,
+            cache_tail=cache_tail and group_update_enabled,
             ttt_proj_weight=ttt_proj_weight,
             ttt_conv_weight=ttt_conv_weight,
         )
@@ -464,6 +515,7 @@ def install_mlp_fast_weight_wrapper(
     state: FastWeightState,
     key: FastWeightKey,
     row_key_provider: Callable[[int], Sequence[FastWeightKey] | None] | None = None,
+    row_phase_provider: Callable[[int], Sequence[str] | None] | None = None,
     chunk_size: int,
     learning_rate: float,
     phase_getter: Callable[[], str] | None = None,
@@ -511,18 +563,26 @@ def install_mlp_fast_weight_wrapper(
         if row_key_provider is not None:
             provided_row_keys = row_key_provider(int(activated.shape[0]))
             if provided_row_keys is None:
-                return original_forward(hidden)
+                raise RuntimeError("request-keyed fast-weight overlay requires packed row metadata")
             row_keys = _require_fast_weight_row_keys(provided_row_keys, rows=int(activated.shape[0]))
+            row_phases = None
+            if row_phase_provider is not None:
+                provided_row_phases = row_phase_provider(int(activated.shape[0]))
+                if provided_row_phases is None:
+                    raise RuntimeError("request-keyed fast-weight overlay requires packed row phases")
+                row_phases = tuple(str(value) for value in provided_row_phases)
             return _run_grouped_down_proj_fast_weight_step(
                 hidden=activated,
                 target=hidden,
                 base_weight=weight,
                 state=state,
                 row_keys=row_keys,
+                row_phases=row_phases,
                 chunk_size=chunk_size,
                 learning_rate=learning_rate,
-                update_enabled=update_enabled,
-                cache_tail=update_enabled,
+                update_enabled=True,
+                decode_update_enabled=decode_update_enabled,
+                cache_tail=True,
                 ttt_proj_weight=ttt_proj_weight,
                 ttt_conv_weight=ttt_conv_weight,
             )
@@ -544,5 +604,3 @@ def install_mlp_fast_weight_wrapper(
     bound_forward = MethodType(_forward, module)
     setattr(module, "forward", bound_forward)
     return DownProjFastWeightOverlayHandle(module=module, original_forward=original_forward)
-
-

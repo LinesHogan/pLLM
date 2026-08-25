@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "tllm"
 version = "0.1.0"
-description = "Runtime layer for producer/consumer extensions on top of the vLLM v1 inference engine"
+description = "Auxiliary-workload compiler middle-end for the vLLM inference engine"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -20,11 +20,15 @@ dependencies = [
 # docs/environment.md.
 vllm027 = ["vllm>=0.27.1,<0.28"]
 test = ["pytest==9.0.3"]
+tlm = ["transformers>=5.0,<6", "peft>=0.20,<0.21"]
 
 # Runs in every vLLM process (parent, EngineCore child, workers) to
 # rehydrate the tLLM runtime under VLLM_ENABLE_V1_MULTIPROCESSING=1.
 [project.entry-points."vllm.general_plugins"]
 tllm = "tllm.runtime.mp.plugin:tllm_general_plugin"
 
-[tool.setuptools.packages.find]
-include = ["tllm*"]
+[tool.maturin]
+manifest-path = "rust/tllm_core/Cargo.toml"
+python-source = "."
+module-name = "tllm._core"
+features = ["pyo3/extension-module"]

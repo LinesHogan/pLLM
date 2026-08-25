@@ -59,21 +59,19 @@ def _build_mrv2_step_view(*, runtime: Any, runner: Any, logits: torch.Tensor) ->
     prompt_idx_tensor = getattr(runtime, "decode_prompt_idx_tensor", None)
     if isinstance(prompt_idx_tensor, torch.Tensor) and int(prompt_idx_tensor.numel()) >= decode_count:
         prompt_idx_tensor = prompt_idx_tensor[:decode_count]
-        prompt_idxs = ()
     else:
         prompt_idx_tensor = None
-        prompt_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_prompt_idxs", []))[:decode_count])
-        if len(prompt_idxs) != decode_count:
-            return None
+    prompt_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_prompt_idxs", []))[:decode_count])
+    if len(prompt_idxs) != decode_count:
+        return None
     sample_idx_tensor = getattr(runtime, "decode_sample_idx_tensor", None)
     if isinstance(sample_idx_tensor, torch.Tensor) and int(sample_idx_tensor.numel()) >= decode_count:
         sample_idx_tensor = sample_idx_tensor[:decode_count]
-        sample_idxs = ()
     else:
         sample_idx_tensor = None
-        sample_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_sample_idxs", []))[:decode_count])
-        if len(sample_idxs) != decode_count:
-            return None
+    sample_idxs = tuple(int(x) for x in list(getattr(runtime, "decode_sample_idxs", []))[:decode_count])
+    if len(sample_idxs) != decode_count:
+        return None
     raw_request_ids = list(getattr(runtime, "decode_request_ids", []))
     request_ids = tuple(str(x) for x in raw_request_ids[:decode_count]) if len(raw_request_ids) >= decode_count else ()
     return SamplerStepView(

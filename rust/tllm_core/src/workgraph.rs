@@ -6,6 +6,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -676,6 +677,67 @@ struct PhysicalFenceDesc {
     kind: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PhysicalStreamClass {
+    Default,
+    SideForward,
+    SideTrain,
+}
+
+impl<'py> FromPyObject<'py> for PhysicalStreamClass {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        match ob.extract::<String>()?.as_str() {
+            "default" => Ok(Self::Default),
+            "side_forward" => Ok(Self::SideForward),
+            "side_train" => Ok(Self::SideTrain),
+            value => Err(PyValueError::new_err(format!(
+                "unsupported physical stream '{value}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PhysicalCapturePolicy {
+    Disabled,
+    Prefer,
+    Require,
+}
+
+impl<'py> FromPyObject<'py> for PhysicalCapturePolicy {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        match ob.extract::<String>()?.as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "prefer" => Ok(Self::Prefer),
+            "require" => Ok(Self::Require),
+            value => Err(PyValueError::new_err(format!(
+                "unsupported physical capture_policy '{value}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PhysicalFallbackPolicy {
+    Eager,
+    Reject,
+}
+
+impl<'py> FromPyObject<'py> for PhysicalFallbackPolicy {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        match ob.extract::<String>()?.as_str() {
+            "eager" => Ok(Self::Eager),
+            "reject" => Ok(Self::Reject),
+            value => Err(PyValueError::new_err(format!(
+                "unsupported physical fallback_policy '{value}'"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, FromPyObject, Hash, PartialEq)]
 struct PhysicalNodeDesc {
     #[pyo3(attribute)]
@@ -683,7 +745,7 @@ struct PhysicalNodeDesc {
     #[pyo3(attribute)]
     executor: ExecutorKeyDesc,
     #[pyo3(attribute)]
-    stream: String,
+    stream: PhysicalStreamClass,
     #[pyo3(attribute)]
     fences: Vec<PhysicalFenceDesc>,
     #[pyo3(attribute)]
@@ -691,9 +753,9 @@ struct PhysicalNodeDesc {
     #[pyo3(attribute)]
     buffer_bucket: Option<PhysicalKeyDesc>,
     #[pyo3(attribute)]
-    capture_policy: String,
+    capture_policy: PhysicalCapturePolicy,
     #[pyo3(attribute)]
-    fallback_policy: String,
+    fallback_policy: PhysicalFallbackPolicy,
 }
 
 #[derive(Clone, Debug, Eq, FromPyObject, PartialEq)]
@@ -3104,19 +3166,12 @@ fn validate_physical_plan(plan: &PhysicalFlowPlanDesc) -> Result<Vec<String>, St
             return Err("PhysicalFlowPlan contains duplicate node keys".to_string());
         }
         positions.insert(node_text, position);
-        if !["default", "side_forward", "side_train"].contains(&node.stream.as_str()) {
-            return Err("physical node declares an unsupported stream class".to_string());
-        }
-        if !["disabled", "prefer", "require"].contains(&node.capture_policy.as_str()) {
-            return Err("physical node declares an unsupported capture policy".to_string());
-        }
-        if !["eager", "reject"].contains(&node.fallback_policy.as_str()) {
-            return Err("physical node declares an unsupported fallback policy".to_string());
-        }
-        if node.capture_policy == "require" && node.fallback_policy == "eager" {
+        if node.capture_policy == PhysicalCapturePolicy::Require
+            && node.fallback_policy == PhysicalFallbackPolicy::Eager
+        {
             return Err("required physical capture cannot use eager fallback".to_string());
         }
-        if node.capture_policy != "disabled" && node.artifact_key.is_none() {
+        if node.capture_policy != PhysicalCapturePolicy::Disabled && node.artifact_key.is_none() {
             return Err("enabled physical capture requires an ArtifactKey".to_string());
         }
         if let Some(artifact) = &node.artifact_key {
@@ -4798,6 +4853,116 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn physical_node_descriptor<'py>(
+        py: Python<'py>,
+        stream: &str,
+        capture_policy: &str,
+        fallback_policy: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let namespace = py.import("types")?.getattr("SimpleNamespace")?;
+        let node_key = namespace.call0()?;
+        node_key.setattr("namespace", "consumer_flow")?;
+        node_key.setattr("owner", "physical.node")?;
+        node_key.setattr("ordinal", 0)?;
+
+        let executor = namespace.call0()?;
+        executor.setattr("namespace", "consumer")?;
+        executor.setattr("name", "physical.node")?;
+        executor.setattr("version", "1")?;
+
+        let artifact_key = namespace.call0()?;
+        artifact_key.setattr("namespace", "capture")?;
+        artifact_key.setattr("name", "physical.node")?;
+        artifact_key.setattr("version", 1)?;
+        artifact_key.setattr("digest", "a".repeat(64))?;
+
+        let node = namespace.call0()?;
+        node.setattr("node_key", node_key)?;
+        node.setattr("executor", executor)?;
+        node.setattr("stream", stream)?;
+        node.setattr("fences", Vec::<i64>::new())?;
+        node.setattr("artifact_key", artifact_key)?;
+        node.setattr("buffer_bucket", py.None())?;
+        node.setattr("capture_policy", capture_policy)?;
+        node.setattr("fallback_policy", fallback_policy)?;
+        Ok(node)
+    }
+
+    #[test]
+    fn physical_node_descriptor_accepts_existing_wire_values() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let node = physical_node_descriptor(py, "side_train", "prefer", "reject").unwrap();
+            let node = node.extract::<PhysicalNodeDesc>().unwrap();
+            let plan = PhysicalFlowPlanDesc {
+                plan_epoch: 1,
+                nodes: vec![node],
+                buffer_buckets: Vec::new(),
+                schema_version: SCHEMA_VERSION,
+            };
+
+            assert!(validate_physical_plan(&plan).is_ok());
+        });
+    }
+
+    #[test]
+    fn physical_node_descriptor_rejects_unknown_wire_values_during_extraction() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            for (stream, capture_policy, fallback_policy, field) in [
+                ("side_copy", "disabled", "eager", "stream"),
+                ("default", "always", "eager", "capture_policy"),
+                ("default", "disabled", "retry", "fallback_policy"),
+            ] {
+                let node =
+                    physical_node_descriptor(py, stream, capture_policy, fallback_policy).unwrap();
+                let error = node.extract::<PhysicalNodeDesc>().unwrap_err();
+
+                assert!(error.to_string().contains(field));
+            }
+        });
+    }
+
+    #[test]
+    fn physical_wire_enums_preserve_known_serde_values_and_reject_unknown_values() {
+        assert_eq!(
+            serde_json::to_string(&PhysicalStreamClass::SideForward).unwrap(),
+            r#""side_forward""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PhysicalCapturePolicy::Prefer).unwrap(),
+            r#""prefer""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PhysicalFallbackPolicy::Reject).unwrap(),
+            r#""reject""#
+        );
+
+        assert!(serde_json::from_str::<PhysicalStreamClass>(r#""side_copy""#).is_err());
+        assert!(serde_json::from_str::<PhysicalCapturePolicy>(r#""always""#).is_err());
+        assert!(serde_json::from_str::<PhysicalFallbackPolicy>(r#""retry""#).is_err());
+    }
+
+    #[test]
+    fn physical_capture_fallback_invariant_remains_validator_owned() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let node = physical_node_descriptor(py, "default", "require", "eager").unwrap();
+            let node = node.extract::<PhysicalNodeDesc>().unwrap();
+            let plan = PhysicalFlowPlanDesc {
+                plan_epoch: 1,
+                nodes: vec![node],
+                buffer_buckets: Vec::new(),
+                schema_version: SCHEMA_VERSION,
+            };
+
+            assert_eq!(
+                validate_physical_plan(&plan).unwrap_err(),
+                "required physical capture cannot use eager fallback"
+            );
+        });
+    }
 
     fn key(owner: &str) -> NodeKeyDesc {
         NodeKeyDesc {

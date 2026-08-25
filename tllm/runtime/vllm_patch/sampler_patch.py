@@ -9,11 +9,19 @@ import torch
 
 from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.min_p import apply_min_p
+from tllm.runtime.workload_execution import BackendObservableEvent
 
 _PATCH_INSTALLED = False
 _ORIG_VLLM_SAMPLER_SAMPLE = None
 _SAMPLING_EPS = 1e-5
 def _resolve_provider(runtime: Any) -> Any:
+    execution = getattr(runtime, "workload_execution", None)
+    if execution is not None:
+        getter = getattr(execution, "sampler_modifier_provider", None)
+        if callable(getter):
+            provider = getter()
+            if provider is not None:
+                return provider
     consumer = getattr(runtime, "consumer", None)
     if consumer is None:
         return None
@@ -90,7 +98,7 @@ def dispatch_sampler_pre_draw(*, runtime: Any, runner: Any, device: torch.device
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         runner=runner,
-        event_name="sampler.pre_draw",
+        event=BackendObservableEvent.SAMPLER_PRE_DRAW,
         phase="decode",
         layer_path=None,
         capture_enabled=bool(getattr(runtime, "launch_consumer_from_hooks", False)),

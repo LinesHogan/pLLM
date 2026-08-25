@@ -17,6 +17,8 @@ from typing import Any
 
 import torch
 
+from tllm import _core
+
 
 class StepState(Enum):
     CREATED = auto()
@@ -69,6 +71,9 @@ class StepSession:
     sample_index: torch.Tensor | None = None
 
     num_scheduled_tokens: Any = None
+    # PyO3 SchedulerBatchPhase derived from vLLM scheduler columns. It stays
+    # opaque here so runtime code cannot reinterpret scheduler semantics.
+    batch_phase: _core.SchedulerBatchPhase | None = None
     positions: torch.Tensor | None = None
     logits_indices: torch.Tensor | None = None
     expanded_idx_mapping: torch.Tensor | None = None

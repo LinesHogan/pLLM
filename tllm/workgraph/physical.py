@@ -254,10 +254,30 @@ class PhysicalNodePlan:
 
 
 @dataclass(frozen=True, slots=True)
+class AnchorPlacementDesc:
+    node_key: NodeKey
+    after_anchor: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "node_key",
+            _instance(self.node_key, NodeKey, "AnchorPlacementDesc.node_key"),
+        )
+        object.__setattr__(
+            self,
+            "after_anchor",
+            _text(self.after_anchor, "AnchorPlacementDesc.after_anchor"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PhysicalFlowPlan:
     plan_epoch: int
     nodes: tuple[PhysicalNodePlan, ...]
     buffer_buckets: tuple[BufferBucketDesc, ...] = ()
+    anchor_placements: tuple[AnchorPlacementDesc, ...] = ()
+    schedule_signature: str = ""
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -265,6 +285,11 @@ class PhysicalFlowPlan:
         nodes = _tuple_of(self.nodes, PhysicalNodePlan, "PhysicalFlowPlan.nodes")
         buckets = _tuple_of(
             self.buffer_buckets, BufferBucketDesc, "PhysicalFlowPlan.buffer_buckets"
+        )
+        placements = _tuple_of(
+            self.anchor_placements,
+            AnchorPlacementDesc,
+            "PhysicalFlowPlan.anchor_placements",
         )
         if self.schema_version != 1:
             raise ValueError("PhysicalFlowPlan.schema_version must be 1")
@@ -278,6 +303,20 @@ class PhysicalFlowPlan:
             for node in nodes
         ):
             raise ValueError("PhysicalFlowPlan node references an unknown buffer bucket")
+        if placements and tuple(placement.node_key for placement in placements) != tuple(
+            node.node_key for node in nodes
+        ):
+            raise ValueError(
+                "PhysicalFlowPlan anchor placements must cover nodes in execution order"
+            )
+        signature = self.schedule_signature
+        if signature and (
+            len(signature) != 64
+            or any(character not in "0123456789abcdef" for character in signature)
+        ):
+            raise ValueError(
+                "PhysicalFlowPlan.schedule_signature must be lowercase SHA-256"
+            )
         node_keys = {node.node_key for node in nodes}
         positions = {node.node_key: ordinal for ordinal, node in enumerate(nodes)}
         fence_keys: set[FenceKey] = set()
@@ -293,6 +332,7 @@ class PhysicalFlowPlan:
         object.__setattr__(self, "plan_epoch", epoch)
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "buffer_buckets", buckets)
+        object.__setattr__(self, "anchor_placements", placements)
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,6 +839,7 @@ def _compile_partitioned_region(
 
 
 __all__ = [
+    "AnchorPlacementDesc",
     "BufferBucketDesc",
     "BufferBucketKey",
     "BufferOwnershipKind",

@@ -881,6 +881,27 @@ class PromptIdxKey:
     """State key source: prompt identity from bundle metadata."""
 
 
+class RequestKeyField(StrEnum):
+    REQUEST_ID = "request_id"
+    PROMPT_IDX = "prompt_idx"
+    SAMPLE_IDX = "sample_idx"
+
+
+@dataclass(frozen=True, slots=True)
+class RequestStateKey:
+    """Composite REQUEST-state identity sourced from typed row metadata."""
+
+    fields: tuple[RequestKeyField, ...]
+
+    def __post_init__(self) -> None:
+        normalized = tuple(RequestKeyField(field) for field in self.fields)
+        if not normalized:
+            raise ValueError("request state key requires at least one field")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("request state key fields must be unique")
+        object.__setattr__(self, "fields", normalized)
+
+
 def hidden(layer: int, site: str, phase: str) -> HiddenSource:
     return HiddenSource(layer=layer, site=site, phase=phase)
 
@@ -903,6 +924,14 @@ def result(flow_name: str, output_name: str) -> ResultRef:
 
 def request_prompt_idx() -> PromptIdxKey:
     return PromptIdxKey()
+
+
+def request_state_key(*fields: RequestKeyField | str) -> RequestStateKey:
+    return RequestStateKey(tuple(RequestKeyField(field) for field in fields))
+
+
+def request_sample_key() -> RequestStateKey:
+    return request_state_key(RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1221,6 +1250,8 @@ __all__ = [
     "ProvidedSource",
     "LocalRef",
     "PromptIdxKey",
+    "RequestKeyField",
+    "RequestStateKey",
     "ResultRef",
     "SinkRef",
     "extern",
@@ -1229,6 +1260,8 @@ __all__ = [
     "local",
     "provided",
     "request_prompt_idx",
+    "request_sample_key",
+    "request_state_key",
     "result",
     "sink",
 ]

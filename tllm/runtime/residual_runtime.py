@@ -114,6 +114,11 @@ def _collect_workgraph_capture_metadata(
 def _refresh_dispatch_plan() -> None:
     consumers = _active_dispatch_consumers()
     if not consumers:
+        from tllm.runtime.model_region import restore_model_region_executors
+
+        restore_model_region_executors(RUNTIME)
+        RUNTIME.test_time_lora_store = None
+        RUNTIME.test_time_lora_publisher = None
         RUNTIME.dispatch_plan = None
         RUNTIME.execution_plan = None
         RUNTIME.workgraph_snapshot = None
@@ -128,13 +133,35 @@ def _refresh_dispatch_plan() -> None:
     RUNTIME.workgraph_captures = captures
     RUNTIME.workgraph_attachments = attachments
     plan = DispatchPlan.build(consumers)
+    adapter_stores = plan.runtime_adapter_stores()
+    unique_stores = {id(store): store for store in adapter_stores}
+    if len(unique_stores) > 1:
+        raise RuntimeError("only one runtime adapter store may be active")
+    adapter_store = next(iter(unique_stores.values()), None)
+    if adapter_store is not RUNTIME.test_time_lora_store:
+        RUNTIME.test_time_lora_publisher = None
+    RUNTIME.test_time_lora_store = adapter_store
     RUNTIME.dispatch_plan = None if plan.is_empty() else plan
+    if not plan.recurrence_targets():
+        from tllm.runtime.model_region import restore_model_region_executors
+
+        restore_model_region_executors(RUNTIME)
     # Fail fast at startup when a consumer reads a migrated port kind that no
     # registered producer can serve (kinds still served by legacy hardcoded
     # producers are not enforced yet).
     from tllm.runtime.execution_plan import compile_default_plan
 
-    execution_plan = compile_default_plan(consumers=consumers)
+    resolution = RUNTIME.workgraph_backend_resolution
+    execution_plan = compile_default_plan(
+        consumers=consumers,
+        backend_capabilities=None if resolution is None else resolution.capabilities,
+    )
+    if resolution is not None:
+        plan.validate_recurrence_admission(
+            backend_capabilities=resolution.capabilities,
+            graph_mode=resolution.graph_mode,
+            tp_size=resolution.tp_size,
+        )
     from tllm.runtime.producer_executor import (
         ProducerExecutor,
         default_producer_materializers,
@@ -394,6 +421,10 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
             store.collect_retired()
         for consumer in _active_dispatch_consumers():
             consumer.finish_workgraph_step(previous)
+        workload_store = RUNTIME.workload_execution_store
+        if workload_store is not None:
+            workload_store.finish_step(previous)
+            workload_store.collect_retired()
     for consumer in _active_dispatch_consumers():
         consumer.drain_workgraph_specializations()
     if store is not None:
@@ -403,6 +434,29 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
             resources.reset_adaptive_reservations()
     for consumer in _active_dispatch_consumers():
         consumer.prepare_workgraph_step(step)
+    workload_store = RUNTIME.workload_execution_store
+    if workload_store is not None:
+        pending_shapes = workload_store.current.peek_shape_specialization_requests()
+        if pending_shapes:
+            from tllm.runtime.runtime import active_runtime
+
+            if active_runtime().apply_region_shape_specializations(pending_shapes):
+                drained = workload_store.current.drain_shape_specialization_requests()
+                if drained != pending_shapes:
+                    raise RuntimeError(
+                        "native shape specialization queue changed during safe-point compilation"
+                    )
+        workload_execution = workload_store.prepare_step(step)
+        RUNTIME.workload_execution = workload_execution
+        RUNTIME.workload_compilation = workload_execution.compilation
+        RUNTIME.physical_executor = workload_execution
+        RUNTIME.native_schedule_graph = workload_execution.compilation.graph
+        RUNTIME.native_workloads_pending = False
+        workload_store.collect_retired()
+    else:
+        workload_execution = RUNTIME.workload_execution
+        if workload_execution is not None:
+            workload_execution.prepare_step(step)
     if distributed_store is not None:
         distributed_store.prepare_step(step)
         RUNTIME.distributed_prepared_step_id = step
@@ -651,6 +705,19 @@ def record_workgraph_backend_resolution(*, resolution: "BackendResolution") -> N
     plan = RUNTIME.dispatch_plan
     if plan is None:
         return
+    plan.validate_recurrence_admission(
+        backend_capabilities=resolution.capabilities,
+        graph_mode=resolution.graph_mode,
+        tp_size=resolution.tp_size,
+    )
+    from tllm.runtime.execution_plan import compile_default_plan
+
+    # Re-run the Rust admission checks against the concrete backend facts,
+    # but keep the already-authoritative plan and executor identities stable.
+    compile_default_plan(
+        consumers=_active_dispatch_consumers(),
+        backend_capabilities=resolution.capabilities,
+    )
     if previous_resolution == resolution and not RUNTIME.workgraph_refresh_pending:
         return
     if plan.requires_graph_mode_refresh(resolution.graph_mode):
@@ -661,6 +728,106 @@ def record_workgraph_backend_resolution(*, resolution: "BackendResolution") -> N
     # backend descriptor therefore needs only the cold shadow refresh, not a
     # second dispatch-side placement transition.
     _compile_concrete_workgraph_snapshot()
+
+
+def publish_workload_compilation(
+    compilation: object | None,
+    *,
+    bindings: object | None = None,
+) -> None:
+    """Publish an immutable result and activate only fully bound native plans."""
+
+    if compilation is not None:
+        from tllm.schedule import WorkloadCompilation
+
+        if not isinstance(compilation, WorkloadCompilation):
+            raise TypeError("workload compilation must be WorkloadCompilation or None")
+        from tllm.runtime.workload_execution import build_native_workload_execution
+        from tllm.runtime.workload_execution import WorkloadExecutionBindings
+
+        if bindings is not None and not isinstance(bindings, WorkloadExecutionBindings):
+            raise TypeError("workload runtime bindings must be WorkloadExecutionBindings")
+        if bindings is None and RUNTIME.native_workloads_pending:
+            raise RuntimeError(
+                "native workload publication requires explicit bindings"
+            )
+
+        execution = build_native_workload_execution(
+            compilation,
+            runtime=RUNTIME,
+            # A WorkloadExecutionBindings object is the complete native
+            # authority contract.  Do not even instantiate the legacy
+            # registry while binding it.
+            consumers=() if bindings is not None else _active_dispatch_consumers(),
+            bindings=bindings,
+        )
+    else:
+        if bindings is not None:
+            raise ValueError("workload runtime bindings require a compilation")
+        execution = None
+    from tllm.runtime.workload_execution import NativeWorkloadExecutionStore
+
+    store = RUNTIME.workload_execution_store
+    previous = RUNTIME.workload_execution
+    if compilation is None:
+        if store is not None:
+            store.close()
+        elif previous is not None:
+            previous.close()
+        if RUNTIME.physical_executor is previous:
+            RUNTIME.physical_executor = None
+        RUNTIME.workload_execution_store = None
+        RUNTIME.workload_compilation = None
+        RUNTIME.workload_execution = None
+        return
+    if execution is None:
+        if store is not None:
+            store.close()
+        elif previous is not None:
+            previous.close()
+        if RUNTIME.physical_executor is previous:
+            RUNTIME.physical_executor = None
+        RUNTIME.workload_execution_store = None
+        RUNTIME.workload_compilation = compilation
+        RUNTIME.workload_execution = None
+        return
+    if (
+        previous is not None
+        and previous.plan_epoch == execution.plan_epoch
+        and previous.compilation.decision.signature
+        == execution.compilation.decision.signature
+        and previous.artifact_report == execution.artifact_report
+    ):
+        execution.close()
+        if store is None:
+            store = NativeWorkloadExecutionStore(previous)
+            RUNTIME.workload_execution_store = store
+        RUNTIME.workload_compilation = compilation
+        RUNTIME.workload_execution = previous
+        RUNTIME.physical_executor = previous
+        return
+    if store is None:
+        if previous is not None and previous is not execution:
+            store = NativeWorkloadExecutionStore(previous)
+            store.stage(execution)
+            RUNTIME.workload_execution_store = store
+            return
+        store = NativeWorkloadExecutionStore(execution)
+        RUNTIME.workload_execution_store = store
+        RUNTIME.workload_compilation = compilation
+        RUNTIME.workload_execution = execution
+        RUNTIME.physical_executor = execution
+        return
+    store.stage(execution)
+
+
+def advance_workload_anchor(anchor: str) -> bool:
+    """Advance the native plan at one backend-exported observable anchor."""
+
+    execution = RUNTIME.workload_execution
+    if execution is None:
+        return False
+    return execution.advance_anchor(str(anchor))
 
 
 def finalize_workgraph_snapshot_after_placement_refresh() -> None:
@@ -895,10 +1062,26 @@ def configure_runtime(
 
 
 def set_esamp_training_enabled(enabled: bool) -> None:
-    """Toggle training on the active consumer (config lives on the consumer)."""
+    """Toggle legacy ESamp directly or publish native ESamp through an epoch."""
+    from tllm.runtime.runtime import active_runtime
+
+    runtime = active_runtime()
+    if runtime.has_native_workloads:
+        from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
+        from tllm.runtime.mp.control import active_control_plane
+
+        runtime.transition_native_workload_enabled(
+            bool(enabled), plane=active_control_plane()
+        )
+        refresh_exported_bootstrap_spec()
+        return
     if RUNTIME.consumer is not None:
         RUNTIME.consumer.set_enabled(enabled)
         _refresh_dispatch_plan()
+    elif RUNTIME.workload_execution is not None:
+        raise RuntimeError(
+            "native ESamp enable changes require the owning coordinator runtime"
+        )
     from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
     from tllm.runtime.mp.control import active_control_plane
 
@@ -979,6 +1162,8 @@ def synchronize_esamp() -> None:
     synchronize_deferred_port_bundles(runtime=RUNTIME)
     if RUNTIME.consumer is not None:
         synchronize_consumer(RUNTIME.consumer)
+    elif RUNTIME.workload_execution is not None:
+        RUNTIME.workload_execution.synchronize()
     registry = RUNTIME.consumer_registry
     if registry is not None:
         for consumer in registry.consumers():
@@ -992,11 +1177,12 @@ def synchronize_esamp() -> None:
 
 
 def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
-    local = (
-        TrainingStats(loss_avg=0.0, loss_count=0)
-        if RUNTIME.consumer is None
-        else RUNTIME.consumer.read_and_reset_stats(sync=sync)
-    )
+    if RUNTIME.consumer is not None:
+        local = RUNTIME.consumer.read_and_reset_stats(sync=sync)
+    elif RUNTIME.workload_execution is not None:
+        local = RUNTIME.workload_execution.read_and_reset_stats(sync=sync)
+    else:
+        local = TrainingStats(loss_avg=0.0, loss_count=0)
     from tllm.runtime.mp.control import active_control_plane
 
     plane = active_control_plane()
@@ -1006,7 +1192,14 @@ def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
 
 
 def read_and_reset_esamp_per_request_stats(sync: bool = True) -> Dict[int, TrainingStats]:
-    local = {} if RUNTIME.consumer is None else RUNTIME.consumer.read_and_reset_per_request_stats(sync=sync)
+    if RUNTIME.consumer is not None:
+        local = dict(RUNTIME.consumer.read_and_reset_per_request_stats(sync=sync))
+    elif RUNTIME.workload_execution is not None:
+        local = dict(
+            RUNTIME.workload_execution.read_and_reset_per_request_stats(sync=sync)
+        )
+    else:
+        local = {}
     from tllm.runtime.mp.control import active_control_plane
 
     plane = active_control_plane()

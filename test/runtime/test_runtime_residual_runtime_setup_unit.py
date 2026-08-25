@@ -13,6 +13,60 @@ from tllm.runtime.ports import residual_runtime_setup
 
 
 class RuntimeResidualRuntimeSetupUnitTest(unittest.TestCase):
+    def test_native_setup_uses_only_explicit_resource_locators(self) -> None:
+        locator = ResidualLocator(
+            layer=0,
+            site="block_output",
+            phase="decode",
+        )
+        raw_path = "model.layers.0"
+        layer = torch.nn.Linear(4, 4)
+        model = type("Model", (), {})()
+        model.mapping = {raw_path: layer}
+        model.config = type("Cfg", (), {"hidden_size": 4})()
+        runtime = type("Runtime", (), {})()
+        runtime.config = type(
+            "Config",
+            (),
+            {
+                "tap_layer_paths": [],
+                "graph_scratch_rows": 2,
+                "compact_capture_lane": False,
+                "enable_distiller_intervention": False,
+            },
+        )()
+        runtime.residual_raw_paths = {locator: raw_path}
+        runtime.dispatch_plan = None
+        runtime.native_schedule_graph = type("Graph", (), {"tasks": ()})()
+        core = type(
+            "Core",
+            (),
+            {
+                "RUNTIME": runtime,
+                "_resolve_module_by_path_with_fallback": staticmethod(
+                    lambda model, path: (model.mapping[path], path)
+                ),
+                "_infer_hidden_dtype": staticmethod(lambda _layer: torch.float32),
+                "_runner_uses_compilation_or_cudagraph": staticmethod(
+                    lambda _runner: False
+                ),
+            },
+        )()
+        runner = type(
+            "Runner",
+            (),
+            {
+                "model": model,
+                "device": torch.device("cpu"),
+                "max_num_reqs": 2,
+            },
+        )()
+
+        setup = residual_runtime_setup.resolve_runtime_setup(core=core, runner=runner)
+
+        self.assertEqual(tuple(setup.runtime_bindings), (raw_path,))
+        self.assertEqual(setup.runtime_bindings[raw_path].locator, locator)
+
     def test_apply_runtime_setup_populates_runtime_state_and_installs_hooks(self) -> None:
         runtime = type("Runtime", (), {})()
         runtime.config = type(
@@ -39,6 +93,8 @@ class RuntimeResidualRuntimeSetupUnitTest(unittest.TestCase):
         runtime.source_resolved_path = ""
         runtime.target_resolved_path = ""
         runtime.launch_consumer_from_hooks = True
+        runtime.native_schedule_graph = None
+        runtime.native_hidden_path_aliases = {}
         runtime.decode_row_idx = None
         runtime.decode_valid_mask = None
         core = type(

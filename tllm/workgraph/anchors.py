@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
-from tllm.backends.protocol import BackendCapabilities, GraphSafety, SamplerStage
+from tllm.backends.protocol import (
+    BackendCapabilities,
+    BackendCapability,
+    GraphSafety,
+    SamplerStage,
+)
 from tllm.workgraph.graph_mode import GraphMode
 from tllm.workgraph.ir import AnchorDesc, BackendSnapshot
 
@@ -41,6 +46,37 @@ def _validate_capabilities(capabilities: object) -> BackendCapabilities:
         raise TypeError("BackendCapabilities.split_execute_and_sample must be bool")
     if not isinstance(cast(object, capabilities.graph_safety), GraphSafety):
         raise TypeError("BackendCapabilities.graph_safety must be GraphSafety")
+    extensions = cast(object, capabilities.extensions)
+    if not isinstance(extensions, frozenset):
+        raise TypeError(
+            "BackendCapabilities.extensions must be frozenset[BackendCapability]"
+        )
+    typed_extensions = cast(frozenset[object], extensions)
+    if any(
+        not isinstance(capability, BackendCapability)
+        for capability in typed_extensions
+    ):
+        raise TypeError(
+            "BackendCapabilities.extensions must be frozenset[BackendCapability]"
+        )
+    overlay = capabilities.module_weight_overlay
+    if overlay is not None:
+        from tllm.backends.protocol import ModuleWeightOverlayCapabilities
+
+        if not isinstance(overlay, ModuleWeightOverlayCapabilities):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
+            raise TypeError(
+                "BackendCapabilities.module_weight_overlay must be "
+                "ModuleWeightOverlayCapabilities or None"
+            )
+    region = capabilities.model_region
+    if region is not None:
+        from tllm.backends.protocol import ModelRegionCapabilities
+
+        if not isinstance(region, ModelRegionCapabilities):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
+            raise TypeError(
+                "BackendCapabilities.model_region must be "
+                "ModelRegionCapabilities or None"
+            )
     return capabilities
 
 
@@ -56,6 +92,7 @@ class BackendResolution:
     capabilities: BackendCapabilities
     graph_mode: GraphMode
     backend_version: str = "0.27.1"
+    tp_size: int = 1
 
     def __post_init__(self) -> None:
         capabilities = _validate_capabilities(self.capabilities)
@@ -71,6 +108,8 @@ class BackendResolution:
         )
         if not backend_version.startswith("0.27."):
             raise ValueError("BackendResolution.backend_version must be in the vLLM 0.27.x family")
+        if isinstance(self.tp_size, bool) or not isinstance(self.tp_size, int) or self.tp_size < 1:  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
+            raise ValueError("BackendResolution.tp_size must be a positive int")
         object.__setattr__(self, "capabilities", capabilities)
         object.__setattr__(self, "graph_mode", graph_mode)
         object.__setattr__(self, "backend_version", backend_version)
@@ -117,6 +156,7 @@ def _snapshot_from_capabilities(
         f"tuple_sampler_return:{bool(capabilities.tuple_sampler_return)}",
         f"split_execute_and_sample:{bool(capabilities.split_execute_and_sample)}",
         *(f"sampler_stage:{stage.name.lower()}" for stage in sorted(capabilities.sampler_stages, key=lambda item: item.name)),
+        *sorted(capabilities.capability_names()),
     )
     return BackendSnapshot(
         backend_id=capabilities.backend_id,
@@ -173,12 +213,13 @@ def backend_snapshot_from_resolution(resolution: BackendResolution) -> BackendSn
         raise BackendCompatibilityError(
             f"unsupported resolved graph mode {resolution_value.graph_mode!r}"
         ) from exc
-    return _snapshot_from_capabilities(
+    snapshot = _snapshot_from_capabilities(
         resolution_value.capabilities,
         graph_mode=mode_name,
         backend_version=resolution_value.backend_version,
         allow_legacy_mode=True,
     )
+    return replace(snapshot, tp_size=resolution_value.tp_size)
 
 
 def validate_backend_snapshot(backend: BackendSnapshot) -> None:

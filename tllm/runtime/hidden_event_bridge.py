@@ -14,13 +14,14 @@ from tllm.runtime.ports import residual_bindings as _residual_bindings
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 
 
-class ResidualRuntimeLike(Protocol):
+class ResidualRuntimeLike(_common_hooks.RuntimeWithDispatchPlan, Protocol):
     tap_decode_hidden: dict[str, torch.Tensor]
     decode_row_idx: torch.Tensor | None
     decode_valid_mask: torch.Tensor | None
     decode_count: int
     decode_prompt_idxs: list[int]
     decode_sample_idxs: list[int]
+    decode_request_ids: list[str]
     decode_prompt_idx_tensor: torch.Tensor | None
     decode_sample_idx_tensor: torch.Tensor | None
     source_resolved_path: str
@@ -96,7 +97,7 @@ def dispatch_deferred_layer_batches(*, core: EventCoreLike, runner: RunnerLike) 
             batch = build_runtime_hidden_batch(core=core, layer_path=layer_key)
             if batch is None:
                 continue
-            dispatched += _common_hooks.dispatch_runtime_event(
+            dispatched += _common_hooks.dispatch_legacy_runtime_event(
                 runtime=core.RUNTIME,
                 runner=runner,
                 event_name="layer.post",
@@ -106,7 +107,7 @@ def dispatch_deferred_layer_batches(*, core: EventCoreLike, runner: RunnerLike) 
                 batch=batch,
             )
             continue
-        dispatched += _common_hooks.dispatch_runtime_event(
+        dispatched += _common_hooks.dispatch_legacy_runtime_event(
             runtime=core.RUNTIME,
             runner=runner,
             event_name="layer.post",
@@ -125,7 +126,7 @@ def dispatch_layer_lifecycle_events(
     layer_path: str,
     capture_enabled: bool,
 ) -> None:
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
         event_name="layer.pre",
@@ -133,7 +134,7 @@ def dispatch_layer_lifecycle_events(
         layer_path=layer_path,
         capture_enabled=bool(capture_enabled),
     )
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
         event_name="layer.post",
@@ -142,7 +143,7 @@ def dispatch_layer_lifecycle_events(
         capture_enabled=bool(capture_enabled),
         batch_factory=lambda: build_runtime_hidden_batch(core=core, layer_path=layer_path),
     )
-    _common_hooks.dispatch_runtime_event(
+    _common_hooks.dispatch_legacy_runtime_event(
         runtime=core.RUNTIME,
         runner=runner,
         event_name="block.end",
@@ -152,7 +153,7 @@ def dispatch_layer_lifecycle_events(
     )
     _, target_path = _residual_bindings.default_resolved_paths(core.RUNTIME)
     if layer_path == target_path:
-        _common_hooks.dispatch_runtime_event(
+        _common_hooks.dispatch_legacy_runtime_event(
             runtime=core.RUNTIME,
             runner=runner,
             event_name="stack.end",

@@ -1,5 +1,31 @@
 # Architecture
 
+## Current execution model
+
+`tllm.workload` declares a fine-grained graph for analysis, but
+`ExecutionRegion` is the coarse-grained physical unit of execution. Rust
+derives, validates, and signs every Region's bindings, materializations,
+fences, lifetimes, artifact identity, and capture policy. Python does not
+infer task meaning, reschedule, or choose capture: it mechanically materializes
+the signed artifact and submits the Region at its signed anchor. A fence/event
+may exist only at a Region, device, or backend boundary; Region-internal
+dependencies are ordinary FX/Tensor/CUDA-Graph edges.
+
+`RegionCaptureMode` is a Rust closed enum carried in the signed decision. It
+selects either `disabled` or `require` before Python lowering; Python does not
+infer capture from task types, streams, or runtime names. Unsupported
+capability, artifact, or binding is a cold-install rejection.
+
+With `torch==2.13.0+cu129` and `vllm==0.27.1`, verified GPU correctness covers
+native Dummy and native ESamp exact eager, in-process execution on MRv1 and
+MRv2. The latest short ESamp smoke had `loss_count=6`, `update_count=6`,
+`state_version=6`, and `fallback_count=0`. Native ESamp exact eager Regions
+also passed EngineCore MP correctness on both runners: loss, update,
+state-version, and intervention counters were nonzero, while fallback and
+replay counts were zero. This is not a throughput claim. Model-backed native
+piecewise CUDA Graph execution, real vLLM prefill Recirculation takeover, and
+shape-miss epoch switching remain unverified or incomplete.
+
 ## The layered stack
 
 ```
@@ -7,15 +33,14 @@
 │ workflows/          entry points (bench,    │
 │                     starter, esamp support) │
 ├─────────────────────────────────────────────┤
-│ consumers/          leaves: esamp (legacy + │
-│                     program), your consumer │
+│ consumers/          legacy adapters and     │
+│                     native workload shells  │
 ├─────────────────────────────────────────────┤
 │ backends/           vLLM v1 adapters        │
 ├──────────────────────┬──────────────────────┤
-│ runtime/             │ program/             │
-│ execution: lanes,    │ compiler: declare →  │
-│ sampler bridge,      │ slice → verify →     │
-│ stats, plugins       │ generate consumer    │
+│ runtime/             │ workload/            │
+│ Region executor,     │ declaration → graph  │
+│ sampler bridge,      │ → signed Region plan │
 ├──────────────────────┴──────────────────────┤
 │ workgraph/          declaration language    │
 │                     (frontend, lowering,    │
@@ -41,7 +66,26 @@ Two principles:
 - **Rust decides, Python executes.** The `core/` extension makes scheduling decisions; all tensor execution stays in Python/torch where it is inspectable and debuggable.
 - **Fail closed.** Every compiler rejection is a stable error code; there is no silent fallback path (`PG190` exists precisely to make that attempt a loud error).
 
-## The program pipeline
+## Native Region pipeline
+
+```
+@workload / @task
+      │ typed values, effects, timing, affine access
+      ▼
+ScheduleGraph ──► Rust legality + granularity + memory planning
+      ▼
+signed ScheduleDecision v2 ──► ExecutionRegions + RegionCaptureMode
+      ▼
+PhysicalFlowPlan ──► one artifact/callable per Region at signed anchors
+```
+
+The planner starts from the largest legal Region and splits only for an
+unintersectable anchor window, required effect/version or typed-extern
+boundary, backend/device/graph-safety boundary, or hard memory constraint. It
+minimizes explicit materialization and boundaries; it does not choose per-task
+streams, predict kernel timing, or allocate SMs.
+
+## Legacy Program compatibility pipeline
 
 ```
 ESampProgram (your Module)
@@ -57,7 +101,10 @@ compile_program ──► optimizer lowered to functional transitions;
 ProgramConsumer ──► runtime execution (below)
 ```
 
-## Runtime execution
+## Legacy runtime execution
+
+The following lane/state-bank description applies to the retained Program
+compatibility path. It is not the native Region optimizer contract.
 
 The generated consumer runs inside vLLM generation. Execution policy is derived from the declared DAG, not hardcoded:
 

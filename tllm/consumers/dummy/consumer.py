@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Dict, Sequence
 
+import torch
+
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.stream_runtime import DummyStreamRuntime
@@ -88,6 +90,16 @@ class DummyConsumer(BaseConsumer[DummyConsumerConfig]):
         if (int(bundle.key.engine_step_id) % stride) != 0:
             return
         self._handle_hidden_rows(rows_hidden)
+
+    def execute_native_export(self, hidden_rows: object, *, step_id: int) -> None:
+        """Execute the Dummy effect after a compiled physical task selects it."""
+
+        if not isinstance(hidden_rows, torch.Tensor):
+            raise TypeError("native Dummy export requires a torch.Tensor")
+        stride = max(1, int(self.config.export_every_n_steps))
+        if int(step_id) % stride != 0:
+            return
+        self._handle_hidden_rows(hidden_rows)
 
     def on_step_end(self, ctx: RuntimeContext) -> None:
         _ = ctx

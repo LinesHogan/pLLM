@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, Sequence
 
 import torch
 
@@ -14,12 +14,27 @@ from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.consumer_compat import dispatch_consumer_event
 from tllm.runtime.scheduling.deferred import DeferredWorkQueue
 from tllm.runtime.vllm_patch.compilation import is_torch_compiling
+from tllm.runtime.workload_execution import BackendObservableEvent
+
+if TYPE_CHECKING:
+    from tllm.runtime.workload_execution import NativeWorkloadExecution
 
 
 class RuntimeWithDispatchPlan(Protocol):
     dispatch_plan: DispatchPlan | None
+    workload_execution: "NativeWorkloadExecution | None"
     deferred_work_queue: DeferredWorkQueue
     event_step_id: int
+
+
+def _advance_native_workload(
+    runtime: RuntimeWithDispatchPlan,
+    event: BackendObservableEvent | None,
+) -> None:
+    execution = runtime.workload_execution
+    if execution is None or event is None:
+        return
+    execution.advance_backend_event(event)
 
 
 def _advance_distributed_collective_window(
@@ -111,7 +126,62 @@ def dispatch_runtime_event(
     *,
     runtime: RuntimeWithDispatchPlan,
     runner: RunnerLike,
+    event: BackendObservableEvent,
+    phase: Optional[str] = None,
+    layer_path: Optional[str] = None,
+    capture_enabled: Optional[bool] = None,
+    batch: Optional[HiddenBatch] = None,
+    batch_factory: Optional[Callable[[], Optional[HiddenBatch]]] = None,
+    predecessor_events: Sequence[object] = (),
+) -> int:
+    """Dispatch a signed backend event to legacy and native consumers."""
+    return _dispatch_runtime_event(
+        runtime=runtime,
+        runner=runner,
+        event_name=event.value,
+        native_event=event,
+        phase=phase,
+        layer_path=layer_path,
+        capture_enabled=capture_enabled,
+        batch=batch,
+        batch_factory=batch_factory,
+        predecessor_events=predecessor_events,
+    )
+
+
+def dispatch_legacy_runtime_event(
+    *,
+    runtime: RuntimeWithDispatchPlan,
+    runner: RunnerLike,
     event_name: str,
+    phase: Optional[str] = None,
+    layer_path: Optional[str] = None,
+    capture_enabled: Optional[bool] = None,
+    batch: Optional[HiddenBatch] = None,
+    batch_factory: Optional[Callable[[], Optional[HiddenBatch]]] = None,
+    predecessor_events: Sequence[object] = (),
+) -> int:
+    """Dispatch a legacy-only hook without advancing a native workload."""
+    return _dispatch_runtime_event(
+        runtime=runtime,
+        runner=runner,
+        event_name=event_name,
+        native_event=None,
+        phase=phase,
+        layer_path=layer_path,
+        capture_enabled=capture_enabled,
+        batch=batch,
+        batch_factory=batch_factory,
+        predecessor_events=predecessor_events,
+    )
+
+
+def _dispatch_runtime_event(
+    *,
+    runtime: RuntimeWithDispatchPlan,
+    runner: RunnerLike,
+    event_name: str,
+    native_event: BackendObservableEvent | None,
     phase: Optional[str] = None,
     layer_path: Optional[str] = None,
     capture_enabled: Optional[bool] = None,
@@ -143,9 +213,23 @@ def dispatch_runtime_event(
             expired_only=event_name == "prepare_inputs.pre",
             predecessor_events=effective_predecessors,
         )
-    plan = getattr(runtime, "dispatch_plan", None)
+    plan = runtime.dispatch_plan
     if plan is None:
+        _advance_native_workload(runtime, native_event)
         return 0
+
+    # ``mixed`` is an exact transport of Rust's SchedulerBatchPhase.Mixed,
+    # never a Python reclassification.  Legacy subscriptions express only a
+    # single row phase, so treating it as no match would silently omit a
+    # consumer and treating it as ``None`` would run it on the wrong rows.
+    # Native Regions are advanced by the signed BackendObservableEvent and do
+    # not use this compatibility filter.
+    if phase == "mixed" and plan.has_legacy_event_targets(event_name):
+        raise RuntimeError(
+            "Rust-derived mixed scheduler batch cannot be dispatched to "
+            f"legacy event subscribers at {event_name!r}; use a native "
+            "Region-only workload or split the scheduler batch"
+        )
 
     if capture_enabled is None:
         capture_enabled = not _runner_uses_cudagraph(runner)
@@ -157,6 +241,7 @@ def dispatch_runtime_event(
         capture_enabled=bool(capture_enabled),
     )
     if not targets:
+        _advance_native_workload(runtime, native_event)
         return 0
 
     ctx = build_runtime_context(
@@ -175,6 +260,5 @@ def dispatch_runtime_event(
             event_name=event_name,
             ctx=ctx,
         )
+    _advance_native_workload(runtime, native_event)
     return len(targets)
-
-

@@ -13,6 +13,11 @@ from tllm.ports.consumer import BaseConsumer
 def _build_esamp(config: ESampConsumerConfig) -> BaseConsumer:
     if str(config.implementation) == "program":
         return ESampProgramConsumer(config)
+    if str(config.implementation) == "region":
+        raise ValueError(
+            "implementation='region' is a native @workload; use "
+            "build_esamp_workload(config) with TllmRuntime(workloads=...)"
+        )
     return ESampConsumer(config)
 
 

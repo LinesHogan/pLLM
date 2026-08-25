@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import time
-from typing import List, Protocol
+from typing import TYPE_CHECKING, List, Protocol
 
 import torch
 
@@ -49,6 +49,9 @@ from tllm.runtime.timing_debug import (
 from tllm.runtime.stats import PlacementStats
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 
+if TYPE_CHECKING:
+    from tllm.runtime.workload_execution import NativeWorkloadExecution
+
 
 class PortDispatchRuntimeLike(Protocol):
     decode_count: int
@@ -69,6 +72,7 @@ class PortDispatchRuntimeLike(Protocol):
     placement_stats: PlacementStats
     fusion_executor: FusionExecutor
     path_hotspot_enabled: bool
+    workload_execution: "NativeWorkloadExecution | None"
 
 
 class PortDispatchCoreLike(Protocol):
@@ -790,10 +794,16 @@ def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLi
             residual_runtime.finalize_workgraph_snapshot_after_placement_refresh()
 
     step_id = int(core.RUNTIME.event_step_id)
+    native_execution = core.RUNTIME.workload_execution
     targets = [
         target
         for target in plan.flow_targets()
-        if (not is_post_generate_flow(target.flow)) and _flow_due_for_step(flow=target.flow, step_id=step_id)
+        if (not is_post_generate_flow(target.flow))
+        and _flow_due_for_step(flow=target.flow, step_id=step_id)
+        and not (
+            native_execution is not None
+            and native_execution.owns_consumer(target.consumer)
+        )
     ]
     if not targets:
         return 0

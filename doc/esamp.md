@@ -8,29 +8,37 @@ ESamp (*Large Language Models Explore by Latent Distilling*) is tLLM's reference
 2. **Train**: a low-rank gated residual model learns to predict `target` from `source`, updated with AdamW as generation proceeds.
 3. **Guide**: the sampler bridge uses the trained model's predictions to adjust candidate-token logits after top-k/top-p/min-p filtering (`--enable-distiller-intervention`, strength `--distiller-beta`).
 
-## Two implementations
+## Implementations and verification boundary
 
 | `implementation=` | What it is |
 |---|---|
-| `"program"` (recommended) | `tllm/consumers/esamp/program.py` — the whole algorithm as ~80 lines of `@flow`/`@extern` declarations, compiled by `tllm.program`. Training runs on the training lane, predictions on the reader lane, and the whole train step is captured into a CUDA graph per batch shape. |
+| `"region"` | Native exact eager `ExecutionRegion` declaration. Rust signs the Region contract and Python mechanically binds it; it does not use a legacy ESamp authority. Correctness passed in-process and EngineCore MP on MRv1/MRv2, with nonzero loss/update/state-version/intervention and zero fallback/replay counts. This is not a throughput or CUDA Graph result. |
+| `"program"` | Retained Program compatibility adapter: `tllm/consumers/esamp/program.py` is compiled from `@flow`/`@extern` declarations and uses the legacy lane model. |
 | `"legacy"` | The hand-tuned pipeline (dedicated train stream, per-slot staging events, Triton kernels). Kept as an explicit baseline for benchmarks. |
 
 Select via config:
 
 ```python
-from tllm.consumers.esamp import ESampConsumerConfig, activate
-activate(ESampConsumerConfig(implementation="program"))
+from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
+from tllm.runtime import TllmRuntime
+
+workload = build_esamp_workload(ESampConsumerConfig(implementation="region"))
+runtime = TllmRuntime(workloads=(workload,))
 ```
 
-Both implementations expose the same stats surface (`loss_count`, `loss_avg`, intervention counters), so benchmark comparisons are apples-to-apples.
+`"region"` rejects legacy-only per-request/model-bank modes, compact capture
+lanes, row selection, and non-`post_filter_exact` samplers. The model-backed
+native piecewise CUDA Graph path remains unverified and incomplete; the native
+ESamp verification is eager correctness only. Program and legacy remain
+migration/benchmark paths, not evidence of native Region throughput.
 
 ## Key config knobs (`ESampConsumerConfig`)
 
-- `implementation`: `"program"` or `"legacy"`.
+- `implementation`: `"region"`, `"program"`, or `"legacy"`.
 - `distiller_hidden_dim`, `distiller_lr`: model rank capacity and AdamW learning rate.
 - `enable_distiller_intervention`, `distiller_beta`: sampler guidance on/off and strength.
 - `distiller_sampler_backend`: candidate filtering backend (default `post_filter_exact`).
-- `model_bank_train_cudagraph` (legacy only): whole-step CUDA graph capture in the legacy engine. The program path captures by itself; this flag does not apply to it.
+- `model_bank_train_cudagraph` (legacy only): whole-step CUDA graph capture in the legacy engine. It does not apply to the native eager Region path.
 
 ## Benchmark
 

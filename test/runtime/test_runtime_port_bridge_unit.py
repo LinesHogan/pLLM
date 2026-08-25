@@ -23,6 +23,23 @@ from tllm.runtime.vllm_patch import port_runtime_hooks
 
 
 class RuntimePortBridgeUnitTest(unittest.TestCase):
+    def test_native_signed_hidden_requirement_runs_decode_localization(self) -> None:
+        localize = mock.Mock()
+        runtime = SimpleNamespace(
+            producer_executor=None,
+            workload_execution=SimpleNamespace(requires_decode_hidden=True),
+            dispatch_plan=None,
+        )
+        core = SimpleNamespace(RUNTIME=runtime)
+
+        port_runtime_hooks.run_prepare_inputs_post_producers(
+            core=core,
+            runner=SimpleNamespace(),
+            localize_decode=localize,
+        )
+
+        localize.assert_called_once_with()
+
     class _StepFlowConsumer(BaseConsumer):
         @property
         def consumer_id(self) -> str:
@@ -89,6 +106,7 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
         runtime.fusion_executor = FusionExecutor()
         runtime.placement_stats = PlacementStats()
         runtime.path_hotspot_enabled = False
+        runtime.workload_execution = None
         return type(
             "Core",
             (),

@@ -2,24 +2,100 @@
 
 # tLLM
 
-**A test-time intervention layer for vLLM — declare what your algorithm computes, and the compiler makes it fast.**
+**An auxiliary-workload compiler middle-end for vLLM.**
 
 [Quick Start](#quick-start) · [Documentation](#documentation) · [Performance](#performance) · [中文文档](doc_zh/README.md)
 
 </div>
 
-tLLM is a runtime layer on top of the vLLM v1 inference engine for building producer/consumer extensions: capture model-internal data such as hidden states, route it through stable public ports, and run custom consumers during generation — without maintaining a fork of vLLM.
+tLLM treats vLLM as a pinned main workload and compiles developer-defined
+auxiliary workloads around the real lifecycle boundaries exported by its
+backend. It does not capture or reorder vLLM's complete FX/ATen graph.
 
-Its core is a **program compiler**: you declare your algorithm as a small dataflow graph (`@flow` nodes and `@extern` training steps over named state), and tLLM derives the execution strategy from those declarations — stream placement, gradient mode, batching, and whole-step CUDA graph capture all fall out of the dependency edges, not from hand-written orchestration code.
+`tllm.workload` is the current declaration surface. The task graph is
+fine-grained for analysis, while `ExecutionRegion` is the coarse-grained
+physical execution unit. Rust validates and signs a Region-authoritative
+`ScheduleDecision`; Python only mechanically binds its artifact, resources,
+anchor, and explicit cross-Region fences. Existing
+Program and `BaseConsumer` implementations remain migration compatibility
+inputs for workloads that have not completed native takeover; they are not the
+optimization model. A workload without an eligible native executor or complete
+legacy adapter fails before vLLM construction instead of being silently skipped.
 
-## Latest News
+> [!WARNING]
+> **Recirculation/model-region support is ongoing experimental work.** The
+> compiler has finite CPU-request serial/wavefront Regions, but it does not
+> yet have a verified native vLLM prefill row/model-Region binding. Do not
+> treat it as taking over vLLM prefill. For Recirculation, CUDA Graph,
+> EngineCore multiprocessing, decode recurrence, speculative decoding, PP/DP,
+> and general model-family support are not complete. Unsupported configurations
+> fail closed instead of silently falling back. See the
+> [Recirculation implementation notes](tllm/consumers/Recirculation/introduce.md).
 
-- **[2026-08-21]** The ESamp algorithm is re-implemented as a tLLM Program in ~80 lines. The compiled path runs the full train step in ~3–5 kernel launches per step via whole-step CUDA graph capture, faster than the hand-tuned legacy pipeline in host probes.
-- **[2026-08-18]** tLLM reorganized into a strict layered architecture (`core ← contracts ← ports ← workgraph ← runtime ← backends`), enforced by an AST-level import gate; all phase-numbered module names replaced with functional names.
+Its core is a compiler middle-end with three data contracts:
+`MainWorkloadTimeline`, fine-grained `ScheduleGraph`, and Region-authoritative
+`ScheduleDecision`. The legacy `@flow`/`@extern` Program model is lowered into
+the same dependence/effect vocabulary only during migration.
+
+**Current GPU correctness evidence (not a throughput result):** with
+`torch==2.13.0+cu129` and `vllm==0.27.1`, native Dummy and native ESamp passed
+exact eager, in-process MRv1/MRv2 short smokes. The ESamp smoke reported
+`loss_count=6`, `update_count=6`, `state_version=6`, and `fallback_count=0`.
+The same native ESamp exact eager Region also passed EngineCore MP correctness
+on MRv1/MRv2: loss, update, state-version, and sampler-intervention counters
+were nonzero, with `fallback_count=0` and `replay_count=0`. This establishes
+non-capture execution correctness only. No throughput result is claimed; the
+model-backed native piecewise CUDA Graph path, real native Recirculation vLLM
+prefill takeover, and shape-miss epoch switching remain unverified or
+incomplete.
+
+The canonical declaration surface uses one node decorator:
+
+```python
+from tllm.workload import (
+    AdamWSpec, Before, Between, State, StateScope,
+    hidden, read, request_key, result, sink, task, temporary,
+    transition, workload,
+)
+
+@workload(id="esamp")
+class ESamp:
+    distiller = State(
+        scope=StateScope.REQUEST,
+        key=request_key("request_id", "sample_idx"),
+        parameters="model",
+        optimizer=AdamWSpec(lr=1e-3),
+    )
+
+    @task(
+        inputs={"source": hidden(0), "target": hidden(-1)},
+        outputs={"prediction": sink("guidance"), "loss": temporary()},
+        effects=(read(distiller),),
+        timing=Between("model.execute", "sampler.pre_draw"),
+    )
+    def predict_and_loss(self, source, target): ...
+
+    @task(
+        inputs={"loss": result("predict_and_loss", "loss")},
+        effects=(transition(distiller),),
+        timing=Before("next.prepare"),
+    )
+    def update(self, loss): ...
+```
+
+See [the workload compiler guide](doc/workload-compiler.md) for the current
+contract and migration boundary.
+
+## Migration Note
+
+The Program example below documents a retained compatibility API. New native
+workloads should use `tllm.workload` and the Region compiler guide; neither
+per-task stream placement nor CUDA-event choreography is part of the current
+planning contract.
 
 ## Quick Start
 
-ESamp — an algorithm that trains a low-rank distiller *during* generation to predict final-layer hidden states from first-layer ones, then uses the predictions to guide sampling — is the reference consumer. Expressed as a tLLM Program, this is the **entire algorithm**:
+ESamp — an algorithm that trains a low-rank distiller *during* generation to predict final-layer hidden states from first-layer ones, then uses the predictions to guide sampling — remains a useful compatibility example. The native reference is the `tllm.workload` declaration near the top of this README; the following Program is retained for legacy adapters:
 
 ```python
 import torch
@@ -77,7 +153,7 @@ class ESampProgram(torch.nn.Module):
         self.optimizer.step()
 ```
 
-There is no stream, buffer, event, lease, or graph-capture code here. From these declarations the compiler derives:
+There is no stream, buffer, event, lease, or graph-capture code here. In this legacy lane the runtime derives:
 
 - **Gradient mode from dataflow.** The `result("forward", "loss")` edge asks for a value *with* its autograd graph, so when the training extern is due, `forward` runs once in grad mode; the outputs serve the sink and the loss serves `autograd.grad` — no double forward.
 - **Lane placement from node roles.** State-writing externs run on a dedicated training lane; read-only `run_flow` calls (sampler predictions) run on a low-priority reader lane fenced by events; the decode stream only ever waits on the single output event it consumes.
@@ -127,6 +203,9 @@ If you already have a vLLM generation script, tLLM keeps the same prompts and `S
 
 ## Performance
 
+The figures below are historical legacy/program measurements. They do not
+establish Region throughput; no Region throughput claim is currently made.
+
 **Legacy hand-tuned pipeline** (measured, RTX 4090): in the aligned 7B min-p ESamp benchmark, optimized ESamp reaches **98.8% of a vLLM baseline** with modern inference optimizations enabled (vLLM V1 engine, CUDA graph execution, FlashInfer sampling, bfloat16, prefix-cache control for fairness, identical sampling workload):
 
 | Model / workload | Optimized vLLM baseline | ESamp (legacy, Triton kernel) | Ratio |
@@ -139,10 +218,13 @@ The full paired in-engine benchmark (5 alternating rounds, gate: program/legacy 
 
 ## What You Can Build
 
-- Activation / hidden-state export and editing pipelines.
-- Runtime analysis of LLM internals.
-- Test-time training algorithms that learn during generation.
+- Test-time training algorithms that learn during generation. `esamp`, `ttrl`, `fttt`, and `override` use `tllm.program`; TLM uses a full HF/PEFT side model because its official-family update trains internal `q_proj/v_proj` LoRA rather than a hidden-to-logits surrogate.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
+- Algorithms that edit the model's own weights (In-Place-TTT style) via the fast-weight overlay — see [adapting In-Place TTT](doc/inplace-ttt.md).
+- Experimental prefill recurrences such as Recirculation through the eager
+  model-region/KV materializer. This path is ongoing and is not yet covered by
+  the CUDA Graph performance claims above.
+- Activation / hidden-state export and editing pipelines; runtime analysis of LLM internals.
 
 ## Installation
 
@@ -159,7 +241,7 @@ The starter runs ESamp with `Qwen/Qwen2.5-7B-Instruct`, generates 16 answers in 
 
 ## Documentation
 
-- English: [doc/README.md](doc/README.md) — [quickstart](doc/quickstart.md) · [write a consumer](doc/write-a-consumer.md) · [architecture](doc/architecture.md) · [ESamp reference](doc/esamp.md)
+- English: [doc/README.md](doc/README.md) — [quickstart](doc/quickstart.md) · [write a consumer](doc/write-a-consumer.md) · [architecture](doc/architecture.md) · [ESamp reference](doc/esamp.md) · [adapting In-Place TTT](doc/inplace-ttt.md) · [TLM q/v LoRA](doc/tlm.md)
 - 中文: [doc_zh/README.md](doc_zh/README.md)
 
 ## Requirements

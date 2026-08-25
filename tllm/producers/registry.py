@@ -181,6 +181,11 @@ def compile_execution_plan(
             enforced_kinds=None if enforced_kinds is None else [k.value for k in enforced_kinds],
             supported_hooks=None if supported_hooks is None else [h.value for h in supported_hooks],
             backend=backend,
+            backend_capabilities=(
+                None
+                if backend_capabilities is None
+                else sorted(backend_capabilities.capability_names())
+            ),
         )
     except RuntimeError as exc:
         raise ExecutionPlanError(str(exc)) from exc

@@ -71,7 +71,17 @@ class _PluginModule(Protocol):
 
 _BUILTIN_PLUGIN_MODULES = {
     name: f"tllm.consumers.{name}.register"
-    for name in ("esamp", "fttt", "gtta", "inplace_ttt", "override", "tlm", "ttrl", "dummy")
+    for name in (
+        "esamp",
+        "fttt",
+        "gtta",
+        "inplace_ttt",
+        "override",
+        "recirculation",
+        "tlm",
+        "ttrl",
+        "dummy",
+    )
 }
 _CONSUMER_PLUGINS: dict[str, ConsumerPluginSpec[Any, Any]] = {}
 _ENTRY_POINTS: dict[str, metadata.EntryPoint] | None = None

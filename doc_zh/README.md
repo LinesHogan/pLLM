@@ -1,18 +1,35 @@
 # tLLM 文档
 
-tLLM 是 vLLM 的 test-time intervention 层：把算法声明为一个小型数据流程序，编译器从声明推导快速执行。
+tLLM 是 vLLM 的附加载荷编译器。新工作负载用 `tllm.workload` 声明；Rust
+生成已签名的 `ScheduleDecision`。task 图用于细粒度分析，`ExecutionRegion` 才是粗粒度的
+物理执行单位；Python 只机械绑定签名计划。Program/Consumer 的 lane、stream、event 保留为
+迁移兼容层，不是优化模型。
 
 ## 阅读顺序
 
-1. [快速上手](quickstart.md) — 安装、跑 starter、挂载 consumer。
-2. [编写 consumer](write-a-consumer.md) — 程序模型：`@flow`、`@extern`、state bank，以及编译器推导什么。
-3. [架构](architecture.md) — 分层结构、import 门禁、程序如何被编译与执行。
-4. [ESamp 参考](esamp.md) — 内置的 test-time training consumer。
+1. [附加载荷编译器](workload-compiler.md) — 当前 frontend、已签名 Region 契约与迁移边界。
+2. [快速上手](quickstart.md) — native ESamp 导览及保留的 Program 示例。
+3. [编写 consumer](write-a-consumer.md) — `tllm.workload` 指南和 legacy Program 兼容 API。
+4. [架构](architecture.md) — Region 执行栈与兼容层。
+5. [ESamp 参考](esamp.md) — 内置的 test-time training consumer。
+6. [适配 In-Place TTT](inplace-ttt.md) — 改模型自身权重的算法：学习一半是 Program，应用一半是 backend 提供的权重 overlay。
+7. [TLM q/v LoRA](tlm.md) — 完整 HF/PEFT side training，以及通过 vLLM 原生 LoRA 路径发布不可变版本。
 
 ## 一段话心智模型
 
-你写一个 `torch.nn.Module`，用 `@flow(inputs/outputs/state)` 和 `@extern(inputs/after/state/deadline)` 标注它的方法。`tllm.program.compile_program` 把每个 flow 切成 torch.export 图，把 optimizer 降级为函数式 transition，并在编译期用你的 Python 函数体做 oracle 校验。生成的 consumer 在 vLLM 生成过程中运行：状态写入走训练 lane，只读预测走 reader lane，整个 step 被捕获为 CUDA Graph —— 全部从你声明的依赖边推导。
+对于 native workload，用 `@workload` 与 `@task` 声明类型化输入、输出、effect、timing
+以及可选 affine access。Rust 校验完整图，并签名 Region 边界、binding、materialization、
+lifetime 与 capture policy。旧的 `@flow`/`@extern` Program lane 在 workload 迁移时仍可作为
+adapter，但不会用于新的物理调度决策。
 
-如果程序用到语言不支持的结构，编译会带稳定错误码（`PG###`）显式失败。没有静默 fallback。
+不支持的 native 或兼容声明都会 fail closed；没有静默 fallback。
+
+在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，GPU 正确性已覆盖 exact eager in-process 的
+native Dummy 与 native ESamp，均通过 MRv1/MRv2。最新 ESamp 短 smoke：`loss_count=6`、
+`update_count=6`、`state_version=6`、`fallback_count=0`。native ESamp exact eager Region
+还通过了 MRv1/MRv2 的 EngineCore MP 正确性：loss、update、state-version、sampler intervention
+计数均非零，`fallback_count=0`、`replay_count=0`。这不是吞吐结论；model-backed native
+piecewise CUDA Graph、真实 native Recirculation vLLM prefill 接管和 shape-miss epoch switching
+仍未验证或未完成。
 
 English docs: [doc/README.md](../doc/README.md)。
