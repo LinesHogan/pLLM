@@ -48,6 +48,39 @@ def _timeline():
 
 
 class BackendRegionBinderSlotTest(unittest.TestCase):
+    def test_slot_owned_backend_stager_is_identity_bound_and_fails_closed(self) -> None:
+        implementation_id = "test.backend:slot-owned@1"
+        observed: list[BackendRegionStageContext] = []
+        slot = BackendRegionBinderSlot(implementation_id, backend_stager=observed.append)
+        context = BackendRegionStageContext(
+            implementation_id=implementation_id,
+            backend_event="prepare_inputs.post",
+            region_id="region-0000-slot-owned",
+            slot=slot,
+            runtime=object(),
+            runner=object(),
+            step_id=2,
+            num_scheduled_tokens=None,
+            input_batch=None,
+        )
+        slot.stage_from_backend(context)
+        self.assertEqual(observed, [context])
+
+        unbound = BackendRegionBinderSlot(implementation_id)
+        unbound_context = BackendRegionStageContext(
+            implementation_id=implementation_id,
+            backend_event="prepare_inputs.post",
+            region_id="region-0000-slot-owned",
+            slot=unbound,
+            runtime=object(),
+            runner=object(),
+            step_id=2,
+            num_scheduled_tokens=None,
+            input_batch=None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "no worker-local backend stager"):
+            unbound.stage_from_backend(unbound_context)
+
     def test_backend_stager_registry_is_identity_bound_and_fails_closed(self) -> None:
         implementation_id = "test.backend:extern@1"
         slot = BackendRegionBinderSlot(implementation_id)

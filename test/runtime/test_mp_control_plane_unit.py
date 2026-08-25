@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from collections.abc import Mapping
@@ -255,6 +256,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=8,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 64,
@@ -278,15 +280,19 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 "device": "cpu",
                 "dtype": "torch.float32",
                 "hidden_size": 64,
+                "max_prefill_tokens": 16,
                 "rows": 8,
             },
         )
 
     def test_runner_specialization_facts_reject_non_exact_positive_integers(self) -> None:
-        def runner(rows: object, hidden_size: object) -> SimpleNamespace:
+        def runner(
+            rows: object, hidden_size: object, max_prefill_tokens: object = 16
+        ) -> SimpleNamespace:
             return SimpleNamespace(
                 device=torch.device("cpu"),
                 max_num_reqs=rows,
+                max_num_tokens=max_prefill_tokens,
                 model_config=SimpleNamespace(
                     dtype=torch.float32,
                     get_hidden_size=lambda: hidden_size,
@@ -294,21 +300,42 @@ class ControlPlaneUnitTest(unittest.TestCase):
             )
 
         self.assertIsNotNone(_runner_specialization_facts(runner(2, 4)))
-        for rows, hidden_size in (
-            (True, 4),
-            (2.0, 4),
-            ("2", 4),
-            (_CoercibleInteger(), 4),
-            (2, True),
-            (2, 4.0),
-            (2, "4"),
-            (2, _CoercibleInteger()),
-            (0, 4),
-            (2, 0),
+        for rows, hidden_size, max_prefill_tokens in (
+            (True, 4, 16),
+            (2.0, 4, 16),
+            ("2", 4, 16),
+            (_CoercibleInteger(), 4, 16),
+            (2, True, 16),
+            (2, 4.0, 16),
+            (2, "4", 16),
+            (2, _CoercibleInteger(), 16),
+            (0, 4, 16),
+            (2, 0, 16),
+            (2, 4, True),
+            (2, 4, 0),
+            (2, 4, "16"),
         ):
-            with self.subTest(rows=rows, hidden_size=hidden_size):
+            with self.subTest(
+                rows=rows,
+                hidden_size=hidden_size,
+                max_prefill_tokens=max_prefill_tokens,
+            ):
                 with self.assertRaises((TypeError, ValueError)):
-                    _runner_specialization_facts(runner(rows, hidden_size))
+                    _runner_specialization_facts(
+                        runner(rows, hidden_size, max_prefill_tokens)
+                    )
+
+        fallback = runner(2, 4)
+        del fallback.max_num_tokens
+        fallback.max_num_batched_tokens = 16
+        facts = _runner_specialization_facts(fallback)
+        assert facts is not None
+        self.assertEqual(facts.max_prefill_tokens, 16)
+
+        missing = runner(2, 4)
+        del missing.max_num_tokens
+        with self.assertRaisesRegex(RuntimeError, "max_num_tokens"):
+            _runner_specialization_facts(missing)
 
     def test_runner_specialization_layer_count_comes_from_bound_driver(self) -> None:
         from tllm.backends.protocol import RunnerBinding
@@ -316,6 +343,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 4,
@@ -533,7 +561,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
             fail_on_unsupported=True,
         )
 
-    def test_parent_compiles_and_worker_installs_signed_workload_plan(self) -> None:
+    def test_parent_rejects_legacy_workload_without_an_immutable_worker_spec(self) -> None:
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.runtime.graph_policy import GraphMode
         from tllm.runtime.runtime import TllmRuntime
@@ -567,26 +595,14 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 capabilities=V027MRv2Driver().capabilities(),
                 graph_mode=GraphMode.EAGER,
             )
-            runtime._coordinate_worker_compilation(plane)
-
-            compilation = runtime.workload_compilation
-            self.assertIsNotNone(compilation)
-            self.assertIs(residual_runtime.RUNTIME.workload_compilation, compilation)
-            assert compilation is not None
-            methods = [call[0] for call in llm.llm_engine.engine_core.calls]
-            self.assertEqual(
-                methods,
-                [
-                    "tllm_workload_timeline",
-                    "tllm_prepare_workload_decision",
-                    "tllm_commit_workload_decision",
-                    "tllm_activate_workload_decision",
-                    "tllm_finalize_workload_decision",
-                ],
-            )
-            self.assertEqual(
-                compilation.decision.signature,
-                residual_runtime.RUNTIME.workload_compilation.decision.signature,
+            with self.assertRaisesRegex(
+                RuntimeError, "explicit worker reconstruction spec"
+            ):
+                runtime._coordinate_worker_compilation(plane)
+            self.assertEqual(llm.llm_engine.engine_core.calls, [])
+            self.assertIsNone(runtime.workload_compilation)
+            self.assertIs(
+                residual_runtime.RUNTIME.workload_compilation, saved_compilation
             )
         finally:
             residual_runtime.RUNTIME.workgraph_backend_resolution = saved_resolution
@@ -680,6 +696,97 @@ class ControlPlaneUnitTest(unittest.TestCase):
             residual_runtime.RUNTIME.workload_execution_store = saved_execution_store
             residual_runtime.RUNTIME.physical_executor = saved_physical
 
+    def test_parent_cold_compiles_recirculation_bundle_before_load_only_worker_reconstruction(
+        self,
+    ) -> None:
+        """The EngineCore worker receives a signed bundle, never a compiler callback."""
+
+        from tllm.backends.protocol import RunnerBinding
+        from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
+        from tllm.consumers.recirculation import (
+            RecirculationConfig,
+            VllmRecirculationRegionWorkload,
+        )
+        from tllm.consumers.recirculation import vllm_region_workload
+        from tllm.runtime.graph_policy import GraphMode
+        from tllm.runtime.runtime import TllmRuntime
+        from tllm.runtime.state import ResidualRuntimeState
+        from tllm.workgraph.anchors import BackendResolution
+
+        driver = V027MRv2Driver()
+        workload = VllmRecirculationRegionWorkload(
+            RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
+        )
+        runtime = TllmRuntime(
+            workloads=(workload,), workload_memory_budget_bytes=1 << 20
+        )
+        llm = _FakeLLM()
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_num_reqs=2,
+            max_num_tokens=2,
+            model_config=SimpleNamespace(
+                dtype=torch.float32,
+                get_hidden_size=lambda: 4,
+            ),
+        )
+        layer_driver = mock.Mock()
+        layer_driver.runner_model_layer_count.return_value = 3
+        setattr(
+            runner,
+            "_tllm_runner_binding",
+            RunnerBinding(
+                driver=layer_driver,
+                runner=runner,
+                capabilities=driver.capabilities(),
+            ),
+        )
+        llm.llm_engine.engine_core.handler.model_runner = runner
+        plane = ControlPlane(llm)
+        state = ResidualRuntimeState(
+            workgraph_backend_resolution=BackendResolution(
+                capabilities=driver.capabilities(),
+                graph_mode=GraphMode.EAGER,
+            )
+        )
+        compile_stage = _core.compile_typed_recurrence_stage_artifact_json
+        compile_bundle = _core.compile_typed_recurrence_stage_artifact_bundle_json
+        build_graph = vllm_region_workload.build_recirculation_graph
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(
+                _core,
+                "compile_typed_recurrence_stage_artifact_json",
+                wraps=compile_stage,
+            ) as artifact_compile,
+            mock.patch.object(
+                _core,
+                "compile_typed_recurrence_stage_artifact_bundle_json",
+                wraps=compile_bundle,
+            ) as bundle_compile,
+            mock.patch.object(
+                vllm_region_workload,
+                "build_recirculation_graph",
+                wraps=build_graph,
+            ) as graph_compile,
+        ):
+            runtime._coordinate_worker_compilation(plane)
+
+        resources = workload.native_workload_resources()
+        worker_spec = resources.worker_spec
+        assert worker_spec is not None
+        assert "typed_stage_artifact_bundle" in worker_spec.config
+        assert artifact_compile.call_count == 2
+        assert bundle_compile.call_count == 1
+        assert graph_compile.call_count == 2
+        self.assertEqual(
+            llm.llm_engine.engine_core.calls[-4][0],
+            "tllm_prepare_workload_decision",
+        )
+        worker_wire = llm.llm_engine.engine_core.calls[-4][1][-1]
+        self.assertEqual(worker_wire, [worker_spec.to_wire()])
+
     def test_caller_supplied_worker_spec_without_parent_resource_is_closed(self) -> None:
         from tllm.backends.timeline import export_main_workload_timeline
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
@@ -702,19 +809,47 @@ class ControlPlaneUnitTest(unittest.TestCase):
         bindings = runtime.workload_execution_bindings
         assert bindings is not None
 
-        self.assertEqual(compilation.options.static_binding_manifest, "[]")
+        expected_manifest = json.dumps(
+            [
+                {
+                    "workload_id": "mp.native-regions",
+                    "factory": spec.factory,
+                    "config": {},
+                    "specialization_key": [],
+                    "backend_region_implementation_ids": [],
+                }
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(
+            compilation.options.static_binding_manifest, expected_manifest
+        )
         self.assertIsNone(bindings.static_binding_entries[0][1])
         self.assertEqual(
             static_backend_binding_manifest_wire(bindings.static_binding_entries),
-            "[]",
+            expected_manifest,
         )
         reconstructed = reconstruct_worker_bindings(compilation, (spec,))
         self.assertEqual(
             static_backend_binding_manifest_wire(
                 reconstructed.static_binding_entries
             ),
-            "[]",
+            expected_manifest,
         )
+
+        tampered_spec = WorkloadWorkerSpec(
+            f"{__name__}:_reconstruct_native_mp_workload_with_static_binding",
+            {},
+        )
+        with (
+            mock.patch(
+                "tllm.runtime.workload_plugins._resolve_factory"
+            ) as resolve_factory,
+            self.assertRaisesRegex(RuntimeError, "parent-signed static binding"),
+        ):
+            reconstruct_worker_bindings(compilation, (tampered_spec,))
+        resolve_factory.assert_not_called()
 
         worker_static_spec = WorkloadWorkerSpec(
             f"{__name__}:_reconstruct_native_mp_workload_with_static_binding",
@@ -956,6 +1091,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 4,
@@ -1719,6 +1855,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 4,
@@ -1791,6 +1928,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 4,
@@ -1933,6 +2071,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 4,
@@ -2010,6 +2149,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 get_hidden_size=lambda: 4,

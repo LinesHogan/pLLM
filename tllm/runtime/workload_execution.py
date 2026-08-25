@@ -91,7 +91,7 @@ class _ExecutableMaterializationBinding:
     value_id: str
     version: int
     producer_region: str
-    consumer_regions: tuple[str, ...]
+    consumer_region: str
     size_bytes: int
     live_start: str
     live_end: str
@@ -104,7 +104,6 @@ class _SignedMaterializationBindings:
         "_by_id",
         "_inputs",
         "_outputs",
-        "_initial_refcounts",
     )
 
     def __init__(
@@ -115,9 +114,8 @@ class _SignedMaterializationBindings:
         if len(by_id) != len(bindings):
             raise RuntimeError("signed materialization table contains duplicate ids")
         inputs = {
-            (consumer_region, binding.materialization_id): binding
+            (binding.consumer_region, binding.materialization_id): binding
             for binding in bindings
-            for consumer_region in binding.consumer_regions
         }
         outputs = {
             (binding.producer_region, binding.materialization_id): binding
@@ -126,17 +124,6 @@ class _SignedMaterializationBindings:
         self._by_id = MappingProxyType(by_id)
         self._inputs = MappingProxyType(inputs)
         self._outputs = MappingProxyType(outputs)
-        self._initial_refcounts = MappingProxyType(
-            {
-                binding.materialization_id: len(binding.consumer_regions)
-                for binding in bindings
-            }
-        )
-
-    @property
-    def initial_refcounts(self) -> Mapping[str, int]:
-        return self._initial_refcounts
-
     def input_binding_for(
         self, region_id: str, materialization_id: str
     ) -> _ExecutableMaterializationBinding:
@@ -281,7 +268,7 @@ def lower_signed_materialization_bindings(
                 value_id=materialization.value_id,
                 version=materialization.version,
                 producer_region=producer.region_id,
-                consumer_regions=(consumer.region_id,),
+                consumer_region=consumer.region_id,
                 size_bytes=materialization.size_bytes,
                 live_start=materialization.live_start,
                 live_end=materialization.live_end,
@@ -1137,8 +1124,6 @@ class _RegionValueStore:
         "_materializations",
         "_state_versions",
         "_enabled_predicate",
-        "_initial_result_uses",
-        "_remaining_result_uses",
         "_values",
         "_step_id",
     )
@@ -1168,8 +1153,6 @@ class _RegionValueStore:
                 if binding.kind is RegionInputKind.HIDDEN
             }
         )
-        self._initial_result_uses = Counter(materializations.initial_refcounts)
-        self._remaining_result_uses: Counter[str] = Counter()
         self._values: dict[str, object] = {}
         self._step_id = -1
 
@@ -1182,13 +1165,11 @@ class _RegionValueStore:
             raise RuntimeError("Region values from the prior step were not retired")
         self._step_id = step_id
         self._values.clear()
-        self._remaining_result_uses = self._initial_result_uses.copy()
 
     def finish_step(self, step_id: int) -> None:
         if self._step_id not in {-1, step_id}:
             raise RuntimeError("cannot retire Region values for another step")
         self._values.clear()
-        self._remaining_result_uses.clear()
         self._step_id = -1
 
     def execute(
@@ -1286,10 +1267,10 @@ class _RegionValueStore:
                 artifact.region_id, binding.binding_id
             )
             key = binding.binding_id
-            remaining = self._remaining_result_uses[key] - 1
-            self._remaining_result_uses[key] = remaining
-            if remaining == 0:
-                self._values.pop(key, None)
+            # Each materialization record names exactly one Rust-signed
+            # consumer Region. Release that explicit boundary after its
+            # consumer executes; Python does not derive a liveness count.
+            self._values.pop(key, None)
 
 
 class _RegionCudaGraph:
@@ -1856,68 +1837,6 @@ def _bind_physical_region_nodes(
     return tuple(bound)
 
 
-def _validate_capture_preflight_bindings(
-    compilation: "WorkloadCompilation",
-    bound_nodes: tuple[tuple[PhysicalNodePlan, ExecutionRegion, str, ArtifactKey], ...],
-) -> None:
-    """Reject capture inputs that only exist after this event group executes.
-
-    Rust validates the canonical case during schedule compilation. This local
-    check keeps native installation fail-closed even when a stale or foreign
-    signed artifact reaches a Python worker boundary.
-    """
-
-    node_by_region = {region.region_id: node for node, region, _anchor, _key in bound_nodes}
-    materialized_producers = {
-        output.binding_id: region.region_id
-        for _node, region, _anchor, _key in bound_nodes
-        for output in region.output_bindings
-        if output.kind is RegionOutputKind.MATERIALIZED
-    }
-    groups = tuple(
-        (
-            f"backend event {advance.backend_event.value!r} at {advance.anchor_id!r}",
-            advance.region_ids,
-        )
-        for advance in compilation.decision.runtime_advance_plan
-        if advance.region_ids
-    )
-    # ``advance_anchor`` is retained as a compatibility boundary, so it must
-    # retain the same atomic preflight guarantee as native backend events.
-    groups += tuple(
-        (
-            f"anchor {anchor!r}",
-            tuple(
-                region.region_id
-                for _node, region, bound_anchor, _key in bound_nodes
-                if bound_anchor == anchor
-            ),
-        )
-        for anchor in sorted({anchor for _node, _region, anchor, _key in bound_nodes})
-    )
-    for label, region_ids in groups:
-        members = frozenset(region_ids)
-        for region_id in region_ids:
-            node = node_by_region[region_id]
-            if node.capture_policy is CapturePolicy.DISABLED:
-                continue
-            region = next(
-                candidate
-                for _node, candidate, _anchor, _key in bound_nodes
-                if candidate.region_id == region_id
-            )
-            for binding in region.input_bindings:
-                if binding.kind is not RegionInputKind.MATERIALIZED:
-                    continue
-                producer = materialized_producers.get(binding.binding_id)
-                if producer in members:
-                    raise RuntimeError(
-                        "native Region capture preflight cannot resolve "
-                        f"materialized input {binding.binding_id!r}: producer "
-                        f"{producer!r} is in the same {label}"
-                    )
-
-
 def _region_workload_execution(
     compilation: "WorkloadCompilation",
     *,
@@ -1989,7 +1908,6 @@ def _region_workload_execution(
     if physical is None:
         raise RuntimeError("native Region workload has no materialized physical plan")
     bound_nodes = _bind_physical_region_nodes(compilation)
-    _validate_capture_preflight_bindings(compilation, bound_nodes)
 
     value_store = _RegionValueStore(
         runtime=runtime,
@@ -2060,14 +1978,15 @@ def _region_workload_execution(
     if compilation.decision.completion_anchor not in known_anchors:
         raise RuntimeError("signed Region completion anchor has no Region binding")
 
-    owned_consumers: list[object] = []
-    for declaration in bindings.declarations:
-        try:
-            adapter = declaration.instance.legacy_consumer  # type: ignore[attr-defined]
-        except AttributeError:
-            adapter = None
-        if adapter is not None and any(adapter is consumer for consumer in consumers):
-            owned_consumers.append(adapter)
+    from tllm.workload import WorkloadAuthority
+
+    if any(
+        declaration.authority is not WorkloadAuthority.NATIVE_REGION
+        for declaration in bindings.declarations
+    ):
+        raise RuntimeError(
+            "native Region execution cannot bind a legacy-adapter workload"
+        )
     resources = _plan_resources(compilation, graphs=tuple(runtime_graphs))
     executor = PhysicalExecutor(
         snapshots=PlanSnapshotStore(resources),
@@ -2083,7 +2002,7 @@ def _region_workload_execution(
         compilation=compilation,
         executor=executor,
         completion_anchor=compilation.decision.completion_anchor,
-        _owned_consumers=tuple(owned_consumers),
+        _owned_consumers=(),
         _anchor_nodes=frozen_anchor_nodes,
         _event_nodes=frozen_event_nodes,
         _value_store=value_store,

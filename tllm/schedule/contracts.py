@@ -1213,6 +1213,7 @@ class CostBreakdown:
     capture_boundary_count: int = 0
     launch_group_count: int = 0
     cross_region_fence_count: int = 0
+    critical_path_extension: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1781,6 +1782,7 @@ class ScheduleDecision:
                 "capture_boundary_count",
                 "launch_group_count",
                 "cross_region_fence_count",
+                "critical_path_extension",
             ):
                 cost.pop(key)
         payload["signature"] = self.signature
@@ -1934,6 +1936,7 @@ class ScheduleDecision:
             "capture_boundary_count",
             "launch_group_count",
             "cross_region_fence_count",
+            "critical_path_extension",
         )
         materialization_fields = (
             "materialization_id",

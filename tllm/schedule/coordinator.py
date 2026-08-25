@@ -9,6 +9,7 @@ from threading import Lock
 from tllm.schedule.compiler import (
     compile_schedule,
     effective_compile_options,
+    validate_compile_environment,
     validate_schedule,
 )
 from tllm.schedule.contracts import (
@@ -175,9 +176,10 @@ def install_workload_compilation(
         decision_json,
         plan_epoch,
     )
+    options = CompileOptions.from_json(options_json)
+    validate_compile_environment(options)
     graph = ScheduleGraph.from_json(graph_json)
     timeline = MainWorkloadTimeline.from_json(timeline_json)
-    options = CompileOptions.from_json(options_json)
     decision = ScheduleDecision.from_json(decision_json)
     physical = lower_physical_flow_plan(
         graph,

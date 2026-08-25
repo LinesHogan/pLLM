@@ -40,11 +40,24 @@ def compiler_environment_fingerprint() -> str:
 def effective_compile_options(options: CompileOptions) -> CompileOptions:
     if not isinstance(options, CompileOptions):
         raise TypeError("options must be CompileOptions")
-    if options.compiler_fingerprint:
-        return options
-    return replace(
-        options, compiler_fingerprint=compiler_environment_fingerprint()
-    )
+    if not options.compiler_fingerprint:
+        options = replace(
+            options, compiler_fingerprint=compiler_environment_fingerprint()
+        )
+    return validate_compile_environment(options)
+
+
+def validate_compile_environment(options: CompileOptions) -> CompileOptions:
+    """Require signed options to describe this process's compiler environment."""
+
+    if not isinstance(options, CompileOptions):
+        raise TypeError("options must be CompileOptions")
+    if options.compiler_fingerprint != compiler_environment_fingerprint():
+        raise RuntimeError(
+            "compiler environment fingerprint mismatch: signed workload options "
+            "do not match this process"
+        )
+    return options
 
 
 def compile_schedule(
@@ -88,5 +101,6 @@ __all__ = [
     "compile_schedule",
     "compiler_environment_fingerprint",
     "effective_compile_options",
+    "validate_compile_environment",
     "validate_schedule",
 ]

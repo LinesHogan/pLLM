@@ -104,17 +104,15 @@ def main() -> int:
             )
         binding = getattr(runner, "_tllm_runner_binding", None)
         handles = getattr(binding, "model_region_handles", {})
-        if tuple(handles) != ("compiled-recurrence",):
+        if tuple(handles) != ("typed-layer-replay",):
             raise AssertionError(f"native model-region handle missing: {tuple(handles)}")
-        stats = handles["compiled-recurrence"].stats
+        stats = handles["typed-layer-replay"].stats
         output_request_ids = {str(output.request_id) for output in outputs}
         replay_ids = set(stats.request_replays)
         if (
-            stats.request_count < 2
+            stats.prepare_count <= 0
             or stats.replay_count < 2
-            or stats.normal_row_count <= 0
-            or stats.recurrent_row_count <= 0
-            or stats.fused_group_count <= 0
+            or stats.replay_row_count <= 0
             or not all(
                 any(
                     replay_id == request_id

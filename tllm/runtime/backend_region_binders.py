@@ -85,6 +85,7 @@ class BackendRegionBinderSlot:
     __slots__ = (
         "_implementation_id",
         "_provided_inputs",
+        "_backend_stager",
         "_staged",
         "_completed_step",
     )
@@ -94,6 +95,7 @@ class BackendRegionBinderSlot:
         implementation_id: str,
         *,
         provided_inputs: Mapping[str, Callable[[int], object]] | None = None,
+        backend_stager: BackendRegionStager | None = None,
     ) -> None:
         if not isinstance(implementation_id, str) or not implementation_id:
             raise TypeError("backend Region binder implementation_id must be non-empty str")
@@ -105,14 +107,31 @@ class BackendRegionBinderSlot:
             raise TypeError(
                 "backend Region binder provided_inputs must map non-empty names to callables"
             )
+        if backend_stager is not None and not callable(backend_stager):
+            raise TypeError("backend Region binder backend_stager must be callable or None")
         self._implementation_id = implementation_id
         self._provided_inputs = MappingProxyType(dict(raw_inputs))
+        self._backend_stager = backend_stager
         self._staged: _StagedBackendRegion | None = None
         self._completed_step: int | None = None
 
     @property
     def implementation_id(self) -> str:
         return self._implementation_id
+
+    def stage_from_backend(self, context: BackendRegionStageContext) -> None:
+        """Invoke the workload-owned backend adapter for this signed slot."""
+
+        if not isinstance(context, BackendRegionStageContext):
+            raise TypeError("backend Region staging requires BackendRegionStageContext")
+        if context.slot is not self or context.implementation_id != self._implementation_id:
+            raise ValueError("backend Region stage context does not match binder slot")
+        if self._backend_stager is None:
+            raise RuntimeError(
+                "signed backend Region has no worker-local backend stager for "
+                f"{self._implementation_id!r}"
+            )
+        self._backend_stager(context)
 
     @staticmethod
     def _step_id(value: object) -> int:

@@ -20,15 +20,16 @@ from tllm.consumers.recirculation import (
     RecirculationConsumer,
     RecirculationExecutionRequest,
     RecirculationRegionWorkload,
-    run_exact_recirculation_region,
     run_serial_recirculation,
 )
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
+from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
 from tllm.workgraph.recurrence import JacobiPolicy
 from tllm.workload import declare_workload
+from tllm.consumers.recirculation import region_workload
 
 
 class _TinyCausalDecoder:
@@ -89,6 +90,21 @@ def _timeline():
     )
 
 
+def _cold_specialize(
+    workload: RecirculationRegionWorkload, *, rows: int = 3
+) -> RuntimeSpecializationSpec:
+    spec = RuntimeSpecializationSpec(
+        rows=rows,
+        hidden_size=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        model_layer_count=_TinyCausalDecoder.layer_count,
+        max_prefill_tokens=rows,
+    )
+    workload.native_workload_resources().cold_specializer(spec)
+    return spec
+
+
 def test_finite_request_capability_is_closed_and_exported_to_timeline() -> None:
     capabilities = _capabilities()
 
@@ -100,34 +116,41 @@ def test_finite_request_capability_is_closed_and_exported_to_timeline() -> None:
         replace(capabilities, extensions=frozenset({"recirculation/finite_request"}))
 
 
-def test_region_serial_and_wavefront_match_serial_oracle() -> None:
+def test_region_uses_one_rust_selected_grouping_and_matches_serial_oracle() -> None:
     config = _config()
     oracle = run_serial_recirculation(
         _TinyCausalDecoder(), RecirculationConsumer(config), (1, 2, 3)
     )
+    workload = RecirculationRegionWorkload(config)
+    _cold_specialize(workload)
 
-    serial = run_exact_recirculation_region(
-        RecirculationExecutionRequest(_TinyCausalDecoder(), (1, 2, 3), "serial"),
-        config,
-        step_id=4,
-    )
-    wavefront = run_exact_recirculation_region(
-        RecirculationExecutionRequest(_TinyCausalDecoder(), (1, 2, 3), "wavefront"),
-        config,
-        step_id=4,
-    )
+    with (
+        mock.patch.object(
+            region_workload,
+            "build_recirculation_graph",
+            side_effect=AssertionError("runtime rebuilt a Recirculation graph"),
+        ),
+        mock.patch.object(
+            region_workload._core,
+            "compile_typed_recurrence_plan",
+            side_effect=AssertionError("runtime compiled a typed recurrence plan"),
+        ),
+    ):
+        native = workload.execute_exact(
+            RecirculationExecutionRequest(_TinyCausalDecoder(), (1, 2, 3)), 4
+        )
 
-    assert serial.schedule_kind == "serial"
-    assert wavefront.schedule_kind == "wavefront"
-    assert any(len(group) == 2 for group in wavefront.schedule_groups)
-    for actual, expected in zip(serial.logits, oracle.logits, strict=True):
+    assert native.schedule_kind == "wavefront"
+    assert any(len(group) == 2 for group in native.schedule_groups)
+    for actual, expected in zip(native.logits, oracle.logits, strict=True):
         torch.testing.assert_close(actual, expected)
-    for actual, expected in zip(serial.recurrent_states, oracle.recurrent_states, strict=True):
+    for actual, expected in zip(native.recurrent_states, oracle.recurrent_states, strict=True):
         torch.testing.assert_close(actual, expected)
-    for actual, expected in zip(wavefront.logits, oracle.logits, strict=True):
-        torch.testing.assert_close(actual, expected)
-    for actual, expected in zip(wavefront.recurrent_states, oracle.recurrent_states, strict=True):
-        torch.testing.assert_close(actual, expected)
+
+
+def test_native_request_has_no_runtime_grouping_selector() -> None:
+    with pytest.raises(TypeError):
+        RecirculationExecutionRequest(_TinyCausalDecoder(), (1,), "serial")
 
 
 def test_region_workload_has_one_affine_region_and_no_legacy_authority() -> None:
@@ -156,16 +179,19 @@ def test_region_rejects_normal_v027_timeline_before_execution() -> None:
     )
 
     assert BackendCapability.RECIRCULATION_FINITE_REQUEST.value not in timeline.capabilities
-    with pytest.raises(RuntimeError, match="requires unavailable capability.*recirculation/finite_request"):
+    with pytest.raises(
+        RuntimeError, match="requires unavailable capabilities.*recirculation/finite_request"
+    ):
         runtime.compile_workloads(timeline)
 
 
 def test_native_region_runtime_executes_complete_request_without_retained_intermediate() -> None:
     workload = RecirculationRegionWorkload(_config())
+    _cold_specialize(workload, rows=2)
     runtime = TllmRuntime(workloads=(workload,), workload_memory_budget_bytes=1 << 20)
     compilation = runtime.compile_workloads(_timeline())
     state = ResidualRuntimeState()
-    request = RecirculationExecutionRequest(_TinyCausalDecoder(), (1, 2), "wavefront")
+    request = RecirculationExecutionRequest(_TinyCausalDecoder(), (1, 2))
 
     with mock.patch.object(residual_runtime, "RUNTIME", state):
         residual_runtime.publish_workload_compilation(
@@ -191,14 +217,72 @@ def test_native_region_runtime_executes_complete_request_without_retained_interm
 def test_worker_reconstruction_preserves_signed_native_region() -> None:
     workload = RecirculationRegionWorkload(_config())
     runtime = TllmRuntime(workloads=(workload,), workload_memory_budget_bytes=1 << 20)
+    specialization = RuntimeSpecializationSpec(
+        rows=2,
+        hidden_size=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        model_layer_count=_TinyCausalDecoder.layer_count,
+        max_prefill_tokens=2,
+    )
+    runtime.cold_specialize_workloads(specialization)
     compilation = runtime.compile_workloads(_timeline())
     spec = workload.native_workload_resources().worker_spec
     assert spec is not None
+    assert "stage_artifact_bundle" in spec.config
+    assert "serial_stage_artifact_bundle" not in spec.config
+    assert "wavefront_stage_artifact_bundle" not in spec.config
 
-    bindings = reconstruct_worker_bindings(compilation, (spec,))
+    bindings = reconstruct_worker_bindings(
+        compilation, (spec,), specialization=specialization
+    )
     assert bindings.declarations[0].ir.semantic_key == declare_workload(workload).ir.semantic_key
     assert set(bindings.provided_inputs) == {"recirculation_request"}
     assert set(bindings.output_sinks) == {"recirculation_result"}
+
+
+def test_exact_region_fails_closed_until_cold_specialized() -> None:
+    workload = RecirculationRegionWorkload(_config())
+
+    with pytest.raises(RuntimeError, match="specialization-required"):
+        workload.execute_exact(
+            RecirculationExecutionRequest(_TinyCausalDecoder(), (1,)), 1
+        )
+
+
+def test_worker_reconstruction_requires_one_signed_artifact_bundle() -> None:
+    workload = RecirculationRegionWorkload(_config())
+    _cold_specialize(workload, rows=2)
+    spec = workload.native_workload_resources().worker_spec
+    assert spec is not None
+
+    with (
+        mock.patch.object(
+            region_workload,
+            "build_recirculation_graph",
+            side_effect=AssertionError("worker rebuilt a Recirculation graph"),
+        ),
+        mock.patch.object(
+            region_workload._core,
+            "compile_typed_recurrence_stage_artifact_json",
+            side_effect=AssertionError("worker compiled a stage artifact"),
+        ),
+        mock.patch.object(
+            region_workload._core,
+            "load_typed_recurrence_stage_artifact_bundle",
+            wraps=region_workload._core.load_typed_recurrence_stage_artifact_bundle,
+        ) as load_bundle,
+    ):
+        rebuilt = region_workload.reconstruct_recirculation_region_workload(spec.config)
+
+    assert load_bundle.call_count == 1
+    assert rebuilt.specialization_key["stage_artifact_bundle"] == (
+        workload.native_workload_resources().specialization_key["stage_artifact_bundle"]
+    )
+    missing = dict(spec.config)
+    missing.pop("stage_artifact_bundle")
+    with pytest.raises(RuntimeError, match="requires a signed cold stage artifact"):
+        region_workload.reconstruct_recirculation_region_workload(missing)
 
 
 def test_region_fails_closed_without_request_or_for_approximation() -> None:

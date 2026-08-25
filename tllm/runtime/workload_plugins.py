@@ -202,10 +202,6 @@ def static_backend_binding_manifest_wire(
             )
         if not isinstance(spec, WorkloadWorkerSpec):
             raise TypeError("static backend binding spec must be WorkloadWorkerSpec")
-        if resource is None or (
-            not resource.specialization_key and not resource.backend_region_binders
-        ):
-            continue
         records.append(
             {
                 "workload_id": workload_id,
@@ -213,10 +209,12 @@ def static_backend_binding_manifest_wire(
                 "config": dict(spec.config),
                 "specialization_key": [
                     [name, value]
-                    for name, value in resource.specialization_key.items()
+                    for name, value in (
+                        () if resource is None else resource.specialization_key.items()
+                    )
                 ],
                 "backend_region_implementation_ids": sorted(
-                    resource.backend_region_binders
+                    () if resource is None else resource.backend_region_binders
                 ),
             }
         )
@@ -322,6 +320,26 @@ def reconstruct_worker_bindings(
 
     if not specs:
         raise ValueError("native worker reconstruction requires at least one spec")
+    from tllm import _core
+
+    plan_epoch = 1 if compilation.physical is None else compilation.physical.plan_epoch
+    # Validate the complete signed compilation and the exact factory/config
+    # recipes before importing or invoking any worker-local factory.
+    _core.validate_worker_reconstruction_specs(
+        compilation.cache_key,
+        compilation.graph.to_json(),
+        compilation.timeline.to_json(),
+        compilation.options.to_json(),
+        compilation.decision.to_json(),
+        plan_epoch,
+        json.dumps(
+            [spec.to_wire() for spec in specs],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ),
+    )
     reconstructed: list[NativeWorkloadResources] = []
     for spec in specs:
         result = _resolve_factory(spec.factory)(spec.config)
@@ -367,6 +385,11 @@ def reconstruct_worker_bindings(
                 "hidden_size": specialization.hidden_size,
                 "rows": specialization.rows,
                 **(
+                    {"max_prefill_tokens": specialization.max_prefill_tokens}
+                    if specialization.max_prefill_tokens is not None
+                    else {}
+                ),
+                **(
                     {"model_layer_count": specialization.model_layer_count}
                     if specialization.model_layer_count is not None
                     else {}
@@ -377,8 +400,6 @@ def reconstruct_worker_bindings(
             ensure_ascii=True,
             allow_nan=False,
         )
-    from tllm import _core
-
     # This is deliberately before callback/resource binding.  Rust validates
     # the original signed wire, re-runs graph derivation for the local graph,
     # and owns all signed specialization-fact comparisons.

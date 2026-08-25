@@ -1,12 +1,25 @@
-//! Generic finite recurrence scheduling.
+//! Generic finite recurrence planning.
 //!
-//! The compiler sees operation instances, dependence edges, and dependence
-//! kinds a backend can satisfy inside an ordered-row kernel.  It never sees a
-//! consumer or algorithm name.
+//! The JSON contract in this module is intentionally backend and workload
+//! neutral. Rust owns graph validation, deterministic grouping, and value
+//! liveness; Python binds the resulting typed operands to runtime resources.
 
+use crate::prefill_row_plan::{PackedPrefillRowPlan, SchedulerBatchPhase};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+pyo3::create_exception!(
+    _core,
+    TypedRecurrenceSpecializationRequired,
+    pyo3::exceptions::PyValueError
+);
+
+fn validation_error(message: impl Into<String>) -> PyErr {
+    PyValueError::new_err(message.into())
+}
 
 #[derive(Clone, FromPyObject)]
 struct IterationPointDesc {
@@ -44,6 +57,8 @@ struct RecurrenceEdgeDesc {
     visibility: String,
 }
 
+/// Compatibility-only fixture result. Production execution uses
+/// `TypedRecurrencePlan` below.
 #[pyclass]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompiledRecurrenceSchedule {
@@ -57,178 +72,7 @@ pub(crate) struct CompiledRecurrenceSchedule {
     fusion_rejections: Vec<(String, String, String)>,
 }
 
-/// Closed execution tags for the exact Recirculation backend adapter.
-///
-/// This is deliberately an enum rather than an executor string. Python may
-/// dispatch a vLLM layer or the mix callback from this tag, but it does not
-/// parse an algorithm-specific executor naming convention.
-#[pyclass(frozen, eq, eq_int, hash)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RecirculationPrefillOpKind {
-    Normal,
-    Mix,
-    Recurrent,
-}
-
-/// Closed source of a model-layer input.  The only non-value input is the
-/// original model row captured by the backend; all other inputs are stable
-/// operation ordinals selected by Rust.
-#[pyclass(frozen, eq, eq_int, hash)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RecirculationInputKind {
-    Seed,
-    Ordinal,
-}
-
-/// One backend primitive group.  Python dispatches this enum mechanically;
-/// it must not infer the primitive or layer from the first operation.
-#[pyclass(frozen, eq, eq_int, hash)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RecirculationPrefillGroupKind {
-    ModelLayer,
-    Mix,
-}
-
-/// One immutable operation in a Rust-derived exact Recirculation schedule.
-///
-/// ``data_predecessor_ordinals`` is the complete ordered data-input list.
-/// Mix operations additionally name their three semantic normal inputs so a
-/// tensor binder never has to reconstruct an incoming-edge map.
-#[pyclass]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecirculationPrefillOp {
-    op_id: String,
-    #[pyo3(get)]
-    ordinal: i64,
-    #[pyo3(get)]
-    kind: RecirculationPrefillOpKind,
-    #[pyo3(get)]
-    token: i64,
-    #[pyo3(get)]
-    layer: i64,
-    #[pyo3(get)]
-    data_predecessor_ordinals: Vec<i64>,
-    #[pyo3(get)]
-    model_input_kind: Option<RecirculationInputKind>,
-    #[pyo3(get)]
-    model_input_ordinal: Option<i64>,
-    #[pyo3(get)]
-    mix_source_ordinal: Option<i64>,
-    #[pyo3(get)]
-    mix_destination_ordinal: Option<i64>,
-    #[pyo3(get)]
-    mix_final_normal_ordinal: Option<i64>,
-}
-
-#[pyclass]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecirculationPrefillGroup {
-    #[pyo3(get)]
-    ordinal: i64,
-    #[pyo3(get)]
-    kind: RecirculationPrefillGroupKind,
-    #[pyo3(get)]
-    model_layer: Option<i64>,
-    #[pyo3(get)]
-    operations: Vec<RecirculationPrefillOp>,
-    /// Region-local values whose final use occurs in this group.
-    #[pyo3(get)]
-    release_after: Vec<i64>,
-}
-
-/// Closed, backend-bindable finite recurrence schedule for exact prefill.
-///
-/// The groups are already in legal execution order. Every member is a typed
-/// operation with stable ordinal inputs; no graph construction, effect
-/// declaration, executor-string parsing, or anchor choice is left to Python.
-#[pyclass]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecirculationPrefillSchedule {
-    #[pyo3(get)]
-    token_count: i64,
-    #[pyo3(get)]
-    layer_count: i64,
-    #[pyo3(get)]
-    source_layer: i64,
-    #[pyo3(get)]
-    destination_layer: i64,
-    #[pyo3(get)]
-    kind: String,
-    #[pyo3(get)]
-    groups: Vec<RecirculationPrefillGroup>,
-    #[pyo3(get)]
-    final_normal_ordinals: Vec<i64>,
-    /// Values intentionally retained past the final group for observable
-    /// outputs. All other operation values are released by a group action.
-    #[pyo3(get)]
-    retained_ordinals: Vec<i64>,
-    #[pyo3(get)]
-    fusion_rejections: Vec<(i64, i64, String)>,
-}
-
-fn validation_error(message: impl Into<String>) -> PyErr {
-    PyValueError::new_err(message.into())
-}
-
-struct OrderedRowFusionPolicy {
-    internalized_edges: Vec<String>,
-    max_rows: usize,
-}
-
-fn parse_ordered_row_fusion_policy(policy: &str) -> PyResult<Option<OrderedRowFusionPolicy>> {
-    if policy == "none" {
-        return Ok(None);
-    }
-    let (max_rows_field, edges_field) = policy
-        .split_once(';')
-        .ok_or_else(|| validation_error("ordered-row fusion policy must be canonical"))?;
-    let max_rows_text = max_rows_field
-        .strip_prefix("max_rows=")
-        .ok_or_else(|| validation_error("ordered-row fusion policy must start with max_rows="))?;
-    let edge_text = edges_field
-        .strip_prefix("internalized_edges=")
-        .ok_or_else(|| {
-            validation_error("ordered-row fusion policy must contain internalized_edges=")
-        })?;
-    let max_rows = max_rows_text.parse::<usize>().map_err(|_| {
-        validation_error("ordered-row fusion policy max_rows must be a positive integer")
-    })?;
-    if max_rows < 2 || max_rows.to_string() != max_rows_text {
-        return Err(validation_error(
-            "ordered-row fusion policy max_rows must be canonical and >= 2",
-        ));
-    }
-    let internalized_edges: Vec<String> = edge_text.split(',').map(str::to_owned).collect();
-    if internalized_edges.is_empty()
-        || internalized_edges.iter().any(|edge| edge.is_empty())
-        || internalized_edges
-            .windows(2)
-            .any(|pair| pair[0].as_str() >= pair[1].as_str())
-        || internalized_edges.iter().any(|edge| {
-            edge.chars()
-                .any(|character| matches!(character, ',' | ';' | '='))
-        })
-    {
-        return Err(validation_error(
-            "ordered-row fusion policy internalized_edges must be non-empty, unique, and sorted",
-        ));
-    }
-    let canonical = format!(
-        "max_rows={max_rows};internalized_edges={}",
-        internalized_edges.join(",")
-    );
-    if policy != canonical {
-        return Err(validation_error(
-            "ordered-row fusion policy must be canonical",
-        ));
-    }
-    Ok(Some(OrderedRowFusionPolicy {
-        internalized_edges,
-        max_rows,
-    }))
-}
-
-fn validate_graph(ops: &[RecurrenceOpDesc], edges: &[RecurrenceEdgeDesc]) -> PyResult<()> {
+fn validate_legacy_graph(ops: &[RecurrenceOpDesc], edges: &[RecurrenceEdgeDesc]) -> PyResult<()> {
     let mut known = HashSet::new();
     for op in ops {
         if op.op_id.is_empty() || op.executor.is_empty() || op.point.pass_name.is_empty() {
@@ -240,21 +84,19 @@ fn validate_graph(ops: &[RecurrenceOpDesc], edges: &[RecurrenceEdgeDesc]) -> PyR
             ));
         }
         if !known.insert(op.op_id.clone()) {
-            return Err(validation_error(format!(
-                "recurrence graph contains duplicate op id {:?}",
-                op.op_id
-            )));
+            return Err(validation_error(
+                "recurrence graph contains duplicate op id",
+            ));
         }
     }
     for edge in edges {
-        if !known.contains(&edge.source) || !known.contains(&edge.target) {
-            return Err(validation_error(format!(
-                "recurrence edge references unknown op: {}->{}",
-                edge.source, edge.target
-            )));
-        }
-        if edge.source == edge.target {
-            return Err(validation_error("recurrence graph contains a self edge"));
+        if !known.contains(&edge.source)
+            || !known.contains(&edge.target)
+            || edge.source == edge.target
+        {
+            return Err(validation_error(
+                "recurrence edge references an invalid operation",
+            ));
         }
         if edge.kind == "carried"
             && (edge.distance.is_empty()
@@ -262,20 +104,17 @@ fn validate_graph(ops: &[RecurrenceOpDesc], edges: &[RecurrenceEdgeDesc]) -> PyR
                 || !edge.distance.iter().any(|value| *value > 0))
         {
             return Err(validation_error(
-                "carried dependence requires a non-negative, positive distance",
+                "carried dependence requires a positive distance",
             ));
         }
         if edge.visibility != "current" && edge.visibility != "previous_round" {
-            return Err(validation_error(format!(
-                "unsupported recurrence visibility {:?}",
-                edge.visibility
-            )));
+            return Err(validation_error("unsupported recurrence visibility"));
         }
     }
     Ok(())
 }
 
-fn topological_groups(
+fn legacy_topological_groups(
     ops: &[RecurrenceOpDesc],
     edges: &[RecurrenceEdgeDesc],
     pairs: &[(String, String)],
@@ -324,8 +163,8 @@ fn topological_groups(
         .collect();
     ready.sort_by_key(|index| group_ordinal[*index]);
     let mut result = Vec::with_capacity(groups.len());
-    while !ready.is_empty() {
-        let index = ready.remove(0);
+    while let Some(index) = ready.first().copied() {
+        ready.remove(0);
         result.push(groups[index].clone());
         let mut next: Vec<usize> = successors[index].iter().copied().collect();
         next.sort_by_key(|target| group_ordinal[*target]);
@@ -338,9 +177,7 @@ fn topological_groups(
         ready.sort_by_key(|candidate| group_ordinal[*candidate]);
     }
     if result.len() != groups.len() {
-        return Err(validation_error(
-            "recurrence instance graph or contracted fusion graph contains a cycle",
-        ));
+        return Err(validation_error("recurrence graph contains a cycle"));
     }
     Ok(result)
 }
@@ -353,7 +190,7 @@ fn compile_recurrence_schedule(
     internalized_edges: Option<Vec<String>>,
     max_rows: usize,
 ) -> PyResult<CompiledRecurrenceSchedule> {
-    validate_graph(&ops, &edges)?;
+    validate_legacy_graph(&ops, &edges)?;
     if max_rows < 1 {
         return Err(validation_error("recurrence max_rows must be positive"));
     }
@@ -384,901 +221,1652 @@ fn compile_recurrence_schedule(
             };
             if let Some(reason) = reason {
                 rejections.push((edge.source.clone(), edge.target.clone(), reason.to_string()));
-                continue;
+            } else {
+                used.insert(edge.source.clone());
+                used.insert(edge.target.clone());
+                pairs.push((edge.source.clone(), edge.target.clone()));
             }
-            used.insert(edge.source.clone());
-            used.insert(edge.target.clone());
-            pairs.push((edge.source.clone(), edge.target.clone()));
         }
     }
-    let groups = topological_groups(&ops, &edges, &pairs)?;
+    let groups = legacy_topological_groups(&ops, &edges, &pairs)?;
     let execution_order = groups.iter().flatten().cloned().collect();
     Ok(CompiledRecurrenceSchedule {
         groups,
         execution_order,
         kind: if pairs.is_empty() {
-            "serial".to_string()
+            "serial".into()
         } else {
-            "wavefront".to_string()
+            "wavefront".into()
         },
         fusion_rejections: rejections,
     })
 }
 
-fn resolve_recirculation_layer(raw: i64, layer_count: i64, name: &str) -> PyResult<i64> {
-    let resolved = if raw < 0 {
-        layer_count.checked_add(raw).ok_or_else(|| {
-            validation_error(format!(
-                "Recirculation {name} is outside the supported layer index range"
-            ))
-        })?
-    } else {
-        raw
+#[pyclass(frozen, eq, eq_int, hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperandKind {
+    Seed,
+    RegionValue,
+    BackendResource,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedOperand {
+    #[pyo3(get)]
+    kind: OperandKind,
+    #[pyo3(get)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding_id: Option<String>,
+    #[pyo3(get)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_id: Option<String>,
+    #[pyo3(get)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_id: Option<String>,
+}
+
+#[pyclass(frozen, eq, eq_int, hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EffectKind {
+    StateRead,
+    StateWrite,
+    StateTransition,
+    VersionPublish,
+    ExternIo,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedEffect {
+    #[pyo3(get)]
+    kind: EffectKind,
+    #[pyo3(get)]
+    resource_id: String,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedOperation {
+    #[pyo3(get)]
+    operation_id: String,
+    #[pyo3(get)]
+    primitive_key: String,
+    #[pyo3(get)]
+    implementation_id: String,
+    #[pyo3(get)]
+    operands: Vec<TypedOperand>,
+    #[pyo3(get)]
+    results: Vec<String>,
+    #[pyo3(get)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effects: Vec<TypedEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedDependency {
+    source: String,
+    target: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MixedBatchPolicy {
+    Reject,
+    Noop,
+}
+
+impl<'de> Deserialize<'de> for MixedBatchPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "reject" => Ok(Self::Reject),
+            "noop" => Ok(Self::Noop),
+            _ => Err(serde::de::Error::custom(
+                "mixed_batch must be reject or noop",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RowAdmission {
+    allowed_phases: Vec<String>,
+    mixed_batch: MixedBatchPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FiniteRecurrenceSpec {
+    schema_version: u64,
+    region_id: String,
+    implementation_id: String,
+    row_admission: RowAdmission,
+    fusion_policy: String,
+    operations: Vec<TypedOperation>,
+    dependencies: Vec<TypedDependency>,
+    retained_values: Vec<String>,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedExecutionGroup {
+    #[pyo3(get)]
+    group_id: u64,
+    #[pyo3(get)]
+    primitive_key: String,
+    #[pyo3(get)]
+    implementation_id: String,
+    #[pyo3(get)]
+    operations: Vec<TypedOperation>,
+    #[pyo3(get)]
+    release_after: Vec<String>,
+}
+
+/// Closed execution grouping derived from the accepted typed plan.
+///
+/// This is generic planner evidence: consumers cannot relabel singleton
+/// groups as serial or infer a schedule from Python-side operation details.
+#[pyclass(frozen, eq, eq_int, hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionGroupingKind {
+    Serial,
+    Wavefront,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedRecurrencePlan {
+    #[pyo3(get)]
+    schema_version: u64,
+    spec: FiniteRecurrenceSpec,
+    #[pyo3(get)]
+    groups: Vec<TypedExecutionGroup>,
+    #[pyo3(get)]
+    grouping_kind: ExecutionGroupingKind,
+    #[pyo3(get)]
+    retained_values: Vec<String>,
+    #[pyo3(get)]
+    fusion_rejections: Vec<(String, String, String)>,
+}
+
+struct FusionPolicy {
+    max_rows: usize,
+    internalized_edges: BTreeSet<String>,
+}
+
+fn is_nonempty(value: &str) -> bool {
+    !value.is_empty()
+}
+
+fn parse_fusion_policy(value: &str) -> PyResult<FusionPolicy> {
+    if value == "none" {
+        return Ok(FusionPolicy {
+            max_rows: 1,
+            internalized_edges: BTreeSet::new(),
+        });
+    }
+    let (max_rows_field, edge_field) = value
+        .split_once(';')
+        .ok_or_else(|| validation_error("fusion_policy must be canonical"))?;
+    let max_rows_text = max_rows_field
+        .strip_prefix("max_rows=")
+        .ok_or_else(|| validation_error("fusion_policy must start with max_rows="))?;
+    let edge_text = edge_field
+        .strip_prefix("internalized_edges=")
+        .ok_or_else(|| validation_error("fusion_policy must contain internalized_edges="))?;
+    let max_rows = max_rows_text
+        .parse::<usize>()
+        .map_err(|_| validation_error("fusion_policy max_rows must be a positive integer"))?;
+    if max_rows < 2 || max_rows.to_string() != max_rows_text {
+        return Err(validation_error(
+            "fusion_policy max_rows must be canonical and >= 2",
+        ));
+    }
+    let edge_values: Vec<String> = edge_text.split(',').map(str::to_owned).collect();
+    let internalized_edges: BTreeSet<String> = edge_values.iter().cloned().collect();
+    if edge_values.is_empty()
+        || edge_values.iter().any(|edge| !is_nonempty(edge))
+        || internalized_edges.len() != edge_values.len()
+        || edge_values.windows(2).any(|pair| pair[0] >= pair[1])
+        || edge_values
+            .iter()
+            .any(|edge| edge.contains([',', ';', '=']))
+    {
+        return Err(validation_error(
+            "fusion_policy internalized_edges must be non-empty, unique, and sorted",
+        ));
+    }
+    if value
+        != format!(
+            "max_rows={max_rows};internalized_edges={}",
+            edge_values.join(",")
+        )
+    {
+        return Err(validation_error("fusion_policy must be canonical"));
+    }
+    Ok(FusionPolicy {
+        max_rows,
+        internalized_edges,
+    })
+}
+
+fn validate_operand(operand: &TypedOperand) -> PyResult<()> {
+    let valid = match operand.kind {
+        OperandKind::Seed => {
+            operand.binding_id.as_deref().is_some_and(is_nonempty)
+                && operand.value_id.is_none()
+                && operand.resource_id.is_none()
+        }
+        OperandKind::RegionValue => {
+            operand.value_id.as_deref().is_some_and(is_nonempty)
+                && operand.binding_id.is_none()
+                && operand.resource_id.is_none()
+        }
+        OperandKind::BackendResource => {
+            operand.resource_id.as_deref().is_some_and(is_nonempty)
+                && operand.binding_id.is_none()
+                && operand.value_id.is_none()
+        }
     };
-    if resolved < 0 || resolved >= layer_count {
+    if valid {
+        Ok(())
+    } else {
+        Err(validation_error(
+            "typed operand fields do not match its kind",
+        ))
+    }
+}
+
+fn validate_spec(
+    spec: &FiniteRecurrenceSpec,
+) -> PyResult<(
+    FusionPolicy,
+    HashMap<String, usize>,
+    HashMap<String, String>,
+)> {
+    if spec.schema_version != 1 {
+        return Err(validation_error(
+            "unsupported finite recurrence schema_version",
+        ));
+    }
+    if !is_nonempty(&spec.region_id) || !is_nonempty(&spec.implementation_id) {
+        return Err(validation_error(
+            "region_id and implementation_id must be non-empty",
+        ));
+    }
+    if spec.row_admission.allowed_phases.is_empty()
+        || spec
+            .row_admission
+            .allowed_phases
+            .iter()
+            .any(|phase| !matches!(phase.as_str(), "prefill" | "decode"))
+        || spec
+            .row_admission
+            .allowed_phases
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(validation_error(
+            "allowed_phases must be non-empty, unique, and sorted supported phases",
+        ));
+    }
+    let policy = parse_fusion_policy(&spec.fusion_policy)?;
+    if spec.operations.is_empty() {
+        return Err(validation_error("operations must be non-empty"));
+    }
+    let mut operation_index = HashMap::new();
+    let mut producer = HashMap::new();
+    for (index, operation) in spec.operations.iter().enumerate() {
+        if !is_nonempty(&operation.operation_id)
+            || !is_nonempty(&operation.primitive_key)
+            || !is_nonempty(&operation.implementation_id)
+            || operation.implementation_id != spec.implementation_id
+            || !operation_index
+                .insert(operation.operation_id.clone(), index)
+                .is_none()
+        {
+            return Err(validation_error(
+                "operation identifiers must be unique and match the plan implementation",
+            ));
+        }
+        if operation.results.is_empty() {
+            return Err(validation_error(
+                "each operation must produce at least one result",
+            ));
+        }
+        for operand in &operation.operands {
+            validate_operand(operand)?;
+        }
+        for effect in &operation.effects {
+            if !is_nonempty(&effect.resource_id) {
+                return Err(validation_error("effect fields must be non-empty"));
+            }
+        }
+        for result in &operation.results {
+            if !is_nonempty(result)
+                || producer
+                    .insert(result.clone(), operation.operation_id.clone())
+                    .is_some()
+            {
+                return Err(validation_error(
+                    "result identifiers must be non-empty and globally unique",
+                ));
+            }
+        }
+    }
+    for operation in &spec.operations {
+        for operand in &operation.operands {
+            if let Some(value_id) = &operand.value_id {
+                if !producer.contains_key(value_id) {
+                    return Err(validation_error(
+                        "region_value operand references an unknown result",
+                    ));
+                }
+            }
+        }
+    }
+    let mut seen_dependencies = HashSet::new();
+    for dependency in &spec.dependencies {
+        if !operation_index.contains_key(&dependency.source)
+            || !operation_index.contains_key(&dependency.target)
+            || dependency.source == dependency.target
+            || !is_nonempty(&dependency.kind)
+            || !seen_dependencies.insert((
+                dependency.source.as_str(),
+                dependency.target.as_str(),
+                dependency.kind.as_str(),
+            ))
+        {
+            return Err(validation_error(
+                "dependencies must be unique and reference distinct known operations",
+            ));
+        }
+    }
+    let mut retained = HashSet::new();
+    for value in &spec.retained_values {
+        if !producer.contains_key(value) || !retained.insert(value) {
+            return Err(validation_error(
+                "retained_values must be unique produced results",
+            ));
+        }
+    }
+    Ok((policy, operation_index, producer))
+}
+
+fn derived_dependencies(
+    spec: &FiniteRecurrenceSpec,
+    producer: &HashMap<String, String>,
+) -> Vec<TypedDependency> {
+    let mut all = spec.dependencies.clone();
+    let mut seen: HashSet<(String, String, String)> = all
+        .iter()
+        .map(|edge| (edge.source.clone(), edge.target.clone(), edge.kind.clone()))
+        .collect();
+    for operation in &spec.operations {
+        for operand in &operation.operands {
+            if let Some(value_id) = &operand.value_id {
+                let source = producer[value_id].clone();
+                let edge = (
+                    source,
+                    operation.operation_id.clone(),
+                    "region_value".to_string(),
+                );
+                if seen.insert(edge.clone()) {
+                    all.push(TypedDependency {
+                        source: edge.0,
+                        target: edge.1,
+                        kind: edge.2,
+                    });
+                }
+            }
+        }
+    }
+    all
+}
+
+fn stable_topological_order(
+    operations: &[TypedOperation],
+    operation_index: &HashMap<String, usize>,
+    dependencies: &[TypedDependency],
+) -> PyResult<Vec<String>> {
+    let mut indegree = vec![0_usize; operations.len()];
+    let mut successors: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); operations.len()];
+    for dependency in dependencies {
+        let source = operation_index[&dependency.source];
+        let target = operation_index[&dependency.target];
+        if successors[source].insert(target) {
+            indegree[target] += 1;
+        }
+    }
+    let mut ready: BTreeSet<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    let mut order = Vec::with_capacity(operations.len());
+    while let Some(index) = ready.pop_first() {
+        order.push(operations[index].operation_id.clone());
+        for target in &successors[index] {
+            indegree[*target] -= 1;
+            if indegree[*target] == 0 {
+                ready.insert(*target);
+            }
+        }
+    }
+    if order.len() != operations.len() {
+        Err(validation_error("recurrence dependencies contain a cycle"))
+    } else {
+        Ok(order)
+    }
+}
+
+/// Order contracted execution groups after fusion. A valid operation DAG can
+/// become cyclic when a later operation is appended to an earlier group, so
+/// this is a separate legality check from operation-level topological order.
+fn stable_group_order(
+    groups: &[TypedExecutionGroup],
+    group_of: &HashMap<String, usize>,
+    dependencies: &[TypedDependency],
+) -> Option<Vec<usize>> {
+    let mut indegree = vec![0_usize; groups.len()];
+    let mut successors: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); groups.len()];
+    for dependency in dependencies {
+        let (Some(&source), Some(&target)) = (
+            group_of.get(&dependency.source),
+            group_of.get(&dependency.target),
+        ) else {
+            // During incremental contraction, future operations do not have
+            // a group yet. The final call below sees the complete map.
+            continue;
+        };
+        if source != target && successors[source].insert(target) {
+            indegree[target] += 1;
+        }
+    }
+    let mut ready: BTreeSet<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    let mut order = Vec::with_capacity(groups.len());
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for target in &successors[index] {
+            indegree[*target] -= 1;
+            if indegree[*target] == 0 {
+                ready.insert(*target);
+            }
+        }
+    }
+    (order.len() == groups.len()).then_some(order)
+}
+
+fn compile_typed(spec: FiniteRecurrenceSpec) -> PyResult<TypedRecurrencePlan> {
+    let (policy, operation_index, producer) = validate_spec(&spec)?;
+    let dependencies = derived_dependencies(&spec, &producer);
+    let order = stable_topological_order(&spec.operations, &operation_index, &dependencies)?;
+    let mut inbound: HashMap<&str, Vec<&TypedDependency>> = HashMap::new();
+    for dependency in &dependencies {
+        inbound
+            .entry(&dependency.target)
+            .or_default()
+            .push(dependency);
+    }
+    let by_id: HashMap<&str, &TypedOperation> = spec
+        .operations
+        .iter()
+        .map(|op| (op.operation_id.as_str(), op))
+        .collect();
+    let mut groups: Vec<TypedExecutionGroup> = Vec::new();
+    let mut group_of = HashMap::new();
+    let mut fusion_rejections = Vec::new();
+    for operation_id in &order {
+        let operation = by_id[operation_id.as_str()];
+        let candidates = inbound
+            .get(operation_id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let predecessor_groups: BTreeSet<usize> = candidates
+            .iter()
+            .filter(|edge| policy.internalized_edges.contains(&edge.kind))
+            .filter_map(|edge| group_of.get(&edge.source).copied())
+            .collect();
+        let mut append_to = None;
+        if predecessor_groups.len() == 1 {
+            let group_index = *predecessor_groups.iter().next().unwrap();
+            let group = &groups[group_index];
+            if group.operations.len() < policy.max_rows
+                && group.primitive_key == operation.primitive_key
+                && group.implementation_id == operation.implementation_id
+                && group.operations.last().is_some_and(|previous| {
+                    candidates.iter().any(|edge| {
+                        edge.source == previous.operation_id
+                            && policy.internalized_edges.contains(&edge.kind)
+                    })
+                })
+            {
+                append_to = Some(group_index);
+            }
+        }
+        let group_index = match append_to {
+            Some(index) => {
+                groups[index].operations.push(operation.clone());
+                index
+            }
+            None => {
+                let index = groups.len();
+                groups.push(TypedExecutionGroup {
+                    group_id: index as u64,
+                    primitive_key: operation.primitive_key.clone(),
+                    implementation_id: operation.implementation_id.clone(),
+                    operations: vec![operation.clone()],
+                    release_after: Vec::new(),
+                });
+                index
+            }
+        };
+        group_of.insert(operation.operation_id.clone(), group_index);
+        if append_to.is_some() && stable_group_order(&groups, &group_of, &dependencies).is_none() {
+            let fused_source = groups[group_index]
+                .operations
+                .get(groups[group_index].operations.len() - 2)
+                .expect("newly fused group has a predecessor")
+                .operation_id
+                .clone();
+            groups[group_index].operations.pop();
+            let index = groups.len();
+            groups.push(TypedExecutionGroup {
+                group_id: index as u64,
+                primitive_key: operation.primitive_key.clone(),
+                implementation_id: operation.implementation_id.clone(),
+                operations: vec![operation.clone()],
+                release_after: Vec::new(),
+            });
+            group_of.insert(operation.operation_id.clone(), index);
+            fusion_rejections.push((
+                fused_source,
+                operation.operation_id.clone(),
+                "contracted_group_cycle".into(),
+            ));
+        }
+    }
+    let group_order = stable_group_order(&groups, &group_of, &dependencies)
+        .ok_or_else(|| validation_error("accepted fusion produced a cyclic group graph"))?;
+    let mut old_to_new = vec![0_usize; groups.len()];
+    let mut reordered = Vec::with_capacity(groups.len());
+    for (new_index, old_index) in group_order.into_iter().enumerate() {
+        old_to_new[old_index] = new_index;
+        let mut group = groups[old_index].clone();
+        group.group_id = new_index as u64;
+        reordered.push(group);
+    }
+    for group_index in group_of.values_mut() {
+        *group_index = old_to_new[*group_index];
+    }
+    groups = reordered;
+    let retained: HashSet<&str> = spec.retained_values.iter().map(String::as_str).collect();
+    let mut last_use: HashMap<&str, usize> = HashMap::new();
+    for operation in &spec.operations {
+        let producer_group = group_of[&operation.operation_id];
+        for result in &operation.results {
+            last_use.insert(result, producer_group);
+        }
+    }
+    for operation in &spec.operations {
+        let consumer_group = group_of[&operation.operation_id];
+        for operand in &operation.operands {
+            if let Some(value_id) = &operand.value_id {
+                last_use
+                    .entry(value_id)
+                    .and_modify(|last| *last = (*last).max(consumer_group));
+            }
+        }
+    }
+    for (value, group_index) in last_use {
+        if !retained.contains(value) {
+            groups[group_index].release_after.push(value.to_string());
+        }
+    }
+    for group in &mut groups {
+        group.release_after.sort();
+    }
+    let grouping_kind = if groups.iter().any(|group| group.operations.len() > 1) {
+        ExecutionGroupingKind::Wavefront
+    } else {
+        ExecutionGroupingKind::Serial
+    };
+    Ok(TypedRecurrencePlan {
+        schema_version: 1,
+        grouping_kind,
+        retained_values: spec.retained_values.clone(),
+        spec,
+        groups,
+        fusion_rejections,
+    })
+}
+
+/// One opaque resource coordinate selected by an artifact-owning workload.
+/// Rust validates identity/coverage; the workload alone interprets the kind.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedStageBinding {
+    #[pyo3(get)]
+    binding_id: String,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    coordinates: Vec<i64>,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedStageResourceBinding {
+    #[pyo3(get)]
+    resource_id: String,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    coordinates: Vec<i64>,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedStageOutputBinding {
+    #[pyo3(get)]
+    output_id: String,
+    #[pyo3(get)]
+    value_id: String,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    coordinates: Vec<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedRecurrenceStageSpec {
+    schema_version: u64,
+    shape_specialization: Vec<(String, String)>,
+    row_count: u64,
+    request_count: u64,
+    recurrence: FiniteRecurrenceSpec,
+    seed_bindings: Vec<TypedStageBinding>,
+    resource_bindings: Vec<TypedStageResourceBinding>,
+    output_bindings: Vec<TypedStageOutputBinding>,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedRecurrenceStageArtifact {
+    #[pyo3(get)]
+    schema_version: u64,
+    #[pyo3(get)]
+    signature: String,
+    #[pyo3(get)]
+    shape_specialization: Vec<(String, String)>,
+    #[pyo3(get)]
+    row_count: u64,
+    #[pyo3(get)]
+    request_count: u64,
+    #[pyo3(get)]
+    plan: TypedRecurrencePlan,
+    #[pyo3(get)]
+    seed_bindings: Vec<TypedStageBinding>,
+    #[pyo3(get)]
+    resource_bindings: Vec<TypedStageResourceBinding>,
+    #[pyo3(get)]
+    output_bindings: Vec<TypedStageOutputBinding>,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedBoundRecurrenceStage {
+    #[pyo3(get)]
+    signature: String,
+    #[pyo3(get)]
+    plan: TypedRecurrencePlan,
+    #[pyo3(get)]
+    seed_bindings: Vec<TypedStageBinding>,
+    #[pyo3(get)]
+    resource_bindings: Vec<TypedStageResourceBinding>,
+    #[pyo3(get)]
+    output_bindings: Vec<TypedStageOutputBinding>,
+}
+
+/// Backend-observed row ownership after Rust has validated stage admission.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedObservedStageSpan {
+    #[pyo3(get)]
+    request_ordinal: i64,
+    #[pyo3(get)]
+    packed_row_start: i64,
+    #[pyo3(get)]
+    packed_row_end: i64,
+    #[pyo3(get)]
+    token_offset_start: i64,
+    #[pyo3(get)]
+    token_offset_end: i64,
+    #[pyo3(get)]
+    phase: SchedulerBatchPhase,
+}
+
+/// A signed stage plus the exact packed-row span admitted by Rust.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedPackedRecurrenceStageBinding {
+    #[pyo3(get)]
+    stage: TypedBoundRecurrenceStage,
+    #[pyo3(get)]
+    observed_span: TypedObservedStageSpan,
+}
+
+/// Whole packed-plan admission derived from signed row policy and Rust facts.
+#[pyclass(frozen, eq, eq_int, hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TypedStagePlanAdmission {
+    Execute,
+    Noop,
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedRecurrenceStageArtifactBundleEntry {
+    #[pyo3(get)]
+    row_count: u64,
+    #[pyo3(get)]
+    artifact: TypedRecurrenceStageArtifact,
+}
+
+/// A signed, cold-specialized family of one stage artifact per row count.
+/// Python may select an exact member, but cannot reinterpret or reassemble
+/// the signed wire representation.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedRecurrenceStageArtifactBundle {
+    #[pyo3(get)]
+    schema_version: u64,
+    #[pyo3(get)]
+    signature: String,
+    #[pyo3(get)]
+    artifacts: Vec<TypedRecurrenceStageArtifactBundleEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedRecurrenceStageArtifactBundleSpec {
+    schema_version: u64,
+    artifacts: Vec<TypedRecurrenceStageArtifactBundleWireEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedRecurrenceStageArtifactBundleWireEntry {
+    row_count: u64,
+    artifact_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedRecurrenceStageArtifactBundleWire {
+    schema_version: u64,
+    signature: String,
+    artifacts: Vec<TypedRecurrenceStageArtifactBundleWireEntry>,
+}
+
+#[derive(Serialize)]
+struct TypedRecurrenceStageArtifactBundleUnsigned<'a> {
+    schema_version: u64,
+    artifacts: &'a [TypedRecurrenceStageArtifactBundleWireEntry],
+}
+
+/// Closed runtime evidence for one request's contiguous packed stage rows.
+///
+/// The row plan owns these coordinates. A stage artifact never infers a
+/// request association from Python objects or a backend-specific batch type.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedStageRequestSpan {
+    request_ordinal: u64,
+    packed_row_start: u64,
+    packed_row_end: u64,
+    token_offset_start: u64,
+    token_offset_end: u64,
+    phase: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedStageFacts {
+    schema_version: u64,
+    shape_specialization: Vec<(String, String)>,
+    row_count: u64,
+    request_count: u64,
+    request_spans: Vec<TypedStageRequestSpan>,
+}
+
+fn stage_digest<T: Serialize>(value: &T) -> PyResult<String> {
+    let wire = serde_json::to_string(value).map_err(|error| {
+        validation_error(format!("failed to encode typed recurrence stage: {error}"))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(wire.as_bytes())))
+}
+
+fn validate_shape_specialization(entries: &[(String, String)]) -> PyResult<()> {
+    if entries.is_empty()
+        || entries
+            .iter()
+            .any(|(key, value)| !is_nonempty(key) || !is_nonempty(value))
+        || entries.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return Err(validation_error(
+            "typed recurrence stage shape_specialization must be non-empty and sorted unique",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stage_shape_specialization(
+    entries: &[(String, String)],
+    row_count: u64,
+    request_count: u64,
+) -> PyResult<()> {
+    validate_shape_specialization(entries)?;
+    let required = [
+        ("stage/request_count", request_count.to_string()),
+        ("stage/row_count", row_count.to_string()),
+    ];
+    for (key, expected) in required {
+        let Some((_, actual)) = entries.iter().find(|(candidate, _)| candidate == key) else {
+            return Err(validation_error(format!(
+                "typed recurrence stage shape_specialization requires {key}"
+            )));
+        };
+        if actual != &expected {
+            return Err(validation_error(format!(
+                "typed recurrence stage shape_specialization {key} must equal {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn coordinates_are_nonnegative(coordinates: &[i64]) -> bool {
+    coordinates.iter().all(|coordinate| *coordinate >= 0)
+}
+
+fn validate_stage_binding_list(
+    bindings: &[TypedStageBinding],
+    expected: &BTreeSet<String>,
+    label: &str,
+) -> PyResult<()> {
+    let actual: BTreeSet<String> = bindings
+        .iter()
+        .map(|binding| binding.binding_id.clone())
+        .collect();
+    if bindings.iter().any(|binding| {
+        !is_nonempty(&binding.binding_id)
+            || !is_nonempty(&binding.kind)
+            || !coordinates_are_nonnegative(&binding.coordinates)
+    }) || actual.len() != bindings.len()
+        || actual != *expected
+        || bindings
+            .windows(2)
+            .any(|pair| pair[0].binding_id >= pair[1].binding_id)
+    {
         return Err(validation_error(format!(
-            "Recirculation {name} must resolve inside [0, layer_count)"
+            "typed recurrence stage {label} bindings must exactly and canonically cover signed operands"
         )));
     }
-    Ok(resolved)
+    Ok(())
 }
 
-fn append_recirculation_op(
-    ops: &mut Vec<RecirculationPrefillOp>,
-    kind: RecirculationPrefillOpKind,
-    token: i64,
-    layer: i64,
-) -> String {
-    let ordinal = ops.len() as i64;
-    let op_id = format!("recirculation/{ordinal}");
-    ops.push(RecirculationPrefillOp {
-        op_id: op_id.clone(),
-        ordinal,
-        kind,
-        token,
-        layer,
-        data_predecessor_ordinals: Vec::new(),
-        model_input_kind: None,
-        model_input_ordinal: None,
-        mix_source_ordinal: None,
-        mix_destination_ordinal: None,
-        mix_final_normal_ordinal: None,
-    });
-    op_id
-}
-
-fn checked_recirculation_operation_count(
-    token_count: i64,
-    layer_count: i64,
-    destination_layer: i64,
-) -> PyResult<i64> {
-    let per_token = layer_count
-        .checked_mul(2)
-        .and_then(|value| value.checked_sub(destination_layer))
-        .ok_or_else(|| {
-            validation_error(
-                "Recirculation token/layer domain exceeds the supported operation range",
-            )
-        })?;
-    token_count.checked_mul(per_token).ok_or_else(|| {
-        validation_error("Recirculation token/layer domain exceeds the supported operation range")
-    })
-}
-
-fn checked_usize(value: i64, name: &str) -> PyResult<usize> {
-    usize::try_from(value)
-        .map_err(|_| validation_error(format!("Recirculation {name} exceeds the host index range")))
-}
-
-fn reserve_recirculation<T>(values: &mut Vec<T>, additional: usize) -> PyResult<()> {
-    values.try_reserve_exact(additional).map_err(|_| {
-        validation_error("Recirculation schedule allocation exceeds available host memory")
-    })
-}
-
-fn add_edge(
-    edges: &mut Vec<RecurrenceEdgeDesc>,
-    source: &str,
-    target: &str,
-    kind: &str,
-    distance: Vec<i64>,
-) {
-    edges.push(RecurrenceEdgeDesc {
-        source: source.to_string(),
-        target: target.to_string(),
-        kind: kind.to_string(),
-        distance,
-        visibility: "current".to_string(),
-    });
-}
-
-fn derive_recirculation_group_releases(
-    groups: &mut [RecirculationPrefillGroup],
-    retained_ordinals: &[i64],
+fn validate_stage_resource_binding_list(
+    bindings: &[TypedStageResourceBinding],
+    expected: &BTreeSet<String>,
 ) -> PyResult<()> {
-    let retained: HashSet<i64> = retained_ordinals.iter().copied().collect();
-    let mut producer_group = HashMap::new();
-    for (group_index, group) in groups.iter().enumerate() {
-        for operation in &group.operations {
-            if producer_group
-                .insert(operation.ordinal, group_index)
-                .is_some()
-            {
-                return Err(validation_error(
-                    "Recirculation group operations must have unique ordinals",
-                ));
-            }
-        }
-    }
-    let mut last_use = producer_group.clone();
-    for (group_index, group) in groups.iter().enumerate() {
-        for operation in &group.operations {
-            for source in &operation.data_predecessor_ordinals {
-                let Some(entry) = last_use.get_mut(source) else {
-                    return Err(validation_error(
-                        "Recirculation operation data predecessor must identify a group operation",
-                    ));
-                };
-                *entry = (*entry).max(group_index);
-            }
-        }
-    }
-    for group in groups.iter_mut() {
-        group.release_after.clear();
-    }
-    for (ordinal, group_index) in last_use {
-        if !retained.contains(&ordinal) {
-            groups[group_index].release_after.push(ordinal);
-        }
-    }
-    for group in groups.iter_mut() {
-        group.release_after.sort_unstable();
+    let actual: BTreeSet<String> = bindings
+        .iter()
+        .map(|binding| binding.resource_id.clone())
+        .collect();
+    if bindings.iter().any(|binding| {
+        !is_nonempty(&binding.resource_id)
+            || !is_nonempty(&binding.kind)
+            || !coordinates_are_nonnegative(&binding.coordinates)
+    }) || actual.len() != bindings.len()
+        || actual != *expected
+        || bindings
+            .windows(2)
+            .any(|pair| pair[0].resource_id >= pair[1].resource_id)
+    {
+        return Err(validation_error(
+            "typed recurrence stage resource bindings must exactly and canonically cover signed operands",
+        ));
     }
     Ok(())
 }
 
-fn validate_recirculation_prefill_schedule(
-    schedule: &RecirculationPrefillSchedule,
-    all_ops: &[RecirculationPrefillOp],
-    edges: &[RecurrenceEdgeDesc],
+fn validate_stage_outputs(
+    bindings: &[TypedStageOutputBinding],
+    retained_values: &[String],
 ) -> PyResult<()> {
-    if schedule.token_count < 1 || schedule.layer_count < 1 {
-        return Err(validation_error(
-            "Recirculation schedule token_count and layer_count must be positive",
-        ));
-    }
-    if schedule.destination_layer < 0
-        || schedule.destination_layer >= schedule.source_layer
-        || schedule.source_layer >= schedule.layer_count
-    {
-        return Err(validation_error(
-            "Recirculation schedule layers must satisfy 0 <= destination < source < layer_count",
-        ));
-    }
-
-    let expected_count = checked_recirculation_operation_count(
-        schedule.token_count,
-        schedule.layer_count,
-        schedule.destination_layer,
-    )?;
-    let mut flattened = Vec::new();
-    for (group_index, group) in schedule.groups.iter().enumerate() {
-        if group.ordinal != group_index as i64 {
-            return Err(validation_error(
-                "Recirculation schedule group ordinals must be contiguous",
-            ));
-        }
-        if group.operations.is_empty() || group.operations.len() > 2 {
-            return Err(validation_error(
-                "Recirculation schedule groups must contain one or two operations",
-            ));
-        }
-        match group.kind {
-            RecirculationPrefillGroupKind::ModelLayer => {
-                let Some(layer) = group.model_layer else {
-                    return Err(validation_error(
-                        "Recirculation model-layer group must name its layer",
-                    ));
-                };
-                if layer < 0 || layer >= schedule.layer_count {
-                    return Err(validation_error(
-                        "Recirculation model-layer group layer is outside its domain",
-                    ));
-                }
-                if group.operations.iter().any(|op| {
-                    !matches!(
-                        op.kind,
-                        RecirculationPrefillOpKind::Normal | RecirculationPrefillOpKind::Recurrent
-                    ) || op.layer != layer
-                }) {
-                    return Err(validation_error(
-                        "Recirculation model-layer group must contain one-layer normal or recurrent operations",
-                    ));
-                }
-            }
-            RecirculationPrefillGroupKind::Mix => {
-                if group.model_layer.is_some()
-                    || group.operations.len() != 1
-                    || group.operations[0].kind != RecirculationPrefillOpKind::Mix
-                {
-                    return Err(validation_error(
-                        "Recirculation mix group must contain exactly one mix operation",
-                    ));
-                }
-            }
-        }
-        flattened.extend(group.operations.iter());
-    }
-    if flattened.len() as i64 != expected_count || all_ops.len() as i64 != expected_count {
-        return Err(validation_error(
-            "Recirculation schedule operation count does not cover its token/layer domain",
-        ));
-    }
-
-    let mut by_ordinal = HashMap::new();
-    let mut execution_position = HashMap::new();
-    for (group_index, group) in schedule.groups.iter().enumerate() {
-        for (within_group, op) in group.operations.iter().enumerate() {
-            if op.ordinal < 0 || !by_ordinal.insert(op.ordinal, op).is_none() {
-                return Err(validation_error(
-                    "Recirculation schedule operation ordinals must be unique and non-negative",
-                ));
-            }
-            execution_position.insert(op.ordinal, (group_index, within_group));
-            if op.token < 0
-                || op.token >= schedule.token_count
-                || op.layer < 0
-                || op.layer >= schedule.layer_count
-            {
-                return Err(validation_error(
-                    "Recirculation schedule operation token/layer is outside its domain",
-                ));
-            }
-            match op.kind {
-                RecirculationPrefillOpKind::Normal => {
-                    if op.model_input_kind.is_none() {
-                        return Err(validation_error(
-                            "Recirculation normal operation must name a typed model input",
-                        ));
-                    }
-                    if op.mix_source_ordinal.is_some()
-                        || op.mix_destination_ordinal.is_some()
-                        || op.mix_final_normal_ordinal.is_some()
-                    {
-                        return Err(validation_error(
-                            "only Recirculation mix operations may carry mix input ordinals",
-                        ));
-                    }
-                }
-                RecirculationPrefillOpKind::Mix => {
-                    if op.model_input_kind.is_some() || op.model_input_ordinal.is_some() {
-                        return Err(validation_error(
-                            "Recirculation mix operation cannot carry a model input",
-                        ));
-                    }
-                    if op.layer != schedule.destination_layer {
-                        return Err(validation_error(
-                            "Recirculation mix operation must execute at destination_layer",
-                        ));
-                    }
-                    let (Some(source), Some(destination), Some(final_normal)) = (
-                        op.mix_source_ordinal,
-                        op.mix_destination_ordinal,
-                        op.mix_final_normal_ordinal,
-                    ) else {
-                        return Err(validation_error(
-                            "Recirculation mix operation must name source, destination, and final normal inputs",
-                        ));
-                    };
-                    for (ordinal, expected_layer) in [
-                        (source, schedule.source_layer),
-                        (destination, schedule.destination_layer),
-                        (final_normal, schedule.layer_count - 1),
-                    ] {
-                        let Some(input) = by_ordinal.get(&ordinal) else {
-                            return Err(validation_error(
-                                "Recirculation mix input ordinal must identify a schedule operation",
-                            ));
-                        };
-                        if input.kind != RecirculationPrefillOpKind::Normal
-                            || input.token != op.token
-                            || input.layer != expected_layer
-                            || !op.data_predecessor_ordinals.contains(&ordinal)
-                        {
-                            return Err(validation_error(
-                                "Recirculation mix inputs must be current-token normal source, destination, and final outputs",
-                            ));
-                        }
-                    }
-                }
-                RecirculationPrefillOpKind::Recurrent => {
-                    if op.layer <= schedule.destination_layer {
-                        return Err(validation_error(
-                            "Recirculation recurrent operations must be above destination_layer",
-                        ));
-                    }
-                    if op.mix_source_ordinal.is_some()
-                        || op.mix_destination_ordinal.is_some()
-                        || op.mix_final_normal_ordinal.is_some()
-                    {
-                        return Err(validation_error(
-                            "only Recirculation mix operations may carry mix input ordinals",
-                        ));
-                    }
-                    if op.model_input_kind != Some(RecirculationInputKind::Ordinal) {
-                        return Err(validation_error(
-                            "Recirculation recurrent operation must consume an ordinal model input",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for ordinal in 0..expected_count {
-        if !by_ordinal.contains_key(&ordinal) {
-            return Err(validation_error(
-                "Recirculation schedule operation ordinals must be contiguous",
-            ));
-        }
-    }
-
-    let id_to_ordinal: HashMap<&str, i64> = all_ops
+    let retained: BTreeSet<&str> = retained_values.iter().map(String::as_str).collect();
+    let output_ids: BTreeSet<String> = bindings
         .iter()
-        .map(|op| (op.op_id.as_str(), op.ordinal))
+        .map(|binding| binding.output_id.clone())
         .collect();
-    let mut expected_data: HashMap<i64, Vec<i64>> = HashMap::new();
-    for edge in edges {
-        let source = id_to_ordinal[edge.source.as_str()];
-        let target = id_to_ordinal[edge.target.as_str()];
-        let (source_group, source_index) = execution_position[&source];
-        let (target_group, target_index) = execution_position[&target];
-        if source_group > target_group
-            || (source_group == target_group && source_index >= target_index)
-        {
-            return Err(validation_error(
-                "Recirculation schedule does not place every dependency before its consumer",
-            ));
-        }
-        if edge.kind == "data" {
-            let data = expected_data.entry(target).or_default();
-            if !data.contains(&source) {
-                data.push(source);
-            }
-        }
-    }
-    for op in &flattened {
-        if expected_data.get(&op.ordinal).cloned().unwrap_or_default()
-            != op.data_predecessor_ordinals
-        {
-            return Err(validation_error(
-                "Recirculation operation data predecessor ordinals disagree with its dependence graph",
-            ));
-        }
-        match op.kind {
-            RecirculationPrefillOpKind::Mix => {}
-            RecirculationPrefillOpKind::Normal if op.layer == 0 => {
-                if op.model_input_kind != Some(RecirculationInputKind::Seed)
-                    || op.model_input_ordinal.is_some()
-                    || !op.data_predecessor_ordinals.is_empty()
-                {
-                    return Err(validation_error(
-                        "Recirculation layer-zero normal operation must consume only the seed input",
-                    ));
-                }
-            }
-            RecirculationPrefillOpKind::Normal | RecirculationPrefillOpKind::Recurrent => {
-                if op.model_input_kind != Some(RecirculationInputKind::Ordinal)
-                    || op.data_predecessor_ordinals.len() != 1
-                    || op.model_input_ordinal != Some(op.data_predecessor_ordinals[0])
-                {
-                    return Err(validation_error(
-                        "Recirculation model operation must consume its sole typed data predecessor",
-                    ));
-                }
-            }
-        }
-    }
-
-    if schedule.final_normal_ordinals.len() != checked_usize(schedule.token_count, "token_count")? {
-        return Err(validation_error(
-            "Recirculation schedule must expose one final normal output per token",
-        ));
-    }
-    for (token, ordinal) in schedule.final_normal_ordinals.iter().enumerate() {
-        let op = by_ordinal.get(ordinal).ok_or_else(|| {
-            validation_error(
-                "Recirculation final normal ordinal must identify a schedule operation",
-            )
-        })?;
-        if op.kind != RecirculationPrefillOpKind::Normal
-            || op.token != token as i64
-            || op.layer != schedule.layer_count - 1
-        {
-            return Err(validation_error(
-                "Recirculation final normal outputs must cover every token at the final layer",
-            ));
-        }
-    }
-
-    let retained: HashSet<i64> = schedule.retained_ordinals.iter().copied().collect();
-    if retained.len() != schedule.retained_ordinals.len()
-        || retained.len() != schedule.final_normal_ordinals.len()
-        || !schedule
-            .final_normal_ordinals
-            .iter()
-            .all(|ordinal| retained.contains(ordinal))
+    let value_ids: BTreeSet<String> = bindings
+        .iter()
+        .map(|binding| binding.value_id.clone())
+        .collect();
+    if bindings.iter().any(|binding| {
+        !is_nonempty(&binding.output_id)
+            || !is_nonempty(&binding.value_id)
+            || !is_nonempty(&binding.kind)
+            || !coordinates_are_nonnegative(&binding.coordinates)
+            || !retained.contains(binding.value_id.as_str())
+    }) || output_ids.len() != bindings.len()
+        || value_ids.len() != bindings.len()
+        || value_ids != retained.into_iter().map(str::to_string).collect()
+        || bindings
+            .windows(2)
+            .any(|pair| pair[0].output_id >= pair[1].output_id)
     {
         return Err(validation_error(
-            "Recirculation retained ordinals must exactly name final normal outputs",
+            "typed recurrence stage output bindings must be canonical retained values",
         ));
-    }
-    let mut last_use = HashMap::new();
-    for (ordinal, (group_index, _)) in &execution_position {
-        last_use.insert(*ordinal, *group_index);
-    }
-    for op in &flattened {
-        let (consumer_group, _) = execution_position[&op.ordinal];
-        for source in &op.data_predecessor_ordinals {
-            let entry = last_use
-                .get_mut(source)
-                .expect("validated data predecessor must identify an operation");
-            *entry = (*entry).max(consumer_group);
-        }
-    }
-    let mut expected_releases: Vec<Vec<i64>> = vec![Vec::new(); schedule.groups.len()];
-    for (ordinal, group_index) in last_use {
-        if !retained.contains(&ordinal) {
-            expected_releases[group_index].push(ordinal);
-        }
-    }
-    for releases in &mut expected_releases {
-        releases.sort_unstable();
-    }
-    for (group, expected) in schedule.groups.iter().zip(expected_releases) {
-        let mut actual = group.release_after.clone();
-        actual.sort_unstable();
-        if actual != expected {
-            return Err(validation_error(
-                "Recirculation group release_after does not match Rust-derived value lifetime",
-            ));
-        }
     }
     Ok(())
 }
 
-/// Compile the exact Recirculation prefill recurrence from typed shape and
-/// binding facts. This is the native alternative to Python graph building and
-/// effect declaration; ordered-row fusion is selected only from the signed,
-/// canonical backend policy supplied by the caller.
-#[pyfunction]
-fn compile_recirculation_prefill_schedule(
-    token_count: i64,
-    layer_count: i64,
-    source_layer: i64,
-    destination_layer: i64,
-    ordered_row_fusion_policy: String,
-) -> PyResult<RecirculationPrefillSchedule> {
-    if token_count < 1 || layer_count < 1 {
+fn stage_artifact_from_spec(
+    spec: TypedRecurrenceStageSpec,
+) -> PyResult<TypedRecurrenceStageArtifact> {
+    if spec.schema_version != 1 || spec.row_count == 0 || spec.request_count == 0 {
         return Err(validation_error(
-            "Recirculation token_count and layer_count must be positive",
+            "typed recurrence stage schema_version, row_count, and request_count are invalid",
         ));
     }
-    let source_layer = resolve_recirculation_layer(source_layer, layer_count, "source_layer")?;
-    let destination_layer =
-        resolve_recirculation_layer(destination_layer, layer_count, "destination_layer")?;
-    if destination_layer >= source_layer {
+    validate_stage_shape_specialization(
+        &spec.shape_specialization,
+        spec.row_count,
+        spec.request_count,
+    )?;
+    if spec.recurrence.row_admission.mixed_batch == MixedBatchPolicy::Noop {
         return Err(validation_error(
-            "Recirculation layers must satisfy destination_layer < source_layer",
+            "typed recurrence stage artifacts do not support mixed_batch=noop",
         ));
     }
-    let ordered_row_fusion = parse_ordered_row_fusion_policy(&ordered_row_fusion_policy)?;
-
-    let operation_count =
-        checked_recirculation_operation_count(token_count, layer_count, destination_layer)?;
-    let token_len = checked_usize(token_count, "token_count")?;
-    let layer_len = checked_usize(layer_count, "layer_count")?;
-    let operation_len = checked_usize(operation_count, "operation count")?;
-
-    let mut typed_ops = Vec::new();
-    let mut ops = Vec::new();
-    let mut edges = Vec::new();
-    reserve_recirculation(&mut typed_ops, operation_len)?;
-    reserve_recirculation(&mut ops, operation_len)?;
-    reserve_recirculation(
-        &mut edges,
-        operation_len.checked_mul(3).ok_or_else(|| {
-            validation_error("Recirculation dependence count exceeds the supported host range")
-        })?,
-    )?;
-    let mut normal_ids = Vec::new();
-    let mut recurrent_ids = Vec::new();
-    reserve_recirculation(&mut normal_ids, token_len)?;
-    reserve_recirculation(&mut recurrent_ids, token_len)?;
-    for _ in 0..token_len {
-        let mut normal_layers = Vec::new();
-        let mut recurrent_layers = Vec::new();
-        reserve_recirculation(&mut normal_layers, layer_len)?;
-        reserve_recirculation(&mut recurrent_layers, layer_len)?;
-        normal_layers.resize(layer_len, String::new());
-        recurrent_layers.resize(layer_len, None);
-        normal_ids.push(normal_layers);
-        recurrent_ids.push(recurrent_layers);
-    }
-    let mut mix_ids = Vec::new();
-    let mut final_normal_ordinals = Vec::new();
-    reserve_recirculation(&mut mix_ids, token_len)?;
-    reserve_recirculation(&mut final_normal_ordinals, token_len)?;
-
-    for token in 0..token_count {
-        for layer in 0..layer_count {
-            let id = append_recirculation_op(
-                &mut typed_ops,
-                RecirculationPrefillOpKind::Normal,
-                token,
-                layer,
-            );
-            normal_ids[token as usize][layer as usize] = id.clone();
-            ops.push(RecurrenceOpDesc {
-                op_id: id.clone(),
-                executor: format!("model_layer:{layer}"),
-                point: IterationPointDesc {
-                    token,
-                    layer,
-                    pass_name: "normal".to_string(),
-                    round: 0,
-                },
-            });
-            if layer > 0 {
-                add_edge(
-                    &mut edges,
-                    &normal_ids[token as usize][(layer - 1) as usize],
-                    &id,
-                    "data",
-                    Vec::new(),
-                );
+    let plan = compile_typed(spec.recurrence)?;
+    let mut expected_seeds = BTreeSet::new();
+    let mut expected_resources = BTreeSet::new();
+    for operation in &plan.spec.operations {
+        for operand in &operation.operands {
+            if let Some(binding_id) = &operand.binding_id {
+                expected_seeds.insert(binding_id.clone());
             }
-            if token > 0 {
-                let prior = if layer <= destination_layer {
-                    &normal_ids[(token - 1) as usize][layer as usize]
-                } else {
-                    recurrent_ids[(token - 1) as usize][layer as usize]
-                        .as_ref()
-                        .expect("prior token recurrent operation must exist")
-                };
-                add_edge(
-                    &mut edges,
-                    prior,
-                    &id,
-                    if layer <= destination_layer {
-                        "kv_write_read"
-                    } else {
-                        "kv_overwrite_read"
-                    },
-                    vec![1],
-                );
-            }
-        }
-
-        let mix_id = append_recirculation_op(
-            &mut typed_ops,
-            RecirculationPrefillOpKind::Mix,
-            token,
-            destination_layer,
-        );
-        let source_ordinal = typed_ops
-            .iter()
-            .find(|op| op.op_id == normal_ids[token as usize][source_layer as usize])
-            .expect("source normal operation must exist")
-            .ordinal;
-        let destination_ordinal = typed_ops
-            .iter()
-            .find(|op| op.op_id == normal_ids[token as usize][destination_layer as usize])
-            .expect("destination normal operation must exist")
-            .ordinal;
-        let final_normal_ordinal = typed_ops
-            .iter()
-            .find(|op| op.op_id == normal_ids[token as usize][(layer_count - 1) as usize])
-            .expect("final normal operation must exist")
-            .ordinal;
-        let mix = typed_ops
-            .last_mut()
-            .expect("mix operation was just appended");
-        mix.mix_source_ordinal = Some(source_ordinal);
-        mix.mix_destination_ordinal = Some(destination_ordinal);
-        mix.mix_final_normal_ordinal = Some(final_normal_ordinal);
-        final_normal_ordinals.push(final_normal_ordinal);
-        for dependency in [
-            &normal_ids[token as usize][destination_layer as usize],
-            &normal_ids[token as usize][source_layer as usize],
-            &normal_ids[token as usize][(layer_count - 1) as usize],
-        ] {
-            add_edge(&mut edges, dependency, &mix_id, "data", Vec::new());
-        }
-        ops.push(RecurrenceOpDesc {
-            op_id: mix_id.clone(),
-            executor: "recirculation_mix".to_string(),
-            point: IterationPointDesc {
-                token,
-                layer: destination_layer,
-                pass_name: "mix".to_string(),
-                round: 0,
-            },
-        });
-        mix_ids.push(mix_id.clone());
-
-        for layer in (destination_layer + 1)..layer_count {
-            let id = append_recirculation_op(
-                &mut typed_ops,
-                RecirculationPrefillOpKind::Recurrent,
-                token,
-                layer,
-            );
-            recurrent_ids[token as usize][layer as usize] = Some(id.clone());
-            let previous = if layer == destination_layer + 1 {
-                &mix_ids[token as usize]
-            } else {
-                recurrent_ids[token as usize][(layer - 1) as usize]
-                    .as_ref()
-                    .expect("prior recurrent operation must exist")
-            };
-            add_edge(&mut edges, previous, &id, "data", Vec::new());
-            add_edge(
-                &mut edges,
-                &normal_ids[token as usize][layer as usize],
-                &id,
-                "control",
-                Vec::new(),
-            );
-            ops.push(RecurrenceOpDesc {
-                op_id: id,
-                executor: format!("model_layer:{layer}"),
-                point: IterationPointDesc {
-                    token,
-                    layer,
-                    pass_name: "recurrent".to_string(),
-                    round: 0,
-                },
-            });
-        }
-    }
-    let by_id: HashMap<String, usize> = typed_ops
-        .iter()
-        .enumerate()
-        .map(|(index, op)| (op.op_id.clone(), index))
-        .collect();
-    for edge in &edges {
-        if edge.kind != "data" {
-            continue;
-        }
-        let source = typed_ops[by_id[&edge.source]].ordinal;
-        let target = &mut typed_ops[by_id[&edge.target]];
-        if !target.data_predecessor_ordinals.contains(&source) {
-            target.data_predecessor_ordinals.push(source);
-        }
-    }
-    for operation in &mut typed_ops {
-        match operation.kind {
-            RecirculationPrefillOpKind::Mix => {}
-            RecirculationPrefillOpKind::Normal if operation.layer == 0 => {
-                operation.model_input_kind = Some(RecirculationInputKind::Seed);
-            }
-            RecirculationPrefillOpKind::Normal | RecirculationPrefillOpKind::Recurrent => {
-                let input = *operation.data_predecessor_ordinals.first().ok_or_else(|| {
-                    validation_error("Recirculation model operation is missing a data input")
-                })?;
-                if operation.data_predecessor_ordinals.len() != 1 {
-                    return Err(validation_error(
-                        "Recirculation model operation must have exactly one data input",
-                    ));
-                }
-                operation.model_input_kind = Some(RecirculationInputKind::Ordinal);
-                operation.model_input_ordinal = Some(input);
+            if let Some(resource_id) = &operand.resource_id {
+                expected_resources.insert(resource_id.clone());
             }
         }
     }
-
-    let compiled = compile_recurrence_schedule(
-        ops,
-        edges.clone(),
-        ordered_row_fusion
-            .as_ref()
-            .map(|policy| policy.internalized_edges.clone()),
-        ordered_row_fusion
-            .as_ref()
-            .map_or(1, |policy| policy.max_rows),
-    )?;
-    let mut groups: Vec<RecirculationPrefillGroup> = compiled
-        .groups
-        .iter()
-        .enumerate()
-        .map(|(ordinal, group)| {
-            let operations: Vec<RecirculationPrefillOp> = group
-                .iter()
-                .map(|id| typed_ops[by_id[id]].clone())
-                .collect();
-            let (kind, model_layer) = match operations[0].kind {
-                RecirculationPrefillOpKind::Mix => (RecirculationPrefillGroupKind::Mix, None),
-                RecirculationPrefillOpKind::Normal | RecirculationPrefillOpKind::Recurrent => (
-                    RecirculationPrefillGroupKind::ModelLayer,
-                    Some(operations[0].layer),
-                ),
-            };
-            RecirculationPrefillGroup {
-                ordinal: ordinal as i64,
-                kind,
-                model_layer,
-                operations,
-                release_after: Vec::new(),
-            }
-        })
-        .collect();
-    derive_recirculation_group_releases(&mut groups, &final_normal_ordinals)?;
-    let id_to_ordinal: HashMap<&str, i64> = typed_ops
-        .iter()
-        .map(|op| (op.op_id.as_str(), op.ordinal))
-        .collect();
-    let schedule = RecirculationPrefillSchedule {
-        token_count,
-        layer_count,
-        source_layer,
-        destination_layer,
-        kind: compiled.kind,
-        groups,
-        retained_ordinals: final_normal_ordinals.clone(),
-        final_normal_ordinals,
-        fusion_rejections: compiled
-            .fusion_rejections
-            .into_iter()
-            .map(|(source, target, reason)| {
-                (
-                    id_to_ordinal[source.as_str()],
-                    id_to_ordinal[target.as_str()],
-                    reason,
-                )
-            })
-            .collect(),
+    validate_stage_binding_list(&spec.seed_bindings, &expected_seeds, "seed")?;
+    validate_stage_resource_binding_list(&spec.resource_bindings, &expected_resources)?;
+    validate_stage_outputs(&spec.output_bindings, &plan.retained_values)?;
+    let unsigned = TypedRecurrenceStageArtifact {
+        schema_version: 1,
+        signature: String::new(),
+        shape_specialization: spec.shape_specialization,
+        row_count: spec.row_count,
+        request_count: spec.request_count,
+        plan,
+        seed_bindings: spec.seed_bindings,
+        resource_bindings: spec.resource_bindings,
+        output_bindings: spec.output_bindings,
     };
-    validate_recirculation_prefill_schedule(&schedule, &typed_ops, &edges)?;
-    Ok(schedule)
+    let mut artifact = unsigned;
+    artifact.signature = stage_digest(&artifact_without_signature(&artifact))?;
+    Ok(artifact)
+}
+
+#[derive(Serialize)]
+struct TypedRecurrenceStageUnsigned<'a> {
+    schema_version: u64,
+    shape_specialization: &'a [(String, String)],
+    row_count: u64,
+    request_count: u64,
+    plan: &'a TypedRecurrencePlan,
+    seed_bindings: &'a [TypedStageBinding],
+    resource_bindings: &'a [TypedStageResourceBinding],
+    output_bindings: &'a [TypedStageOutputBinding],
+}
+
+fn artifact_without_signature(
+    artifact: &TypedRecurrenceStageArtifact,
+) -> TypedRecurrenceStageUnsigned<'_> {
+    TypedRecurrenceStageUnsigned {
+        schema_version: artifact.schema_version,
+        shape_specialization: &artifact.shape_specialization,
+        row_count: artifact.row_count,
+        request_count: artifact.request_count,
+        plan: &artifact.plan,
+        seed_bindings: &artifact.seed_bindings,
+        resource_bindings: &artifact.resource_bindings,
+        output_bindings: &artifact.output_bindings,
+    }
+}
+
+fn validate_stage_artifact(artifact: &TypedRecurrenceStageArtifact) -> PyResult<()> {
+    let expected = stage_artifact_from_spec(TypedRecurrenceStageSpec {
+        schema_version: artifact.schema_version,
+        shape_specialization: artifact.shape_specialization.clone(),
+        row_count: artifact.row_count,
+        request_count: artifact.request_count,
+        recurrence: artifact.plan.spec.clone(),
+        seed_bindings: artifact.seed_bindings.clone(),
+        resource_bindings: artifact.resource_bindings.clone(),
+        output_bindings: artifact.output_bindings.clone(),
+    })?;
+    if artifact != &expected {
+        return Err(validation_error(
+            "typed recurrence stage artifact plan, bindings, or signature differ from Rust-derived values",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stage_facts(
+    artifact: &TypedRecurrenceStageArtifact,
+    facts: &TypedStageFacts,
+) -> PyResult<()> {
+    if facts.schema_version != 1
+        || facts.shape_specialization != artifact.shape_specialization
+        || facts.row_count != artifact.row_count
+        || facts.request_count != artifact.request_count
+    {
+        return Err(validation_error(
+            "typed recurrence stage facts shape_specialization does not match the signed artifact",
+        ));
+    }
+    validate_stage_shape_specialization(
+        &facts.shape_specialization,
+        facts.row_count,
+        facts.request_count,
+    )?;
+    if facts.request_spans.len() != artifact.request_count as usize {
+        return Err(validation_error(
+            "typed recurrence stage facts must contain one canonical request span per request",
+        ));
+    }
+    let mut next_packed_row = 0_u64;
+    for (expected_ordinal, span) in facts.request_spans.iter().enumerate() {
+        if span.request_ordinal != expected_ordinal as u64
+            || span.packed_row_start != next_packed_row
+            || span.packed_row_end <= span.packed_row_start
+            || span.token_offset_end < span.token_offset_start
+            || span.token_offset_end - span.token_offset_start
+                != span.packed_row_end - span.packed_row_start
+            || !matches!(span.phase.as_str(), "prefill" | "decode")
+        {
+            return Err(validation_error(
+                "typed recurrence stage facts request_spans must canonically partition packed rows with coherent phases",
+            ));
+        }
+        next_packed_row = span.packed_row_end;
+    }
+    if next_packed_row != artifact.row_count {
+        return Err(validation_error(
+            "typed recurrence stage facts request_spans do not cover the signed row_count",
+        ));
+    }
+    let allowed: BTreeSet<&str> = artifact
+        .plan
+        .spec
+        .row_admission
+        .allowed_phases
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let all_allowed = facts
+        .request_spans
+        .iter()
+        .all(|span| allowed.contains(span.phase.as_str()));
+    let mixed = facts
+        .request_spans
+        .windows(2)
+        .any(|pair| pair[0].phase != pair[1].phase);
+    if !all_allowed || mixed {
+        return Err(validation_error(
+            "typed recurrence stage row admission rejects backend facts",
+        ));
+    }
+    Ok(())
+}
+
+fn bundle_digest(
+    schema_version: u64,
+    artifacts: &[TypedRecurrenceStageArtifactBundleWireEntry],
+) -> PyResult<String> {
+    stage_digest(&TypedRecurrenceStageArtifactBundleUnsigned {
+        schema_version,
+        artifacts,
+    })
+}
+
+fn bundle_from_wire(
+    schema_version: u64,
+    artifacts: Vec<TypedRecurrenceStageArtifactBundleWireEntry>,
+) -> PyResult<TypedRecurrenceStageArtifactBundle> {
+    if schema_version != 1 || artifacts.is_empty() {
+        return Err(validation_error(
+            "typed recurrence stage artifact bundle schema_version and artifacts are invalid",
+        ));
+    }
+    let mut entries = Vec::with_capacity(artifacts.len());
+    let mut row_admission: Option<RowAdmission> = None;
+    for (index, wire_entry) in artifacts.iter().enumerate() {
+        let expected_row_count = index as u64 + 1;
+        if wire_entry.row_count != expected_row_count || wire_entry.artifact_json.is_empty() {
+            return Err(validation_error(
+                "typed recurrence stage artifact bundle rows must canonically cover 1 through N",
+            ));
+        }
+        let artifact: TypedRecurrenceStageArtifact = decode_json(
+            &wire_entry.artifact_json,
+            "typed recurrence stage artifact bundle member",
+        )?;
+        validate_stage_artifact(&artifact)?;
+        if row_admission
+            .as_ref()
+            .is_some_and(|expected| expected != &artifact.plan.spec.row_admission)
+        {
+            return Err(validation_error(
+                "typed recurrence stage artifact bundle members must share one row admission policy",
+            ));
+        }
+        row_admission.get_or_insert_with(|| artifact.plan.spec.row_admission.clone());
+        let canonical_artifact_json = serde_json::to_string(&artifact).map_err(|error| {
+            validation_error(format!(
+                "failed to encode typed recurrence stage artifact bundle member: {error}"
+            ))
+        })?;
+        if wire_entry.artifact_json != canonical_artifact_json
+            || artifact.row_count != wire_entry.row_count
+        {
+            return Err(validation_error(
+                "typed recurrence stage artifact bundle member does not match its canonical row specialization",
+            ));
+        }
+        entries.push(TypedRecurrenceStageArtifactBundleEntry {
+            row_count: wire_entry.row_count,
+            artifact,
+        });
+    }
+    let signature = bundle_digest(schema_version, &artifacts)?;
+    Ok(TypedRecurrenceStageArtifactBundle {
+        schema_version,
+        signature,
+        artifacts: entries,
+    })
+}
+
+fn validate_stage_artifact_bundle_wire(
+    wire: TypedRecurrenceStageArtifactBundleWire,
+) -> PyResult<TypedRecurrenceStageArtifactBundle> {
+    let bundle = bundle_from_wire(wire.schema_version, wire.artifacts)?;
+    if bundle.signature != wire.signature {
+        return Err(validation_error(
+            "typed recurrence stage artifact bundle signature differs from Rust-derived values",
+        ));
+    }
+    Ok(bundle)
+}
+
+#[pyfunction]
+fn compile_typed_recurrence_stage_artifact(
+    spec_json: &str,
+) -> PyResult<TypedRecurrenceStageArtifact> {
+    let spec: TypedRecurrenceStageSpec = decode_json(spec_json, "typed recurrence stage spec")?;
+    stage_artifact_from_spec(spec)
+}
+
+#[pyfunction]
+fn compile_typed_recurrence_stage_artifact_json(spec_json: &str) -> PyResult<String> {
+    let artifact = compile_typed_recurrence_stage_artifact(spec_json)?;
+    serde_json::to_string(&artifact).map_err(|error| {
+        validation_error(format!(
+            "failed to encode typed recurrence stage artifact: {error}"
+        ))
+    })
+}
+
+#[pyfunction]
+fn validate_typed_recurrence_stage_artifact(artifact_json: &str) -> PyResult<()> {
+    let artifact: TypedRecurrenceStageArtifact =
+        decode_json(artifact_json, "typed recurrence stage artifact")?;
+    validate_stage_artifact(&artifact)
+}
+
+#[pyfunction]
+fn load_typed_recurrence_stage_artifact(
+    artifact_json: &str,
+) -> PyResult<TypedRecurrenceStageArtifact> {
+    let artifact: TypedRecurrenceStageArtifact =
+        decode_json(artifact_json, "typed recurrence stage artifact")?;
+    validate_stage_artifact(&artifact)?;
+    Ok(artifact)
+}
+
+#[pyfunction]
+fn bind_typed_recurrence_stage(
+    artifact: PyRef<'_, TypedRecurrenceStageArtifact>,
+    facts_json: &str,
+) -> PyResult<TypedBoundRecurrenceStage> {
+    let facts: TypedStageFacts = decode_json(facts_json, "typed recurrence stage facts")?;
+    validate_stage_facts(&artifact, &facts)?;
+    Ok(TypedBoundRecurrenceStage {
+        signature: artifact.signature.clone(),
+        plan: artifact.plan.clone(),
+        seed_bindings: artifact.seed_bindings.clone(),
+        resource_bindings: artifact.resource_bindings.clone(),
+        output_bindings: artifact.output_bindings.clone(),
+    })
+}
+
+fn bind_single_request_observed_stage(
+    artifact: &TypedRecurrenceStageArtifact,
+    observed_span: TypedObservedStageSpan,
+    phase_name: &str,
+) -> PyResult<TypedPackedRecurrenceStageBinding> {
+    if artifact.request_count != 1 {
+        return Err(validation_error(
+            "observed stage binding requires a one-request signed artifact",
+        ));
+    }
+    let packed_row_count = observed_span
+        .packed_row_end
+        .checked_sub(observed_span.packed_row_start)
+        .ok_or_else(|| validation_error("typed recurrence observed span has invalid row bounds"))?;
+    let row_count = u64::try_from(packed_row_count)
+        .map_err(|_| validation_error("typed recurrence observed span row count is unsupported"))?;
+    let token_offset_start = u64::try_from(observed_span.token_offset_start)
+        .map_err(|_| validation_error("typed recurrence observed token offset is unsupported"))?;
+    let token_offset_end = u64::try_from(observed_span.token_offset_end)
+        .map_err(|_| validation_error("typed recurrence observed token offset is unsupported"))?;
+    let facts = TypedStageFacts {
+        schema_version: 1,
+        shape_specialization: artifact.shape_specialization.clone(),
+        row_count,
+        request_count: 1,
+        request_spans: vec![TypedStageRequestSpan {
+            request_ordinal: 0,
+            packed_row_start: 0,
+            packed_row_end: row_count,
+            token_offset_start,
+            token_offset_end,
+            phase: phase_name.into(),
+        }],
+    };
+    validate_stage_facts(artifact, &facts)?;
+    Ok(TypedPackedRecurrenceStageBinding {
+        stage: TypedBoundRecurrenceStage {
+            signature: artifact.signature.clone(),
+            plan: artifact.plan.clone(),
+            seed_bindings: artifact.seed_bindings.clone(),
+            resource_bindings: artifact.resource_bindings.clone(),
+            output_bindings: artifact.output_bindings.clone(),
+        },
+        observed_span,
+    })
+}
+
+#[pyfunction]
+fn bind_typed_recurrence_stage_bundle_for_request_rows(
+    bundle: PyRef<'_, TypedRecurrenceStageArtifactBundle>,
+    row_count: u64,
+) -> PyResult<TypedPackedRecurrenceStageBinding> {
+    let artifact = bundle
+        .artifacts
+        .iter()
+        .find(|entry| entry.row_count == row_count)
+        .map(|entry| &entry.artifact)
+        .ok_or_else(|| {
+            TypedRecurrenceSpecializationRequired::new_err(format!(
+                "typed recurrence stage artifact bundle has no exact row specialization for {row_count}"
+            ))
+        })?;
+    let (phase, phase_name) = match artifact.plan.spec.row_admission.allowed_phases.as_slice() {
+        [phase] if phase == "prefill" => (SchedulerBatchPhase::Prefill, "prefill"),
+        [phase] if phase == "decode" => (SchedulerBatchPhase::Decode, "decode"),
+        _ => {
+            return Err(validation_error(
+                "request-row stage binding requires one signed prefill or decode admission phase",
+            ));
+        }
+    };
+    let row_end = i64::try_from(row_count)
+        .map_err(|_| validation_error("typed recurrence request row count is unsupported"))?;
+    bind_single_request_observed_stage(
+        artifact,
+        TypedObservedStageSpan {
+            request_ordinal: 0,
+            packed_row_start: 0,
+            packed_row_end: row_end,
+            token_offset_start: 0,
+            token_offset_end: row_end,
+            phase,
+        },
+        phase_name,
+    )
+}
+
+#[pyfunction]
+fn admit_typed_recurrence_stage_bundle_for_packed_plan(
+    bundle: PyRef<'_, TypedRecurrenceStageArtifactBundle>,
+    row_plan: PyRef<'_, PackedPrefillRowPlan>,
+) -> PyResult<TypedStagePlanAdmission> {
+    let artifact = &bundle
+        .artifacts
+        .first()
+        .ok_or_else(|| validation_error("typed recurrence stage artifact bundle is empty"))?
+        .artifact;
+    let observed: BTreeSet<&str> = row_plan.phases.iter().map(String::as_str).collect();
+    if observed.is_empty() {
+        return Ok(TypedStagePlanAdmission::Noop);
+    }
+    if observed.len() > 1 {
+        return match artifact.plan.spec.row_admission.mixed_batch {
+            MixedBatchPolicy::Reject => Err(validation_error(
+                "typed recurrence stage row admission rejects mixed backend phases",
+            )),
+            MixedBatchPolicy::Noop => Ok(TypedStagePlanAdmission::Noop),
+        };
+    }
+    let phase = observed
+        .first()
+        .ok_or_else(|| validation_error("typed recurrence packed plan has no observed phase"))?;
+    if artifact
+        .plan
+        .spec
+        .row_admission
+        .allowed_phases
+        .iter()
+        .any(|allowed| allowed == phase)
+    {
+        Ok(TypedStagePlanAdmission::Execute)
+    } else {
+        Ok(TypedStagePlanAdmission::Noop)
+    }
+}
+
+#[pyfunction]
+fn bind_typed_recurrence_stage_bundle_for_packed_span(
+    bundle: PyRef<'_, TypedRecurrenceStageArtifactBundle>,
+    row_plan: PyRef<'_, PackedPrefillRowPlan>,
+    request_ordinal: i64,
+) -> PyResult<TypedPackedRecurrenceStageBinding> {
+    let span = row_plan
+        .request_spans
+        .iter()
+        .find(|span| span.request_ordinal == request_ordinal)
+        .ok_or_else(|| {
+            validation_error(format!(
+                "typed recurrence packed row plan has no request ordinal {request_ordinal}"
+            ))
+        })?;
+    let packed_row_count = span
+        .packed_row_end
+        .checked_sub(span.packed_row_start)
+        .ok_or_else(|| validation_error("typed recurrence packed span has invalid row bounds"))?;
+    if packed_row_count <= 0
+        || span.prefill_row_count < 0
+        || span.decode_row_count < 0
+        || span.prefill_row_count + span.decode_row_count != packed_row_count
+        || span.token_offset_end - span.token_offset_start != packed_row_count
+    {
+        return Err(validation_error(
+            "typed recurrence packed span has inconsistent observed row facts",
+        ));
+    }
+    let (phase, phase_name) = match (span.prefill_row_count, span.decode_row_count) {
+        (prefill, 0) if prefill > 0 => (SchedulerBatchPhase::Prefill, "prefill"),
+        (0, decode) if decode > 0 => (SchedulerBatchPhase::Decode, "decode"),
+        _ => {
+            return Err(validation_error(
+                "typed recurrence packed span contains mixed prefill/decode rows",
+            ));
+        }
+    };
+    let row_count = u64::try_from(packed_row_count)
+        .map_err(|_| validation_error("typed recurrence packed span row count is unsupported"))?;
+    let artifact = bundle
+        .artifacts
+        .iter()
+        .find(|entry| entry.row_count == row_count)
+        .map(|entry| &entry.artifact)
+        .ok_or_else(|| {
+            TypedRecurrenceSpecializationRequired::new_err(format!(
+                "typed recurrence stage artifact bundle has no exact row specialization for {row_count}"
+            ))
+        })?;
+    bind_single_request_observed_stage(
+        artifact,
+        TypedObservedStageSpan {
+            request_ordinal: span.request_ordinal,
+            packed_row_start: span.packed_row_start,
+            packed_row_end: span.packed_row_end,
+            token_offset_start: span.token_offset_start,
+            token_offset_end: span.token_offset_end,
+            phase,
+        },
+        phase_name,
+    )
+}
+
+#[pyfunction]
+fn compile_typed_recurrence_stage_artifact_bundle_json(spec_json: &str) -> PyResult<String> {
+    let spec: TypedRecurrenceStageArtifactBundleSpec =
+        decode_json(spec_json, "typed recurrence stage artifact bundle spec")?;
+    let bundle = bundle_from_wire(spec.schema_version, spec.artifacts)?;
+    let wire = TypedRecurrenceStageArtifactBundleWire {
+        schema_version: bundle.schema_version,
+        signature: bundle.signature,
+        artifacts: bundle
+            .artifacts
+            .into_iter()
+            .map(|entry| {
+                serde_json::to_string(&entry.artifact)
+                    .map(|artifact_json| TypedRecurrenceStageArtifactBundleWireEntry {
+                        row_count: entry.row_count,
+                        artifact_json,
+                    })
+                    .map_err(|error| {
+                        validation_error(format!(
+                            "failed to encode typed recurrence stage artifact bundle member: {error}"
+                        ))
+                    })
+            })
+            .collect::<PyResult<Vec<_>>>()?,
+    };
+    serde_json::to_string(&wire).map_err(|error| {
+        validation_error(format!(
+            "failed to encode typed recurrence stage artifact bundle: {error}"
+        ))
+    })
+}
+
+#[pyfunction]
+fn validate_typed_recurrence_stage_artifact_bundle(bundle_json: &str) -> PyResult<()> {
+    let wire: TypedRecurrenceStageArtifactBundleWire =
+        decode_json(bundle_json, "typed recurrence stage artifact bundle")?;
+    validate_stage_artifact_bundle_wire(wire).map(|_| ())
+}
+
+#[pyfunction]
+fn load_typed_recurrence_stage_artifact_bundle(
+    bundle_json: &str,
+) -> PyResult<TypedRecurrenceStageArtifactBundle> {
+    let wire: TypedRecurrenceStageArtifactBundleWire =
+        decode_json(bundle_json, "typed recurrence stage artifact bundle")?;
+    validate_stage_artifact_bundle_wire(wire)
+}
+
+#[pyfunction]
+fn typed_recurrence_stage_artifact_for_rows(
+    bundle: PyRef<'_, TypedRecurrenceStageArtifactBundle>,
+    row_count: u64,
+) -> PyResult<TypedRecurrenceStageArtifact> {
+    bundle
+        .artifacts
+        .iter()
+        .find(|entry| entry.row_count == row_count)
+        .map(|entry| entry.artifact.clone())
+        .ok_or_else(|| {
+            validation_error(format!(
+                "typed recurrence stage artifact bundle has no exact row specialization for {row_count}"
+            ))
+        })
+}
+
+fn decode_json<T: for<'de> Deserialize<'de>>(json: &str, name: &str) -> PyResult<T> {
+    serde_json::from_str(json)
+        .map_err(|error| validation_error(format!("invalid {name} JSON: {error}")))
+}
+
+#[pyfunction]
+fn compile_typed_recurrence_plan(spec_json: &str) -> PyResult<TypedRecurrencePlan> {
+    let spec: FiniteRecurrenceSpec = decode_json(spec_json, "finite recurrence spec")?;
+    compile_typed(spec)
+}
+
+#[pyfunction]
+fn compile_typed_recurrence_plan_json(spec_json: &str) -> PyResult<String> {
+    let plan = compile_typed_recurrence_plan(spec_json)?;
+    serde_json::to_string(&plan).map_err(|error| {
+        validation_error(format!("failed to encode typed recurrence plan: {error}"))
+    })
+}
+
+#[pyfunction]
+fn validate_typed_recurrence_plan(plan_json: &str) -> PyResult<()> {
+    let submitted: TypedRecurrencePlan = decode_json(plan_json, "typed recurrence plan")?;
+    let expected = compile_typed(submitted.spec.clone())?;
+    if submitted != expected {
+        return Err(validation_error(
+            "typed recurrence plan groups or release_after do not match Rust-derived plan",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(
+        "TypedRecurrenceSpecializationRequired",
+        m.py().get_type::<TypedRecurrenceSpecializationRequired>(),
+    )?;
     m.add_function(wrap_pyfunction!(compile_recurrence_schedule, m)?)?;
-    m.add_function(wrap_pyfunction!(compile_recirculation_prefill_schedule, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_typed_recurrence_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_typed_recurrence_plan_json, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_typed_recurrence_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        compile_typed_recurrence_stage_artifact,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compile_typed_recurrence_stage_artifact_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        validate_typed_recurrence_stage_artifact,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(load_typed_recurrence_stage_artifact, m)?)?;
+    m.add_function(wrap_pyfunction!(bind_typed_recurrence_stage, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        admit_typed_recurrence_stage_bundle_for_packed_plan,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        bind_typed_recurrence_stage_bundle_for_request_rows,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        bind_typed_recurrence_stage_bundle_for_packed_span,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compile_typed_recurrence_stage_artifact_bundle_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        validate_typed_recurrence_stage_artifact_bundle,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        load_typed_recurrence_stage_artifact_bundle,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        typed_recurrence_stage_artifact_for_rows,
+        m
+    )?)?;
     m.add_class::<CompiledRecurrenceSchedule>()?;
-    m.add_class::<RecirculationInputKind>()?;
-    m.add_class::<RecirculationPrefillGroupKind>()?;
-    m.add_class::<RecirculationPrefillOpKind>()?;
-    m.add_class::<RecirculationPrefillOp>()?;
-    m.add_class::<RecirculationPrefillGroup>()?;
-    m.add_class::<RecirculationPrefillSchedule>()?;
+    m.add_class::<OperandKind>()?;
+    m.add_class::<EffectKind>()?;
+    m.add_class::<TypedOperand>()?;
+    m.add_class::<TypedEffect>()?;
+    m.add_class::<TypedOperation>()?;
+    m.add_class::<TypedExecutionGroup>()?;
+    m.add_class::<ExecutionGroupingKind>()?;
+    m.add_class::<TypedRecurrencePlan>()?;
+    m.add_class::<TypedStageBinding>()?;
+    m.add_class::<TypedStageResourceBinding>()?;
+    m.add_class::<TypedStageOutputBinding>()?;
+    m.add_class::<TypedRecurrenceStageArtifact>()?;
+    m.add_class::<TypedBoundRecurrenceStage>()?;
+    m.add_class::<TypedObservedStageSpan>()?;
+    m.add_class::<TypedPackedRecurrenceStageBinding>()?;
+    m.add_class::<TypedStagePlanAdmission>()?;
+    m.add_class::<TypedRecurrenceStageArtifactBundleEntry>()?;
+    m.add_class::<TypedRecurrenceStageArtifactBundle>()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use super::{
-        compile_recirculation_prefill_schedule, compile_recurrence_schedule, IterationPointDesc,
-        RecirculationPrefillOpKind, RecurrenceEdgeDesc, RecurrenceOpDesc,
-    };
+    use super::{compile_typed, FiniteRecurrenceSpec};
 
     #[test]
-    fn fuses_generic_ordered_rows_without_algorithm_identity() {
-        let ops = vec![
-            RecurrenceOpDesc {
-                op_id: "a".into(),
-                executor: "layer:1".into(),
-                point: IterationPointDesc {
-                    token: 0,
-                    layer: 1,
-                    pass_name: "x".into(),
-                    round: 0,
-                },
-            },
-            RecurrenceOpDesc {
-                op_id: "b".into(),
-                executor: "layer:1".into(),
-                point: IterationPointDesc {
-                    token: 1,
-                    layer: 1,
-                    pass_name: "y".into(),
-                    round: 0,
-                },
-            },
-        ];
-        let edges = vec![RecurrenceEdgeDesc {
-            source: "a".into(),
-            target: "b".into(),
-            kind: "kv_overwrite_read".into(),
-            distance: vec![1],
-            visibility: "current".into(),
-        }];
-        let plan =
-            compile_recurrence_schedule(ops, edges, Some(vec!["kv_overwrite_read".into()]), 2)
-                .expect("valid plan");
-        assert_eq!(plan.kind, "wavefront");
-        assert_eq!(plan.groups, vec![vec!["a", "b"]]);
-    }
-
-    #[test]
-    fn exact_recirculation_descriptor_closes_graph_effects_and_data_inputs() {
-        let schedule = compile_recirculation_prefill_schedule(
-            2,
-            4,
-            2,
-            0,
-            "max_rows=2;internalized_edges=kv_overwrite_read".to_string(),
-        )
-        .expect("valid exact Recirculation schedule");
-        assert_eq!(schedule.kind, "wavefront");
-        assert_eq!(schedule.source_layer, 2);
-        assert_eq!(schedule.destination_layer, 0);
-        let ops: Vec<_> = schedule
-            .groups
-            .iter()
-            .flat_map(|group| group.operations.iter())
-            .collect();
-        assert_eq!(ops.len(), 16);
-        let mut ordinals: Vec<_> = ops.iter().map(|op| op.ordinal).collect();
-        ordinals.sort_unstable();
-        assert_eq!(ordinals, (0..16).collect::<Vec<_>>());
-        let mixes: Vec<_> = ops
-            .iter()
-            .filter(|op| op.kind == RecirculationPrefillOpKind::Mix)
-            .collect();
-        assert_eq!(mixes.len(), 2);
-        for mix in mixes {
-            assert!(mix
-                .data_predecessor_ordinals
-                .contains(&mix.mix_source_ordinal.expect("source ordinal")));
-            assert!(mix
-                .data_predecessor_ordinals
-                .contains(&mix.mix_destination_ordinal.expect("destination ordinal")));
-            assert!(mix
-                .data_predecessor_ordinals
-                .contains(&mix.mix_final_normal_ordinal.expect("final ordinal")));
-        }
-        assert_eq!(schedule.final_normal_ordinals.len(), 2);
-        let by_ordinal: HashMap<_, _> = ops.iter().map(|op| (op.ordinal, *op)).collect();
-        for (token, ordinal) in schedule.final_normal_ordinals.iter().enumerate() {
-            let op = by_ordinal[ordinal];
-            assert_eq!(op.kind, RecirculationPrefillOpKind::Normal);
-            assert_eq!(op.token, token as i64);
-            assert_eq!(op.layer, 3);
-        }
-    }
-
-    #[test]
-    fn exact_recirculation_descriptor_rejects_invalid_static_contracts() {
-        assert!(compile_recirculation_prefill_schedule(0, 4, 2, 0, "none".to_string()).is_err());
-        assert!(compile_recirculation_prefill_schedule(1, 0, 0, 0, "none".to_string()).is_err());
-        assert!(compile_recirculation_prefill_schedule(1, 4, 0, 0, "none".to_string()).is_err());
-        assert!(compile_recirculation_prefill_schedule(1, 4, -5, 0, "none".to_string()).is_err());
-    }
-
-    #[test]
-    fn recirculation_policy_is_parsed_in_rust() {
-        let wavefront = compile_recirculation_prefill_schedule(
-            2,
-            4,
-            2,
-            0,
-            "max_rows=2;internalized_edges=kv_overwrite_read".to_string(),
-        )
-        .expect("canonical policy must compile");
-        assert_eq!(wavefront.kind, "wavefront");
-        let serial = compile_recirculation_prefill_schedule(2, 4, 2, 0, "none".to_string())
-            .expect("none policy must compile");
-        assert_eq!(serial.kind, "serial");
-        assert!(compile_recirculation_prefill_schedule(
-            2,
-            4,
-            2,
-            0,
-            "max_rows=2;internalized_edges=kv_overwrite_read,control".to_string(),
-        )
-        .is_err());
+    fn generic_plan_derives_fusion_and_liveness() {
+        let spec: FiniteRecurrenceSpec = serde_json::from_str(r#"{
+            "schema_version":1,"region_id":"unit","implementation_id":"backend.unit@1",
+            "row_admission":{"allowed_phases":["prefill"],"mixed_batch":"reject"},
+            "fusion_policy":"max_rows=2;internalized_edges=state_write_read",
+            "operations":[
+              {"operation_id":"a","primitive_key":"backend.layer@1","implementation_id":"backend.unit@1","operands":[{"kind":"seed","binding_id":"hidden"}],"results":["a"]},
+              {"operation_id":"b","primitive_key":"backend.layer@1","implementation_id":"backend.unit@1","operands":[{"kind":"region_value","value_id":"a"}],"results":["b"]}
+            ],"dependencies":[{"source":"a","target":"b","kind":"state_write_read"}],"retained_values":["b"]
+        }"#).unwrap();
+        let plan = compile_typed(spec).unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].release_after, vec!["a"]);
     }
 }

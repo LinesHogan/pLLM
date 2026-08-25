@@ -54,6 +54,8 @@ class _ExternalRunner(Protocol):
     model_config: object
     device: object
     max_num_reqs: object
+    max_num_tokens: object
+    max_num_batched_tokens: object
     model: object
 
 
@@ -69,6 +71,7 @@ class _RunnerSpecializationFacts:
     dtype: object
     device: object
     model_layer_count: int | None
+    max_prefill_tokens: int | None
 
 
 @dataclass(slots=True)
@@ -149,12 +152,28 @@ def _runner_specialization_facts(
         raise ValueError(
             "runner specialization rows and hidden_size must be positive"
         )
+    for name in ("max_num_tokens", "max_num_batched_tokens"):
+        try:
+            max_prefill_tokens = getattr(raw_runner, name)
+        except AttributeError:
+            continue
+        if type(max_prefill_tokens) is not int or max_prefill_tokens < 1:
+            raise TypeError(
+                "runner specialization max_prefill_tokens must be an exact positive integer"
+            )
+        break
+    else:
+        raise RuntimeError(
+            "runner must expose max_num_tokens or max_num_batched_tokens for "
+            "runtime specialization"
+        )
     return _RunnerSpecializationFacts(
         rows=max_num_reqs,
         hidden_size=hidden_size,
         dtype=dtype,
         device=device,
         model_layer_count=model_layer_count,
+        max_prefill_tokens=cast(int, max_prefill_tokens),
     )
 
 
@@ -541,6 +560,7 @@ class TllmWorkerExtension:
                 "dtype": str(facts.dtype),
                 "hidden_size": facts.hidden_size,
                 "rows": facts.rows,
+                "max_prefill_tokens": facts.max_prefill_tokens,
                 **(
                     {"model_layer_count": facts.model_layer_count}
                     if facts.model_layer_count is not None
@@ -707,6 +727,7 @@ class TllmWorkerExtension:
                         cast("torch.device | str | int", facts.device)
                     ),
                     model_layer_count=facts.model_layer_count,
+                    max_prefill_tokens=facts.max_prefill_tokens,
                 )
         bindings = (
             reconstruct_worker_bindings(

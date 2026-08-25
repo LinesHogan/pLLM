@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 
 from tllm.backends.protocol import BackendCapabilities
@@ -71,6 +73,26 @@ def runner_tensor_parallel_size(runner: object) -> int:
     return tp_size
 
 
+def _runner_max_prefill_tokens(runner: object) -> int:
+    """Read the exact vLLM prefill capacity from one supported runner field."""
+
+    for name in ("max_num_tokens", "max_num_batched_tokens"):
+        try:
+            value = getattr(runner, name)
+        except AttributeError:
+            continue
+        if type(value) is not int or value < 1:
+            raise RuntimeError(
+                f"vLLM runner {name} must be an exact positive integer for "
+                "runtime specialization"
+            )
+        return cast(int, value)
+    raise RuntimeError(
+        "vLLM runner must expose max_num_tokens or max_num_batched_tokens "
+        "for runtime specialization"
+    )
+
+
 def cold_specialize_loaded_runtime(*, core: object, runner: object) -> None:
     """Publish model-layout facts while still inside the vLLM quarantine."""
 
@@ -96,6 +118,7 @@ def cold_specialize_loaded_runtime(*, core: object, runner: object) -> None:
         dtype=model_config.dtype,
         device=runner.device,  # type: ignore[attr-defined]
         model_layer_count=model_layer_count,
+        max_prefill_tokens=_runner_max_prefill_tokens(runner),
     )
     from tllm.runtime.runtime import active_runtime
 

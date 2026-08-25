@@ -298,7 +298,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
                     "ramp_tokens": 4,
                 },
                 "specialization_key": [
-                    ["algorithm", "recirculation-vllm-prefill-region-v1"],
+                    ["algorithm", "recirculation-vllm-typed-region-v2"],
                     ["alpha", "0x1.999999999999ap-3"],
                     ["beta", "default"],
                     ["destination_layer", "1"],
@@ -337,6 +337,56 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
                 reconstructed_static_bindings=self._json(drifted_key),
             )
 
+    def test_worker_factory_specs_are_checked_before_python_import(self) -> None:
+        signed = [
+            {
+                "workload_id": "worker.test",
+                "factory": "worker.module:build",
+                "config": {"artifact": "signed"},
+                "specialization_key": [],
+                "backend_region_implementation_ids": [],
+            }
+        ]
+        cache_key, graph, timeline, options, decision = self._wire(
+            static_bindings=self._json(signed)
+        )
+
+        def validate(specs: object) -> None:
+            _core.validate_worker_reconstruction_specs(
+                cache_key,
+                graph,
+                timeline,
+                options,
+                decision,
+                1,
+                self._json(specs),
+            )
+
+        validate([{"factory": "worker.module:build", "config": {"artifact": "signed"}}])
+        for drifted in (
+            [],
+            [{"factory": "worker.module:other", "config": {"artifact": "signed"}}],
+            [{"factory": "worker.module:build", "config": {"artifact": "changed"}}],
+            [
+                {"factory": "worker.module:build", "config": {"artifact": "signed"}},
+                {"factory": "worker.module:build", "config": {"artifact": "signed"}},
+            ],
+        ):
+            with self.subTest(specs=drifted), self.assertRaisesRegex(
+                RuntimeError, "parent-signed static binding"
+            ):
+                validate(drifted)
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            validate(
+                [
+                    {
+                        "factory": "worker.module:build",
+                        "config": {"artifact": "signed"},
+                        "extra": True,
+                    }
+                ]
+            )
+
     def test_local_static_recirculation_binding_must_match_live_resources(self) -> None:
         signed = [
             {
@@ -350,7 +400,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
                     "ramp_tokens": 4,
                 },
                 "specialization_key": [
-                    ["algorithm", "recirculation-vllm-prefill-region-v1"],
+                    ["algorithm", "recirculation-vllm-typed-region-v2"],
                     ["alpha", "0x1.999999999999ap-3"],
                     ["beta", "default"],
                     ["destination_layer", "1"],
@@ -418,6 +468,35 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
             self._validate(
                 runtime_entries=entries,
                 facts=facts.replace('"model_layer_count":4', '"model_layer_count":5'),
+            )
+
+    def test_max_prefill_tokens_is_a_signed_runtime_fact(self) -> None:
+        entries = [
+            ("runtime/device", "cpu"),
+            ("runtime/dtype", "torch.float32"),
+            ("runtime/hidden_size", "4"),
+            ("runtime/max_prefill_tokens", "16"),
+            ("runtime/rows", "2"),
+        ]
+        facts = self._json(
+            {
+                "device": "cpu",
+                "dtype": "torch.float32",
+                "hidden_size": 4,
+                "max_prefill_tokens": 16,
+                "rows": 2,
+            }
+        )
+        self._validate(runtime_entries=entries, facts=facts)
+        with self.assertRaisesRegex(RuntimeError, "specialization does not match"):
+            self._validate(
+                runtime_entries=entries,
+                facts=facts.replace('"max_prefill_tokens":16', '"max_prefill_tokens":32'),
+            )
+        with self.assertRaisesRegex(RuntimeError, "specialization does not match"):
+            self._validate(
+                runtime_entries=entries,
+                facts=facts.replace(',"max_prefill_tokens":16', ''),
             )
 
 

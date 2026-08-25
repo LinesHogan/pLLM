@@ -714,11 +714,11 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         table = lower_signed_materialization_bindings(
             compilation.graph, compilation.decision, artifacts
         )
-        self.assertEqual(table.initial_refcounts, {materialization.materialization_id: 1})
         binding = table.input_binding_for(
             target.region_id, materialization.materialization_id
         )
         self.assertEqual(binding.producer_region, source.region_id)
+        self.assertEqual(binding.consumer_region, target.region_id)
         self.assertEqual(binding.value_id, materialization.value_id)
         self.assertEqual(binding.version, materialization.version)
         self.assertEqual(binding.live_start, source.placement_anchor)
@@ -847,7 +847,19 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 (declaration,), compilation.decision, compilation.options
             ),
         )
-        self.assertEqual(set(table.initial_refcounts.values()), {1})
+        self.assertEqual(
+            {
+                table.input_binding_for(
+                    materialization.consumer_region,
+                    materialization.materialization_id,
+                ).consumer_region
+                for materialization in compilation.decision.materializations
+            },
+            {
+                materialization.consumer_region
+                for materialization in compilation.decision.materializations
+            },
+        )
 
         state = ResidualRuntimeState()
         bindings = WorkloadExecutionBindings(
@@ -2005,6 +2017,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         object.__setattr__(invalid, "dtype", torch.float32)
         object.__setattr__(invalid, "device", torch.device("cpu"))
         object.__setattr__(invalid, "model_layer_count", None)
+        object.__setattr__(invalid, "max_prefill_tokens", None)
 
         with self.assertRaisesRegex(ValueError, "runtime specialization facts"):
             runtime.cold_specialize_workloads(invalid)

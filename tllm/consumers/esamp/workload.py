@@ -11,6 +11,7 @@ from tllm.workload import (
     Between,
     State,
     StateScope,
+    WorkloadAuthority,
     hidden,
     read,
     request_key,
@@ -37,7 +38,7 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
     legacy = build_legacy_consumer(resolved)
 
     if not resolved.enable_esamp_training:
-        @workload(id=identifier)
+        @workload(id=identifier, authority=WorkloadAuthority.LEGACY_ADAPTER)
         class DisabledESampWorkload:
             @property
             def legacy_consumer(self) -> BaseConsumer:
@@ -53,7 +54,7 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
         optimizer=AdamWSpec(lr=float(resolved.distiller_lr)),
     )
 
-    @workload(id=identifier)
+    @workload(id=identifier, authority=WorkloadAuthority.LEGACY_ADAPTER)
     class ESampWorkloadDeclaration:
         state = distiller
 

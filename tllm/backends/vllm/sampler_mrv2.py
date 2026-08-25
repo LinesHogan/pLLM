@@ -7,7 +7,7 @@ via ``apply_sampling_params(skip_top_k_top_p=True)``, then filters with
 top-k/top-p (either fused inside FlashInfer or via ``apply_top_k_top_p``)
 and draws with ``gumbel_sample``.
 
-ESamp requires the "filter first, intervene on survivors" stage, which does
+Post-filter modifiers require the "filter first, intervene on survivors" stage, which does
 not exist inside the fused FlashInfer kernel. The interceptor therefore:
 
 * leaves the instance untouched when no provider is active (bit-for-bit the

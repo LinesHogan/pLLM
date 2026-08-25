@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_plugins import (
         NativeWorkloadResources,
         WorkloadWorkerSpec,
@@ -60,6 +61,52 @@ def active_runtime() -> "TllmRuntime":
     if _ACTIVE_RUNTIME is None:
         return default_runtime()
     return _ACTIVE_RUNTIME
+
+
+def _runtime_specialization_spec_from_wire(
+    raw: Mapping[str, object],
+) -> "RuntimeSpecializationSpec":
+    """Map Rust-validated wire facts to the two concrete Torch value types."""
+
+    import torch
+
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
+
+    required = {"device", "dtype", "hidden_size", "rows"}
+    optional = {"model_layer_count", "max_prefill_tokens"}
+    keys = set(raw)
+    if not required.issubset(keys) or not keys.issubset(required | optional):
+        raise RuntimeError("worker returned an invalid runtime specialization fact set")
+    device_wire = raw["device"]
+    dtype_wire = raw["dtype"]
+    if type(device_wire) is not str or type(dtype_wire) is not str:
+        raise RuntimeError("worker runtime specialization device/dtype must be strings")
+    numeric_values = {
+        name: raw[name]
+        for name in ("rows", "hidden_size", "model_layer_count", "max_prefill_tokens")
+        if name in raw
+    }
+    if any(type(value) is not int for value in numeric_values.values()):
+        raise RuntimeError("worker runtime specialization numeric facts must be exact ints")
+    if not dtype_wire.startswith("torch."):
+        raise RuntimeError("worker returned an invalid Torch dtype specialization")
+    dtype = getattr(torch, dtype_wire.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype) or str(dtype) != dtype_wire:
+        raise RuntimeError("worker returned an invalid Torch dtype specialization")
+    try:
+        device = torch.device(device_wire)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError("worker returned an invalid Torch device specialization") from exc
+    if str(device) != device_wire:
+        raise RuntimeError("worker returned a noncanonical Torch device specialization")
+    return RuntimeSpecializationSpec(
+        rows=cast(int, numeric_values["rows"]),
+        hidden_size=cast(int, numeric_values["hidden_size"]),
+        dtype=dtype,
+        device=device,
+        model_layer_count=cast("int | None", numeric_values.get("model_layer_count")),
+        max_prefill_tokens=cast("int | None", numeric_values.get("max_prefill_tokens")),
+    )
 
 
 class TllmRuntime:
@@ -174,6 +221,8 @@ class TllmRuntime:
         native_resource_entries = []
         residual_paths: dict[object, str] = {}
         for workload_instance in self._workloads:
+            if not self._is_native_workload_declaration(workload_instance):
+                continue
             resources = self._native_workload_resources.get(id(workload_instance))
             definition = self._workload_definition(workload_instance)
             if definition is None:
@@ -286,15 +335,36 @@ class TllmRuntime:
 
     @staticmethod
     def _legacy_consumer_for(workload_instance: Any) -> Any | None:
-        """Resolve the migration adapter without treating declarations as executable."""
+        """Resolve only declarations explicitly owned by the legacy adapter."""
 
-        if TllmRuntime._workload_definition(workload_instance) is None:
+        definition = TllmRuntime._workload_definition(workload_instance)
+        if definition is None:
             return workload_instance
+        from tllm.workload import WorkloadAuthority
+
+        if definition.authority is WorkloadAuthority.NATIVE_REGION:
+            return None
         try:
             adapter = workload_instance.legacy_consumer
         except AttributeError:
-            return None
-        return adapter() if callable(adapter) else adapter
+            raise RuntimeError(
+                "legacy-adapter workload declaration must provide legacy_consumer"
+            ) from None
+        consumer = adapter() if callable(adapter) else adapter
+        if consumer is None:
+            raise RuntimeError(
+                "legacy-adapter workload declaration returned no legacy_consumer"
+            )
+        return consumer
+
+    @staticmethod
+    def _is_native_workload_declaration(workload_instance: Any) -> bool:
+        definition = TllmRuntime._workload_definition(workload_instance)
+        if definition is None:
+            return False
+        from tllm.workload import WorkloadAuthority
+
+        return definition.authority is WorkloadAuthority.NATIVE_REGION
 
     @property
     def workloads(self) -> tuple[Any, ...]:
@@ -508,6 +578,11 @@ class TllmRuntime:
                 "hidden_size": spec.hidden_size,
                 "rows": spec.rows,
                 **(
+                    {"max_prefill_tokens": spec.max_prefill_tokens}
+                    if spec.max_prefill_tokens is not None
+                    else {}
+                ),
+                **(
                     {"model_layer_count": spec.model_layer_count}
                     if spec.model_layer_count is not None
                     else {}
@@ -523,12 +598,20 @@ class TllmRuntime:
                 self._workload_compile_options.to_json(), facts_json
             )
         )
+        if specialized_options == self._workload_compile_options:
+            return
+        # Publish the runtime facts before workload cold specializers rebuild
+        # immutable, shape-specific static resources. Their refreshed worker
+        # specs and specialization keys must participate in this same epoch.
+        self._workload_compile_options = specialized_options
+        refreshed_resources = False
         for resources in self._native_workload_resources.values():
             if resources.cold_specializer is not None:
                 resources.cold_specializer(spec)
-        if specialized_options != self._workload_compile_options:
-            self._workload_compile_options = specialized_options
-            self._rebuild_workload_compiler()
+                refreshed_resources = True
+        if refreshed_resources:
+            self._refresh_native_worker_specs()
+        self._rebuild_workload_compiler()
 
     @property
     def has_compilable_workloads(self) -> bool:
@@ -541,7 +624,7 @@ class TllmRuntime:
         declarations = tuple(
             declare_workload(workload_instance)
             for workload_instance in self._workloads
-            if self._workload_definition(workload_instance) is not None
+            if self._is_native_workload_declaration(workload_instance)
         )
         self._workload_compiler = (
             None
@@ -1121,7 +1204,17 @@ class TllmRuntime:
                 "TP=1 workload compilation requires identical worker specializations"
             )
         specialized_options = CompileOptions.from_json(normalized_options_json[0])
-        if specialized_options != self._workload_compile_options:
+        specialization = None
+        if timeline_payloads and replies[0].get("specialization") is not None:
+            specialization = _runtime_specialization_spec_from_wire(
+                cast("Mapping[str, object]", replies[0]["specialization"])
+            )
+        if specialization is not None:
+            # The coordinator owns compilation of typed cold artifacts.  The
+            # subsequent worker reconstruction receives only the immutable,
+            # Rust-signed bundle through its refreshed worker spec.
+            self.cold_specialize_workloads(specialization)
+        elif specialized_options != self._workload_compile_options:
             self._workload_compile_options = specialized_options
             self._rebuild_workload_compiler()
         timelines = tuple(

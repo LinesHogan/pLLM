@@ -17,14 +17,15 @@ infer capture from task types, streams, or runtime names. Unsupported
 capability, artifact, or binding is a cold-install rejection.
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, verified GPU correctness covers
-native Dummy and native ESamp exact eager, in-process execution on MRv1 and
-MRv2. The latest short ESamp smoke had `loss_count=6`, `update_count=6`,
+native Dummy, native Recirculation, and native ESamp exact eager, in-process
+execution on MRv1 and MRv2. Recirculation reported typed layer replay with zero
+fallback. The latest short ESamp smoke had `loss_count=6`, `update_count=6`,
 `state_version=6`, and `fallback_count=0`. Native ESamp exact eager Regions
 also passed EngineCore MP correctness on both runners: loss, update,
 state-version, and intervention counters were nonzero, while fallback and
 replay counts were zero. This is not a throughput claim. Model-backed native
-piecewise CUDA Graph execution, real vLLM prefill Recirculation takeover, and
-shape-miss epoch switching remain unverified or incomplete.
+piecewise CUDA Graph execution, Recirculation EngineCore MP/capture integration,
+and shape-miss epoch switching remain unverified or incomplete.
 
 ## The layered stack
 

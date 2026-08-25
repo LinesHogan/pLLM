@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from unittest import mock
 
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.schedule import (
+    BackendObservableEvent,
     CompileOptions,
     ExecutionRegion,
     HiddenPhase,
@@ -97,6 +100,68 @@ def _indexed_hidden_manifest(
 
 
 class ScheduleContractUnitTest(unittest.TestCase):
+    def test_rust_selects_implementation_candidate_from_timeline(self) -> None:
+        timing = TaskTiming(after="model.execute", before="step.end")
+        graph = ScheduleGraph(
+            workload_key="candidate-selection",
+            tasks=(
+                ScheduleTask(
+                    "select",
+                    timing=timing,
+                    implementation_ids=("backend:extern@1", "python:compiled@1"),
+                    implementation_kinds=("extern", "captured"),
+                    implementation_capabilities=(
+                        ("backend/alternate",),
+                        ("backend/default", "torch.export"),
+                    ),
+                    required_capabilities=(),
+                    capture_safe=False,
+                ),
+            ),
+            schema_version=2,
+        )
+
+        # The first candidate is unavailable, so Rust selects the declared
+        # compiled fallback and signs only that implementation into the plan.
+        compiled_timeline = replace(
+            _timeline(),
+            capabilities=tuple(sorted((*_timeline().capabilities, "backend/default"))),
+        )
+        compiled = compile_schedule(
+            graph,
+            compiled_timeline,
+            CompileOptions(memory_budget_bytes=64),
+        )
+        region = compiled.execution_regions[0]
+        self.assertEqual(region.implementation_ids, ("python:compiled@1",))
+        self.assertIs(region.implementation_kind, RegionImplementationKind.COMPILED)
+        self.assertTrue(region.compile_safe)
+        self.assertEqual(region.required_capabilities, ("backend/default",))
+        self.assertEqual(compiled.placements[0].implementation_id, "python:compiled@1")
+
+        # Once both are legal, declaration order is the deterministic tie
+        # breaker and Rust selects the extern implementation instead.
+        extern_timeline = replace(
+            compiled_timeline,
+            capabilities=tuple(
+                sorted((*compiled_timeline.capabilities, "backend/alternate"))
+            ),
+        )
+        extern = compile_schedule(
+            graph,
+            extern_timeline,
+            CompileOptions(memory_budget_bytes=64),
+        )
+        extern_region = extern.execution_regions[0]
+        self.assertEqual(extern_region.implementation_ids, ("backend:extern@1",))
+        self.assertIs(extern_region.implementation_kind, RegionImplementationKind.EXTERN)
+        self.assertFalse(extern_region.compile_safe)
+        self.assertEqual(extern_region.required_capabilities, ("backend/alternate",))
+
+        unavailable = replace(_timeline(), capabilities=())
+        with self.assertRaisesRegex(RuntimeError, "no implementation candidate"):
+            compile_schedule(graph, unavailable, CompileOptions(memory_budget_bytes=64))
+
     def test_graph_v2_rust_cross_checks_python_derived_task_semantics(self) -> None:
         """V2 keeps transition fields only as Rust-verified wire evidence."""
 
@@ -940,7 +1005,6 @@ class ScheduleContractUnitTest(unittest.TestCase):
         base = CompileOptions(
             memory_budget_bytes=64,
             shape_specialization=(("batch", "8"),),
-            compiler_fingerprint="1" * 64,
         )
         changed_shape = replace(
             base, shape_specialization=(("batch", "16"),)
@@ -948,10 +1012,18 @@ class ScheduleContractUnitTest(unittest.TestCase):
         changed_environment = replace(base, compiler_fingerprint="2" * 64)
         eager_policy = replace(base, compile_policy="eager")
 
-        decisions = tuple(
+        first_two = tuple(
             compile_schedule(graph, _timeline(), options)
-            for options in (base, changed_shape, changed_environment)
+            for options in (base, changed_shape)
         )
+        with mock.patch(
+            "tllm.schedule.compiler.compiler_environment_fingerprint",
+            return_value="2" * 64,
+        ):
+            changed_environment_decision = compile_schedule(
+                graph, _timeline(), changed_environment
+            )
+        decisions = (*first_two, changed_environment_decision)
 
         self.assertEqual(len({decision.signature for decision in decisions}), 3)
         self.assertEqual(
@@ -1037,6 +1109,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         region = first.execution_regions[0]
         self.assertTrue(region.capture_safe)
         self.assertIs(region.capture_mode, RegionCaptureMode.REQUIRE)
+        self.assertEqual(first.cost.capture_boundary_count, 1)
         self.assertEqual(first.signature, second.signature)
         self.assertEqual(region.artifact_key, second.execution_regions[0].artifact_key)
         self.assertEqual(
@@ -1052,6 +1125,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
             disabled.execution_regions[0].capture_mode,
             RegionCaptureMode.DISABLED,
         )
+        self.assertEqual(disabled.cost.capture_boundary_count, 0)
         self.assertEqual(
             lower_physical_flow_plan(
                 graph, piecewise, disabled, replace(auto, capture_policy="disabled")
@@ -1072,6 +1146,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
             eager_auto.execution_regions[0].capture_mode,
             RegionCaptureMode.DISABLED,
         )
+        self.assertEqual(eager_auto.cost.capture_boundary_count, 0)
         with self.assertRaisesRegex(RuntimeError, "required Region capture"):
             compile_schedule(graph, eager, replace(auto, capture_policy="require"))
 
@@ -1119,27 +1194,199 @@ class ScheduleContractUnitTest(unittest.TestCase):
             regions=(),
             static_headroom_bytes=64,
         )
-        decision = compile_schedule(
-            graph,
-            timeline,
-            CompileOptions(
+        with mock.patch(
+            "tllm.schedule.compiler.compiler_environment_fingerprint",
+            return_value="1" * 64,
+        ):
+            decision = compile_schedule(
+                graph,
+                timeline,
+                CompileOptions(
+                    memory_budget_bytes=64,
+                    compiler_fingerprint="1" * 64,
+                ),
+            )
+
+        golden = (
+            Path(__file__).with_name("golden") / "schedule_v2_region.json"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(decision.to_json() + "\n", golden)
+        parsed_golden = type(decision).from_json(golden)
+        with mock.patch(
+            "tllm.schedule.compiler.compiler_environment_fingerprint",
+            return_value="1" * 64,
+        ):
+            validate_schedule(graph, timeline, parsed_golden, CompileOptions(
                 memory_budget_bytes=64,
                 compiler_fingerprint="1" * 64,
-            ),
-        )
-
+            ))
         self.assertEqual(
             decision.signature,
-            "7d90c481a6a03e0be54a4febd9b7211835deba43a0ff4cd58c4389886c742a96",
-        )
-        self.assertEqual(
-            decision.execution_regions[0].region_id,
-            "region-0000-f2531aeffc30e24b",
+            "566aac263c7e3108931da7d4702214189ef37f2bb3111ea482218e1545f3a5b5",
         )
         self.assertEqual(
             decision.execution_regions[0].artifact_key,
             "b76b9fe03be8c874d70646d72c1cdb42c2f39da5e1863c9c1fe27ca417d03dba",
         )
+
+    def test_schema_v2_complex_region_signature_golden(self) -> None:
+        """Freeze Rust-owned binder, state, and cross-Region wire records."""
+
+        graph = ScheduleGraph(
+            workload_key="complex-golden",
+            tasks=(
+                ScheduleTask(
+                    "produce",
+                    timing=TaskTiming(
+                        after="model.execute", before="sampler.pre_draw"
+                    ),
+                    implementation_ids=("python:produce@1",),
+                    implementation_capabilities=(("torch.export",),),
+                    required_capabilities=(),
+                    effects=(
+                        ScheduleEffect(
+                            ScheduleEffectKind.STATE_TRANSITION, "optimizer"
+                        ),
+                    ),
+                    outputs=(
+                        ScheduleOutput(
+                            "handoff", ScheduleOutputKind.TEMPORARY, "handoff"
+                        ),
+                    ),
+                ),
+                ScheduleTask(
+                    "bind",
+                    timing=TaskTiming(
+                        after="sampler.pre_draw", before="step.end"
+                    ),
+                    implementation_ids=("test.backend:bind@1",),
+                    implementation_kinds=("extern",),
+                    implementation_capabilities=(("backend/region_binder",),),
+                    required_capabilities=("backend/region_binder",),
+                    inputs=(
+                        ScheduleInput(
+                            "handoff",
+                            ScheduleInputKind.RESULT,
+                            "produce",
+                            "handoff",
+                        ),
+                    ),
+                ),
+            ),
+            edges=(ScheduleEdge("produce", "bind", ScheduleEdgeKind.DATA),),
+            values=(
+                ScheduleValue(
+                    "handoff",
+                    producer="produce",
+                    producer_output="handoff",
+                    consumers=("bind",),
+                    size_bytes=16,
+                ),
+            ),
+            states=(ScheduleState("optimizer", "replica"),),
+            schema_version=2,
+        )
+        timeline = MainWorkloadTimeline(
+            backend_id="complex-golden",
+            backend_version="1",
+            runner_family="mrv2",
+            graph_mode="eager",
+            anchors=(
+                TimelineAnchor(
+                    "model.execute",
+                    0,
+                    backend_events=(BackendObservableEvent.PREPARE_INPUTS_POST,),
+                ),
+                TimelineAnchor(
+                    "sampler.pre_draw",
+                    1,
+                    backend_events=(BackendObservableEvent.SAMPLER_PRE_DRAW,),
+                ),
+                TimelineAnchor(
+                    "step.end",
+                    2,
+                    backend_events=(BackendObservableEvent.SAMPLE_TOKENS_POST,),
+                ),
+            ),
+            regions=(),
+            static_headroom_bytes=64,
+            capabilities=("backend/region_binder", "torch.export"),
+            schema_version=2,
+        )
+        options = CompileOptions(
+            memory_budget_bytes=64,
+            compiler_fingerprint="2" * 64,
+        )
+        with mock.patch(
+            "tllm.schedule.compiler.compiler_environment_fingerprint",
+            return_value="2" * 64,
+        ):
+            decision = compile_schedule(graph, timeline, options)
+            repeated = compile_schedule(graph, timeline, options)
+
+        self.assertEqual(decision.to_json(), repeated.to_json())
+        self.assertEqual(len(decision.execution_regions), 2)
+        self.assertTrue(
+            any(
+                region.implementation_kind is RegionImplementationKind.EXTERN
+                and "backend/region_binder" in region.required_capabilities
+                for region in decision.execution_regions
+            )
+        )
+        self.assertTrue(
+            any(
+                effect.kind is ScheduleEffectKind.STATE_TRANSITION
+                and effect.resource == "optimizer"
+                for region in decision.execution_regions
+                for effect in region.effects
+            )
+        )
+        self.assertEqual(len(decision.materializations), 1)
+        materialization = decision.materializations[0]
+        self.assertEqual(materialization.value_id, "handoff")
+        self.assertEqual(materialization.size_bytes, 16)
+        self.assertEqual(
+            (
+                materialization.producer_region,
+                materialization.consumer_region,
+            ),
+            (
+                decision.execution_regions[0].region_id,
+                decision.execution_regions[1].region_id,
+            ),
+        )
+        self.assertEqual(len(decision.fences), 1)
+        self.assertEqual(
+            (decision.fences[0].source, decision.fences[0].target),
+            (
+                decision.execution_regions[0].region_id,
+                decision.execution_regions[1].region_id,
+            ),
+        )
+        binder_stages = tuple(
+            stage
+            for advance in decision.runtime_advance_plan
+            for stage in advance.backend_region_binder_stages
+        )
+        self.assertEqual(len(binder_stages), 1)
+        self.assertEqual(
+            binder_stages[0].implementation_id, "test.backend:bind@1"
+        )
+        self.assertIs(
+            binder_stages[0].backend_event, BackendObservableEvent.SAMPLER_PRE_DRAW
+        )
+
+        golden = (
+            Path(__file__).with_name("golden") / "schedule_v2_complex_region.json"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(decision.to_json() + "\n", golden)
+        parsed_golden = type(decision).from_json(golden)
+        self.assertEqual(parsed_golden, decision)
+        with mock.patch(
+            "tllm.schedule.compiler.compiler_environment_fingerprint",
+            return_value="2" * 64,
+        ):
+            validate_schedule(graph, timeline, parsed_golden, options)
 
     def test_memory_budget_is_a_hard_constraint(self) -> None:
         graph = ScheduleGraph(

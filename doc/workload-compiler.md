@@ -194,24 +194,25 @@ rejects Regions with state effects, so the stateful ESamp `predict_and_loss` /
 model-backed native piecewise CUDA Graph path remains unverified and
 incomplete. These are capability boundaries, not throughput claims.
 
-Recirculation has a separate native Region declaration only for an explicitly
-published, finite CPU `RecirculationExecutionRequest`. It owns the exact
-serial or proven ordered-row wavefront recurrence and returns the explicit
-result sink; it has no legacy adapter because the request is wholly Region
-owned. The current backend timeline provides no prefill row/model-Region
-binding, so using this declaration as an implicit real-vLLM prefill feature
-fails closed at the missing request provider. It must not be described as
-taking over vLLM prefill.
+Recirculation has two complete native Region declarations. The standalone
+declaration consumes an explicitly published, finite CPU
+`RecirculationExecutionRequest`; it owns the exact Rust-signed recurrence and
+returns an explicit result sink. The experimental vLLM declaration binds a
+Rust-signed typed recurrence stage at `Before("model.execute")` through
+`BackendRegionBinderSlot`. Its row admission, grouping, operation order,
+operands, effects, and `release_after` all come from Rust artifacts; the Python
+backend adapter only binds layer-replay resources. The eager MRv1/MRv2 GPU
+smokes exercise this native prefill path successfully. CUDA Graph, EngineCore
+MP, decode recurrence, speculative decoding, PP/DP, and general model-family
+support remain outside its verified boundary.
 
-Separately, the retained eager vLLM model-region adapter has correctness-only
-MRv1/MRv2 evidence against its serial oracle: both runners selected the same
-token, with maximum BF16 logit difference `0.15625` and minimum cosine
-similarity `0.99995947`. This validates the adapter's wavefront arithmetic; it
-does not turn that adapter into the native prefill takeover described above.
+The older eager vLLM model-region adapter remains only as a numerical oracle and
+compatibility fixture. Its MRv1/MRv2 comparison selected the same token, with
+maximum BF16 logit difference `0.15625` and minimum cosine similarity
+`0.99995947`; it does not own the native physical plan.
 
-All remaining workloads other than the native ESamp, finite-request
-Recirculation, and Dummy declarations retain a complete legacy consumer or
-sidecar adapter.
+All remaining workloads other than native ESamp, standalone and vLLM
+Recirculation, and Dummy retain a complete legacy consumer or sidecar adapter.
 There is no partially authoritative native execution: a workload reaches
 physical takeover only when its complete resource, binding, specialization,
 and artifact contract is available; otherwise its existing adapter remains
@@ -231,15 +232,16 @@ values are likewise rejected instead of being ignored.
 ## Current verification boundary
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, short GPU correctness smokes
-cover the generic native Dummy and native ESamp declarations in exact eager,
-in-process MRv1 and MRv2. The latest ESamp run recorded `loss_count=6`,
+cover the generic native Dummy, native Recirculation vLLM prefill, and native
+ESamp declarations in exact eager, in-process MRv1 and MRv2. Recirculation
+reported typed layer replay with zero fallback. The latest ESamp run recorded `loss_count=6`,
 `update_count=6`, `state_version=6`, and `fallback_count=0`. Native ESamp
 exact eager Regions also passed EngineCore MP correctness on both runners:
 loss, update, state-version, and intervention counters were nonzero, with
 `fallback_count=0` and `replay_count=0`. These establish execution and
 state/sampler activity, not performance. The model-backed native piecewise
-CUDA Graph path, real native Recirculation vLLM prefill takeover, and
-shape-miss specialization epoch switching remain unverified or incomplete.
+CUDA Graph path, Recirculation EngineCore MP/capture integration, and shape-miss
+specialization epoch switching remain unverified or incomplete.
 Throughput experiments are not claimed here.
 
 Generic multi-task/value eager Region execution, signed internal task

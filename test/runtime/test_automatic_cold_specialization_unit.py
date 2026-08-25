@@ -126,6 +126,7 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
         runner = SimpleNamespace(
             model_config=model_config,
             max_num_reqs=6,
+            max_num_tokens=32,
             device=torch.device("cpu"),
             enforce_eager=True,
             sampler=None,
@@ -162,8 +163,25 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
                 hidden_size=8,
                 dtype=torch.float16,
                 device=torch.device("cpu"),
+                max_prefill_tokens=32,
             ),
         )
+
+    def test_vllm_cold_specialization_rejects_missing_prefill_capacity(self) -> None:
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(
+                dtype=torch.float16,
+                get_hidden_size=lambda: 8,
+            ),
+            max_num_reqs=6,
+            device=torch.device("cpu"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "max_num_tokens"):
+            v027_mrv2.cold_specialize_loaded_runtime(
+                core=residual_runtime,
+                runner=runner,
+            )
 
     def test_enabled_esamp_is_cold_specialized_and_physically_staged_before_first_token(self) -> None:
         consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=4), engine=mock.Mock())

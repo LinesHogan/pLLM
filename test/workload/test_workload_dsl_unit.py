@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 from unittest import mock
 
@@ -410,10 +411,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
             regions=(),
             static_headroom_bytes=64,
         )
-        options = CompileOptions(
-            memory_budget_bytes=64,
-            compiler_fingerprint="1" * 64,
-        )
+        options = CompileOptions(memory_budget_bytes=64)
         compilation = WorkloadCompilerCoordinator(
             (declaration,), options=options
         ).compile(timeline)
@@ -487,10 +485,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
             regions=(),
             static_headroom_bytes=64,
         )
-        options = CompileOptions(
-            memory_budget_bytes=64,
-            compiler_fingerprint="1" * 64,
-        )
+        options = CompileOptions(memory_budget_bytes=64)
         compilation = WorkloadCompilerCoordinator(
             (declaration,), options=options
         ).compile(timeline)
@@ -509,6 +504,81 @@ class WorkloadDslUnitTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "artifact coverage mismatch"):
             RegionArtifactRegistry(compilation.decision, ())
+
+    def test_signed_implementation_id_selects_its_registered_callable(self) -> None:
+        first = ExternImplementation(
+            namespace="test.candidate",
+            name="first",
+            input_types=("object",),
+            output_types=("object",),
+            capabilities=("candidate/first",),
+        )
+        second = ExternImplementation(
+            namespace="test.candidate",
+            name="second",
+            input_types=("object",),
+            output_types=("object",),
+            capabilities=("candidate/second",),
+        )
+
+        @workload(id="region.signed-candidate")
+        class Alternatives:
+            @task(
+                inputs={"value": provided("value")},
+                outputs={"result": sink("result")},
+                timing=Between("model.execute", "step.end"),
+                implementation=(first, second),
+            )
+            def transform(self, value: object) -> object:
+                return value
+
+        registry = ExecutorRegistry()
+        registry.register(first, lambda value: f"first:{value}")
+        registry.register(second, lambda value: f"second:{value}")
+        declaration = declare_workload(
+            Alternatives(), executor_registry=registry
+        )
+        timeline = MainWorkloadTimeline(
+            backend_id="vllm",
+            backend_version="0.27.1",
+            runner_family="mrv2",
+            graph_mode="eager",
+            anchors=(
+                TimelineAnchor("model.execute", 0),
+                TimelineAnchor("step.end", 1),
+            ),
+            regions=(),
+            static_headroom_bytes=64,
+            capabilities=("candidate/second",),
+        )
+        options = CompileOptions(memory_budget_bytes=64)
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,), options=options
+        ).compile(timeline)
+        region = compilation.decision.execution_regions[0]
+
+        self.assertEqual(region.implementation_ids, (second.key,))
+        artifact = materialize_region_artifacts(
+            (declaration,), compilation.decision, compilation.options
+        )[0]
+        self.assertEqual(
+            artifact.execute({artifact.input_bindings[0].binding_id: "value"}),
+            {artifact.output_bindings[0].binding_id: "second:value"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "unavailable local implementation"):
+            materialize_region_artifacts(
+                (declaration,),
+                replace(
+                    compilation.decision,
+                    execution_regions=(
+                        replace(
+                            region,
+                            implementation_ids=("test.candidate:unknown@1",),
+                        ),
+                    ),
+                ),
+                compilation.options,
+            )
 
 
 if __name__ == "__main__":

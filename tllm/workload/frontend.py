@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from functools import wraps
 from types import FunctionType
 from typing import Any, ParamSpec, TypeVar, cast, get_type_hints, overload
@@ -574,10 +575,18 @@ def task(
     return decorate if function is None else decorate(function)
 
 
+class WorkloadAuthority(str, Enum):
+    """The execution runtime explicitly authorized for a declaration."""
+
+    NATIVE_REGION = "native_region"
+    LEGACY_ADAPTER = "legacy_adapter"
+
+
 @dataclass(frozen=True, slots=True)
 class WorkloadDefinition:
     workload_id: str
     approximation: ApproximationPolicy
+    authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,12 +594,27 @@ class WorkloadDeclaration:
     ir: WorkloadIR
     instance: object
     executors: tuple[tuple[str, Callable[..., object]], ...]
+    authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION
+    implementation_executors: tuple[
+        tuple[str, str, Callable[..., object]], ...
+    ] = ()
 
-    def executor(self, task_name: str) -> Callable[..., object]:
-        for name, executor in self.executors:
-            if name == task_name:
+    def executor(
+        self,
+        task_name: str,
+        implementation_id: str | None = None,
+    ) -> Callable[..., object]:
+        """Return the callable declared for one exact task implementation."""
+
+        if implementation_id is None:
+            for name, executor in self.executors:
+                if name == task_name:
+                    return executor
+            raise KeyError(task_name)
+        for name, key, executor in self.implementation_executors:
+            if name == task_name and key == implementation_id:
                 return executor
-        raise KeyError(task_name)
+        raise KeyError((task_name, implementation_id))
 
 
 def workload(
@@ -599,12 +623,17 @@ def workload(
     *,
     id: str | None = None,
     approximation: ApproximationPolicy = ApproximationPolicy.EXACT,
+    authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION,
 ) -> type[_T] | Callable[[type[_T]], type[_T]]:
     def decorate(target: type[_T]) -> type[_T]:
         if not isinstance(target, type):
             raise TypeError("workload must decorate a class")
         workload_id = id or f"{target.__module__}.{target.__qualname__}"
-        definition = WorkloadDefinition(_name(workload_id, "workload.id"), ApproximationPolicy(approximation))
+        definition = WorkloadDefinition(
+            _name(workload_id, "workload.id"),
+            ApproximationPolicy(approximation),
+            WorkloadAuthority(authority),
+        )
         setattr(target, "__tllm_workload__", definition)
         # Validate at class definition time without constructing an instance.
         _build_ir(target, definition)
@@ -776,9 +805,17 @@ def _build_ir(cls: type[object], definition: WorkloadDefinition) -> WorkloadIR:
     )
 
 
-def declare_workload(instance: object) -> WorkloadDeclaration:
+def declare_workload(
+    instance: object,
+    *,
+    executor_registry: ExecutorRegistry | None = None,
+) -> WorkloadDeclaration:
     if isinstance(instance, type):
         raise TypeError("declare_workload expects a workload instance")
+    if executor_registry is not None and not isinstance(
+        executor_registry, ExecutorRegistry
+    ):
+        raise TypeError("executor_registry must be ExecutorRegistry or None")
     try:
         definition = type(instance).__tllm_workload__  # type: ignore[attr-defined]
     except AttributeError:
@@ -786,8 +823,30 @@ def declare_workload(instance: object) -> WorkloadDeclaration:
     if not isinstance(definition, WorkloadDefinition):
         raise TypeError("instance class is not decorated with @workload")
     ir = _build_ir(type(instance), definition)
-    executors = tuple((task.name, getattr(instance, task.name)) for task in ir.tasks)
-    return WorkloadDeclaration(ir=ir, instance=instance, executors=executors)
+    executors: list[tuple[str, Callable[..., object]]] = []
+    implementation_executors: list[tuple[str, str, Callable[..., object]]] = []
+    for task in ir.tasks:
+        default_executor = getattr(instance, task.name)
+        if not callable(default_executor):
+            raise TypeError(f"workload task {task.name!r} is not callable")
+        executors.append((task.name, default_executor))
+        for implementation in task.implementations:
+            executor = default_executor
+            if (
+                executor_registry is not None
+                and implementation.kind is ImplementationKind.EXTERN
+            ):
+                executor = executor_registry.resolve(implementation.key)
+            implementation_executors.append(
+                (task.name, implementation.key, executor)
+            )
+    return WorkloadDeclaration(
+        ir=ir,
+        instance=instance,
+        executors=tuple(executors),
+        authority=definition.authority,
+        implementation_executors=tuple(implementation_executors),
+    )
 
 
 __all__ = [
@@ -805,6 +864,7 @@ __all__ = [
     "State",
     "StateEffect",
     "WorkloadDeclaration",
+    "WorkloadAuthority",
     "current",
     "declare_workload",
     "hidden",

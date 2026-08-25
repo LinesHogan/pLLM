@@ -216,6 +216,7 @@ class ESampRegionUnitTest(unittest.TestCase):
         extension.model_runner = mock.Mock(
             device=torch.device("cpu"),
             max_num_reqs=2,
+            max_num_tokens=16,
             model_config=mock.Mock(
                 dtype=torch.float32,
                 get_hidden_size=mock.Mock(return_value=4),

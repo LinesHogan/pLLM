@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
+from tllm.backends.vllm import module_weight_overlay
 from tllm.backends.protocol import OrderedRowFusionCapabilities
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
@@ -18,14 +21,19 @@ from tllm.consumers.recirculation import (
 )
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.runtime import residual_runtime
-from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
+from tllm.runtime.backend_region_binders import (
+    BackendRegionBinderSlot,
+    BackendRegionStageContext,
+)
 from tllm.runtime.runtime import TllmRuntime
+from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_plugins import (
     WorkloadWorkerSpec,
     static_backend_binding_manifest_wire,
 )
 from tllm.schedule import BackendObservableEvent, RegionImplementationKind
+from tllm.consumers.recirculation import vllm_region_workload
 
 
 def _runtime() -> tuple[TllmRuntime, VllmRecirculationRegionWorkload]:
@@ -42,6 +50,17 @@ def _timeline():
         V027MRv2Driver().capabilities(),
         graph_mode="eager",
         static_headroom_bytes=1 << 20,
+    )
+
+
+def _cold_spec() -> RuntimeSpecializationSpec:
+    return RuntimeSpecializationSpec(
+        rows=2,
+        hidden_size=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        model_layer_count=3,
+        max_prefill_tokens=2,
     )
 
 
@@ -183,12 +202,10 @@ def test_signed_region_consumes_staged_plan_and_invokes_backend_once() -> None:
     compilation = runtime.compile_workloads(_timeline())
     state = ResidualRuntimeState()
     calls: list[tuple[object, object, int]] = []
-    plan = "canonical-rust-prefill-plan"
+    plan = "canonical-typed-recurrence-stage"
     workload.binder.stage(
         plan,
-        lambda staged, inputs, step: calls.append(
-            (staged, inputs["config"], step)
-        ),
+        lambda staged, inputs, step: calls.append((staged, inputs, step)),
         7,
     )
 
@@ -204,4 +221,171 @@ def test_signed_region_consumes_staged_plan_and_invokes_backend_once() -> None:
         assert execution.executor.stats.execute_count == 1
         assert execution.retained_value_count == 0
 
-    assert calls == [(plan, workload.binding_config, 7)]
+    assert calls == [(plan, {}, 7)]
+
+
+def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() -> None:
+    """The hook may bind signed facts, but cannot reconstruct a recurrence."""
+
+    workload = VllmRecirculationRegionWorkload(
+        RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
+    )
+    workload.native_workload_resources().cold_specializer(_cold_spec())
+
+    columns = module_weight_overlay.PackedRowPlanInputs(
+        request_ids=("request-0",),
+        scheduled_tokens=(2,),
+        prompt_tokens=(2,),
+        computed_tokens=(0,),
+    )
+    handle = SimpleNamespace(
+        binding=SimpleNamespace(
+            driver=SimpleNamespace(
+                fast_weight_packed_row_plan_inputs=lambda **_kwargs: columns
+            )
+        ),
+        prepare=mock.Mock(),
+    )
+    context = BackendRegionStageContext(
+        implementation_id=PREFILL_BINDER_IMPLEMENTATION_ID,
+        backend_event="prepare_inputs.post",
+        region_id="region-test",
+        slot=workload.binder,
+        runtime=object(),
+        runner=object(),
+        step_id=9,
+        num_scheduled_tokens=(2,),
+        input_batch=object(),
+    )
+
+    with (
+        mock.patch.object(
+            vllm_region_workload,
+            "build_recirculation_graph",
+            side_effect=AssertionError("hook rebuilt a Recirculation graph"),
+        ),
+        mock.patch.object(
+            vllm_region_workload._core,
+            "compile_typed_recurrence_plan",
+            side_effect=AssertionError("hook compiled a typed recurrence plan"),
+        ),
+        mock.patch.object(
+            vllm_region_workload,
+            "install_typed_layer_replay",
+            return_value=handle,
+        ),
+    ):
+        workload.binder.stage_from_backend(context)
+        workload.binder.invoke(9)
+
+    prepared = handle.prepare.call_args.args[0]
+    assert prepared.total_rows == 2
+    assert tuple(request.request_id for request in prepared.requests) == ("request-0",)
+
+
+def test_worker_reconstruction_loads_signed_artifact_without_any_compile() -> None:
+    coordinator = VllmRecirculationRegionWorkload(
+        RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
+    )
+    coordinator.native_workload_resources().cold_specializer(_cold_spec())
+    spec = coordinator.native_workload_resources().worker_spec
+    assert spec is not None
+    expected_signature = coordinator.native_workload_resources().specialization_key[
+        "stage_artifact_bundle"
+    ]
+
+    with (
+        mock.patch.object(
+            vllm_region_workload,
+            "build_recirculation_graph",
+            side_effect=AssertionError("worker rebuilt a Recirculation graph"),
+        ),
+        mock.patch.object(
+            vllm_region_workload._core,
+            "compile_typed_recurrence_plan",
+            side_effect=AssertionError("worker compiled a typed recurrence plan"),
+        ),
+        mock.patch.object(
+            vllm_region_workload._core,
+            "compile_typed_recurrence_stage_artifact_json",
+            side_effect=AssertionError("worker compiled a stage artifact"),
+        ),
+        mock.patch.object(
+            vllm_region_workload._core,
+            "load_typed_recurrence_stage_artifact_bundle",
+            wraps=vllm_region_workload._core.load_typed_recurrence_stage_artifact_bundle,
+        ) as load_bundle,
+    ):
+        rebuilt = vllm_region_workload.reconstruct_vllm_recirculation_region_workload(
+            spec.config
+        )
+
+    assert load_bundle.call_count == 1
+    assert rebuilt.specialization_key["stage_artifact_bundle"] == expected_signature
+
+
+def test_runtime_row_shape_miss_fails_closed_without_hook_compilation() -> None:
+    workload = VllmRecirculationRegionWorkload(
+        RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
+    )
+    workload.native_workload_resources().cold_specializer(_cold_spec())
+    columns = module_weight_overlay.PackedRowPlanInputs(
+        request_ids=("request-0",),
+        scheduled_tokens=(3,),
+        prompt_tokens=(3,),
+        computed_tokens=(0,),
+    )
+    handle = SimpleNamespace(
+        binding=SimpleNamespace(
+            driver=SimpleNamespace(
+                fast_weight_packed_row_plan_inputs=lambda **_kwargs: columns
+            )
+        )
+    )
+    context = BackendRegionStageContext(
+        implementation_id=PREFILL_BINDER_IMPLEMENTATION_ID,
+        backend_event="prepare_inputs.post",
+        region_id="region-test",
+        slot=workload.binder,
+        runtime=object(),
+        runner=object(),
+        step_id=10,
+        num_scheduled_tokens=(3,),
+        input_batch=object(),
+    )
+
+    with (
+        mock.patch.object(
+            vllm_region_workload,
+            "build_recirculation_graph",
+            side_effect=AssertionError("shape miss rebuilt a Recirculation graph"),
+        ),
+        mock.patch.object(
+            vllm_region_workload._core,
+            "compile_typed_recurrence_plan",
+            side_effect=AssertionError("shape miss compiled a typed recurrence plan"),
+        ),
+        mock.patch.object(
+            vllm_region_workload,
+            "install_typed_layer_replay",
+            return_value=handle,
+        ),
+        mock.patch.object(vllm_region_workload, "restore_typed_layer_replay"),
+        pytest.raises(RuntimeError, match="specialization-required"),
+    ):
+        workload.binder.stage_from_backend(context)
+
+
+def test_worker_reconstruction_rejects_missing_signed_stage_artifact() -> None:
+    with pytest.raises(RuntimeError, match="requires a signed cold artifact bundle"):
+        vllm_region_workload.reconstruct_vllm_recirculation_region_workload(
+            {
+                "source_layer": 1,
+                "destination_layer": 0,
+                "alpha": 0.2,
+                "beta": None,
+                "ramp_tokens": 0,
+                "consumer_id": "recirculation",
+                "enabled": True,
+            }
+        )

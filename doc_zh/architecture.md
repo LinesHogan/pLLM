@@ -12,12 +12,13 @@ Region 内依赖是普通 FX/Tensor/CUDA-Graph 边。
 capture 行为（`disabled` 或 `require`）；Python 不会从 task 类型、stream 或运行期名称推断
 capture。缺 capability、artifact 或 binding 会在 cold install 时拒绝。
 
-在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，GPU 正确性已验证 native Dummy 与 native
-ESamp 的 exact eager in-process 执行，二者均通过 MRv1/MRv2。最新 ESamp 短 smoke：
+在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，GPU 正确性已验证 native Dummy、native
+Recirculation 与 native ESamp 的 exact eager in-process 执行，均通过 MRv1/MRv2。
+Recirculation 观察到 typed layer replay 且 fallback 为零。最新 ESamp 短 smoke：
 `loss_count=6`、`update_count=6`、`state_version=6`、`fallback_count=0`。native ESamp exact
 eager Region 还通过了两种 runner 的 EngineCore MP 正确性：loss、update、state-version、
 intervention 均非零，fallback/replay 均为零。这不是吞吐结论；model-backed native piecewise
-CUDA Graph、真实 vLLM prefill Recirculation 接管和 shape-miss epoch switching 仍未验证或未完成。
+CUDA Graph、Recirculation EngineCore MP/capture 集成和 shape-miss epoch switching 仍未验证或未完成。
 
 ## 分层结构
 

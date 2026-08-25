@@ -31,16 +31,11 @@ def test_model_region_stages_the_signed_binder_at_its_signed_event() -> None:
             context.step_id,
         )
 
-    slot = BackendRegionBinderSlot(
-        implementation_id,
-    )
+    slot = BackendRegionBinderSlot(implementation_id, backend_stager=stage)
     runtime = SimpleNamespace(
         event_step_id=19,
         dispatch_plan=None,
         model_region_binding=None,
-        backend_region_stager_registry=BackendRegionStagerRegistry(
-            {implementation_id: stage}
-        ),
         workload_execution=SimpleNamespace(
             backend_region_binders={implementation_id: slot},
             backend_region_binder_stages=lambda event: (
@@ -177,4 +172,5 @@ def test_model_region_rejects_a_coercible_backend_step_id() -> None:
             runtime=runtime,
             runner=object(),
             num_scheduled_tokens=None,
+            step_id=True,
         )

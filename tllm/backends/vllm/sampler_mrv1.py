@@ -11,7 +11,7 @@
 * min-p is a native argmax-invariant logits processor, so tLLM no longer
   patches ``InputBatch``/``SamplingMetadata``; the processor runs inside the
   wrapped ``sample`` before the bridge sees the logits, which keeps the
-  ESamp "filter first, intervene on survivors" semantics intact (min-p,
+  declared "filter first, intervene on survivors" semantics intact (min-p,
   top-k and top-p masking commute).
 
 The wrapper mirrors the upstream ``Sampler.sample`` control flow exactly so
@@ -33,12 +33,6 @@ from tllm.runtime.vllm_patch.sampler_patch import (
 )
 
 _SAMPLING_EPS = 1e-5
-
-
-def _unwrap_sampled(result: Any) -> torch.Tensor:
-    if isinstance(result, tuple):
-        return result[0]
-    return result
 
 
 def _processed_logprobs_for_mode(
@@ -111,49 +105,6 @@ def _standard_completion(
     return sampled, processed
 
 
-def _maybe_sample_precomputed_dense_fast(
-    *,
-    runtime: Any,
-    runner: Any,
-    provider: Any,
-    sampler: Any,
-    logits: torch.Tensor,
-    sampling_metadata: Any,
-    greedy_sampled: torch.Tensor | None,
-) -> torch.Tensor | None:
-    if greedy_sampled is not None:
-        return None
-    if bool(getattr(sampling_metadata, "generators", {})):
-        return None
-    cache = runtime.sampler_precompute.cache_for_step(int(getattr(runtime, "event_step_id", -2)))
-    if cache is None or not bool(cache.all_rows):
-        return None
-    dense = cache.dense_logits
-    if dense is None:
-        return None
-    beta = float(getattr(getattr(provider, "config", None), "distiller_beta", 0.0) or 0.0)
-    if beta == 0.0:
-        return None
-    backend = str(getattr(getattr(provider, "config", None), "distiller_sampler_backend", "") or "")
-    if backend != "pre_filter_dense":
-        return None
-    event = getattr(runtime.sampler_precompute, "event", None)
-    if event is not None and logits.device.type == "cuda":
-        torch.cuda.current_stream(device=logits.device).wait_event(event)
-    dispatch_sampler_pre_draw(runtime=runtime, runner=runner, device=logits.device)
-    dense = dense.to(device=logits.device, dtype=logits.dtype)
-    logits.mul_(1.0 + beta)
-    logits.add_(dense, alpha=-beta)
-    return _unwrap_sampled(
-        sampler.topk_topp_sampler(
-            logits,
-            sampling_metadata.generators,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
-        )
-    ).to(dtype=torch.long)
-
-
 def wrapped_sampler_sample_v027(
     *,
     sampler: Any,
@@ -183,37 +134,26 @@ def wrapped_sampler_sample_v027(
             logits = processor.apply(logits)
 
     modified_logits = logits
-    sampled: torch.Tensor | None = _maybe_sample_precomputed_dense_fast(
+    view = build_sampler_step_view(
         runtime=runtime,
         runner=runner,
-        provider=provider,
+        model=getattr(runner, "model", None),
+        logits=logits,
+        sampling_metadata=sampling_metadata,
+    )
+    sampled = sample_with_optional_modifier(
         sampler=sampler,
         logits=logits,
         sampling_metadata=sampling_metadata,
+        view=view,
+        provider=provider,
         greedy_sampled=greedy_sampled,
-    )
-    view = None
-    if sampled is None:
-        view = build_sampler_step_view(
+        before_draw=lambda: dispatch_sampler_pre_draw(
             runtime=runtime,
             runner=runner,
-            model=getattr(runner, "model", None),
-            logits=logits,
-            sampling_metadata=sampling_metadata,
-        )
-        sampled = sample_with_optional_modifier(
-            sampler=sampler,
-            logits=logits,
-            sampling_metadata=sampling_metadata,
-            view=view,
-            provider=provider,
-            greedy_sampled=greedy_sampled,
-            before_draw=lambda: dispatch_sampler_pre_draw(
-                runtime=runtime,
-                runner=runner,
-                device=logits.device,
-            ),
-        )
+            device=logits.device,
+        ),
+    )
 
     if sampled is None:
         # No candidate state: finish with the unmodified upstream algorithm.

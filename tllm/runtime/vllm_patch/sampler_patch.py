@@ -147,50 +147,6 @@ def _vanilla_sample(*, sampler: Any, logits: torch.Tensor, sampling_metadata: An
     ).to(dtype=torch.long)
 
 
-def _maybe_sample_precomputed_dense_fast(
-    *,
-    runtime: Any,
-    runner: Any,
-    provider: Any,
-    sampler: Any,
-    logits: torch.Tensor,
-    sampling_metadata: Any,
-    greedy_sampled: torch.Tensor | None,
-) -> torch.Tensor | None:
-    with maybe_record_function("distiller.precomputed_dense_fast_path"):
-        if greedy_sampled is not None:
-            return None
-        if bool(getattr(sampling_metadata, "generators", {})):
-            return None
-        cache = runtime.sampler_precompute.cache_for_step(int(getattr(runtime, "event_step_id", -2)))
-        if cache is None:
-            return None
-        if not bool(cache.all_rows):
-            return None
-        dense = cache.dense_logits
-        if dense is None:
-            return None
-        beta = float(getattr(getattr(provider, "config", None), "distiller_beta", 0.0) or 0.0)
-        if beta == 0.0:
-            return None
-        backend = str(getattr(getattr(provider, "config", None), "distiller_sampler_backend", "") or "")
-        if backend != "pre_filter_dense":
-            return None
-        event = getattr(runtime.sampler_precompute, "event", None)
-        if event is not None and logits.device.type == "cuda":
-            torch.cuda.current_stream(device=logits.device).wait_event(event)
-        dispatch_sampler_pre_draw(runtime=runtime, runner=runner, device=logits.device)
-        dense = dense.to(device=logits.device, dtype=logits.dtype)
-        logits.mul_(1.0 + beta)
-        logits.add_(dense, alpha=-beta)
-        return sampler.topk_topp_sampler(
-            logits,
-            sampling_metadata.generators,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
-        ).to(dtype=torch.long)
-
-
 def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metadata: Any) -> torch.Tensor:
     runtime = getattr(sampler, "_tllm_runtime", None)
     runner = getattr(sampler, "_tllm_runner", None)
@@ -212,18 +168,6 @@ def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metad
     logits_for_sampling = logits if temperature is None else sampler.apply_temperature(logits, temperature)
     for processor in sampling_metadata.logitsprocs.argmax_invariant:
         logits_for_sampling = processor.apply(logits_for_sampling)
-
-    fast_sampled = _maybe_sample_precomputed_dense_fast(
-        runtime=runtime,
-        runner=runner,
-        provider=provider,
-        sampler=sampler,
-        logits=logits_for_sampling,
-        sampling_metadata=sampling_metadata,
-        greedy_sampled=greedy_sampled,
-    )
-    if fast_sampled is not None:
-        return fast_sampled
 
     view = build_sampler_step_view(
         runtime=runtime,

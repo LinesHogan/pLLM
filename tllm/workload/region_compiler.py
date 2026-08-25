@@ -138,7 +138,16 @@ class RegionArtifactRegistry:
 @dataclass(frozen=True, slots=True)
 class _TaskBinding:
     task_id: str
-    executor: Callable[..., object]
+    executors: Mapping[str, Callable[..., object]]
+
+    def executor(self, implementation_id: str) -> Callable[..., object]:
+        try:
+            return self.executors[implementation_id]
+        except KeyError as exc:
+            raise RuntimeError(
+                "ExecutionRegion references an unavailable local implementation "
+                f"for task {self.task_id!r}: {implementation_id!r}"
+            ) from exc
 
 
 def _task_bindings(
@@ -163,9 +172,24 @@ def _task_bindings(
             task_id = qualify(task.name)
             if task_id in bindings:
                 raise ValueError(f"duplicate Region task binding {task_id!r}")
+            executors: dict[str, Callable[..., object]] = {}
+            for implementation in task.implementations:
+                try:
+                    executor = declaration.executor(task.name, implementation.key)
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "WorkloadDeclaration is missing a callable for task "
+                        f"{task_id!r}, implementation {implementation.key!r}"
+                    ) from exc
+                if implementation.key in executors:
+                    raise RuntimeError(
+                        "WorkloadDeclaration has duplicate implementation binding "
+                        f"for task {task_id!r}: {implementation.key!r}"
+                    )
+                executors[implementation.key] = executor
             bindings[task_id] = _TaskBinding(
                 task_id=task_id,
-                executor=declaration.executor(task.name),
+                executors=MappingProxyType(executors),
             )
     return bindings
 
@@ -246,8 +270,15 @@ def materialize_region_callable(
     bindings = _task_bindings(declarations)
     try:
         region_bindings = tuple(
-            (invocation, bindings[invocation.task_id])
-            for invocation in region.task_invocations
+            (
+                invocation,
+                bindings[invocation.task_id].executor(implementation_id),
+            )
+            for invocation, implementation_id in zip(
+                region.task_invocations,
+                region.implementation_ids,
+                strict=True,
+            )
         )
     except KeyError as exc:
         raise RuntimeError(
@@ -264,7 +295,7 @@ def materialize_region_callable(
                 f"ExecutionRegion {region.region_id!r} expected {len(input_keys)} inputs"
             )
         values_by_binding = dict(zip(input_keys, external, strict=True))
-        for invocation, binding in region_bindings:
+        for invocation, executor in region_bindings:
             try:
                 arguments = {
                     task_input.port_name: values_by_binding[
@@ -277,7 +308,7 @@ def materialize_region_callable(
                     "signed ExecutionRegion task invocation references an "
                     f"unavailable value binding {exc.args[0]!r}"
                 ) from exc
-            result = binding.executor(**arguments)
+            result = executor(**arguments)
             task_values = _normalize_task_outputs(invocation, result)
             for output, value in zip(
                 invocation.outputs, task_values, strict=True

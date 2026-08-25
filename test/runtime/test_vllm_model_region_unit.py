@@ -23,6 +23,7 @@ from tllm.backends.vllm.model_region import (
     restore_model_region_executors,
     stage_signed_backend_region_event,
 )
+from tllm.backends.vllm.typed_layer_replay import VllmTypedLayerReplayHandle
 from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
 from tllm.consumers.recirculation import (
@@ -31,10 +32,12 @@ from tllm.consumers.recirculation import (
     RecirculationConsumer,
     VllmRecirculationRegionWorkload,
 )
+from tllm.consumers.recirculation import vllm_region_workload
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
+from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.schedule import BackendObservableEvent, BackendRegionBinderStage
 from tllm.runtime.workload_execution import BackendObservableEvent
@@ -178,12 +181,20 @@ def _native_recirculation_runtime() -> tuple[
     workload = VllmRecirculationRegionWorkload(
         RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
     )
-    return (
-        TllmRuntime(
-            workloads=(workload,), workload_memory_budget_bytes=1 << 20
-        ),
-        workload,
+    runtime = TllmRuntime(
+        workloads=(workload,), workload_memory_budget_bytes=1 << 20
     )
+    runtime.cold_specialize_workloads(
+        RuntimeSpecializationSpec(
+            rows=2,
+            hidden_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            model_layer_count=3,
+            max_prefill_tokens=4,
+        )
+    )
+    return runtime, workload
 
 
 def _publish_native_recirculation_step(
@@ -418,29 +429,44 @@ def test_native_prefill_binder_stages_without_reading_legacy_dispatch_plan(
         ),
     )
     staged = workload.binder.plan_for_step(7)
-    assert isinstance(staged, _core.RecirculationPrefillPlan)
+    assert len(staged.requests) == 1
+    assert isinstance(staged.requests[0].bound_stage, _core.TypedBoundRecurrenceStage)
 
 
-def test_native_prefill_plan_does_not_coerce_request_identity_before_rust_ffi() -> None:
-    """The typed Rust boundary, rather than ``str()``, owns request identity."""
+def test_native_typed_stage_does_not_coerce_request_identity() -> None:
+    """The native boundary rejects an opaque request ID without ``str()``."""
 
     class _DisplayOnlyRequestId:
         def __str__(self) -> str:
             return "request-that-must-not-be-coerced"
 
-    with pytest.raises(RuntimeError, match="request identifiers"):
-        model_region._native_prefill_plan(
-            driver=V027MRv2Driver(),
-            runner=SimpleNamespace(),
-            num_scheduled_tokens=[1],
-            input_batch=SimpleNamespace(
-                req_ids=[_DisplayOnlyRequestId()],
-                num_reqs=1,
-                prefill_len_np=[1],
-                num_computed_tokens_np=[0],
-            ),
-            layer_count=3,
+    runtime, _workload = _native_recirculation_runtime()
+    state = ResidualRuntimeState(event_step_id=9)
+    _publish_native_recirculation_step(state=state, runtime=runtime, step_id=9)
+    runner, _inner = _runner()
+    binding = module_weight_overlay.ensure_runner_binding(
+        driver=V027MRv2Driver(), runner=runner
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            __import__("vllm.envs", fromlist=["VLLM_ENABLE_V1_MULTIPROCESSING"]),
+            "VLLM_ENABLE_V1_MULTIPROCESSING",
+            False,
         )
+        with pytest.raises(RuntimeError, match="string vLLM request identifiers"):
+            stage_signed_backend_region_event(
+                event=BackendObservableEvent.PREPARE_INPUTS_POST,
+                runtime=state,
+                runner=runner,
+                num_scheduled_tokens=[1],
+                input_batch=SimpleNamespace(
+                    req_ids=[_DisplayOnlyRequestId()],
+                    num_reqs=1,
+                    prefill_len_np=[1],
+                    num_computed_tokens_np=[0],
+                ),
+            )
+    assert binding.model_region_handles == {}
 
 
 def test_native_prefill_handle_is_prepared_only_by_signed_prepare_post_region(
@@ -497,33 +523,29 @@ def test_native_prefill_handle_is_prepared_only_by_signed_prepare_post_region(
         runtime_patch.setattr(residual_runtime, "RUNTIME", state)
         assert residual_runtime.advance_workload_anchor("prepare.post")
 
-    handle = binding.model_region_handles["compiled-recurrence"]
-    assert isinstance(handle, VllmModelRegionHandle)
+    handle = next(
+        handle
+        for handle in binding.model_region_handles.values()
+        if isinstance(handle, VllmTypedLayerReplayHandle)
+    )
     assert handle.prepared is not None
     assert handle.prepared.total_rows == 2
     with pytest.raises(RuntimeError, match="already completed"):
         workload.binder.invoke(11)
 
 
-def test_native_prefill_region_never_reconstructs_python_recurrence(
+def test_native_prefill_region_uses_rust_typed_plan_without_legacy_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rust owns the recurrence graph/effect/schedule descriptor end to end."""
+    """The native path may declare a graph but cannot enter legacy replay."""
 
     def _forbidden(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("native Recirculation must not construct a Python recurrence")
+        raise AssertionError("native typed Recirculation must not load legacy replay")
 
     monkeypatch.setattr(
         model_region,
-        "build_exact_recirculation_graph",
+        "_legacy",
         _forbidden,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        model_region,
-        "compile_recurrence",
-        _forbidden,
-        raising=False,
     )
     monkeypatch.setattr(
         __import__("vllm.envs", fromlist=["VLLM_ENABLE_V1_MULTIPROCESSING"]),
@@ -570,20 +592,27 @@ def test_native_prefill_region_never_reconstructs_python_recurrence(
         runtime_patch.setattr(residual_runtime, "RUNTIME", state)
         assert residual_runtime.advance_workload_anchor("prepare.post")
 
-    handle = binding.model_region_handles["compiled-recurrence"]
-    assert isinstance(handle, VllmModelRegionHandle)
+    handle = next(
+        handle
+        for handle in binding.model_region_handles.values()
+        if isinstance(handle, VllmTypedLayerReplayHandle)
+    )
     with __import__("vllm.forward_context", fromlist=["override_forward_context"]).override_forward_context(
         _context(2)
     ):
         output = inner(torch.tensor([2, 3]), torch.tensor([0, 1]))
     assert output.shape == (2, 1)
+    assert handle.prepared is None
+    assert handle.stats.prepare_count == 1
     assert handle.stats.replay_count == 1
+    assert handle.stats.replay_row_count == 2
+    assert handle.stats.request_replays == ("req",)
 
 
-def test_native_prefill_rejects_worker_fusion_policy_mismatch_before_forward(
+def test_native_prefill_does_not_reselect_artifact_policy_from_worker_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A worker may not select a serial schedule for a signed wavefront epoch."""
+    """The hook binds the signed serial artifact without choosing a policy."""
 
     monkeypatch.setattr(
         __import__("vllm.envs", fromlist=["VLLM_ENABLE_V1_MULTIPROCESSING"]),
@@ -608,21 +637,19 @@ def test_native_prefill_rejects_worker_fusion_policy_mismatch_before_forward(
         model_region=replace(signed_region, ordered_row_fusion=None),
     )
 
-    with pytest.raises(RuntimeError, match="ordered-row fusion policy"):
-        stage_signed_backend_region_event(
-            event=BackendObservableEvent.PREPARE_INPUTS_POST,
-            runtime=state,
-            runner=runner,
-            num_scheduled_tokens=[2],
-            input_batch=SimpleNamespace(
-                req_ids=["req"],
-                num_reqs=1,
-                prefill_len_np=[2],
-                num_computed_tokens_np=[0],
-            ),
-        )
+    assert stage_signed_backend_region_event(
+        event=BackendObservableEvent.PREPARE_INPUTS_POST,
+        runtime=state,
+        runner=runner,
+        num_scheduled_tokens=[2],
+        input_batch=SimpleNamespace(
+            req_ids=["req"],
+            num_reqs=1,
+            prefill_len_np=[2],
+            num_computed_tokens_np=[0],
+        ),
+    )
     assert inner.calls == []
-    assert binding.model_region_handles == {}
 
 
 def test_native_prefill_rejects_mixed_decode_before_model_forward(
@@ -644,7 +671,7 @@ def test_native_prefill_rejects_mixed_decode_before_model_forward(
     runner, inner = _runner()
     module_weight_overlay.ensure_runner_binding(driver=V027MRv2Driver(), runner=runner)
 
-    with pytest.raises(RuntimeError, match="cannot mix prefill and decode"):
+    with pytest.raises(ValueError, match="mixed backend phases"):
         stage_signed_backend_region_event(
             event=BackendObservableEvent.PREPARE_INPUTS_POST,
             runtime=state,
@@ -659,6 +686,49 @@ def test_native_prefill_rejects_mixed_decode_before_model_forward(
             ),
         )
     assert inner.calls == []
+
+
+def test_native_prefill_shape_miss_never_compiles_in_the_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        __import__("vllm.envs", fromlist=["VLLM_ENABLE_V1_MULTIPROCESSING"]),
+        "VLLM_ENABLE_V1_MULTIPROCESSING",
+        False,
+    )
+    runtime, _workload = _native_recirculation_runtime()
+    state = ResidualRuntimeState(event_step_id=23)
+    _publish_native_recirculation_step(state=state, runtime=runtime, step_id=23)
+    runner, inner = _runner()
+    binding = module_weight_overlay.ensure_runner_binding(
+        driver=V027MRv2Driver(), runner=runner
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("vLLM hook must never cold compile a stage artifact")
+
+    monkeypatch.setattr(_core, "compile_typed_recurrence_stage_artifact", forbidden)
+    monkeypatch.setattr(_core, "compile_typed_recurrence_stage_artifact_json", forbidden)
+    monkeypatch.setattr(
+        _core, "compile_typed_recurrence_stage_artifact_bundle_json", forbidden
+    )
+    monkeypatch.setattr(vllm_region_workload, "build_recirculation_graph", forbidden)
+
+    with pytest.raises(RuntimeError, match="specialization-required"):
+        stage_signed_backend_region_event(
+            event=BackendObservableEvent.PREPARE_INPUTS_POST,
+            runtime=state,
+            runner=runner,
+            num_scheduled_tokens=[5],
+            input_batch=SimpleNamespace(
+                req_ids=["req"],
+                num_reqs=1,
+                prefill_len_np=[5],
+                num_computed_tokens_np=[0],
+            ),
+        )
+    assert inner.calls == []
+    assert binding.model_region_handles == {}
 
 
 def test_native_prefill_rejects_a_signed_binder_without_a_local_slot(

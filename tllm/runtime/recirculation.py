@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+from typing import Protocol
+
 import torch
 
-from tllm.contracts.recirculation import RecirculationPrefillBindingConfig
 from tllm.workgraph.recurrence import RecurrenceOp
 
 
+class RecirculationMixConfig(Protocol):
+    @property
+    def alpha(self) -> float: ...
+
+    @property
+    def beta(self) -> float | None: ...
+
+    @property
+    def ramp_tokens(self) -> int: ...
+
+    def resolved_layers(self, layer_count: int) -> tuple[int, int]: ...
+
+
 def mix_recirculation_tensors(
-    config: RecirculationPrefillBindingConfig,
+    config: RecirculationMixConfig,
     source: torch.Tensor,
     destination: torch.Tensor,
     positions: torch.Tensor,
@@ -47,7 +61,7 @@ class RecirculationMixAdapter:
 
     def __init__(
         self,
-        config: RecirculationPrefillBindingConfig,
+        config: RecirculationMixConfig,
         *,
         layer_count: int,
     ) -> None:

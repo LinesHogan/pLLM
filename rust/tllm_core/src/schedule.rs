@@ -324,6 +324,19 @@ struct ScheduleTask {
     outputs: Vec<ScheduleOutput>,
 }
 
+/// The one implementation selected by the Rust planner for a task.  The
+/// ScheduleGraph retains every declaration so the planner can make this
+/// choice against the coordinator's timeline capabilities; nothing in Python
+/// is allowed to pick a different member of that declaration later.
+#[derive(Clone, Debug)]
+struct SelectedTaskImplementation {
+    kind: TaskImplementationKind,
+    implementation_id: String,
+    required_capabilities: Vec<String>,
+    compile_safe: bool,
+    capture_safe: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScheduleInput {
@@ -510,6 +523,16 @@ struct StaticBackendBinding {
     backend_region_implementation_ids: Vec<String>,
 }
 
+/// Import recipes are executable authority, so their pure-data identity must
+/// be checked against the coordinator-signed static manifest before Python
+/// imports a worker factory.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerReconstructionSpec {
+    factory: String,
+    config: serde_json::Value,
+}
+
 fn default_compile_policy() -> String {
     "torch_compile".to_owned()
 }
@@ -586,6 +609,8 @@ struct Cost {
     launch_group_count: u64,
     #[serde(default)]
     cross_region_fence_count: u64,
+    #[serde(default)]
+    critical_path_extension: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1372,6 +1397,98 @@ fn validate_affine_regions(
 
 const TORCH_EXPORT_CAPABILITY: &str = "torch.export";
 
+fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
+    capabilities
+        .iter()
+        .filter(|capability| capability.as_str() != TORCH_EXPORT_CAPABILITY)
+        .cloned()
+        .collect()
+}
+
+/// Select the first declaration-order implementation that the signed
+/// timeline can actually provide.  A candidate's `torch.export` marker is
+/// compiler evidence, not a backend requirement; every other capability must
+/// be supplied by the timeline.  Schema v1 did not carry per-candidate facts,
+/// so it intentionally preserves the historical first-candidate behaviour.
+fn select_task_implementations(
+    graph: &ScheduleGraph,
+    timeline: &Timeline,
+) -> PyResult<Vec<SelectedTaskImplementation>> {
+    let available: BTreeSet<&str> = timeline.capabilities.iter().map(String::as_str).collect();
+    graph
+        .tasks
+        .iter()
+        .map(|task| {
+            let candidates = if graph.schema_version == 1 {
+                vec![(
+                    0usize,
+                    task.implementation_kinds[0],
+                    task.implementation_ids[0].clone(),
+                    task.required_capabilities.clone(),
+                    true,
+                )]
+            } else {
+                task.implementation_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, implementation_id)| {
+                        let capabilities = &task.implementation_capabilities[index];
+                        (
+                            index,
+                            task.implementation_kinds[index],
+                            implementation_id.clone(),
+                            capabilities.clone(),
+                            capabilities
+                                .iter()
+                                .any(|capability| capability == TORCH_EXPORT_CAPABILITY),
+                        )
+                    })
+                    .collect()
+            };
+            let unsupported = candidates
+                .iter()
+                .map(|(_, _, implementation_id, capabilities, _)| {
+                    let missing: Vec<String> = backend_capabilities(capabilities)
+                        .into_iter()
+                        .filter(|capability| !available.contains(capability.as_str()))
+                        .collect();
+                    format!("{implementation_id:?} requires unavailable capabilities {missing:?}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            candidates
+                .into_iter()
+                .find_map(
+                    |(_candidate_index, kind, implementation_id, capabilities, export_safe)| {
+                        let required_capabilities = backend_capabilities(&capabilities);
+                        required_capabilities
+                            .iter()
+                            .all(|capability| available.contains(capability.as_str()))
+                            .then(|| {
+                                let compile_safe = kind == TaskImplementationKind::Captured
+                                    && (graph.schema_version == 1 || export_safe);
+                                SelectedTaskImplementation {
+                                    kind,
+                                    implementation_id,
+                                    required_capabilities: required_capabilities
+                                        .into_iter()
+                                        .collect(),
+                                    capture_safe: compile_safe && task.effects.is_empty(),
+                                    compile_safe,
+                                }
+                            })
+                    },
+                )
+                .ok_or_else(|| {
+                    schedule_error(format!(
+                        "task {:?} has no implementation candidate supported by the timeline: {}",
+                        task.task_id, unsupported
+                    ))
+                })
+        })
+        .collect()
+}
+
 /// Recompute the graph facts that Python historically derived while lowering
 /// a workload declaration.  V2 retains those fields on the wire only as
 /// signed, inspectable evidence; the scheduler refuses to use them unless
@@ -1393,7 +1510,7 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
                 task.task_id
             )));
         }
-        let mut required = BTreeSet::<String>::new();
+        let mut required_by_all_candidates: Option<BTreeSet<String>> = None;
         for capabilities in &task.implementation_capabilities {
             let mut seen = BTreeSet::<&str>::new();
             for capability in capabilities {
@@ -1403,9 +1520,6 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
                         task.task_id
                     )));
                 }
-                if capability != TORCH_EXPORT_CAPABILITY {
-                    required.insert(capability.clone());
-                }
             }
             let canonical: Vec<&str> = capabilities.iter().map(String::as_str).collect();
             if canonical.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -1414,8 +1528,22 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
                     task.task_id
                 )));
             }
+            let candidate_requirements = backend_capabilities(capabilities);
+            required_by_all_candidates = Some(match required_by_all_candidates {
+                Some(required) => required
+                    .intersection(&candidate_requirements)
+                    .cloned()
+                    .collect(),
+                None => candidate_requirements,
+            });
         }
-        let expected_capabilities: Vec<String> = required.into_iter().collect();
+        // A graph-level field can only express requirements shared by every
+        // candidate.  Candidate-specific requirements are selected above and
+        // emitted only on the resulting ExecutionRegion.
+        let expected_capabilities: Vec<String> = required_by_all_candidates
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         if task.required_capabilities != expected_capabilities {
             return Err(schedule_error(format!(
                 "task {:?} derived required_capabilities disagree with implementation evidence",
@@ -1710,12 +1838,18 @@ fn validate_inputs(
                 task.task_id
             )));
         }
-        for capability in &task.required_capabilities {
-            if !capabilities.contains(capability.as_str()) {
-                return Err(schedule_error(format!(
-                    "task {:?} requires unavailable capability {:?}",
-                    task.task_id, capability
-                )));
+        // V2 records only capability requirements common to all candidates;
+        // candidate-specific requirements are checked by the Rust selector
+        // after the whole graph has been validated.  V1 has no candidate
+        // evidence, so retain its historical task-level capability gate.
+        if graph.schema_version == 1 {
+            for capability in &task.required_capabilities {
+                if !capabilities.contains(capability.as_str()) {
+                    return Err(schedule_error(format!(
+                        "task {:?} requires unavailable capability {:?}",
+                        task.task_id, capability
+                    )));
+                }
             }
         }
         validate_affine_task(task)?;
@@ -2100,6 +2234,7 @@ fn drafts_topologically_ordered(
 
 fn drafts_can_merge(
     graph: &ScheduleGraph,
+    selected: &[SelectedTaskImplementation],
     anchor_index: &HashMap<String, usize>,
     left: &RegionDraft,
     right: &RegionDraft,
@@ -2110,12 +2245,12 @@ fn drafts_can_merge(
     tasks.extend(right.tasks.iter().copied());
     tasks.sort_by_key(|index| order_rank[*index]);
     let (earliest, before) = draft_window(graph, anchor_index, &tasks);
-    let implementation_kind = graph.tasks[tasks[0]].implementation_kinds[0];
+    let implementation_kind = selected[tasks[0]].kind;
     if earliest >= before
         || implementation_kind == TaskImplementationKind::Extern
         || tasks
             .iter()
-            .any(|index| graph.tasks[*index].implementation_kinds[0] != implementation_kind)
+            .any(|index| selected[*index].kind != implementation_kind)
         || !effects_can_be_internalized(graph, &tasks, effect_reachability)
     {
         return None;
@@ -2131,7 +2266,7 @@ fn drafts_can_merge(
 
 const EXACT_REGION_PARTITION_STATE_LIMIT: usize = 100_000;
 
-type DraftPartitionScore = (u64, u64, u64, u64, u64, String);
+type DraftPartitionScore = (u64, u64, u64, u64, u64, u64, u64, String);
 
 fn draft_partition_identity(graph: &ScheduleGraph, drafts: &[RegionDraft]) -> String {
     format!(
@@ -2151,11 +2286,13 @@ fn draft_partition_identity(graph: &ScheduleGraph, drafts: &[RegionDraft]) -> St
 
 fn explore_region_partitions(
     graph: &ScheduleGraph,
+    selected: &[SelectedTaskImplementation],
     timeline: &Timeline,
     anchor_index: &HashMap<String, usize>,
     task_index: &HashMap<String, usize>,
     order_rank: &[usize],
     effect_reachability: &[BTreeSet<usize>],
+    capture_cost_enabled: bool,
     budget: u64,
     drafts: Vec<RegionDraft>,
     visited: &mut BTreeSet<Vec<Vec<usize>>>,
@@ -2176,17 +2313,16 @@ fn explore_region_partitions(
     if let Ok(slots) = assign_region_slots(graph, task_index, &mut scored) {
         let peak = peak_memory(graph, timeline, &slots, task_index);
         if peak <= budget {
-            let (materialization, capture_boundaries, fences) =
-                draft_partition_cost(graph, task_index, &scored);
-            // Critical-path and compute estimates are not represented by the
-            // current graph contract. They are equal for all candidates until
-            // the schema carries those facts, so identity is the final tie.
+            let (materialization, capture_boundaries, fences, critical_path_extension) =
+                draft_partition_cost(graph, selected, task_index, &scored, capture_cost_enabled);
             let score = (
                 materialization,
                 capture_boundaries,
                 peak,
                 scored.len() as u64,
                 fences,
+                critical_path_extension,
+                graph.tasks.len() as u64,
                 draft_partition_identity(graph, &scored),
             );
             if best.as_ref().is_none_or(|(current, _)| score < *current) {
@@ -2199,6 +2335,7 @@ fn explore_region_partitions(
         for right in left + 1..drafts.len() {
             let Some(merged) = drafts_can_merge(
                 graph,
+                selected,
                 anchor_index,
                 &drafts[left],
                 &drafts[right],
@@ -2215,11 +2352,13 @@ fn explore_region_partitions(
             }
             explore_region_partitions(
                 graph,
+                selected,
                 timeline,
                 anchor_index,
                 task_index,
                 order_rank,
                 effect_reachability,
+                capture_cost_enabled,
                 budget,
                 candidate,
                 visited,
@@ -2232,11 +2371,13 @@ fn explore_region_partitions(
 
 fn make_region_drafts(
     graph: &ScheduleGraph,
+    selected: &[SelectedTaskImplementation],
     timeline: &Timeline,
     anchor_index: &HashMap<String, usize>,
     task_index: &HashMap<String, usize>,
     order: &[usize],
     force_singletons: bool,
+    capture_cost_enabled: bool,
     budget: u64,
 ) -> PyResult<Vec<RegionDraft>> {
     let order_rank = task_order_rank(order, graph.tasks.len());
@@ -2262,11 +2403,13 @@ fn make_region_drafts(
     let mut best = None;
     explore_region_partitions(
         graph,
+        selected,
         timeline,
         anchor_index,
         task_index,
         &order_rank,
         &effect_reachability,
+        capture_cost_enabled,
         budget,
         drafts,
         &mut visited,
@@ -2277,11 +2420,49 @@ fn make_region_drafts(
     })
 }
 
+/// Mirror the final Region capture eligibility before the executor bindings
+/// exist.  Result inputs from another draft become materialized bindings;
+/// hidden inputs remain hidden bindings.  Provided and step-id bindings make
+/// capture ineligible, and a Region with no external tensor contract is not
+/// capturable.  This keeps partition-search cost equal to the final signed
+/// `capture_mode` semantics instead of charging eager/disabled timelines.
+fn draft_capture_safe(
+    graph: &ScheduleGraph,
+    selected: &[SelectedTaskImplementation],
+    task_index: &HashMap<String, usize>,
+    draft: &RegionDraft,
+) -> bool {
+    if !draft.tasks.iter().all(|task| selected[*task].capture_safe) {
+        return false;
+    }
+    let members: BTreeSet<usize> = draft.tasks.iter().copied().collect();
+    let mut external_inputs = 0usize;
+    for task_index_in_draft in &draft.tasks {
+        for input in &graph.tasks[*task_index_in_draft].inputs {
+            match input.kind {
+                ScheduleInputKind::Hidden => external_inputs += 1,
+                ScheduleInputKind::Result => {
+                    let Some(source) = task_index.get(&input.source).copied() else {
+                        return false;
+                    };
+                    if !members.contains(&source) {
+                        external_inputs += 1;
+                    }
+                }
+                ScheduleInputKind::Provided | ScheduleInputKind::StepId => return false,
+            }
+        }
+    }
+    external_inputs > 0
+}
+
 fn draft_partition_cost(
     graph: &ScheduleGraph,
+    selected: &[SelectedTaskImplementation],
     task_index: &HashMap<String, usize>,
     drafts: &[RegionDraft],
-) -> (u64, u64, u64) {
+    capture_cost_enabled: bool,
+) -> (u64, u64, u64, u64) {
     let mut task_regions = vec![0usize; graph.tasks.len()];
     for (region, draft) in drafts.iter().enumerate() {
         for task in &draft.tasks {
@@ -2303,15 +2484,14 @@ fn draft_partition_cost(
             value.size_bytes.saturating_mul(consumers.len() as u64)
         })
         .fold(0u64, u64::saturating_add);
-    let capture_boundaries = drafts
-        .iter()
-        .filter(|draft| {
-            draft
-                .tasks
+    let capture_boundaries = capture_cost_enabled
+        .then(|| {
+            drafts
                 .iter()
-                .all(|index| graph.tasks[*index].capture_safe)
+                .filter(|draft| draft_capture_safe(graph, selected, task_index, draft))
+                .count() as u64
         })
-        .count() as u64;
+        .unwrap_or(0);
     let cross_region_fences: BTreeSet<(usize, usize)> = dependency_pairs(graph)
         .into_keys()
         .filter_map(|(source, target)| {
@@ -2320,10 +2500,34 @@ fn draft_partition_cost(
             (source_region != target_region).then_some((source_region, target_region))
         })
         .collect();
+    let mut successors = vec![BTreeSet::new(); drafts.len()];
+    let mut indegree = vec![0usize; drafts.len()];
+    for &(source, target) in &cross_region_fences {
+        if successors[source].insert(target) {
+            indegree[target] += 1;
+        }
+    }
+    let mut ready: BTreeSet<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(region, degree)| (*degree == 0).then_some(region))
+        .collect();
+    let mut critical_path = vec![0u64; drafts.len()];
+    while let Some(source) = ready.pop_first() {
+        for &target in &successors[source] {
+            critical_path[target] =
+                critical_path[target].max(critical_path[source].saturating_add(1));
+            indegree[target] -= 1;
+            if indegree[target] == 0 {
+                ready.insert(target);
+            }
+        }
+    }
     (
         materialization_bytes,
         capture_boundaries,
         cross_region_fences.len() as u64,
+        critical_path.into_iter().max().unwrap_or(0),
     )
 }
 
@@ -2749,17 +2953,20 @@ fn compile_impl(
     options_json: &str,
 ) -> PyResult<Decision> {
     let (anchor_index, task_index) = validate_inputs(graph, timeline, options)?;
+    let selected = select_task_implementations(graph, timeline)?;
     let order = topological_order(graph, &task_index)?;
     let affine_regions = compile_affine_regions(graph, &task_index)?;
     let budget = effective_budget(options, timeline);
 
     let mut drafts = make_region_drafts(
         graph,
+        &selected,
         timeline,
         &anchor_index,
         &task_index,
         &order,
         false,
+        options.capture_policy != "disabled" && timeline.graph_mode != "eager",
         budget,
     )?;
     let slots = assign_region_slots(graph, &task_index, &mut drafts)?;
@@ -2793,8 +3000,7 @@ fn compile_impl(
             timeline.anchors[draft.before].anchor_id
         );
         let region_id = format!("region-{ordinal:04}-{}", &digest(&identity)[..16]);
-        let implementation_kind = if graph.tasks[draft.tasks[0]].implementation_kinds[0]
-            == TaskImplementationKind::Extern
+        let implementation_kind = if selected[draft.tasks[0]].kind == TaskImplementationKind::Extern
         {
             RegionImplementationKind::Extern
         } else {
@@ -2803,7 +3009,7 @@ fn compile_impl(
         let required_capabilities: BTreeSet<String> = draft
             .tasks
             .iter()
-            .flat_map(|index| graph.tasks[*index].required_capabilities.iter().cloned())
+            .flat_map(|index| selected[*index].required_capabilities.iter().cloned())
             .collect();
         let region_tasks: BTreeSet<&str> = tasks.iter().map(String::as_str).collect();
         let affine_schedule = affine_regions
@@ -2817,19 +3023,18 @@ fn compile_impl(
             })
             .map(|region| region.schedule.clone())
             .unwrap_or_default();
-        // This is static capability evidence, not a selected compiler
-        // policy.  In particular an explicitly signed eager command must not
-        // make the same Region appear incapable of compilation or capture.
-        let compile_safe = implementation_kind == RegionImplementationKind::Compiled;
+        // This is selected implementation evidence, not a compiler policy.
+        // An explicitly signed eager command does not change it.
+        let compile_safe = implementation_kind == RegionImplementationKind::Compiled
+            && draft
+                .tasks
+                .iter()
+                .all(|index| selected[*index].compile_safe);
         let capture_safe = compile_safe
             && draft
                 .tasks
                 .iter()
-                .all(|index| graph.tasks[*index].effects.is_empty())
-            && draft
-                .tasks
-                .iter()
-                .all(|index| graph.tasks[*index].capture_safe);
+                .all(|index| selected[*index].capture_safe);
         execution_regions.push(ExecutionRegion {
             region_id,
             tasks,
@@ -2840,7 +3045,7 @@ fn compile_impl(
             implementation_ids: draft
                 .tasks
                 .iter()
-                .map(|index| graph.tasks[*index].implementation_ids[0].clone())
+                .map(|index| selected[*index].implementation_id.clone())
                 .collect(),
             compile_command: None,
             required_capabilities: required_capabilities.into_iter().collect(),
@@ -3197,7 +3402,7 @@ fn compile_impl(
             Placement {
                 task_id: graph.tasks[*index].task_id.clone(),
                 after_anchor: region.placement_anchor.clone(),
-                implementation_id: graph.tasks[*index].implementation_ids[0].clone(),
+                implementation_id: selected[*index].implementation_id.clone(),
                 stream: "region".to_owned(),
             }
         })
@@ -3270,11 +3475,23 @@ fn compile_impl(
             capture_boundary_count,
             launch_group_count: drafts.len() as u64,
             cross_region_fence_count: fence_kinds.len() as u64,
+            critical_path_extension: draft_partition_cost(
+                graph,
+                &selected,
+                &task_index,
+                &drafts,
+                false,
+            )
+            .3,
         },
         explanations: vec![
             "selected deterministic maximal legal ExecutionRegion partition".to_owned(),
             format!("materialized {materialization_bytes} bytes across Region boundaries"),
             format!("selected {} launch groups", drafts.len()),
+            format!(
+                "selected structural critical-path extension {}",
+                draft_partition_cost(graph, &selected, &task_index, &drafts, false).3
+            ),
             format!("selected {serial_fallback_count} explicit serial fallback regions"),
             format!("effective memory budget is {budget} bytes"),
         ],
@@ -3781,6 +3998,79 @@ fn validate_workload_compilation_wire_inputs(
     Ok(())
 }
 
+fn worker_spec_projection<'a, I>(entries: I, label: &str) -> PyResult<Vec<(String, String)>>
+where
+    I: IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
+{
+    let mut projection = Vec::new();
+    for (factory, config) in entries {
+        if factory.is_empty() || !config.is_object() {
+            return Err(value_error(format!(
+                "{label} require a non-empty factory and JSON object config"
+            )));
+        }
+        projection.push((
+            factory.to_owned(),
+            canonical_ascii_json(config).map_err(value_error)?,
+        ));
+    }
+    projection.sort();
+    Ok(projection)
+}
+
+/// Validate executable worker import recipes before Python resolves a module
+/// or invokes a factory. The full compilation wire is revalidated in the same
+/// Rust call so the static manifest cannot be detached from its cache/signature
+/// identity.
+#[pyfunction]
+fn validate_worker_reconstruction_specs(
+    cache_key: &str,
+    graph_json: &str,
+    timeline_json: &str,
+    options_json: &str,
+    decision_json: &str,
+    plan_epoch: &Bound<'_, PyAny>,
+    reconstruction_specs_json: &str,
+) -> PyResult<()> {
+    if !plan_epoch.is_exact_instance_of::<PyInt>() {
+        return Err(value_error("plan_epoch must be a positive integer"));
+    }
+    let plan_epoch: u64 = plan_epoch
+        .extract()
+        .map_err(|_| value_error("plan_epoch must be a positive integer"))?;
+    validate_workload_compilation_wire_inputs(
+        cache_key,
+        graph_json,
+        timeline_json,
+        options_json,
+        decision_json,
+        plan_epoch,
+    )?;
+
+    let options: CompileOptions = decode(options_json, "CompileOptions")?;
+    let signed = validate_static_backend_binding_manifest(&options)?;
+    let submitted: Vec<WorkerReconstructionSpec> =
+        decode(reconstruction_specs_json, "worker reconstruction specs")?;
+    let signed_projection = worker_spec_projection(
+        signed
+            .iter()
+            .map(|binding| (binding.factory.as_str(), &binding.config)),
+        "signed worker reconstruction specs",
+    )?;
+    let submitted_projection = worker_spec_projection(
+        submitted
+            .iter()
+            .map(|spec| (spec.factory.as_str(), &spec.config)),
+        "worker reconstruction specs",
+    )?;
+    if submitted_projection != signed_projection {
+        return Err(schedule_error(
+            "worker reconstruction specs do not match the parent-signed static binding manifest",
+        ));
+    }
+    Ok(())
+}
+
 /// Runtime facts observed by a worker before it binds process-local resources.
 ///
 /// The JSON object is deliberately closed and nullable at the FFI boundary.
@@ -3795,6 +4085,8 @@ struct RuntimeSpecializationFacts {
     hidden_size: u64,
     rows: u64,
     #[serde(default)]
+    max_prefill_tokens: Option<u64>,
+    #[serde(default)]
     model_layer_count: Option<u64>,
 }
 
@@ -3804,10 +4096,11 @@ impl RuntimeSpecializationFacts {
             || self.dtype.is_empty()
             || self.hidden_size == 0
             || self.rows == 0
+            || self.max_prefill_tokens == Some(0)
             || self.model_layer_count == Some(0)
         {
             return Err(value_error(
-                "runtime specialization facts require non-empty device/dtype and positive rows/hidden_size",
+                "runtime specialization facts require non-empty device/dtype and positive rows/hidden_size/max_prefill_tokens",
             ));
         }
         Ok(())
@@ -3822,6 +4115,9 @@ impl RuntimeSpecializationFacts {
         ];
         if let Some(model_layer_count) = self.model_layer_count {
             entries.push(("runtime/model_layer_count", model_layer_count.to_string()));
+        }
+        if let Some(max_prefill_tokens) = self.max_prefill_tokens {
+            entries.push(("runtime/max_prefill_tokens", max_prefill_tokens.to_string()));
         }
         entries
     }
@@ -3847,7 +4143,9 @@ fn validate_runtime_specialization_facts(
         .shape_specialization
         .iter()
         .filter_map(|(key, value)| {
-            (REQUIRED_KEYS.contains(&key.as_str()) || key == "runtime/model_layer_count")
+            (REQUIRED_KEYS.contains(&key.as_str())
+                || key == "runtime/model_layer_count"
+                || key == "runtime/max_prefill_tokens")
                 .then_some((key.as_str(), value.as_str()))
         })
         .collect();
@@ -3908,7 +4206,9 @@ fn normalize_runtime_specialization_options_wire(
     let signed: BTreeMap<&str, &str> = entries
         .iter()
         .filter_map(|(key, value)| {
-            (REQUIRED_KEYS.contains(&key.as_str()) || key == "runtime/model_layer_count")
+            (REQUIRED_KEYS.contains(&key.as_str())
+                || key == "runtime/model_layer_count"
+                || key == "runtime/max_prefill_tokens")
                 .then_some((key.as_str(), value.as_str()))
         })
         .collect();
@@ -4242,6 +4542,10 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        validate_worker_reconstruction_specs,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         validate_worker_reconstruction_wire,
         module
     )?)?;
@@ -4363,6 +4667,22 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("invalid nullable RuntimeSpecializationFacts"));
+
+        let prefill_facts = r#"{"device":"cpu","dtype":"torch.float32","hidden_size":4,"max_prefill_tokens":16,"rows":2}"#;
+        let prefill_normalized =
+            normalize_runtime_specialization_options_wire(options, prefill_facts).unwrap();
+        let prefill_value: serde_json::Value = serde_json::from_str(&prefill_normalized).unwrap();
+        assert!(prefill_value["shape_specialization"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["runtime/max_prefill_tokens", "16"])));
+        assert!(normalize_runtime_specialization_options_wire(
+            &prefill_normalized,
+            r#"{"device":"cpu","dtype":"torch.float32","hidden_size":4,"max_prefill_tokens":32,"rows":2}"#,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not match"));
     }
 
     #[test]
@@ -4482,6 +4802,54 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("binder implementation"));
+    }
+
+    #[test]
+    fn schema_v2_selects_first_timeline_supported_implementation() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"candidate-selection","tasks":[{"task_id":"select","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["backend:extern@1","python:compiled@1"],"implementation_kinds":["extern","captured"],"implementation_capabilities":[["backend/alternate"],["backend/default","torch.export"]],"required_capabilities":[],"capture_safe":false}],"edges":[],"values":[],"states":[],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":["backend/default"],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled: serde_json::Value =
+            serde_json::from_str(&compile_schedule(graph, timeline, options).unwrap()).unwrap();
+        let region = &compiled["execution_regions"][0];
+        assert_eq!(
+            region["implementation_ids"],
+            serde_json::json!(["python:compiled@1"])
+        );
+        assert_eq!(region["implementation_kind"], "compiled");
+        assert_eq!(
+            region["required_capabilities"],
+            serde_json::json!(["backend/default"])
+        );
+        assert_eq!(
+            compiled["placements"][0]["implementation_id"],
+            "python:compiled@1"
+        );
+
+        let alternate_timeline = timeline.replace(
+            r#"["backend/default"]"#,
+            r#"["backend/alternate","backend/default"]"#,
+        );
+        let extern_decision: serde_json::Value =
+            serde_json::from_str(&compile_schedule(graph, &alternate_timeline, options).unwrap())
+                .unwrap();
+        assert_eq!(
+            extern_decision["execution_regions"][0]["implementation_ids"],
+            serde_json::json!(["backend:extern@1"])
+        );
+        assert_eq!(
+            extern_decision["execution_regions"][0]["implementation_kind"],
+            "extern"
+        );
+
+        let unavailable_timeline = timeline.replace(r#"["backend/default"]"#, "[]");
+        assert!(compile_schedule(graph, &unavailable_timeline, options)
+            .unwrap_err()
+            .to_string()
+            .contains("no implementation candidate"));
     }
 
     #[test]
@@ -4685,6 +5053,7 @@ mod tests {
             first.execution_regions[0].capture_mode,
             RegionCaptureMode::Require
         );
+        assert_eq!(first.cost.capture_boundary_count, 1);
         assert_eq!(
             first.execution_regions[0].stream,
             Some(RegionStreamClass::Default)
@@ -4707,6 +5076,7 @@ mod tests {
             disabled.execution_regions[0].capture_mode,
             RegionCaptureMode::Disabled
         );
+        assert_eq!(disabled.cost.capture_boundary_count, 0);
 
         let eager_auto: Decision =
             serde_json::from_str(&compile_schedule(graph, eager, auto).unwrap()).unwrap();
@@ -4714,6 +5084,7 @@ mod tests {
             eager_auto.execution_regions[0].capture_mode,
             RegionCaptureMode::Disabled
         );
+        assert_eq!(eager_auto.cost.capture_boundary_count, 0);
         let require = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"residual_resource_manifest":[{"layer_index":0,"site":"post","phase":"decode","module_path":"model.layers.0"}],"capture_policy":"require","schema_version":1}"#;
         assert!(compile_schedule(graph, eager, require)
             .unwrap_err()
@@ -5124,6 +5495,8 @@ mod tests {
             ]
         );
         assert_eq!(decision.cost.materialization_bytes, 10);
+        assert_eq!(decision.cost.compute_cost, 4);
+        assert_eq!(decision.cost.critical_path_extension, 1);
     }
 
     #[test]

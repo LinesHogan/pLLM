@@ -92,14 +92,22 @@ def lower_schedule_graph(
                         tuple(sorted(set(implementation.capabilities)))
                         for implementation in task.implementations
                     ),
+                    # This graph-level field contains only requirements that
+                    # every candidate shares. Rust selects one candidate
+                    # against the timeline and derives the Region's actual
+                    # requirements from that selected declaration.
                     required_capabilities=tuple(
                         sorted(
-                            {
-                                capability
-                                for implementation in task.implementations
-                                for capability in implementation.capabilities
-                                if capability != "torch.export"
-                            }
+                            set.intersection(
+                                *(
+                                    {
+                                        capability
+                                        for capability in implementation.capabilities
+                                        if capability != "torch.export"
+                                    }
+                                    for implementation in task.implementations
+                                )
+                            )
                         )
                     ),
                     capture_safe=(
