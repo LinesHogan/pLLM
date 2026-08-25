@@ -1,6 +1,7 @@
 """Public auxiliary-workload declaration API."""
 
 from tllm.workload.frontend import (
+    AdamSpec,
     AdamWSpec,
     AffineAccess,
     AffineExpr,
@@ -51,6 +52,7 @@ from tllm.workload.region_compiler import (
 )
 
 __all__ = [
+    "AdamSpec",
     "AdamWSpec",
     "AffineAccess",
     "AffineExpr",

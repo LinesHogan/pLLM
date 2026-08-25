@@ -93,6 +93,34 @@ class AdamWSpec(OptimizerSpec):
         )
 
 
+class AdamSpec(OptimizerSpec):
+    """Signed Adam declaration (no decoupled weight decay).
+
+    Optimizer kinds are an open extension point: ``kind`` plus the sorted
+    ``options`` pairs are the signed identity, so future fast-weight or
+    weight-overlay optimizers plug in here without changing the State or
+    Region contracts.
+    """
+
+    def __init__(
+        self,
+        *,
+        lr: float,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+    ) -> None:
+        if lr <= 0:
+            raise ValueError("AdamSpec.lr must be positive")
+        super().__init__(
+            kind="adam",
+            options=(
+                ("betas", repr(tuple(float(value) for value in betas))),
+                ("eps", float(eps).hex()),
+                ("lr", float(lr).hex()),
+            ),
+        )
+
+
 class State:
     """A named state family declared on a workload class."""
 

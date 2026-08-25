@@ -10,9 +10,16 @@ from dataclasses import dataclass
 class OverRIDEConsumerConfig:
     consumer_id: str = "override"
     enabled: bool = True
+    # "consumer" keeps the legacy Program implementation; "region" selects the
+    # native Region workload via build_override_workload (legacy remains
+    # available during the migration transition).
+    implementation: str = "consumer"
     hidden_size: int = 0
     vocab_size: int = 0
     rank: int = 16
     num_iterations: int = 2
     lambd: float = 0.8
     learning_rate: float = 1e-4
+    # Residual tap feeding the reweight heads.  Mirrors the runtime default
+    # source locator so legacy and Region implementations read the same tensor.
+    source_layer_path: str = "model.model.layers[0].input_layernorm"
