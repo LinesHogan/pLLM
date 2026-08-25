@@ -46,6 +46,7 @@ from tllm.workgraph.physical import (
 )
 from tllm.workgraph.frontend import ArtifactKey
 from tllm.workgraph.ir import ExecutorKey, NodeKey
+from tllm.workload.region_compiler import compare_region_outputs
 from tllm.schedule.contracts import (
     BackendObservableEvent,
     BackendRegionBinderStage,
@@ -1377,7 +1378,7 @@ class _RegionCudaGraph:
             warmup = artifact.callable(
                 *(staging[key] for key in artifact.input_keys)
             )
-            self._tensor_outputs(artifact, warmup)
+            warmup_outputs = self._tensor_outputs(artifact, warmup)
         capture_stream.synchronize()
 
         graph = torch.cuda.CUDAGraph()
@@ -1388,6 +1389,11 @@ class _RegionCudaGraph:
         outputs = self._tensor_outputs(artifact, captured)
         with torch.cuda.stream(capture_stream):
             graph.replay()
+        capture_stream.synchronize()
+        # First-replay parity gate (native PG146 analogue): the captured graph
+        # must reproduce the pre-capture oracle run on identical staging
+        # inputs.  Any divergence fails closed before the graph is installed.
+        compare_region_outputs(artifact.region_id, warmup_outputs, outputs)
         current.wait_stream(capture_stream)
         self._graph = graph
         self._stream = capture_stream

@@ -21,8 +21,135 @@ from tllm.schedule.contracts import (
     RegionTaskInvocation,
     ScheduleDecision,
     ScheduleEffect,
+    ScheduleEffectKind,
 )
 from tllm.workload.frontend import WorkloadDeclaration
+
+
+class RegionParityError(RuntimeError):
+    """Fail-closed numerical parity violation for a signed ExecutionRegion.
+
+    Raised when a compiled or captured Region artifact diverges from its
+    serial oracle (the same composed callable, run eagerly).  There is no
+    silent fallback: the decision is rejected, never silently re-run.
+    """
+
+
+def region_dtype_tolerance(dtype: torch.dtype) -> float:
+    """Dtype-aware tolerance for Region parity checks."""
+    if dtype in (torch.float64,):
+        return 1e-10
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2e-2
+    return 1e-5
+
+
+def compare_region_outputs(
+    region_id: str,
+    reference: tuple[object, ...],
+    candidate: tuple[object, ...],
+) -> None:
+    """Fail closed unless candidate matches the serial oracle within tolerance."""
+    if len(reference) != len(candidate):
+        raise RegionParityError(
+            f"ExecutionRegion {region_id!r} parity check failed: "
+            f"output count {len(candidate)} != oracle {len(reference)}"
+        )
+    for index, (expected, actual) in enumerate(zip(reference, candidate, strict=True)):
+        if torch.is_tensor(expected) or torch.is_tensor(actual):
+            if not (torch.is_tensor(expected) and torch.is_tensor(actual)):
+                raise RegionParityError(
+                    f"ExecutionRegion {region_id!r} parity check failed: "
+                    f"output {index} type mismatch"
+                )
+            if expected.shape != actual.shape or expected.dtype != actual.dtype:
+                raise RegionParityError(
+                    f"ExecutionRegion {region_id!r} parity check failed: "
+                    f"output {index} shape/dtype mismatch "
+                    f"({tuple(actual.shape)}/{actual.dtype} != "
+                    f"{tuple(expected.shape)}/{expected.dtype})"
+                )
+            tolerance = region_dtype_tolerance(expected.dtype)
+            if not torch.allclose(actual, expected, rtol=tolerance, atol=tolerance):
+                raise RegionParityError(
+                    f"ExecutionRegion {region_id!r} parity check failed: "
+                    f"output {index} diverges from the serial oracle"
+                )
+        elif actual != expected:
+            raise RegionParityError(
+                f"ExecutionRegion {region_id!r} parity check failed: "
+                f"output {index} value mismatch"
+            )
+
+
+_MUTATING_EFFECT_KINDS = frozenset(
+    {
+        ScheduleEffectKind.STATE_WRITE,
+        ScheduleEffectKind.STATE_TRANSITION,
+        ScheduleEffectKind.VERSION_PUBLISH,
+        ScheduleEffectKind.EXTERN_IO,
+    }
+)
+
+
+def _effects_are_replayable(effects: tuple[ScheduleEffect, ...]) -> bool:
+    """A Region may be executed twice for parity only when it cannot mutate."""
+    return all(effect.kind not in _MUTATING_EFFECT_KINDS for effect in effects)
+
+
+def _snapshot_rng(
+    devices: set[torch.device],
+) -> tuple[torch.Tensor, dict[torch.device, torch.Tensor]]:
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = {
+        device: torch.cuda.get_rng_state(device)
+        for device in devices
+        if device.type == "cuda"
+    }
+    return cpu_state, cuda_states
+
+
+def _restore_rng(snapshot: tuple[torch.Tensor, dict[torch.device, torch.Tensor]]) -> None:
+    cpu_state, cuda_states = snapshot
+    torch.random.set_rng_state(cpu_state)
+    for device, state in cuda_states.items():
+        torch.cuda.set_rng_state(state, device)
+
+
+class _FirstCallParityGate:
+    """Run the serial oracle and the compiled artifact once, fail on divergence.
+
+    The first invocation executes the eager composition (serial oracle) and
+    the compiled artifact on identical RNG state and compares outputs.  Later
+    invocations go straight to the compiled artifact.
+    """
+
+    __slots__ = ("_region_id", "_eager", "_compiled", "_verified")
+
+    def __init__(
+        self,
+        region_id: str,
+        eager: Callable[..., tuple[object, ...]],
+        compiled: Callable[..., tuple[object, ...]],
+    ) -> None:
+        self._region_id = region_id
+        self._eager = eager
+        self._compiled = compiled
+        self._verified = False
+
+    def __call__(self, *args: object) -> tuple[object, ...]:
+        if self._verified:
+            return self._compiled(*args)
+        devices = {
+            arg.device for arg in args if torch.is_tensor(arg)
+        }
+        snapshot = _snapshot_rng(devices)
+        reference = self._eager(*args)
+        _restore_rng(snapshot)
+        candidate = self._compiled(*args)
+        compare_region_outputs(self._region_id, reference, candidate)
+        self._verified = True
+        return candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +166,11 @@ class RegionCallableArtifact:
     input_bindings: tuple[RegionInputBinding, ...] = ()
     output_bindings: tuple[RegionOutputBinding, ...] = ()
     effects: tuple[ScheduleEffect, ...] = ()
+    # "first_call": a serial-oracle parity gate runs on the first invocation;
+    # "deferred_state_effects": compiled Region with mutating effects, which
+    # cannot be re-executed for parity (oracle hook is a future extension);
+    # "eager": no compiled artifact, parity is trivially satisfied.
+    parity: str = "eager"
 
     def execute(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         if not isinstance(inputs, Mapping):
@@ -322,12 +454,21 @@ def materialize_region_callable(
     if region.implementation_kind is RegionImplementationKind.EXTERN and command is not None:
         raise RuntimeError("extern ExecutionRegion cannot carry a compile command")
     executable: Callable[..., tuple[object, ...]] = combined
+    parity = "eager"
     if command is not None:
         try:
             adapter = _COMPILER_ADAPTERS[command.adapter]
         except KeyError as exc:
             raise RuntimeError("unsupported signed Region compiler adapter") from exc
         executable = adapter(combined, command, torch_compile)
+        if command.adapter is RegionCompilerAdapter.TORCH_COMPILE:
+            if _effects_are_replayable(region.effects):
+                executable = _FirstCallParityGate(region.region_id, combined, executable)
+                parity = "first_call"
+            else:
+                # Mutating effects cannot be re-executed for a shadow parity
+                # run; the gate hook is kept as an explicit extension point.
+                parity = "deferred_state_effects"
     return RegionCallableArtifact(
         region_id=region.region_id,
         artifact_key=region.artifact_key,
@@ -342,6 +483,7 @@ def materialize_region_callable(
         input_bindings=region.input_bindings,
         output_bindings=region.output_bindings,
         effects=region.effects,
+        parity=parity,
     )
 
 
@@ -375,6 +517,9 @@ def materialize_region_artifacts(
 __all__ = [
     "RegionArtifactRegistry",
     "RegionCallableArtifact",
+    "RegionParityError",
+    "compare_region_outputs",
     "materialize_region_artifacts",
     "materialize_region_callable",
+    "region_dtype_tolerance",
 ]
