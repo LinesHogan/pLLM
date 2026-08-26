@@ -3,7 +3,7 @@
 //! Only primitive, versioned metadata crosses this module. Python callables,
 //! tensors, CUDA handles, and backend objects cannot be extracted here.
 
-use isl_rs::{Context, Schedule, ScheduleConstraints, UnionMap, UnionSet};
+use isl_rs::{Context, Schedule, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyInt;
@@ -1136,6 +1136,126 @@ fn relation_variables<'a>(
     (variables, mapping)
 }
 
+/// Derive value-flow dependences with isl's must-source analysis.
+///
+/// Reads become the sink, writes the must-source, and the schedule orders
+/// statements by graph task index and instances lexicographically (zero
+/// padded to a common rank).  `compute_flow` then keeps only true
+/// must-source dependences: a write killed by a later write before any read
+/// contributes nothing, which the syntactic all-pairs pairing cannot see.
+/// Returns the dependence relations in isl's normalized text, or `None` when
+/// the accesses are not Presburger-representable for the analysis (the
+/// caller then falls back to the syntactic pairing).
+fn affine_flow_dependences(
+    graph: &ScheduleGraph,
+    component: &[usize],
+    prefix: &str,
+) -> Option<String> {
+    let mut reads: Vec<String> = Vec::new();
+    let mut writes: Vec<String> = Vec::new();
+    let mut schedule_entries: Vec<String> = Vec::new();
+    let max_rank = component
+        .iter()
+        .map(|index| graph.tasks[*index].domain.indices.len())
+        .max()
+        .unwrap_or(0);
+    for &index in component {
+        let task = &graph.tasks[index];
+        let bounds_by_index: HashMap<&str, (&str, &str)> = task
+            .domain
+            .bounds
+            .iter()
+            .map(|(name, lower, upper)| (name.as_str(), (lower.as_str(), upper.as_str())))
+            .collect();
+        let variables: Vec<String> = task.domain.indices.clone();
+        let mapping: HashMap<&str, String> = task
+            .domain
+            .indices
+            .iter()
+            .map(|name| (name.as_str(), name.clone()))
+            .collect();
+        let mut constraints = Vec::new();
+        for name in &task.domain.indices {
+            let (lower, upper) = bounds_by_index[name.as_str()];
+            constraints.push(format!("{lower} <= {name}"));
+            constraints.push(format!("{name} < {upper}"));
+        }
+        let domain_condition = constraints.join(" and ");
+        // isl map text carries constraints at the end: `{ S[i] -> A[i] : c }`.
+        let suffix = if domain_condition.is_empty() {
+            String::new()
+        } else {
+            format!(" : {domain_condition}")
+        };
+        let tuple = relation_tuple(index, &variables);
+        let mut scatter: Vec<String> = vec![index.to_string()];
+        scatter.extend(variables.iter().cloned());
+        while scatter.len() < 1 + max_rank {
+            scatter.push("0".to_owned());
+        }
+        schedule_entries.push(format!(
+            "{tuple} -> [{}]{suffix}",
+            scatter.join(", ")
+        ));
+        for access in &task.accesses {
+            let elements = access
+                .indices
+                .iter()
+                .map(|expression| affine_expression(expression, &mapping))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let entry = format!("{tuple} -> {}[{elements}]{suffix}", access.value);
+            match access.mode.as_str() {
+                "read" => reads.push(entry),
+                "write" => writes.push(entry),
+                "read_write" => {
+                    reads.push(entry.clone());
+                    writes.push(entry);
+                }
+                _ => {}
+            }
+        }
+    }
+    if reads.is_empty() || writes.is_empty() {
+        // With no producer/consumer pair the syntactic pairing is empty too.
+        return Some(String::new());
+    }
+    let context = Context::alloc();
+    let sink = UnionMap::read_from_str(
+        &context,
+        &format!("{prefix}{{ {} }}", reads.join("; ")),
+    )
+    .ok()?;
+    let must_source = UnionMap::read_from_str(
+        &context,
+        &format!("{prefix}{{ {} }}", writes.join("; ")),
+    )
+    .ok()?;
+    let schedule_map = UnionMap::read_from_str(
+        &context,
+        &format!("{prefix}{{ {} }}", schedule_entries.join("; ")),
+    )
+    .ok()?;
+    let flow = UnionAccessInfo::from_sink(sink)
+        .ok()?
+        .set_must_source(must_source)
+        .ok()?
+        .set_schedule_map(schedule_map)
+        .ok()?
+        .compute_flow()
+        .ok()?;
+    let must_dependence = flow.get_must_dependence().ok()?;
+    let text = must_dependence.to_str().ok()?.to_owned();
+    let open = text.find('{')?;
+    let inner = text[open + 1..]
+        .trim()
+        .strip_suffix('}')
+        .unwrap_or(text[open + 1..].trim())
+        .trim()
+        .to_owned();
+    Some(inner)
+}
+
 fn affine_problem_strings(
     graph: &ScheduleGraph,
     component: &[usize],
@@ -1220,45 +1340,57 @@ fn affine_problem_strings(
         ));
     }
 
-    for source in component {
-        let source_task = &graph.tasks[*source];
-        for source_access in source_task
-            .accesses
-            .iter()
-            .filter(|access| matches!(access.mode.as_str(), "write" | "read_write"))
-        {
-            for target in component {
-                let target_task = &graph.tasks[*target];
-                for target_access in target_task.accesses.iter().filter(|access| {
-                    access.value == source_access.value
-                        && matches!(access.mode.as_str(), "read" | "read_write")
-                }) {
-                    if source_access.indices.len() != target_access.indices.len() {
-                        return Err(value_error(format!(
-                            "affine value {:?} has inconsistent access rank",
-                            source_access.value
-                        )));
+    match affine_flow_dependences(graph, component, &prefix) {
+        Some(inner) => {
+            // isl must-source flow analysis derived the value dependences.
+            if !inner.is_empty() {
+                relations.insert(inner);
+            }
+        }
+        None => {
+            // Fallback: syntactic all-pairs write/read pairing for accesses
+            // the flow analysis cannot represent.
+            for source in component {
+                let source_task = &graph.tasks[*source];
+                for source_access in source_task
+                    .accesses
+                    .iter()
+                    .filter(|access| matches!(access.mode.as_str(), "write" | "read_write"))
+                {
+                    for target in component {
+                        let target_task = &graph.tasks[*target];
+                        for target_access in target_task.accesses.iter().filter(|access| {
+                            access.value == source_access.value
+                                && matches!(access.mode.as_str(), "read" | "read_write")
+                        }) {
+                            if source_access.indices.len() != target_access.indices.len() {
+                                return Err(value_error(format!(
+                                    "affine value {:?} has inconsistent access rank",
+                                    source_access.value
+                                )));
+                            }
+                            let (source_variables, source_mapping) = relation_variables(source_task, "s");
+                            let (target_variables, target_mapping) = relation_variables(target_task, "d");
+                            let constraints: Vec<String> = source_access
+                                .indices
+                                .iter()
+                                .zip(&target_access.indices)
+                                .map(|(source_expression, target_expression)| {
+                                    format!(
+                                        "{} = {}",
+                                        affine_expression(source_expression, &source_mapping),
+                                        affine_expression(target_expression, &target_mapping)
+                                    )
+                                })
+                                .collect();
+                            relations.insert(format!(
+                                "{} -> {} : {}",
+                                relation_tuple(*source, &source_variables),
+                                relation_tuple(*target, &target_variables),
+                                constraints.join(" and ")
+                            ));
+                        }
                     }
-                    let (source_variables, source_mapping) = relation_variables(source_task, "s");
-                    let (target_variables, target_mapping) = relation_variables(target_task, "d");
-                    let constraints: Vec<String> = source_access
-                        .indices
-                        .iter()
-                        .zip(&target_access.indices)
-                        .map(|(source_expression, target_expression)| {
-                            format!(
-                                "{} = {}",
-                                affine_expression(source_expression, &source_mapping),
-                                affine_expression(target_expression, &target_mapping)
-                            )
-                        })
-                        .collect();
-                    relations.insert(format!(
-                        "{} -> {} : {}",
-                        relation_tuple(*source, &source_variables),
-                        relation_tuple(*target, &target_variables),
-                        constraints.join(" and ")
-                    ));
                 }
             }
         }
@@ -5635,4 +5767,57 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    #[test]
+    fn flow_dependences_drop_a_killed_write() {
+        pyo3::prepare_freethreaded_python();
+        // w1 and w2 both write A[i]; r reads A[i].  The syntactic pairing
+        // emits w1 -> r and w2 -> r, while must-source flow keeps only
+        // w2 -> r: w1's write is killed before any read.
+        let graph = r#"{"workload_key":"flow-kill","tasks":[{"task_id":"w1","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:w1@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"domain":{"name":"affine","indices":["i"],"bounds":[["i","0","N"]],"parameters":["N"]},"accesses":[{"value":"A","indices":[{"coefficients":[["i",1]],"constant":0}],"mode":"write"}]},{"task_id":"w2","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:w2@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"domain":{"name":"affine","indices":["i"],"bounds":[["i","0","N"]],"parameters":["N"]},"accesses":[{"value":"A","indices":[{"coefficients":[["i",1]],"constant":0}],"mode":"write"}]},{"task_id":"r","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:r@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"domain":{"name":"affine","indices":["i"],"bounds":[["i","0","N"]],"parameters":["N"]},"accesses":[{"value":"A","indices":[{"coefficients":[["i",1]],"constant":0}],"mode":"read"}]}],"edges":[],"values":[],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.schedule_tree.affine_regions.len(), 1);
+        let dependences = &decision.schedule_tree.affine_regions[0].dependences;
+        assert!(
+            dependences.contains("T1") && dependences.contains("T2"),
+            "must-source dependence w2 -> r is required: {dependences}"
+        );
+        assert!(
+            !dependences.contains("T0"),
+            "killed write w1 must not reach the reader: {dependences}"
+        );
+    }
+
+    #[test]
+    fn flow_dependences_keep_a_self_referential_recurrence() {
+        pyo3::prepare_freethreaded_python();
+        // recirculation pattern: one task writes kv[t, l] and reads
+        // kv[t - 1, l]; the must-source flow relates instance t-1 to t.
+        let graph = r#"{"workload_key":"flow-recurrence","tasks":[{"task_id":"rw","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:rw@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"domain":{"name":"affine","indices":["t","l"],"bounds":[["t","0","T"],["l","0","L"]],"parameters":["T","L"]},"accesses":[{"value":"kv","indices":[{"coefficients":[["t",1]],"constant":0},{"coefficients":[["l",1]],"constant":0}],"mode":"write"},{"value":"kv","indices":[{"coefficients":[["t",1]],"constant":-1},{"coefficients":[["l",1]],"constant":0}],"mode":"read"}]}],"edges":[],"values":[],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.schedule_tree.affine_regions.len(), 1);
+        let dependences = &decision.schedule_tree.affine_regions[0].dependences;
+        assert!(
+            dependences.contains("T0"),
+            "the recurrence dependence must survive flow analysis: {dependences}"
+        );
+        // The flow relates instance t-1 to t and the domain restricts sources
+        // to t >= 0, so the boundary read at t = 0 has no in-domain source:
+        // the shift is present without the syntactic pairing's blanket row.
+        assert!(
+            dependences.contains("1 + "),
+            "flow dependence must carry the t-1 -> t shift: {dependences}"
+        );
+    }
+
 }
