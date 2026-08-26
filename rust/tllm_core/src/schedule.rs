@@ -1760,7 +1760,13 @@ fn validate_inputs(
             if effect.resource.is_empty() {
                 return Err(value_error("invalid normalized schedule effect"));
             }
-            if !graph.states.is_empty() && !state_resources.contains(effect.resource.as_str()) {
+            // extern_io names an external channel, not a typed state; every
+            // other effect kind must reference a declared state when the
+            // graph declares any.
+            if effect.kind != ScheduleEffectKind::ExternIo
+                && !graph.states.is_empty()
+                && !state_resources.contains(effect.resource.as_str())
+            {
                 return Err(value_error(
                     "normalized schedule effect references an unknown typed state",
                 ));

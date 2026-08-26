@@ -182,7 +182,31 @@ class State:
 @dataclass(frozen=True, slots=True)
 class StateEffect:
     kind: EffectKind
-    state: State
+    state: State | None
+    resource: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", EffectKind(self.kind))
+        if self.kind is EffectKind.EXTERN_IO:
+            if self.state is not None:
+                raise ValueError("extern_io effects name an external resource, not a State")
+            object.__setattr__(
+                self, "resource", _name(self.resource, "extern_io resource")
+            )
+            return
+        if not isinstance(self.state, State):
+            raise TypeError(f"{self.kind.value} expects a State")
+        if self.resource is not None:
+            raise ValueError("only extern_io effects may name a raw resource")
+
+    @property
+    def resource_name(self) -> str:
+        """The signed effect resource: the State name, or the extern channel."""
+        if self.kind is EffectKind.EXTERN_IO:
+            assert self.resource is not None
+            return self.resource
+        assert self.state is not None
+        return self.state.name
 
 
 def read(state: State) -> StateEffect:
@@ -203,6 +227,21 @@ def transition(state: State) -> StateEffect:
 
 def next(state: State) -> StateEffect:
     return _effect(EffectKind.NEXT, state)
+
+
+def extern_io(resource: str) -> StateEffect:
+    """Declare an external I/O effect on a named channel (e.g. "trace:file").
+
+    The resource names the external channel, not a workload State.  A task
+    with an extern_io effect can never be internalized into a merged Region
+    (the planner forces a Region boundary: the signed graph has no ordering
+    proof for external side effects) and is never capture-safe.  This is the
+    effect-level complement of ``implementation_kind=EXTERN``: an EXTERN
+    implementation says *who* runs the task (a registered extern executor),
+    while extern_io says the task *observes or mutates something outside* the
+    signed state model regardless of who runs it.
+    """
+    return StateEffect(EffectKind.EXTERN_IO, None, resource)
 
 
 def _effect(kind: EffectKind, state: State) -> StateEffect:
@@ -740,6 +779,8 @@ def _build_ir(cls: type[object], definition: WorkloadDefinition) -> WorkloadIR:
 
     for ordinal, (name, function, declaration) in enumerate(raw_tasks):
         for effect in declaration.effects:
+            if effect.kind is EffectKind.EXTERN_IO:
+                continue  # extern channels are validated on the effect itself
             if effect.state not in known_states:
                 raise ValueError(f"task {name!r} references state from another workload")
         for parameter, input_spec in declaration.inputs:
@@ -766,7 +807,7 @@ def _build_ir(cls: type[object], definition: WorkloadDefinition) -> WorkloadIR:
                 ordinal=ordinal,
                 inputs=tuple(_input_ir(param, value) for param, value in declaration.inputs),
                 outputs=tuple(_output_ir(output, value) for output, value in declaration.outputs),
-                effects=tuple(EffectIR(effect.kind, effect.state.name) for effect in declaration.effects),
+                effects=tuple(EffectIR(effect.kind, effect.resource_name) for effect in declaration.effects),
                 timing=_timing_ir(declaration.timing),
                 implementations=implementations,
                 domain=declaration.domain.to_ir(),
@@ -776,11 +817,14 @@ def _build_ir(cls: type[object], definition: WorkloadDefinition) -> WorkloadIR:
 
     # State effects are version-order constraints. Reads may commute, while a
     # transition is ordered against every adjacent access to the same state.
+    # extern_io channels serialize the same way: the signed graph has no
+    # ordering proof for external side effects, so declaration order is kept.
+    ordered_kinds = frozenset({EffectKind.TRANSITION, EffectKind.EXTERN_IO})
     state_effects: dict[str, list[tuple[str, EffectKind]]] = {}
     for task_ir in task_irs:
         for effect in task_ir.effects:
             accesses = state_effects.setdefault(effect.state, [])
-            if accesses and (effect.kind is EffectKind.TRANSITION or accesses[-1][1] is EffectKind.TRANSITION):
+            if accesses and (effect.kind in ordered_kinds or accesses[-1][1] in ordered_kinds):
                 edges.append(WorkloadEdge(accesses[-1][0], task_ir.name, WorkloadEdgeKind.EFFECT, effect.state))
             accesses.append((task_ir.name, effect.kind))
 

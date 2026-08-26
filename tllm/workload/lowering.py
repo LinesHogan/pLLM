@@ -65,6 +65,7 @@ def lower_schedule_graph(
         EffectKind.CURRENT: ScheduleEffectKind.STATE_READ,
         EffectKind.TRANSITION: ScheduleEffectKind.STATE_TRANSITION,
         EffectKind.NEXT: ScheduleEffectKind.VERSION_PUBLISH,
+        EffectKind.EXTERN_IO: ScheduleEffectKind.EXTERN_IO,
     }
     for workload in workloads:
         states.extend(

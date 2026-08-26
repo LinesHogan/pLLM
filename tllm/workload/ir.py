@@ -33,6 +33,7 @@ class EffectKind(StrEnum):
     CURRENT = "current"
     TRANSITION = "transition"
     NEXT = "next"
+    EXTERN_IO = "extern_io"
 
 
 class WorkloadEdgeKind(StrEnum):
