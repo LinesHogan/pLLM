@@ -8,6 +8,7 @@ before the first model forward.
 
 from __future__ import annotations
 
+import contextlib
 from collections import Counter, deque
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationInput,
     RegionShapeSpecializationRequest,
 )
+from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
 from tllm.runtime.scheduling.physical import Fence
 from tllm.runtime.scheduling.plan_store import (
     PlanResources,
@@ -752,6 +754,7 @@ class NativeWorkloadExecution:
     _prepared_step: int = -1
     _executed_nodes: set[NodeKey] = field(default_factory=set)
     _side_streams: tuple[object, ...] = ()
+    _cost_probe: RegionCostProbe = field(default_factory=RegionCostProbe)
 
     def _join_side_streams(self) -> None:
         """Order the main stream after all side-stream work enqueued so far.
@@ -776,6 +779,19 @@ class NativeWorkloadExecution:
         """Read-only local backend binder registry for signed extern Regions."""
 
         return self._backend_region_binders
+
+    def region_cost_report(self, *, block: bool = False) -> RegionCostReport:
+        """Read-only observed region cost snapshot (Phase D backfill).
+
+        Diagnostics only: the signed Decision (including its
+        ``Cost.main_path_extension_ns`` placeholder) is never mutated, and no
+        measurement feeds back into the compiler.
+        """
+
+        signed = self.compilation.decision.cost.main_path_extension_ns
+        return self._cost_probe.report(
+            signed_main_path_extension_ns=signed, block=block
+        )
 
     def backend_region_binder_stages(
         self, backend_event: BackendObservableEvent
@@ -819,6 +835,7 @@ class NativeWorkloadExecution:
         self.executor.finish_step(step)
         if self._value_store is not None:
             self._value_store.finish_step(step)
+        self._cost_probe.harvest()
         self._prepared_step = -1
         self._executed_nodes.clear()
 
@@ -1310,6 +1327,8 @@ class _RegionCudaGraph:
         "_preflight_inputs",
         "_preflight_disabled",
         "_preflight_miss",
+        "_cost_probe",
+        "_stream_label",
     )
 
     def __init__(
@@ -1321,6 +1340,9 @@ class _RegionCudaGraph:
             RegionShapeSpecializationRequest,
         ]
         | None = None,
+        *,
+        cost_probe: RegionCostProbe | None = None,
+        stream_label: str = "default",
     ) -> None:
         if artifact.effects:
             raise RuntimeError(
@@ -1340,6 +1362,8 @@ class _RegionCudaGraph:
         self._preflight_inputs: Mapping[str, torch.Tensor] | None = None
         self._preflight_disabled = False
         self._preflight_miss: RegionShapeSpecializationRequest | None = None
+        self._cost_probe = cost_probe
+        self._stream_label = str(stream_label)
 
     def replay(self) -> None:
         raise RuntimeError("Region CUDA Graph replay requires execution context")
@@ -1483,8 +1507,16 @@ class _RegionCudaGraph:
         tensors = self._preflight_inputs
         if tensors is None:
             raise RuntimeError("Region CUDA Graph replay was not preflighted")
+        probe = self._cost_probe
         if self._graph is None:
-            self._capture(tensors)
+            # Capture is one-time and host-visible; measure its wall time.
+            timer = (
+                probe.measure_host(self._artifact.region_id, "capture", self._stream_label)
+                if probe is not None
+                else contextlib.nullcontext()
+            )
+            with timer:
+                self._capture(tensors)
         else:
             stream = self._stream
             graph = self._graph
@@ -1492,9 +1524,17 @@ class _RegionCudaGraph:
             current = torch.cuda.current_stream(next(iter(tensors.values())).device)
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
-                for key, value in tensors.items():
-                    self._staging[key].copy_(value)
-                graph.replay()
+                # Events recorded inside this block live on the capture stream,
+                # so the reading is the graph's own GPU span, not the fencing.
+                timer = (
+                    probe.measure(self._artifact.region_id, "replay", self._stream_label)
+                    if probe is not None
+                    else contextlib.nullcontext()
+                )
+                with timer:
+                    for key, value in tensors.items():
+                        self._staging[key].copy_(value)
+                    graph.replay()
             current.wait_stream(stream)
         outputs = dict(
             zip(self._artifact.output_keys, self._outputs, strict=True)
@@ -1986,10 +2026,12 @@ def _region_workload_execution(
     ] = {}
     runtime_graphs: list[RuntimeGraph] = []
     shape_specializations = _NativeShapeSpecializationQueue()
+    cost_probe = RegionCostProbe()
     anchor_nodes: dict[str, list[NodeKey]] = {}
     node_by_region: dict[str, NodeKey] = {}
     for node, region, anchor, artifact_key in bound_nodes:
         artifact = registry.resolve(region.region_id)
+        stream_label = region.stream.value if region.stream is not None else "default"
         if node.capture_policy is not CapturePolicy.DISABLED:
             if not region.capture_safe:
                 raise RuntimeError(
@@ -2017,6 +2059,8 @@ def _region_workload_execution(
                         artifact,
                         value_store,
                         request_shape_specialization,
+                        cost_probe=cost_probe,
+                        stream_label=stream_label,
                     ),
                 )
             )
@@ -2025,8 +2069,12 @@ def _region_workload_execution(
             context: PhysicalExecutionContext,
             *,
             bound_artifact: "RegionCallableArtifact" = artifact,
+            bound_stream_label: str = stream_label,
         ) -> None:
-            value_store.execute(bound_artifact, context)
+            with cost_probe.measure(
+                bound_artifact.region_id, "execute", bound_stream_label
+            ):
+                value_store.execute(bound_artifact, context)
 
         handlers[node.node_key] = execute_region
         anchor_nodes.setdefault(anchor, []).append(node.node_key)
@@ -2092,6 +2140,7 @@ def _region_workload_execution(
         _requires_decode_hidden=bool(hidden_bindings),
         _shape_specializations=shape_specializations,
         _side_streams=side_streams,
+        _cost_probe=cost_probe,
     )
 
 
