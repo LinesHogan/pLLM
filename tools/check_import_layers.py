@@ -87,6 +87,9 @@ SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("runtime", "tllm.backends.protocol"),
         ("producers", "tllm.backends.protocol"),
         ("workgraph", "tllm.backends.protocol"),
+        # Consumer binders reach concrete backend drivers only through the
+        # protocol seam (runner binding -> driver), never via driver modules.
+        ("consumers", "tllm.backends.protocol"),
     }
 )
 

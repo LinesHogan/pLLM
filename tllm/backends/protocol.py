@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.typed_replay import TypedLayerReplayHandle
 
 if TYPE_CHECKING:
     from tllm.ports.module_weight_view import ModuleWeightViewLocator
@@ -268,6 +269,23 @@ class BackendDriver(Protocol):
         ...
 
     def restore_model_region_executors(self, binding: RunnerBinding) -> int:
+        ...
+
+    def install_typed_layer_replay(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+    ) -> TypedLayerReplayHandle:
+        """Install (or return) the restorable typed replay hook for a runner.
+
+        Consumer-owned binders reach the concrete backend replay machinery
+        only through this protocol; they never import a driver module.
+        """
+        ...
+
+    def restore_typed_layer_replay(self, *, runtime: Any) -> int:
+        """Restore any typed replay hook installed for this runtime."""
         ...
 
     # The runtime must not inspect engine-private runner layouts.  Drivers

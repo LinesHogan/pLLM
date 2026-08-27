@@ -502,6 +502,18 @@ class V027MRv1Driver:
     def restore_model_region_executors(self, binding: RunnerBinding) -> int:
         return _model_region.restore_model_region_executors(binding)
 
+    def install_typed_layer_replay(self, *, runtime: Any, runner: Any) -> Any:
+        from tllm.backends.vllm import typed_layer_replay
+
+        return typed_layer_replay.install_typed_layer_replay(
+            runtime=runtime, runner=runner
+        )
+
+    def restore_typed_layer_replay(self, *, runtime: Any) -> int:
+        from tllm.backends.vllm import typed_layer_replay
+
+        return typed_layer_replay.restore_typed_layer_replay(runtime)
+
     def runner_model_identity(self, runner: Any) -> int:
         return _module_weight_overlay.runner_model_identity(runner)
 

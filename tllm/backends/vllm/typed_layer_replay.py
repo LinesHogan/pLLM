@@ -3,13 +3,14 @@
 This module owns only vLLM model interception and exact layer/norm resources.
 It receives an already signed plan invocation from an owning workload and
 does not inspect workload identities, operation IDs, or primitive strings.
+The shared replay vocabulary (state, step plan, bound calls, primitive keys)
+lives in ``tllm.contracts.typed_replay``; consumer-owned binders and this
+driver meet only through that contract and the ``BackendDriver`` protocol.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import os
 from typing import Any
 
@@ -22,67 +23,12 @@ from tllm.backends.protocol import (
     ordered_row_fusion_policy_fingerprint,
 )
 from tllm.backends.vllm import module_weight_overlay as _overlay
-from tllm.runtime.typed_recurrence import PrimitiveAdapter
+from tllm.contracts.typed_replay import (
+    LayerReplayState,
+    TypedLayerReplayStep,
+)
 
 _HANDLE_KEY = "typed-layer-replay"
-VLLM_LAYER_REPLAY_PRIMITIVE = "tllm.vllm:typed_layer_replay@1"
-VLLM_FINAL_NORM_PRIMITIVE = "tllm.vllm:typed_final_norm@1"
-
-
-@dataclass(frozen=True, slots=True)
-class LayerReplayState:
-    """One decoder-layer input/output, preserving the residual stream."""
-
-    hidden: torch.Tensor
-    residual: torch.Tensor | None
-
-    def stream(self) -> torch.Tensor:
-        return self.hidden if self.residual is None else self.hidden + self.residual
-
-
-@dataclass(frozen=True, slots=True)
-class TypedLayerReplayRequest:
-    """One request-local callback bound by a workload-owned stager."""
-
-    request_id: str
-    packed_rows: tuple[int, ...]
-    replay: Callable[["VllmTypedLayerReplayHandle"], Mapping[int, torch.Tensor]]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request_id, str) or not self.request_id:
-            raise TypeError("typed layer replay request_id must be a non-empty str")
-        if not self.packed_rows or any(
-            isinstance(row, bool) or not isinstance(row, int) or row < 0
-            for row in self.packed_rows
-        ):
-            raise ValueError("typed layer replay packed_rows must be non-empty int rows")
-        if len(self.packed_rows) != len(set(self.packed_rows)):
-            raise ValueError("typed layer replay packed_rows must be unique")
-        if not callable(self.replay):
-            raise TypeError("typed layer replay request callback must be callable")
-
-
-@dataclass(frozen=True, slots=True)
-class TypedLayerReplayStep:
-    """All callbacks for one packed model forward."""
-
-    total_rows: int
-    requests: tuple[TypedLayerReplayRequest, ...]
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.total_rows, bool)
-            or not isinstance(self.total_rows, int)
-            or self.total_rows < 1
-        ):
-            raise ValueError("typed layer replay total_rows must be a positive int")
-        if not self.requests or not all(
-            isinstance(request, TypedLayerReplayRequest) for request in self.requests
-        ):
-            raise TypeError("typed layer replay requests must be non-empty typed requests")
-        rows = tuple(row for request in self.requests for row in request.packed_rows)
-        if len(rows) != self.total_rows or set(rows) != set(range(self.total_rows)):
-            raise ValueError("typed layer replay requests must cover packed rows exactly")
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,60 +358,6 @@ class VllmTypedLayerReplayHandle:
         self.restored = True
 
 
-@dataclass(frozen=True, slots=True)
-class VllmLayerReplayCall:
-    """One pre-bound vLLM layer invocation selected as a typed resource."""
-
-    handle: VllmTypedLayerReplayHandle
-    layer: int
-    request_ordinal: int
-    packed_row: int
-    token_position: int
-
-    def execute(self, state: LayerReplayState) -> LayerReplayState:
-        return self.handle.replay_layer(
-            state,
-            layer=self.layer,
-            request_ordinal=self.request_ordinal,
-            packed_row=self.packed_row,
-            token_position=self.token_position,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class VllmNormCall:
-    """The pre-bound terminal norm resource for one typed model Region."""
-
-    handle: VllmTypedLayerReplayHandle
-
-    def execute(self, state: LayerReplayState) -> torch.Tensor:
-        return self.handle.normalize(state)
-
-
-def primitive_adapters(implementation_id: str) -> tuple[PrimitiveAdapter, ...]:
-    """Return the exact vLLM primitives an owning Region may bind.
-
-    Resource selection is already encoded by the typed operands. The adapter
-    consequently has no need to classify operation records or workloads.
-    """
-
-    if not isinstance(implementation_id, str) or not implementation_id:
-        raise TypeError("typed vLLM primitive implementation_id must be non-empty str")
-
-    def replay(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
-        state, call = operands
-        return (call.execute(state),)  # type: ignore[union-attr]
-
-    def norm(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
-        state, call = operands
-        return (call.execute(state),)  # type: ignore[union-attr]
-
-    return (
-        PrimitiveAdapter(implementation_id, VLLM_LAYER_REPLAY_PRIMITIVE, replay),
-        PrimitiveAdapter(implementation_id, VLLM_FINAL_NORM_PRIMITIVE, norm),
-    )
-
-
 def _require_binding(*, runtime: object, runner: object) -> RunnerBinding:
     binding = _overlay.get_runner_binding(runner)
     if not isinstance(binding, RunnerBinding) or not binding.active:
@@ -573,18 +465,10 @@ def restore_typed_layer_replay(runtime: object) -> int:
 
 
 __all__ = [
-    "LayerReplayState",
-    "TypedLayerReplayRequest",
     "TypedLayerReplayStats",
-    "TypedLayerReplayStep",
-    "VllmLayerReplayCall",
-    "VllmNormCall",
     "VllmTypedLayerReplayHandle",
-    "VLLM_FINAL_NORM_PRIMITIVE",
-    "VLLM_LAYER_REPLAY_PRIMITIVE",
     "abort_typed_layer_replay",
     "install_typed_layer_replay",
-    "primitive_adapters",
     "restore_typed_layer_replay",
     "signed_ordered_row_fusion_policy",
 ]

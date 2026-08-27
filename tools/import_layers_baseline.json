@@ -104,8 +104,6 @@
       "tllm.workload.region_compiler -> tllm.schedule.contracts"
     ]
   },
-  "module_level": {
-    "consumers->backends": 1
-  },
+  "module_level": {},
   "local_level": {}
 }

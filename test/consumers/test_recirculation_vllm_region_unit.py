@@ -239,13 +239,14 @@ def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() ->
         computed_tokens=(0,),
     )
     handle = SimpleNamespace(
-        binding=SimpleNamespace(
-            driver=SimpleNamespace(
-                fast_weight_packed_row_plan_inputs=lambda **_kwargs: columns
-            )
-        ),
         prepare=mock.Mock(),
     )
+    driver = SimpleNamespace(
+        install_typed_layer_replay=lambda **_: handle,
+        restore_typed_layer_replay=lambda **_: 0,
+        fast_weight_packed_row_plan_inputs=lambda **_: columns,
+    )
+    binding = SimpleNamespace(active=True, driver=driver)
     context = BackendRegionStageContext(
         implementation_id=PREFILL_BINDER_IMPLEMENTATION_ID,
         backend_event="prepare_inputs.post",
@@ -271,8 +272,8 @@ def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() ->
         ),
         mock.patch.object(
             vllm_region_workload,
-            "install_typed_layer_replay",
-            return_value=handle,
+            "runner_binding_for",
+            return_value=binding,
         ),
     ):
         workload.binder.stage_from_backend(context)
@@ -335,13 +336,13 @@ def test_runtime_row_shape_miss_fails_closed_without_hook_compilation() -> None:
         prompt_tokens=(3,),
         computed_tokens=(0,),
     )
-    handle = SimpleNamespace(
-        binding=SimpleNamespace(
-            driver=SimpleNamespace(
-                fast_weight_packed_row_plan_inputs=lambda **_kwargs: columns
-            )
-        )
+    handle = SimpleNamespace()
+    driver = SimpleNamespace(
+        install_typed_layer_replay=lambda **_: handle,
+        restore_typed_layer_replay=lambda **_: 0,
+        fast_weight_packed_row_plan_inputs=lambda **_: columns,
     )
+    binding = SimpleNamespace(active=True, driver=driver)
     context = BackendRegionStageContext(
         implementation_id=PREFILL_BINDER_IMPLEMENTATION_ID,
         backend_event="prepare_inputs.post",
@@ -367,10 +368,9 @@ def test_runtime_row_shape_miss_fails_closed_without_hook_compilation() -> None:
         ),
         mock.patch.object(
             vllm_region_workload,
-            "install_typed_layer_replay",
-            return_value=handle,
+            "runner_binding_for",
+            return_value=binding,
         ),
-        mock.patch.object(vllm_region_workload, "restore_typed_layer_replay"),
         pytest.raises(RuntimeError, match="specialization-required"),
     ):
         workload.binder.stage_from_backend(context)

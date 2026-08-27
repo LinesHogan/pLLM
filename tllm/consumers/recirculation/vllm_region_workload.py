@@ -2,8 +2,10 @@
 
 The consumer declares its finite recurrence and owns the resulting slot
 stager. Rust compiles that declaration into typed groups and liveness; this
-module binds the signed operands to vLLM replay resources and the consumer's
-exact mix primitive. No legacy recurrence plan participates in this path.
+module binds the signed operands to the backend's typed replay resources
+(reached only through ``tllm.contracts.typed_replay`` vocabulary and the
+``BackendDriver`` protocol) and the consumer's exact mix primitive. No
+legacy recurrence plan participates in this path.
 """
 
 from __future__ import annotations
@@ -16,21 +18,19 @@ from typing import Callable, Mapping, cast
 import tllm._core as _core
 import torch
 
-from tllm.backends.vllm.typed_layer_replay import (
-    LayerReplayState,
-    TypedLayerReplayRequest,
-    TypedLayerReplayStep,
-    VLLM_FINAL_NORM_PRIMITIVE,
-    VLLM_LAYER_REPLAY_PRIMITIVE,
-    VllmLayerReplayCall,
-    VllmNormCall,
-    VllmTypedLayerReplayHandle,
-    install_typed_layer_replay,
-    primitive_adapters,
-    restore_typed_layer_replay,
-)
+from tllm.backends.protocol import runner_binding_for
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.recirculation import RECIRCULATION_PREFILL_BINDER_IMPLEMENTATION_ID
+from tllm.contracts.typed_replay import (
+    VLLM_FINAL_NORM_PRIMITIVE,
+    VLLM_LAYER_REPLAY_PRIMITIVE,
+    FinalNormCall,
+    LayerReplayCall,
+    LayerReplayState,
+    TypedLayerReplayHandle,
+    TypedLayerReplayRequest,
+    TypedLayerReplayStep,
+)
 from tllm.consumers.recirculation.config import RecirculationConfig
 from tllm.consumers.recirculation.graph import build_recirculation_graph
 from tllm.runtime.backend_region_binders import (
@@ -360,15 +360,38 @@ class _RecirculationMixCall:
 
 
 def _primitive_registry() -> PrimitiveAdapterRegistry:
-    """Combine backend replay primitives with the consumer's exact mix."""
+    """Combine backend replay primitives with the consumer's exact mix.
+
+    The replay/norm trampolines dispatch to backend-owned bound call
+    resources (``LayerReplayCall``/``FinalNormCall`` over the typed replay
+    handle installed through the driver protocol); the consumer owns only
+    registry composition and its own mix primitive.
+    """
+
+    def replay(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
+        state, call = operands
+        return (call.execute(state),)  # type: ignore[union-attr]
+
+    def norm(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
+        state, call = operands
+        return (call.execute(state),)  # type: ignore[union-attr]
 
     def mix(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
         source, destination, call = operands
         return (call.execute(source, destination),)  # type: ignore[union-attr]
 
     return PrimitiveAdapterRegistry(
-        primitive_adapters(PREFILL_BINDER_IMPLEMENTATION_ID)
-        + (
+        (
+            PrimitiveAdapter(
+                PREFILL_BINDER_IMPLEMENTATION_ID,
+                VLLM_LAYER_REPLAY_PRIMITIVE,
+                replay,
+            ),
+            PrimitiveAdapter(
+                PREFILL_BINDER_IMPLEMENTATION_ID,
+                VLLM_FINAL_NORM_PRIMITIVE,
+                norm,
+            ),
             PrimitiveAdapter(
                 PREFILL_BINDER_IMPLEMENTATION_ID,
                 _RECIRCULATION_MIX_PRIMITIVE,
@@ -380,7 +403,7 @@ def _primitive_registry() -> PrimitiveAdapterRegistry:
 
 @dataclass(frozen=True, slots=True)
 class _RequestBindingContext:
-    handle: VllmTypedLayerReplayHandle
+    handle: TypedLayerReplayHandle
     config: RecirculationConfig
     request_ordinal: int
     packed_rows: tuple[int, ...]
@@ -429,7 +452,7 @@ def _seed_state_resolver(coordinates: tuple[int, ...]) -> _SeedResolver:
 
 def _layer_replay_resolver(coordinates: tuple[int, ...]) -> _ResourceResolver:
     token, layer = _layer_replay_coordinates(coordinates)
-    return lambda context: VllmLayerReplayCall(
+    return lambda context: LayerReplayCall(
         handle=context.handle,
         layer=layer,
         request_ordinal=context.request_ordinal,
@@ -449,7 +472,7 @@ def _mix_resolver(coordinates: tuple[int, ...]) -> _ResourceResolver:
 def _final_norm_resolver(coordinates: tuple[int, ...]) -> _ResourceResolver:
     if coordinates:
         raise RuntimeError("signed vLLM final-norm descriptor must not have coordinates")
-    return lambda context: VllmNormCall(context.handle)
+    return lambda context: FinalNormCall(context.handle)
 
 
 def _normalized_output_resolver(coordinates: tuple[int, ...]) -> _OutputResolver:
@@ -704,7 +727,7 @@ class _TypedRecirculationRequest:
     descriptors: _StageDescriptorRegistry
     config: RecirculationConfig
 
-    def replay(self, handle: VllmTypedLayerReplayHandle) -> Mapping[int, torch.Tensor]:
+    def replay(self, handle: TypedLayerReplayHandle) -> Mapping[int, torch.Tensor]:
         context = _RequestBindingContext(
             handle=handle,
             config=self.config,
@@ -761,9 +784,15 @@ def _stage_typed_recirculation(
         raise RuntimeError(
             "specialization-required: typed Recirculation has no cold stage artifact bundle"
         )
-    handle = install_typed_layer_replay(runtime=context.runtime, runner=context.runner)
+    # The concrete replay machinery is backend-owned; this binder reaches it
+    # only through the runner binding's driver protocol.
+    binding = runner_binding_for(context.runner)
+    if binding is None or not binding.active:
+        raise RuntimeError("typed Recirculation staging requires an active runner binding")
+    driver = binding.driver
+    handle = driver.install_typed_layer_replay(runtime=context.runtime, runner=context.runner)
     try:
-        columns = handle.binding.driver.fast_weight_packed_row_plan_inputs(
+        columns = driver.fast_weight_packed_row_plan_inputs(
             runner=context.runner,
             num_scheduled_tokens=context.num_scheduled_tokens,
             input_batch=context.input_batch,
@@ -855,7 +884,7 @@ def _stage_typed_recirculation(
 
         context.slot.stage(stage, bind, context.step_id)
     except Exception:
-        restore_typed_layer_replay(context.runtime)
+        driver.restore_typed_layer_replay(runtime=context.runtime)
         raise
 
 

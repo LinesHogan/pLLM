@@ -6,16 +6,27 @@ should create an explicit runtime instance:
 
     runtime = TllmRuntime(consumers=[...])
     llm = runtime.make_llm(...)
+
+The legacy/runtime names (:class:`BaseConsumer`, :class:`TllmRuntime`,
+``default_runtime``, ``BeforeNextUse``, ``extern``, ``flow``) load lazily via
+PEP 562 so that importing a native-stack subpackage (``tllm.workload``,
+``tllm.schedule``) never pulls the legacy Program/workgraph frontend or the
+runtime into a compiler-only process.  They are gone at legacy retirement.
 """
 
 from __future__ import annotations
 
-from tllm.consumers.base import BaseConsumer
-from tllm.runtime.runtime import TllmRuntime, default_runtime
-from tllm.workgraph.frontend import BeforeNextUse, extern, flow
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tllm.consumers.base import BaseConsumer
+    from tllm.runtime.runtime import TllmRuntime, default_runtime
+    from tllm.workgraph.frontend import BeforeNextUse, extern, flow
 
 
 def make_llm(*args: object, **kwargs: object) -> object:
+    from tllm.runtime.runtime import TllmRuntime, default_runtime
+
     workloads = kwargs.pop("workloads", None)
     runtime_option_names = (
         "workload_memory_budget_bytes",
@@ -49,11 +60,31 @@ def make_llm(*args: object, **kwargs: object) -> object:
 
 
 def register_consumer(consumer: BaseConsumer) -> None:
+    from tllm.runtime.runtime import default_runtime
+
     default_runtime().register_consumer(consumer)
 
 
 def clear_consumers() -> None:
+    from tllm.runtime.runtime import default_runtime
+
     default_runtime().clear_consumers()
+
+
+def __getattr__(name: str) -> object:
+    if name == "BaseConsumer":
+        from tllm.consumers.base import BaseConsumer
+
+        return BaseConsumer
+    if name in ("TllmRuntime", "default_runtime"):
+        from tllm.runtime import runtime as _runtime
+
+        return getattr(_runtime, name)
+    if name in ("BeforeNextUse", "extern", "flow"):
+        from tllm.workgraph import frontend as _frontend
+
+        return getattr(_frontend, name)
+    raise AttributeError(f"module 'tllm' has no attribute {name!r}")
 
 
 __all__ = [
