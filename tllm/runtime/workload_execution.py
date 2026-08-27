@@ -1813,9 +1813,16 @@ def _plan_resources(
         RuntimeStream(
             stream_class,
             (
-                _SerialStream()
-                if stream_class is StreamClass.DEFAULT or not cuda
-                else torch.cuda.Stream()
+                # With real side streams the fences between Regions are real
+                # CUDA events, and recording one requires a real stream: the
+                # main path is the ambient current stream.
+                torch.cuda.current_stream()
+                if real_side_streams and stream_class is StreamClass.DEFAULT
+                else (
+                    _SerialStream()
+                    if stream_class is StreamClass.DEFAULT or not cuda
+                    else torch.cuda.Stream()
+                )
             ),
             retire_fence=Fence(
                 FenceKey(

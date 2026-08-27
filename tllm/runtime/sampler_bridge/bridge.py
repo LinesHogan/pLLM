@@ -263,9 +263,14 @@ def sample_with_optional_modifier(
     with maybe_record_function("distiller.sample_with_optional_modifier"):
         if view is None or provider is None or not provider.is_active():
             return None
-        state = provider.prepare_step(view)
+        # The parameter-read fence must publish *before* the provider reads
+        # any Region output: dispatch joins side-stream work onto the main
+        # stream, and provider consumption after the join observes complete
+        # results.  The reverse order raced side Regions signed before
+        # sampler.pre_draw.
         if before_draw is not None:
             before_draw()
+        state = provider.prepare_step(view)
         if state is None or int(state.affected_row_ids.numel()) <= 0:
             return None
         try:

@@ -3144,11 +3144,13 @@ fn compile_impl(
         .map(|index| graph.tasks[*index].task_id.clone())
         .collect();
     let mut task_regions = vec![0usize; graph.tasks.len()];
-    let mut execution_regions = Vec::with_capacity(drafts.len());
     for (ordinal, draft) in drafts.iter().enumerate() {
         for task in &draft.tasks {
             task_regions[*task] = ordinal;
         }
+    }
+    let mut execution_regions = Vec::with_capacity(drafts.len());
+    for (ordinal, draft) in drafts.iter().enumerate() {
         let tasks: Vec<String> = draft
             .tasks
             .iter()
@@ -3201,15 +3203,10 @@ fn compile_impl(
             .iter()
             .flat_map(|index| graph.tasks[*index].effects.iter().cloned())
             .collect();
-        // Side-stream placement only exposes legal parallelism to the GPU
-        // hardware scheduler; every cross-stream dependency remains an
-        // explicit fence.  Regions with any state effect stay on the default
-        // stream so version ordering never depends on hardware timing.
-        let stream = if options.allow_side_stream && effects.is_empty() {
-            RegionStreamClass::SideForward
-        } else {
-            RegionStreamClass::Default
-        };
+        // The stream class is assigned after input bindings refine
+        // capture safety (see below): side placement requires the final
+        // signed capture_safe, not the draft-time value.
+        let stream = RegionStreamClass::Default;
         execution_regions.push(ExecutionRegion {
             region_id,
             tasks,
@@ -3548,6 +3545,27 @@ fn compile_impl(
                     RegionInputKind::Hidden | RegionInputKind::Materialized
                 )
             });
+        // Side-stream placement only exposes legal parallelism to the GPU
+        // hardware scheduler; every cross-stream dependency remains an
+        // explicit fence.  A Region may leave the default stream only when
+        // the signed graph proves the placement safe:
+        // - zero state effects, so version ordering never depends on
+        //   hardware timing;
+        // - the final signed capture_safe, so the compiled callable has no
+        //   host-side hazard the stream context could invalidate;
+        // - every input a signed materialization (fence-covered cross-region
+        //   value).  Hidden taps and provided/step-id values are excluded:
+        //   the model cannot prove the main snapshot event covers their
+        //   production.
+        if options.allow_side_stream
+            && region.effects.is_empty()
+            && region.capture_safe
+            && region.input_bindings.iter().all(|binding| {
+                matches!(binding.kind, RegionInputKind::Materialized)
+            })
+        {
+            region.stream = Some(RegionStreamClass::SideForward);
+        }
         region.capture_mode = capture_mode_for_region(timeline, options, region)?;
         region.compile_command = compile_command_for_region(options, region);
         region.artifact_key = region_artifact_key(graph_json, timeline_json, options_json, region)?;
@@ -3829,12 +3847,20 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                 "serial fallback region is disabled by CompileOptions",
             ));
         }
-        if region.stream == Some(RegionStreamClass::SideForward)
-            && (!options_desc.allow_side_stream || !region.effects.is_empty())
-        {
-            return Err(schedule_error(
-                "side-stream ExecutionRegion requires allow_side_stream and zero state effects",
-            ));
+        if region.stream == Some(RegionStreamClass::SideForward) {
+            let inputs_materialized = region
+                .input_bindings
+                .iter()
+                .all(|binding| matches!(binding.kind, RegionInputKind::Materialized));
+            if !options_desc.allow_side_stream
+                || !region.effects.is_empty()
+                || !region.capture_safe
+                || !inputs_materialized
+            {
+                return Err(schedule_error(
+                    "side-stream ExecutionRegion requires allow_side_stream, zero state effects, capture safety, and fully materialized inputs",
+                ));
+            }
         }
         if let Some(command) = &region.compile_command {
             let expected_adapter =
@@ -5307,8 +5333,12 @@ mod tests {
     #[test]
     fn side_stream_placement_is_signed_and_option_gated() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"side-stream","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":false,"inputs":[{"name":"value","kind":"provided","source":"value"}],"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[],"values":[{"value_id":"side:run:answer","version":1,"producer":"run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
-        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        // Side-eligible: pure, capture-safe, and every Region input a signed
+        // materialization.  The two tasks sit in disjoint windows so the
+        // planner cannot merge them: `consume` reads `produce` through a
+        // fence-covered cross-region value.
+        let graph = r#"{"workload_key":"side-stream","tasks":[{"task_id":"produce","timing":{"after":"model.execute","before":"sampler.pre_draw"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"consume","timing":{"after":"sampler.pre_draw","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"inputs":[{"name":"value","kind":"result","source":"produce","output":"value"}],"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[{"source":"produce","target":"consume","kind":"data"}],"values":[{"value_id":"side:produce:value","version":1,"producer":"produce","producer_output":"value","consumers":["consume"],"size_bytes":0,"alias_set":""},{"value_id":"side:consume:answer","version":1,"producer":"consume","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"sampler.pre_draw","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
         let serial_options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
         let side_options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
@@ -5316,18 +5346,29 @@ mod tests {
         let serial: Decision =
             serde_json::from_str(&compile_schedule(graph, timeline, serial_options).unwrap())
                 .unwrap();
-        assert_eq!(
-            serial.execution_regions[0].stream,
-            Some(RegionStreamClass::Default)
-        );
+        assert!(serial
+            .execution_regions
+            .iter()
+            .all(|region| region.stream == Some(RegionStreamClass::Default)));
 
         let side: Decision =
             serde_json::from_str(&compile_schedule(graph, timeline, side_options).unwrap())
                 .unwrap();
-        assert_eq!(
-            side.execution_regions[0].stream,
-            Some(RegionStreamClass::SideForward)
-        );
+        // `produce` has no signed inputs (never capture-safe), `consume` is
+        // the side-eligible Region.
+        assert_eq!(side.execution_regions.len(), 2);
+        let consume = side
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks.iter().any(|task| task == "consume"))
+            .unwrap();
+        assert_eq!(consume.stream, Some(RegionStreamClass::SideForward));
+        let produce = side
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks.iter().any(|task| task == "produce"))
+            .unwrap();
+        assert_eq!(produce.stream, Some(RegionStreamClass::Default));
         validate_schedule(
             graph,
             timeline,
@@ -5345,6 +5386,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("side-stream"));
+
+        // Provided/hidden inputs are not signed materializations: the model
+        // cannot prove the main snapshot covers their production, so the
+        // Region stays on the default stream.
+        let provided_graph = r#"{"workload_key":"side-stream-provided","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"inputs":[{"name":"value","kind":"provided","source":"value"}],"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[],"values":[{"value_id":"side:run:answer","version":1,"producer":"run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
+        let provided: Decision = serde_json::from_str(
+            &compile_schedule(provided_graph, timeline, side_options).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            provided.execution_regions[0].stream,
+            Some(RegionStreamClass::Default)
+        );
+
+        // Without capture safety the compiled callable may carry host-side
+        // hazards the stream context could invalidate: default stream.
+        let unsafe_graph = r#"{"workload_key":"side-stream-unsafe","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":false,"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[],"values":[{"value_id":"side:run:answer","version":1,"producer":"run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
+        let unsafe_decision: Decision = serde_json::from_str(
+            &compile_schedule(unsafe_graph, timeline, side_options).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe_decision.execution_regions[0].stream,
+            Some(RegionStreamClass::Default)
+        );
     }
 
     #[test]
