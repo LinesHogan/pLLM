@@ -13,3 +13,5 @@ class TTRLConsumerConfig:
     hidden_size: int = 0
     rank: int = 16
     learning_rate: float = 1e-3
+    # "consumer" = legacy Program path; "region" = native Region declaration.
+    implementation: str = "consumer"
