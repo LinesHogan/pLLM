@@ -89,7 +89,10 @@ shape specialization、serial/side-stream 标记，以及静态 Python/torch/CUD
 compiler fingerprint。
 
 进程内 artifact materializer 会把普通 PyTorch task 组合成一个 Region callable，并只把
-这个完整 callable 交给一次 `torch.compile`。Region 内消费的 result 保持为局部 Python/FX
+这个完整 callable 交给一次 `torch.compile`。每次物化都在独立的 per-Region code
+identity 下编译，Dynamo 的重编译缓存（按 code object 计数）不会在同一进程内跨
+Region 累积；从不触碰 Dynamo 全局生命周期旋钮，外部所有的主负载的编译状态不受
+影响。Region 内消费的 result 保持为局部 Python/FX
 value，不作为 materialized output 返回。不可捕获的 typed extern 是显式 singleton Region，
 并绕过 `torch.compile`；CUDA Graph capture 和 replay 同样以 Region 为单位。若 runtime
 无法物化选定 artifact 或 capability，必须拒绝计划，不能静默退回逐 task eager。

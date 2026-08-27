@@ -117,6 +117,10 @@ Python/torch/CUDA/device compiler fingerprint.
 
 The process-local artifact materializer composes ordinary PyTorch tasks in one
 Region callable and passes that complete callable to `torch.compile` once.
+Every materialization compiles under a fresh per-Region code identity, so
+Dynamo recompile caches (which are per code object) never accumulate across
+Regions in one process; global Dynamo lifecycle knobs are never touched,
+leaving the externally owned main model's compilation state intact.
 Result edges consumed within the Region remain local Python/FX values and are
 not returned as materialized outputs. Uncapturable typed extern work remains
 an explicit singleton Region and bypasses `torch.compile`. CUDA Graph capture

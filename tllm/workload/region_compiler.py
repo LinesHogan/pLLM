@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from typing import cast
 
 import torch
@@ -463,6 +463,40 @@ _COMPILER_ADAPTERS: Mapping[
 )
 
 
+def _fresh_region_code(
+    function: Callable[..., tuple[object, ...]],
+    region_id: str,
+) -> Callable[..., tuple[object, ...]]:
+    """Give one materialized Region its own Dynamo code-object identity.
+
+    Every ``combined`` closure below shares one module-level code object, and
+    Dynamo's recompile cache is per code object: without this, repeated
+    materializations in one process (many Regions, or epoch re-materialization)
+    accumulate guard entries on a single frame until the cache-size limit
+    rejects compilation or silently degrades the Region to eager.  A fresh
+    code object per materialization gives each Region its own cache budget.
+
+    Global lifecycle knobs (``torch._dynamo.reset`` / ``cache_size_limit``)
+    are deliberately not touched: the process also hosts the externally owned
+    main model's compilation state, which must not be clobbered.
+    """
+
+    safe_name = "".join(
+        character if character.isalnum() or character == "_" else "_"
+        for character in region_id
+    )
+    fresh_code = function.__code__.replace(co_name=f"region_{safe_name}")
+    return cast(
+        Callable[..., tuple[object, ...]],
+        FunctionType(
+            fresh_code,
+            function.__globals__,
+            name=fresh_code.co_name,
+            closure=function.__closure__,
+        ),
+    )
+
+
 def materialize_region_callable(
     declarations: tuple[WorkloadDeclaration, ...],
     region: ExecutionRegion,
@@ -525,6 +559,7 @@ def materialize_region_callable(
                 values_by_binding[output.value_binding_id] = value
         return tuple(values_by_binding[source] for source in output_sources)
 
+    combined = _fresh_region_code(combined, region.region_id)
     command = region.compile_command
     if region.implementation_kind is RegionImplementationKind.COMPILED and command is None:
         raise RuntimeError("compiled ExecutionRegion is missing its signed compile command")
