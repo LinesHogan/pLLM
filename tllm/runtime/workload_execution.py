@@ -538,18 +538,15 @@ class StateVersionRegistry:
                 )
             increment = mutation_counts[resource]
             conditional = conditional_counts[resource]
-            # A conditional transition may fire or skip per execution (the
-            # signed graph cannot prove which), so each slot may advance by
-            # the strict increment or the strict + conditional increment —
-            # nothing in between and never more.
+            # Each conditional transition may independently fire or skip per
+            # execution (the signed graph cannot prove which), so a slot may
+            # advance by any count between the strict increment and strict +
+            # conditional — every subset of the signed conditional
+            # transitions is legal, and never more than all of them.
             invalid = {
                 key: (previous[key], current[key])
                 for key in current
-                if current[key] != previous[key] + increment
-                and not (
-                    conditional
-                    and current[key] == previous[key] + increment + conditional
-                )
+                if not increment <= current[key] - previous[key] <= increment + conditional
             }
             if invalid:
                 action = "mutation" if increment or conditional else "read"

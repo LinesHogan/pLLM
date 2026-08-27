@@ -1820,6 +1820,75 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "signed mutation version effect"):
             self._run_conditional_transition(2)
 
+    def _run_double_conditional_transition(self, bump_a: int, bump_b: int) -> None:
+        versions: dict[Hashable, int] = {None: 0}
+
+        @workload(id=f"runtime.state.maybe2.{bump_a}.{bump_b}")
+        class Stateful:
+            state = State(
+                scope=StateScope.REPLICA,
+                parameters="model",
+                transition="manual",
+            )
+
+            @task(
+                effects=(maybe_transition(state),),
+                timing=Between("model.execute", "step.end"),
+            )
+            def update_a(self) -> None:
+                versions[None] += bump_a
+
+            @task(
+                effects=(maybe_transition(state),),
+                timing=Between("model.execute", "step.end"),
+            )
+            def update_b(self) -> None:
+                versions[None] += bump_b
+
+        declaration = declare_workload(Stateful())
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+            ),
+        ).compile(_timeline())
+        regions = compilation.decision.execution_regions
+        # Both conditional transitions land in ONE Region (same window,
+        # internalized effects) — the case the interval audit must cover.
+        self.assertEqual(len(regions), 1)
+        schedule_state = compilation.graph.states[0]
+        state = ResidualRuntimeState()
+        bindings = WorkloadExecutionBindings(
+            declarations=(declaration,),
+            state_versions={
+                schedule_state.resource: StateVersionBinding(
+                    schedule_state,
+                    lambda _step_id: dict(versions),
+                )
+            },
+        )
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.publish_workload_compilation(
+                compilation,
+                bindings=bindings,
+            )
+            residual_runtime.prepare_physical_workgraph_step(1)
+            anchor = regions[0].placement_anchor
+            residual_runtime.advance_workload_anchor(anchor)
+
+    def test_two_conditional_transitions_accept_any_partial_fire(self) -> None:
+        # Any subset of the signed conditional transitions may fire:
+        # +0, +1 (either one) and +2 are all legal.
+        self._run_double_conditional_transition(0, 0)
+        self._run_double_conditional_transition(1, 0)
+        self._run_double_conditional_transition(0, 1)
+        self._run_double_conditional_transition(1, 1)
+
+    def test_two_conditional_transitions_reject_beyond_signed_total(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "signed mutation version effect"):
+            self._run_double_conditional_transition(1, 2)
+
     def test_dummy_compilation_takes_authority_at_decision_anchor(self) -> None:
         workload = DummyWorkload(
             DummyConsumerConfig(
