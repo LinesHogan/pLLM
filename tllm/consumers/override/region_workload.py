@@ -36,7 +36,6 @@ Weight-overlay outlook (standing requirement — do not close the road):
 
 from __future__ import annotations
 
-import math
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -417,7 +416,8 @@ class OverRIDERegionWorkload(NativeWorkload):
                     device=spec.device,
                     dtype=spec.dtype,
                 )
-                torch.nn.init.normal_(down, mean=0.0, std=1.0 / math.sqrt(float(hidden_size)))
+                # Official Head-A init: N(0, 0.02) (~/OverRIDE modeling.py:70).
+                torch.nn.init.normal_(down, mean=0.0, std=0.02)
                 up = torch.zeros(
                     (num_heads, int(self.config.vocab_size), int(self.config.rank)),
                     device=spec.device,

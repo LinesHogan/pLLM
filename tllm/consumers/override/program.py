@@ -12,7 +12,6 @@ stash are plain Python in ``consumer.py``.
 
 from __future__ import annotations
 
-import math
 
 import torch
 from torch import nn
@@ -40,7 +39,8 @@ class OverRIDEProgram(torch.nn.Module):
         if int(num_heads) <= 0:
             raise ValueError("OverRIDEProgram requires at least one head")
         down = torch.empty((int(num_heads), int(rank), int(hidden_size)), device=device, dtype=dtype)
-        nn.init.normal_(down, mean=0.0, std=1.0 / math.sqrt(float(hidden_size)))
+        # Official Head-A init: N(0, 0.02) (~/OverRIDE modeling.py:70).
+        nn.init.normal_(down, mean=0.0, std=0.02)
         self.down = nn.Parameter(down)
         self.up = nn.Parameter(
             torch.zeros((int(num_heads), int(vocab_size), int(rank)), device=device, dtype=dtype)
