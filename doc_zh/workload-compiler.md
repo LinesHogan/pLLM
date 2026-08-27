@@ -56,16 +56,24 @@ v1 只为读取旧 golden 保留，执行校验会拒绝它。内存预算是硬
 backend 静态 headroom 的较小值。capability 缺失、deadline 非法、依赖成环、Region
 覆盖不完整、artifact 不匹配或内存超限都会 fail closed。
 
-Granularity Planner 对细粒度 task 图做分析，但为执行产出粗粒度 Region。它从拓扑序上的最大
-确定性 Region 开始，只在 anchor window 无交集、
-effect/version 或 typed extern boundary 必须可观察、graph safety 不一致，或硬内存约束
-要求显式 serial fallback 时拆分。Region 内消费的 value 保持为图内边；跨 Region value
+Granularity Planner 对细粒度 task 图做分析，但为执行产出粗粒度 Region。它从单例
+Region（每 Region 一个 task）出发做精确合并搜索：两个 Region 仅在 anchor window
+相交、共享同一个非 extern 的 implementation kind、其间的 effect/version 与 typed
+extern boundary 全部可以内化、且合并后的划分仍可按拓扑序排列时才可合并。候选划分在
+硬内存预算下按字典序评分比较——依次为 materialization bytes、capture boundary、peak
+live memory、Region 数量、跨 Region fence、critical-path 延伸，最后是确定性的划分标识。
+该搜索在 100,000 个已探索划分状态内是穷举的，超过上限或没有任何划分满足预算时 fail
+closed。签名中的 `serial_fallback` 标记为显式 serial Region 保留，validation 会依据
+`allow_serial_fallback` 对其强制检查，但当前的精确 planner 不会产生它。Region 内消费的
+value 保持为图内边；跨 Region value
 才产生显式 materialization 和 lifetime，依赖 fence 也只存在于 Region 之间。结构成本
 记录 materialization bytes、capture boundary、peak live memory、launch group 和跨 Region
 fence。中端不预测 kernel 精确时序、不分配 SM，也不查询运行时空闲显存。
 
 Rust 构建固定 `isl-rs==0.3.1`，使用其随包构建并静态链接的 isl 0.27；schedule
-和 flow API 均有 Rust 测试。整个连通 region 的 domain/access 都能表示为
+和 flow API 均有 Rust 测试。原设计报告曾点名 Tadashi 承担多面体调度；实现已收敛到
+isl 内建调度器——它覆盖所需的 validity/coincidence/proximity 计算且不引入额外依赖。
+整个连通 region 的 domain/access 都能表示为
 Presburger relation 时，现在会 lower 成 isl 的 validity、coincidence 和 proximity
 约束；生成的 schedule 与 dependence relation 保存在 typed affine region 中，并由
 独立 validator 再次检查。其他节点继续由 DAG scheduler 处理。
@@ -75,8 +83,10 @@ Presburger relation 时，现在会 lower 成 isl 的 validity、coincidence 和
 `PhysicalFlowPlan` 现在每个 `ExecutionRegion` 对应一个物理节点，而不是每个逻辑 task
 对应一个节点。Python lowering 只能绑定签名过的 Region artifact、executor key、anchor
 和跨 Region fence，不能再次拆分 Region 或选择执行顺序。Region artifact identity 纳入
-Region IR、shape specialization、包含 approximation 的 workload key、backend timeline、
-compile/capture policy，以及静态 Python/torch/CUDA/device fingerprint。
+签名后的 Region record、schedule graph（携带每个 workload 的 approximation policy key）、
+backend timeline，以及完整的规范化 compile options：内存预算、compile/capture policy、
+shape specialization、serial/side-stream 标记，以及静态 Python/torch/CUDA/device
+compiler fingerprint。
 
 进程内 artifact materializer 会把普通 PyTorch task 组合成一个 Region callable，并只把
 这个完整 callable 交给一次 `torch.compile`。Region 内消费的 result 保持为局部 Python/FX
@@ -107,7 +117,10 @@ sink 和 state version 后，才能使用进程内 eager Region runtime。
 MRv1/MRv2 worker 会上报纯数据 timeline 和一次初始化完成后的静态显存快照。实例作用域
 的父进程 coordinator 负责编译并签名 decision（含 typed dependency fence 和主负载
 reservation），再通过 string-method RPC 广播；worker 独立验证签名，并把 immutable
-Region decision 机械 lower 成 `PhysicalFlowPlan` descriptor。
+Region decision 机械 lower 成 `PhysicalFlowPlan` descriptor。coordinator 还可以把签名后的
+decision 持久化到可配置目录，条目以不变的 compilation cache key 命名；持久化条目属于
+不可信输入，只有在 Rust wire 校验重新推导出其 key 与签名后才被接受，任何不匹配都 fail
+closed。
 
 native MP 执行要求显式提供 `WorkloadWorkerSpec`。控制面只传 importable factory 名称和
 纯 JSON config；factory 在 worker 内重建 declaration 和进程本地 callback。worker 完成
@@ -190,3 +203,24 @@ shape-miss specialization epoch switching 仍未验证或未完成。本文不�
 hidden/provided/sink binding、state-version 审计，以及带精确 artifact 回报的显式 worker
 重建均已实现，并有 CPU 测试覆盖。完整 GPU 正确性矩阵和 ESamp paired throughput gate
 仍未宣称完成。
+
+## 相对原报告的已修订承诺清单
+
+原设计报告承诺的若干事项已被本架构有意识地重新划定范围。记录于此，以便读者区分
+"未做"与"不再做"。
+
+- **Backend 四类能力（原报告 §4.4）——已修订。** 原报告要求 backend 提供四种自由形式
+  的能力：图遍历、anchor 节点插删、张量元数据查询、缓冲区申请/释放/in-place 复用。实际
+  落地的契约以 `BackendDriver` 协议加签名 capability 记录（`BackendCapabilities`、
+  `ModuleWeightOverlayCapabilities`、`ModelRegionCapabilities` 与 typed replay handle
+  协议）取而代之。backend 导出的是 capability 与可观察 anchor，而不是一份可重排的模型图。
+- **Profiling 反馈闭环（原报告 §9.3）——部分完成，闭环未闭合。** runtime 现已按 Region
+  采集 CPU/CUDA 计时（EWMA）并提供只读 cost report。该 report 是诊断估算：它排除
+  side-stream 时间并对 default-stream Region 求和，因此不是严格的 main-path cost 回填。
+  没有任何测量结果回流到 planner 决策。
+- **Wavefront 旋钮（原报告 §8.3）——已撤销。** affine region 不做任何 tiling、
+  interchange 或 skewing，也不存在 serial/wavefront 选择器。recurrence 编译器中的
+  `Serial`/`Wavefront` 标签只是有序行对融合策略的命名，不是多面体调度。设计立场是
+  CUDA Graph capture 加硬件调度，而不是提取 wavefront。
+- **联合图重排——已收缩。** 主负载图由外部所有且固定；重排只适用于附加 task 的
+  Region 划分，从不作用于覆盖模型的联合图。

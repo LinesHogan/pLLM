@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from tllm.schedule.coordinator import (
         WorkloadCompilation,
         WorkloadCompilerCoordinator,
+        WorkloadDecisionCacheError,
         PlanEpochAllocator,
         install_workload_compilation,
         workload_compilation_cache_key,
@@ -96,6 +97,7 @@ def __getattr__(name: str) -> Any:
     if name in {
         "WorkloadCompilation",
         "WorkloadCompilerCoordinator",
+        "WorkloadDecisionCacheError",
         "PlanEpochAllocator",
         "install_workload_compilation",
         "workload_compilation_cache_key",
@@ -160,6 +162,7 @@ __all__ = [
     "TimelineAnchor",
     "WorkloadCompilation",
     "WorkloadCompilerCoordinator",
+    "WorkloadDecisionCacheError",
     "PlanEpochAllocator",
     "compile_schedule",
     "executor_key_for_implementation",

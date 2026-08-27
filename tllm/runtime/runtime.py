@@ -121,6 +121,7 @@ class TllmRuntime:
         workload_allow_serial_fallback: bool = True,
         workload_allow_side_stream: bool = False,
         workload_persistent_state_bytes: int = 0,
+        workload_decision_cache_directory: str | None = None,
         workload_provided_inputs: Mapping[str, Callable[[int], object]] | None = None,
         workload_output_sinks: Mapping[
             str, Callable[[object, int], None]
@@ -154,6 +155,14 @@ class TllmRuntime:
         ):
             raise ValueError("workload_persistent_state_bytes must be a non-negative int")
         self._workload_persistent_state_bytes = workload_persistent_state_bytes
+        if workload_decision_cache_directory is not None and not (
+            isinstance(workload_decision_cache_directory, str)
+            and workload_decision_cache_directory
+        ):
+            raise TypeError(
+                "workload_decision_cache_directory must be a non-empty str or None"
+            )
+        self._workload_decision_cache_directory = workload_decision_cache_directory
         self._workload_provided_inputs = dict(workload_provided_inputs or {})
         self._workload_output_sinks = dict(workload_output_sinks or {})
         self._workload_state_snapshots = dict(workload_state_snapshots or {})
@@ -636,6 +645,7 @@ class TllmRuntime:
                 options=self._workload_compile_options,
                 persistent_state_bytes=self._workload_persistent_state_bytes,
                 epoch_allocator=self._workload_epoch_allocator,
+                cache_directory=self._workload_decision_cache_directory,
             )
         )
         self._workload_compilation = None

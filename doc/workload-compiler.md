@@ -71,11 +71,20 @@ Missing capabilities, invalid deadlines, dependency cycles, invalid Region
 coverage, artifact mismatches, and memory overflow fail closed.
 
 The granularity planner analyzes the fine-grained task graph but emits
-coarse-grained Regions for execution. It starts with the largest deterministic
-Region in topological order and splits only when anchor windows do not intersect, an
-effect/version or typed-extern boundary must remain observable, graph safety
-differs, or a hard memory constraint requires the explicit serial fallback.
-Values consumed inside one Region stay as graph edges. A value crossing a
+coarse-grained Regions for execution. It starts from singleton Regions (one
+task each) and runs an exact merge search: two Regions may merge only when
+their anchor windows intersect, they share one non-extern implementation
+kind, every effect/version and typed-extern boundary between them can be
+internalized, and the merged partition remains topologically orderable.
+Candidate partitions are compared by a lexicographic score —
+materialization bytes, capture boundaries, peak live memory, Region count,
+cross-Region fences, critical-path extension, then a deterministic
+partition identity — under the hard memory budget. The search is exhaustive
+up to 100,000 explored partition states and fails closed beyond that bound
+or when no partition fits the budget. A signed `serial_fallback` marker
+exists for explicit serial Regions and validation enforces
+`allow_serial_fallback` against it, but the current exact planner never
+emits it. Values consumed inside one Region stay as graph edges. A value crossing a
 Region boundary gets an explicit materialization and lifetime; dependency
 fences are emitted only between Regions. The structural cost records
 materialization bytes, capture boundaries, peak live memory, launch groups,
@@ -83,7 +92,11 @@ and cross-Region fences. The middle-end does not predict kernel timing, assign
 SMs, or query live free memory.
 
 The Rust build pins `isl-rs==0.3.1`, which builds and statically links its
-bundled isl 0.27 source. A complete connected region whose domains and accesses
+bundled isl 0.27 source. The original design report named Tadashi for the
+polyhedral scheduling role; the implementation converged on isl's built-in
+scheduler, which covers the required validity/coincidence/proximity
+computation without an additional dependency. A complete connected region
+whose domains and accesses
 are Presburger-representable is now lowered to isl validity, coincidence, and
 proximity constraints. The resulting schedule and dependence relation are
 stored in a typed affine region and revalidated independently. Other nodes stay
@@ -95,9 +108,12 @@ produce a per-task CUDA launch timetable.
 `PhysicalFlowPlan` contains one physical node per `ExecutionRegion`, not one
 node per logical task. Python lowering only binds the signed Region artifact,
 executor key, selected anchor, and cross-Region fence. It cannot split a Region
-or choose a different order. Region artifact identities include the Region IR,
-shape specialization, approximation-bearing workload key, backend timeline,
-compile/capture policy, and a static Python/torch/CUDA/device fingerprint.
+or choose a different order. Region artifact identities include the signed
+Region record, the schedule graph (which carries each workload's
+approximation policy key), the backend timeline, and the complete canonical
+compile options: memory budget, compile/capture policy, shape
+specialization, serial/side-stream flags, and a static
+Python/torch/CUDA/device compiler fingerprint.
 
 The process-local artifact materializer composes ordinary PyTorch tasks in one
 Region callable and passes that complete callable to `torch.compile` once.
@@ -139,7 +155,11 @@ static-memory snapshot. The instance-scoped parent coordinator compiles and
 signs the decision, including typed dependency fences and memory reservations,
 then broadcasts it through string-method RPC. Workers independently validate
 the signature and mechanically lower the immutable Region decision to a
-`PhysicalFlowPlan` descriptor.
+`PhysicalFlowPlan` descriptor. The coordinator may also persist signed
+decisions under a configurable directory keyed by the unchanged compilation
+cache key; a persisted entry is untrusted input and is accepted only after
+the Rust wire validation re-derives its key and signature, failing closed on
+any mismatch.
 
 Native MP execution requires explicit `WorkloadWorkerSpec` records. Only an
 importable factory name and pure JSON config cross the control plane; the
@@ -249,3 +269,34 @@ invocations, typed hidden/provided/sink binding, state-version auditing, and
 explicit worker reconstruction with exact artifact reporting are implemented
 and covered by CPU tests. The full GPU correctness matrix and an ESamp paired
 performance gate are not claimed.
+
+## Revised commitments relative to the original report
+
+Several items promised by the original design report were deliberately
+re-scoped by this architecture. They are recorded here so that readers can
+distinguish "not done" from "withdrawn".
+
+- **Backend ability classes (original §4.4) — revised.** The report asked
+  backends for four free-form abilities: graph traversal, anchor node
+  insertion/removal, tensor metadata queries, and buffer
+  alloc/free/in-place reuse. The shipped contract replaces them with the
+  `BackendDriver` protocol plus signed capability records
+  (`BackendCapabilities`, `ModuleWeightOverlayCapabilities`,
+  `ModelRegionCapabilities`, and the typed replay handle protocol).
+  Backends export capabilities and observable anchors, not a reorderable
+  model graph.
+- **Profiling feedback loop (original §9.3) — partially done, loop not
+  closed.** The runtime collects per-Region CPU/CUDA timings with EWMA and
+  exposes a read-only cost report. That report is a diagnostic estimate: it
+  excludes side-stream time and sums default-stream Regions, so it is not a
+  strict main-path cost backfill. Nothing feeds measurements back into
+  planner decisions.
+- **Wavefront controls (original §8.3) — withdrawn.** No tiling,
+  interchange, or skewing is applied to affine regions, and no
+  serial/wavefront selector exists. The `Serial`/`Wavefront` labels in the
+  recurrence compiler name ordered-row fusion policies, not polyhedral
+  schedules. The design position is CUDA Graph capture plus hardware
+  scheduling rather than extracted wavefronts.
+- **Joint graph reordering — shrunk.** The main workload graph is
+  externally owned and pinned; reordering applies only to auxiliary-task
+  Region partitioning, never to a joint graph spanning the model.

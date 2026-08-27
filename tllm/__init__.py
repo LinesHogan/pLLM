@@ -32,6 +32,7 @@ def make_llm(*args: object, **kwargs: object) -> object:
         "workload_memory_budget_bytes",
         "workload_allow_serial_fallback",
         "workload_persistent_state_bytes",
+        "workload_decision_cache_directory",
     )
     runtime_options = {
         name: kwargs.pop(name) for name in runtime_option_names if name in kwargs
@@ -42,17 +43,23 @@ def make_llm(*args: object, **kwargs: object) -> object:
         memory_budget = runtime_options.get("workload_memory_budget_bytes", 0)
         allow_serial = runtime_options.get("workload_allow_serial_fallback", True)
         persistent_state = runtime_options.get("workload_persistent_state_bytes", 0)
+        cache_directory = runtime_options.get("workload_decision_cache_directory", None)
         if not isinstance(memory_budget, int) or isinstance(memory_budget, bool):
             raise TypeError("workload_memory_budget_bytes must be int")
         if not isinstance(allow_serial, bool):
             raise TypeError("workload_allow_serial_fallback must be bool")
         if not isinstance(persistent_state, int) or isinstance(persistent_state, bool):
             raise TypeError("workload_persistent_state_bytes must be int")
+        if cache_directory is not None and not (
+            isinstance(cache_directory, str) and cache_directory
+        ):
+            raise TypeError("workload_decision_cache_directory must be str or None")
         return TllmRuntime(
             workloads=tuple(workloads),
             workload_memory_budget_bytes=memory_budget,
             workload_allow_serial_fallback=allow_serial,
             workload_persistent_state_bytes=persistent_state,
+            workload_decision_cache_directory=cache_directory,
         ).make_llm(*args, **kwargs)
     if runtime_options:
         raise TypeError("workload compiler options require make_llm(workloads=...)")
