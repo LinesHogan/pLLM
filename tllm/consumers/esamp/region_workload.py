@@ -4,14 +4,19 @@ This module owns only the ESamp algorithm and its explicit process-local
 resources.  Runtime integration binds the declared ``guidance`` sink and
 calls :meth:`begin_step` before materializing the Region; it never needs a
 legacy consumer or an on-demand sampler model forward.
+
+The process-local lifecycle (specialization identity, resource assembly,
+cold-specialization guards, optimizer construction, update finalization,
+worker reconstruction) is provided by :class:`tllm.kit.RegionAlgorithm`;
+what remains here is the ESamp algorithm itself: row metadata, guidance
+publication, the sampler bridge, and the two signed tasks.
 """
 
 from __future__ import annotations
 
-from collections.abc import Hashable
-from dataclasses import dataclass, replace
-from types import MappingProxyType
-from typing import Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -19,16 +24,11 @@ import torch.nn.functional as F
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.lm_head import resolve_lm_head
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
-from tllm.contracts.consumer_stats import TrainingStats
-from tllm.runtime.workload_plugins import (
-    NativeWorkload,
-    NativeWorkloadResources,
-    WorkloadWorkerSpec,
-)
-from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
+from tllm.kit import RegionAlgorithm, RegionResourcesBase
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.ports.residual_stream import ResidualLocator
+from tllm.runtime.workload_plugins import NativeWorkloadResources
 from tllm.workload import (
     AdamWSpec,
     Before,
@@ -45,25 +45,6 @@ from tllm.workload import (
     transition,
     workload,
 )
-
-_STATE_NAME = "distiller"
-
-
-def _specialization_key(config: ESampConsumerConfig) -> Mapping[str, str]:
-    """Return the immutable compile-time ESamp configuration identity."""
-
-    return {
-        "algorithm": "esamp-exact-region-v1",
-        "distiller_hidden_dim": str(config.distiller_hidden_dim),
-        "distiller_lr": float(config.distiller_lr).hex(),
-        "output_layernorm": str(bool(config.model_bank_use_output_layernorm)),
-        "training_enabled": str(bool(config.enable_esamp_training)),
-        "intervention_enabled": str(bool(config.enable_distiller_intervention)),
-        "distiller_beta": float(config.distiller_beta).hex(),
-        "sampler_backend": str(config.distiller_sampler_backend),
-        "source_layer_path": str(config.source_layer_path),
-        "target_layer_path": str(config.target_layer_path),
-    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,20 +93,13 @@ class ESampRegionGuidance:
         return int(self.prediction.shape[0])
 
 
-class ESampRegionResources:
-    """Explicit local bindings required by the native ESamp Region.
-
-    Resource ownership is intentionally visible through this single object:
-    the runtime can bind its sink, audit the replica version, and obtain the
-    sampler provider without reaching into implementation-private storage.
-    """
+class ESampRegionResources(RegionResourcesBase):
+    """Guidance publication storage plus the kit-owned stats bookkeeping."""
 
     def __init__(self, workload: "ESampRegionWorkload") -> None:
-        self._workload = workload
+        super().__init__(workload)
+        self._algorithm: "ESampRegionWorkload" = workload
         self._guidance: ESampRegionGuidance | None = None
-        self._loss_count = 0
-        self._update_count = 0
-        self._loss_sum: torch.Tensor | None = None
 
     def publish_guidance(
         self,
@@ -156,52 +130,15 @@ class ESampRegionResources:
         record = self._guidance
         return record if record is not None and record.step_id == int(step_id) else None
 
-    def state_snapshot(self) -> Mapping[str, int]:
-        return MappingProxyType({"replica": self._workload.state_version})
-
-    def runtime_state_snapshot(self, _step_id: int) -> Mapping[Hashable, int]:
-        snapshot: dict[Hashable, int] = {None: self._workload.state_version}
-        return MappingProxyType(snapshot)
-
     def sampler_provider(self) -> "ESampRegionSamplerProvider":
-        return self._workload._sampler_provider
+        return cast("ESampRegionSamplerProvider", self._algorithm.sampler_provider)
 
-    def stats(self) -> Mapping[str, int]:
+    def extra_stats(self) -> Mapping[str, int]:
         guidance = self._guidance
-        return MappingProxyType(
-            {
-                "guidance_rows": 0 if guidance is None else guidance.rows,
-                "loss_count": self._loss_count,
-                "update_count": self._update_count,
-            }
-        )
-
-    def read_and_reset_stats(self, sync: bool = True) -> TrainingStats:
-        loss_sum = self._loss_sum
-        if loss_sum is None or self._loss_count <= 0:
-            return TrainingStats(loss_avg=0.0, loss_count=0)
-        if sync and loss_sum.device.type == "cuda":
-            torch.cuda.current_stream(loss_sum.device).synchronize()
-        result = TrainingStats(
-            loss_avg=float(loss_sum.item()) / self._loss_count,
-            loss_count=self._loss_count,
-        )
-        self._loss_sum = None
-        self._loss_count = 0
-        return result
-
-    def _record_update(self, loss: torch.Tensor) -> None:
-        detached = loss.detach().float()
-        self._loss_sum = (
-            detached.clone()
-            if self._loss_sum is None
-            else self._loss_sum + detached
-        )
-        self._loss_count += 1
-        self._update_count += 1
+        return {"guidance_rows": 0 if guidance is None else guidance.rows}
 
 
-class ESampRegionSamplerProvider(SamplerModifierProvider):
+class ESampRegionSamplerProvider:
     """Sampler bridge which consumes, but never recomputes, Region guidance."""
 
     def __init__(self, workload: "ESampRegionWorkload") -> None:
@@ -284,90 +221,97 @@ _DISTILLER = State(
 
 
 @workload(id="esamp.region")
-class ESampRegionWorkload(NativeWorkload):
+class ESampRegionWorkload(RegionAlgorithm[ESampConsumerConfig]):
     """Replica-state ESamp algorithm ready for native Region materialization."""
+
+    algorithm = "esamp-exact-region-v1"
+    config_type = ESampConsumerConfig
+    specialization_fields = {
+        "distiller_hidden_dim": "distiller_hidden_dim",
+        "distiller_lr": "distiller_lr",
+        "output_layernorm": "model_bank_use_output_layernorm",
+        "training_enabled": "enable_esamp_training",
+        "intervention_enabled": "enable_distiller_intervention",
+        "distiller_beta": "distiller_beta",
+        "sampler_backend": "distiller_sampler_backend",
+        "source_layer_path": "source_layer_path",
+        "target_layer_path": "target_layer_path",
+    }
+    resources_type = ESampRegionResources
+    sampler_provider_type = ESampRegionSamplerProvider
+    enabled_field = "enable_esamp_training"
+    worker_factory = "tllm.consumers.esamp.region_workload:reconstruct_esamp_region_workload"
 
     distiller = _DISTILLER
 
-    def __init__(self, config: ESampConsumerConfig) -> None:
+    def validate_config(self, config: ESampConsumerConfig) -> None:
         validate_region_config(config)
-        self.config = config
-        enabled_snapshot = bool(config.enable_esamp_training)
-        self._model: LowRankGatedResidualModel | None = None
-        self._optimizer: torch.optim.AdamW | None = None
-        self._specialization: RuntimeSpecializationSpec | None = None
-        self._state_version = 0
-        self._active_step: tuple[int, ESampRegionStepMetadata] | None = None
-        self._resources = ESampRegionResources(self)
-        self._sampler_provider = ESampRegionSamplerProvider(self)
-        self._native_resources = NativeWorkloadResources(
-            workload=self,
-            output_sinks={"guidance": self._publish_guidance_sink},
-            state_snapshots={_STATE_NAME: self._resources.runtime_state_snapshot},
-            cold_specializer=self.cold_specialize,
-            sampler_provider=self._sampler_provider,
-            diagnostics_reader=self._resources.stats,
-            stats_reader=self._resources.read_and_reset_stats,
-            per_request_stats_reader=lambda _sync: {},
-            enabled_setter=self.set_enabled,
-            # This predicate belongs to this immutable resource snapshot. A
-            # later enable transition creates a new signed Region epoch.
-            enabled_predicate=lambda enabled=enabled_snapshot: enabled,
-            synchronizer=lambda: None,
-            specialization_key=_specialization_key(config),
-            residual_paths={
-                ResidualLocator(0, "block_output", "decode"): str(
-                    config.source_layer_path
-                ),
-                ResidualLocator(-1, "block_output", "decode"): str(
-                    config.target_layer_path
-                ),
-            },
-            worker_spec=WorkloadWorkerSpec(
-                factory=(
-                    "tllm.consumers.esamp.region_workload:"
-                    "reconstruct_esamp_region_workload"
-                ),
-                config=_config_to_wire(config),
-            ),
-        )
 
-    @property
-    def model(self) -> LowRankGatedResidualModel | None:
-        return self._model
+    def output_sinks(self) -> Mapping[str, object]:
+        return {"guidance": self._publish_guidance_sink}
 
-    @property
-    def optimizer(self) -> torch.optim.AdamW | None:
-        return self._optimizer
+    def residual_paths(self) -> Mapping[object, str]:
+        return {
+            ResidualLocator(0, "block_output", "decode"): str(self.config.source_layer_path),
+            ResidualLocator(-1, "block_output", "decode"): str(self.config.target_layer_path),
+        }
 
-    @property
-    def state_version(self) -> int:
-        return self._state_version
+    def extra_resource_fields(self) -> Mapping[str, object]:
+        return {"per_request_stats_reader": lambda _sync: {}}
+
+    # -- cold specialization (kit-owned guards; this hook is the algorithm) ----
+
+    def init_parameters(
+        self, spec: RuntimeSpecializationSpec
+    ) -> Mapping[str, torch.nn.Module]:
+        rank = max(1, min(int(self.config.distiller_hidden_dim), int(spec.hidden_size)))
+        return {
+            "distiller": LowRankGatedResidualModel(
+                hidden_size=int(spec.hidden_size),
+                rank=rank,
+                use_output_layernorm=bool(self.config.model_bank_use_output_layernorm),
+                device=spec.device,
+                dtype=spec.dtype,
+            )
+        }
+
+    def optimizer_overrides(self) -> Mapping[str, object]:
+        # The signed optimizer lr is nominal; the physical lr is pinned per
+        # instance by the specialization key.
+        return {"lr": float(self.config.distiller_lr)}
+
+    # -- resource exposure ------------------------------------------------------
 
     @property
     def resources(self) -> ESampRegionResources:
-        return self._resources
+        return cast(ESampRegionResources, self._resources)
 
-    def native_workload_resources(self) -> NativeWorkloadResources:
-        return self._native_resources
+    @property
+    def model(self) -> LowRankGatedResidualModel | None:
+        parameters = self._parameters
+        if parameters is None:
+            return None
+        return cast(LowRankGatedResidualModel, parameters["distiller"])
 
-    def set_enabled(self, enabled: bool) -> None:
-        self.config.enable_esamp_training = bool(enabled)
-        enabled_snapshot = bool(self.config.enable_esamp_training)
-        worker_spec = self._native_resources.worker_spec
-        if worker_spec is None:
-            raise RuntimeError("ESamp Region workload requires a worker spec")
-        # Worker specs and resource keys are frozen snapshots.  A changed
-        # enable state therefore gets a new snapshot for the next epoch.
-        self._native_resources = replace(
-            self._native_resources,
-            specialization_key=_specialization_key(self.config),
-            enabled_predicate=lambda enabled=enabled_snapshot: enabled,
-            worker_spec=WorkloadWorkerSpec(
-                factory=worker_spec.factory,
-                config=_config_to_wire(self.config),
-            ),
-        )
+    def _require_model(self) -> LowRankGatedResidualModel:
+        model = self.model
+        if model is None:
+            raise RuntimeError("ESamp Region must be cold_specialize()d before execution")
+        return model
+
+    # -- step bookkeeping --------------------------------------------------------
+
+    def begin_step(self, *, step_id: int, metadata: ESampRegionStepMetadata) -> None:
+        if int(step_id) != metadata.engine_step_id:
+            raise ValueError("ESamp Region step_id must match metadata.engine_step_id")
+        if self._active_step is not None:
+            raise RuntimeError("ESamp Region already has an active step")
+        self._active_step = (int(step_id), metadata.isolated_copy())
+
+    def _end_step(self) -> None:
+        self._active_step = None
+
+    _active_step: tuple[int, ESampRegionStepMetadata] | None = None
 
     def _publish_guidance_sink(self, value: object, step_id: int) -> None:
         if not isinstance(value, torch.Tensor):
@@ -390,55 +334,13 @@ class ESampRegionWorkload(NativeWorkload):
             raise RuntimeError(
                 "ESamp Region guidance sink has incomplete decode row metadata"
             )
-        self._resources.publish_guidance(
+        self.resources.publish_guidance(
             step_id=int(step_id),
             prediction=value,
             metadata=metadata,
         )
 
-    def cold_specialize(self, spec: RuntimeSpecializationSpec) -> None:
-        """Allocate trainable model and optimizer outside ambient inference mode."""
-        if not isinstance(spec, RuntimeSpecializationSpec):
-            raise TypeError("spec must be RuntimeSpecializationSpec")
-        previous = self._specialization
-        if previous is not None:
-            if previous != spec:
-                raise RuntimeError(
-                    "ESamp Region is already specialized for another static shape, "
-                    "dtype, or device"
-                )
-            return
-        rank = max(1, min(int(self.config.distiller_hidden_dim), int(spec.hidden_size)))
-        with torch.inference_mode(False):
-            with torch.enable_grad():
-                model = LowRankGatedResidualModel(
-                    hidden_size=int(spec.hidden_size),
-                    rank=rank,
-                    use_output_layernorm=bool(self.config.model_bank_use_output_layernorm),
-                    device=spec.device,
-                    dtype=spec.dtype,
-                )
-                optimizer = torch.optim.AdamW(
-                    model.parameters(), lr=float(self.config.distiller_lr), foreach=False
-                )
-        self._model = model
-        self._optimizer = optimizer
-        self._specialization = spec
-
-    def begin_step(self, *, step_id: int, metadata: ESampRegionStepMetadata) -> None:
-        if int(step_id) != metadata.engine_step_id:
-            raise ValueError("ESamp Region step_id must match metadata.engine_step_id")
-        if self._active_step is not None:
-            raise RuntimeError("ESamp Region already has an active step")
-        self._active_step = (int(step_id), metadata.isolated_copy())
-
-    def _end_step(self) -> None:
-        self._active_step = None
-
-    def _require_model(self) -> tuple[LowRankGatedResidualModel, torch.optim.AdamW]:
-        if self._model is None or self._optimizer is None:
-            raise RuntimeError("ESamp Region must be cold_specialize()d before execution")
-        return self._model, self._optimizer
+    # -- signed tasks ------------------------------------------------------------
 
     @task(
         inputs={
@@ -452,7 +354,7 @@ class ESampRegionWorkload(NativeWorkload):
     def predict_and_loss(
         self, source: torch.Tensor, target: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        model, _ = self._require_model()
+        model = self._require_model()
         if source.ndim != 2 or target.ndim != 2 or source.shape != target.shape:
             raise ValueError("ESamp Region source and target must be matching rank-2 tensors")
         with torch.inference_mode(False):
@@ -476,16 +378,9 @@ class ESampRegionWorkload(NativeWorkload):
         ),
     )
     def update(self, loss: torch.Tensor) -> None:
-        _, optimizer = self._require_model()
-        if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
-            raise ValueError("ESamp Region update requires a differentiable loss tensor")
-        with torch.inference_mode(False):
-            with torch.enable_grad():
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-        self._state_version += 1
-        self._resources._record_update(loss)
+        self.step_update(loss)
+
+    # -- manual drive (standalone parity/testing) --------------------------------
 
     def run_predict_and_loss(
         self,
@@ -498,7 +393,7 @@ class ESampRegionWorkload(NativeWorkload):
         self.begin_step(step_id=step_id, metadata=metadata)
         try:
             prediction, loss = self.predict_and_loss(source, target)
-            self._resources.publish_guidance(
+            self.resources.publish_guidance(
                 step_id=step_id,
                 prediction=prediction,
                 metadata=metadata,
@@ -515,23 +410,10 @@ def build_esamp_region_workload(config: ESampConsumerConfig) -> ESampRegionWorkl
     return ESampRegionWorkload(config)
 
 
-def _config_to_wire(config: ESampConsumerConfig) -> Mapping[str, object]:
-    from tllm.common.dataclass_json import dataclass_to_jsonable
-
-    raw = dataclass_to_jsonable(config)
-    if not isinstance(raw, dict):
-        raise TypeError("ESamp Region config did not encode as a JSON object")
-    return raw
-
-
 def reconstruct_esamp_region_workload(
     raw: Mapping[str, object],
 ) -> NativeWorkloadResources:
-    from tllm.common.dataclass_json import dataclass_from_dict
-
-    config = dataclass_from_dict(ESampConsumerConfig, dict(raw))
-    workload_instance = build_esamp_region_workload(config)
-    return workload_instance.native_workload_resources()
+    return ESampRegionWorkload.reconstruct(raw)
 
 
 __all__ = [

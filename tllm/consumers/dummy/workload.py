@@ -7,17 +7,13 @@ from types import MappingProxyType
 
 import torch
 
-from tllm.common.dataclass_json import dataclass_from_dict, dataclass_to_jsonable
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.stream_runtime import DummyStreamRuntime
 from tllm.consumers.dummy.transfer import clone_hidden_to_cpu
 from tllm.consumers.dummy.worker import DummyCpuWorker
+from tllm.kit import RegionAlgorithm
 from tllm.ports.residual_stream import ResidualLocator
-from tllm.runtime.workload_plugins import (
-    NativeWorkload,
-    NativeWorkloadResources,
-    WorkloadWorkerSpec,
-)
+from tllm.runtime.workload_plugins import NativeWorkloadResources
 from tllm.workload import (
     Before,
     ExternImplementation,
@@ -49,25 +45,6 @@ def _validate_native_config(config: DummyConsumerConfig) -> None:
             "native Dummy Region does not support non-default capture_policy; "
             "its typed extern Region is explicitly eager-only"
         )
-
-
-def _specialization_key(config: DummyConsumerConfig) -> Mapping[str, str]:
-    """Immutable identity for the CPU-export behavior bound to this Region."""
-
-    return MappingProxyType(
-        {
-            "algorithm": "dummy-cpu-export-region-v1",
-            "async": str(bool(config.enable_async)),
-            "export": str(bool(config.export_to_cpu)),
-            "stride": str(int(config.export_every_n_steps)),
-            "max_queue_size": str(int(config.max_queue_size)),
-            "max_rows": str(int(config.export_max_rows)),
-            "max_cols": str(int(config.export_max_cols)),
-            "noise_std": float(config.noise_std).hex(),
-            "feedback_interval": str(int(config.feedback_interval)),
-            "hidden_path": _hidden_path(config),
-        }
-    )
 
 
 class DummyNativeResources:
@@ -125,35 +102,51 @@ class DummyNativeResources:
 
 
 @workload(id="dummy")
-class DummyWorkload(NativeWorkload):
+class DummyWorkload(RegionAlgorithm[DummyConsumerConfig]):
     """A complete native singleton extern Region, with no legacy authority."""
 
+    algorithm = "dummy-cpu-export-region-v1"
+    config_type = DummyConsumerConfig
+    specialization_fields = {
+        "async": "enable_async",
+        "export": "export_to_cpu",
+        "stride": "export_every_n_steps",
+        "max_queue_size": "max_queue_size",
+        "max_rows": "export_max_rows",
+        "max_cols": "export_max_cols",
+        "noise_std": "noise_std",
+        "feedback_interval": "feedback_interval",
+    }
+    worker_factory = "tllm.consumers.dummy.workload:reconstruct_dummy_workload"
+
     def __init__(self, config: DummyConsumerConfig | None = None) -> None:
-        self.config = config or DummyConsumerConfig()
-        _validate_native_config(self.config)
-        self._resources = DummyNativeResources(self.config)
-        locator = ResidualLocator(layer=0, site="block_output", phase="decode")
-        self._native_resources = NativeWorkloadResources(
-            workload=self,
-            diagnostics_reader=self._resources.read_stats,
-            synchronizer=self._resources.synchronize,
-            specialization_key=_specialization_key(self.config),
-            residual_paths={locator: _hidden_path(self.config)},
-            worker_spec=WorkloadWorkerSpec(
-                factory="tllm.consumers.dummy.workload:reconstruct_dummy_workload",
-                config=_config_to_wire(self.config),
-            ),
-        )
+        super().__init__(config if config is not None else DummyConsumerConfig())
+
+    def validate_config(self, config: DummyConsumerConfig) -> None:
+        _validate_native_config(config)
+
+    def make_resources(self) -> DummyNativeResources:
+        return DummyNativeResources(self.config)
 
     @property
     def resources(self) -> DummyNativeResources:
-        return self._resources
+        return self._resources  # type: ignore[return-value]
 
-    def native_workload_resources(self) -> NativeWorkloadResources:
-        return self._native_resources
+    def diagnostics_reader(self) -> object:
+        return self.resources.read_stats
+
+    def synchronize(self) -> None:
+        self.resources.synchronize()
+
+    def extra_specialization(self) -> Mapping[str, str]:
+        return {"hidden_path": _hidden_path(self.config)}
+
+    def residual_paths(self) -> Mapping[object, str]:
+        locator = ResidualLocator(layer=0, site="block_output", phase="decode")
+        return {locator: _hidden_path(self.config)}
 
     def read_stats(self) -> Mapping[str, float]:
-        return self._resources.read_stats()
+        return self.resources.read_stats()
 
     @task(
         inputs={
@@ -170,20 +163,11 @@ class DummyWorkload(NativeWorkload):
         ),
     )
     def export_hidden(self, hidden_rows: torch.Tensor, step_id: int) -> None:
-        self._resources.export_hidden(hidden_rows, step_id=step_id)
-
-
-def _config_to_wire(config: DummyConsumerConfig) -> Mapping[str, object]:
-    raw = dataclass_to_jsonable(config)
-    if not isinstance(raw, dict):
-        raise TypeError("Dummy config did not encode as a JSON object")
-    return raw
+        self.resources.export_hidden(hidden_rows, step_id=step_id)
 
 
 def reconstruct_dummy_workload(raw: Mapping[str, object]) -> NativeWorkloadResources:
-    config = dataclass_from_dict(DummyConsumerConfig, dict(raw))
-    workload_instance = DummyWorkload(config)
-    return workload_instance.native_workload_resources()
+    return DummyWorkload.reconstruct(raw)
 
 
 __all__ = [

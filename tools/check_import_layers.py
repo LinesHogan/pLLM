@@ -72,8 +72,15 @@ RULES: dict[str, frozenset[str]] = {
     # but the runtime must never import a concrete driver (only the pure
     # protocol module, via SANCTIONED_EDGES).
     "backends": frozenset({"contracts", "ports", "workgraph", "runtime", "core"}),
+    # Author-facing ergonomics kit: composes the public DSL facade, the
+    # runtime plugin contracts, and common codecs.  Nothing below imports it,
+    # so it can never become a hidden dependency of the compiler or runtime.
+    "kit": frozenset({"contracts", "common", "ports", "runtime", "workload", "core"}),
     "consumers": frozenset(
-        {"contracts", "ports", "common", "producers", "workgraph", "runtime", "program", "core"}
+        {
+            "contracts", "ports", "common", "producers", "workgraph",
+            "runtime", "program", "kit", "core",
+        }
     ),
     "workflows": None,  # leaf entry points: may import anything
     # Script helpers used by workflows/starter/gpu scripts.
