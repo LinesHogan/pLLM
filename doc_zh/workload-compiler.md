@@ -224,3 +224,12 @@ hidden/provided/sink binding、state-version 审计，以及带精确 artifact �
   CUDA Graph capture 加硬件调度，而不是提取 wavefront。
 - **联合图重排——已收缩。** 主负载图由外部所有且固定；重排只适用于附加 task 的
   Region 划分，从不作用于覆盖模型的联合图。
+- **Effectful Region 数值 parity——已撤销。** 带 mutation effect 的 Region 在每次
+  执行时接受签名 state-version 审计；不再承诺对其实现 serial-oracle 数值比较。
+  该审计的保证边界精确但狭窄：只证明版本增量计数与槽位身份与签名 effect 一致，
+  无法发现"参数更新数值错误但版本正常增加"。`EXTERN_IO` effect 完全豁免审计。
+- **近似签名边界——已澄清。** 只有近似 *policy* 被签名进 schedule graph wire（并
+  改变 workload semantic key）。`ApproximationCriteria(rtol, atol)` 刻意留在宿主侧：
+  不进入签名 artifact 身份，由首次调用 parity 门在物化时查询。此外签名 planner
+  拒绝把不同 approximation policy 的 workload 的 task 合并进同一 Region，非 exact
+  容差永远不会覆盖 exact workload 的输出。

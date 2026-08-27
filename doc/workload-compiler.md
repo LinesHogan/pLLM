@@ -300,3 +300,19 @@ distinguish "not done" from "withdrawn".
 - **Joint graph reordering — shrunk.** The main workload graph is
   externally owned and pinned; reordering applies only to auxiliary-task
   Region partitioning, never to a joint graph spanning the model.
+- **Effectful Region numerical parity — withdrawn.** Regions carrying
+  mutation effects run under the signed state-version audit on every
+  execution; numerical comparison against a serial oracle is not
+  implemented for them and is no longer promised. The audit's guarantee
+  boundary is exact but narrow: it proves version-increment counts and
+  slot identities match the signed effects, and it cannot detect a
+  numerically wrong parameter update that still bumps versions.
+  `EXTERN_IO` effects are exempt from the audit entirely.
+- **Approximation signing boundary — clarified.** Only the approximation
+  *policy* is signed into the schedule graph wire (and changes the
+  workload semantic key). `ApproximationCriteria(rtol, atol)` is
+  deliberately host-side: it stays outside the signed artifact identity
+  and is consulted by the first-call parity gate at materialization time.
+  The signed planner additionally refuses to merge tasks from workloads
+  with different approximation policies into one Region, so a non-exact
+  tolerance can never wash over an exact workload's outputs.
