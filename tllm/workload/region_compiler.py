@@ -130,6 +130,17 @@ def _region_parity_tolerance(
         for invocation in region.task_invocations
         if invocation.task_id in owner
     }
+    policies = {declaration.ir.approximation.value for declaration in covered}
+    if len(policies) > 1:
+        # The signed planner never merges across approximation policies; a
+        # mixed Region here came from a supplied (untrusted) decision, so the
+        # parity gate fails closed rather than letting a loose tolerance wash
+        # over an exact workload's outputs.
+        raise RegionParityError(
+            f"ExecutionRegion {region.region_id!r} mixes approximation policies "
+            f"{sorted(policies)} across workloads; the signed planner forbids "
+            "cross-policy Region merges"
+        )
     non_exact = tuple(
         declaration
         for declaration in covered

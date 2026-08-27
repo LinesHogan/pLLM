@@ -283,6 +283,101 @@ class ApproximationParityUnitTest(unittest.TestCase):
             artifact.execute({artifact.input_keys[0]: torch.tensor([3.0])})
 
 
+class CrossPolicyMergeUnitTest(unittest.TestCase):
+    """An exact task never shares a Region (and its tolerance) with a
+    non-exact task — round-2 review acceptance for cross-policy merging."""
+
+    @staticmethod
+    def _declarations():
+        @workload(id="audit.exact")
+        class Exact:
+            @task(
+                inputs={"value": provided("exact_in")},
+                outputs={"result_value": sink("exact_out")},
+                timing=Between("model.execute", "step.end"),
+            )
+            def run(self, value: object) -> object:
+                assert isinstance(value, torch.Tensor)
+                return value + 1
+
+        @workload(
+            id="audit.approx",
+            approximation=ApproximationPolicy.JACOBI,
+            approximation_criteria=ApproximationCriteria(rtol=0.2, atol=0.2),
+        )
+        class Approx:
+            @task(
+                inputs={"value": provided("approx_in")},
+                outputs={"result_value": sink("approx_out")},
+                timing=Between("model.execute", "step.end"),
+            )
+            def run(self, value: object) -> object:
+                assert isinstance(value, torch.Tensor)
+                return value * 2
+
+        return (declare_workload(Exact()), declare_workload(Approx()))
+
+    def test_exact_and_approximation_tasks_keep_separate_regions(self) -> None:
+        declarations = self._declarations()
+        compilation = WorkloadCompilerCoordinator(
+            declarations, options=CompileOptions(memory_budget_bytes=1 << 20)
+        ).compile(_timeline())
+        regions = compilation.decision.execution_regions
+        self.assertEqual(len(regions), 2)
+        region_tasks = sorted(region.tasks[0] for region in regions)
+        self.assertEqual(region_tasks, ["audit.approx/run", "audit.exact/run"])
+
+    def test_exact_output_is_not_released_under_the_approximation_tolerance(self) -> None:
+        declarations = self._declarations()
+        compilation = WorkloadCompilerCoordinator(
+            declarations, options=CompileOptions(memory_budget_bytes=1 << 20)
+        ).compile(_timeline())
+        # +0.1 drift stays inside the declared approximation criteria but far
+        # outside the exact Region's dtype tolerance.
+        with mock.patch(
+            "torch.compile",
+            side_effect=ApproximationParityUnitTest._drifting_compile(0.1),
+        ):
+            artifacts = materialize_region_artifacts(
+                declarations, compilation.decision, compilation.options
+            )
+        by_task = {
+            region.tasks[0]: artifact
+            for region, artifact in zip(
+                compilation.decision.execution_regions, artifacts, strict=True
+            )
+        }
+        approx = by_task["audit.approx/run"]
+        self.assertEqual(approx.parity, "first_call_approximation")
+        approx.execute({approx.input_keys[0]: torch.tensor([3.0])})
+        exact = by_task["audit.exact/run"]
+        self.assertNotEqual(exact.parity, "first_call_approximation")
+        with self.assertRaises(RegionParityError):
+            exact.execute({exact.input_keys[0]: torch.tensor([3.0])})
+
+
+    def test_supplied_mixed_region_fails_closed_at_the_parity_gate(self) -> None:
+        from tllm.schedule.contracts import RegionTaskInvocation
+        from tllm.workload.region_compiler import _region_parity_tolerance
+
+        declarations = self._declarations()
+        compilation = WorkloadCompilerCoordinator(
+            declarations, options=CompileOptions(memory_budget_bytes=1 << 20)
+        ).compile(_timeline())
+        region = compilation.decision.execution_regions[0]
+        mixed = replace(
+            region,
+            tasks=("audit.exact/run", "audit.approx/run"),
+            implementation_ids=region.implementation_ids * 2,
+            task_invocations=(
+                RegionTaskInvocation(task_id="audit.exact/run"),
+                RegionTaskInvocation(task_id="audit.approx/run"),
+            ),
+        )
+        with self.assertRaisesRegex(RegionParityError, "mixes approximation policies"):
+            _region_parity_tolerance(declarations, mixed)
+
+
 class CompareRegionOutputsUnitTest(unittest.TestCase):
     def test_matching_outputs_pass(self) -> None:
         compare_region_outputs(

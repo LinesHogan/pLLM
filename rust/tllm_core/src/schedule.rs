@@ -2409,6 +2409,22 @@ fn drafts_topologically_ordered(
     true
 }
 
+fn task_approximation_policy<'a>(graph: &'a ScheduleGraph, task_id: &str) -> &'a str {
+    // Multi-workload graphs prefix task ids with `<workload_id>/` (the same
+    // convention Python lowering and the parity gate use); single-workload
+    // graphs are policy-uniform by construction, so the absent-entry fallback
+    // never hides a mix.
+    if let Some((workload_id, _)) = task_id.split_once('/') {
+        if let Ok(position) = graph
+            .workload_approximations
+            .binary_search_by(|entry| entry.0.as_str().cmp(workload_id))
+        {
+            return graph.workload_approximations[position].1.as_str();
+        }
+    }
+    "exact"
+}
+
 fn drafts_can_merge(
     graph: &ScheduleGraph,
     selected: &[SelectedTaskImplementation],
@@ -2423,11 +2439,19 @@ fn drafts_can_merge(
     tasks.sort_by_key(|index| order_rank[*index]);
     let (earliest, before) = draft_window(graph, anchor_index, &tasks);
     let implementation_kind = selected[tasks[0]].kind;
+    // Merging is per-policy: a shared Region would otherwise let a non-exact
+    // workload's parity tolerance wash over an exact workload's outputs.
+    let first_policy = task_approximation_policy(graph, graph.tasks[tasks[0]].task_id.as_str());
+    let mixes_policies = tasks
+        .iter()
+        .skip(1)
+        .any(|index| task_approximation_policy(graph, graph.tasks[*index].task_id.as_str()) != first_policy);
     if earliest >= before
         || implementation_kind == TaskImplementationKind::Extern
         || tasks
             .iter()
             .any(|index| selected[*index].kind != implementation_kind)
+        || mixes_policies
         || !effects_can_be_internalized(graph, &tasks, effect_reachability)
     {
         return None;
@@ -5435,6 +5459,46 @@ mod tests {
             unsafe_decision.execution_regions[0].stream,
             Some(RegionStreamClass::Default)
         );
+    }
+
+    #[test]
+    fn cross_policy_region_merge_is_forbidden() {
+        pyo3::prepare_freethreaded_python();
+        // Review reproduction: an exact and a jacobi workload each contribute
+        // one task in the same anchor window.  Without a policy check the
+        // planner merges them and the non-exact tolerance washes over the
+        // exact output; the merge must be rejected so each task keeps its own
+        // Region (and its own parity tolerance).
+        let graph = r#"{"workload_key":"mixed-policy","tasks":[{"task_id":"audit.exact/run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"answer","kind":"sink","target":"exact"}]},{"task_id":"audit.approx/run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"answer","kind":"sink","target":"approx"}]}],"edges":[],"values":[{"value_id":"mix:audit.exact/run:answer","version":1,"producer":"audit.exact/run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""},{"value_id":"mix:audit.approx/run:answer","version":1,"producer":"audit.approx/run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1,"workload_approximations":[["audit.approx","jacobi"]]}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let decision: Decision =
+            serde_json::from_str(&compile_schedule(graph, timeline, options).unwrap()).unwrap();
+        assert_eq!(decision.execution_regions.len(), 2);
+        assert!(decision
+            .execution_regions
+            .iter()
+            .all(|region| region.tasks.len() == 1));
+        validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&decision).unwrap(),
+        )
+        .unwrap();
+
+        // Uniform non-exact policies still merge: the restriction only bites
+        // across *different* policies.
+        let uniform_graph = graph.replace(
+            r#""workload_approximations":[["audit.approx","jacobi"]]"#,
+            r#""workload_approximations":[["audit.approx","jacobi"],["audit.exact","jacobi"]]"#,
+        );
+        let uniform: Decision =
+            serde_json::from_str(&compile_schedule(&uniform_graph, timeline, options).unwrap())
+                .unwrap();
+        assert_eq!(uniform.execution_regions.len(), 1);
     }
 
     #[test]
