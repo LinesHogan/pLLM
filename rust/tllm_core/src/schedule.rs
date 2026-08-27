@@ -116,6 +116,7 @@ enum ScheduleEffectKind {
     StateRead,
     StateWrite,
     StateTransition,
+    StateTransitionMaybe,
     VersionPublish,
     ExternIo,
 }
@@ -1709,9 +1710,21 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
                 )));
             }
             if let Some((previous_task, previous_kind)) = previous_effects.get(&effect.resource) {
-                if effect.kind == ScheduleEffectKind::StateTransition
-                    || *previous_kind == ScheduleEffectKind::StateTransition
-                {
+                // transitions (strict or conditional) and extern channels
+                // serialize against every adjacent access to the same
+                // resource: the signed graph has no ordering proof for
+                // either.  Reads may commute.
+                if matches!(
+                    effect.kind,
+                    ScheduleEffectKind::StateTransition
+                        | ScheduleEffectKind::StateTransitionMaybe
+                        | ScheduleEffectKind::ExternIo
+                ) || matches!(
+                    *previous_kind,
+                    ScheduleEffectKind::StateTransition
+                        | ScheduleEffectKind::StateTransitionMaybe
+                        | ScheduleEffectKind::ExternIo
+                ) {
                     expected_effect_edges.insert((previous_task.clone(), task.task_id.clone()));
                 }
             }
@@ -2207,10 +2220,14 @@ fn region_identity(graph: &ScheduleGraph, draft: &RegionDraft) -> String {
 }
 
 fn effect_is_mutating(effect: &ScheduleEffect) -> bool {
+    // A conditional transition is a *potential* mutation: merge legality and
+    // ordering must treat it as mutating because the signed graph cannot
+    // prove at plan time whether the update fires.
     matches!(
         effect.kind,
         ScheduleEffectKind::StateWrite
             | ScheduleEffectKind::StateTransition
+            | ScheduleEffectKind::StateTransitionMaybe
             | ScheduleEffectKind::VersionPublish
     )
 }
@@ -4732,7 +4749,8 @@ mod tests {
         normalize_runtime_specialization_options_wire, validate_runtime_specialization_facts,
         validate_schedule, workload_compilation_wire_cache_key, CompileOptions, Decision,
         ExecutionRegion, HiddenPhase, HiddenSite, RegionCaptureMode, RegionFallbackPolicy,
-        RegionInputBinding, RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleInput,
+        RegionInputBinding, RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleEffectKind,
+        ScheduleInput,
     };
     use isl_rs::{Context, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
 
@@ -5595,6 +5613,36 @@ mod tests {
         let mut tampered: serde_json::Value = serde_json::from_str(graph).unwrap();
         tampered["edges"] = serde_json::json!([
             {"source":"read","target":"transition","kind":"effect"}
+        ]);
+        assert!(compile_schedule(&tampered.to_string(), timeline, options)
+            .unwrap_err()
+            .to_string()
+            .contains("derived effect edges"));
+    }
+
+    #[test]
+    fn graph_v2_conditional_transition_serializes_like_a_strict_one() {
+        // A conditional transition orders against adjacent accesses exactly
+        // like a strict transition: the signed graph cannot prove the update
+        // will not fire, so the ordering contract is identical.
+        let graph = r#"{"workload_key":"v2-maybe","tasks":[{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"maybe","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition_maybe","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"maybe","kind":"effect"},{"source":"maybe","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        // The ordered read/maybe/read chain internalizes into one Region,
+        // exactly as a strict transition chain would.
+        assert_eq!(decision.execution_regions.len(), 1);
+        assert!(decision.execution_regions[0]
+            .effects
+            .iter()
+            .any(|effect| effect.kind == ScheduleEffectKind::StateTransitionMaybe));
+
+        let mut tampered: serde_json::Value = serde_json::from_str(graph).unwrap();
+        tampered["edges"] = serde_json::json!([
+            {"source":"read","target":"maybe","kind":"effect"}
         ]);
         assert!(compile_schedule(&tampered.to_string(), timeline, options)
             .unwrap_err()

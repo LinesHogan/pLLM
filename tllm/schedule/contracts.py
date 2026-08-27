@@ -334,6 +334,7 @@ class ScheduleEffectKind(StrEnum):
     STATE_READ = "state_read"
     STATE_WRITE = "state_write"
     STATE_TRANSITION = "state_transition"
+    STATE_TRANSITION_MAYBE = "state_transition_maybe"
     VERSION_PUBLISH = "version_publish"
     EXTERN_IO = "extern_io"
 

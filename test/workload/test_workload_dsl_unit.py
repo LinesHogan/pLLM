@@ -20,6 +20,7 @@ from tllm.workload import (
     StateScope,
     declare_workload,
     hidden,
+    maybe_transition,
     read,
     request_key,
     result,
@@ -183,6 +184,10 @@ class WorkloadDslUnitTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "transition.*optimizer"):
             transition(state)
+        with self.assertRaisesRegex(ValueError, "maybe_transition.*optimizer"):
+            maybe_transition(state)
+        with self.assertRaisesRegex(TypeError, "maybe_transition expects a State"):
+            maybe_transition("model")  # type: ignore[arg-type]
 
     def test_typed_extern_registry_is_separate_from_serialized_ir(self) -> None:
         implementation = ExternImplementation(

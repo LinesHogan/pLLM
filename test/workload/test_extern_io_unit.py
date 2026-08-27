@@ -68,6 +68,26 @@ class ExternIODeclarationUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw resource"):
             StateEffect(EffectKind.READ, state, "trace:file")
 
+    def test_extern_channel_colliding_with_a_state_name_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "collides with a state name"):
+
+            @workload(id="extern-io.collide")
+            class Collide:
+                bank = State(
+                    scope=StateScope.REPLICA,
+                    parameters="weights",
+                    optimizer=AdamWSpec(lr=1e-3),
+                )
+
+                @task(
+                    inputs={"value": provided("value")},
+                    outputs={"out": sink("out")},
+                    effects=(extern_io("bank"),),
+                    timing=Between("model.execute", "step.end"),
+                )
+                def io(self, value: object) -> object:
+                    return value
+
     def test_same_channel_extern_io_serializes_in_declaration_order(self) -> None:
         @workload(id="extern-io.ordered")
         class Ordered:
@@ -177,6 +197,78 @@ class ExternIOCompileUnitTest(unittest.TestCase):
         # The graph declares a state while the extern channel is not a state:
         # this compiled, which previously failed with "unknown typed state".
         self.assertIn("bank", {state.resource for state in compilation.graph.states})
+
+    @staticmethod
+    def _two_task_declaration(workload_id: str):
+        @workload(id=workload_id)
+        class Two:
+            @task(
+                inputs={"value": provided("value")},
+                outputs={"first_out": sink("first")},
+                effects=(extern_io("trace:file"),),
+                timing=Between("model.execute", "step.end"),
+            )
+            def first(self, value: object) -> object:
+                return value
+
+            @task(
+                inputs={"value": provided("value")},
+                outputs={"second_out": sink("second")},
+                effects=(extern_io("trace:file"),),
+                timing=Between("model.execute", "step.end"),
+            )
+            def second(self, value: object) -> object:
+                return value
+
+        return declare_workload(Two())
+
+    def test_same_channel_extern_io_compiles_with_the_signed_effect_edge(self) -> None:
+        compilation = WorkloadCompilerCoordinator(
+            (self._two_task_declaration("extern-io.two"),),
+            options=CompileOptions(memory_budget_bytes=1 << 20),
+        ).compile(_timeline())
+        # The Rust-signed graph previously rejected this with "derived effect
+        # edges disagree with typed state effects" because only transitions
+        # were re-derived; extern channels serialize the same way.
+        self.assertIn(
+            ("first", "second"),
+            {
+                (edge.source, edge.target)
+                for edge in compilation.graph.edges
+                if edge.kind.value == "effect"
+            },
+        )
+
+    def test_shared_channel_across_workloads_serializes_cross_workload(self) -> None:
+        compilation = WorkloadCompilerCoordinator(
+            (
+                self._two_task_declaration("w.a"),
+                self._two_task_declaration("w.b"),
+            ),
+            options=CompileOptions(memory_budget_bytes=1 << 20),
+        ).compile(_timeline())
+        # The channel is process-global: it is never prefixed per workload, so
+        # both declarations share one resource and serialize across workloads.
+        extern_resources = {
+            effect.resource
+            for task in compilation.graph.tasks
+            for effect in task.effects
+            if effect.kind.value == "extern_io"
+        }
+        self.assertEqual(extern_resources, {"trace:file"})
+        effect_edges = [
+            (edge.source, edge.target)
+            for edge in compilation.graph.edges
+            if edge.kind.value == "effect"
+        ]
+        self.assertEqual(
+            effect_edges,
+            [
+                ("w.a/first", "w.a/second"),
+                ("w.a/second", "w.b/first"),
+                ("w.b/first", "w.b/second"),
+            ],
+        )
 
 
 if __name__ == "__main__":

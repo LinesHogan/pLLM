@@ -63,13 +63,13 @@ from tllm.workload import (
     State,
     StateScope,
     hidden,
+    maybe_transition,
     provided,
     read,
     result,
     sink,
     task,
     temporary,
-    transition,
     workload,
 )
 
@@ -710,7 +710,7 @@ class OverRIDERegionWorkload(NativeWorkload):
 
     @task(
         inputs={"loss": result("train", "loss")},
-        effects=(transition(_HEADS),),
+        effects=(maybe_transition(_HEADS),),
         timing=Before("step.end"),
         implementation=ExternImplementation(
             namespace="tllm.override",

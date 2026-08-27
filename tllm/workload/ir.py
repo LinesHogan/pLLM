@@ -32,6 +32,7 @@ class EffectKind(StrEnum):
     READ = "read"
     CURRENT = "current"
     TRANSITION = "transition"
+    TRANSITION_MAYBE = "transition_maybe"
     NEXT = "next"
     EXTERN_IO = "extern_io"
 

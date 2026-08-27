@@ -519,6 +519,11 @@ class StateVersionRegistry:
         mutation_counts = Counter(
             effect.resource for effect in effects if effect.kind in self._MUTATING
         )
+        conditional_counts = Counter(
+            effect.resource
+            for effect in effects
+            if effect.kind is ScheduleEffectKind.STATE_TRANSITION_MAYBE
+        )
         resources = {
             effect.resource
             for effect in effects
@@ -532,13 +537,22 @@ class StateVersionRegistry:
                     f"state resource {resource!r} changed version-slot identity within a Region"
                 )
             increment = mutation_counts[resource]
+            conditional = conditional_counts[resource]
+            # A conditional transition may fire or skip per execution (the
+            # signed graph cannot prove which), so each slot may advance by
+            # the strict increment or the strict + conditional increment —
+            # nothing in between and never more.
             invalid = {
                 key: (previous[key], current[key])
                 for key in current
                 if current[key] != previous[key] + increment
+                and not (
+                    conditional
+                    and current[key] == previous[key] + increment + conditional
+                )
             }
             if invalid:
-                action = "mutation" if increment else "read"
+                action = "mutation" if increment or conditional else "read"
                 raise RuntimeError(
                     f"state resource {resource!r} violated signed {action} version effect: "
                     f"{invalid!r}"

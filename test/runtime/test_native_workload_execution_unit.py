@@ -80,6 +80,7 @@ from tllm.workload import (
     StateScope,
     declare_workload,
     hidden,
+    maybe_transition,
     provided,
     read,
     result,
@@ -1715,6 +1716,61 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             anchor = compilation.decision.execution_regions[0].placement_anchor
             with self.assertRaisesRegex(RuntimeError, "signed mutation version effect"):
                 residual_runtime.advance_workload_anchor(anchor)
+
+    def _run_conditional_transition(self, bump: int) -> None:
+        versions: dict[Hashable, int] = {None: 0}
+
+        @workload(id=f"runtime.state.maybe.{bump}")
+        class Stateful:
+            state = State(
+                scope=StateScope.REPLICA,
+                parameters="model",
+                transition="manual",
+            )
+
+            @task(
+                effects=(maybe_transition(state),),
+                timing=Between("model.execute", "step.end"),
+            )
+            def update(self) -> None:
+                versions[None] += bump
+
+        declaration = declare_workload(Stateful())
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+            ),
+        ).compile(_timeline())
+        schedule_state = compilation.graph.states[0]
+        state = ResidualRuntimeState()
+        bindings = WorkloadExecutionBindings(
+            declarations=(declaration,),
+            state_versions={
+                schedule_state.resource: StateVersionBinding(
+                    schedule_state,
+                    lambda _step_id: dict(versions),
+                )
+            },
+        )
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.publish_workload_compilation(
+                compilation,
+                bindings=bindings,
+            )
+            residual_runtime.prepare_physical_workgraph_step(1)
+            anchor = compilation.decision.execution_regions[0].placement_anchor
+            residual_runtime.advance_workload_anchor(anchor)
+
+    def test_signed_conditional_transition_accepts_skip_or_fire(self) -> None:
+        # The audit accepts exactly +0 (data-dependent skip) or +1 (fired).
+        self._run_conditional_transition(0)
+        self._run_conditional_transition(1)
+
+    def test_signed_conditional_transition_rejects_any_other_delta(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "signed mutation version effect"):
+            self._run_conditional_transition(2)
 
     def test_dummy_compilation_takes_authority_at_decision_anchor(self) -> None:
         workload = DummyWorkload(

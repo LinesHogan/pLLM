@@ -114,7 +114,11 @@ class OverRIDERegionDeclarationUnitTest(unittest.TestCase):
         self.assertEqual(train.timing.after, "token.commit")
         self.assertEqual(train.timing.before, "step.end")
         self.assertEqual(update.timing.before, "step.end")
-        self.assertEqual([effect.kind.value for effect in update.effects], ["transition"])
+        # Zero-kept-row steps skip the optimizer update without a version
+        # bump, so the update transition is signed as conditional.
+        self.assertEqual(
+            [effect.kind.value for effect in update.effects], ["transition_maybe"]
+        )
 
     def test_iteration_parse_matches_legacy_rules(self) -> None:
         self.assertEqual(iteration_from_request_id("plain"), 1)
@@ -321,6 +325,59 @@ class OverRIDERegionSignedStepUnitTest(unittest.TestCase):
         stats = workload.resources.read_and_reset_stats()
         self.assertEqual(stats.loss_count, 1)
         self.assertGreater(stats.loss_avg, 0.0)
+
+    def test_signed_regions_accept_a_zero_trainable_row_step(self) -> None:
+        # Both requests are past num_iterations: no row trains, the update
+        # region executes its signed conditional transition as a skip (+0),
+        # and the runtime version audit must accept it.
+        workload = build_override_region_workload(_config())
+        runtime = TllmRuntime(
+            workloads=(workload,), workload_memory_budget_bytes=1 << 20
+        )
+        runtime.cold_specialize_workloads(_spec())
+        compilation = runtime.compile_workloads(
+            export_main_workload_timeline(
+                _capabilities(), graph_mode="eager", static_headroom_bytes=1 << 20
+            )
+        )
+        regions = compilation.decision.execution_regions
+
+        request_ids = ("2_a", "3_b")
+        torch.manual_seed(17)
+        hidden = torch.randn(2, 4)
+        logits = torch.randn(2, 7)
+        state = ResidualRuntimeState()
+        locator = ResidualLocator(0, "block_output", "decode")
+        state.residual_bindings = {"source": ResidualPathBinding(locator, "source")}
+        state.tap_decode_hidden = {"source": hidden}
+        state.decode_count = 2
+        state.decode_request_ids = list(request_ids)
+        state.decode_prompt_idxs = [0, 1]
+        state.decode_sample_idxs = [0, 1]
+        assert workload.up is not None
+        up_before = workload.up.detach().clone()
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.publish_workload_compilation(
+                compilation,
+                bindings=runtime.workload_execution_bindings,
+            )
+            residual_runtime.prepare_physical_workgraph_step(9)
+            for region in regions:
+                residual_runtime.advance_workload_anchor(region.placement_anchor)
+                if region.tasks == ("reweight",):
+                    record = workload.resources.output_sink()
+                    self.assertIsNotNone(record)
+                    provider = workload.sampler_provider
+                    view = _view(9, request_ids, logits=logits, source_hidden=hidden)
+                    provider.prepare_step(view)
+                    provider.after_sample(view, torch.tensor([2, 4], dtype=torch.long))
+
+        self.assertEqual(workload.state_version, 0)
+        assert workload.up is not None
+        self.assertTrue(torch.equal(workload.up.detach(), up_before))
+        stats = workload.resources.read_and_reset_stats()
+        self.assertEqual(stats.loss_count, 0)
 
     def test_missing_reweight_publication_fails_closed(self) -> None:
         workload = build_override_region_workload(_config())

@@ -225,6 +225,27 @@ def transition(state: State) -> StateEffect:
     return StateEffect(EffectKind.TRANSITION, state)
 
 
+def maybe_transition(state: State) -> StateEffect:
+    """Declare a *conditional* transition: the version may or may not advance.
+
+    Use this when whether the update fires is data-dependent and cannot be
+    proven at signing time (e.g. a zero-kept-row step that skips the optimizer
+    update entirely).  Ordering, merge legality, and capture safety treat it
+    exactly like a strict ``transition`` — the signed graph cannot prove the
+    mutation will not happen — while the runtime version audit accepts either
+    ``+0`` (skipped) or ``+1`` (fired) per mutating effect, never more.  A
+    conditional transition therefore never weakens the signed ordering
+    contract; it only widens the audited version delta.
+    """
+    if not isinstance(state, State):
+        raise TypeError("maybe_transition expects a State")
+    if state.optimizer is None and state.transition_kind == "optimizer":
+        raise ValueError(
+            "maybe_transition requires a State optimizer or explicit version conversion"
+        )
+    return StateEffect(EffectKind.TRANSITION_MAYBE, state)
+
+
 def next(state: State) -> StateEffect:
     return _effect(EffectKind.NEXT, state)
 
@@ -780,6 +801,11 @@ def _build_ir(cls: type[object], definition: WorkloadDefinition) -> WorkloadIR:
     for ordinal, (name, function, declaration) in enumerate(raw_tasks):
         for effect in declaration.effects:
             if effect.kind is EffectKind.EXTERN_IO:
+                if effect.resource_name in {state.name for state in states}:
+                    raise ValueError(
+                        f"task {name!r} extern_io channel {effect.resource_name!r} "
+                        "collides with a state name"
+                    )
                 continue  # extern channels are validated on the effect itself
             if effect.state not in known_states:
                 raise ValueError(f"task {name!r} references state from another workload")
@@ -819,7 +845,9 @@ def _build_ir(cls: type[object], definition: WorkloadDefinition) -> WorkloadIR:
     # transition is ordered against every adjacent access to the same state.
     # extern_io channels serialize the same way: the signed graph has no
     # ordering proof for external side effects, so declaration order is kept.
-    ordered_kinds = frozenset({EffectKind.TRANSITION, EffectKind.EXTERN_IO})
+    ordered_kinds = frozenset(
+        {EffectKind.TRANSITION, EffectKind.TRANSITION_MAYBE, EffectKind.EXTERN_IO}
+    )
     state_effects: dict[str, list[tuple[str, EffectKind]]] = {}
     for task_ir in task_irs:
         for effect in task_ir.effects:
@@ -940,6 +968,7 @@ __all__ = [
     "current",
     "declare_workload",
     "hidden",
+    "maybe_transition",
     "next",
     "provided",
     "read",

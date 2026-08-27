@@ -86,6 +86,7 @@ _MUTATING_EFFECT_KINDS = frozenset(
     {
         ScheduleEffectKind.STATE_WRITE,
         ScheduleEffectKind.STATE_TRANSITION,
+        ScheduleEffectKind.STATE_TRANSITION_MAYBE,
         ScheduleEffectKind.VERSION_PUBLISH,
         ScheduleEffectKind.EXTERN_IO,
     }

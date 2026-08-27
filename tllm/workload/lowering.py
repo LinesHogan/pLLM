@@ -64,10 +64,19 @@ def lower_schedule_graph(
         EffectKind.READ: ScheduleEffectKind.STATE_READ,
         EffectKind.CURRENT: ScheduleEffectKind.STATE_READ,
         EffectKind.TRANSITION: ScheduleEffectKind.STATE_TRANSITION,
+        EffectKind.TRANSITION_MAYBE: ScheduleEffectKind.STATE_TRANSITION_MAYBE,
         EffectKind.NEXT: ScheduleEffectKind.VERSION_PUBLISH,
         EffectKind.EXTERN_IO: ScheduleEffectKind.EXTERN_IO,
     }
     for workload in workloads:
+        # extern_io names a process-global channel, not workload state: it is
+        # never prefixed, so two workloads naming the same channel share it.
+        extern_resources = {
+            effect.state
+            for task in workload.tasks
+            for effect in task.effects
+            if effect.kind is EffectKind.EXTERN_IO
+        }
         states.extend(
             ScheduleState(
                 resource=state_id(workload, state.name),
@@ -121,7 +130,9 @@ def lower_schedule_graph(
                     effects=tuple(
                         ScheduleEffect(
                             effect_kind[effect.kind],
-                            state_id(workload, effect.state),
+                            effect.state
+                            if effect.kind is EffectKind.EXTERN_IO
+                            else state_id(workload, effect.state),
                         )
                         for effect in task.effects
                     ),
@@ -175,6 +186,14 @@ def lower_schedule_graph(
                 )
             )
         for edge in workload.edges:
+            if (
+                multiple
+                and edge.kind is WorkloadEdgeKind.EFFECT
+                and edge.detail in extern_resources
+            ):
+                # Shared extern channels serialize across workloads; those
+                # edges are re-derived over the combined task list below.
+                continue
             edges.append(
                 ScheduleEdge(
                     task_id(workload, edge.source),
@@ -191,6 +210,23 @@ def lower_schedule_graph(
                     consumers=tuple(task_id(workload, consumer) for consumer in value.consumers),
                 )
             )
+    if multiple:
+        # Re-derive extern channel serialization across the combined graph in
+        # declaration order, mirroring the signed graph's derivation: a shared
+        # channel serializes every adjacent pair of tasks that touch it.
+        extern_previous: dict[str, str] = {}
+        for workload in workloads:
+            for task in workload.tasks:
+                for effect in task.effects:
+                    if effect.kind is not EffectKind.EXTERN_IO:
+                        continue
+                    current = task_id(workload, task.name)
+                    previous = extern_previous.get(effect.state)
+                    if previous is not None:
+                        edges.append(
+                            ScheduleEdge(previous, current, ScheduleEdgeKind.EFFECT)
+                        )
+                    extern_previous[effect.state] = current
     return ScheduleGraph(
         workload_key=combined_key,
         tasks=tuple(tasks),
