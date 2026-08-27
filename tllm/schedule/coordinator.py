@@ -22,7 +22,7 @@ from tllm.schedule.contracts import (
     ScheduleGraph,
 )
 from tllm.schedule.physical import lower_physical_flow_plan
-from tllm.workgraph.physical import PhysicalFlowPlan
+from tllm.contracts.physical_plan import PhysicalFlowPlan
 from tllm.workload.frontend import WorkloadDeclaration
 from tllm.workload.lowering import lower_schedule_graph
 

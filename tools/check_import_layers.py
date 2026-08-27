@@ -111,13 +111,13 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.workload.compat", "tllm.workgraph.frontend"),
         ("tllm.workload.lowering", "tllm.schedule.contracts"),
         ("tllm.workload.region_compiler", "tllm.schedule.contracts"),
-        # Compiler composition and mechanical physical lowering.
-        ("tllm.schedule.coordinator", "tllm.workgraph.physical"),
+        # Compiler composition and mechanical physical lowering.  The frozen
+        # physical-plan vocabulary lives in the native contracts layer; the
+        # schedule middle-end never touches the legacy workgraph stack.
+        ("tllm.schedule.coordinator", "tllm.contracts.physical_plan"),
         ("tllm.schedule.coordinator", "tllm.workload.frontend"),
         ("tllm.schedule.coordinator", "tllm.workload.lowering"),
-        ("tllm.schedule.physical", "tllm.workgraph.frontend"),
-        ("tllm.schedule.physical", "tllm.workgraph.ir"),
-        ("tllm.schedule.physical", "tllm.workgraph.physical"),
+        ("tllm.schedule.physical", "tllm.contracts.physical_plan"),
         ("tllm.schedule.timeline", "tllm.backends.protocol"),
         # Backends export the typed main-workload timeline, but never import
         # the coordinator or workload executors.

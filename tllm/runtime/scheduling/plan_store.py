@@ -30,10 +30,11 @@ from tllm.runtime.scheduling.adaptive import (
     AdaptiveAdmissionScheduler,
     validate_adaptive_flow_bindings,
 )
-from tllm.workgraph.frontend import ArtifactKey, Device
-from tllm.workgraph.physical import (
+from tllm.contracts.physical_plan import (
+    ArtifactKey,
     BufferBucketDesc,
     CapturePolicy,
+    Device,
     FenceKey,
     PhysicalFlowPlan,
     StreamClass,

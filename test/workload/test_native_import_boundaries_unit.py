@@ -59,6 +59,57 @@ class NativeImportBoundariesUnitTest(unittest.TestCase):
         )
         self.assertEqual(_run(code), "OK")
 
+    def test_coordinator_compile_loads_no_legacy(self) -> None:
+        # R2-5 acceptance: the coordinator and one full compile (including the
+        # mechanical physical lowering) must not pull the legacy
+        # Program/workgraph stack into the process.  The physical descriptor
+        # vocabulary now lives in tllm.contracts.physical_plan.
+        code = """
+import sys
+from tllm.schedule import (
+    CompileOptions,
+    MainWorkloadTimeline,
+    TimelineAnchor,
+    WorkloadCompilerCoordinator,
+)
+from tllm.workload import Between, declare_workload, provided, sink, task, workload
+
+
+@workload(id="boundary.probe")
+class Probe:
+    @task(
+        inputs={"value": provided("value")},
+        outputs={"result_value": sink("result")},
+        timing=Between("model.execute", "step.end"),
+    )
+    def run(self, value: object) -> object:
+        return value
+
+
+timeline = MainWorkloadTimeline(
+    backend_id="vllm",
+    backend_version="0.27.1",
+    runner_family="mrv2",
+    graph_mode="eager",
+    anchors=(TimelineAnchor("model.execute", 0), TimelineAnchor("step.end", 1)),
+    regions=(),
+    static_headroom_bytes=64,
+)
+coordinator = WorkloadCompilerCoordinator(
+    (declare_workload(Probe()),),
+    options=CompileOptions(memory_budget_bytes=1 << 20),
+)
+compilation = coordinator.compile(timeline)
+legacy = [
+    module
+    for module in sys.modules
+    if module == "tllm.program" or module.startswith("tllm.program.")
+    or module == "tllm.workgraph" or module.startswith("tllm.workgraph.")
+]
+print("OK" if compilation.decision.signature and not legacy else "FAIL " + ",".join(sorted(legacy)))
+"""
+        self.assertEqual(_run(code), "OK")
+
 
 if __name__ == "__main__":
     unittest.main()

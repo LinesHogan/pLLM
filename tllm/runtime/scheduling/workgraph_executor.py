@@ -30,13 +30,14 @@ from tllm.runtime.scheduling.plan_store import (
     RuntimeStream,
     select_buffer_bucket,
 )
-from tllm.workgraph.frontend import ArtifactKey
-from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph.physical import (
+from tllm.contracts.physical_plan import (
+    ArtifactKey,
     BufferBucketKey,
     CapturePolicy,
+    ExecutorKey,
     FallbackPolicy,
     FenceKey,
+    NodeKey,
     PhysicalNodePlan,
     StreamClass,
 )

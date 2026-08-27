@@ -44,12 +44,10 @@ from tllm.workgraph.frontend import (
     flow,
 )
 from tllm.workgraph.hierarchy import CaptureAttachment
-from tllm.workgraph.ir import ExecutorKey, NodeKey
+from tllm.contracts.physical_plan import ExecutorKey, FenceKey, NodeKey, StreamClass
 from tllm.workgraph.physical import (
-    FenceKey,
     PhysicalCaptureRegion,
     PhysicalRegionExecutorDesc,
-    StreamClass,
 )
 from tllm.runtime.scheduling.plan_store import (
     PlanResources,

@@ -39,15 +39,16 @@ from tllm.runtime.scheduling.workgraph_executor import (
     ShapeSpecializationMiss,
     runtime_stats_from_executor,
 )
-from tllm.workgraph.physical import (
+from tllm.contracts.physical_plan import (
+    ArtifactKey,
     CapturePolicy,
+    ExecutorKey,
     FallbackPolicy,
     FenceKey,
+    NodeKey,
     PhysicalNodePlan,
     StreamClass,
 )
-from tllm.workgraph.frontend import ArtifactKey
-from tllm.workgraph.ir import ExecutorKey, NodeKey
 from tllm.workload.region_compiler import compare_region_outputs
 from tllm.schedule.contracts import (
     BackendObservableEvent,

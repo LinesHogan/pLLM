@@ -14,7 +14,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypeVar, cast
 
-from tllm.workgraph.ir import NodeKey
+from tllm.contracts.physical_plan import NodeKey
 from tllm.workgraph.placement import MoveKey, PlacementPlan, ValueKey
 from tllm.workgraph.admission import (
     AdmissionMode,

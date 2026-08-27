@@ -7,10 +7,10 @@ from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import torch
 
-from tllm.workgraph.frontend import Device
-from tllm.workgraph.physical import (
+from tllm.contracts.physical_plan import (
     BufferBucketDesc,
     BufferOwnershipKind,
+    Device,
     FenceKey,
 )
 

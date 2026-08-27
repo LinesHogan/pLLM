@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
+from tllm.contracts.physical_plan import ExecutorKey, NodeKey
 from tllm.ports.address import PortAddressDesc
 from tllm.ports.port_id import PortId
 
@@ -281,87 +282,6 @@ def _validate_anchor_edges(
         attached.add(source)
     if attached != anchor_keys:
         raise ValueError(f"{label} AnchorNodes must each attach through an Anchor edge")
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class NodeKey:
-    """Stable logical node identity.
-
-    ``str(NodeKey(...))`` is the persisted form.  The three components are
-    intentionally independent of object addresses, request ids, Tensor reprs
-    and source line numbers.
-    """
-
-    namespace: str
-    owner: str
-    ordinal: int = 0
-
-    def __post_init__(self) -> None:
-        namespace = _require_str(self.namespace, "NodeKey.namespace", nonempty=True)
-        owner = _require_str(self.owner, "NodeKey.owner", nonempty=True)
-        if "/" in namespace:
-            raise ValueError("NodeKey.namespace must not contain '/'")
-        if namespace == "anchor":
-            segments = owner.split("/")
-            if len(segments) != 4 or any(not segment or "\\" in segment for segment in segments):
-                raise ValueError(
-                    "anchor NodeKey.owner must contain exactly four non-empty '/'-separated segments"
-                )
-        else:
-            owner = _stable_segment(owner, "NodeKey.owner")
-        ordinal = _require_int(self.ordinal, "NodeKey.ordinal")
-        if ordinal < 0:
-            raise ValueError("NodeKey.ordinal must be a non-negative int")
-        object.__setattr__(self, "namespace", namespace)
-        object.__setattr__(self, "owner", owner)
-        object.__setattr__(self, "ordinal", ordinal)
-
-    @property
-    def value(self) -> str:
-        if self.namespace == "anchor":
-            return f"{self.namespace}/{self.owner}"
-        return f"{self.namespace}/{self.owner}/{self.ordinal}"
-
-    def __str__(self) -> str:
-        return self.value
-
-    @classmethod
-    def consumer_flow(cls, consumer_id: str, ordinal: int) -> "NodeKey":
-        return cls("consumer_flow", consumer_id, ordinal)
-
-    @classmethod
-    def producer(cls, producer_id: str) -> "NodeKey":
-        return cls("producer", producer_id, 0)
-
-    @classmethod
-    def anchor(cls, backend: str, runner: str, graph_mode: str, hook: str) -> "NodeKey":
-        return cls("anchor", f"{backend}/{runner}/{graph_mode}/{hook}", 0)
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class ExecutorKey:
-    """Stable identity for an implementation, without storing its callback."""
-
-    namespace: str
-    name: str
-    version: str = "1"
-
-    def __post_init__(self) -> None:
-        namespace = _require_str(self.namespace, "ExecutorKey.namespace", nonempty=True)
-        name = _require_str(self.name, "ExecutorKey.name", nonempty=True)
-        version = _require_str(self.version, "ExecutorKey.version", nonempty=True)
-        if "/" in namespace or "/" in name:
-            raise ValueError("ExecutorKey namespace/name must not contain '/'")
-        object.__setattr__(self, "namespace", namespace)
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "version", version)
-
-    @property
-    def value(self) -> str:
-        return f"{self.namespace}:{self.name}@{self.version}"
-
-    def __str__(self) -> str:
-        return self.value
 
 
 @dataclass(frozen=True, slots=True)

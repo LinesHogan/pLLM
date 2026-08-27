@@ -10,6 +10,12 @@ from functools import wraps
 from types import FunctionType
 from typing import Callable, ParamSpec, Protocol, TypeVar, cast, get_type_hints, overload
 
+from tllm.contracts.physical_plan import (
+    ArtifactKey,
+    Device,
+    TensorDTypeDesc,
+    TensorDeviceDesc,
+)
 from tllm.ports.address import PortAddressDesc
 from tllm.ports.base import TimingDeadline
 from tllm.ports.port_id import PortId
@@ -111,11 +117,6 @@ class StateScope(StrEnum):
     GLOBAL = "global"
 
 
-class Device(StrEnum):
-    CPU = "cpu"
-    CUDA = "cuda"
-
-
 class Capability(StrEnum):
     EAGER_ONLY = "eager_only"
     CAPTURE_SAFE = "capture_safe"
@@ -150,60 +151,6 @@ class _BeforeNextUse:
 
 
 BeforeNextUse = _BeforeNextUse()
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class ArtifactKey:
-    """Stable leaf-artifact identity, independent of node and executor keys."""
-
-    namespace: str
-    name: str
-    version: int = 1
-    digest: str = ""
-
-    def __post_init__(self) -> None:
-        namespace = _require_str(cast(object, self.namespace), "ArtifactKey.namespace", nonempty=True)
-        name = _require_str(cast(object, self.name), "ArtifactKey.name", nonempty=True)
-        if "/" in namespace or "\\" in namespace:
-            raise ValueError("ArtifactKey.namespace must not contain path separators")
-        if "/" in name or "\\" in name:
-            raise ValueError("ArtifactKey.name must not contain path separators")
-        version = _require_int(cast(object, self.version), "ArtifactKey.version")
-        if version < 1:
-            raise ValueError("ArtifactKey.version must be >= 1")
-        digest = _require_str(cast(object, self.digest), "ArtifactKey.digest")
-        if digest and (
-            len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise ValueError("ArtifactKey.digest must be an empty string or lowercase SHA-256")
-        object.__setattr__(self, "namespace", namespace)
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "version", version)
-        object.__setattr__(self, "digest", digest)
-
-    @classmethod
-    def from_callable(
-        cls,
-        function: Callable[..., object],
-        *,
-        digest: str = "",
-    ) -> "ArtifactKey":
-        if not isinstance(function, FunctionType):
-            raise TypeError("captured callable must be a Python function")
-        namespace = function.__module__
-        name = function.__qualname__
-        if not name:
-            raise TypeError("captured callable must have a stable qualified name")
-        return cls(namespace=namespace, name=name, digest=digest)
-
-    @property
-    def value(self) -> str:
-        suffix = "" if not self.digest else f"#{self.digest}"
-        return f"{self.namespace}:{self.name}@{self.version}{suffix}"
-
-    def __str__(self) -> str:
-        return self.value
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,45 +266,6 @@ class DynamicDim:
         object.__setattr__(self, "dimension", dimension)
         object.__setattr__(self, "lower_bound", lower_bound)
         object.__setattr__(self, "upper_bound", upper_bound)
-
-
-@dataclass(frozen=True, slots=True)
-class TensorDeviceDesc:
-    kind: Device
-    index: int | None = None
-
-    def __post_init__(self) -> None:
-        kind = _require_instance(cast(object, self.kind), Device, "TensorDeviceDesc.kind")
-        index_value = cast(object, self.index)
-        index: int | None
-        if index_value is None:
-            index = None
-        else:
-            index = _require_int(index_value, "TensorDeviceDesc.index")
-            if index < 0:
-                raise ValueError("TensorDeviceDesc.index must be non-negative")
-        if kind == Device.CPU and index is not None:
-            raise ValueError("CPU TensorDeviceDesc cannot declare a device index")
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "index", index)
-
-
-@dataclass(frozen=True, slots=True)
-class TensorDTypeDesc:
-    namespace: str
-    name: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "namespace",
-            _require_str(cast(object, self.namespace), "TensorDTypeDesc.namespace", nonempty=True),
-        )
-        object.__setattr__(
-            self,
-            "name",
-            _require_str(cast(object, self.name), "TensorDTypeDesc.name", nonempty=True),
-        )
 
 
 @dataclass(frozen=True, slots=True)

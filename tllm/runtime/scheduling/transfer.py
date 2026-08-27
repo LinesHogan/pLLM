@@ -8,8 +8,7 @@ from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import torch
 
-from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph.physical import PhysicalFlowPlan
+from tllm.contracts.physical_plan import ExecutorKey, NodeKey, PhysicalFlowPlan
 from tllm.workgraph.placement import (
     CopyEngine,
     CopyEngineCapacityDesc,

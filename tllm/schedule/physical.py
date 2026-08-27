@@ -13,15 +13,16 @@ from tllm.schedule.contracts import (
     ScheduleDecision,
     ScheduleGraph,
 )
-from tllm.workgraph.frontend import ArtifactKey
-from tllm.workgraph.ir import ExecutorKey, NodeKey
-from tllm.workgraph.physical import (
+from tllm.contracts.physical_plan import (
     AnchorPlacementDesc,
+    ArtifactKey,
     CapturePolicy,
+    ExecutorKey,
     FallbackPolicy,
     FenceDependencyDesc,
     FenceKey,
     FenceKind,
+    NodeKey,
     PhysicalFlowPlan,
     PhysicalNodePlan,
     StreamClass,

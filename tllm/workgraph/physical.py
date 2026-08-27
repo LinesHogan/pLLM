@@ -1,4 +1,10 @@
-"""Frozen physical-plan descriptors for single-device WorkGraph execution.
+"""Legacy capture-region lowering for single-device WorkGraph execution.
+
+The frozen descriptor vocabulary itself now lives in
+``tllm.contracts.physical_plan`` and is re-exported here so existing
+legacy import paths keep identical class identity.  What remains in
+this module is the legacy shadow-plan lowering (capture regions and
+task partitions) that only the residual Program/workgraph path uses.
 
 This module is a control-plane boundary.  It deliberately contains no Tensor,
 CUDA stream/event, CUDAGraph, callback, request id, or backend runtime handle.
@@ -8,23 +14,34 @@ Those objects belong to the Python physical executor.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from tllm.workgraph.frontend import (
+from tllm.contracts.physical_plan import (
+    AnchorPlacementDesc,
     ArtifactKey,
+    BufferBucketDesc,
+    BufferBucketKey,
+    BufferOwnershipKind,
+    CapturePolicy,
+    ExecutorKey,
+    FallbackPolicy,
+    FenceDependencyDesc,
+    FenceKey,
+    FenceKind,
+    NodeKey,
+    PhysicalFlowPlan,
+    PhysicalNodePlan,
+    StreamClass,
+)
+from tllm.workgraph.frontend import (
     Capability,
     CaptureStatus,
     ExternContract,
-    TensorDTypeDesc,
-    TensorDeviceDesc,
 )
 from tllm.workgraph.hierarchy import CaptureAttachment, RootFlowDesc
 from tllm.workgraph.ir import (
     EdgeKind,
     ExecutionNodeDesc,
-    ExecutorKey,
-    NodeKey,
 )
 
 if TYPE_CHECKING:
@@ -34,305 +51,10 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 
-def _text(value: object, label: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be str")
-    if not value:
-        raise ValueError(f"{label} must be non-empty")
-    if "/" in value or "\\" in value:
-        raise ValueError(f"{label} must not contain path separators")
-    if "0x" in value.lower() or "<" in value or ">" in value:
-        raise ValueError(f"{label} must not contain runtime repr or address text")
-    return value
-
-
-def _integer(value: object, label: str, *, minimum: int = 0) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{label} must be int")
-    if value < minimum:
-        raise ValueError(f"{label} must be >= {minimum}")
-    return value
-
-
 def _instance(value: object, expected: type[_T], label: str) -> _T:
     if not isinstance(value, expected):
         raise TypeError(f"{label} must be {expected.__name__}")
     return value
-
-
-def _tuple_of(value: object, expected: type[_T], label: str) -> tuple[_T, ...]:
-    if not isinstance(value, tuple):
-        raise TypeError(f"{label} must be tuple")
-    items = cast(tuple[object, ...], value)
-    if any(not isinstance(item, expected) for item in items):
-        raise TypeError(f"{label} must contain only {expected.__name__}")
-    return cast(tuple[_T, ...], items)
-
-
-class StreamClass(StrEnum):
-    DEFAULT = "default"
-    SIDE_FORWARD = "side_forward"
-    SIDE_TRAIN = "side_train"
-
-
-class FenceKind(StrEnum):
-    READY = "ready"
-    COMPLETION = "completion"
-    RETIRE = "retire"
-
-
-class CapturePolicy(StrEnum):
-    DISABLED = "disabled"
-    PREFER = "prefer"
-    REQUIRE = "require"
-
-
-class FallbackPolicy(StrEnum):
-    EAGER = "eager"
-    REJECT = "reject"
-
-
-class BufferOwnershipKind(StrEnum):
-    BORROWED = "borrowed"
-    MANAGED = "managed"
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class FenceKey:
-    namespace: str
-    name: str
-    ordinal: int = 0
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "namespace", _text(self.namespace, "FenceKey.namespace"))
-        object.__setattr__(self, "name", _text(self.name, "FenceKey.name"))
-        object.__setattr__(self, "ordinal", _integer(self.ordinal, "FenceKey.ordinal"))
-
-    @property
-    def value(self) -> str:
-        return f"{self.namespace}:{self.name}/{self.ordinal}"
-
-    def __str__(self) -> str:
-        return self.value
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class BufferBucketKey:
-    namespace: str
-    name: str
-    ordinal: int = 0
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "namespace", _text(self.namespace, "BufferBucketKey.namespace"))
-        object.__setattr__(self, "name", _text(self.name, "BufferBucketKey.name"))
-        object.__setattr__(self, "ordinal", _integer(self.ordinal, "BufferBucketKey.ordinal"))
-
-    @property
-    def value(self) -> str:
-        return f"{self.namespace}:{self.name}/{self.ordinal}"
-
-    def __str__(self) -> str:
-        return self.value
-
-
-@dataclass(frozen=True, slots=True)
-class BufferBucketDesc:
-    key: BufferBucketKey
-    shape: tuple[int, ...]
-    dtype: TensorDTypeDesc
-    device: TensorDeviceDesc
-    slots: int = 1
-    ownership: BufferOwnershipKind = BufferOwnershipKind.MANAGED
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "key", _instance(self.key, BufferBucketKey, "BufferBucketDesc.key"))
-        raw_shape = cast(object, self.shape)
-        if not isinstance(raw_shape, tuple):
-            raise TypeError("BufferBucketDesc.shape must be tuple")
-        shape = tuple(
-            _integer(dimension, "BufferBucketDesc.shape dimension", minimum=1)
-            for dimension in cast(tuple[object, ...], raw_shape)
-        )
-        if not shape:
-            raise ValueError("BufferBucketDesc.shape must be non-empty")
-        object.__setattr__(self, "shape", shape)
-        object.__setattr__(
-            self,
-            "dtype",
-            _instance(self.dtype, TensorDTypeDesc, "BufferBucketDesc.dtype"),
-        )
-        _text(self.dtype.namespace, "BufferBucketDesc.dtype.namespace")
-        _text(self.dtype.name, "BufferBucketDesc.dtype.name")
-        object.__setattr__(
-            self,
-            "device",
-            _instance(self.device, TensorDeviceDesc, "BufferBucketDesc.device"),
-        )
-        object.__setattr__(self, "slots", _integer(self.slots, "BufferBucketDesc.slots", minimum=1))
-        object.__setattr__(
-            self,
-            "ownership",
-            _instance(self.ownership, BufferOwnershipKind, "BufferBucketDesc.ownership"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class FenceDependencyDesc:
-    fence: FenceKey
-    producer: NodeKey
-    consumer: NodeKey
-    kind: FenceKind
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "fence", _instance(self.fence, FenceKey, "FenceDependencyDesc.fence"))
-        producer = _instance(self.producer, NodeKey, "FenceDependencyDesc.producer")
-        consumer = _instance(self.consumer, NodeKey, "FenceDependencyDesc.consumer")
-        if producer == consumer:
-            raise ValueError("FenceDependencyDesc producer and consumer must differ")
-        object.__setattr__(self, "producer", producer)
-        object.__setattr__(self, "consumer", consumer)
-        object.__setattr__(self, "kind", _instance(self.kind, FenceKind, "FenceDependencyDesc.kind"))
-
-
-@dataclass(frozen=True, slots=True)
-class PhysicalNodePlan:
-    node_key: NodeKey
-    executor: ExecutorKey
-    stream: StreamClass
-    fences: tuple[FenceDependencyDesc, ...] = ()
-    artifact_key: ArtifactKey | None = None
-    buffer_bucket: BufferBucketKey | None = None
-    capture_policy: CapturePolicy = CapturePolicy.DISABLED
-    fallback_policy: FallbackPolicy = FallbackPolicy.EAGER
-
-    def __post_init__(self) -> None:
-        node_key = _instance(self.node_key, NodeKey, "PhysicalNodePlan.node_key")
-        _text(node_key.namespace, "PhysicalNodePlan.node_key.namespace")
-        _text(node_key.owner, "PhysicalNodePlan.node_key.owner")
-        object.__setattr__(self, "node_key", node_key)
-        executor = _instance(self.executor, ExecutorKey, "PhysicalNodePlan.executor")
-        _text(executor.namespace, "PhysicalNodePlan.executor.namespace")
-        _text(executor.name, "PhysicalNodePlan.executor.name")
-        _text(executor.version, "PhysicalNodePlan.executor.version")
-        object.__setattr__(self, "executor", executor)
-        object.__setattr__(self, "stream", _instance(self.stream, StreamClass, "PhysicalNodePlan.stream"))
-        fences = _tuple_of(self.fences, FenceDependencyDesc, "PhysicalNodePlan.fences")
-        if any(fence.consumer != node_key for fence in fences):
-            raise ValueError("PhysicalNodePlan fences must target the owning node")
-        if len({fence.fence for fence in fences}) != len(fences):
-            raise ValueError("PhysicalNodePlan fences must have unique keys")
-        object.__setattr__(self, "fences", fences)
-        if self.artifact_key is not None:
-            artifact_key = _instance(
-                self.artifact_key, ArtifactKey, "PhysicalNodePlan.artifact_key"
-            )
-            if len(artifact_key.digest) != 64:
-                raise ValueError("physical ArtifactKey requires a SHA-256 digest")
-            object.__setattr__(
-                self,
-                "artifact_key",
-                artifact_key,
-            )
-        if self.buffer_bucket is not None:
-            object.__setattr__(
-                self,
-                "buffer_bucket",
-                _instance(self.buffer_bucket, BufferBucketKey, "PhysicalNodePlan.buffer_bucket"),
-            )
-        capture_policy = _instance(
-            self.capture_policy, CapturePolicy, "PhysicalNodePlan.capture_policy"
-        )
-        fallback_policy = _instance(
-            self.fallback_policy, FallbackPolicy, "PhysicalNodePlan.fallback_policy"
-        )
-        if capture_policy == CapturePolicy.REQUIRE and fallback_policy == FallbackPolicy.EAGER:
-            raise ValueError("required capture cannot declare eager fallback")
-        if capture_policy != CapturePolicy.DISABLED and self.artifact_key is None:
-            raise ValueError("enabled capture requires an ArtifactKey")
-        object.__setattr__(self, "capture_policy", capture_policy)
-        object.__setattr__(self, "fallback_policy", fallback_policy)
-
-
-@dataclass(frozen=True, slots=True)
-class AnchorPlacementDesc:
-    node_key: NodeKey
-    after_anchor: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "node_key",
-            _instance(self.node_key, NodeKey, "AnchorPlacementDesc.node_key"),
-        )
-        object.__setattr__(
-            self,
-            "after_anchor",
-            _text(self.after_anchor, "AnchorPlacementDesc.after_anchor"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class PhysicalFlowPlan:
-    plan_epoch: int
-    nodes: tuple[PhysicalNodePlan, ...]
-    buffer_buckets: tuple[BufferBucketDesc, ...] = ()
-    anchor_placements: tuple[AnchorPlacementDesc, ...] = ()
-    schedule_signature: str = ""
-    schema_version: int = 1
-
-    def __post_init__(self) -> None:
-        epoch = _integer(self.plan_epoch, "PhysicalFlowPlan.plan_epoch", minimum=1)
-        nodes = _tuple_of(self.nodes, PhysicalNodePlan, "PhysicalFlowPlan.nodes")
-        buckets = _tuple_of(
-            self.buffer_buckets, BufferBucketDesc, "PhysicalFlowPlan.buffer_buckets"
-        )
-        placements = _tuple_of(
-            self.anchor_placements,
-            AnchorPlacementDesc,
-            "PhysicalFlowPlan.anchor_placements",
-        )
-        if self.schema_version != 1:
-            raise ValueError("PhysicalFlowPlan.schema_version must be 1")
-        if len({node.node_key for node in nodes}) != len(nodes):
-            raise ValueError("PhysicalFlowPlan nodes must have unique NodeKey values")
-        bucket_keys = {bucket.key for bucket in buckets}
-        if len(bucket_keys) != len(buckets):
-            raise ValueError("PhysicalFlowPlan buffer buckets must have unique keys")
-        if any(
-            node.buffer_bucket is not None and node.buffer_bucket not in bucket_keys
-            for node in nodes
-        ):
-            raise ValueError("PhysicalFlowPlan node references an unknown buffer bucket")
-        if placements and tuple(placement.node_key for placement in placements) != tuple(
-            node.node_key for node in nodes
-        ):
-            raise ValueError(
-                "PhysicalFlowPlan anchor placements must cover nodes in execution order"
-            )
-        signature = self.schedule_signature
-        if signature and (
-            len(signature) != 64
-            or any(character not in "0123456789abcdef" for character in signature)
-        ):
-            raise ValueError(
-                "PhysicalFlowPlan.schedule_signature must be lowercase SHA-256"
-            )
-        node_keys = {node.node_key for node in nodes}
-        positions = {node.node_key: ordinal for ordinal, node in enumerate(nodes)}
-        fence_keys: set[FenceKey] = set()
-        for node in nodes:
-            for fence in node.fences:
-                if fence.producer not in node_keys:
-                    raise ValueError("PhysicalFlowPlan fence references an unknown producer")
-                if fence.fence in fence_keys:
-                    raise ValueError("PhysicalFlowPlan fences must have unique keys")
-                fence_keys.add(fence.fence)
-                if positions[fence.producer] >= positions[fence.consumer]:
-                    raise ValueError("PhysicalFlowPlan nodes must be in dependency order")
-        object.__setattr__(self, "plan_epoch", epoch)
-        object.__setattr__(self, "nodes", nodes)
-        object.__setattr__(self, "buffer_buckets", buckets)
-        object.__setattr__(self, "anchor_placements", placements)
 
 
 @dataclass(frozen=True, slots=True)
