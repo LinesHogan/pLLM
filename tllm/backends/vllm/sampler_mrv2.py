@@ -16,7 +16,15 @@ not exist inside the fused FlashInfer kernel. The interceptor therefore:
   applies top-k/top-p explicitly, reweights only the surviving candidates
   with ``(1+beta)*logit - beta*distiller_logit``, and draws with the same
   ``gumbel_sample`` call (same seeds/positions, so RNG consumption matches
-  the unmodified non-FlashInfer path).
+  the unmodified non-FlashInfer path);
+* for ``pre_filter_dense`` providers, applies the intervention to the raw
+  logits *before* ``apply_sampling_params`` — the ``softmax((p - λh)/T)``
+  pipeline order — on a clone, so penalties, temperature and min-p all
+  operate on the intervened distribution.
+
+The pre-draw fence is dispatched before ``provider.prepare_step`` consumes
+any Region output (side-stream join precedes consumption), matching the
+generic bridge and the MRv1 wrapper.
 
 The class is never patched globally; the wrapper is installed on the
 sampler instance owned by the bound runner.
@@ -459,12 +467,17 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
         _trace = _os.getenv("TLLM_TRACE_MRV2_SAMPLER", "") == "1"
         _tp0 = _time.perf_counter() if _trace else 0.0
         view = _build_mrv2_step_view(runtime=runtime, runner=runner, logits=logits)
-        state = provider.prepare_step(view) if view is not None else None
+        # The parameter-read fence must publish *before* the provider reads
+        # any Region output: dispatch joins side-stream work onto the main
+        # stream, and provider consumption after the join observes complete
+        # results.  The reverse order raced side Regions signed before
+        # sampler.pre_draw (mirrors sample_with_optional_modifier).
         dispatch_sampler_pre_draw(
             runtime=runtime,
             runner=runner,
             device=logits.device,
         )
+        state = provider.prepare_step(view) if view is not None else None
         if _trace:
             from tllm.runtime.residual_runtime import record_path_hotspot_cpu
 
@@ -513,6 +526,30 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
                 _notify_after_sample(provider=provider, view=view, sampled_token_ids=sampled)
                 return sampled, logits
 
+        if state.backend == "pre_filter_dense":
+            # Pre-filter dense semantics: reweight the RAW logits before the
+            # sampling pipeline — softmax((p - λh)/T), not softmax(p/T - λh).
+            # Penalties, temperature and min-p then apply to the intervened
+            # distribution.  The raw logits alias the runner's tensor, so the
+            # intervention always works on a clone.
+            dense = state.precomputed_dense_logits
+            if dense is None:
+                pred_hidden = state.pred_hidden
+                dense = F.linear(
+                    pred_hidden.to(dtype=state.lm_head_weight.dtype),
+                    state.lm_head_weight,
+                    state.lm_head_bias,
+                ).to(torch.float32)
+            dense = dense.to(device=logits.device, dtype=logits.dtype)
+            affected = state.affected_row_ids.to(device=logits.device, dtype=torch.long)
+            intervened = logits.clone()
+            sub = intervened[affected]
+            sub.mul_(1.0 + float(state.beta))
+            sub.add_(dense[: int(affected.numel())], alpha=-float(state.beta))
+            intervened[affected] = sub
+            logits = intervened
+        _ti = _hotspot("mrv2_sampler.pre_pipeline_intervene_cpu", _t0)
+
         processed_logits = sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -522,29 +559,13 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
             expanded_local_pos,
             skip_top_k_top_p=True,
         )
-        _t1 = _hotspot("mrv2_sampler.apply_sampling_params_cpu", _t0)
+        _t1 = _hotspot("mrv2_sampler.apply_sampling_params_cpu", _ti)
         top_k, top_p = sampler.sampling_states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
         _t2 = _hotspot("mrv2_sampler.get_top_k_top_p_cpu", _t1)
 
         if state.backend == "pre_filter_dense":
-            dense = state.precomputed_dense_logits
-            if dense is None:
-                pred_hidden = state.pred_hidden
-                dense = F.linear(
-                    pred_hidden.to(dtype=state.lm_head_weight.dtype),
-                    state.lm_head_weight,
-                    state.lm_head_bias,
-                ).to(torch.float32)
-            dense = dense.to(device=processed_logits.device, dtype=processed_logits.dtype)
-            if processed_logits is logits:
-                # No upstream logits processing: this aliases the runner's
-                # logits, which must not be mutated in place.
-                processed_logits = processed_logits.clone()
-            affected = state.affected_row_ids.to(device=processed_logits.device, dtype=torch.long)
-            sub = processed_logits[affected]
-            sub.mul_(1.0 + float(state.beta))
-            sub.add_(dense[: int(affected.numel())], alpha=-float(state.beta))
-            processed_logits[affected] = sub
+            # Intervention already applied to the raw logits above; only the
+            # top-k/top-p filter remains before the draw.
             filtered = apply_top_k_top_p(processed_logits, top_k, top_p)
         else:
             # post-filter: filter the base logits first, then reweight only

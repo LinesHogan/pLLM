@@ -1091,6 +1091,54 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
         self.assertEqual(trace, ["left", "right"])
 
+    def test_zero_node_signed_event_still_joins_side_streams(self) -> None:
+        """A signed event advancing zero Regions must still fence side work.
+
+        The sampler provider reached via dispatch_sampler_pre_draw consumes
+        side-Region outputs at an anchor that typically advances no Region;
+        skipping the join there re-opens the pre-draw consumption race.
+        """
+
+        @workload(id="runtime.zero-node-join")
+        class ZeroNode:
+            @task(
+                outputs={"output": sink("answer")},
+                timing=Between("model.execute", "logits.post"),
+            )
+            def produce(self) -> torch.Tensor:
+                return torch.ones(4)
+
+        declaration = declare_workload(ZeroNode())
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+            ),
+        ).compile(_timeline())
+        bindings = WorkloadExecutionBindings(
+            declarations=(declaration,),
+            output_sinks={"answer": lambda _value, _step_id: None},
+        )
+        state = ResidualRuntimeState()
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.publish_workload_compilation(compilation, bindings=bindings)
+            execution = state.workload_execution
+            self.assertIsNotNone(execution)
+            assert execution is not None
+            residual_runtime.prepare_physical_workgraph_step(1)
+            with mock.patch.object(
+                NativeWorkloadExecution, "_join_side_streams", autospec=True
+            ) as join:
+                self.assertFalse(
+                    execution.advance_backend_event(
+                        BackendObservableEvent.SAMPLER_PRE_DRAW
+                    )
+                )
+                join.assert_called_once()
+            execution.finish_step(1)
+
     def test_physical_region_identity_coverage_fails_closed(self) -> None:
         @workload(id="runtime.identity")
         class Identity:

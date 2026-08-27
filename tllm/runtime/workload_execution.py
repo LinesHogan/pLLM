@@ -877,7 +877,12 @@ class NativeWorkloadExecution:
             )
         # A signed timeline may expose an observable event that advances no
         # Region. It is an intentional lifecycle no-op, not an unsigned hook.
+        # The side-stream join is still owed here: main-path consumers at
+        # this point in the timeline (e.g. the sampler provider reached via
+        # dispatch_sampler_pre_draw) must observe completed side work even
+        # when the event itself advances zero Region nodes.
         if not nodes:
+            self._join_side_streams()
             return False
         return self._advance_nodes(nodes)
 
