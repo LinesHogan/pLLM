@@ -235,6 +235,16 @@ def lower_schedule_graph(
         states=tuple(states),
         persistent_state_bytes=persistent_state_bytes,
         schema_version=2,
+        # Non-exact policies are signed into the graph so the Decision can
+        # explain which Regions run under approximation parity.  Criteria
+        # stay host-side (declaration-only) by design.
+        workload_approximations=tuple(
+            sorted(
+                (workload.workload_id, workload.approximation.value)
+                for workload in workloads
+                if workload.approximation.value != "exact"
+            )
+        ),
     )
 
 

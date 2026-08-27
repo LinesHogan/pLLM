@@ -14,6 +14,7 @@ from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.workload.ir import (
     AffineAccessIR,
     AffineExprIR,
+    ApproximationCriteria,
     ApproximationPolicy,
     DomainIR,
     EffectIR,
@@ -675,6 +676,7 @@ class WorkloadDefinition:
     workload_id: str
     approximation: ApproximationPolicy
     authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION
+    approximation_criteria: ApproximationCriteria | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,6 +688,9 @@ class WorkloadDeclaration:
     implementation_executors: tuple[
         tuple[str, str, Callable[..., object]], ...
     ] = ()
+    # Host-side parity validation parameters for approximation workloads;
+    # deliberately outside the signed IR and workload identity.
+    approximation_criteria: ApproximationCriteria | None = None
 
     def executor(
         self,
@@ -712,15 +717,27 @@ def workload(
     id: str | None = None,
     approximation: ApproximationPolicy = ApproximationPolicy.EXACT,
     authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION,
+    approximation_criteria: ApproximationCriteria | None = None,
 ) -> type[_T] | Callable[[type[_T]], type[_T]]:
     def decorate(target: type[_T]) -> type[_T]:
         if not isinstance(target, type):
             raise TypeError("workload must decorate a class")
+        policy = ApproximationPolicy(approximation)
+        if approximation_criteria is not None:
+            if not isinstance(approximation_criteria, ApproximationCriteria):
+                raise TypeError(
+                    "workload.approximation_criteria must be ApproximationCriteria or None"
+                )
+            if policy is ApproximationPolicy.EXACT:
+                raise ValueError(
+                    "an exact workload must not declare approximation criteria"
+                )
         workload_id = id or f"{target.__module__}.{target.__qualname__}"
         definition = WorkloadDefinition(
             _name(workload_id, "workload.id"),
-            ApproximationPolicy(approximation),
+            policy,
             WorkloadAuthority(authority),
+            approximation_criteria,
         )
         setattr(target, "__tllm_workload__", definition)
         # Validate at class definition time without constructing an instance.
@@ -946,6 +963,7 @@ def declare_workload(
         executors=tuple(executors),
         authority=definition.authority,
         implementation_executors=tuple(implementation_executors),
+        approximation_criteria=definition.approximation_criteria,
     )
 
 
@@ -954,6 +972,7 @@ __all__ = [
     "AffineAccess",
     "AffineExpr",
     "After",
+    "ApproximationCriteria",
     "Before",
     "Between",
     "Domain",

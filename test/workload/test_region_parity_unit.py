@@ -14,6 +14,8 @@ from tllm.schedule import (
 )
 from tllm.schedule.contracts import ScheduleEffect, ScheduleEffectKind
 from tllm.workload import (
+    ApproximationCriteria,
+    ApproximationPolicy,
     Between,
     declare_workload,
     materialize_region_artifacts,
@@ -203,6 +205,82 @@ class RegionParityGateUnitTest(unittest.TestCase):
         )
         self.assertFalse(artifact.compiled)
         self.assertEqual(artifact.parity, "eager")
+
+
+class ApproximationParityUnitTest(unittest.TestCase):
+    @staticmethod
+    def _declaration(criteria: ApproximationCriteria | None):
+        @workload(
+            id="region.parity-approx",
+            approximation=ApproximationPolicy.JACOBI,
+            approximation_criteria=criteria,
+        )
+        class Approx:
+            @task(
+                inputs={"value": provided("value")},
+                outputs={"result_value": sink("result")},
+                timing=Between("model.execute", "step.end"),
+            )
+            def run(self, value: object) -> object:
+                assert isinstance(value, torch.Tensor)
+                return value * 2
+
+        return declare_workload(Approx())
+
+    @staticmethod
+    def _drifting_compile(delta: float):
+        def corrupting_compile(function: object, **kwargs: object) -> object:
+            compiled = _REAL_TORCH_COMPILE(function, backend="eager", **kwargs)  # type: ignore[arg-type]
+
+            def drifted(*args: object) -> object:
+                outputs = compiled(*args)
+                return tuple(
+                    output + delta if torch.is_tensor(output) else output
+                    for output in outputs
+                )
+
+            return drifted
+
+        return corrupting_compile
+
+    def _compile(self, declaration: object):
+        return WorkloadCompilerCoordinator(
+            (declaration,), options=CompileOptions(memory_budget_bytes=1 << 20)
+        ).compile(_timeline())
+
+    def test_approximation_without_criteria_fails_closed(self) -> None:
+        declaration = self._declaration(None)
+        compilation = self._compile(declaration)
+        with mock.patch("torch.compile", side_effect=_eager_backend_compile):
+            with self.assertRaisesRegex(RegionParityError, "no approximation criteria"):
+                materialize_region_artifacts(
+                    (declaration,), compilation.decision, compilation.options
+                )
+
+    def test_approximation_gate_uses_declared_criteria(self) -> None:
+        declaration = self._declaration(ApproximationCriteria(rtol=0.2, atol=0.2))
+        compilation = self._compile(declaration)
+        with mock.patch("torch.compile", side_effect=self._drifting_compile(0.1)):
+            (artifact,) = materialize_region_artifacts(
+                (declaration,), compilation.decision, compilation.options
+            )
+        self.assertEqual(artifact.parity, "first_call_approximation")
+        self.assertEqual(artifact.parity_tolerance, (0.2, 0.2))
+        # +0.1 drift on values of order 6 stays inside rtol=atol=0.2.
+        output = artifact.execute({artifact.input_keys[0]: torch.tensor([3.0])})
+        torch.testing.assert_close(
+            output[artifact.output_keys[0]], torch.tensor([6.1])
+        )
+
+    def test_approximation_gate_rejects_drift_beyond_criteria(self) -> None:
+        declaration = self._declaration(ApproximationCriteria(rtol=1e-4, atol=1e-4))
+        compilation = self._compile(declaration)
+        with mock.patch("torch.compile", side_effect=self._drifting_compile(0.1)):
+            (artifact,) = materialize_region_artifacts(
+                (declaration,), compilation.decision, compilation.options
+            )
+        with self.assertRaises(RegionParityError):
+            artifact.execute({artifact.input_keys[0]: torch.tensor([3.0])})
 
 
 class CompareRegionOutputsUnitTest(unittest.TestCase):

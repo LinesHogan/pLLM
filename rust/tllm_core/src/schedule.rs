@@ -422,6 +422,10 @@ struct ScheduleGraph {
     states: Vec<ScheduleState>,
     persistent_state_bytes: u64,
     schema_version: i64,
+    /// (workload_id, approximation policy) for non-exact workloads.  Absent
+    /// (not empty) on the wire for exact-only graphs.
+    #[serde(default)]
+    workload_approximations: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1817,6 +1821,18 @@ fn validate_inputs(
     validate_compile_options_preflight(options)?;
     if graph.workload_key.is_empty() || timeline.backend_id.is_empty() {
         return Err(value_error("schedule identities must be non-empty"));
+    }
+    for (position, entry) in graph.workload_approximations.iter().enumerate() {
+        if entry.0.is_empty() || entry.1.is_empty() || entry.1 == "exact" {
+            return Err(value_error(
+                "schedule graph workload_approximations require non-exact policy entries",
+            ));
+        }
+        if position > 0 && graph.workload_approximations[position - 1] >= *entry {
+            return Err(value_error(
+                "schedule graph workload_approximations must be sorted unique",
+            ));
+        }
     }
     if timeline.backend_version.is_empty() {
         return Err(value_error("timeline backend_version must be non-empty"));
@@ -3673,17 +3689,25 @@ fn compile_impl(
             )
             .3,
         },
-        explanations: vec![
-            "selected deterministic maximal legal ExecutionRegion partition".to_owned(),
-            format!("materialized {materialization_bytes} bytes across Region boundaries"),
-            format!("selected {} launch groups", drafts.len()),
-            format!(
-                "selected structural critical-path extension {}",
-                draft_partition_cost(graph, &selected, &task_index, &drafts, false).3
-            ),
-            format!("selected {serial_fallback_count} explicit serial fallback regions"),
-            format!("effective memory budget is {budget} bytes"),
-        ],
+        explanations: {
+            let mut explanations = vec![
+                "selected deterministic maximal legal ExecutionRegion partition".to_owned(),
+                format!("materialized {materialization_bytes} bytes across Region boundaries"),
+                format!("selected {} launch groups", drafts.len()),
+                format!(
+                    "selected structural critical-path extension {}",
+                    draft_partition_cost(graph, &selected, &task_index, &drafts, false).3
+                ),
+                format!("selected {serial_fallback_count} explicit serial fallback regions"),
+                format!("effective memory budget is {budget} bytes"),
+            ];
+            for (workload_id, policy) in &graph.workload_approximations {
+                explanations.push(format!(
+                    "workload {workload_id} signs approximation policy {policy}: Region parity uses declaration-supplied criteria"
+                ));
+            }
+            explanations
+        },
         signature: String::new(),
         schema_version: 2,
     };
@@ -5714,6 +5738,38 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("derived effect edges"));
+    }
+
+    #[test]
+    fn non_exact_workload_policies_are_explained_and_validated() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"approx","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true}],"edges":[],"values":[],"persistent_state_bytes":0,"schema_version":2,"workload_approximations":[["w.a","jacobi"]]}"#;
+        let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert!(decision
+            .explanations
+            .iter()
+            .any(|line| line.contains("w.a") && line.contains("jacobi")));
+
+        // "exact" entries and unsorted entries are rejected.
+        let mut tampered: serde_json::Value = serde_json::from_str(graph).unwrap();
+        tampered["workload_approximations"] = serde_json::json!([["w.a", "exact"]]);
+        assert!(compile_schedule(&tampered.to_string(), timeline, options)
+            .unwrap_err()
+            .to_string()
+            .contains("workload_approximations"));
+
+        let mut tampered: serde_json::Value = serde_json::from_str(graph).unwrap();
+        tampered["workload_approximations"] =
+            serde_json::json!([["w.b", "jacobi"], ["w.a", "jacobi"]]);
+        assert!(compile_schedule(&tampered.to_string(), timeline, options)
+            .unwrap_err()
+            .to_string()
+            .contains("sorted unique"));
     }
 
     #[test]

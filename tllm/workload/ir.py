@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, StrEnum
 from typing import Any, Mapping, cast
@@ -26,6 +27,33 @@ class StateScope(StrEnum):
 class ApproximationPolicy(StrEnum):
     EXACT = "exact"
     JACOBI = "jacobi"
+
+
+@dataclass(frozen=True, slots=True)
+class ApproximationCriteria:
+    """Declared numerical acceptance criteria for an approximation workload.
+
+    The signed policy (``ApproximationPolicy``) says *that* a workload
+    approximates; the criteria say *how much* divergence its Region parity
+    gate tolerates.  Criteria are host-side validation parameters: they never
+    enter the signed graph or the workload identity, and an exact workload
+    must not declare them.
+    """
+
+    rtol: float
+    atol: float
+
+    def __post_init__(self) -> None:
+        for name in ("rtol", "atol"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"ApproximationCriteria.{name} must be a real number")
+            coerced = float(value)
+            if not math.isfinite(coerced) or coerced < 0.0:
+                raise ValueError(
+                    f"ApproximationCriteria.{name} must be a finite non-negative number"
+                )
+            object.__setattr__(self, name, coerced)
 
 
 class EffectKind(StrEnum):
@@ -352,6 +380,7 @@ class WorkloadIR:
 __all__ = [
     "AffineAccessIR",
     "AffineExprIR",
+    "ApproximationCriteria",
     "ApproximationPolicy",
     "DomainIR",
     "EffectIR",

@@ -1451,7 +1451,14 @@ class _RegionCudaGraph:
         # First-replay parity gate (native PG146 analogue): the captured graph
         # must reproduce the pre-capture oracle run on identical staging
         # inputs.  Any divergence fails closed before the graph is installed.
-        compare_region_outputs(artifact.region_id, warmup_outputs, outputs)
+        # Approximation Regions compare under their declaration-supplied
+        # criteria; exact Regions under dtype-aware defaults.
+        compare_region_outputs(
+            artifact.region_id,
+            warmup_outputs,
+            outputs,
+            tolerance=artifact.parity_tolerance,
+        )
         current.wait_stream(capture_stream)
         self._graph = graph
         self._stream = capture_stream

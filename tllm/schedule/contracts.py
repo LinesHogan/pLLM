@@ -802,6 +802,10 @@ class ScheduleGraph:
     states: tuple[ScheduleState, ...] = ()
     persistent_state_bytes: int = 0
     schema_version: int = 1
+    # (workload_id, approximation policy) for every non-exact workload, sorted
+    # by workload id.  Omitted from the wire form when empty so exact-only
+    # graphs keep a byte-identical identity.
+    workload_approximations: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workload_key", _name(self.workload_key, "ScheduleGraph.workload_key"))
@@ -849,6 +853,24 @@ class ScheduleGraph:
             raise ValueError(
                 "ScheduleGraph schema v2 tasks require per-implementation capabilities"
             )
+        if not isinstance(self.workload_approximations, tuple) or any(
+            not isinstance(entry, tuple)
+            or len(entry) != 2
+            or not all(isinstance(item, str) and item for item in entry)
+            for entry in self.workload_approximations
+        ):
+            raise TypeError(
+                "ScheduleGraph.workload_approximations must be tuple[tuple[str, str], ...]"
+            )
+        if any(
+            policy == "exact"
+            for _, policy in self.workload_approximations
+        ):
+            raise ValueError(
+                "ScheduleGraph.workload_approximations lists only non-exact workloads"
+            )
+        if tuple(sorted(self.workload_approximations)) != self.workload_approximations:
+            raise ValueError("ScheduleGraph.workload_approximations must be sorted")
 
     @property
     def graph_key(self) -> str:
@@ -863,6 +885,9 @@ class ScheduleGraph:
             for task in tasks:
                 assert isinstance(task, dict)
                 task.pop("implementation_capabilities")
+        if not self.workload_approximations:
+            # Exact-only graphs keep a byte-identical wire form and identity.
+            payload.pop("workload_approximations")
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
     @classmethod
@@ -980,6 +1005,10 @@ class ScheduleGraph:
             ),
             persistent_state_bytes=raw["persistent_state_bytes"],
             schema_version=raw.get("schema_version", 1),
+            workload_approximations=tuple(
+                (str(entry[0]), str(entry[1]))
+                for entry in raw.get("workload_approximations", ())
+            ),
         )
 
 

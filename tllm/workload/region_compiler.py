@@ -48,8 +48,14 @@ def compare_region_outputs(
     region_id: str,
     reference: tuple[object, ...],
     candidate: tuple[object, ...],
+    *,
+    tolerance: tuple[float, float] | None = None,
 ) -> None:
-    """Fail closed unless candidate matches the serial oracle within tolerance."""
+    """Fail closed unless candidate matches the serial oracle within tolerance.
+
+    ``tolerance`` is the (rtol, atol) pair an approximation workload declares;
+    when absent, dtype-aware defaults apply (the exact-policy contract).
+    """
     if len(reference) != len(candidate):
         raise RegionParityError(
             f"ExecutionRegion {region_id!r} parity check failed: "
@@ -69,8 +75,11 @@ def compare_region_outputs(
                     f"({tuple(actual.shape)}/{actual.dtype} != "
                     f"{tuple(expected.shape)}/{expected.dtype})"
                 )
-            tolerance = region_dtype_tolerance(expected.dtype)
-            if not torch.allclose(actual, expected, rtol=tolerance, atol=tolerance):
+            if tolerance is None:
+                rtol = atol = region_dtype_tolerance(expected.dtype)
+            else:
+                rtol, atol = tolerance
+            if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
                 raise RegionParityError(
                     f"ExecutionRegion {region_id!r} parity check failed: "
                     f"output {index} diverges from the serial oracle"
@@ -96,6 +105,53 @@ _MUTATING_EFFECT_KINDS = frozenset(
 def _effects_are_replayable(effects: tuple[ScheduleEffect, ...]) -> bool:
     """A Region may be executed twice for parity only when it cannot mutate."""
     return all(effect.kind not in _MUTATING_EFFECT_KINDS for effect in effects)
+
+
+def _region_parity_tolerance(
+    declarations: tuple[WorkloadDeclaration, ...],
+    region: ExecutionRegion,
+) -> tuple[float, float] | None:
+    """Resolve the declared approximation criteria covering one Region.
+
+    Returns None for exact-only Regions (dtype-aware defaults apply).  A
+    Region touching a non-exact workload requires that workload's declared
+    criteria; conflicting declarations across covered workloads fail closed.
+    """
+    multiple = len(declarations) > 1
+    owner: dict[str, WorkloadDeclaration] = {}
+    for declaration in declarations:
+        for task in declaration.ir.tasks:
+            task_id = (
+                f"{declaration.ir.workload_id}/{task.name}" if multiple else task.name
+            )
+            owner[task_id] = declaration
+    covered = {
+        owner[invocation.task_id]
+        for invocation in region.task_invocations
+        if invocation.task_id in owner
+    }
+    non_exact = tuple(
+        declaration
+        for declaration in covered
+        if declaration.ir.approximation.value != "exact"
+    )
+    if not non_exact:
+        return None
+    criteria = {declaration.approximation_criteria for declaration in non_exact}
+    if None in criteria:
+        raise RegionParityError(
+            f"ExecutionRegion {region.region_id!r} runs under an approximation policy "
+            "but the covering workload declares no approximation criteria; "
+            "declare approximation_criteria on @workload or keep the exact policy"
+        )
+    if len(criteria) != 1:
+        raise RegionParityError(
+            f"ExecutionRegion {region.region_id!r} mixes conflicting approximation "
+            "criteria across workloads; split the declarations or unify the criteria"
+        )
+    declared = next(iter(criteria))
+    assert declared is not None
+    return (declared.rtol, declared.atol)
 
 
 def _snapshot_rng(
@@ -125,18 +181,20 @@ class _FirstCallParityGate:
     invocations go straight to the compiled artifact.
     """
 
-    __slots__ = ("_region_id", "_eager", "_compiled", "_verified")
+    __slots__ = ("_region_id", "_eager", "_compiled", "_verified", "_tolerance")
 
     def __init__(
         self,
         region_id: str,
         eager: Callable[..., tuple[object, ...]],
         compiled: Callable[..., tuple[object, ...]],
+        tolerance: tuple[float, float] | None = None,
     ) -> None:
         self._region_id = region_id
         self._eager = eager
         self._compiled = compiled
         self._verified = False
+        self._tolerance = tolerance
 
     def __call__(self, *args: object) -> tuple[object, ...]:
         if self._verified:
@@ -148,7 +206,9 @@ class _FirstCallParityGate:
         reference = self._eager(*args)
         _restore_rng(snapshot)
         candidate = self._compiled(*args)
-        compare_region_outputs(self._region_id, reference, candidate)
+        compare_region_outputs(
+            self._region_id, reference, candidate, tolerance=self._tolerance
+        )
         self._verified = True
         return candidate
 
@@ -167,9 +227,14 @@ class RegionCallableArtifact:
     input_bindings: tuple[RegionInputBinding, ...] = ()
     output_bindings: tuple[RegionOutputBinding, ...] = ()
     effects: tuple[ScheduleEffect, ...] = ()
+    # Declared (rtol, atol) when an approximation workload covers this Region;
+    # None means the exact-policy dtype-aware defaults.
+    parity_tolerance: tuple[float, float] | None = None
     # "first_call": a serial-oracle parity gate runs on the first invocation;
+    # "first_call_approximation": same gate with declaration-supplied criteria;
     # "deferred_state_effects": compiled Region with mutating effects, which
-    # cannot be re-executed for parity (oracle hook is a future extension);
+    # cannot be re-executed for parity (its production gate is the signed
+    # state-version audit, which runs on every execution);
     # "eager": no compiled artifact, parity is trivially satisfied.
     parity: str = "eager"
 
@@ -456,6 +521,7 @@ def materialize_region_callable(
         raise RuntimeError("extern ExecutionRegion cannot carry a compile command")
     executable: Callable[..., tuple[object, ...]] = combined
     parity = "eager"
+    tolerance = _region_parity_tolerance(declarations, region)
     if command is not None:
         try:
             adapter = _COMPILER_ADAPTERS[command.adapter]
@@ -464,11 +530,16 @@ def materialize_region_callable(
         executable = adapter(combined, command, torch_compile)
         if command.adapter is RegionCompilerAdapter.TORCH_COMPILE:
             if _effects_are_replayable(region.effects):
-                executable = _FirstCallParityGate(region.region_id, combined, executable)
-                parity = "first_call"
+                executable = _FirstCallParityGate(
+                    region.region_id, combined, executable, tolerance
+                )
+                parity = (
+                    "first_call_approximation" if tolerance is not None else "first_call"
+                )
             else:
                 # Mutating effects cannot be re-executed for a shadow parity
-                # run; the gate hook is kept as an explicit extension point.
+                # run; their production gate is the signed state-version
+                # audit, which runs on every execution.
                 parity = "deferred_state_effects"
     return RegionCallableArtifact(
         region_id=region.region_id,
@@ -484,6 +555,7 @@ def materialize_region_callable(
         input_bindings=region.input_bindings,
         output_bindings=region.output_bindings,
         effects=region.effects,
+        parity_tolerance=tolerance,
         parity=parity,
     )
 

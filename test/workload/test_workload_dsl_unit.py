@@ -7,6 +7,7 @@ from unittest import mock
 from tllm.workload import (
     AdamWSpec,
     AffineAccess,
+    ApproximationCriteria,
     ApproximationPolicy,
     Before,
     Between,
@@ -136,6 +137,107 @@ class WorkloadDslUnitTest(unittest.TestCase):
         exact = build(ApproximationPolicy.EXACT)
         jacobi = build(ApproximationPolicy.JACOBI)
         self.assertNotEqual(exact, jacobi)
+
+    def test_approximation_criteria_validation_and_identity(self) -> None:
+        with self.assertRaises((TypeError, ValueError)):
+            ApproximationCriteria(rtol=-1e-3, atol=0.0)
+        with self.assertRaises((TypeError, ValueError)):
+            ApproximationCriteria(rtol=float("inf"), atol=0.0)
+        with self.assertRaises((TypeError, ValueError)):
+            ApproximationCriteria(rtol=True, atol=0.0)  # type: ignore[arg-type]
+
+        # Exact workloads must not declare criteria.
+        with self.assertRaisesRegex(ValueError, "exact workload"):
+
+            @workload(
+                id="recur.exact-criteria",
+                approximation_criteria=ApproximationCriteria(rtol=1e-2, atol=1e-2),
+            )
+            class ExactWithCriteria:
+                @task(timing=Before("step.end"))
+                def advance(self) -> None:
+                    return None
+
+        # Criteria are host-side validation parameters: they never enter the
+        # signed identity.
+        def build(criteria: ApproximationCriteria | None) -> str:
+            @workload(
+                id="recur.criteria",
+                approximation=ApproximationPolicy.JACOBI,
+                approximation_criteria=criteria,
+            )
+            class Recurrence:
+                @task(timing=Before("step.end"))
+                def advance(self) -> None:
+                    return None
+
+            declaration = declare_workload(Recurrence())
+            self.assertIs(declaration.approximation_criteria, criteria)
+            return declaration.ir.semantic_key
+
+        without = build(None)
+        with_criteria = build(ApproximationCriteria(rtol=1e-2, atol=1e-2))
+        self.assertEqual(without, with_criteria)
+
+    def test_non_exact_policy_is_signed_into_the_graph_and_explained(self) -> None:
+        @workload(
+            id="recur.jacobi",
+            approximation=ApproximationPolicy.JACOBI,
+            approximation_criteria=ApproximationCriteria(rtol=1e-2, atol=1e-2),
+        )
+        class Recurrence:
+            @task(timing=Before("step.end"))
+            def advance(self) -> None:
+                return None
+
+        @workload(id="recur.exact")
+        class Plain:
+            @task(timing=Before("step.end"))
+            def advance(self) -> None:
+                return None
+
+        jacobi_graph = lower_schedule_graph((declare_workload(Recurrence()).ir,))
+        self.assertEqual(
+            jacobi_graph.workload_approximations, (("recur.jacobi", "jacobi"),)
+        )
+        self.assertIn("workload_approximations", jacobi_graph.to_json())
+
+        exact_graph = lower_schedule_graph((declare_workload(Plain()).ir,))
+        self.assertEqual(exact_graph.workload_approximations, ())
+        # Exact-only graphs keep a byte-identical wire form (golden identity).
+        self.assertNotIn("workload_approximations", exact_graph.to_json())
+
+        timeline = MainWorkloadTimeline(
+            backend_id="vllm",
+            backend_version="0.27.1",
+            runner_family="mrv2",
+            graph_mode="eager",
+            anchors=(
+                TimelineAnchor("step.begin", 0),
+                TimelineAnchor("step.end", 1),
+            ),
+            regions=(),
+            static_headroom_bytes=64,
+        )
+        compilation = WorkloadCompilerCoordinator(
+            (declare_workload(Recurrence()),),
+            options=CompileOptions(memory_budget_bytes=1 << 20),
+        ).compile(timeline)
+        self.assertIn(
+            "workload recur.jacobi signs approximation policy jacobi: "
+            "Region parity uses declaration-supplied criteria",
+            compilation.decision.explanations,
+        )
+        exact_compilation = WorkloadCompilerCoordinator(
+            (declare_workload(Plain()),),
+            options=CompileOptions(memory_budget_bytes=1 << 20),
+        ).compile(timeline)
+        self.assertFalse(
+            any(
+                "approximation policy" in line
+                for line in exact_compilation.decision.explanations
+            )
+        )
 
     def test_schedule_lowering_preserves_affine_domain_and_accesses(self) -> None:
         token = Index("token")
