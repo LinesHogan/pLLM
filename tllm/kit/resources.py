@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from tllm.contracts.consumer_stats import TrainingStats
+from tllm.kit.sink import SinkStore
 
 if TYPE_CHECKING:
     from tllm.kit.algorithm import RegionAlgorithm
@@ -24,14 +25,15 @@ if TYPE_CHECKING:
 class RegionResourcesBase:
     """Loss/version bookkeeping for one native Region workload.
 
-    Subclasses add algorithm-specific publication storage (guidance,
-    reweight, staged rows).  The version accounting reads
-    ``workload.state_version`` so the signed audit and the stats pipe always
-    observe the same counter.
+    Subclasses add algorithm-specific publication storage beyond the
+    framework-owned :attr:`sinks` store (guidance, staged rows).  The
+    version accounting reads ``workload.state_version`` so the signed audit
+    and the stats pipe always observe the same counter.
     """
 
     def __init__(self, workload: "RegionAlgorithm") -> None:  # type: ignore[type-arg]
         self._workload = workload
+        self.sinks = SinkStore()
         self._loss_count = 0
         self._update_count = 0
         self._loss_sum: torch.Tensor | None = None
@@ -48,8 +50,12 @@ class RegionResourcesBase:
     # -- training stats ----------------------------------------------------
 
     def extra_stats(self) -> Mapping[str, int]:
-        """Algorithm-specific counters merged into :meth:`stats`."""
-        return MappingProxyType({})
+        """Algorithm-specific counters merged into :meth:`stats`.
+
+        Defaults to the workload's ``extra_stats`` hook so authors never
+        subclass resources just for counters; subclasses may still override.
+        """
+        return self._workload.extra_stats()
 
     def stats(self) -> Mapping[str, int]:
         merged = dict(self.extra_stats())

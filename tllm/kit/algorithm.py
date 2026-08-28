@@ -4,13 +4,16 @@ Design goal: an algorithm author writes only the algorithm — config
 validation, parameter initialization, task bodies, and any publication or
 sampler logic.  Everything mechanical is owned here once:
 
-- specialization key assembly from the config dataclass (``str``/``int``/
-  ``bool``/``float.hex`` encoding convention),
+- specialization key assembly from the config dataclass (derived from all
+  fields by default; ``str``/``int``/``bool``/``float.hex`` encoding),
 - ``NativeWorkloadResources`` assembly (state snapshots, stats readers,
   enabled epoch snapshots, worker spec, residual manifest),
 - ``cold_specialize`` guard preamble plus parameter/optimizer allocation
   driven by the signed ``State(parameters=..., optimizer=...)`` declaration,
 - the ``update`` finalization (zero_grad/backward/step, version bump, stats),
+- sink publication storage with runtime-attached row identity, and the
+  sampler bridge (authors implement ``modify_candidates`` only),
+- grad context for tasks whose signed effects read a trainable State,
 - ``build``/``reconstruct``/worker-factory wiring over ``dataclass_json``.
 
 Weight-overlay outlook: the optimizer is built from the signed
@@ -25,7 +28,9 @@ only mechanizes process-local lifecycle code, never the signed surface.
 from __future__ import annotations
 
 import ast
+import dataclasses
 from collections.abc import Callable, Hashable, Mapping
+from functools import partial, wraps
 from types import MappingProxyType
 from typing import ClassVar, Generic, TypeVar
 
@@ -33,13 +38,17 @@ import torch
 
 from tllm.common.dataclass_json import dataclass_from_dict, dataclass_to_jsonable
 from tllm.kit.resources import RegionResourcesBase
+from tllm.kit.sampler import SamplerModifier
+from tllm.ports.sampler import CandidateModifierState
 from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
     NativeWorkloadResources,
     WorkloadWorkerSpec,
 )
-from tllm.workload import State
+from tllm.workload import EffectKind, State
+from tllm.workload.frontend import SinkOutput, TaskDecl
 
 ConfigT = TypeVar("ConfigT")
 
@@ -98,7 +107,11 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
     algorithm: ClassVar[str] = ""
     config_type: ClassVar[type | None] = None
     state_name: ClassVar[str | None] = None
-    specialization_fields: ClassVar[Mapping[str, str]] = MappingProxyType({})
+    # None (the default) derives the specialization key from every config
+    # dataclass field, minus specialization_exclude.  An explicit mapping
+    # (key name -> config field name) remains available for legacy surfaces.
+    specialization_fields: ClassVar[Mapping[str, str] | None] = None
+    specialization_exclude: ClassVar[tuple[str, ...]] = ()
     resources_type: ClassVar[type[RegionResourcesBase] | None] = RegionResourcesBase
     sampler_provider_type: ClassVar[type | None] = None
     enabled_field: ClassVar[str | None] = None
@@ -122,9 +135,31 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
         self._specialization: RuntimeSpecializationSpec | None = None
         self._state_version = 0
         self._resources = self.make_resources()
-        provider_type = type(self).sampler_provider_type
-        self._sampler_provider = None if provider_type is None else provider_type(self)
+        self._sampler_provider = self._make_sampler_provider()
+        self._wrap_trainable_read_tasks()
         self._native_resources = self._assemble_resources()
+
+    def _make_sampler_provider(self) -> object:
+        provider_type = type(self).sampler_provider_type
+        modifier_overridden = (
+            type(self).modify_candidates is not RegionAlgorithm.modify_candidates
+        )
+        if provider_type is not None:
+            if modifier_overridden:
+                raise RuntimeError(
+                    f"{type(self).__name__} must declare either "
+                    "sampler_provider_type or modify_candidates, not both"
+                )
+            return provider_type(self)
+        if not modifier_overridden:
+            return None
+        sinks = self._declared_sink_names()
+        if len(sinks) != 1:
+            raise RuntimeError(
+                f"{type(self).__name__} implements modify_candidates and must "
+                f"declare exactly one sink output (found {len(sinks)})"
+            )
+        return SamplerModifier(self, sinks[0])
 
     # -- author hooks ----------------------------------------------------
 
@@ -173,6 +208,27 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
         """Physical optimizer kwargs overriding the nominal signed options."""
         return MappingProxyType({})
 
+    def extra_stats(self) -> Mapping[str, int]:
+        """Algorithm-specific counters merged into the resources stats."""
+        return MappingProxyType({})
+
+    def modifier_active(self) -> bool:
+        """Extra sampler-modifier predicate beyond the signed enabled flag."""
+        return True
+
+    def modify_candidates(
+        self, value: torch.Tensor, view: SamplerStepView
+    ) -> CandidateModifierState:
+        """Map this step's sink publication to the sampler modifier payload.
+
+        Overriding this hook installs the framework-owned SamplerModifier:
+        the enabled check, publication lookup, and row/phase/device alignment
+        are all owned by the kit.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not modify sampler candidates"
+        )
+
     # -- resource exposure -----------------------------------------------
 
     @property
@@ -191,6 +247,35 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
                 f"{type(self).__name__} must be cold_specialize()d before execution"
             )
         return MappingProxyType(parameters)
+
+    def param(self, name: str) -> torch.nn.Parameter | torch.nn.Module:
+        """One declared State parameter; never None, never Optional-typed."""
+        try:
+            value = self.params[name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"{type(self).__name__} has no signed parameter {name!r}"
+            ) from exc
+        if not isinstance(value, (torch.nn.Parameter, torch.nn.Module)):
+            raise RuntimeError(
+                f"{type(self).__name__} parameter {name!r} is not a Parameter/Module"
+            )
+        return value
+
+    @property
+    def model(self) -> torch.nn.Module:
+        """The single Module-valued State parameter (raises otherwise)."""
+        modules = [
+            value
+            for value in self.params.values()
+            if isinstance(value, torch.nn.Module)
+        ]
+        if len(modules) != 1:
+            raise RuntimeError(
+                f"{type(self).__name__} must declare exactly one Module parameter "
+                f"to use .model (found {len(modules)})"
+            )
+        return modules[0]
 
     @property
     def optimizer(self) -> torch.optim.Optimizer | None:
@@ -211,10 +296,27 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
 
     def _specialization_key(self) -> Mapping[str, str]:
         key: dict[str, str] = {"algorithm": type(self).algorithm}
-        for name, field_name in type(self).specialization_fields.items():
-            key[name] = _encode_specialization_value(
-                getattr(self.config, field_name), field_name
-            )
+        declared = type(self).specialization_fields
+        if declared is None:
+            excluded = frozenset(type(self).specialization_exclude)
+            try:
+                config_fields = dataclasses.fields(self.config)  # type: ignore[arg-type]
+            except TypeError as exc:
+                raise TypeError(
+                    f"{type(self).__name__} config must be a dataclass for the "
+                    "derived specialization key (or set specialization_fields)"
+                ) from exc
+            for field in config_fields:
+                if field.name in excluded:
+                    continue
+                key[field.name] = _encode_specialization_value(
+                    getattr(self.config, field.name), field.name
+                )
+        else:
+            for name, field_name in declared.items():
+                key[name] = _encode_specialization_value(
+                    getattr(self.config, field_name), field_name
+                )
         for name, value in self.extra_specialization().items():
             if not isinstance(value, str) or not value:
                 raise TypeError("extra specialization values must be non-empty str")
@@ -266,14 +368,81 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
     def _trainable_state_resource(self, state: State) -> str:
         return state.name
 
+    def _declared_sink_names(self) -> tuple[str, ...]:
+        """Sink output names from the signed task declarations (class order)."""
+        names: list[str] = []
+        for klass in reversed(type(self).__mro__):
+            for member in vars(klass).values():
+                try:
+                    declaration = member.__tllm_task__
+                except AttributeError:
+                    continue
+                if not isinstance(declaration, TaskDecl):
+                    continue
+                for name, output in declaration.outputs:
+                    if isinstance(output, SinkOutput) and name not in names:
+                        names.append(name)
+        return tuple(names)
+
+    def _wrap_trainable_read_tasks(self) -> None:
+        """Run tasks that read a trainable State under grad, automatically.
+
+        The signed effects already say which tasks touch trainable
+        parameters, so the ``inference_mode(False) / enable_grad`` preamble
+        is owned here instead of inside every task body.
+        """
+        state = self._declared_trainable_state()
+        if state is None or state.optimizer is None:
+            return
+        for klass in type(self).__mro__:
+            for name, member in vars(klass).items():
+                try:
+                    declaration = member.__tllm_task__
+                except AttributeError:
+                    continue
+                if not isinstance(declaration, TaskDecl):
+                    continue
+                if not any(
+                    effect.kind is EffectKind.READ and effect.state is state
+                    for effect in declaration.effects
+                ):
+                    continue
+                if name in self.__dict__:
+                    continue  # already wrapped (MRO re-visit)
+                bound = getattr(self, name)
+
+                @wraps(bound)
+                def grad_wrapped(
+                    *args: object, _bound: Callable[..., object] = bound, **kwargs: object
+                ) -> object:
+                    with torch.inference_mode(False), torch.enable_grad():
+                        return _bound(*args, **kwargs)
+
+                setattr(self, name, grad_wrapped)
+
     def _assemble_resources(self) -> NativeWorkloadResources:
         state = self._declared_trainable_state()
         enabled_field = type(self).enabled_field
         extras = dict(self.extra_resource_fields())
+        output_sinks = dict(self.output_sinks())
+        declared_sinks = self._declared_sink_names()
+        if declared_sinks:
+            # Declared sinks publish into the kit SinkStore by default; the
+            # runtime attaches the row identity at publish time.
+            resources = self._resources
+            if not isinstance(resources, RegionResourcesBase):
+                raise RuntimeError(
+                    f"{type(self).__name__} declares sink outputs and must use "
+                    "a RegionResourcesBase resources object"
+                )
+            for name in declared_sinks:
+                if name in output_sinks:
+                    continue  # explicit author binding wins (transitional)
+                output_sinks[name] = partial(resources.sinks.publish, name)
         kwargs: dict[str, object] = {
             "workload": self,
             "provided_inputs": self.provided_inputs(),
-            "output_sinks": self.output_sinks(),
+            "output_sinks": output_sinks,
             "sampler_provider": self._sampler_provider,
             "synchronizer": self.synchronize,
             "specialization_key": self._specialization_key(),
