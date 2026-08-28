@@ -28,7 +28,6 @@ from tllm.contracts.recirculation import (
     RECIRCULATION_PREFILL_BINDER_IMPLEMENTATION_ID,
     RecirculationPrefillBindingConfig,
 )
-from tllm.runtime.recirculation import mix_recirculation_tensors
 from tllm.workgraph.recurrence import (
     CompiledRecurrence,
     DependenceKind,
@@ -36,6 +35,27 @@ from tllm.workgraph.recurrence import (
 )
 
 _HANDLE_KEY = "compiled-recurrence"
+
+
+def _legacy_recirculation_mix(config, source, destination, positions):
+    """Legacy oracle only; production Recirculation owns its mix primitive."""
+
+    flat_positions = positions[0] if positions.ndim == 2 else positions
+    source_float = source.float()
+    destination_float = destination.float()
+    source_norm = torch.linalg.vector_norm(
+        source_float, dim=-1, keepdim=True
+    ).clamp_min(torch.finfo(torch.float32).tiny)
+    destination_norm = torch.linalg.vector_norm(
+        destination_float, dim=-1, keepdim=True
+    )
+    normalized = source_float * (destination_norm / source_norm)
+    alpha = config.alpha
+    if config.ramp_tokens:
+        ramp = flat_positions.float().clamp(0, config.ramp_tokens)
+        alpha = (ramp / config.ramp_tokens).unsqueeze(-1) * config.alpha
+    beta = 1.0 - alpha if config.beta is None else config.beta
+    return (beta * destination_float + alpha * normalized).to(destination.dtype)
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,7 +667,7 @@ class VllmModelRegionHandle:
         if position_tensor is None:
             raise RuntimeError("model-region did not capture model positions")
         position = request.token_positions[int(operation.token)]
-        result = mix_recirculation_tensors(
+        result = _legacy_recirculation_mix(
             request.config,
             source,
             destination,

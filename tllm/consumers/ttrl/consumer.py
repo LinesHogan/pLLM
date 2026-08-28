@@ -27,6 +27,8 @@ from tllm.consumers.ttrl.rewards import (
     majority_vote_rewards,
 )
 from tllm.consumers.ttrl.verifier import TTRLVerifier, _default_ttrl_verifier
+from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
+from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
 from tllm.ports.base import ConsumerFlow
 from tllm.ports.generation_trace import GenerationTrace
 from tllm.ports.reward_outcome import RewardOutcome
@@ -99,17 +101,19 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
     ) -> TTRLRewardResult:
         return build_ttrl_reward_result(
             samples,
-            n_votes_per_prompt=n_votes_per_prompt,
-            n_samples_per_prompt=n_samples_per_prompt,
+            n_votes_per_prompt=n_votes_per_prompt or 0,
+            n_samples_per_prompt=n_samples_per_prompt or 0,
             verifier=self.verifier,
         )
 
-    def reward_outcome_batch_for_trace(self, trace: object) -> object:
+    def reward_outcome_batch_for_trace(
+        self, trace: GenerationTraceBatch
+    ) -> RewardOutcomeBatch:
         return build_ttrl_reward_outcome_batch(trace, verifier=self.verifier)
 
     def closed_loop_intent_for_trace(
         self,
-        trace: object,
+        trace: GenerationTraceBatch,
         *,
         n_votes_per_prompt: int | None = None,
         n_samples_per_prompt: int | None = None,
@@ -117,13 +121,15 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
         return build_ttrl_closed_loop_intent(
             trace,
             consumer_id=self.consumer_id,
-            n_votes_per_prompt=n_votes_per_prompt,
-            n_samples_per_prompt=n_samples_per_prompt,
+            n_votes_per_prompt=n_votes_per_prompt or 0,
+            n_samples_per_prompt=n_samples_per_prompt or 0,
             verifier=self.verifier,
             adapter_version_id=self.adapter_version_id(),
         )
 
-    def write_reward_outcomes_for_trace(self, runtime: object, trace: object) -> int:
+    def write_reward_outcomes_for_trace(
+        self, runtime: object, trace: GenerationTraceBatch
+    ) -> int:
         from tllm.runtime.reward_outcome_runtime import write_reward_outcomes
 
         return write_reward_outcomes(runtime, build_ttrl_reward_outcome_batch(trace, verifier=self.verifier))
@@ -222,7 +228,7 @@ class TTRLConsumer(BaseConsumer[TTRLConsumerConfig]):
 
 def run_ttrl_toy_closed_loop(
     consumer: TTRLConsumer,
-    trace: object,
+    trace: GenerationTraceBatch,
     hidden_rows: torch.Tensor,
     *,
     n_votes_per_prompt: int | None = None,

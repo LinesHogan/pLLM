@@ -81,6 +81,10 @@ class ValueSourceKind(StrEnum):
     RESULT = "result"
     PROVIDED = "provided"
     STEP_ID = "step_id"
+    STAGED = "staged"
+    SAMPLER_REQUEST_IDS = "sampler_request_ids"
+    SAMPLER_LOGITS = "sampler_logits"
+    SAMPLED_TOKENS = "sampled_tokens"
 
 
 class HiddenLayerKind(StrEnum):
@@ -92,6 +96,8 @@ class HiddenLayerKind(StrEnum):
 class ValueTargetKind(StrEnum):
     SINK = "sink"
     TEMPORARY = "temporary"
+    HOST = "host"
+    SAMPLER = "sampler"
 
 
 def _nonempty(value: object, label: str) -> str:

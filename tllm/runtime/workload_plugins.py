@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
+    from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.contracts.consumer_stats import TrainingStats
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
@@ -89,7 +90,7 @@ class NativeWorkloadResources:
     enabled_predicate: Callable[[], bool] | None = None
     synchronizer: Callable[[], None] | None = None
     specialization_key: Mapping[str, str] = field(default_factory=dict)
-    residual_paths: Mapping[object, str] = field(default_factory=dict)
+    residual_paths: Mapping["ResidualLocator", str] = field(default_factory=dict)
     backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
         default_factory=dict
     )
@@ -237,7 +238,7 @@ class NativeWorkload(ABC):
 
 
 def residual_resource_manifest_from_paths(
-    paths: Mapping[object, str],
+    paths: Mapping["ResidualLocator", str],
 ) -> tuple["ResidualResourceBinding", ...]:
     """Mechanically encode INDEX hidden locators as signed resource bindings."""
 
@@ -458,7 +459,7 @@ def reconstruct_worker_bindings(
     )
     if len(providers) > 1:
         raise RuntimeError("native worker reconstruction has multiple sampler providers")
-    residual_paths: dict[object, str] = {}
+    residual_paths: dict["ResidualLocator", str] = {}
     for item in reconstructed:
         overlap = set(residual_paths).intersection(item.residual_paths)
         if overlap:

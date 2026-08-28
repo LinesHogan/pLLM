@@ -57,15 +57,14 @@ def main() -> int:
 
     from vllm import SamplingParams
 
-    from tllm.consumers.dummy.config import DummyConsumerConfig
-    from tllm.consumers.dummy.workload import DummyWorkload
+    from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane
     from tllm.runtime.runtime import TllmRuntime
     from tllm.util.tools import shutdown_llm_instance
 
     workload = DummyWorkload(
-        DummyConsumerConfig(
+        DummyConfig(
             enable_async=False,
             export_every_n_steps=1,
             export_max_rows=1,

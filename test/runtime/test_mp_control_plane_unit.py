@@ -15,6 +15,7 @@ import torch
 
 from tllm import _core
 from tllm.consumers.dummy.config import DummyConsumerConfig
+from tllm.consumers.dummy.workload import DummyConfig
 from tllm.consumers.dummy.workload import DummyWorkload
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
@@ -455,11 +456,11 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.runtime.specialization import RuntimeSpecializationSpec
 
         from tllm.consumers.esamp.region_workload import (
-            ESampRegionConfig,
-            ESampRegionWorkload,
+            ESampConfig,
+            ESampWorkload,
         )
 
-        workload = ESampRegionWorkload(ESampRegionConfig(enable_esamp_training=True))
+        workload = ESampWorkload(ESampConfig(enabled=True))
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -473,7 +474,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 static_headroom_bytes=1 << 20,
             )
         )
-        model = workload.model
+        model = workload.distiller
         optimizer = workload.optimizer
         state_version = workload.state_version
 
@@ -481,8 +482,8 @@ class ControlPlaneUnitTest(unittest.TestCase):
             runtime.transition_native_workload_enabled(False, plane=object())
 
         self.assertIs(runtime.workload_compilation, initial)
-        self.assertTrue(workload.config.enable_esamp_training)
-        self.assertIs(workload.model, model)
+        self.assertTrue(workload.config.enabled)
+        self.assertIs(workload.distiller, model)
         self.assertIs(workload.optimizer, optimizer)
         self.assertEqual(workload.state_version, state_version)
 
@@ -1052,15 +1053,15 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.backends.timeline import export_main_workload_timeline
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.consumers.esamp.region_workload import (
-            ESampRegionConfig,
-            ESampRegionWorkload,
+            ESampConfig,
+            ESampWorkload,
         )
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.runtime.state import ResidualRuntimeState
 
-        workload_instance = ESampRegionWorkload(
-            ESampRegionConfig(
+        workload_instance = ESampWorkload(
+            ESampConfig(
                 source_layer_path="model.layers.0",
                 target_layer_path="model.layers.0",
             )
@@ -1837,7 +1838,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.runtime.state import ResidualRuntimeState
 
-        workload = DummyWorkload(DummyConsumerConfig(enable_async=False))
+        workload = DummyWorkload(DummyConfig(enable_async=False))
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -1911,7 +1912,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.runtime.state import ResidualRuntimeState
 
-        workload = DummyWorkload(DummyConsumerConfig(enable_async=False))
+        workload = DummyWorkload(DummyConfig(enable_async=False))
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -2125,14 +2126,14 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.backends.timeline import export_main_workload_timeline
         from tllm.consumers.esamp.region_workload import (
-            ESampRegionConfig,
-            ESampRegionWorkload,
+            ESampConfig,
+            ESampWorkload,
         )
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.runtime.state import ResidualRuntimeState
 
-        workload = ESampRegionWorkload(ESampRegionConfig())
+        workload = ESampWorkload(ESampConfig())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )

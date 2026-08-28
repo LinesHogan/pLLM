@@ -37,7 +37,7 @@ from tllm.runtime.backend_region_binders import (
     BackendRegionBinderSlot,
     BackendRegionStageContext,
 )
-from tllm.runtime.recirculation import mix_recirculation_tensors
+from tllm.consumers.recirculation.mix import mix_recirculation_tensors
 from tllm.runtime.typed_recurrence import (
     PrimitiveAdapter,
     PrimitiveAdapterRegistry,

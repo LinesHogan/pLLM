@@ -337,6 +337,44 @@ class TllmWorkerExtension:
 
         core.synchronize_esamp()
 
+    def tllm_prepare_workload_port(
+        self, key: str, transaction: str, wire: dict[str, object]
+    ) -> dict[str, object]:
+        from tllm.runtime import residual_runtime as core
+        from tllm.runtime.mp.port_wire import decode_port_payload
+
+        execution = core.RUNTIME.workload_execution
+        if execution is None:
+            raise RuntimeError("worker has no active workload execution")
+        execution.prepare_port(key, transaction, decode_port_payload(wire))
+        return {"key": key, "transaction": transaction, "prepared": True}
+
+    def tllm_commit_workload_port(
+        self, key: str, transaction: str
+    ) -> dict[str, object]:
+        from tllm.runtime import residual_runtime as core
+
+        execution = core.RUNTIME.workload_execution
+        if execution is None:
+            raise RuntimeError("worker has no active workload execution")
+        sequence = execution.commit_port(key, transaction)
+        return {
+            "key": key,
+            "transaction": transaction,
+            "committed": True,
+            "sequence": sequence,
+        }
+
+    def tllm_abort_workload_port(
+        self, key: str, transaction: str
+    ) -> dict[str, object]:
+        from tllm.runtime import residual_runtime as core
+
+        execution = core.RUNTIME.workload_execution
+        if execution is not None:
+            execution.abort_port(key, transaction)
+        return {"key": key, "transaction": transaction, "aborted": True}
+
     def tllm_apply_enable_flags(self, flags: dict[str, bool]) -> None:
         """Apply supported enable flags to this process's runtime."""
         from tllm.runtime import residual_runtime as core

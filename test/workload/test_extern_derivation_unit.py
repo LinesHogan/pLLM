@@ -31,18 +31,18 @@ def _extern_tasks(cls: type) -> list[tuple[str, object]]:
 class ExternDerivationGoldenTest(unittest.TestCase):
     def test_derived_types_match_every_existing_declaration(self) -> None:
         from tllm.consumers.dummy.workload import DummyWorkload
-        from tllm.consumers.esamp.region_workload import ESampRegionWorkload
-        from tllm.consumers.override.region_workload import OverRIDERegionWorkload
-        from tllm.consumers.reft.region_workload import ReftInterventionWorkload
-        from tllm.consumers.ttrl.region_workload import TTRLRegionWorkload
+        from tllm.consumers.esamp.region_workload import ESampWorkload
+        from tllm.consumers.override.region_workload import OverRIDEWorkload
+        from tllm.consumers.reft.region_workload import ReftWorkload
+        from tllm.consumers.ttrl.region_workload import TTRLWorkload
 
         checked = 0
         for cls in (
             DummyWorkload,
-            ESampRegionWorkload,
-            OverRIDERegionWorkload,
-            ReftInterventionWorkload,
-            TTRLRegionWorkload,
+            ESampWorkload,
+            OverRIDEWorkload,
+            ReftWorkload,
+            TTRLWorkload,
         ):
             for task_name, member in _extern_tasks(cls):
                 decl = member.__tllm_task__

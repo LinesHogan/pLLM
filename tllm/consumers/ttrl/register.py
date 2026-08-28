@@ -14,9 +14,9 @@ CONFIG_TYPE = PLUGIN.config_type
 
 def build(config: TTRLConsumerConfig | None = None) -> TTRLConsumer:
     resolved = config if config is not None else TTRLConsumerConfig()
-    if resolved.implementation == "region":
+    if resolved.implementation == "native":
         raise ValueError(
-            "TTRL implementation='region' is a native Region workload; build it "
+            "TTRL implementation='native' is a workload; build it "
             "with tllm.consumers.ttrl.workload.build_ttrl_workload and pass it "
             "to make_llm(..., workloads=(...)), not the legacy consumer plugin"
         )

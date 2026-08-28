@@ -21,10 +21,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Sequence, cast
+from typing import TYPE_CHECKING, Any, Sequence, TypeVar, cast
 import weakref
+from uuid import uuid4
 
 if TYPE_CHECKING:
+    import torch
     from tllm.contracts.consumer_stats import TrainingStats
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
@@ -35,6 +37,9 @@ if TYPE_CHECKING:
         NativeWorkloadResources,
         WorkloadWorkerSpec,
     )
+    from tllm.workload.staging import StagedPort
+    from tllm.workload.frontend import PublishedState
+    from tllm.workload.host import HostOutput
     from tllm.schedule import (
         CompileOptions,
         MainWorkloadTimeline,
@@ -50,6 +55,8 @@ _RUNNER_RUNTIMES: "weakref.WeakKeyDictionary[Any, TllmRuntime]" = weakref.WeakKe
 
 # The runtime the process-wide class hooks currently dispatch to.
 _ACTIVE_RUNTIME: "TllmRuntime | None" = None
+StagedT = TypeVar("StagedT")
+HostOutputT = TypeVar("HostOutputT")
 
 
 def bind_runner_runtime(runner: Any, runtime: "TllmRuntime") -> None:
@@ -110,6 +117,46 @@ def _runtime_specialization_spec_from_wire(
 
 
 class TllmRuntime:
+    def stage(self, port: "StagedPort[StagedT]", value: StagedT) -> int:
+        """Stage one typed payload for the next signed workload step."""
+
+        workload = self._workloads_by_type[port.owner]
+        transaction = uuid4().hex
+        workload.prepare_port(port.key, transaction, value)
+        from tllm.runtime.mp.control import active_control_plane
+        from tllm.runtime.mp.port_wire import encode_port_payload
+
+        plane = active_control_plane()
+        encoded = encode_port_payload(value) if plane is not None else None
+        try:
+            if plane is not None and encoded is not None:
+                plane.prepare_workload_port(port.key, transaction, encoded.wire)
+                plane.commit_workload_port(port.key, transaction)
+            return workload.commit_port(port.key, transaction)
+        except Exception:
+            workload.abort_port(port.key, transaction)
+            if plane is not None:
+                plane.abort_workload_port(port.key, transaction)
+            raise
+        finally:
+            if encoded is not None:
+                encoded.release()
+
+    def drain(self, port: "HostOutput[HostOutputT]") -> tuple[HostOutputT, ...]:
+        """Drain typed outputs published by signed workload tasks."""
+
+        workload = self._workloads_by_type[port.owner]
+        return workload.drain_port(port)
+
+    def publish(
+        self,
+        state: "PublishedState[torch.nn.Module]",
+        values: "Mapping[str, torch.Tensor]",
+    ) -> int:
+        """Publish a complete typed State payload for the next safe point."""
+
+        return self.stage(state.port, values)
+
     def __init__(
         self,
         *,
@@ -138,6 +185,9 @@ class TllmRuntime:
             )
         self.producers = tuple(producers)
         self._workloads: list[Any] = list(workloads)
+        self._workloads_by_type = {
+            type(workload): workload for workload in self._workloads
+        }
         self._consumers: list[Any] = list(consumers)
         self._unadapted_workload_ids: list[str] = []
         self._native_workload_resources: dict[int, "NativeWorkloadResources"] = {}
@@ -230,7 +280,7 @@ class TllmRuntime:
 
         entries: list[tuple[str, str]] = []
         native_resource_entries = []
-        residual_paths: dict[object, str] = {}
+        residual_paths: dict["ResidualLocator", str] = {}
         for workload_instance in self._workloads:
             if not self._is_native_workload_declaration(workload_instance):
                 continue
@@ -565,7 +615,7 @@ class TllmRuntime:
                 None if not enabled_predicates else enabled_predicates[0]
             ),
             synchronizer=None if not synchronizers else synchronizers[0],
-            residual_paths=cast("Mapping[object, str]", residual_paths),
+            residual_paths=residual_paths,
             backend_region_binders=backend_region_binders,
             static_binding_entries=static_binding_entries,
         )

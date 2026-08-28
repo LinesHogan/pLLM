@@ -30,9 +30,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 from collections.abc import Callable, Hashable, Mapping
-from functools import partial, wraps
+from functools import wraps
 from types import MappingProxyType
-from typing import ClassVar, Generic, TypeVar
+from typing import ClassVar, Generic, TypeVar, cast
 
 import torch
 
@@ -75,10 +75,25 @@ def _encode_specialization_value(value: object, label: str) -> str:
     )
 
 
-def _optimizer_options(spec_options: tuple[tuple[str, str], ...]) -> dict[str, object]:
+def _optimizer_options(
+    spec_options: tuple[tuple[str, str], ...], config: object
+) -> dict[str, object]:
     """Decode signed optimizer options (hex floats / repr tuples)."""
     decoded: dict[str, object] = {}
     for key, value in spec_options:
+        if value.startswith("field:"):
+            field_name = value.removeprefix("field:")
+            resolved = getattr(config, field_name)
+            if not isinstance(resolved, (int, float)) or isinstance(resolved, bool):
+                raise TypeError(
+                    f"optimizer config field {field_name!r} must be numeric"
+                )
+            if float(resolved) <= 0:
+                raise ValueError(
+                    f"optimizer config field {field_name!r} must be positive"
+                )
+            decoded[key] = float(resolved)
+            continue
         if key == "betas":
             parsed = ast.literal_eval(value)
             if not isinstance(parsed, tuple):
@@ -323,17 +338,19 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
         if declared is None:
             excluded = frozenset(type(self).specialization_exclude)
             try:
-                config_fields = dataclasses.fields(self.config)  # type: ignore[arg-type]
+                config_items = (
+                    (field.name, getattr(self.config, field.name))
+                    for field in dataclasses.fields(self.config)  # type: ignore[arg-type]
+                )
             except TypeError as exc:
                 raise TypeError(
-                    f"{type(self).__name__} config must be a dataclass for the "
-                    "derived specialization key (or set specialization_fields)"
+                    f"{type(self).__name__} config must be a dataclass"
                 ) from exc
-            for field in config_fields:
-                if field.name in excluded:
+            for field_name, field_value in config_items:
+                if field_name in excluded:
                     continue
-                key[field.name] = _encode_specialization_value(
-                    getattr(self.config, field.name), field.name
+                key[field_name] = _encode_specialization_value(
+                    field_value, field_name
                 )
         else:
             for name, field_name in declared.items():
@@ -361,7 +378,10 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
     @classmethod
     def reconstruct(cls, raw: Mapping[str, object]) -> NativeWorkloadResources:
         """Spawn-safe worker factory bound by the default worker spec."""
-        config = dataclass_from_dict(cls.config_type, dict(raw))  # type: ignore[arg-type]
+        config_type = cls.config_type
+        if config_type is None:
+            raise TypeError(f"{cls.__name__} has no declared config type")
+        config = dataclass_from_dict(config_type, dict(raw))  # type: ignore[arg-type]
         return cls(config).native_workload_resources()
 
     # -- resource assembly ---------------------------------------------------
@@ -458,10 +478,14 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
                     f"{type(self).__name__} declares sink outputs and must use "
                     "a RegionResourcesBase resources object"
                 )
+            sink_store = resources.sinks
             for name in declared_sinks:
                 if name in output_sinks:
                     continue  # explicit author binding wins (transitional)
-                output_sinks[name] = partial(resources.sinks.publish, name)
+                def publish_sink(value: object, step_id: int, sink: str = name) -> None:
+                    sink_store.publish(sink, cast(torch.Tensor, value), step_id)
+
+                output_sinks[name] = publish_sink
         kwargs: dict[str, object] = {
             "workload": self,
             "provided_inputs": self.provided_inputs(),
@@ -560,7 +584,7 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
                 raise TypeError(
                     "init_parameters values must be Parameter or nn.Module"
                 )
-        kwargs = _optimizer_options(spec.options)
+        kwargs = _optimizer_options(spec.options, self.config)
         kwargs.update(self.optimizer_overrides())
         # foreach=False keeps the physical step deterministic and matches the
         # established single-group Region training semantics.

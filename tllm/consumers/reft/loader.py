@@ -3,7 +3,7 @@
 pyreft saves one file per intervened layer, named
 ``intkey_layer.{L}.comp.block_output.unit.pos.nunit.1#0.bin``, holding
 ``{"weight" [r,d], "bias" [r], "rotate_layer" [d,r]}`` — exactly the
-stacked layout :class:`tllm.runtime.activation_patch.LoreftBank` consumes.
+stacked layout consumed by :class:`ReftParameters`.
 """
 
 from __future__ import annotations

@@ -14,8 +14,15 @@ _TTRL_DEFAULT_VERIFIER_JUDGE = "boxed_normalized_exact"
 
 
 class TTRLVerifier(Protocol):
+    @property
+    def judge_name(self) -> str: ...
+
+    @property
+    def missing_reason(self) -> str: ...
+
     def label_for_completion(self, completion: str) -> str:
         """Return a normalized label, or an empty string when unverifiable."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -60,3 +67,6 @@ def _extract_boxed_answer_label(text: str) -> str:
 
 def _default_ttrl_verifier() -> TTRLVerifier:
     return BoxedNormalizedVerifier()
+
+
+DEFAULT_TTRL_VERIFIER: TTRLVerifier = BoxedNormalizedVerifier()

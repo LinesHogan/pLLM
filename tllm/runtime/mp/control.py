@@ -385,6 +385,32 @@ class ControlPlane:
     def synchronize(self, *, timeout: float | None = None) -> None:
         self.call("tllm_synchronize", timeout=timeout)
 
+    def prepare_workload_port(
+        self,
+        key: str,
+        transaction: str,
+        wire: Mapping[str, object],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        self.call(
+            "tllm_prepare_workload_port",
+            key,
+            transaction,
+            dict(wire),
+            timeout=timeout,
+        )
+
+    def commit_workload_port(
+        self, key: str, transaction: str, *, timeout: float | None = None
+    ) -> None:
+        self.call("tllm_commit_workload_port", key, transaction, timeout=timeout)
+
+    def abort_workload_port(
+        self, key: str, transaction: str, *, timeout: float | None = None
+    ) -> None:
+        self.call("tllm_abort_workload_port", key, transaction, timeout=timeout)
+
     def apply_enable_flags(self, flags: Mapping[str, bool], *, timeout: float | None = None) -> None:
         self.call("tllm_apply_enable_flags", {str(k): bool(v) for k, v in flags.items()}, timeout=timeout)
 

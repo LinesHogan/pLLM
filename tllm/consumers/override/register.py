@@ -9,9 +9,9 @@ from tllm.consumers.plugin import ConsumerPluginSpec
 
 
 def _build_override(config: OverRIDEConsumerConfig) -> OverRIDEConsumer:
-    if str(config.implementation) == "region":
+    if str(config.implementation) == "native":
         raise ValueError(
-            "implementation='region' is a native @workload; use "
+            "implementation='native' is a workload; use "
             "build_override_workload(config) with TllmRuntime(workloads=...)"
         )
     return OverRIDEConsumer(config)

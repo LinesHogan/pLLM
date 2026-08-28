@@ -43,7 +43,7 @@ def _active_esamp_diagnostics(
     raw_diagnostics = status.get("diagnostics")
     if type(raw_diagnostics) is not dict:
         raise AssertionError(f"worker diagnostics are not a JSON object: {status!r}")
-    raw_metrics = raw_diagnostics.get("esamp.region")
+    raw_metrics = raw_diagnostics.get("esamp")
     if type(raw_metrics) is not dict:
         raise AssertionError(
             "worker did not report namespaced ESamp Region diagnostics: "
@@ -154,7 +154,7 @@ def main() -> int:
 
     from vllm import SamplingParams
 
-    from tllm.consumers.esamp.region_workload import ESampRegionConfig, ESampRegionWorkload
+    from tllm.consumers.esamp.region_workload import ESampConfig, ESampWorkload
     from tllm.contracts.request_identity import resolve_request_identity
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane
@@ -164,10 +164,10 @@ def main() -> int:
     )
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = ESampRegionWorkload(
-        ESampRegionConfig(
-            enable_esamp_training=True,
-            enable_distiller_intervention=True,
+    workload = ESampWorkload(
+        ESampConfig(
+            enabled=True,
+            intervention=True,
             distiller_hidden_dim=8,
             distiller_lr=1e-3,
             distiller_beta=0.5,

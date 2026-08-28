@@ -28,27 +28,28 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
     """Build a config-specialized declaration backed by the current runtime."""
 
     resolved = config or ESampConsumerConfig()
-    if resolved.implementation == "region":
+    if resolved.implementation == "native":
         from tllm.consumers.esamp.region_workload import (
-            ESampRegionConfig,
-            ESampRegionWorkload,
+            ESampConfig,
+            ESampWorkload,
         )
 
         if resolved.distiller_sampler_backend != "post_filter_exact":
             raise ValueError(
-                "implementation='region' supports only "
+                "implementation='native' supports only "
                 "distiller_sampler_backend='post_filter_exact'"
             )
-        return ESampRegionWorkload(
-            ESampRegionConfig(
+        return ESampWorkload(
+            ESampConfig(
                 source_layer_path=str(resolved.source_layer_path),
                 target_layer_path=str(resolved.target_layer_path),
-                enable_esamp_training=bool(resolved.enable_esamp_training),
+                enabled=bool(resolved.enable_esamp_training),
                 distiller_hidden_dim=int(resolved.distiller_hidden_dim),
                 distiller_lr=float(resolved.distiller_lr),
                 output_layernorm=bool(resolved.model_bank_use_output_layernorm),
-                enable_distiller_intervention=bool(resolved.enable_distiller_intervention),
+                intervention=bool(resolved.enable_distiller_intervention),
                 distiller_beta=float(resolved.distiller_beta),
+                sampler_backend="post_filter_exact",
             )
         )
     identifier = str(resolved.consumer_id)

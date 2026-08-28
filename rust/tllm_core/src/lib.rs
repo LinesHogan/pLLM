@@ -15,6 +15,7 @@ mod sampler_plan;
 mod schedule;
 mod shape_specialization;
 mod workgraph;
+mod workload_frontend;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -29,5 +30,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     recurrence::register(m)?;
     schedule::register(m)?;
     workgraph::register(m)?;
+    workload_frontend::register(m)?;
     Ok(())
 }

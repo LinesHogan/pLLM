@@ -26,6 +26,7 @@ from tllm.kit.lm_head import resolve_lm_head
 from tllm.kit.resources import RegionResourcesBase
 from tllm.ports.sampler import CandidateModifierState, SamplerBackend
 from tllm.runtime.sampler_bridge.types import SamplerStepView
+from tllm.runtime.workload_sinks import MissingSinkRecord, SinkRecord
 
 if TYPE_CHECKING:
     from tllm.kit.algorithm import RegionAlgorithm
@@ -50,9 +51,11 @@ class SamplerModifier:
         resources = self._workload.resources
         if not isinstance(resources, RegionResourcesBase):
             raise RuntimeError("sampler modifier requires RegionResourcesBase resources")
-        record = resources.sinks.for_step(self._sink, view.engine_step_id)
-        if record is None:
-            return self._workload.missing_publication(view)
+        match resources.sinks.lookup(self._sink, view.engine_step_id):
+            case MissingSinkRecord():
+                return self._workload.missing_publication(view)
+            case SinkRecord() as record:
+                pass
         identity = record.identity
         rows = int(view.decode_count)
         if identity.rows != rows:

@@ -17,11 +17,13 @@ from tllm.consumers.ttrl.verifier import (
     _MISSING_BOXED_ANSWER,
     _TTRL_DEFAULT_VERIFIER_JUDGE,
     TTRLVerifier,
-    _default_ttrl_verifier,
+    DEFAULT_TTRL_VERIFIER,
 )
 
 if TYPE_CHECKING:
+    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
     from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
+    from tllm.runtime.reward_outcome_runtime import RewardOutcomeEntry
     from tllm.runtime.retry_control_runtime import RetryControlBatch
     from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch
 
@@ -104,11 +106,11 @@ def select_ttrl_training_indices(
 def build_ttrl_reward_result(
     samples: Sequence[TTRLSample],
     *,
-    n_votes_per_prompt: int | None = None,
-    n_samples_per_prompt: int | None = None,
-    verifier: TTRLVerifier | None = None,
+    n_votes_per_prompt: int = 0,
+    n_samples_per_prompt: int = 0,
+    verifier: TTRLVerifier = DEFAULT_TTRL_VERIFIER,
 ) -> TTRLRewardResult:
-    resolved_verifier = verifier or _default_ttrl_verifier()
+    resolved_verifier = verifier
     judge_name = str(resolved_verifier.judge_name)
     missing_reason = str(resolved_verifier.missing_reason)
     grouped: dict[int, list[tuple[int, TTRLSample, str, str]]] = defaultdict(list)
@@ -150,9 +152,9 @@ def build_ttrl_reward_result(
             )
             result_by_input_idx[int(idx)] = sample_result
 
-    if n_votes_per_prompt is None and n_samples_per_prompt is None:
+    if n_votes_per_prompt == 0 and n_samples_per_prompt == 0:
         selected_indices = list(range(len(samples)))
-    elif n_votes_per_prompt is not None and n_samples_per_prompt is not None:
+    elif n_votes_per_prompt > 0 and n_samples_per_prompt > 0:
         if int(n_votes_per_prompt) <= 0:
             raise ValueError("n_votes_per_prompt must be positive")
         if len(samples) % int(n_votes_per_prompt) != 0:
@@ -177,16 +179,13 @@ def build_ttrl_reward_result(
 
 
 def build_ttrl_reward_outcome_batch(
-    trace: object,
+    trace: "GenerationTraceBatch",
     *,
-    verifier: TTRLVerifier | None = None,
+    verifier: TTRLVerifier = DEFAULT_TTRL_VERIFIER,
 ) -> RewardOutcomeBatch:
-    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
     from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeEntry
 
-    if not isinstance(trace, GenerationTraceBatch):
-        raise TypeError("trace must be GenerationTraceBatch")
-    resolved_verifier = verifier or _default_ttrl_verifier()
+    resolved_verifier = verifier
     samples = [
         TTRLSample(
             prompt_idx=int(entry.prompt_idx),
@@ -221,22 +220,18 @@ def _ttrl_barrier_id(group_id: str, prompt_idx: int) -> str:
 
 
 def build_ttrl_closed_loop_intent(
-    trace: object,
+    trace: "GenerationTraceBatch",
     *,
     consumer_id: str = "ttrl",
-    n_votes_per_prompt: int | None = None,
-    n_samples_per_prompt: int | None = None,
-    verifier: TTRLVerifier | None = None,
+    n_votes_per_prompt: int = 0,
+    n_samples_per_prompt: int = 0,
+    verifier: TTRLVerifier = DEFAULT_TTRL_VERIFIER,
     adapter_version_id: str = "",
 ) -> TTRLClosedLoopIntent:
-    from tllm.runtime.generation_trace_runtime import GenerationTraceBatch
     from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlEntry
     from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierEntry
 
-    if not isinstance(trace, GenerationTraceBatch):
-        raise TypeError("trace must be GenerationTraceBatch")
-
-    resolved_verifier = verifier or _default_ttrl_verifier()
+    resolved_verifier = verifier
     reward_outcomes = build_ttrl_reward_outcome_batch(trace, verifier=resolved_verifier)
     samples = [
         TTRLSample(
@@ -258,7 +253,7 @@ def build_ttrl_closed_loop_intent(
         if reward_outcomes.entries[int(idx)].reward is not None
     }
     retry_entries: list[RetryControlEntry] = []
-    grouped: dict[tuple[str, int], list[object]] = defaultdict(list)
+    grouped: dict[tuple[str, int], list["RewardOutcomeEntry"]] = defaultdict(list)
     grouped_indices: dict[tuple[str, int], list[int]] = defaultdict(list)
     training_reward_values: list[float] = []
     training_indices: list[int] = []
@@ -336,5 +331,7 @@ def build_ttrl_closed_loop_intent(
     )
 
 
-def majority_vote_rewards(samples: Sequence[TTRLSample], *, verifier: TTRLVerifier | None = None) -> list[float]:
+def majority_vote_rewards(
+    samples: Sequence[TTRLSample], *, verifier: TTRLVerifier = DEFAULT_TTRL_VERIFIER
+) -> list[float]:
     return build_ttrl_reward_result(samples, verifier=verifier).rewards

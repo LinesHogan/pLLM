@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GPU correctness smoke for the native ESamp ExecutionRegion path.
 
-This deliberately constructs ``ESampRegionWorkload`` through ``TllmRuntime``.
+This deliberately constructs ``ESampWorkload`` through ``TllmRuntime``.
 It must never install a legacy/program consumer: the assertions below inspect
 the signed Region decision and the materialized local execution artifacts.
 """
@@ -43,7 +43,7 @@ def _active_esamp_diagnostics(raw: object) -> dict[str, int | float]:
 
     if not isinstance(raw, Mapping):
         raise AssertionError(f"active resource diagnostics are not a mapping: {raw!r}")
-    payload = raw.get("esamp.region")
+    payload = raw.get("esamp")
     if not isinstance(payload, Mapping):
         raise AssertionError(
             "active native ESamp Region did not report namespaced diagnostics: "
@@ -90,7 +90,7 @@ def main() -> int:
 
     from vllm import SamplingParams
 
-    from tllm.consumers.esamp.region_workload import ESampRegionConfig, ESampRegionWorkload
+    from tllm.consumers.esamp.region_workload import ESampConfig, ESampWorkload
     from tllm.contracts.request_identity import resolve_request_identity
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.runtime import TllmRuntime
@@ -100,10 +100,10 @@ def main() -> int:
     from tllm.util.tools import shutdown_llm_instance
     from tllm.workgraph.physical import CapturePolicy
 
-    workload = ESampRegionWorkload(
-        ESampRegionConfig(
-            enable_esamp_training=True,
-            enable_distiller_intervention=True,
+    workload = ESampWorkload(
+        ESampConfig(
+            enabled=True,
+            intervention=True,
             distiller_hidden_dim=8,
             distiller_lr=1e-3,
             distiller_beta=0.5,

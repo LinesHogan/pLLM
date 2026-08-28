@@ -15,9 +15,19 @@ from dataclasses import dataclass, field
 from math import isfinite
 from threading import Lock
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
+
+
+class WorkloadPortOwner(Protocol):
+    def owns_port(self, key: str) -> bool: ...
+
+    def prepare_port(self, key: str, transaction: str, value: object) -> None: ...
+
+    def commit_port(self, key: str, transaction: str) -> int: ...
+
+    def abort_port(self, key: str, transaction: str) -> None: ...
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.shape_specialization import (
@@ -50,6 +60,7 @@ from tllm.contracts.physical_plan import (
     StreamClass,
 )
 from tllm.workload.region_compiler import compare_region_outputs
+from tllm.workload.runtime_values import SKIPPED
 from tllm.schedule.contracts import (
     BackendObservableEvent,
     BackendRegionBinderStage,
@@ -67,6 +78,7 @@ from tllm.schedule.contracts import (
 )
 
 if TYPE_CHECKING:
+    from tllm.ports.residual_stream import ResidualLocator
     from tllm.contracts.consumer_stats import TrainingStats
     from tllm.contracts.runtime_stats import WorkGraphRuntimeStats
     from tllm.runtime.backend_region_binders import (
@@ -79,7 +91,6 @@ if TYPE_CHECKING:
     from tllm.workload.region_compiler import RegionCallableArtifact
 
 
-_SKIPPED = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -604,7 +615,7 @@ class WorkloadExecutionBindings:
     enabled_setter: Callable[[bool], None] | None = None
     enabled_predicate: Callable[[], bool] | None = None
     synchronizer: Callable[[], None] | None = None
-    residual_paths: Mapping[object, str] = field(default_factory=dict)
+    residual_paths: Mapping["ResidualLocator", str] = field(default_factory=dict)
     backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
         default_factory=dict
     )
@@ -739,6 +750,7 @@ class NativeWorkloadExecution:
     executor: PhysicalExecutor
     completion_anchor: str
     _owned_consumers: tuple[object, ...]
+    _workload_instances: tuple[WorkloadPortOwner, ...] = ()
     _anchor_nodes: Mapping[str, tuple[NodeKey, ...]] = field(default_factory=dict)
     _event_nodes: Mapping[BackendObservableEvent, tuple[NodeKey, ...]] = field(
         default_factory=dict
@@ -785,6 +797,26 @@ class NativeWorkloadExecution:
 
     def owns_consumer(self, consumer: object) -> bool:
         return any(owner is consumer for owner in self._owned_consumers)
+
+    def prepare_port(self, key: str, transaction: str, value: object) -> None:
+        for workload in self._workload_instances:
+            if workload.owns_port(key):
+                workload.prepare_port(key, transaction, value)
+                return
+        raise KeyError(key)
+
+    def commit_port(self, key: str, transaction: str) -> int:
+        for workload in self._workload_instances:
+            if workload.owns_port(key):
+                return workload.commit_port(key, transaction)
+        raise KeyError(key)
+
+    def abort_port(self, key: str, transaction: str) -> None:
+        for workload in self._workload_instances:
+            if workload.owns_port(key):
+                workload.abort_port(key, transaction)
+                return
+        raise KeyError(key)
 
     @property
     def backend_region_binders(self) -> Mapping[str, "BackendRegionBinderSlot"]:
@@ -1213,7 +1245,7 @@ class _RegionValueStore:
 
     @property
     def retained_value_count(self) -> int:
-        return sum(value is not _SKIPPED for value in self._values.values())
+        return sum(value is not SKIPPED for value in self._values.values())
 
     def prepare_step(self, step_id: int) -> None:
         if self._step_id >= 0 and self._step_id != step_id:
@@ -1236,15 +1268,15 @@ class _RegionValueStore:
             self.commit_outputs(
                 artifact,
                 context,
-                {key: _SKIPPED for key in artifact.output_keys},
+                {key: SKIPPED for key in artifact.output_keys},
             )
             return
         inputs = self.resolve_inputs(artifact, context)
         state_before = self._state_versions.before(
             artifact.effects, context.step_id
         )
-        if any(value is _SKIPPED for value in inputs.values()):
-            outputs = {key: _SKIPPED for key in artifact.output_keys}
+        if any(value is SKIPPED for value in inputs.values()):
+            outputs = {key: SKIPPED for key in artifact.output_keys}
         else:
             outputs = artifact.execute(inputs)
             self._state_versions.after(
@@ -1277,7 +1309,13 @@ class _RegionValueStore:
                 inputs[binding.binding_id] = self._values[binding.binding_id]
             elif binding.kind is RegionInputKind.STEP_ID:
                 inputs[binding.binding_id] = context.step_id
-            elif binding.kind is RegionInputKind.PROVIDED:
+            elif binding.kind in (
+                RegionInputKind.PROVIDED,
+                RegionInputKind.STAGED,
+                RegionInputKind.SAMPLER_REQUEST_IDS,
+                RegionInputKind.SAMPLER_LOGITS,
+                RegionInputKind.SAMPLED_TOKENS,
+            ):
                 inputs[binding.binding_id] = self._providers[binding.source](
                     context.step_id
                 )
@@ -1304,8 +1342,12 @@ class _RegionValueStore:
             )
         for binding in artifact.output_bindings:
             value = outputs[binding.binding_id]
-            if binding.kind is RegionOutputKind.SINK:
-                if value is not _SKIPPED:
+            if binding.kind in (
+                RegionOutputKind.SINK,
+                RegionOutputKind.HOST,
+                RegionOutputKind.SAMPLER,
+            ):
+                if value is not SKIPPED:
                     self._sinks[binding.target](value, context.step_id)
             elif binding.kind is RegionOutputKind.MATERIALIZED:
                 self._materializations.output_binding_for(
@@ -1496,7 +1538,7 @@ class _RegionCudaGraph:
             self._preflight_disabled = True
             return
         inputs = self._store.resolve_inputs(self._artifact, context)
-        if any(value is _SKIPPED for value in inputs.values()):
+        if any(value is SKIPPED for value in inputs.values()):
             self._preflight_disabled = True
             return
         tensors = self._tensor_inputs(self._artifact, inputs)
@@ -1524,7 +1566,7 @@ class _RegionCudaGraph:
             self._store.commit_outputs(
                 self._artifact,
                 context,
-                {key: _SKIPPED for key in self._artifact.output_keys},
+                {key: SKIPPED for key in self._artifact.output_keys},
             )
             self._clear_preflight()
             return
@@ -1583,7 +1625,7 @@ def _hidden_value(
         )
     active = int(runtime.decode_count)
     if active <= 0:
-        return _SKIPPED
+        return SKIPPED
     path: str | None
     if binding.layer_kind is HiddenLayerKind.INDEX:
         assert binding.layer_index is not None
@@ -1740,13 +1782,24 @@ def _local_binding_requirements(
         binding.source
         for region in compilation.decision.execution_regions
         for binding in region.input_bindings
-        if binding.kind is RegionInputKind.PROVIDED
+        if binding.kind
+        in (
+            RegionInputKind.PROVIDED,
+            RegionInputKind.STAGED,
+            RegionInputKind.SAMPLER_REQUEST_IDS,
+            RegionInputKind.SAMPLER_LOGITS,
+            RegionInputKind.SAMPLED_TOKENS,
+        )
     }
     sinks = {
         binding.target
         for region in compilation.decision.execution_regions
         for binding in region.output_bindings
-        if binding.kind is RegionOutputKind.SINK
+        if binding.kind in (
+            RegionOutputKind.SINK,
+            RegionOutputKind.HOST,
+            RegionOutputKind.SAMPLER,
+        )
     }
     effects = tuple(
         effect
@@ -2151,6 +2204,10 @@ def _region_workload_execution(
         executor=executor,
         completion_anchor=compilation.decision.completion_anchor,
         _owned_consumers=(),
+        _workload_instances=cast(
+            tuple[WorkloadPortOwner, ...],
+            tuple(declaration.instance for declaration in bindings.declarations),
+        ),
         _anchor_nodes=frozen_anchor_nodes,
         _event_nodes=frozen_event_nodes,
         _value_store=value_store,

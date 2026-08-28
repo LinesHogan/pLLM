@@ -48,18 +48,18 @@ def main() -> int:
     from vllm import SamplingParams
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from tllm.consumers.reft import ReftConsumerConfig, build_reft_region_workload
+    from tllm.consumers.reft import ReftConfig, ReftWorkload
+    from tllm.consumers.reft.vllm_patch import install_reft_patch_on_llm
     from tllm.runtime.runtime import TllmRuntime
-    from tllm.runtime.vllm_patch.activation_patch_hooks import install_activation_patch_on_llm
 
     prompts = ["The capital of France is", "Water is made of"]
-    workload = build_reft_region_workload(ReftConsumerConfig(
+    workload = ReftWorkload(ReftConfig(
         layers=(args.layer,), rank=args.rank, last_tokens=args.last_tokens))
     runtime = TllmRuntime(workloads=(workload,), workload_memory_budget_bytes=64 << 20)
     llm = runtime.make_llm(model_name=args.model, dtype="bfloat16", enforce_eager=True,
         gpu_memory_utilization=0.3, max_model_len=128, max_num_batched_tokens=128,
         enable_prefix_caching=False, seed=0)
-    install_activation_patch_on_llm(llm, workload.patch_spec(), workload.bank_getter())
+    install_reft_patch_on_llm(llm, workload)
     greedy = SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True)
 
     def rollout(tag: str) -> list[str]:
@@ -103,15 +103,17 @@ def main() -> int:
 
     # --- push the trained intervention back through the signed Region ---
     state = reft.state_dict()
-    workload.push_intervention(
-        state["weight"].unsqueeze(0).float(), state["bias"].unsqueeze(0).float(),
-        state["rotate_layer"].unsqueeze(0).float())
-    before = workload.intervention_version()
+    runtime.publish(ReftWorkload.intervention, {
+        "source_w": state["weight"].unsqueeze(0).float(),
+        "source_b": state["bias"].unsqueeze(0).float(),
+        "rotate": state["rotate_layer"].unsqueeze(0).float(),
+    })
+    before = workload.state_version
     # One engine step lands the push through the signed publish Region (the
     # prefill of a request in the same step would race the publication).
     llm.generate(["ping"], SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True), use_tqdm=False)
     rollout("patched")
-    print(f"[push] intervention version {before} -> {workload.intervention_version()}")
+    print(f"[push] intervention version {before} -> {workload.state_version}")
     return 0
 
 

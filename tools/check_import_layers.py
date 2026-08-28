@@ -143,6 +143,7 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.runtime.workload_execution", "tllm.workload.frontend"),
         ("tllm.runtime.workload_execution", "tllm.workload.lowering"),
         ("tllm.runtime.workload_execution", "tllm.workload.region_compiler"),
+        ("tllm.runtime.workload_execution", "tllm.workload.runtime_values"),
         # Authority enum check at native execution bind time (function-local).
         ("tllm.runtime.workload_execution", "tllm.workload"),
         ("tllm.runtime.workload_plugins", "tllm.schedule"),

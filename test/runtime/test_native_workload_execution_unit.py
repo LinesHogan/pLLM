@@ -10,10 +10,11 @@ import torch
 
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
-from tllm.consumers.dummy import DummyConsumerConfig, DummyWorkload
+from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
 from tllm.contracts.hidden_locator import HiddenLocatorCapability, HiddenPhase, HiddenSite
 from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 from tllm.contracts.runtime_context import CompilationConfigLike
+from tllm.workload.runtime_values import SKIPPED
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
@@ -25,7 +26,6 @@ from tllm.runtime.workload_execution import (
     _RegionCudaGraph,
     _NativeShapeSpecializationQueue,
     _RegionValueStore,
-    _SKIPPED,
     _bind_physical_region_nodes,
     lower_signed_materialization_bindings,
     _region_shape_specialization_request,
@@ -346,7 +346,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
         graph.replay_context(context)
 
-        self.assertEqual(store.committed, {"output": _SKIPPED})
+        self.assertEqual(store.committed, {"output": SKIPPED})
 
     def test_region_cuda_graph_shape_miss_queues_signed_specialization_request(self) -> None:
         @workload(id="runtime.capture-shape-miss")
@@ -1891,7 +1891,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
     def test_dummy_compilation_takes_authority_at_decision_anchor(self) -> None:
         workload = DummyWorkload(
-            DummyConsumerConfig(
+            DummyConfig(
                 enable_async=False,
                 export_every_n_steps=2,
                 export_max_rows=4,
@@ -1928,7 +1928,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             residual_runtime.prepare_physical_workgraph_step(2)
             self.assertTrue(residual_runtime.advance_workload_anchor("token.commit"))
 
-        stats = workload.read_stats()
+        stats = workload.exporter.diagnostics()
         self.assertEqual(stats["consumed_batches"], 1.0)
         self.assertEqual(stats["consumed_rows"], 3.0)
         self.assertEqual(stats["processed_batches"], 1.0)
@@ -1937,7 +1937,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
     def test_dummy_native_handler_preserves_dispatch_stride(self) -> None:
         workload = DummyWorkload(
-            DummyConsumerConfig(
+            DummyConfig(
                 enable_async=False,
                 export_every_n_steps=2,
                 export_max_rows=4,
@@ -1966,7 +1966,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             residual_runtime.prepare_physical_workgraph_step(1)
             residual_runtime.advance_workload_anchor("token.commit")
 
-        stats = workload.read_stats()
+        stats = workload.exporter.diagnostics()
         self.assertEqual(stats["consumed_batches"], 0.0)
         self.assertEqual(stats["processed_batches"], 0.0)
         assert state.workload_execution is not None
@@ -2012,10 +2012,10 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 )
 
     def test_native_dummy_rejects_legacy_only_feedback_and_capture_policies(self) -> None:
-        with self.assertRaisesRegex(ValueError, "feedback_interval"):
-            DummyWorkload(DummyConsumerConfig(feedback_interval=1))
-        with self.assertRaisesRegex(ValueError, "capture_policy"):
-            DummyWorkload(DummyConsumerConfig(capture_policy="required"))
+        with self.assertRaisesRegex(ValueError, "declared fields"):
+            DummyWorkload(DummyConfig(feedback_interval=1))
+        with self.assertRaisesRegex(ValueError, "declared fields"):
+            DummyWorkload(DummyConfig(capture_policy="required"))
 
     def test_dummy_region_rejects_a_backend_without_its_eager_capability(self) -> None:
         workload = DummyWorkload()
@@ -2043,11 +2043,11 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
     def test_dummy_noise_configuration_isolated_in_cache_and_artifact_keys(self) -> None:
         quiet = TllmRuntime(
-            workloads=(DummyWorkload(DummyConsumerConfig(noise_std=0.0)),),
+            workloads=(DummyWorkload(DummyConfig(noise_std=0.0)),),
             workload_memory_budget_bytes=1 << 20,
         )
         noisy = TllmRuntime(
-            workloads=(DummyWorkload(DummyConsumerConfig(noise_std=0.25)),),
+            workloads=(DummyWorkload(DummyConfig(noise_std=0.25)),),
             workload_memory_budget_bytes=1 << 20,
         )
 
@@ -2082,7 +2082,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
     def test_dummy_worker_reconstruction_preserves_resources_and_signed_graph(self) -> None:
         workload = DummyWorkload(
-            DummyConsumerConfig(
+            DummyConfig(
                 enable_async=False,
                 export_every_n_steps=3,
                 export_max_rows=2,
@@ -2232,7 +2232,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
     def test_reconstructed_dummy_diagnostics_describe_the_active_resources(self) -> None:
         workload = DummyWorkload(
-            DummyConsumerConfig(enable_async=False, export_every_n_steps=1)
+            DummyConfig(enable_async=False, export_every_n_steps=1)
         )
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
@@ -2259,7 +2259,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
         self.assertGreater(active_diagnostics["dummy"]["consumed_batches"], 0)
         self.assertGreater(active_diagnostics["dummy"]["processed_batches"], 0)
-        self.assertEqual(workload.read_stats()["consumed_batches"], 0.0)
+        self.assertEqual(workload.exporter.diagnostics()["consumed_batches"], 0.0)
 
     def test_resource_diagnostics_are_namespaced_and_fail_closed(self) -> None:
         execution = NativeWorkloadExecution(

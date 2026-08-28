@@ -49,19 +49,16 @@ def main() -> int:
     # in-process so the push and the audit are observable here.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
-    from tllm.consumers.reft.config import ReftConsumerConfig
-    from tllm.consumers.reft.region_workload import ReftInterventionWorkload
+    from tllm.consumers.reft.region_workload import ReftConfig, ReftWorkload
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.runtime import TllmRuntime
-    from tllm.runtime.vllm_patch.activation_patch_hooks import (
-        install_activation_patch_on_llm,
-    )
+    from tllm.consumers.reft.vllm_patch import install_reft_patch_on_llm
     from tllm.util.tools import shutdown_llm_instance
     from vllm import SamplingParams
 
     rank = 2
-    workload = ReftInterventionWorkload(
-        ReftConsumerConfig(layers=(int(args.layer),), rank=rank, last_tokens=2)
+    workload = ReftWorkload(
+        ReftConfig(layers=(int(args.layer),), rank=rank, last_tokens=2)
     )
     runtime = TllmRuntime(workloads=(workload,), workload_memory_budget_bytes=64 << 20)
     if runtime.consumers:
@@ -88,16 +85,12 @@ def main() -> int:
         if regions[0].capture_safe:
             raise AssertionError("extern publish Region must be non-capture")
 
-        install_activation_patch_on_llm(
-            llm, workload.patch_spec(), workload.bank_getter()
-        )
+        install_reft_patch_on_llm(llm, workload)
 
         prompts = ["The capital of France is", "Water is made of"]
         baseline = _greedy_tokens(llm, prompts, 8)
 
         spec = workload.specialization
-        if spec is None:
-            raise AssertionError("ReFT workload was not specialized with the model")
         hidden = spec.hidden_size
         # Large constant-direction delta: project onto the first rank
         # direction with a big bias, so the patched hidden moves far.
@@ -107,15 +100,18 @@ def main() -> int:
         rotate = torch.zeros(1, hidden, rank)
         rotate[0, 0, 0] = 1.0
         rotate[0, 1 % hidden, 1 % rank] = 1.0
-        workload.push_intervention(source_w, source_b, rotate)
-        if workload.intervention_version() != 0:
+        runtime.publish(
+            ReftWorkload.intervention,
+            {"source_w": source_w, "source_b": source_b, "rotate": rotate},
+        )
+        if workload.state_version != 0:
             raise AssertionError("intervention went live before any engine step")
 
         # Land the push through the signed publish Region, then roll out.
         _greedy_tokens(llm, ["ping"], 1)
-        if workload.intervention_version() != 1:
+        if workload.state_version != 1:
             raise AssertionError(
-                f"signed publish did not land the push: {workload.intervention_version()}"
+                f"signed publish did not land the push: {workload.state_version}"
             )
         # The active epoch is promoted on the first user step; re-read it.
         execution = core.RUNTIME.workload_execution
@@ -148,7 +144,7 @@ def main() -> int:
                 {
                     "runner": args.runner,
                     "signature": compilation.decision.signature,
-                    "intervention_version": workload.intervention_version(),
+                    "intervention_version": workload.state_version,
                     "baseline": [list(tokens) for tokens in baseline],
                     "patched": [list(tokens) for tokens in patched],
                     "execute_count": physical.execute_count,

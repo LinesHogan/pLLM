@@ -26,6 +26,10 @@ enum ScheduleInputKind {
     Result,
     Provided,
     StepId,
+    Staged,
+    SamplerRequestIds,
+    SamplerLogits,
+    SampledTokens,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -108,6 +112,8 @@ fn hidden_locator_capability(site: HiddenSite, phase: HiddenPhase) -> Option<&'s
 enum ScheduleOutputKind {
     Sink,
     Temporary,
+    Host,
+    Sampler,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -146,6 +152,10 @@ enum RegionInputKind {
     Provided,
     Materialized,
     StepId,
+    Staged,
+    SamplerRequestIds,
+    SamplerLogits,
+    SampledTokens,
 }
 
 impl RegionInputKind {
@@ -155,6 +165,10 @@ impl RegionInputKind {
             Self::Provided => "provided",
             Self::Materialized => "materialized",
             Self::StepId => "step_id",
+            Self::Staged => "staged",
+            Self::SamplerRequestIds => "sampler_request_ids",
+            Self::SamplerLogits => "sampler_logits",
+            Self::SampledTokens => "sampled_tokens",
         }
     }
 }
@@ -164,6 +178,8 @@ impl RegionInputKind {
 enum RegionOutputKind {
     Sink,
     Materialized,
+    Host,
+    Sampler,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1954,6 +1970,10 @@ fn validate_inputs(
                 }
                 ScheduleInputKind::Result
                 | ScheduleInputKind::Provided
+                | ScheduleInputKind::Staged
+                | ScheduleInputKind::SamplerRequestIds
+                | ScheduleInputKind::SamplerLogits
+                | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId
                     if input.layer_kind != HiddenLayerKind::None
                         || input.site != HiddenSite::None
@@ -1966,7 +1986,12 @@ fn validate_inputs(
                 ScheduleInputKind::Result if input.output.is_empty() => {
                     return Err(value_error("result schedule input requires an output name"));
                 }
-                ScheduleInputKind::Provided | ScheduleInputKind::StepId
+                ScheduleInputKind::Provided
+                | ScheduleInputKind::Staged
+                | ScheduleInputKind::SamplerRequestIds
+                | ScheduleInputKind::SamplerLogits
+                | ScheduleInputKind::SampledTokens
+                | ScheduleInputKind::StepId
                     if !input.output.is_empty() || !input.layer.is_empty() =>
                 {
                     return Err(value_error(
@@ -2650,7 +2675,12 @@ fn draft_capture_safe(
                         external_inputs += 1;
                     }
                 }
-                ScheduleInputKind::Provided | ScheduleInputKind::StepId => return false,
+                ScheduleInputKind::Provided
+                | ScheduleInputKind::Staged
+                | ScheduleInputKind::SamplerRequestIds
+                | ScheduleInputKind::SamplerLogits
+                | ScheduleInputKind::SampledTokens
+                | ScheduleInputKind::StepId => return false,
             }
         }
     }
@@ -3439,6 +3469,12 @@ fn compile_impl(
                     let region_kind = match input.kind {
                         ScheduleInputKind::Hidden => RegionInputKind::Hidden,
                         ScheduleInputKind::Provided => RegionInputKind::Provided,
+                        ScheduleInputKind::Staged => RegionInputKind::Staged,
+                        ScheduleInputKind::SamplerRequestIds => {
+                            RegionInputKind::SamplerRequestIds
+                        }
+                        ScheduleInputKind::SamplerLogits => RegionInputKind::SamplerLogits,
+                        ScheduleInputKind::SampledTokens => RegionInputKind::SampledTokens,
                         ScheduleInputKind::StepId => RegionInputKind::StepId,
                         ScheduleInputKind::Result => {
                             unreachable!("result inputs are handled before external bindings")
@@ -3512,16 +3548,19 @@ fn compile_impl(
                     port_name: output.name.clone(),
                     value_binding_id: value_binding_id.clone(),
                 });
-                if output.kind != ScheduleOutputKind::Sink {
-                    continue;
-                }
+                let binding_kind = match output.kind {
+                    ScheduleOutputKind::Sink => RegionOutputKind::Sink,
+                    ScheduleOutputKind::Host => RegionOutputKind::Host,
+                    ScheduleOutputKind::Sampler => RegionOutputKind::Sampler,
+                    ScheduleOutputKind::Temporary => continue,
+                };
                 let identity = format!(
                     "{}\0{}\0{}\0{}",
                     region.region_id, task_id, output.name, output.target
                 );
                 region_outputs[region_index].push(RegionOutputBinding {
                     binding_id: format!("sink-{}", &digest(&identity)[..16]),
-                    kind: RegionOutputKind::Sink,
+                    kind: binding_kind,
                     target: output.target.clone(),
                     producer: RegionPort {
                         task_id: task_id.clone(),

@@ -8,8 +8,7 @@ import torch
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
-from tllm.consumers.override.config import OverRIDEConsumerConfig
-from tllm.consumers.override.region_workload import OverRIDERegionWorkload
+from tllm.consumers.override.region_workload import OverRIDEConfig, OverRIDEWorkload
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
@@ -105,9 +104,8 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
     """Drive one signed native step and read back observed region costs."""
 
     def test_signed_step_backfills_readonly_observed_costs(self) -> None:
-        workload = OverRIDERegionWorkload(
-            OverRIDEConsumerConfig(
-                implementation="region",
+        workload = OverRIDEWorkload(
+            OverRIDEConfig(
                 hidden_size=4,
                 vocab_size=7,
                 rank=2,
@@ -156,7 +154,8 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
             residual_runtime.advance_workload_anchor(regions[0].placement_anchor)
             # Stage the sampler-boundary training rows exactly as the bridge
             # does between the reweight and train region advances.
-            provider = workload.sampler_provider
+            provider = workload.native_workload_resources().sampler_provider
+            assert provider is not None
             view = SamplerStepView(
                 engine_step_id=7,
                 phase="decode",
@@ -175,7 +174,7 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
             )
             modifier = provider.prepare_step(view)
             assert modifier is not None
-            provider.after_sample(view, torch.tensor([2, 4], dtype=torch.long))
+            provider.after_sample(view, torch.tensor([2, 4], dtype=torch.long))  # type: ignore[attr-defined]
             for region in regions[1:]:
                 residual_runtime.advance_workload_anchor(region.placement_anchor)
             execution = state.workload_execution

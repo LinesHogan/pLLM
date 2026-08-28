@@ -344,11 +344,17 @@ class ScheduleInputKind(StrEnum):
     RESULT = "result"
     PROVIDED = "provided"
     STEP_ID = "step_id"
+    STAGED = "staged"
+    SAMPLER_REQUEST_IDS = "sampler_request_ids"
+    SAMPLER_LOGITS = "sampler_logits"
+    SAMPLED_TOKENS = "sampled_tokens"
 
 
 class ScheduleOutputKind(StrEnum):
     SINK = "sink"
     TEMPORARY = "temporary"
+    HOST = "host"
+    SAMPLER = "sampler"
 
 
 class RegionInputKind(StrEnum):
@@ -356,6 +362,10 @@ class RegionInputKind(StrEnum):
     PROVIDED = "provided"
     MATERIALIZED = "materialized"
     STEP_ID = "step_id"
+    STAGED = "staged"
+    SAMPLER_REQUEST_IDS = "sampler_request_ids"
+    SAMPLER_LOGITS = "sampler_logits"
+    SAMPLED_TOKENS = "sampled_tokens"
 
 
 class HiddenLayerKind(StrEnum):
@@ -368,6 +378,8 @@ class HiddenLayerKind(StrEnum):
 class RegionOutputKind(StrEnum):
     SINK = "sink"
     MATERIALIZED = "materialized"
+    HOST = "host"
+    SAMPLER = "sampler"
 
 
 class RegionImplementationKind(StrEnum):

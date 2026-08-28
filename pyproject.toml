@@ -12,6 +12,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "einops==0.8.2",
     "opt-einsum>=3.4,<4",
+    "safetensors>=0.4,<1",
 ]
 
 [project.optional-dependencies]

@@ -11,10 +11,10 @@ __all__ = [
     "ESampConsumerConfig",
     "ESampProgram",
     "ESampProgramConsumer",
-    "ESampRegionConfig",
+    "ESampConfig",
     "ESampSamplerModifierProvider",
     "build_esamp_workload",
-    "ESampRegionWorkload",
+    "ESampWorkload",
 ]
 
 _MODULE_BY_NAME = {
@@ -23,10 +23,10 @@ _MODULE_BY_NAME = {
     "ESampConsumerConfig": "tllm.consumers.esamp.config",
     "ESampProgram": "tllm.consumers.esamp.program",
     "ESampProgramConsumer": "tllm.consumers.esamp.program_consumer",
-    "ESampRegionConfig": "tllm.consumers.esamp.region_workload",
+    "ESampConfig": "tllm.consumers.esamp.region_workload",
     "ESampSamplerModifierProvider": "tllm.consumers.esamp.sampler_provider",
     "build_esamp_workload": "tllm.consumers.esamp.workload",
-    "ESampRegionWorkload": "tllm.consumers.esamp.region_workload",
+    "ESampWorkload": "tllm.consumers.esamp.region_workload",
 }
 
 
