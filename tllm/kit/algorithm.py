@@ -218,6 +218,21 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
         """Extra sampler-modifier predicate beyond the signed enabled flag."""
         return True
 
+    def missing_publication(
+        self, view: SamplerStepView
+    ) -> CandidateModifierState | None:
+        """Sampler step with no same-step sink publication (default: passthrough).
+
+        Override to fail closed when the algorithm's sampler semantics
+        require a publication on every active step.
+        """
+        return None
+
+    def observe_sampled_tokens(
+        self, view: SamplerStepView, sampled_token_ids: torch.Tensor
+    ) -> None:
+        """Post-draw hook, invoked only when this step's modifier fired."""
+
     def modify_candidates(
         self, value: torch.Tensor, view: SamplerStepView
     ) -> CandidateModifierState:
@@ -377,7 +392,7 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
         return state.name
 
     def _declared_sink_names(self) -> tuple[str, ...]:
-        """Sink output names from the signed task declarations (class order)."""
+        """Sink target names from the signed task declarations (class order)."""
         names: list[str] = []
         for klass in reversed(type(self).__mro__):
             for member in vars(klass).values():
@@ -387,9 +402,9 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
                     continue
                 if not isinstance(declaration, TaskDecl):
                     continue
-                for name, output in declaration.outputs:
-                    if isinstance(output, SinkOutput) and name not in names:
-                        names.append(name)
+                for _port, output in declaration.outputs:
+                    if isinstance(output, SinkOutput) and output.name not in names:
+                        names.append(output.name)
         return tuple(names)
 
     def _wrap_trainable_read_tasks(self) -> None:

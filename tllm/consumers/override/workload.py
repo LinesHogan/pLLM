@@ -16,11 +16,9 @@ def build_override_workload(config: OverRIDEConsumerConfig | None = None) -> obj
 
     resolved = config or OverRIDEConsumerConfig()
     if resolved.implementation == "region":
-        from tllm.consumers.override.region_workload import (
-            build_override_region_workload,
-        )
+        from tllm.consumers.override.region_workload import OverRIDERegionWorkload
 
-        return build_override_region_workload(resolved)
+        return OverRIDERegionWorkload(resolved)
     if resolved.implementation == "consumer":
         raise ValueError(
             "implementation='consumer' remains a legacy Program consumer; use "

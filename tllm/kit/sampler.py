@@ -52,7 +52,7 @@ class SamplerModifier:
             raise RuntimeError("sampler modifier requires RegionResourcesBase resources")
         record = resources.sinks.for_step(self._sink, view.engine_step_id)
         if record is None:
-            return None
+            return self._workload.missing_publication(view)
         identity = record.identity
         rows = int(view.decode_count)
         if identity.rows != rows:
@@ -80,6 +80,12 @@ class SamplerModifier:
                 f"sink {self._sink!r} publication device does not match the sampler step"
             )
         return self._workload.modify_candidates(record.value, view)
+
+    def after_sample(
+        self, view: SamplerStepView, sampled_token_ids: torch.Tensor
+    ) -> None:
+        """Forward the post-draw observation to the workload hook."""
+        self._workload.observe_sampled_tokens(view, sampled_token_ids)
 
 
 def candidate_modifier_state(

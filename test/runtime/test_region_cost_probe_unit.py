@@ -9,7 +9,7 @@ from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.consumers.override.config import OverRIDEConsumerConfig
-from tllm.consumers.override.region_workload import build_override_region_workload
+from tllm.consumers.override.region_workload import OverRIDERegionWorkload
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
@@ -105,7 +105,7 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
     """Drive one signed native step and read back observed region costs."""
 
     def test_signed_step_backfills_readonly_observed_costs(self) -> None:
-        workload = build_override_region_workload(
+        workload = OverRIDERegionWorkload(
             OverRIDEConsumerConfig(
                 implementation="region",
                 hidden_size=4,
