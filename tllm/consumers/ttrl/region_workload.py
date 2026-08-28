@@ -26,8 +26,9 @@ host's workload object.  Real runs install a *reconstructed* instance built
 from the signed worker spec (JSON-only transport — callables never cross),
 so instance attributes set on the host object are invisible to the
 executing instance.  Staged rows and the publish target therefore live in a
-process-local channel registry keyed by ``consumer_id`` — the same
-process-global seam as ``residual_runtime.RUNTIME``.  Under mp=1 each
+process-local channel registry keyed by ``consumer_id`` — the kit's
+``host_channel`` seam, process-global in the same sense as
+``residual_runtime.RUNTIME``.  Under mp=1 each
 worker process has its own (empty) registry: workers reconstruct, run
 zero-row steps through the signed audit, and never train.  A control-plane
 staging transport is the documented follow-up that closes that gap.
@@ -55,7 +56,7 @@ from tllm.consumers.ttrl.rewards import (
     build_ttrl_closed_loop_intent,
 )
 from tllm.consumers.ttrl.verifier import TTRLVerifier
-from tllm.kit import RegionAlgorithm, RegionResourcesBase
+from tllm.kit import RegionAlgorithm, RegionResourcesBase, host_channel
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
     AdamSpec,
@@ -104,11 +105,14 @@ class _HostChannel:
     total_staged_reward_rows: int = 0
 
 
-_HOST_CHANNELS: dict[str, _HostChannel] = {}
-
-
 def _host_channel(consumer_id: str) -> _HostChannel:
-    return _HOST_CHANNELS.setdefault(consumer_id, _HostChannel())
+    box = host_channel(f"ttrl:{consumer_id}")
+    if box.value is None:
+        box.value = _HostChannel()
+    channel = box.value
+    if not isinstance(channel, _HostChannel):
+        raise TypeError("TTRL host channel payload type mismatch")
+    return channel
 
 
 class TTRLRegionResources(RegionResourcesBase):

@@ -19,11 +19,11 @@ from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
 from tllm.consumers.ttrl.program import TTRLProgram
-from tllm.consumers.ttrl import region_workload as ttrl_region
 from tllm.consumers.ttrl.region_workload import (
     TTRLRegionWorkload,
     build_ttrl_region_workload,
 )
+from tllm.kit import clear_host_channels
 from tllm.runtime import residual_runtime
 from tllm.runtime.generation_trace_runtime import (
     CompletionTraceEntry,
@@ -128,7 +128,7 @@ class _TTRLRegionTestBase(unittest.TestCase):
         # The host channel registry is process-global (by design: the engine
         # drives a reconstructed instance, not the host object), so tests
         # sharing a consumer_id must not observe each other's staging state.
-        ttrl_region._HOST_CHANNELS.clear()
+        clear_host_channels()
 
 
 class TestTTRLRegionDeclaration(_TTRLRegionTestBase):

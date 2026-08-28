@@ -54,7 +54,14 @@ def _encode_specialization_value(value: object, label: str) -> str:
         return value.hex()
     if isinstance(value, str):
         return value
-    raise TypeError(f"specialization field {label!r} must be bool/int/float/str")
+    if isinstance(value, (tuple, list)) and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in value
+    ):
+        # Layer-index sets and similar small int tuples encode order-sensitively.
+        return ",".join(str(item) for item in value)
+    raise TypeError(
+        f"specialization field {label!r} must be bool/int/float/str/tuple[int, ...]"
+    )
 
 
 def _optimizer_options(spec_options: tuple[tuple[str, str], ...]) -> dict[str, object]:
@@ -375,6 +382,20 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
         )
 
     # -- update finalization ---------------------------------------------------
+
+    def commit_state_update(self) -> None:
+        """Land a host-pushed parameter refresh as one signed state transition.
+
+        Unlike :meth:`step_update` there is no loss or optimizer: an external
+        training loop published new parameter values (the weight-overlay
+        seam), and the signed transition Region calls this after copying them
+        into the State parameters so the audit observes the version bump.
+        """
+        if self._parameters is None:
+            raise RuntimeError(
+                f"{type(self).__name__} must be cold_specialize()d before execution"
+            )
+        self._state_version += 1
 
     def step_update(self, loss: torch.Tensor) -> None:
         """One signed optimizer step: backward, step, version bump, stats."""
