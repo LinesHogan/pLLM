@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import wraps
 from types import FunctionType
@@ -511,6 +511,9 @@ class ExternImplementation:
     input_types: tuple[str, ...] = ()
     output_types: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
+    # When set, task() fills input_types/output_types from the function's
+    # annotations (the encoding rule is the type's __name__, None -> "None").
+    derive_types: bool = False
 
     def __post_init__(self) -> None:
         for field_name in ("namespace", "name", "version"):
@@ -519,12 +522,19 @@ class ExternImplementation:
             value = getattr(self, field_name)
             if not isinstance(value, tuple) or any(not isinstance(item, str) or not item for item in value):
                 raise TypeError(f"ExternImplementation.{field_name} must be tuple[str, ...]")
+        if self.derive_types and (self.input_types or self.output_types):
+            raise ValueError(
+                "ExternImplementation with derive_types=True must not also "
+                "declare input_types/output_types"
+            )
 
     @property
     def key(self) -> str:
         return f"{self.namespace}:{self.name}@{self.version}"
 
     def to_ir(self) -> ImplementationIR:
+        if self.derive_types:
+            raise RuntimeError("extern() implementation escaped task() without type derivation")
         return ImplementationIR(
             kind=ImplementationKind.EXTERN,
             key=self.key,
@@ -532,6 +542,36 @@ class ExternImplementation:
             output_types=self.output_types,
             capabilities=self.capabilities,
         )
+
+
+def extern(key: str, *, capabilities: tuple[str, ...] = ()) -> ExternImplementation:
+    """Declare an extern implementation by key; task() derives the signed
+    input/output types from the function annotations."""
+    if not isinstance(key, str):
+        raise TypeError("extern key must be str")
+    namespace, sep, rest = key.partition(":")
+    name, at, version = rest.partition("@")
+    if not sep or not namespace or not name:
+        raise ValueError("extern key must have the form 'namespace:name[@version]'")
+    return ExternImplementation(
+        namespace=namespace,
+        name=name,
+        version=version if at else "1",
+        capabilities=capabilities,
+        derive_types=True,
+    )
+
+
+def _annotation_type_name(hint: object, label: str) -> str:
+    """Encode one resolved annotation as its signed type string."""
+    if hint is None or hint is type(None):
+        return "None"
+    if not isinstance(hint, type):
+        raise TypeError(
+            f"{label} annotation {hint!r} is not a concrete class; "
+            "extern types must be plain classes"
+        )
+    return hint.__name__
 
 
 class ExecutorRegistry:
@@ -633,6 +673,7 @@ def task(
         raise TypeError("task.accesses must be tuple[AffineAccess, ...]")
 
     def decorate(target: Callable[_P, _R]) -> Callable[_P, _R]:
+        nonlocal implementations
         if not isinstance(target, FunctionType):
             raise TypeError("task requires a Python function")
         parameters = set(inspect.signature(target).parameters)
@@ -649,6 +690,33 @@ def task(
             missing = tuple(name for name in parameters if name not in hints)
             if missing or "return" not in hints:
                 raise TypeError("extern task inputs and output require concrete annotations")
+            if any(item.derive_types for item in implementations):
+                undeclared = tuple(
+                    name for name in parameters if name not in dict(task_inputs)
+                )
+                if undeclared:
+                    raise TypeError(
+                        "extern task parameters must all be declared inputs: "
+                        + ", ".join(undeclared)
+                    )
+                derived_inputs = tuple(
+                    _annotation_type_name(hints[name], f"task input {name!r}")
+                    for name, _ in task_inputs
+                )
+                derived_outputs = (
+                    _annotation_type_name(hints["return"], "task return"),
+                )
+                implementations = tuple(
+                    replace(
+                        item,
+                        input_types=derived_inputs,
+                        output_types=derived_outputs,
+                        derive_types=False,
+                    )
+                    if item.derive_types
+                    else item
+                    for item in implementations
+                )
 
         @wraps(target)
         def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
