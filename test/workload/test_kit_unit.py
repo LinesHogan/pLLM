@@ -332,7 +332,7 @@ class KitV2AutoDerivationTest(unittest.TestCase):
     def test_unencodable_config_field_fails_closed(self) -> None:
         @dataclass
         class _BadConfig:
-            callback: object = None
+            callback: object = (1, "mixed")
 
         @workload(id="kit.bad-spec")
         class _Bad(RegionAlgorithm[_BadConfig]):

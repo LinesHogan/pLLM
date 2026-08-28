@@ -134,12 +134,12 @@ def main() -> int:
     from vllm import SamplingParams
 
     from tllm.consumers.ttrl.config import TTRLConsumerConfig
-    from tllm.consumers.ttrl.region_workload import build_ttrl_region_workload
+    from tllm.consumers.ttrl.region_workload import TTRLRegionWorkload
     from tllm.runtime.mp.control import ControlPlane
     from tllm.runtime.runtime import TllmRuntime
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = build_ttrl_region_workload(
+    workload = TTRLRegionWorkload(
         TTRLConsumerConfig(
             implementation="region",
             rank=2,

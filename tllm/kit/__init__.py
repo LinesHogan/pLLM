@@ -9,7 +9,12 @@ that *is* the algorithm.
 """
 
 from tllm.kit.algorithm import RegionAlgorithm
-from tllm.kit.channel import HostChannelBox, clear_host_channels, host_channel
+from tllm.kit.channel import (
+    HostChannelBox,
+    clear_host_channels,
+    host_channel,
+    typed_host_channel,
+)
 from tllm.kit.lm_head import ResolvedLMHead, resolve_lm_head
 from tllm.kit.resources import RegionResourcesBase
 from tllm.kit.sampler import SamplerModifier, candidate_modifier_state
@@ -28,4 +33,5 @@ __all__ = [
     "clear_host_channels",
     "host_channel",
     "resolve_lm_head",
+    "typed_host_channel",
 ]

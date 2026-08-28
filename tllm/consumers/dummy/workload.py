@@ -13,38 +13,14 @@ from tllm.consumers.dummy.transfer import clone_hidden_to_cpu
 from tllm.consumers.dummy.worker import DummyCpuWorker
 from tllm.kit import RegionAlgorithm
 from tllm.ports.residual_stream import ResidualLocator
-from tllm.runtime.workload_plugins import NativeWorkloadResources
 from tllm.workload import (
     Before,
-    ExternImplementation,
+    extern,
     hidden,
     step_id,
     task,
     workload,
 )
-
-
-def _hidden_path(config: DummyConsumerConfig) -> str:
-    """Resolve the one explicit native tap path from the declared config."""
-
-    return "model.layers.0" if config.layer_filter is None else config.layer_filter
-
-
-def _validate_native_config(config: DummyConsumerConfig) -> None:
-    """Reject legacy-only scheduling semantics before native compilation."""
-
-    if not isinstance(config, DummyConsumerConfig):
-        raise TypeError("config must be DummyConsumerConfig")
-    if int(config.feedback_interval) > 0:
-        raise ValueError(
-            "native Dummy Region does not support feedback_interval > 0; "
-            "use the direct legacy DummyConsumer for per-step feedback draining"
-        )
-    if config.capture_policy != "prefer":
-        raise ValueError(
-            "native Dummy Region does not support non-default capture_policy; "
-            "its typed extern Region is explicitly eager-only"
-        )
 
 
 class DummyNativeResources:
@@ -107,23 +83,22 @@ class DummyWorkload(RegionAlgorithm[DummyConsumerConfig]):
 
     algorithm = "dummy-cpu-export-region-v1"
     config_type = DummyConsumerConfig
-    specialization_fields = {
-        "async": "enable_async",
-        "export": "export_to_cpu",
-        "stride": "export_every_n_steps",
-        "max_queue_size": "max_queue_size",
-        "max_rows": "export_max_rows",
-        "max_cols": "export_max_cols",
-        "noise_std": "noise_std",
-        "feedback_interval": "feedback_interval",
-    }
-    worker_factory = "tllm.consumers.dummy.workload:reconstruct_dummy_workload"
 
     def __init__(self, config: DummyConsumerConfig | None = None) -> None:
         super().__init__(config if config is not None else DummyConsumerConfig())
 
     def validate_config(self, config: DummyConsumerConfig) -> None:
-        _validate_native_config(config)
+        """Reject legacy-only scheduling semantics before native compilation."""
+        if int(config.feedback_interval) > 0:
+            raise ValueError(
+                "native Dummy Region does not support feedback_interval > 0; "
+                "use the direct legacy DummyConsumer for per-step feedback draining"
+            )
+        if config.capture_policy != "prefer":
+            raise ValueError(
+                "native Dummy Region does not support non-default capture_policy; "
+                "its typed extern Region is explicitly eager-only"
+            )
 
     def make_resources(self) -> DummyNativeResources:
         return DummyNativeResources(self.config)
@@ -135,18 +110,16 @@ class DummyWorkload(RegionAlgorithm[DummyConsumerConfig]):
     def diagnostics_reader(self) -> object:
         return self.resources.read_stats
 
+    def read_stats(self) -> Mapping[str, float]:
+        """Host-facing export counters (same pipe as the diagnostics reader)."""
+        return self.resources.read_stats()
+
     def synchronize(self) -> None:
         self.resources.synchronize()
 
-    def extra_specialization(self) -> Mapping[str, str]:
-        return {"hidden_path": _hidden_path(self.config)}
-
     def residual_paths(self) -> Mapping[object, str]:
-        locator = ResidualLocator(layer=0, site="block_output", phase="decode")
-        return {locator: _hidden_path(self.config)}
-
-    def read_stats(self) -> Mapping[str, float]:
-        return self.resources.read_stats()
+        path = self.config.layer_filter or "model.layers.0"
+        return {ResidualLocator(0, "block_output", "decode"): path}
 
     @task(
         inputs={
@@ -154,24 +127,7 @@ class DummyWorkload(RegionAlgorithm[DummyConsumerConfig]):
             "step_id": step_id(),
         },
         timing=Before("step.end"),
-        implementation=ExternImplementation(
-            namespace="dummy",
-            name="cpu_export",
-            input_types=("Tensor", "int"),
-            output_types=("None",),
-            capabilities=("eager_only",),
-        ),
+        implementation=extern("dummy:cpu_export", capabilities=("eager_only",)),
     )
     def export_hidden(self, hidden_rows: torch.Tensor, step_id: int) -> None:
         self.resources.export_hidden(hidden_rows, step_id=step_id)
-
-
-def reconstruct_dummy_workload(raw: Mapping[str, object]) -> NativeWorkloadResources:
-    return DummyWorkload.reconstruct(raw)
-
-
-__all__ = [
-    "DummyNativeResources",
-    "DummyWorkload",
-    "reconstruct_dummy_workload",
-]

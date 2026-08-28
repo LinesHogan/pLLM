@@ -50,7 +50,7 @@ def main() -> int:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     from tllm.consumers.reft.config import ReftConsumerConfig
-    from tllm.consumers.reft.region_workload import build_reft_region_workload
+    from tllm.consumers.reft.region_workload import ReftInterventionWorkload
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.runtime import TllmRuntime
     from tllm.runtime.vllm_patch.activation_patch_hooks import (
@@ -60,7 +60,7 @@ def main() -> int:
     from vllm import SamplingParams
 
     rank = 2
-    workload = build_reft_region_workload(
+    workload = ReftInterventionWorkload(
         ReftConsumerConfig(layers=(int(args.layer),), rank=rank, last_tokens=2)
     )
     runtime = TllmRuntime(workloads=(workload,), workload_memory_budget_bytes=64 << 20)

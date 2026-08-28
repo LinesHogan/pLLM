@@ -83,7 +83,7 @@ def main() -> int:
     from vllm import SamplingParams
 
     from tllm.consumers.ttrl.config import TTRLConsumerConfig
-    from tllm.consumers.ttrl.region_workload import build_ttrl_region_workload
+    from tllm.consumers.ttrl.region_workload import TTRLRegionWorkload
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.generation_trace_runtime import (
         CompletionTraceEntry,
@@ -96,7 +96,7 @@ def main() -> int:
     from tllm.schedule import RegionImplementationKind
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = build_ttrl_region_workload(
+    workload = TTRLRegionWorkload(
         TTRLConsumerConfig(
             implementation="region",
             rank=2,

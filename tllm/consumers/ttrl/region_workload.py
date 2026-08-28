@@ -56,15 +56,15 @@ from tllm.consumers.ttrl.rewards import (
     build_ttrl_closed_loop_intent,
 )
 from tllm.consumers.ttrl.verifier import TTRLVerifier
-from tllm.kit import RegionAlgorithm, RegionResourcesBase, host_channel
+from tllm.kit import RegionAlgorithm, typed_host_channel
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
     AdamSpec,
     Before,
     Between,
-    ExternImplementation,
     State,
     StateScope,
+    extern,
     extern_io,
     maybe_transition,
     provided,
@@ -105,45 +105,12 @@ class _HostChannel:
     total_staged_reward_rows: int = 0
 
 
-def _host_channel(consumer_id: str) -> _HostChannel:
-    box = host_channel(f"ttrl:{consumer_id}")
-    if box.value is None:
-        box.value = _HostChannel()
-    channel = box.value
-    if not isinstance(channel, _HostChannel):
-        raise TypeError("TTRL host channel payload type mismatch")
-    return channel
-
-
-class TTRLRegionResources(RegionResourcesBase):
-    """Kit bookkeeping plus the staged-row counter for diagnostics."""
-
-    def extra_stats(self) -> Mapping[str, int]:
-        staged = self._workload_staged_rows()
-        return {"staged_reward_rows": staged}
-
-    def _workload_staged_rows(self) -> int:
-        workload = self._workload
-        if not isinstance(workload, TTRLRegionWorkload):
-            raise TypeError(
-                "TTRLRegionResources must be attached to a TTRLRegionWorkload"
-            )
-        return _host_channel(workload.consumer_id).total_staged_reward_rows
-
-
 @workload(id="ttrl.region")
 class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
     """Replica-state TTRL reward head as three signed Regions."""
 
     algorithm = "ttrl-exact-region-v1"
     config_type = TTRLConsumerConfig
-    specialization_fields = {
-        "rank": "rank",
-        "learning_rate": "learning_rate",
-        "hidden_size": "hidden_size",
-        "training_enabled": "enabled",
-    }
-    resources_type = TTRLRegionResources
     enabled_field = "enabled"
 
     reward_model = State(
@@ -200,11 +167,10 @@ class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
         # the specialization key.
         return {"lr": float(self.config.learning_rate)}
 
-    # -- host staging API (out-of-band closed loop) -------------------------
+    def extra_stats(self) -> Mapping[str, int]:
+        return {"staged_reward_rows": self._channel.total_staged_reward_rows}
 
-    @property
-    def resources(self) -> TTRLRegionResources:
-        return self._resources  # type: ignore[return-value]
+    # -- host staging API (out-of-band closed loop) -------------------------
 
     @property
     def consumer_id(self) -> str:
@@ -212,7 +178,7 @@ class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
 
     @property
     def _channel(self) -> _HostChannel:
-        return _host_channel(self.consumer_id)
+        return typed_host_channel(f"ttrl:{self.consumer_id}", _HostChannel)
 
     @property
     def last_published_intent(self) -> TTRLClosedLoopIntent | None:
@@ -284,39 +250,25 @@ class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
 
     # -- provided-input callbacks (invoked at signed Region execution) ---------
 
-    def _require_device(self) -> torch.device:
-        spec = self.specialization
-        if spec is None:
-            raise RuntimeError("TTRL Region must be cold_specialize()d before execution")
-        return spec.device
-
     def _train_hidden_for_step(self, _step_id: int) -> torch.Tensor:
         staged = self._channel.staged
         if staged is None:
-            return torch.empty((0, self._hidden_size()), device=self._require_device())
+            down = self.param("down")
+            return torch.empty((0, int(down.shape[1])), device=down.device)
         return staged.hidden
 
     def _train_rewards_for_step(self, _step_id: int) -> torch.Tensor:
         staged = self._channel.staged
         if staged is None:
-            return torch.empty((0,), device=self._require_device())
+            return torch.empty((0,), device=self.param("down").device)
         return staged.rewards
-
-    def _hidden_size(self) -> int:
-        down = self.params.get("down")
-        assert isinstance(down, torch.nn.Parameter)
-        return int(down.shape[1])
 
     # -- host-side read-only prediction (test/inspection helper) ----------------
 
     def predict_scores(self, hidden: torch.Tensor) -> torch.Tensor:
         """Read-only reward predictions against the current replica state."""
-        params = self.params
-        down = params["down"]
-        up = params["up"]
-        assert isinstance(down, torch.nn.Parameter) and isinstance(up, torch.nn.Parameter)
         with torch.no_grad():
-            return F.linear(F.linear(hidden, down), up)
+            return F.linear(F.linear(hidden, self.param("down")), self.param("up"))
 
     # -- signed tasks -------------------------------------------------------------
 
@@ -337,29 +289,16 @@ class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
             return torch.zeros((), device=hidden.device, dtype=hidden.dtype)
         if hidden.ndim != 2 or int(hidden.shape[0]) != int(flat_rewards.numel()):
             raise ValueError("TTRL Region train hidden and rewards row mismatch")
-        params = self.params
-        down = params["down"]
-        up = params["up"]
-        assert isinstance(down, torch.nn.Parameter) and isinstance(up, torch.nn.Parameter)
-        with torch.inference_mode(False):
-            with torch.enable_grad():
-                target = flat_rewards.reshape(-1, 1).to(
-                    device=hidden.device, dtype=hidden.dtype
-                )
-                loss = F.mse_loss(F.linear(F.linear(hidden, down), up), target)
-        return loss
+        target = flat_rewards.reshape(-1, 1).to(device=hidden.device, dtype=hidden.dtype)
+        return F.mse_loss(
+            F.linear(F.linear(hidden, self.param("down")), self.param("up")), target
+        )
 
     @task(
         inputs={"loss": result("train", "loss")},
         effects=(maybe_transition(reward_model),),
         timing=Before("next.prepare"),
-        implementation=ExternImplementation(
-            namespace="tllm.ttrl",
-            name="adam_transition",
-            version="1",
-            input_types=("Tensor",),
-            output_types=("None",),
-        ),
+        implementation=extern("tllm.ttrl:adam_transition@1"),
     )
     def update(self, loss: torch.Tensor) -> None:
         if isinstance(loss, torch.Tensor) and not loss.requires_grad:
@@ -376,13 +315,7 @@ class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
             extern_io("ttrl:update_barrier"),
         ),
         timing=Before("next.prepare"),
-        implementation=ExternImplementation(
-            namespace="tllm.ttrl",
-            name="publish_control_intents",
-            version="1",
-            input_types=("int",),
-            output_types=("None",),
-        ),
+        implementation=extern("tllm.ttrl:publish_control_intents@1"),
     )
     def publish(self, step_id: int) -> None:
         channel = self._channel
@@ -415,18 +348,3 @@ class TTRLRegionWorkload(RegionAlgorithm[TTRLConsumerConfig]):
         write_update_barriers(runtime, intent.update_barriers)
         channel.last_published_intent = intent
         channel.staged = None
-
-
-def build_ttrl_region_workload(
-    config: TTRLConsumerConfig,
-    *,
-    verifier: TTRLVerifier | None = None,
-) -> TTRLRegionWorkload:
-    return TTRLRegionWorkload(config, verifier=verifier)
-
-
-__all__ = [
-    "TTRLRegionResources",
-    "TTRLRegionWorkload",
-    "build_ttrl_region_workload",
-]

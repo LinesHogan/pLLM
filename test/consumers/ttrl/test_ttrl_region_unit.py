@@ -19,10 +19,7 @@ from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.ttrl.config import TTRLConsumerConfig
 from tllm.consumers.ttrl.program import TTRLProgram
-from tllm.consumers.ttrl.region_workload import (
-    TTRLRegionWorkload,
-    build_ttrl_region_workload,
-)
+from tllm.consumers.ttrl.region_workload import TTRLRegionWorkload
 from tllm.kit import clear_host_channels
 from tllm.runtime import residual_runtime
 from tllm.runtime.generation_trace_runtime import (
@@ -133,7 +130,7 @@ class _TTRLRegionTestBase(unittest.TestCase):
 
 class TestTTRLRegionDeclaration(_TTRLRegionTestBase):
     def test_declaration_signs_three_ordered_regions(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         _, compilation = _compile(workload)
 
         regions = compilation.decision.execution_regions
@@ -153,7 +150,7 @@ class TestTTRLRegionDeclaration(_TTRLRegionTestBase):
         self.assertEqual(tuple(publish.tasks), ("publish",))
 
     def test_declaration_records_state_and_extern_io_effects(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         declared = declare_workload(workload)
         effects = {
             task.name: tuple(effect.kind for effect in task.effects)
@@ -177,7 +174,7 @@ class TestTTRLRegionDeclaration(_TTRLRegionTestBase):
             TTRLRegionWorkload(_config(hidden_size=-1))
 
     def test_cold_specialize_resolves_and_checks_hidden_size(self) -> None:
-        workload = build_ttrl_region_workload(_config(hidden_size=0))
+        workload = TTRLRegionWorkload(_config(hidden_size=0))
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -186,14 +183,14 @@ class TestTTRLRegionDeclaration(_TTRLRegionTestBase):
         self.assertIsInstance(down, torch.nn.Parameter)
         self.assertEqual(tuple(down.shape), (_RANK, _HIDDEN))
 
-        mismatched = build_ttrl_region_workload(_config(hidden_size=99))
+        mismatched = TTRLRegionWorkload(_config(hidden_size=99))
         with self.assertRaisesRegex(RuntimeError, "hidden_size"):
             mismatched.cold_specialize(_spec())
 
 
 class TestTTRLRegionStaging(_TTRLRegionTestBase):
     def test_stage_aligns_rows_and_returns_intent(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         hidden_rows = torch.randn(3, _HIDDEN)
 
         intent = workload.stage_completed_generations(_trace(_HAPPY_TEXTS), hidden_rows)
@@ -212,7 +209,7 @@ class TestTTRLRegionStaging(_TTRLRegionTestBase):
     def test_stage_selects_training_indices_when_rows_are_superset(self) -> None:
         # One vote per prompt over two samples: index selection mirrors the
         # legacy toy closed loop (rows keyed by training_indices).
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         hidden_rows = torch.randn(2, _HIDDEN)
 
         intent = workload.stage_completed_generations(
@@ -226,11 +223,11 @@ class TestTTRLRegionStaging(_TTRLRegionTestBase):
         self.assertEqual(intent.training_indices, (0, 1))
 
     def test_staging_fails_closed(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         trace = _trace(_HAPPY_TEXTS)
         hidden_rows = torch.randn(3, _HIDDEN)
 
-        disabled = build_ttrl_region_workload(_config(enabled=False))
+        disabled = TTRLRegionWorkload(_config(enabled=False))
         with self.assertRaisesRegex(RuntimeError, "disabled"):
             disabled.stage_completed_generations(trace, hidden_rows)
 
@@ -244,7 +241,7 @@ class TestTTRLRegionStaging(_TTRLRegionTestBase):
             workload.stage_completed_generations(trace, hidden_rows)
 
     def test_unstaged_step_provides_empty_rows(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         workload.cold_specialize(_spec())
         hidden = workload._train_hidden_for_step(0)
         rewards = workload._train_rewards_for_step(0)
@@ -252,7 +249,7 @@ class TestTTRLRegionStaging(_TTRLRegionTestBase):
         self.assertEqual(tuple(rewards.shape), (0,))
 
     def test_publish_requires_bound_runtime(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         workload.cold_specialize(_spec())
         workload.stage_completed_generations(
             _trace(_HAPPY_TEXTS), torch.randn(3, _HIDDEN)
@@ -261,7 +258,7 @@ class TestTTRLRegionStaging(_TTRLRegionTestBase):
             workload.publish(7)
 
     def test_predict_scores_matches_current_params(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         workload.cold_specialize(_spec())
         hidden = torch.randn(3, _HIDDEN)
         down = workload.params["down"]
@@ -274,7 +271,7 @@ class TestTTRLRegionStaging(_TTRLRegionTestBase):
 
 class TestTTRLRegionSignedSteps(_TTRLRegionTestBase):
     def test_happy_path_signed_step_trains_and_publishes(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         runtime, compilation = _compile(workload)
         control = types.SimpleNamespace()
         workload.bind_control_runtime(control)
@@ -324,7 +321,7 @@ class TestTTRLRegionSignedSteps(_TTRLRegionTestBase):
         )
 
     def test_zero_completion_step_bumps_no_version(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         runtime, compilation = _compile(workload)
         control = types.SimpleNamespace()
         workload.bind_control_runtime(control)
@@ -339,7 +336,7 @@ class TestTTRLRegionSignedSteps(_TTRLRegionTestBase):
         self.assertIsNone(workload.last_published_intent)
 
     def test_zero_trainable_step_publishes_without_update(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         runtime, compilation = _compile(workload)
         control = types.SimpleNamespace()
         workload.bind_control_runtime(control)
@@ -368,7 +365,7 @@ class TestTTRLRegionSignedSteps(_TTRLRegionTestBase):
 
     def test_parameter_parity_with_legacy_program(self) -> None:
         torch.manual_seed(0)
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         workload.cold_specialize(_spec())
         legacy = TTRLProgram(
             hidden_size=_HIDDEN,
@@ -411,7 +408,7 @@ class TestTTRLRegionSignedSteps(_TTRLRegionTestBase):
         self.assertEqual(workload.state_version, 1)
 
     def test_worker_spec_roundtrip(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         runtime, compilation = _compile(workload)
         worker_spec = workload.native_workload_resources().worker_spec
         self.assertIsNotNone(worker_spec)
@@ -427,7 +424,7 @@ class TestTTRLRegionSignedSteps(_TTRLRegionTestBase):
         self.assertEqual(set(bindings.state_versions), {"reward_model"})
 
     def test_enable_epoch_rebuilds_resources_snapshot(self) -> None:
-        workload = build_ttrl_region_workload(_config())
+        workload = TTRLRegionWorkload(_config())
         first = workload.native_workload_resources()
         assert first.enabled_predicate is not None
         self.assertTrue(first.enabled_predicate())

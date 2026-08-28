@@ -33,14 +33,14 @@ import torch
 
 from tllm.consumers.reft.config import ReftConsumerConfig
 from tllm.contracts.activation_patch import ActivationPatchSpec
-from tllm.kit import RegionAlgorithm, host_channel
+from tllm.kit import RegionAlgorithm, typed_host_channel
 from tllm.runtime.activation_patch import LoreftBank
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
     Before,
-    ExternImplementation,
     State,
     StateScope,
+    extern,
     maybe_transition,
     step_id,
     task,
@@ -61,30 +61,12 @@ class _ReftChannel:
     bank: LoreftBank | None = None
 
 
-def _channel_for(consumer_id: str) -> _ReftChannel:
-    box = host_channel(f"reft:{consumer_id}")
-    if box.value is None:
-        box.value = _ReftChannel()
-    channel = box.value
-    if not isinstance(channel, _ReftChannel):
-        raise TypeError("ReFT host channel payload type mismatch")
-    return channel
-
-
 @workload(id="reft.intervention")
 class ReftInterventionWorkload(RegionAlgorithm[ReftConsumerConfig]):
     """Versioned LoReFT parameter bank plus one signed publish Region."""
 
     algorithm = "reft-loreft-region-v1"
     config_type = ReftConsumerConfig
-    specialization_fields = {
-        "layers": "layers",
-        "rank": "rank",
-        "first_tokens": "first_tokens",
-        "last_tokens": "last_tokens",
-        "learning_rate": "learning_rate",
-        "intervention_enabled": "enabled",
-    }
     enabled_field = "enabled"
 
     intervention = State(
@@ -147,6 +129,10 @@ class ReftInterventionWorkload(RegionAlgorithm[ReftConsumerConfig]):
     def consumer_id(self) -> str:
         return str(self.config.consumer_id)
 
+    @property
+    def _channel(self) -> _ReftChannel:
+        return typed_host_channel(f"reft:{self.consumer_id}", _ReftChannel)
+
     def patch_spec(self) -> ActivationPatchSpec:
         return ActivationPatchSpec(
             layers=tuple(self.config.layers),
@@ -163,20 +149,18 @@ class ReftInterventionWorkload(RegionAlgorithm[ReftConsumerConfig]):
         """Stage freshly trained (W, b, R); the next signed step publishes them."""
         if not bool(self.config.enabled):
             raise RuntimeError("ReFT intervention is disabled; refusing to stage weights")
-        channel = _channel_for(self.consumer_id)
+        channel = self._channel
         if channel.staged is not None:
             raise RuntimeError(
                 "ReFT intervention already has staged weights; wait for the "
                 "signed publish Region to land them"
             )
-        params = self.params  # raises unless cold-specialized
         for name, incoming in (
             ("source_w", source_w),
             ("source_b", source_b),
             ("rotate", rotate),
         ):
-            current = params[name]
-            assert isinstance(current, torch.nn.Parameter)
+            current = self.param(name)  # raises unless cold-specialized
             if tuple(incoming.shape) != tuple(current.shape):
                 raise ValueError(
                     f"ReFT push shape mismatch for {name}: "
@@ -190,11 +174,11 @@ class ReftInterventionWorkload(RegionAlgorithm[ReftConsumerConfig]):
 
     def bank_getter(self) -> object:
         """Return the channel-bank lookup the installed wrappers close over."""
-        channel = _channel_for(self.consumer_id)
+        channel = self._channel
         return lambda: channel.bank
 
     def intervention_version(self) -> int:
-        bank = _channel_for(self.consumer_id).bank
+        bank = self._channel.bank
         return 0 if bank is None else int(bank.version)
 
     # -- signed tasks ---------------------------------------------------------
@@ -203,24 +187,16 @@ class ReftInterventionWorkload(RegionAlgorithm[ReftConsumerConfig]):
         inputs={"step_id": step_id()},
         effects=(maybe_transition(intervention),),
         timing=Before("next.prepare"),
-        implementation=ExternImplementation(
-            namespace="tllm.reft",
-            name="publish_intervention",
-            version="1",
-            input_types=("int",),
-            output_types=("None",),
-        ),
+        implementation=extern("tllm.reft:publish_intervention@1"),
     )
     def publish(self, step_id: int) -> None:
-        channel = _channel_for(self.consumer_id)
+        channel = self._channel
         staged = channel.staged
         if staged is not None:
-            params = self.params
             with torch.no_grad():
                 for name in ("source_w", "source_b", "rotate"):
-                    target = params[name]
+                    target = self.param(name)
                     incoming = getattr(staged, name)
-                    assert isinstance(target, torch.nn.Parameter)
                     if tuple(incoming.shape) != tuple(target.shape):
                         raise RuntimeError(
                             f"ReFT staged {name} diverged from the signed shapes"
@@ -235,31 +211,17 @@ class ReftInterventionWorkload(RegionAlgorithm[ReftConsumerConfig]):
         # instance would silently serve stale init values.  The bank activates
         # only after a push has landed (version >= 1) — before that the engine
         # serves the unpatched baseline, and MP workers never patch.
-        params = self.params
-        source_w = params["source_w"]
-        source_b = params["source_b"]
-        rotate = params["rotate"]
-        assert isinstance(source_w, torch.nn.Parameter)
-        assert isinstance(source_b, torch.nn.Parameter)
-        assert isinstance(rotate, torch.nn.Parameter)
         with torch.no_grad():
             if channel.bank is None:
                 channel.bank = LoreftBank(
                     spec=self.patch_spec(),
-                    source_w=source_w.detach().clone(),
-                    source_b=source_b.detach().clone(),
-                    rotate=rotate.detach().clone(),
+                    source_w=self.param("source_w").detach().clone(),
+                    source_b=self.param("source_b").detach().clone(),
+                    rotate=self.param("rotate").detach().clone(),
                 )
             else:
-                channel.bank.source_w.copy_(source_w)
-                channel.bank.source_b.copy_(source_b)
-                channel.bank.rotate.copy_(rotate)
+                channel.bank.source_w.copy_(self.param("source_w"))
+                channel.bank.source_b.copy_(self.param("source_b"))
+                channel.bank.rotate.copy_(self.param("rotate"))
         channel.bank.version = self.state_version
         channel.bank.active = bool(self.config.enabled) and self.state_version > 0
-
-
-def build_reft_region_workload(config: ReftConsumerConfig) -> ReftInterventionWorkload:
-    return ReftInterventionWorkload(config)
-
-
-__all__ = ["ReftInterventionWorkload", "build_reft_region_workload"]

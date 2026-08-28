@@ -19,10 +19,7 @@ from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.reft.config import ReftConsumerConfig
 from tllm.consumers.reft.loader import load_loreft_interventions
-from tllm.consumers.reft.region_workload import (
-    ReftInterventionWorkload,
-    build_reft_region_workload,
-)
+from tllm.consumers.reft.region_workload import ReftInterventionWorkload
 from tllm.contracts.activation_patch import ActivationPatchSpec
 from tllm.kit import clear_host_channels
 from tllm.runtime import residual_runtime
@@ -123,7 +120,7 @@ class TestActivationPatchSpec(_ReftTestBase):
 
 class TestReftDeclaration(_ReftTestBase):
     def test_declaration_signs_one_extern_transition_region(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         _, compilation = _compile(workload)
         regions = compilation.decision.execution_regions
         self.assertEqual(tuple(region.tasks for region in regions), (("publish",),))
@@ -138,7 +135,7 @@ class TestReftDeclaration(_ReftTestBase):
         self.assertEqual(effects["publish"], ("transition_maybe",))
 
     def test_specialization_key_pins_layers_rank_and_positions(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         key = workload.native_workload_resources().specialization_key
         self.assertEqual(key["layers"], "3,7")
         self.assertEqual(key["rank"], "2")
@@ -153,7 +150,7 @@ class TestReftDeclaration(_ReftTestBase):
             ReftInterventionWorkload(_config(layers=()))
 
     def test_cold_specialize_shapes_and_orthonormal_rotate(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         workload.cold_specialize(_spec())
         params = workload.params
         self.assertEqual(tuple(params["source_w"].shape), (2, _RANK, _HIDDEN))
@@ -170,7 +167,7 @@ class TestReftDeclaration(_ReftTestBase):
 
 class TestReftSignedPublish(_ReftTestBase):
     def test_push_lands_through_signed_step(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         runtime, compilation = _compile(workload)
         source_w, source_b, rotate = _trained_params()
         workload.push_intervention(source_w, source_b, rotate)
@@ -191,7 +188,7 @@ class TestReftSignedPublish(_ReftTestBase):
         self.assertTrue(torch.equal(bank.source_w, workload.params["source_w"]))
 
     def test_zero_push_step_creates_inactive_baseline_bank(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         runtime, compilation = _compile(workload)
 
         version = _drive_signed_step(runtime, compilation)
@@ -203,7 +200,7 @@ class TestReftSignedPublish(_ReftTestBase):
         self.assertFalse(bank.active)  # unpatched baseline until the first push
 
     def test_push_fails_closed(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         source_w, source_b, rotate = _trained_params()
 
         with self.assertRaisesRegex(RuntimeError, "cold_specialize"):
@@ -213,7 +210,7 @@ class TestReftSignedPublish(_ReftTestBase):
         with self.assertRaisesRegex(ValueError, "shape mismatch"):
             workload.push_intervention(source_w[:, :1], source_b, rotate)
 
-        disabled = build_reft_region_workload(_config(enabled=False))
+        disabled = ReftInterventionWorkload(_config(enabled=False))
         disabled.cold_specialize(_spec())
         with self.assertRaisesRegex(RuntimeError, "disabled"):
             disabled.push_intervention(source_w, source_b, rotate)
@@ -223,7 +220,7 @@ class TestReftSignedPublish(_ReftTestBase):
             workload.push_intervention(source_w, source_b, rotate)
 
     def test_worker_spec_roundtrip(self) -> None:
-        workload = build_reft_region_workload(_config())
+        workload = ReftInterventionWorkload(_config())
         _, compilation = _compile(workload)
         worker_spec = workload.native_workload_resources().worker_spec
         self.assertIsNotNone(worker_spec)

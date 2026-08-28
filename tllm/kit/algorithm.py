@@ -57,6 +57,8 @@ def _encode_specialization_value(value: object, label: str) -> str:
     """Encode one config field with the established key convention."""
     if isinstance(value, bool):
         return str(value)
+    if value is None:
+        return "none"
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -69,7 +71,7 @@ def _encode_specialization_value(value: object, label: str) -> str:
         # Layer-index sets and similar small int tuples encode order-sensitively.
         return ",".join(str(item) for item in value)
     raise TypeError(
-        f"specialization field {label!r} must be bool/int/float/str/tuple[int, ...]"
+        f"specialization field {label!r} must be bool/int/float/str/tuple[int, ...]/None"
     )
 
 
@@ -254,17 +256,17 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
             )
         return MappingProxyType(parameters)
 
-    def param(self, name: str) -> torch.nn.Parameter | torch.nn.Module:
-        """One declared State parameter; never None, never Optional-typed."""
+    def param(self, name: str) -> torch.nn.Parameter:
+        """One declared State parameter; typed, never None, never Optional."""
         try:
             value = self.params[name]
         except KeyError as exc:
             raise RuntimeError(
                 f"{type(self).__name__} has no signed parameter {name!r}"
             ) from exc
-        if not isinstance(value, (torch.nn.Parameter, torch.nn.Module)):
+        if not isinstance(value, torch.nn.Parameter):
             raise RuntimeError(
-                f"{type(self).__name__} parameter {name!r} is not a Parameter/Module"
+                f"{type(self).__name__} parameter {name!r} is not a Parameter"
             )
         return value
 

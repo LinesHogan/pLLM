@@ -18,6 +18,9 @@ until then MP workers observe zero-row steps through the audit.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TypeVar
+
+P = TypeVar("P")
 
 
 @dataclass(slots=True)
@@ -41,9 +44,24 @@ def host_channel(key: str) -> HostChannelBox:
     return box
 
 
+def typed_host_channel(key: str, payload_type: type[P]) -> P:
+    """Return the channel payload for ``key``, created as ``payload_type()``.
+
+    Owns the create-on-demand + type-check dance once so workloads never
+    hand-write it around :func:`host_channel`.
+    """
+    box = host_channel(key)
+    if box.value is None:
+        box.value = payload_type()
+    payload = box.value
+    if not isinstance(payload, payload_type):
+        raise TypeError(f"host channel {key!r} payload type mismatch")
+    return payload
+
+
 def clear_host_channels() -> None:
     """Drop every channel (test isolation hook; not for production paths)."""
     _CHANNELS.clear()
 
 
-__all__ = ["HostChannelBox", "clear_host_channels", "host_channel"]
+__all__ = ["HostChannelBox", "clear_host_channels", "host_channel", "typed_host_channel"]
