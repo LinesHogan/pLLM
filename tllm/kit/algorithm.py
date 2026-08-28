@@ -232,8 +232,14 @@ class RegionAlgorithm(NativeWorkload, Generic[ConfigT]):
     # -- resource exposure -----------------------------------------------
 
     @property
-    def resources(self) -> object:
-        return self._resources
+    def resources(self) -> RegionResourcesBase:
+        """The kit-owned resources object (raises if this workload has none)."""
+        resources = self._resources
+        if not isinstance(resources, RegionResourcesBase):
+            raise RuntimeError(
+                f"{type(self).__name__} has no RegionResourcesBase resources"
+            )
+        return resources
 
     @property
     def sampler_provider(self) -> object:

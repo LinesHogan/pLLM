@@ -30,10 +30,27 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
     resolved = config or ESampConsumerConfig()
     if resolved.implementation == "region":
         from tllm.consumers.esamp.region_workload import (
-            build_esamp_region_workload,
+            ESampRegionConfig,
+            ESampRegionWorkload,
         )
 
-        return build_esamp_region_workload(resolved)
+        if resolved.distiller_sampler_backend != "post_filter_exact":
+            raise ValueError(
+                "implementation='region' supports only "
+                "distiller_sampler_backend='post_filter_exact'"
+            )
+        return ESampRegionWorkload(
+            ESampRegionConfig(
+                source_layer_path=str(resolved.source_layer_path),
+                target_layer_path=str(resolved.target_layer_path),
+                enable_esamp_training=bool(resolved.enable_esamp_training),
+                distiller_hidden_dim=int(resolved.distiller_hidden_dim),
+                distiller_lr=float(resolved.distiller_lr),
+                output_layernorm=bool(resolved.model_bank_use_output_layernorm),
+                enable_distiller_intervention=bool(resolved.enable_distiller_intervention),
+                distiller_beta=float(resolved.distiller_beta),
+            )
+        )
     identifier = str(resolved.consumer_id)
     legacy = build_legacy_consumer(resolved)
 

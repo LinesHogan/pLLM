@@ -154,8 +154,7 @@ def main() -> int:
 
     from vllm import SamplingParams
 
-    from tllm.consumers.esamp.config import ESampConsumerConfig
-    from tllm.consumers.esamp.region_workload import build_esamp_region_workload
+    from tllm.consumers.esamp.region_workload import ESampRegionConfig, ESampRegionWorkload
     from tllm.contracts.request_identity import resolve_request_identity
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane
@@ -165,16 +164,13 @@ def main() -> int:
     )
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = build_esamp_region_workload(
-        ESampConsumerConfig(
-            implementation="region",
-            graph_scratch_rows=max(8, int(args.batch_size)),
+    workload = ESampRegionWorkload(
+        ESampRegionConfig(
             enable_esamp_training=True,
             enable_distiller_intervention=True,
             distiller_hidden_dim=8,
             distiller_lr=1e-3,
             distiller_beta=0.5,
-            distiller_sampler_backend="post_filter_exact",
         )
     )
     runtime = TllmRuntime(

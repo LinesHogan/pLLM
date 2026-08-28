@@ -50,11 +50,18 @@ def compare_region_outputs(
     candidate: tuple[object, ...],
     *,
     tolerance: tuple[float, float] | None = None,
+    input_floor: float = 0.0,
 ) -> None:
     """Fail closed unless candidate matches the serial oracle within tolerance.
 
     ``tolerance`` is the (rtol, atol) pair an approximation workload declares;
     when absent, dtype-aware defaults apply (the exact-policy contract).
+    ``input_floor`` is the loosest dtype tolerance among the Region's
+    floating-point inputs: an output is a function of those inputs, so its
+    compiled-vs-oracle noise floor is set by the lowest-precision input, not
+    by its own dtype (an fp32 loss derived from bf16 hidden states carries
+    bf16-scale noise).  Real divergence (wrong graph, wrong state) is orders
+    of magnitude larger, so the gate remains fail-closed.
     """
     if len(reference) != len(candidate):
         raise RegionParityError(
@@ -76,7 +83,7 @@ def compare_region_outputs(
                     f"{tuple(expected.shape)}/{expected.dtype})"
                 )
             if tolerance is None:
-                rtol = atol = region_dtype_tolerance(expected.dtype)
+                rtol = atol = max(region_dtype_tolerance(expected.dtype), input_floor)
             else:
                 rtol, atol = tolerance
             if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
@@ -213,12 +220,24 @@ class _FirstCallParityGate:
         devices = {
             arg.device for arg in args if torch.is_tensor(arg)
         }
+        input_floor = max(
+            (
+                region_dtype_tolerance(arg.dtype)
+                for arg in args
+                if torch.is_tensor(arg) and arg.is_floating_point()
+            ),
+            default=0.0,
+        )
         snapshot = _snapshot_rng(devices)
         reference = self._eager(*args)
         _restore_rng(snapshot)
         candidate = self._compiled(*args)
         compare_region_outputs(
-            self._region_id, reference, candidate, tolerance=self._tolerance
+            self._region_id,
+            reference,
+            candidate,
+            tolerance=self._tolerance,
+            input_floor=input_floor,
         )
         self._verified = True
         return candidate

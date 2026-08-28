@@ -454,11 +454,12 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.specialization import RuntimeSpecializationSpec
 
-        from tllm.consumers.esamp.region_workload import build_esamp_region_workload
-
-        workload = build_esamp_region_workload(
-            ESampConsumerConfig(implementation="region", enable_esamp_training=True)
+        from tllm.consumers.esamp.region_workload import (
+            ESampRegionConfig,
+            ESampRegionWorkload,
         )
+
+        workload = ESampRegionWorkload(ESampRegionConfig(enable_esamp_training=True))
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -1050,14 +1051,16 @@ class ControlPlaneUnitTest(unittest.TestCase):
     def test_abort_restores_native_hidden_hook_topology_and_resources(self) -> None:
         from tllm.backends.timeline import export_main_workload_timeline
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
-        from tllm.consumers.esamp.region_workload import build_esamp_region_workload
+        from tllm.consumers.esamp.region_workload import (
+            ESampRegionConfig,
+            ESampRegionWorkload,
+        )
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.runtime.state import ResidualRuntimeState
 
-        workload_instance = build_esamp_region_workload(
-            ESampConsumerConfig(
-                implementation="region",
+        workload_instance = ESampRegionWorkload(
+            ESampRegionConfig(
                 source_layer_path="model.layers.0",
                 target_layer_path="model.layers.0",
             )
@@ -2121,14 +2124,15 @@ class ControlPlaneUnitTest(unittest.TestCase):
     def test_failed_native_install_clears_pending_state_and_partial_bindings(self) -> None:
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.backends.timeline import export_main_workload_timeline
-        from tllm.consumers.esamp.region_workload import build_esamp_region_workload
+        from tllm.consumers.esamp.region_workload import (
+            ESampRegionConfig,
+            ESampRegionWorkload,
+        )
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.runtime.state import ResidualRuntimeState
 
-        workload = build_esamp_region_workload(
-            ESampConsumerConfig(implementation="region")
-        )
+        workload = ESampRegionWorkload(ESampRegionConfig())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )

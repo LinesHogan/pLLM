@@ -80,5 +80,10 @@ class SinkStore:
             return None
         return record
 
+    def latest_rows(self, sink: str) -> int:
+        """Row count of the latest publication on ``sink`` (0 when none)."""
+        record = self._records.get(sink)
+        return 0 if record is None else record.identity.rows
+
 
 __all__ = ["SinkRecord", "SinkStore", "StepRowIdentity"]

@@ -5,18 +5,12 @@ from unittest import mock
 
 import torch
 
-from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
+from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
-from tllm.consumers.esamp.region_workload import (
-    ESampRegionStepMetadata,
-    ESampRegionWorkload,
-    build_esamp_region_workload,
-    reconstruct_esamp_region_workload,
-    validate_region_config,
-)
+from tllm.consumers.esamp.region_workload import ESampRegionConfig, ESampRegionWorkload
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime import residual_runtime
@@ -32,25 +26,23 @@ from tllm.ports.residual_stream import ResidualLocator
 from tllm.workload import declare_workload
 
 
-def _config(**overrides: object) -> ESampConsumerConfig:
+def _config(**overrides: object) -> ESampRegionConfig:
     values: dict[str, object] = {
-        "implementation": "region",
         "enable_distiller_intervention": True,
         "distiller_beta": 0.25,
         "distiller_hidden_dim": 3,
     }
     values.update(overrides)
-    return ESampConsumerConfig(**values)
+    return ESampRegionConfig(**values)  # type: ignore[arg-type]
 
 
-def _metadata(step_id: int, rows: int = 2) -> ESampRegionStepMetadata:
-    return ESampRegionStepMetadata(
-        request_ids=tuple(f"request-{row}" for row in range(rows)),
-        prompt_idxs=tuple(10 + row for row in range(rows)),
-        sample_idxs=tuple(row for row in range(rows)),
-        phase="decode",
-        engine_step_id=step_id,
-    )
+def _decode_state(step_rows: int = 2) -> ResidualRuntimeState:
+    state = ResidualRuntimeState()
+    state.decode_count = step_rows
+    state.decode_request_ids = [f"request-{row}" for row in range(step_rows)]
+    state.decode_prompt_idxs = [10 + row for row in range(step_rows)]
+    state.decode_sample_idxs = [row for row in range(step_rows)]
+    return state
 
 
 class _Model:
@@ -58,17 +50,16 @@ class _Model:
         self.lm_head = torch.nn.Linear(4, 7, bias=False)
 
 
-def _view(step_id: int, metadata: ESampRegionStepMetadata) -> SamplerStepView:
-    rows = len(metadata.request_ids)
+def _view(step_id: int, rows: int = 2, *, request_ids: tuple[str, ...] | None = None) -> SamplerStepView:
     return SamplerStepView(
         engine_step_id=step_id,
         phase="decode",
         logits=torch.empty(rows, 7),
         sampling_metadata=object(),
         decode_count=rows,
-        request_ids=metadata.request_ids,
-        prompt_idxs=metadata.prompt_idxs,
-        sample_idxs=metadata.sample_idxs,
+        request_ids=request_ids or tuple(f"request-{row}" for row in range(rows)),
+        prompt_idxs=tuple(10 + row for row in range(rows)),
+        sample_idxs=tuple(row for row in range(rows)),
         prompt_idx_tensor=None,
         sample_idx_tensor=None,
         source_hidden=torch.empty(rows, 4),
@@ -78,28 +69,63 @@ def _view(step_id: int, metadata: ESampRegionStepMetadata) -> SamplerStepView:
     )
 
 
+def _capabilities() -> BackendCapabilities:
+    return BackendCapabilities(
+        backend_id="vllm-0.27-mrv2",
+        runner_family="mrv2",
+        sampler_stages=frozenset(),
+        native_min_p=False,
+        tuple_sampler_return=False,
+        split_execute_and_sample=True,
+        graph_safety=GraphSafety.EAGER_ONLY,
+        hidden_locators=frozenset({HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}),
+    )
+
+
+def _timeline() -> object:
+    return export_main_workload_timeline(
+        _capabilities(), graph_mode="eager", static_headroom_bytes=1 << 20
+    )
+
+
+def _specialized_workload(**overrides: object) -> ESampRegionWorkload:
+    workload = ESampRegionWorkload(_config(**overrides))
+    workload.cold_specialize(
+        RuntimeSpecializationSpec(2, 4, torch.float32, torch.device("cpu"))
+    )
+    return workload
+
+
+def _publish_guidance(workload: ESampRegionWorkload, step_id: int) -> torch.Tensor:
+    """Drive the real signed sink path: task output -> auto-bound store."""
+    prediction, _loss = workload.predict_and_loss(torch.randn(2, 4), torch.randn(2, 4))
+    with mock.patch.object(residual_runtime, "RUNTIME", _decode_state(2)):
+        workload.native_workload_resources().output_sinks["guidance"](prediction, step_id)
+    return prediction
+
+
 class ESampRegionUnitTest(unittest.TestCase):
     def test_native_region_rejects_a_coinstalled_legacy_consumer(self) -> None:
-        native = build_esamp_region_workload(_config())
+        native = ESampRegionWorkload(_config())
         legacy = ESampConsumer(ESampConsumerConfig(implementation="legacy"))
 
         with self.assertRaisesRegex(RuntimeError, "native Region authority"):
             TllmRuntime(workloads=(native,), consumers=(legacy,))
 
     def test_disabled_workload_exports_a_disabled_immutable_worker_spec(self) -> None:
-        workload = build_esamp_region_workload(_config(enable_esamp_training=True))
+        workload = ESampRegionWorkload(_config(enable_esamp_training=True))
 
         workload.set_enabled(False)
 
         worker_spec = workload.native_workload_resources().worker_spec
         assert worker_spec is not None
         self.assertFalse(worker_spec.config["enable_esamp_training"])
-        reconstructed = reconstruct_esamp_region_workload(worker_spec.config)
+        reconstructed = ESampRegionWorkload.reconstruct(worker_spec.config)
         assert reconstructed.enabled_predicate is not None
         self.assertFalse(reconstructed.enabled_predicate())
 
     def test_new_worker_epoch_refreshes_the_current_enable_snapshot(self) -> None:
-        workload = build_esamp_region_workload(_config(enable_esamp_training=True))
+        workload = ESampRegionWorkload(_config(enable_esamp_training=True))
         runtime = TllmRuntime(workloads=(workload,))
 
         workload.set_enabled(False)
@@ -108,35 +134,19 @@ class ESampRegionUnitTest(unittest.TestCase):
         worker_spec = runtime._workload_worker_specs[0]
         self.assertFalse(worker_spec.config["enable_esamp_training"])
         self.assertIn(
-            ("esamp.region/training_enabled", "False"),
+            ("esamp.region/enable_esamp_training", "False"),
             runtime.workload_compile_options.shape_specialization,
         )
 
     def test_in_process_enable_transition_publishes_a_new_immutable_epoch(self) -> None:
-        workload = build_esamp_region_workload(_config(enable_esamp_training=True))
+        workload = ESampRegionWorkload(_config(enable_esamp_training=True))
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
         runtime.cold_specialize_workloads(
             RuntimeSpecializationSpec(2, 4, torch.float32, torch.device("cpu"))
         )
-        timeline = export_main_workload_timeline(
-            BackendCapabilities(
-                backend_id="vllm-0.27-mrv2",
-                runner_family="mrv2",
-                sampler_stages=frozenset(),
-                native_min_p=False,
-                tuple_sampler_return=False,
-                split_execute_and_sample=True,
-                graph_safety=GraphSafety.EAGER_ONLY,
-                hidden_locators=frozenset(
-                    {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
-                ),
-            ),
-            graph_mode="eager",
-            static_headroom_bytes=1 << 20,
-        )
-        initial = runtime.compile_workloads(timeline)
+        initial = runtime.compile_workloads(_timeline())
         initial_model = workload.model
         initial_optimizer = workload.optimizer
         initial_state_version = workload.state_version
@@ -185,32 +195,14 @@ class ESampRegionUnitTest(unittest.TestCase):
             self.assertFalse(current._value_store.is_enabled())
 
     def test_mp_install_cold_binds_hidden_taps_before_first_forward(self) -> None:
-        workload = build_esamp_region_workload(_config())
+        workload = ESampRegionWorkload(_config())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
         runtime.cold_specialize_workloads(
             RuntimeSpecializationSpec(2, 4, torch.float32, torch.device("cpu"))
         )
-        capabilities = BackendCapabilities(
-            backend_id="vllm-0.27-mrv2",
-            runner_family="mrv2",
-            sampler_stages=frozenset(),
-            native_min_p=False,
-            tuple_sampler_return=False,
-            split_execute_and_sample=True,
-            graph_safety=GraphSafety.EAGER_ONLY,
-            hidden_locators=frozenset(
-                {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
-            ),
-        )
-        compilation = runtime.compile_workloads(
-            export_main_workload_timeline(
-                capabilities,
-                graph_mode="eager",
-                static_headroom_bytes=1 << 20,
-            )
-        )
+        compilation = runtime.compile_workloads(_timeline())
         self.assertTrue(_decision_requires_hidden_taps(compilation.decision))
         extension = TllmWorkerExtension()
         extension.model_runner = mock.Mock(
@@ -269,7 +261,7 @@ class ESampRegionUnitTest(unittest.TestCase):
             state.residual_raw_paths = residual_paths
 
     def test_worker_spec_reconstructs_exact_signed_graph_and_bindings(self) -> None:
-        workload = build_esamp_region_workload(_config())
+        workload = ESampRegionWorkload(_config())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -277,25 +269,7 @@ class ESampRegionUnitTest(unittest.TestCase):
             2, 4, torch.float32, torch.device("cpu")
         )
         runtime.cold_specialize_workloads(spec)
-        capabilities = BackendCapabilities(
-            backend_id="vllm-0.27-mrv2",
-            runner_family="mrv2",
-            sampler_stages=frozenset(),
-            native_min_p=False,
-            tuple_sampler_return=False,
-            split_execute_and_sample=True,
-            graph_safety=GraphSafety.EAGER_ONLY,
-            hidden_locators=frozenset(
-                {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
-            ),
-        )
-        compilation = runtime.compile_workloads(
-            export_main_workload_timeline(
-                capabilities,
-                graph_mode="eager",
-                static_headroom_bytes=1 << 20,
-            )
-        )
+        compilation = runtime.compile_workloads(_timeline())
         worker_spec = workload.native_workload_resources().worker_spec
         assert worker_spec is not None
 
@@ -312,7 +286,7 @@ class ESampRegionUnitTest(unittest.TestCase):
         self.assertIsNotNone(bindings.sampler_provider)
 
     def test_worker_reconstruction_rejects_a_signed_specialization_mismatch(self) -> None:
-        workload = build_esamp_region_workload(_config())
+        workload = ESampRegionWorkload(_config())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
@@ -320,25 +294,7 @@ class ESampRegionUnitTest(unittest.TestCase):
             2, 4, torch.float32, torch.device("cpu")
         )
         runtime.cold_specialize_workloads(expected)
-        capabilities = BackendCapabilities(
-            backend_id="vllm-0.27-mrv2",
-            runner_family="mrv2",
-            sampler_stages=frozenset(),
-            native_min_p=False,
-            tuple_sampler_return=False,
-            split_execute_and_sample=True,
-            graph_safety=GraphSafety.EAGER_ONLY,
-            hidden_locators=frozenset(
-                {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
-            ),
-        )
-        compilation = runtime.compile_workloads(
-            export_main_workload_timeline(
-                capabilities,
-                graph_mode="eager",
-                static_headroom_bytes=1 << 20,
-            )
-        )
+        compilation = runtime.compile_workloads(_timeline())
         worker_spec = workload.native_workload_resources().worker_spec
         assert worker_spec is not None
 
@@ -352,32 +308,14 @@ class ESampRegionUnitTest(unittest.TestCase):
             )
 
     def test_signed_physical_regions_drive_one_complete_training_step(self) -> None:
-        workload = build_esamp_region_workload(_config())
+        workload = ESampRegionWorkload(_config())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
         runtime.cold_specialize_workloads(
             RuntimeSpecializationSpec(2, 4, torch.float32, torch.device("cpu"))
         )
-        capabilities = BackendCapabilities(
-            backend_id="vllm-0.27-mrv2",
-            runner_family="mrv2",
-            sampler_stages=frozenset(),
-            native_min_p=False,
-            tuple_sampler_return=False,
-            split_execute_and_sample=True,
-            graph_safety=GraphSafety.EAGER_ONLY,
-            hidden_locators=frozenset(
-                {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
-            ),
-        )
-        compilation = runtime.compile_workloads(
-            export_main_workload_timeline(
-                capabilities,
-                graph_mode="eager",
-                static_headroom_bytes=1 << 20,
-            )
-        )
+        compilation = runtime.compile_workloads(_timeline())
         self.assertEqual(
             tuple(region.tasks for region in compilation.decision.execution_regions),
             (("predict_and_loss",), ("update",)),
@@ -391,7 +329,7 @@ class ESampRegionUnitTest(unittest.TestCase):
         )
         self.assertEqual(len(compilation.decision.materializations), 1)
 
-        state = ResidualRuntimeState()
+        state = _decode_state(2)
         source_locator = ResidualLocator(0, "block_output", "decode")
         target_locator = ResidualLocator(-1, "block_output", "decode")
         state.residual_bindings = {
@@ -402,12 +340,6 @@ class ESampRegionUnitTest(unittest.TestCase):
             "source": torch.randn(2, 4),
             "target": torch.randn(2, 4),
         }
-        state.decode_count = 2
-        metadata = _metadata(7)
-        state.decode_request_ids = list(metadata.request_ids)
-        state.decode_prompt_idxs = list(metadata.prompt_idxs)
-        state.decode_sample_idxs = list(metadata.sample_idxs)
-        assert workload.model is not None
         before = tuple(
             parameter.detach().clone() for parameter in workload.model.parameters()
         )
@@ -437,14 +369,12 @@ class ESampRegionUnitTest(unittest.TestCase):
         )
         self.assertEqual(workload.state_version, 1)
         self.assertEqual(stats.loss_count, 1)
-        self.assertIsNotNone(workload.resources.output_sink())
-        self.assertEqual(workload.resources.output_sink().step_id, 7)
+        self.assertIsNotNone(workload.resources.sinks.for_step("guidance", 7))
 
     def test_declaration_has_replica_state_and_no_legacy_adapter(self) -> None:
-        workload = build_esamp_region_workload(_config())
+        workload = ESampRegionWorkload(_config())
         declaration = declare_workload(workload)
 
-        self.assertEqual(workload.config.implementation, "region")
         self.assertFalse(hasattr(workload, "legacy_consumer"))
         self.assertEqual(declaration.ir.states[0].scope.value, "replica")
         self.assertEqual(tuple(task.name for task in declaration.ir.tasks), ("predict_and_loss", "update"))
@@ -458,7 +388,8 @@ class ESampRegionUnitTest(unittest.TestCase):
             workload.resources.stats(),
             {"guidance_rows": 0, "loss_count": 0, "update_count": 0},
         )
-        self.assertIsNone(workload.model)
+        with self.assertRaises(RuntimeError):
+            workload.model  # parameters do not exist before cold_specialize
 
         with torch.inference_mode():
             workload.cold_specialize(
@@ -469,20 +400,17 @@ class ESampRegionUnitTest(unittest.TestCase):
                     device=torch.device("cpu"),
                 )
             )
-        self.assertIsNotNone(workload.model)
         self.assertIsNotNone(workload.optimizer)
-        assert workload.model is not None
         self.assertFalse(any(parameter.is_inference() for parameter in workload.model.parameters()))
         before = tuple(parameter.detach().clone() for parameter in workload.model.parameters())
-        prediction, loss = workload.run_predict_and_loss(
-            step_id=7,
-            source=torch.randn(2, 4),
-            target=torch.randn(2, 4),
-            metadata=_metadata(7),
+        _publish_guidance(workload, 7)
+        self.assertIsNotNone(workload.resources.sinks.for_step("guidance", 7))
+
+        # The signed update path (extern task body is one line of logic).
+        loss = torch.nn.functional.mse_loss(
+            workload.model(torch.randn(2, 4)), torch.randn(2, 4)
         )
-        self.assertEqual(tuple(prediction.shape), (2, 4))
-        self.assertEqual(workload.resources.output_sink().step_id, 7)
-        workload.run_update(loss)
+        workload.update(loss)
 
         after = tuple(parameter.detach() for parameter in workload.model.parameters())
         self.assertTrue(any(not torch.equal(old, new) for old, new in zip(before, after, strict=True)))
@@ -507,28 +435,12 @@ class ESampRegionUnitTest(unittest.TestCase):
                     workload.cold_specialize(mismatch)
 
     def test_sampler_semantic_config_changes_the_signed_cache_key(self) -> None:
-        capabilities = BackendCapabilities(
-            backend_id="vllm-0.27-mrv2",
-            runner_family="mrv2",
-            sampler_stages=frozenset(),
-            native_min_p=False,
-            tuple_sampler_return=False,
-            split_execute_and_sample=True,
-            graph_safety=GraphSafety.EAGER_ONLY,
-            hidden_locators=frozenset(
-                {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
-            ),
-        )
-        timeline = export_main_workload_timeline(
-            capabilities,
-            graph_mode="eager",
-            static_headroom_bytes=1 << 20,
-        )
+        timeline = _timeline()
 
         def compile_for(beta: float, intervention: bool) -> object:
             runtime = TllmRuntime(
                 workloads=(
-                    build_esamp_region_workload(
+                    ESampRegionWorkload(
                         _config(
                             distiller_beta=beta,
                             enable_distiller_intervention=intervention,
@@ -548,59 +460,26 @@ class ESampRegionUnitTest(unittest.TestCase):
         self.assertNotEqual(baseline.cache_key, changed_beta.cache_key)
         self.assertNotEqual(baseline.cache_key, disabled_intervention.cache_key)
 
-    def test_sampler_reads_only_same_step_guidance_and_metadata_is_isolated(self) -> None:
-        workload = ESampRegionWorkload(_config())
-        workload.cold_specialize(
-            RuntimeSpecializationSpec(2, 4, torch.float32, torch.device("cpu"))
-        )
-        metadata = _metadata(11)
-        workload.run_predict_and_loss(
-            step_id=11,
-            source=torch.randn(2, 4),
-            target=torch.randn(2, 4),
-            metadata=metadata,
-        )
-        record = workload.resources.output_sink()
-        self.assertEqual(record.metadata, metadata)
-        self.assertIsNot(record.metadata, metadata)
+    def test_sampler_reads_only_same_step_guidance(self) -> None:
+        workload = _specialized_workload()
+        _publish_guidance(workload, 11)
 
-        provider = workload.resources.sampler_provider()
-        assert workload.model is not None
+        provider = workload.native_workload_resources().sampler_provider
+        assert provider is not None
         with mock.patch.object(
             workload.model,
             "forward",
             side_effect=AssertionError("sampler must not re-run the Region model"),
         ) as forward:
-            state = provider.prepare_step(_view(11, metadata))
+            state = provider.prepare_step(_view(11))
         forward.assert_not_called()
         self.assertIsNotNone(state)
         assert state is not None
         self.assertEqual(state.affected_row_ids.tolist(), [0, 1])
         self.assertEqual(tuple(state.pred_hidden.shape), (2, 4))
-        self.assertIsNone(provider.prepare_step(_view(12, _metadata(12))))
-
-        mismatched = ESampRegionStepMetadata(
-            request_ids=("different", "request-1"),
-            prompt_idxs=metadata.prompt_idxs,
-            sample_idxs=metadata.sample_idxs,
-            phase="decode",
-            engine_step_id=11,
-        )
-        with self.assertRaisesRegex(RuntimeError, "metadata"):
-            provider.prepare_step(_view(11, mismatched))
-
-    def test_unsupported_region_configs_fail_closed(self) -> None:
-        for overrides in (
-            {"per_request_models": True},
-            {"per_request_model_bank": True, "per_request_models": True},
-            {"model_bank_train_cudagraph": True},
-            {"trace_per_request_losses": True},
-            {"compact_capture_lane": True},
-            {"training_row_selection": "first_per_prompt"},
-        ):
-            with self.subTest(overrides=overrides):
-                with self.assertRaises(ValueError):
-                    validate_region_config(_config(**overrides))
+        self.assertIsNone(provider.prepare_step(_view(12)))
+        with self.assertRaisesRegex(RuntimeError, "rows"):
+            provider.prepare_step(_view(11, request_ids=("different", "request-1")))
 
 
 if __name__ == "__main__":

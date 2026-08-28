@@ -427,6 +427,35 @@ class CompareRegionOutputsUnitTest(unittest.TestCase):
                 (torch.full((2,), 1.0 + 1e-8, dtype=torch.float64),),
             )
 
+    def test_input_floor_covers_low_precision_input_noise(self) -> None:
+        # An fp32 output derived from bf16 inputs carries bf16-scale noise;
+        # the floor from the Region's floating-point inputs governs it.
+        compare_region_outputs(
+            "region-floor",
+            (torch.ones(4, dtype=torch.float32),),
+            (torch.full((4,), 1.001, dtype=torch.float32),),
+            input_floor=region_dtype_tolerance(torch.bfloat16),
+        )
+
+    def test_input_floor_does_not_hide_real_divergence(self) -> None:
+        with self.assertRaises(RegionParityError):
+            compare_region_outputs(
+                "region-floor-real",
+                (torch.ones(4, dtype=torch.float32),),
+                (torch.full((4,), 1.5, dtype=torch.float32),),
+                input_floor=region_dtype_tolerance(torch.bfloat16),
+            )
+
+    def test_declared_tolerance_overrides_the_input_floor(self) -> None:
+        with self.assertRaises(RegionParityError):
+            compare_region_outputs(
+                "region-floor-declared",
+                (torch.ones(4, dtype=torch.float32),),
+                (torch.full((4,), 1.001, dtype=torch.float32),),
+                tolerance=(1e-6, 1e-6),
+                input_floor=region_dtype_tolerance(torch.bfloat16),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
