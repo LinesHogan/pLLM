@@ -12,6 +12,7 @@ from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
 from tllm.contracts.hidden_locator import HiddenLocatorCapability, HiddenPhase, HiddenSite
+from tllm.contracts.consumer_stats import TrainingStats
 from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 from tllm.contracts.runtime_context import CompilationConfigLike
 from tllm.workload.runtime_values import SKIPPED
@@ -22,7 +23,9 @@ from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import (
+    ExecutionLifecycleBinding,
     NativeWorkloadExecution,
+    NoExecutionLifecycle,
     _RegionCudaGraph,
     _NativeShapeSpecializationQueue,
     _RegionValueStore,
@@ -35,7 +38,14 @@ from tllm.runtime.workload_execution import (
 )
 from tllm.runtime.workload_execution import _hidden_value
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
-from tllm.runtime.workload_bindings import LocalRuntimeServices, WorkerRuntimeBinding
+from tllm.runtime.workload_bindings import (
+    LocalRuntimeServices,
+    PerRequestStats,
+    RuntimeInputBinding,
+    RuntimeOutputBinding,
+    RuntimePortRegistry,
+    WorkerRuntimeBinding,
+)
 from tllm.runtime.vllm_patch import common_hooks
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
@@ -134,6 +144,39 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             for layer, path in sorted(paths)
         )
 
+    def test_execution_lifecycle_variants_are_total(self) -> None:
+        absent = NoExecutionLifecycle()
+        self.assertTrue(absent.is_enabled())
+        self.assertEqual(absent.read_and_reset_stats(False).loss_count, 0)
+        self.assertEqual(absent.read_and_reset_per_request_stats(False), {})
+        absent.synchronize()
+
+        synchronized: list[bool] = []
+        lifecycle = ExecutionLifecycleBinding(
+            stats=lambda sync: TrainingStats(
+                loss_avg=1.5 if sync else 0.5,
+                loss_count=2,
+            ),
+            is_enabled=lambda: False,
+            synchronize=lambda: synchronized.append(True),
+            per_request_stats=PerRequestStats(
+                read=lambda sync: {
+                    7: TrainingStats(
+                        loss_avg=2.5 if sync else 0.25,
+                        loss_count=1,
+                    )
+                }
+            ),
+        )
+        self.assertFalse(lifecycle.is_enabled())
+        self.assertEqual(lifecycle.read_and_reset_stats(True).loss_avg, 1.5)
+        self.assertEqual(
+            lifecycle.read_and_reset_per_request_stats(False)[7].loss_avg,
+            0.25,
+        )
+        lifecycle.synchronize()
+        self.assertEqual(synchronized, [True])
+
     def test_backend_hook_forwards_the_signed_event_without_anchor_lookup(self) -> None:
         events: list[BackendObservableEvent] = []
 
@@ -191,8 +234,18 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         state = ResidualRuntimeState()
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            provided_inputs={"value": lambda _step_id: torch.tensor(1)},
-            output_sinks={"answer": lambda _value, _step_id: None},
+            ports=RuntimePortRegistry(
+                inputs={
+                    "value": RuntimeInputBinding(
+                        lambda _step_id: torch.tensor(1)
+                    )
+                },
+                outputs={
+                    "answer": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    )
+                },
+            ),
         )
         with mock.patch.object(residual_runtime, "RUNTIME", state):
             residual_runtime.publish_workload_compilation(
@@ -553,12 +606,20 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         state = ResidualRuntimeState()
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            provided_inputs={"value": lambda step_id: torch.tensor([float(step_id)])},
-            output_sinks={
-                "answer": lambda value, step_id: outputs.append(
-                    (step_id, cast(torch.Tensor, value))
-                )
-            },
+            ports=RuntimePortRegistry(
+                inputs={
+                    "value": RuntimeInputBinding(
+                        lambda step_id: torch.tensor([float(step_id)])
+                    )
+                },
+                outputs={
+                    "answer": RuntimeOutputBinding(
+                        lambda value, step_id: outputs.append(
+                            (step_id, cast(torch.Tensor, value))
+                        )
+                    )
+                },
+            ),
         )
 
         with mock.patch.object(residual_runtime, "RUNTIME", state):
@@ -629,12 +690,20 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         state = ResidualRuntimeState()
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            provided_inputs={"value": lambda _step_id: torch.tensor([4.0])},
-            output_sinks={
-                "answer": lambda value, _step_id: outputs.append(
-                    cast(torch.Tensor, value)
-                )
-            },
+            ports=RuntimePortRegistry(
+                inputs={
+                    "value": RuntimeInputBinding(
+                        lambda _step_id: torch.tensor([4.0])
+                    )
+                },
+                outputs={
+                    "answer": RuntimeOutputBinding(
+                        lambda value, _step_id: outputs.append(
+                            cast(torch.Tensor, value)
+                        )
+                    )
+                },
+            ),
         )
 
         with mock.patch.object(residual_runtime, "RUNTIME", state):
@@ -866,8 +935,21 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         state = ResidualRuntimeState()
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            provided_inputs={"value": lambda _step_id: torch.tensor([1.0])},
-            output_sinks={"first": lambda _value, _step_id: None, "second": lambda _value, _step_id: None},
+            ports=RuntimePortRegistry(
+                inputs={
+                    "value": RuntimeInputBinding(
+                        lambda _step_id: torch.tensor([1.0])
+                    )
+                },
+                outputs={
+                    "first": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    ),
+                    "second": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    ),
+                },
+            ),
         )
         with mock.patch.object(residual_runtime, "RUNTIME", state):
             residual_runtime.publish_workload_compilation(compilation, bindings=bindings)
@@ -978,7 +1060,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             artifacts=artifacts,
             materializations=materializations,
             state_versions=StateVersionRegistry((), {}, ()),
-            enabled_predicate=None,
+            lifecycle=NoExecutionLifecycle(),
         )
         context = PhysicalExecutionContext(
             step_id=9,
@@ -1042,14 +1124,24 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         self.assertEqual(len(regions), 2)
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            provided_inputs={
-                "left": lambda _step_id: torch.tensor(1),
-                "right": lambda _step_id: torch.tensor(2),
-            },
-            output_sinks={
-                "left": lambda _value, _step_id: None,
-                "right": lambda _value, _step_id: None,
-            },
+            ports=RuntimePortRegistry(
+                inputs={
+                    "left": RuntimeInputBinding(
+                        lambda _step_id: torch.tensor(1)
+                    ),
+                    "right": RuntimeInputBinding(
+                        lambda _step_id: torch.tensor(2)
+                    ),
+                },
+                outputs={
+                    "left": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    ),
+                    "right": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    ),
+                },
+            ),
         )
         state = ResidualRuntimeState()
 
@@ -1117,7 +1209,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         ).compile(_timeline())
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            output_sinks={"answer": lambda _value, _step_id: None},
+            ports=RuntimePortRegistry(
+                outputs={
+                    "answer": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    )
+                }
+            ),
         )
         state = ResidualRuntimeState()
 
@@ -1176,8 +1274,18 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         )
         bindings = WorkloadExecutionBindings(
             declarations=(declaration,),
-            provided_inputs={"value": lambda _step_id: torch.tensor(1)},
-            output_sinks={"answer": lambda _value, _step_id: None},
+            ports=RuntimePortRegistry(
+                inputs={
+                    "value": RuntimeInputBinding(
+                        lambda _step_id: torch.tensor(1)
+                    )
+                },
+                outputs={
+                    "answer": RuntimeOutputBinding(
+                        lambda _value, _step_id: None
+                    )
+                },
+            ),
         )
 
         with (
@@ -1395,7 +1503,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 compilation,
                 bindings=WorkloadExecutionBindings(
                     declarations=(declaration,),
-                    output_sinks={"answer": lambda _value, _step_id: None},
+                    ports=RuntimePortRegistry(
+                        outputs={
+                            "answer": RuntimeOutputBinding(
+                                lambda _value, _step_id: None
+                            )
+                        }
+                    ),
                     residual_paths={
                         ResidualLocator(0, "block_output", "decode"): "model.layers.0"
                     },
@@ -1437,7 +1551,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 compilation,
                 bindings=WorkloadExecutionBindings(
                     declarations=(declaration,),
-                    output_sinks={"answer": lambda _value, _step_id: None},
+                    ports=RuntimePortRegistry(
+                        outputs={
+                            "answer": RuntimeOutputBinding(
+                                lambda _value, _step_id: None
+                            )
+                        }
+                    ),
                 ),
             )
         with self.assertRaisesRegex(RuntimeError, "output sink.*answer"):
@@ -1445,7 +1565,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 compilation,
                 bindings=WorkloadExecutionBindings(
                     declarations=(declaration,),
-                    provided_inputs={"value": lambda _step_id: 1},
+                    ports=RuntimePortRegistry(
+                        inputs={
+                            "value": RuntimeInputBinding(
+                                lambda _step_id: 1
+                            )
+                        }
+                    ),
                 ),
             )
 
@@ -1483,7 +1609,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 compilation,
                 bindings=WorkloadExecutionBindings(
                     declarations=(declaration,),
-                    provided_inputs={"step_id": lambda _step_id: "user-value"},
+                    ports=RuntimePortRegistry(
+                        inputs={
+                            "step_id": RuntimeInputBinding(
+                                lambda _step_id: "user-value"
+                            )
+                        }
+                    ),
                 ),
             )
             execution = state.workload_execution
@@ -1532,7 +1664,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                     cast(Any, compilation),
                     bindings=WorkloadExecutionBindings(
                         declarations=(cast(Any, declaration),),
-                        output_sinks={"answer": lambda _value, _step_id: None},
+                        ports=RuntimePortRegistry(
+                            outputs={
+                                "answer": RuntimeOutputBinding(
+                                    lambda _value, _step_id: None
+                                )
+                            }
+                        ),
                         residual_paths=cast("Mapping[object, str]", residual_paths),
                     ),
                 )
@@ -2103,13 +2241,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             bindings.declarations[0].ir.semantic_key,
             declare_workload(workload).ir.semantic_key,
         )
-        self.assertEqual(bindings.provided_inputs, {})
-        self.assertEqual(bindings.output_sinks, {})
+        self.assertEqual(bindings.ports.inputs, {})
+        self.assertEqual(bindings.ports.outputs, {})
         self.assertEqual(
             bindings.residual_paths,
             {ResidualLocator(0, "block_output", "decode"): "model.layers.0"},
         )
-        self.assertIsNotNone(bindings.synchronizer)
+        self.assertIs(type(bindings.lifecycle), ExecutionLifecycleBinding)
 
     def test_dummy_worker_reconstruction_sends_signed_facts_without_specializer(self) -> None:
         workload = DummyWorkload()

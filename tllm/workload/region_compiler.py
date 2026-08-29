@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import FunctionType, MappingProxyType
-from typing import TYPE_CHECKING, TypeGuard, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -442,15 +442,16 @@ def _normalize_task_outputs(
         return ()
     if count == 1:
         return (result,)
-    if not _is_output_tuple(result) or len(result) != count:
+    if not isinstance(result, tuple):
         raise RuntimeError(
             f"Region task {invocation.task_id!r} must return a {count}-tuple"
         )
-    return result
-
-
-def _is_output_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
-    return isinstance(value, tuple)
+    outputs = cast(tuple[object, ...], result)
+    if len(outputs) != count:
+        raise RuntimeError(
+            f"Region task {invocation.task_id!r} must return a {count}-tuple"
+        )
+    return outputs
 
 
 def _torch_compile_adapter(

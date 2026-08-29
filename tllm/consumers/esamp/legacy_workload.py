@@ -55,12 +55,17 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
     identifier = str(resolved.consumer_id)
     legacy = build_legacy_consumer(resolved)
 
+    def legacy_consumer(_instance: object) -> BaseConsumer[object]:
+        return legacy
+
     if not resolved.enable_esamp_training:
-        @workload(id=identifier, authority=WorkloadAuthority.LEGACY_ADAPTER)
+        @workload(
+            id=identifier,
+            authority=WorkloadAuthority.LEGACY_ADAPTER,
+            legacy_consumer=legacy_consumer,
+        )
         class DisabledESampWorkload:
-            @property
-            def legacy_consumer(self) -> BaseConsumer:
-                return legacy
+            pass
 
         return DisabledESampWorkload()
 
@@ -69,10 +74,14 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
         scope=StateScope.REQUEST if per_request else StateScope.REPLICA,
         key=request_key("request_id", "sample_idx") if per_request else None,
         parameters="distiller",
-        optimizer=AdamWSpec(lr=float(resolved.distiller_lr)),
+        optimizer=AdamWSpec.fixed(float(resolved.distiller_lr)),
     )
 
-    @workload(id=identifier, authority=WorkloadAuthority.LEGACY_ADAPTER)
+    @workload(
+        id=identifier,
+        authority=WorkloadAuthority.LEGACY_ADAPTER,
+        legacy_consumer=legacy_consumer,
+    )
     class ESampWorkloadDeclaration:
         state = distiller
 
@@ -97,10 +106,6 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
         )
         def update(self, loss: object) -> None:
             raise RuntimeError("ESamp workload is declaration-only during legacy takeover")
-
-        @property
-        def legacy_consumer(self) -> BaseConsumer:
-            return legacy
 
     return ESampWorkloadDeclaration()
 

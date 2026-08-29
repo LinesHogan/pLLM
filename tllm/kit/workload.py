@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import ClassVar, Generic, Protocol, TypeVar, cast
@@ -30,6 +30,8 @@ from tllm.runtime.workload_bindings import (
     NoRuntimeServices,
     NoSamplerBinding,
     RuntimePortRegistry,
+    RuntimeInputBinding,
+    RuntimeOutputBinding,
     RuntimeStateRegistry,
     RuntimeServices,
     SamplerRuntimeBinding,
@@ -362,16 +364,22 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         state_snapshots = {
             state.name: self._accounting.state_snapshot for state in type(self)._states()
         }
-        def input_provider(port: StagedPort[object]) -> Callable[[int], object]:
-            return lambda step_id: port.take(self._port_store, step_id)
-
         provided_inputs = {
-            port.key: input_provider(port) for port in type(self)._staged_ports()
+            port.key: RuntimeInputBinding(
+                lambda step_id, port=port: port.take(self._port_store, step_id)
+            )
+            for port in type(self)._staged_ports()
         }
-        sampler_providers: dict[ValueSourceKind, Callable[[int], object]] = {
-            ValueSourceKind.SAMPLER_REQUEST_IDS: self._sampler_context.request_ids,
-            ValueSourceKind.SAMPLER_LOGITS: self._sampler_context.logits,
-            ValueSourceKind.SAMPLED_TOKENS: self._sampler_context.tokens,
+        sampler_providers: dict[ValueSourceKind, RuntimeInputBinding[object]] = {
+            ValueSourceKind.SAMPLER_REQUEST_IDS: RuntimeInputBinding(
+                self._sampler_context.request_ids
+            ),
+            ValueSourceKind.SAMPLER_LOGITS: RuntimeInputBinding(
+                self._sampler_context.logits
+            ),
+            ValueSourceKind.SAMPLED_TOKENS: RuntimeInputBinding(
+                self._sampler_context.tokens
+            ),
         }
         provided_inputs.update(
             {
@@ -380,7 +388,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             }
         )
         backend_binding = self.backend.runtime_binding()
-        output_sinks: dict[str, Callable[[object, int], None]]
+        output_sinks: dict[str, RuntimeOutputBinding[object]]
         match self._sampler:
             case _NoSampler():
                 output_sinks = {}
@@ -389,11 +397,15 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 def publish_sampler(value: object, step_id: int) -> None:
                     self._sinks.publish(policy.name, cast(torch.Tensor, value), step_id)
 
-                output_sinks = {policy.name: publish_sampler}
+                output_sinks = {
+                    policy.name: RuntimeOutputBinding(publish_sampler)
+                }
                 sampler_binding = SamplerRuntimeBinding(sampler)
         output_sinks.update(
             {
-                port.key: port.runtime_publisher(self._host_output_store)
+                port.key: RuntimeOutputBinding(
+                    port.runtime_publisher(self._host_output_store)
+                )
                 for port in type(self)._host_outputs()
             }
         )

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
+
+from tllm.ports.consumer import BaseConsumer
 
 from tllm.workload import (
     NativeWorkloadDefinition,
@@ -10,7 +12,6 @@ from tllm.workload import (
     WorkloadDefinition,
     definition_for_workload_class,
 )
-
 DeclarationDefinition = WorkloadDefinition | NativeWorkloadDefinition
 
 if TYPE_CHECKING:
@@ -22,43 +23,23 @@ def workload_definition(instance: object) -> DeclarationDefinition | None:
 
 
 def legacy_consumer(
-    instance: object, definition: DeclarationDefinition | None
-) -> object | None:
-    if definition is None:
-        return instance
+    instance: object, definition: DeclarationDefinition
+) -> BaseConsumer[object] | None:
     if definition.authority is WorkloadAuthority.NATIVE_REGION:
         return None
-    dynamic_instance = cast(Any, instance)
-    try:
-        adapter: Any = dynamic_instance.legacy_consumer
-    except AttributeError:
-        raise RuntimeError(
-            "legacy-adapter workload declaration must provide legacy_consumer"
-        ) from None
-    consumer: Any = adapter() if callable(adapter) else adapter
-    if consumer is None:
-        raise RuntimeError(
-            "legacy-adapter workload declaration returned no legacy_consumer"
-        )
-    return cast(object, consumer)
+    return definition.legacy_consumer.build(instance)
 
 
-def consumer_spec(consumer: object) -> "ConsumerSpec":
-    from tllm.runtime.consumer_plugins import spec_for_consumer  # pyright: ignore[reportUnknownVariableType]
+def consumer_spec(consumer: BaseConsumer[object]) -> "ConsumerSpec":
+    from tllm.runtime.consumer_plugins import spec_for_consumer
 
-    return cast(
-        "ConsumerSpec",
-        cast(Any, spec_for_consumer)(consumer),  # pyright: ignore[reportUnknownVariableType]
-    )
+    return spec_for_consumer(consumer)
 
 
-def register_legacy_consumer(consumer: object) -> None:
-    from tllm.runtime import residual_runtime
+def register_legacy_consumer(consumer: BaseConsumer[object]) -> None:
+    from tllm.runtime.residual_runtime import register_dispatch_consumer
 
-    cast(
-        Any,
-        residual_runtime.register_dispatch_consumer,  # pyright: ignore[reportUnknownMemberType]
-    )(consumer)
+    register_dispatch_consumer(consumer)
 
 
 __all__ = [

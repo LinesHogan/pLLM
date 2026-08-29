@@ -49,7 +49,6 @@ class ExternIODeclarationUnitTest(unittest.TestCase):
         effect = extern_io("trace:file")
         self.assertIs(effect.kind, EffectKind.EXTERN_IO)
         self.assertEqual(effect.resource_name, "trace:file")
-        self.assertIsNone(effect.state)
 
     def test_extern_io_rejects_empty_and_state_bound_forms(self) -> None:
         with self.assertRaises((TypeError, ValueError)):
@@ -59,14 +58,12 @@ class ExternIODeclarationUnitTest(unittest.TestCase):
         state = State(
             scope=StateScope.REPLICA,
             parameters="weights",
-            optimizer=AdamWSpec(lr=1e-3),
+            optimizer=AdamWSpec.fixed(1e-3),
         )
         from tllm.workload.frontend import StateEffect
 
-        with self.assertRaisesRegex(ValueError, "external resource"):
+        with self.assertRaisesRegex(ValueError, "ExternalEffect"):
             StateEffect(EffectKind.EXTERN_IO, state)
-        with self.assertRaisesRegex(ValueError, "raw resource"):
-            StateEffect(EffectKind.READ, state, "trace:file")
 
     def test_extern_channel_colliding_with_a_state_name_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "collides with a state name"):
@@ -76,7 +73,7 @@ class ExternIODeclarationUnitTest(unittest.TestCase):
                 bank = State(
                     scope=StateScope.REPLICA,
                     parameters="weights",
-                    optimizer=AdamWSpec(lr=1e-3),
+                    optimizer=AdamWSpec.fixed(1e-3),
                 )
 
                 @task(
@@ -127,7 +124,7 @@ class ExternIOCompileUnitTest(unittest.TestCase):
             bank = State(
                 scope=StateScope.REPLICA,
                 parameters="weights",
-                optimizer=AdamWSpec(lr=1e-3),
+                optimizer=AdamWSpec.fixed(1e-3),
             )
 
             @task(

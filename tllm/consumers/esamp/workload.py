@@ -15,6 +15,7 @@ from tllm.workload import (
     Before,
     Between,
     ConfigField,
+    ConfigKind,
     NumericConstraint,
     State,
     TrainableState,
@@ -28,37 +29,38 @@ from tllm.workload import (
 )
 
 
-_ESAMP_ENABLED = ConfigField(True)
+_ESAMP_ENABLED = ConfigField.boolean(True)
+_ESAMP_DISTILLER_LR = ConfigField.floating(
+    1e-3, NumericConstraint.POSITIVE
+)
 
 
 class ESampConfig(WorkloadConfig):
     source_layer_path: str = config_field(
-        default="model.model.layers[0].input_layernorm"
+        default="model.model.layers[0].input_layernorm", kind=ConfigKind.STR
     )
     target_layer_path: str = config_field(
-        default="model.model.layers[-1].input_layernorm"
+        default="model.model.layers[-1].input_layernorm", kind=ConfigKind.STR
     )
     enabled: bool = cast(bool, _ESAMP_ENABLED)
     distiller_hidden_dim: int = config_field(
-        default=128, constraint=NumericConstraint.POSITIVE
+        default=128, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
-    distiller_lr: float = config_field(
-        default=1e-3, constraint=NumericConstraint.POSITIVE
-    )
-    output_layernorm: bool = config_field(default=True)
-    intervention: bool = config_field(default=False)
+    distiller_lr: float = cast(float, _ESAMP_DISTILLER_LR)
+    output_layernorm: bool = config_field(default=True, kind=ConfigKind.BOOL)
+    intervention: bool = config_field(default=False, kind=ConfigKind.BOOL)
     distiller_beta: float = config_field(
-        default=0.0, constraint=NumericConstraint.NONNEGATIVE
+        default=0.0, kind=ConfigKind.FLOAT, constraint=NumericConstraint.NONNEGATIVE
     )
     sampler_backend: Literal["post_filter_exact"] = config_field(
-        default="post_filter_exact"
+        default="post_filter_exact", kind=ConfigKind.STR
     )
 
 
 class ESampWorkload(Workload[ESampConfig]):
     distiller: State[LowRankGatedResidualModel] = (
         State[LowRankGatedResidualModel].replica(
-            optimizer=AdamWSpec(lr=ESampConfig.distiller_lr)
+            optimizer=AdamWSpec.configured(_ESAMP_DISTILLER_LR)
         )
     )
 

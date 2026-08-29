@@ -37,7 +37,7 @@ from tllm.runtime.mp.worker_extension import (
 )
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
-    ReconstructedWorkload,
+    NoWorkloadRuntimeBinding,
     WorkloadWorkerSpec,
     reconstruct_worker_bindings,
     static_backend_binding_manifest_wire,
@@ -59,14 +59,14 @@ class _NativeMPWorkload:
 
 def _reconstruct_native_mp_workload(
     _config: object,
-) -> ReconstructedWorkload:
-    return ReconstructedWorkload(_NativeMPWorkload())
+) -> WorkloadRuntimeBinding:
+    return WorkloadRuntimeBinding(_NativeMPWorkload())
 
 
 def _reconstruct_native_mp_workload_with_static_binding(
     _config: object,
-) -> ReconstructedWorkload:
-    return ReconstructedWorkload(
+) -> WorkloadRuntimeBinding:
+    return WorkloadRuntimeBinding(
         _NativeMPWorkload(),
         specialization_key={"algorithm": "worker-only-static-binding"},
     )
@@ -835,7 +835,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
         self.assertEqual(
             compilation.options.static_binding_manifest, expected_manifest
         )
-        self.assertIsNone(bindings.static_binding_entries[0][1])
+        self.assertEqual(
+            bindings.static_binding_entries[0][1], NoWorkloadRuntimeBinding()
+        )
         self.assertEqual(
             static_backend_binding_manifest_wire(bindings.static_binding_entries),
             expected_manifest,

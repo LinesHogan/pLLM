@@ -23,6 +23,7 @@ import torch
 from tllm.runtime import residual_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import WorkloadExecutionBindings
+from tllm.runtime.workload_bindings import RuntimeOutputBinding, RuntimePortRegistry
 from tllm.schedule import (
     CompileOptions,
     MainWorkloadTimeline,
@@ -123,11 +124,15 @@ def main() -> None:
     state = ResidualRuntimeState()
     bindings = WorkloadExecutionBindings(
         declarations=(declaration,),
-        output_sinks={
-            "answer": lambda value, step_id: observer.outputs.append(
-                (step_id, cast(torch.Tensor, value))
-            )
-        },
+        ports=RuntimePortRegistry(
+            outputs={
+                "answer": RuntimeOutputBinding(
+                    lambda value, step_id: observer.outputs.append(
+                        (step_id, cast(torch.Tensor, value))
+                    )
+                )
+            }
+        ),
     )
 
     with mock.patch.object(residual_runtime, "RUNTIME", state):

@@ -22,6 +22,7 @@ from tllm.workload import (
     Before,
     Between,
     ConfigField,
+    ConfigKind,
     HostOutput,
     NumericConstraint,
     State,
@@ -40,19 +41,20 @@ from tllm.workload import (
 )
 
 
-_TTRL_ENABLED = ConfigField(True)
+_TTRL_ENABLED = ConfigField.boolean(True)
+_TTRL_LEARNING_RATE = ConfigField.floating(
+    1e-3, NumericConstraint.POSITIVE
+)
 
 
 class TTRLConfig(WorkloadConfig):
-    consumer_id: str = config_field(default="ttrl")
+    consumer_id: str = config_field(default="ttrl", kind=ConfigKind.STR)
     enabled: bool = cast(bool, _TTRL_ENABLED)
     hidden_size: int = config_field(
-        default=0, constraint=NumericConstraint.NONNEGATIVE
+        default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
-    rank: int = config_field(default=16, constraint=NumericConstraint.POSITIVE)
-    learning_rate: float = config_field(
-        default=1e-3, constraint=NumericConstraint.POSITIVE
-    )
+    rank: int = config_field(default=16, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE)
+    learning_rate: float = cast(float, _TTRL_LEARNING_RATE)
 
 
 class TTRLRewardHead(torch.nn.Module):
@@ -114,7 +116,7 @@ def prepare_ttrl_training_batch(
 
 class TTRLWorkload(Workload[TTRLConfig]):
     reward_model: State[TTRLRewardHead] = State[TTRLRewardHead].replica(
-        optimizer=AdamSpec(lr=TTRLConfig.learning_rate)
+        optimizer=AdamSpec.configured(_TTRL_LEARNING_RATE)
     )
     train_hidden: StagedPort[torch.Tensor] = StagedPort()
     train_rewards: StagedPort[torch.Tensor] = StagedPort()

@@ -161,14 +161,14 @@ def install_reft_patch(
 
 
 def install_reft_patch_on_llm(
-    llm: object, runtime: TllmRuntime
+    llm: object, runtime: TllmRuntime[ReftWorkload]
 ) -> ReftPatchHandle:
     runner = llm.llm_engine.model_executor.driver_worker.model_runner  # type: ignore[attr-defined]
-    workload = runtime.local_workload(ReftWorkload)
+    workload = runtime.local_workload(runtime.workloads[0])
     return _install_reft_patch(
         runner.model,
         workload,
-        lambda: runtime.local_workload(ReftWorkload),
+        lambda: runtime.local_workload(workload),
     )
 
 

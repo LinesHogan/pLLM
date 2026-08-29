@@ -151,14 +151,14 @@ def registered_consumers() -> tuple[str, ...]:
     )
 
 
-def build_consumer(name: str, config: object | None) -> BaseConsumer:
+def build_consumer(name: str, config: object | None) -> BaseConsumer[object]:
     consumer = _load_plugin(name).build(config)
     if not isinstance(consumer, BaseConsumer):
         raise TypeError(f"consumer plugin `{name}` did not build a BaseConsumer")
     return consumer
 
 
-def spec_for_consumer(consumer: BaseConsumer) -> ConsumerSpec:
+def spec_for_consumer(consumer: BaseConsumer[object]) -> ConsumerSpec:
     """Describe a live consumer as a JSON-safe (name, config) pair.
 
     The reverse lookup uses the consumer/config types registered alongside
@@ -188,7 +188,7 @@ def describe_consumer_or_none(consumer: BaseConsumer) -> ConsumerSpec | None:
         return None
 
 
-def build_consumer_from_spec(spec: ConsumerSpec) -> BaseConsumer:
+def build_consumer_from_spec(spec: ConsumerSpec) -> BaseConsumer[object]:
     """Rebuild a consumer from its spec (child-process bootstrap path)."""
     key = str(spec.name).strip()
     try:
@@ -199,7 +199,9 @@ def build_consumer_from_spec(spec: ConsumerSpec) -> BaseConsumer:
     return build_consumer(key, dataclass_from_dict(plugin.config_type, spec.config))
 
 
-def activate_consumer(consumer: BaseConsumer, *, primary: bool = False) -> BaseConsumer:
+def activate_consumer(
+    consumer: BaseConsumer[object], *, primary: bool = False
+) -> BaseConsumer[object]:
     """Bind a built consumer to the default runtime.
 
     ``primary=True`` installs it as THE runtime consumer (ESamp-style);

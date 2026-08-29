@@ -15,7 +15,7 @@ from tllm.contracts.shape_specialization import (
 )
 from tllm.runtime.runtime import TllmRuntime
 from tllm.schedule import CompileOptions
-from tllm.workload import Between, provided, task, workload
+from tllm.workload import Between, StagedPort, staged, task, workload
 
 
 _DIGEST_A = "a" * 64
@@ -104,8 +104,10 @@ class RegionShapeSpecializationContractTest(unittest.TestCase):
     def test_runtime_recompiles_matching_request_with_a_new_epoch(self) -> None:
         @workload(id="shape.specialization.runtime")
         class Auxiliary:
+            value: StagedPort[torch.Tensor] = StagedPort()
+
             @task(
-                inputs={"value": provided("value")},
+                inputs={"value": staged(value)},
                 timing=Between("model.execute", "step.end"),
             )
             def run(self, value: torch.Tensor) -> None:
@@ -114,7 +116,6 @@ class RegionShapeSpecializationContractTest(unittest.TestCase):
         runtime = TllmRuntime(
             workloads=(Auxiliary(),),
             workload_memory_budget_bytes=1 << 20,
-            workload_provided_inputs={"value": lambda _step: torch.ones((2, 4))},
         )
         timeline = export_main_workload_timeline(
             BackendCapabilities(
@@ -224,8 +225,10 @@ class RegionShapeSpecializationContractTest(unittest.TestCase):
     def test_rust_shape_merge_rejects_conflicting_region_observations(self) -> None:
         @workload(id="shape.specialization.conflict")
         class Auxiliary:
+            value: StagedPort[torch.Tensor] = StagedPort()
+
             @task(
-                inputs={"value": provided("value")},
+                inputs={"value": staged(value)},
                 timing=Between("model.execute", "step.end"),
             )
             def run(self, value: torch.Tensor) -> None:
@@ -234,7 +237,6 @@ class RegionShapeSpecializationContractTest(unittest.TestCase):
         runtime = TllmRuntime(
             workloads=(Auxiliary(),),
             workload_memory_budget_bytes=1 << 20,
-            workload_provided_inputs={"value": lambda _step: torch.ones((2, 4))},
         )
         timeline = export_main_workload_timeline(
             BackendCapabilities(

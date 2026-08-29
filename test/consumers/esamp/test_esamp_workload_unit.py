@@ -105,7 +105,7 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
     """Drive the real signed sink path: task output -> auto-bound store."""
     prediction, _loss = workload.predict_and_loss(torch.randn(2, 4), torch.randn(2, 4))
     with mock.patch.object(residual_runtime, "RUNTIME", _decode_state(2)):
-        workload.native_workload_resources().ports.outputs["guidance"](
+        workload.native_workload_resources().ports.outputs["guidance"].publish(
             prediction, step_id
         )
     return prediction
@@ -186,7 +186,9 @@ class ESampRegionUnitTest(unittest.TestCase):
                 initial.decision.execution_regions[0].artifact_key,
             )
             self.assertIs(old_store.current, old_execution)
-            self.assertIsNotNone(old_store.staged)
+            from tllm.runtime.workload_execution import StagedExecution
+
+            self.assertIsInstance(old_store.staged, StagedExecution)
             self.assertTrue(old_execution._value_store.is_enabled())
             self.assertIs(workload.distiller, initial_model)
             self.assertIs(workload.optimizer, initial_optimizer)
@@ -292,9 +294,9 @@ class ESampRegionUnitTest(unittest.TestCase):
             bindings.declarations[0].ir.semantic_key,
             declare_workload(workload).ir.semantic_key,
         )
-        self.assertEqual(set(bindings.output_sinks), {"guidance"})
+        self.assertEqual(set(bindings.ports.outputs), {"guidance"})
         self.assertEqual(set(bindings.state_versions), {"distiller"})
-        self.assertIsNotNone(bindings.sampler_provider)
+        self.assertIs(type(bindings.sampler), SamplerRuntimeBinding)
 
     def test_worker_reconstruction_rejects_a_signed_specialization_mismatch(self) -> None:
         workload = ESampWorkload(_config())

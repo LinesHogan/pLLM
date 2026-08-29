@@ -93,18 +93,33 @@ def main() -> int:
             raise AssertionError("native Dummy decision was not bound to an executor")
         expected_report = ((region_id, artifact_key),)
         store = core.RUNTIME.workload_execution_store
-        installed = (execution,) if store is None else (store.current, store.staged)
+        installed = [execution]
+        if store is not None:
+            from tllm.runtime.workload_execution import StagedExecution
+
+            installed = [store.current]
+            match store.staged:
+                case StagedExecution(execution=staged_execution):
+                    installed.append(staged_execution)
+                case _:
+                    pass
         if not any(
-            candidate is not None and candidate.artifact_report == expected_report
+            candidate.artifact_report == expected_report
             for candidate in installed
         ):
             raise AssertionError(
                 "native artifact report does not match the signed decision: "
-                f"installed={tuple(candidate.artifact_report for candidate in installed if candidate is not None)!r}, "
+                f"installed={tuple(candidate.artifact_report for candidate in installed)!r}, "
                 f"expected={expected_report!r}"
             )
-        if store is not None and store.staged is not None and not store.staged_activated:
-            raise AssertionError("coordinated Dummy epoch was staged but not activated")
+        if store is not None:
+            match store.staged:
+                case StagedExecution(activated=False):
+                    raise AssertionError(
+                        "coordinated Dummy epoch was staged but not activated"
+                    )
+                case _:
+                    pass
 
         outputs = llm.generate(
             [

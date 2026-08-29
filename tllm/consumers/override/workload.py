@@ -14,6 +14,7 @@ from tllm.workload import (
     Before,
     Between,
     ConfigField,
+    ConfigKind,
     NumericConstraint,
     State,
     TrainableState,
@@ -31,26 +32,27 @@ from tllm.workload import (
 )
 
 
-_OVERRIDE_ENABLED = ConfigField(True)
+_OVERRIDE_ENABLED = ConfigField.boolean(True)
+_OVERRIDE_LEARNING_RATE = ConfigField.floating(
+    1e-3, NumericConstraint.POSITIVE
+)
 
 
 class OverRIDEConfig(WorkloadConfig):
     enabled: bool = cast(bool, _OVERRIDE_ENABLED)
     hidden_size: int = config_field(
-        default=0, constraint=NumericConstraint.NONNEGATIVE
+        default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     vocab_size: int = config_field(
-        default=151936, constraint=NumericConstraint.POSITIVE
+        default=151936, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
-    rank: int = config_field(default=16, constraint=NumericConstraint.POSITIVE)
+    rank: int = config_field(default=16, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE)
     num_iterations: int = config_field(
-        default=10, constraint=NumericConstraint.POSITIVE
+        default=10, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
-    lambd: float = config_field(default=0.8)
-    learning_rate: float = config_field(
-        default=1e-3, constraint=NumericConstraint.POSITIVE
-    )
-    source_layer_path: str = config_field(default="model.model.norm")
+    lambd: float = config_field(default=0.8, kind=ConfigKind.FLOAT)
+    learning_rate: float = cast(float, _OVERRIDE_LEARNING_RATE)
+    source_layer_path: str = config_field(default="model.model.norm", kind=ConfigKind.STR)
 
 
 class OverRIDEHeads(torch.nn.Module):
@@ -88,7 +90,7 @@ def iteration_from_request_id(request_id: str) -> int:
 
 class OverRIDEWorkload(Workload[OverRIDEConfig]):
     heads: State[OverRIDEHeads] = State[OverRIDEHeads].replica(
-        optimizer=AdamSpec(lr=OverRIDEConfig.learning_rate)
+        optimizer=AdamSpec.configured(_OVERRIDE_LEARNING_RATE)
     )
 
     @heads.initialize

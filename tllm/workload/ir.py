@@ -10,9 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, StrEnum
-from typing import Mapping, TypeGuard
+from typing import Mapping, cast
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 
@@ -44,9 +44,8 @@ class ApproximationCriteria:
     atol: float
 
     def __post_init__(self) -> None:
-        for name in ("rtol", "atol"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+        for name, value in (("rtol", self.rtol), ("atol", self.atol)):
+            if isinstance(value, bool):
                 raise TypeError(f"ApproximationCriteria.{name} must be a real number")
             coerced = float(value)
             if not math.isfinite(coerced) or coerced < 0.0:
@@ -316,14 +315,6 @@ class WorkloadEdge:
         object.__setattr__(self, "kind", WorkloadEdgeKind(self.kind))
 
 
-def _is_object_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
-    return isinstance(value, tuple)
-
-
-def _is_object_mapping(value: object) -> TypeGuard[Mapping[object, object]]:
-    return isinstance(value, Mapping)
-
-
 def canonical_value(value: object) -> object:
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -331,19 +322,16 @@ def canonical_value(value: object) -> object:
         return value.hex()
     if isinstance(value, Enum):
         return value.value
-    if _is_object_tuple(value):
-        return [canonical_value(item) for item in value]
-    if _is_object_mapping(value):
+    if isinstance(value, tuple):
+        return [canonical_value(item) for item in cast(tuple[object, ...], value)]
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
         return {
             str(key): canonical_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            for key, item in sorted(mapping.items(), key=lambda pair: str(pair[0]))
         }
     if is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: canonical_value(getattr(value, field.name))
-            for field in fields(value)
-            if field.name != "semantic_key"
-        }
+        return canonical_value(asdict(value))
     raise TypeError(f"workload IR cannot serialize {type(value).__module__}.{type(value).__qualname__}")
 
 

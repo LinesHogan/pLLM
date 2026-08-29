@@ -21,11 +21,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping
 from threading import RLock
-from typing import TYPE_CHECKING, Protocol, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, Never, Protocol, Sequence, TypeVar, cast
+from typing_extensions import TypeVar as TypeVarWithDefault
 import warnings
 from uuid import uuid4
 
+from tllm.ports.consumer import BaseConsumer
+from tllm.producers.base import ProducerDescriptor
 from tllm.runtime.declaration_adapter import (
+    DeclarationDefinition,
     consumer_spec,
     legacy_consumer,
     register_legacy_consumer,
@@ -34,12 +38,14 @@ from tllm.runtime.declaration_adapter import (
 from tllm.runtime.workload_bindings import (
     DiagnosticsRuntimeServices,
     LocalRuntimeServices,
-    NoPerRequestStats,
     NoRuntimeServices,
     NoSamplerBinding,
     NoWorkerBinding,
-    PerRequestStats,
+    RuntimePortRegistry,
+    RuntimeInputBinding,
+    RuntimeOutputBinding,
     SamplerRuntimeBinding,
+    WorkloadRuntimeBinding,
     WorkerRuntimeBinding,
 )
 from tllm.runtime.vllm_adapter import (
@@ -53,15 +59,13 @@ from tllm.runtime.torch_adapter import runtime_torch_values
 
 if TYPE_CHECKING:
     import torch
-    from tllm.contracts.consumer_stats import TrainingStats
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.runtime.mp.control import ControlPlane
-    from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_plugins import (
-        NativeWorkloadResources,
+        StaticBackendBindingEntry,
         WorkloadWorkerSpec,
     )
     from tllm.workload.staging import StagedPort
@@ -76,11 +80,15 @@ if TYPE_CHECKING:
 
 
 # The runtime the process-wide class hooks currently dispatch to.
-_active_runtime: "TllmRuntime | None" = None
+_active_runtime: "TllmRuntime[object] | None" = None
 StagedT = TypeVar("StagedT")
 HostOutputT = TypeVar("HostOutputT")
 RuntimeWorkloadT = TypeVar("RuntimeWorkloadT")
 PublishedModuleT = TypeVar("PublishedModuleT", bound="torch.nn.Module")
+
+ConfiguredWorkloadT = TypeVarWithDefault(
+    "ConfiguredWorkloadT", default=Never
+)
 
 
 class _StagedWorkload(Protocol[StagedT]):
@@ -101,14 +109,14 @@ class _HostOutputWorkload(Protocol[HostOutputT]):
     ) -> tuple[HostOutputT, ...]: ...
 
 
-def bind_runner_runtime(runner: object, runtime: "TllmRuntime") -> None:
+def bind_runner_runtime(runner: object, runtime: "TllmRuntime[object]") -> None:
     bind_runner_owner(runner, runtime)
 
 
 
-def active_runtime() -> "TllmRuntime":
+def active_runtime() -> "TllmRuntime[object]":
     if _active_runtime is None:
-        return default_runtime()
+        return cast("TllmRuntime[object]", default_runtime())
     return _active_runtime
 
 
@@ -146,11 +154,17 @@ def _runtime_specialization_spec_from_wire(
     )
 
 
-class TllmRuntime:
+class TllmRuntime(Generic[ConfiguredWorkloadT]):
     def local_workload(
+        self, workload: ConfiguredWorkloadT
+    ) -> ConfiguredWorkloadT:
+        """Resolve an installed workload exemplar in the active local epoch."""
+
+        return self._local_workload_by_type(type(workload))
+
+    def _local_workload_by_type(
         self, workload_type: type[RuntimeWorkloadT]
     ) -> RuntimeWorkloadT:
-        """Return the process-local instance that executes this workload type."""
 
         self._require_workload_live()
         from tllm.runtime import residual_runtime
@@ -212,7 +226,7 @@ class TllmRuntime:
 
         self._require_workload_live()
         workload = cast(
-            "_StagedWorkload[StagedT]", self.local_workload(port.owner)
+            "_StagedWorkload[StagedT]", self._local_workload_by_type(port.owner)
         )
         from tllm.runtime.mp.control import active_control_plane
 
@@ -313,21 +327,14 @@ class TllmRuntime:
         self,
         *,
         backend: str = "auto",
-        producers: Sequence[object] = (),
-        consumers: Sequence[object] = (),
-        workloads: Sequence[object] = (),
+        producers: Sequence[ProducerDescriptor] = (),
+        consumers: Sequence[BaseConsumer[object]] = (),
+        workloads: Sequence[ConfiguredWorkloadT] = (),
         workload_memory_budget_bytes: int = 0,
         workload_allow_serial_fallback: bool = True,
         workload_allow_side_stream: bool = False,
         workload_persistent_state_bytes: int = 0,
         workload_decision_cache_directory: str | None = None,
-        workload_provided_inputs: Mapping[str, Callable[[int], object]] | None = None,
-        workload_output_sinks: Mapping[
-            str, Callable[[object, int], None]
-        ] | None = None,
-        workload_state_snapshots: Mapping[
-            str, Callable[[int], Mapping[Hashable, int]]
-        ] | None = None,
         workload_worker_specs: Sequence["WorkloadWorkerSpec"] = (),
     ) -> None:
         if backend != "auto":
@@ -335,14 +342,14 @@ class TllmRuntime:
                 f"backend={backend!r}: only 'auto' is supported; backend selection "
                 "is structural (tllm.backends)"
             )
-        self.producers: tuple[object, ...] = tuple(producers)
-        self._workloads: list[object] = list(workloads)
+        self.producers: tuple[ProducerDescriptor, ...] = tuple(producers)
+        self._workloads: tuple[ConfiguredWorkloadT, ...] = tuple(workloads)
         self._workloads_by_type: dict[type[object], object] = {
             type(workload): workload for workload in self._workloads
         }
-        self._consumers: list[object] = list(consumers)
+        self._consumers: list[BaseConsumer[object]] = list(consumers)
         self._unadapted_workload_ids: list[str] = []
-        self._native_workload_resources: dict[int, "NativeWorkloadResources"] = {}
+        self._native_workload_resources: dict[int, WorkloadRuntimeBinding] = {}
         from tllm.schedule import CompileOptions
 
         self._workload_compile_options = CompileOptions(
@@ -358,9 +365,6 @@ class TllmRuntime:
                 "workload_decision_cache_directory must be a non-empty str or None"
             )
         self._workload_decision_cache_directory = workload_decision_cache_directory
-        self._workload_provided_inputs = dict(workload_provided_inputs or {})
-        self._workload_output_sinks = dict(workload_output_sinks or {})
-        self._workload_state_snapshots = dict(workload_state_snapshots or {})
         self._workload_worker_specs: tuple["WorkloadWorkerSpec", ...] = tuple(
             workload_worker_specs
         )
@@ -376,16 +380,24 @@ class TllmRuntime:
         self._port_transaction_owner = uuid4().hex
         self._port_transaction_sequence = 0
         self._shape_specialization_poll_lock = RLock()
+        native_workloads: list[
+            tuple[ConfiguredWorkloadT, DeclarationDefinition]
+        ] = []
         for workload_instance in self._workloads:
             definition = workload_definition(workload_instance)
+            if definition is None:
+                raise TypeError(
+                    "workloads must be declared with @workload; pass legacy "
+                    "consumers through consumers="
+                )
             consumer = legacy_consumer(workload_instance, definition)
             if consumer is None:
-                if definition is None:
-                    raise RuntimeError("native workload has no definition")
+                native_workloads.append((workload_instance, definition))
                 self._record_native_resources(workload_instance)
                 self._unadapted_workload_ids.append(definition.workload_id)
             elif consumer not in self._consumers:
                 self._consumers.append(consumer)
+        self._native_workloads = tuple(native_workloads)
         resource_worker_specs: list["WorkloadWorkerSpec"] = []
         for resources in self._native_workload_resources.values():
             match resources.worker:
@@ -411,29 +423,30 @@ class TllmRuntime:
     def _refresh_resource_specialization_options(self) -> None:
         from dataclasses import replace
         from tllm.runtime.workload_plugins import (
+            NoWorkloadRuntimeBinding,
             residual_resource_manifest_from_paths,
             static_backend_binding_manifest_wire,
         )
 
         entries: list[tuple[str, str]] = []
         native_resource_entries: list[
-            tuple[str, "NativeWorkloadResources | None"]
+            tuple[str, "WorkloadRuntimeBinding | NoWorkloadRuntimeBinding"]
         ] = []
         residual_paths: dict["ResidualLocator", str] = {}
-        for workload_instance in self._workloads:
-            if not self._is_native_workload_declaration(workload_instance):
-                continue
+        for workload_instance, definition in self._native_workloads:
             resources = self._native_workload_resources.get(id(workload_instance))
-            definition = workload_definition(workload_instance)
-            if definition is None:
-                continue
             workload_id = definition.workload_id
             if resources is not None:
                 entries.extend(
                     (f"{workload_id}/{name}", value)
                     for name, value in resources.specialization_key.items()
                 )
-            native_resource_entries.append((workload_id, resources))
+            native_resource_entries.append(
+                (
+                    workload_id,
+                    NoWorkloadRuntimeBinding() if resources is None else resources,
+                )
+            )
             if resources is None:
                 continue
             overlap = set(residual_paths).intersection(resources.residual_paths)
@@ -450,14 +463,7 @@ class TllmRuntime:
         normalized = tuple(sorted((*entries, *runtime_entries)))
         if len({name for name, _value in normalized}) != len(normalized):
             raise RuntimeError("native workload specialization keys must be unique")
-        static_binding_entries: tuple[
-            tuple[
-                str,
-                "NativeWorkloadResources | None",
-                "WorkloadWorkerSpec",
-            ],
-            ...,
-        ] = ()
+        static_binding_entries: tuple["StaticBackendBindingEntry", ...] = ()
         if self._workload_worker_specs:
             if len(self._workload_worker_specs) != len(native_resource_entries):
                 raise RuntimeError(
@@ -525,21 +531,12 @@ class TllmRuntime:
             raise RuntimeError("native workload resources belong to another instance")
         self._native_workload_resources[id(workload_instance)] = resources
 
-    @staticmethod
-    def _is_native_workload_declaration(workload_instance: object) -> bool:
-        definition = workload_definition(workload_instance)
-        if definition is None:
-            return False
-        from tllm.workload import WorkloadAuthority
-
-        return definition.authority is WorkloadAuthority.NATIVE_REGION
+    @property
+    def workloads(self) -> tuple[ConfiguredWorkloadT, ...]:
+        return self._workloads
 
     @property
-    def workloads(self) -> tuple[object, ...]:
-        return tuple(self._workloads)
-
-    @property
-    def consumers(self) -> tuple[object, ...]:
+    def consumers(self) -> tuple[BaseConsumer[object], ...]:
         return tuple(self._consumers)
 
     @property
@@ -565,12 +562,15 @@ class TllmRuntime:
                 "one compilation cannot mix native Region authority with legacy adapters"
             )
         from tllm.runtime.workload_execution import (
+            ExecutionLifecycleBinding,
+            NoExecutionLifecycle,
             StateVersionBinding,
             WorkloadExecutionBindings,
         )
+        from tllm.runtime.workload_plugins import NoWorkloadRuntimeBinding
 
         state_by_resource = {state.resource: state for state in compiler.graph.states}
-        static_binding_entries: tuple[object, ...] = ()
+        static_binding_entries: tuple["StaticBackendBindingEntry", ...] = ()
         if self._workload_worker_specs:
             if len(self._workload_worker_specs) != len(declarations):
                 raise RuntimeError(
@@ -579,7 +579,9 @@ class TllmRuntime:
             static_binding_entries = tuple(
                 (
                     declaration.ir.workload_id,
-                    self._native_workload_resources.get(id(declaration.instance)),
+                    self._native_workload_resources.get(
+                        id(declaration.instance), NoWorkloadRuntimeBinding()
+                    ),
                     spec,
                 )
                 for declaration, spec in zip(
@@ -588,20 +590,14 @@ class TllmRuntime:
                     strict=True,
                 )
             )
-        provided_inputs = dict(self._workload_provided_inputs)
-        output_sinks = dict(self._workload_output_sinks)
-        snapshots = dict(self._workload_state_snapshots)
-        sampler_providers: list["SamplerModifierProvider"] = []
+        provided_inputs: dict[str, RuntimeInputBinding[object]] = {}
+        output_sinks: dict[str, RuntimeOutputBinding[object]] = {}
+        snapshots: dict[str, Callable[[int], Mapping[Hashable, int]]] = {}
+        sampler_bindings: list[SamplerRuntimeBinding] = []
         diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
         residual_paths: dict["ResidualLocator", str] = {}
         backend_region_binders: dict[str, "BackendRegionBinderSlot"] = {}
-        stats_readers: list[Callable[[bool], "TrainingStats"]] = []
-        per_request_stats_readers: list[
-            Callable[[bool], Mapping[int, "TrainingStats"]]
-        ] = []
-        enabled_setters: list[Callable[[bool], None]] = []
-        enabled_predicates: list[Callable[[], bool]] = []
-        synchronizers: list[Callable[[], None]] = []
+        lifecycle_services: list[LocalRuntimeServices] = []
         multiple = len(declarations) > 1
         for declaration in declarations:
             resources = self._native_workload_resources.get(id(declaration.instance))
@@ -637,23 +633,15 @@ class TllmRuntime:
                     )
                 snapshots[resource] = snapshot
             match resources.sampler:
-                case SamplerRuntimeBinding(provider=provider):
-                    sampler_providers.append(provider)
+                case SamplerRuntimeBinding() as sampler:
+                    sampler_bindings.append(sampler)
                 case NoSamplerBinding():
                     pass
 
             match resources.services:
                 case LocalRuntimeServices() as services:
                     diagnostic_callbacks = (services.diagnostics,)
-                    stats_readers.append(services.stats)
-                    enabled_setters.append(services.set_enabled)
-                    enabled_predicates.append(services.is_enabled)
-                    synchronizers.append(services.synchronize)
-                    match services.per_request_stats:
-                        case PerRequestStats(read=read):
-                            per_request_stats_readers.append(read)
-                        case NoPerRequestStats():
-                            pass
+                    lifecycle_services.append(services)
                 case DiagnosticsRuntimeServices(diagnostics=diagnostics):
                     diagnostic_callbacks = (diagnostics,)
                 case NoRuntimeServices():
@@ -682,23 +670,11 @@ class TllmRuntime:
                     + ", ".join(sorted(binder_overlap))
                 )
             backend_region_binders.update(resources.backend.binders)
-        if len(sampler_providers) > 1:
+        if len(sampler_bindings) > 1:
             raise RuntimeError("native Region plan supports at most one sampler provider")
-        duplicates = tuple(
-            attribute
-            for attribute, count in (
-                ("stats_reader", len(stats_readers)),
-                ("per_request_stats_reader", len(per_request_stats_readers)),
-                ("enabled_setter", len(enabled_setters)),
-                ("enabled_predicate", len(enabled_predicates)),
-                ("synchronizer", len(synchronizers)),
-            )
-            if count > 1
-        )
-        if duplicates:
+        if len(lifecycle_services) > 1:
             raise RuntimeError(
-                "native Region plan has ambiguous lifecycle callbacks: "
-                + ", ".join(duplicates)
+                "native Region plan has multiple lifecycle service bindings"
             )
         state_versions: dict[str, StateVersionBinding] = {}
         for resource, snapshot in snapshots.items():
@@ -706,30 +682,29 @@ class TllmRuntime:
                 state = state_by_resource[resource]
             except KeyError as exc:
                 raise RuntimeError(
-                    f"workload_state_snapshots references unknown state {resource!r}"
+                    f"native workload binding references unknown state {resource!r}"
                 ) from exc
             state_versions[resource] = StateVersionBinding(state, snapshot)
 
         return WorkloadExecutionBindings(
             declarations=declarations,
-            provided_inputs=provided_inputs,
-            output_sinks=output_sinks,
+            ports=RuntimePortRegistry(
+                inputs=provided_inputs,
+                outputs=output_sinks,
+            ),
             state_versions=state_versions,
-            sampler_provider=(
-                None if not sampler_providers else sampler_providers[0]
-            ),
+            sampler=(NoSamplerBinding() if not sampler_bindings else sampler_bindings[0]),
             diagnostics_readers=diagnostics_readers,
-            stats_reader=None if not stats_readers else stats_readers[0],
-            per_request_stats_reader=(
-                None
-                if not per_request_stats_readers
-                else per_request_stats_readers[0]
+            lifecycle=(
+                NoExecutionLifecycle()
+                if not lifecycle_services
+                else ExecutionLifecycleBinding(
+                    stats=lifecycle_services[0].stats,
+                    is_enabled=lifecycle_services[0].is_enabled,
+                    synchronize=lifecycle_services[0].synchronize,
+                    per_request_stats=lifecycle_services[0].per_request_stats,
+                )
             ),
-            enabled_setter=None if not enabled_setters else enabled_setters[0],
-            enabled_predicate=(
-                None if not enabled_predicates else enabled_predicates[0]
-            ),
-            synchronizer=None if not synchronizers else synchronizers[0],
             residual_paths=residual_paths,
             backend_region_binders=backend_region_binders,
             static_binding_entries=static_binding_entries,
@@ -796,8 +771,7 @@ class TllmRuntime:
 
         declarations = tuple(
             declare_workload(workload_instance)
-            for workload_instance in self._workloads
-            if self._is_native_workload_declaration(workload_instance)
+            for workload_instance, _definition in self._native_workloads
         )
         self._workload_compiler = (
             None
@@ -844,13 +818,18 @@ class TllmRuntime:
                     "epoch awaits finalization"
                 )
             from tllm.runtime import residual_runtime
+            from tllm.runtime.workload_execution import StagedExecution
 
             store = residual_runtime.RUNTIME.workload_execution_store
-            if store is not None and store.staged is not None:
-                raise RuntimeError(
-                    "cannot change native enable semantics while a workload epoch "
-                    "is already staged"
-                )
+            if store is not None:
+                match store.staged:
+                    case StagedExecution():
+                        raise RuntimeError(
+                            "cannot change native enable semantics while a workload "
+                            "epoch is already staged"
+                        )
+                    case _:
+                        pass
             # Worker reconstruction creates fresh ESamp model/optimizer state.
             # Until that state has an explicit epoch-to-epoch migration contract,
             # MP must reject a live semantic toggle rather than reset training.
@@ -1110,7 +1089,7 @@ class TllmRuntime:
             raise
         return True
 
-    def register_consumer(self, consumer: object) -> None:
+    def register_consumer(self, consumer: BaseConsumer[object]) -> None:
         if self._unadapted_workload_ids:
             raise RuntimeError(
                 "native Region authority cannot be coinstalled with legacy "
@@ -1133,27 +1112,6 @@ class TllmRuntime:
             if plane is not None and spec is not None:
                 plane.register_consumer(spec.name, spec.config)
 
-    def register_workload(self, workload_instance: object) -> None:
-        definition = workload_definition(workload_instance)
-        consumer = legacy_consumer(workload_instance, definition)
-        if consumer is None:
-            if definition is None:
-                raise RuntimeError("native workload has no definition")
-            if self._consumers:
-                raise RuntimeError(
-                    "native Region authority cannot be coinstalled with legacy "
-                    "dispatch consumers"
-                )
-            self._workloads.append(workload_instance)
-            self._record_native_resources(workload_instance)
-            self._refresh_resource_specialization_options()
-            self._rebuild_workload_compiler()
-            self._unadapted_workload_ids.append(definition.workload_id)
-            return
-        self._workloads.append(workload_instance)
-        self._rebuild_workload_compiler()
-        self.register_consumer(consumer)
-
     def clear_consumers(self) -> None:
         self._consumers.clear()
         if active_runtime() is self:
@@ -1174,7 +1132,7 @@ class TllmRuntime:
         registered through the legacy façade untouched (backward compat).
         """
         global _active_runtime
-        _active_runtime = self
+        _active_runtime = cast("TllmRuntime[object]", self)
         from tllm.runtime import residual_runtime
 
         residual_runtime.publish_workload_compilation(None)
@@ -1460,13 +1418,17 @@ class TllmRuntime:
             installed_store = residual_runtime.RUNTIME.workload_execution_store
             installed_execution = None
             if installed_store is not None:
-                for candidate in (
-                    installed_store.current,
-                    installed_store.staged,
-                ):
+                from tllm.runtime.workload_execution import StagedExecution
+
+                candidates = [installed_store.current]
+                match installed_store.staged:
+                    case StagedExecution(execution=staged_execution):
+                        candidates.append(staged_execution)
+                    case _:
+                        pass
+                for candidate in candidates:
                     if (
-                        candidate is not None
-                        and candidate.plan_epoch == expected_epoch
+                        candidate.plan_epoch == expected_epoch
                         and candidate.compilation.decision.signature
                         == compilation.decision.signature
                     ):
@@ -1590,10 +1552,10 @@ class TllmRuntime:
         return len(completed)
 
 
-_default_runtime: "TllmRuntime | None" = None
+_default_runtime: "TllmRuntime[Never] | None" = None
 
 
-def default_runtime() -> TllmRuntime:
+def default_runtime() -> TllmRuntime[Never]:
     global _default_runtime
     if _default_runtime is None:
         _default_runtime = TllmRuntime()

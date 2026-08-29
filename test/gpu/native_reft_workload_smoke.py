@@ -87,7 +87,7 @@ def main() -> int:
         if regions[0].capture_safe:
             raise AssertionError("extern publish Region must be non-capture")
 
-        active_workload = runtime.local_workload(ReftWorkload)
+        active_workload = runtime.local_workload(workload)
         install_reft_patch_on_llm(llm, runtime)
 
         prompts = ["The capital of France is", "Water is made of"]

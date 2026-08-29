@@ -11,6 +11,7 @@ from tllm.workload import (
     AffineAccess,
     Before,
     ConfigField,
+    ConfigKind,
     Domain,
     Index,
     NumericConstraint,
@@ -32,7 +33,7 @@ from tllm.consumers.recirculation.native_backend import (
 _PLAN_INPUT = "typed_recurrence_stage"
 _TOKEN = Index("token")
 _LAYER = Index("layer")
-_RECIRCULATION_ENABLED = ConfigField(True)
+_RECIRCULATION_ENABLED = ConfigField.boolean(True)
 
 
 class RecirculationStage(Protocol):
@@ -40,16 +41,16 @@ class RecirculationStage(Protocol):
 
 
 class RecirculationConfig(WorkloadConfig):
-    source_layer: int = config_field(default=-1)
-    destination_layer: int = config_field(default=0)
+    source_layer: int = config_field(default=-1, kind=ConfigKind.INT)
+    destination_layer: int = config_field(default=0, kind=ConfigKind.INT)
     alpha: float = config_field(
-        default=0.15, constraint=NumericConstraint.UNIT_INTERVAL
+        default=0.15, kind=ConfigKind.FLOAT, constraint=NumericConstraint.UNIT_INTERVAL
     )
     beta: float = config_field(
-        default=0.85, constraint=NumericConstraint.UNIT_INTERVAL
+        default=0.85, kind=ConfigKind.FLOAT, constraint=NumericConstraint.UNIT_INTERVAL
     )
     ramp_tokens: int = config_field(
-        default=0, constraint=NumericConstraint.NONNEGATIVE
+        default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     enabled: bool = cast(bool, _RECIRCULATION_ENABLED)
 

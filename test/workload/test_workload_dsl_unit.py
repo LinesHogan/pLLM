@@ -79,7 +79,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
                 scope=StateScope.REQUEST,
                 key=request_key("request_id", "sample_idx"),
                 parameters="model",
-                optimizer=AdamWSpec(lr=1e-3),
+                optimizer=AdamWSpec.fixed(1e-3),
             )
 
             @task(
@@ -288,8 +288,6 @@ class WorkloadDslUnitTest(unittest.TestCase):
             transition(state)
         with self.assertRaisesRegex(ValueError, "maybe_transition.*optimizer"):
             maybe_transition(state)
-        with self.assertRaisesRegex(TypeError, "maybe_transition expects a State"):
-            maybe_transition("model")  # type: ignore[arg-type]
 
     def test_typed_extern_registry_is_separate_from_serialized_ir(self) -> None:
         implementation = ExternImplementation(

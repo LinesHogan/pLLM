@@ -62,10 +62,24 @@ def install_generate_poll(
     dynamic.generate = generate_after_shape_poll
 
 
+def legacy_runner_graph_enabled(runner: object) -> bool:
+    """Decode legacy vLLM graph flags at the foreign-object boundary."""
+
+    dynamic = cast(Any, runner)
+    if getattr(dynamic, "use_cuda_graph", None) is True:
+        return True
+    config: Any = getattr(dynamic, "compilation_config", None)
+    if config is None:
+        return False
+    level: Any = getattr(config, "level", 0)
+    return type(level) is int and level > 0
+
+
 __all__ = [
     "VllmHandle",
     "bind_inprocess_runner",
     "bind_runner_owner",
     "create_llm",
     "install_generate_poll",
+    "legacy_runner_graph_enabled",
 ]

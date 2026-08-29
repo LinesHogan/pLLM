@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from typing import cast
 
 import torch
 from tllm.kit.workload import Workload
@@ -13,6 +14,8 @@ from tllm.workload import (
     AdamWSpec,
     Before,
     Between,
+    ConfigField,
+    ConfigKind,
     State,
     PublishedModule,
     StagedPort,
@@ -25,17 +28,21 @@ from tllm.workload import (
     workload,
 )
 
+_LEARNING_RATE = ConfigField.floating(3e-4)
+
 
 class _Config(WorkloadConfig):
-    enabled: bool = config_field(default=True)
-    learning_rate: float = config_field(default=3e-4)
-    layer_path: str = config_field(default="model.layers.0")
+    enabled: bool = config_field(default=True, kind=ConfigKind.BOOL)
+    learning_rate: float = cast(float, _LEARNING_RATE)
+    layer_path: str = config_field(
+        default="model.layers.0", kind=ConfigKind.STR
+    )
 
 
 @workload(id="author.probe", config=_Config, enabled=_Config.enabled)
 class _AuthorWorkload(Workload[_Config]):
     model: State[torch.nn.Linear] = State.replica(
-        optimizer=AdamWSpec(lr=_Config.learning_rate)
+        optimizer=AdamWSpec.configured(_LEARNING_RATE)
     )
 
     @model.initialize
@@ -68,7 +75,7 @@ class _AuthorWorkload(Workload[_Config]):
 @workload(id="author.staged", config=_Config, enabled=_Config.enabled)
 class _StagedWorkload(Workload[_Config]):
     model: State[torch.nn.Linear] = State.replica(
-        optimizer=AdamWSpec(lr=_Config.learning_rate)
+        optimizer=AdamWSpec.configured(_LEARNING_RATE)
     )
     batch: StagedPort[torch.Tensor] = StagedPort()
 
@@ -159,13 +166,14 @@ class WorkloadAuthorApiUnitTest(unittest.TestCase):
         )
         from tllm.workload.runtime_values import SKIPPED
 
-        self.assertIs(provider(1), SKIPPED)
+        self.assertIs(provider.read(1), SKIPPED)
         payload = torch.ones(2, 3)
         sequence = workload_instance.stage_port(_StagedWorkload.batch, payload)
         self.assertEqual(sequence, 1)
-        self.assertIs(provider(2), payload)
-        self.assertIs(provider(3), SKIPPED)
+        self.assertIs(provider.read(2), payload)
+        self.assertIs(provider.read(3), SKIPPED)
 
 
 if __name__ == "__main__":
     unittest.main()
+    ConfigField,

@@ -18,7 +18,6 @@ from tllm.runtime.workload_execution import (
 )
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
-    NativeWorkloadResources,
     WorkloadWorkerSpec,
     reconstruct_worker_bindings,
     static_backend_binding_manifest_wire,
@@ -280,7 +279,7 @@ class BackendRegionBinderSlotTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.resources = WorkloadRuntimeBinding(owner=self)
 
-            def native_workload_resources(self) -> NativeWorkloadResources:
+            def native_workload_resources(self) -> WorkloadRuntimeBinding:
                 return self.resources
 
             @task(timing=Between("model.execute", "step.end"))
@@ -292,7 +291,7 @@ class BackendRegionBinderSlotTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.resources = WorkloadRuntimeBinding(owner=self)
 
-            def native_workload_resources(self) -> NativeWorkloadResources:
+            def native_workload_resources(self) -> WorkloadRuntimeBinding:
                 return self.resources
 
             @task(timing=Between("model.execute", "step.end"))

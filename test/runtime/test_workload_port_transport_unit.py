@@ -223,7 +223,10 @@ class _CleanupFailingPayload:
 def _runtime_with_local_port() -> tuple[TllmRuntime, _LocalPortWorkload]:
     workload = _LocalPortWorkload()
     runtime = TllmRuntime.__new__(TllmRuntime)
-    runtime._workloads_by_type = {_PortOwner: workload}
+    runtime._workloads_by_type = {
+        _PortOwner: workload,
+        _LocalPortWorkload: workload,
+    }
     runtime._workload_fail_stop_reason = None
     runtime._workload_compilation = None
     runtime._port_transaction_owner = "test-runtime"
@@ -259,7 +262,7 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
                 SimpleNamespace(next_execution=foreign_execution),
             ),
         ):
-            self.assertIs(runtime.local_workload(_PortOwner), local)
+            self.assertIs(runtime.local_workload(local), local)
 
     def test_drain_reads_current_not_activated_next_execution(self) -> None:
         runtime, _local = _runtime_with_local_port()

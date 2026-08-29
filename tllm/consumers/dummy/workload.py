@@ -16,6 +16,7 @@ from tllm.runtime.workload_bindings import LocalRuntimeServices
 from tllm.workload import (
     Before,
     ConfigField,
+    ConfigKind,
     NumericConstraint,
     WorkloadConfig,
     config_field,
@@ -27,29 +28,29 @@ from tllm.workload import (
 )
 
 
-_DUMMY_ENABLED = ConfigField(True)
+_DUMMY_ENABLED = ConfigField.boolean(True)
 
 
 class DummyConfig(WorkloadConfig):
     enabled: bool = cast(bool, _DUMMY_ENABLED)
-    enable_async: bool = config_field(default=True)
-    export_to_cpu: bool = config_field(default=True)
+    enable_async: bool = config_field(default=True, kind=ConfigKind.BOOL)
+    export_to_cpu: bool = config_field(default=True, kind=ConfigKind.BOOL)
     max_queue_size: int = config_field(
-        default=4096, constraint=NumericConstraint.POSITIVE
+        default=4096, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
     noise_std: float = config_field(
-        default=1e-3, constraint=NumericConstraint.NONNEGATIVE
+        default=1e-3, kind=ConfigKind.FLOAT, constraint=NumericConstraint.NONNEGATIVE
     )
     export_every_n_steps: int = config_field(
-        default=256, constraint=NumericConstraint.POSITIVE
+        default=256, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
     export_max_rows: int = config_field(
-        default=1, constraint=NumericConstraint.NONNEGATIVE
+        default=1, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     export_max_cols: int = config_field(
-        default=16, constraint=NumericConstraint.NONNEGATIVE
+        default=16, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
-    layer_path: str = config_field(default="model.layers.0")
+    layer_path: str = config_field(default="model.layers.0", kind=ConfigKind.STR)
 
 
 class DummyExporter:

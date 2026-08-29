@@ -152,28 +152,33 @@ def main() -> int:
         ):
             raise AssertionError(f"unexpected ESamp Region partition: {regions!r}")
         store = core.RUNTIME.workload_execution_store
-        installed = (
-            (execution,)
-            if store is None
-            else (store.current, store.staged)
-        )
+        installed = [execution]
+        if store is not None:
+            from tllm.runtime.workload_execution import StagedExecution
+
+            installed = [store.current]
+            match store.staged:
+                case StagedExecution(execution=staged_execution):
+                    installed.append(staged_execution)
+                case _:
+                    pass
         if not any(
-            candidate is not None
-            and candidate.artifact_report == expected_artifacts
+            candidate.artifact_report == expected_artifacts
             for candidate in installed
         ):
             raise AssertionError(
                 "no materialized ESamp artifact report matches the signed decision: "
                 f"expected={expected_artifacts!r}, "
-                f"installed={tuple(candidate.artifact_report for candidate in installed if candidate is not None)!r}"
+                f"installed={tuple(candidate.artifact_report for candidate in installed)!r}"
             )
-        if (
-            store is not None
-            and store.staged is not None
-            and store.staged.artifact_report == expected_artifacts
-            and not store.staged_activated
-        ):
-            raise AssertionError("coordinated ESamp epoch was staged but not activated")
+        if store is not None:
+            match store.staged:
+                case StagedExecution(execution=staged_execution, activated=False) if staged_execution.artifact_report == expected_artifacts:
+                    raise AssertionError(
+                        "coordinated ESamp epoch was staged but not activated"
+                    )
+                case _:
+                    pass
         if len(decision.signature) != 64 or not all(
             character in "0123456789abcdef" for character in decision.signature
         ):

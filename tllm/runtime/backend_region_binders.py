@@ -26,15 +26,16 @@ class BackendRegionStageContext:
     input_batch: object | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.implementation_id, str) or not self.implementation_id:
+        if not self.implementation_id:
             raise TypeError("backend Region stage implementation_id must be non-empty str")
-        if not isinstance(self.backend_event, str) or not self.backend_event:
+        if not self.backend_event:
             raise TypeError("backend Region stage backend_event must be non-empty str")
-        if not isinstance(self.region_id, str) or not self.region_id:
+        if not self.region_id:
             raise TypeError("backend Region stage region_id must be non-empty str")
         if self.slot.implementation_id != self.implementation_id:
             raise ValueError("backend Region stage slot does not match implementation_id")
-        BackendRegionBinderSlot._step_id(self.step_id)
+        if self.step_id < 0:
+            raise ValueError("backend Region binder step_id must be non-negative")
 
 
 class BackendRegionStagerRegistry:
@@ -47,20 +48,13 @@ class BackendRegionStagerRegistry:
     __slots__ = ("_stagers",)
 
     def __init__(self, stagers: Mapping[str, BackendRegionStager]) -> None:
-        if not isinstance(stagers, Mapping) or any(
-            not isinstance(implementation_id, str)
-            or not implementation_id
-            or not callable(stager)
-            for implementation_id, stager in stagers.items()
-        ):
+        if any(not implementation_id for implementation_id in stagers):
             raise TypeError(
                 "backend Region stagers must map non-empty implementation IDs to callables"
             )
         self._stagers = MappingProxyType(dict(stagers))
 
     def stage(self, context: BackendRegionStageContext) -> None:
-        if not isinstance(context, BackendRegionStageContext):
-            raise TypeError("backend Region staging requires BackendRegionStageContext")
         try:
             stager = self._stagers[context.implementation_id]
         except KeyError as exc:
@@ -76,7 +70,24 @@ class _StagedBackendRegion:
     step_id: int
     plan: object
     callback: BackendRegionCallback
-    provided_values: dict[str, object] = field(default_factory=dict)
+    provided_values: dict[str, object] = field(
+        default_factory=lambda: dict[str, object]()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenBackendRegion:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedBackendRegion:
+    step_id: int
+
+
+_BackendRegionState = (
+    _OpenBackendRegion | _StagedBackendRegion | _CompletedBackendRegion
+)
 
 
 class BackendRegionBinderSlot:
@@ -86,8 +97,7 @@ class BackendRegionBinderSlot:
         "_implementation_id",
         "_provided_inputs",
         "_backend_stager",
-        "_staged",
-        "_completed_step",
+        "_state",
     )
 
     def __init__(
@@ -97,23 +107,19 @@ class BackendRegionBinderSlot:
         provided_inputs: Mapping[str, Callable[[int], object]] | None = None,
         backend_stager: BackendRegionStager | None = None,
     ) -> None:
-        if not isinstance(implementation_id, str) or not implementation_id:
+        if not implementation_id:
             raise TypeError("backend Region binder implementation_id must be non-empty str")
-        raw_inputs = {} if provided_inputs is None else provided_inputs
-        if not isinstance(raw_inputs, Mapping) or any(
-            not isinstance(name, str) or not name or not callable(provider)
-            for name, provider in raw_inputs.items()
-        ):
+        raw_inputs: Mapping[str, Callable[[int], object]] = (
+            {} if provided_inputs is None else provided_inputs
+        )
+        if any(not name for name in raw_inputs):
             raise TypeError(
                 "backend Region binder provided_inputs must map non-empty names to callables"
             )
-        if backend_stager is not None and not callable(backend_stager):
-            raise TypeError("backend Region binder backend_stager must be callable or None")
         self._implementation_id = implementation_id
         self._provided_inputs = MappingProxyType(dict(raw_inputs))
         self._backend_stager = backend_stager
-        self._staged: _StagedBackendRegion | None = None
-        self._completed_step: int | None = None
+        self._state: _BackendRegionState = _OpenBackendRegion()
 
     @property
     def implementation_id(self) -> str:
@@ -122,8 +128,6 @@ class BackendRegionBinderSlot:
     def stage_from_backend(self, context: BackendRegionStageContext) -> None:
         """Invoke the workload-owned backend adapter for this signed slot."""
 
-        if not isinstance(context, BackendRegionStageContext):
-            raise TypeError("backend Region staging requires BackendRegionStageContext")
         if context.slot is not self or context.implementation_id != self._implementation_id:
             raise ValueError("backend Region stage context does not match binder slot")
         if self._backend_stager is None:
@@ -133,12 +137,6 @@ class BackendRegionBinderSlot:
             )
         self._backend_stager(context)
 
-    @staticmethod
-    def _step_id(value: object) -> int:
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ValueError("backend Region binder step_id must be a non-negative int")
-        return value
-
     def stage(
         self,
         plan: object,
@@ -147,57 +145,60 @@ class BackendRegionBinderSlot:
     ) -> None:
         """Stage exactly one opaque backend plan for one execution step."""
 
-        step = self._step_id(step_id)
-        if not callable(callback):
-            raise TypeError("backend Region binder callback must be callable")
-        current = self._staged
-        if current is not None:
-            if current.step_id == step:
+        if step_id < 0:
+            raise ValueError("backend Region binder step_id must be non-negative")
+        step = step_id
+        match self._state:
+            case _StagedBackendRegion(step_id=current_step):
+                if current_step == step:
+                    raise RuntimeError(
+                        "duplicate backend Region stage for "
+                        f"{self._implementation_id!r} at step {step}"
+                    )
                 raise RuntimeError(
-                    "duplicate backend Region stage for "
-                    f"{self._implementation_id!r} at step {step}"
+                    "stale backend Region stage for "
+                    f"{self._implementation_id!r}: step {current_step} remains staged"
                 )
-            raise RuntimeError(
-                "stale backend Region stage for "
-                f"{self._implementation_id!r}: step {current.step_id} remains staged"
-            )
-        completed = self._completed_step
-        if completed is not None and step <= completed:
-            if step == completed:
+            case _CompletedBackendRegion(step_id=completed) if step <= completed:
+                if step == completed:
+                    raise RuntimeError(
+                        "backend Region stage already completed for "
+                        f"{self._implementation_id!r} at step {step}"
+                    )
                 raise RuntimeError(
-                    "backend Region stage already completed for "
-                    f"{self._implementation_id!r} at step {step}"
+                    "stale backend Region stage for "
+                    f"{self._implementation_id!r}: completed step is {completed}"
                 )
-            raise RuntimeError(
-                "stale backend Region stage for "
-                f"{self._implementation_id!r}: completed step is {completed}"
-            )
-        self._staged = _StagedBackendRegion(step, plan, callback)
+            case _OpenBackendRegion() | _CompletedBackendRegion():
+                self._state = _StagedBackendRegion(step, plan, callback)
 
     def _require_staged(self, step_id: int) -> _StagedBackendRegion:
-        step = self._step_id(step_id)
-        staged = self._staged
-        if staged is None:
-            if self._completed_step == step:
+        if step_id < 0:
+            raise ValueError("backend Region binder step_id must be non-negative")
+        step = step_id
+        match self._state:
+            case _StagedBackendRegion(step_id=staged_step) as staged:
+                if staged_step != step:
+                    raise RuntimeError(
+                        "backend Region is staged for step "
+                        f"{staged_step}, not requested step {step}"
+                    )
+                return staged
+            case _CompletedBackendRegion(step_id=completed) if completed == step:
                 raise RuntimeError(
                     "backend Region stage already completed for "
                     f"{self._implementation_id!r} at step {step}"
                 )
-            raise RuntimeError(
-                "missing staged backend Region for "
-                f"{self._implementation_id!r} at step {step}"
-            )
-        if staged.step_id != step:
-            raise RuntimeError(
-                "backend Region is staged for step "
-                f"{staged.step_id}, not requested step {step}"
-            )
-        return staged
+            case _OpenBackendRegion() | _CompletedBackendRegion():
+                raise RuntimeError(
+                    "missing staged backend Region for "
+                    f"{self._implementation_id!r} at step {step}"
+                )
 
     def provided_input(self, name: str, step_id: int) -> object:
         """Return one lazily materialized provider value for the staged step."""
 
-        if not isinstance(name, str) or not name:
+        if not name:
             raise TypeError("backend Region binder provided input name must be non-empty str")
         staged = self._require_staged(step_id)
         try:
@@ -231,24 +232,25 @@ class BackendRegionBinderSlot:
         """Consume a staged plan without invoking its callback."""
 
         staged = self._require_staged(step_id)
-        self._staged = None
-        self._completed_step = staged.step_id
+        self._state = _CompletedBackendRegion(staged.step_id)
 
     def abort(self, step_id: int) -> bool:
         """Retire an uninvoked stage after its enclosing backend step failed."""
 
-        step = self._step_id(step_id)
-        staged = self._staged
-        if staged is None:
-            return False
-        if staged.step_id != step:
-            raise RuntimeError(
-                "cannot abort backend Region staged for step "
-                f"{staged.step_id} from failed step {step}"
-            )
-        self._staged = None
-        self._completed_step = step
-        return True
+        if step_id < 0:
+            raise ValueError("backend Region binder step_id must be non-negative")
+        step = step_id
+        match self._state:
+            case _StagedBackendRegion(step_id=staged_step):
+                if staged_step != step:
+                    raise RuntimeError(
+                        "cannot abort backend Region staged for step "
+                        f"{staged_step} from failed step {step}"
+                    )
+                self._state = _CompletedBackendRegion(step)
+                return True
+            case _OpenBackendRegion() | _CompletedBackendRegion():
+                return False
 
     def invoke(self, step_id: int) -> object:
         """Invoke and consume the one staged plan for ``step_id`` exactly once."""
@@ -257,8 +259,7 @@ class BackendRegionBinderSlot:
         inputs = self.provided_inputs(staged.step_id)
         # A backend callback can fail, but retrying it would duplicate a
         # possibly side-effectful Region. Consume before crossing that boundary.
-        self._staged = None
-        self._completed_step = staged.step_id
+        self._state = _CompletedBackendRegion(staged.step_id)
         return staged.callback(staged.plan, inputs, staged.step_id)
 
 

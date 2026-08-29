@@ -37,6 +37,17 @@ from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationRequest,
 )
 from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
+from tllm.runtime.workload_bindings import (
+    NoPerRequestStats,
+    NoSamplerBinding,
+    PerRequestStats,
+    PerRequestStatsService,
+    RuntimePortRegistry,
+    RuntimeInputBinding,
+    RuntimeOutputBinding,
+    SamplerBinding,
+    SamplerRuntimeBinding,
+)
 from tllm.runtime.scheduling.physical import Fence
 from tllm.runtime.scheduling.plan_store import (
     PlanResources,
@@ -431,9 +442,9 @@ class StateVersionRegistry:
 
     def __init__(
         self,
-        states: tuple[ScheduleState, ...],
-        bindings: Mapping[str, StateVersionBinding],
-        effects: tuple[ScheduleEffect, ...],
+        states: tuple[ScheduleState, ...] = (),
+        bindings: Mapping[str, StateVersionBinding] = MappingProxyType({}),
+        effects: tuple[ScheduleEffect, ...] = (),
     ) -> None:
         state_by_resource = {state.resource: state for state in states}
         required = {
@@ -567,32 +578,71 @@ class StateVersionRegistry:
 
 
 @dataclass(frozen=True, slots=True)
+class NoExecutionLifecycle:
+    """An execution with no local training lifecycle."""
+
+    def read_and_reset_stats(self, sync: bool) -> "TrainingStats":
+        from tllm.contracts.consumer_stats import TrainingStats
+
+        _ = sync
+        return TrainingStats(loss_avg=0.0, loss_count=0)
+
+    def read_and_reset_per_request_stats(
+        self, sync: bool
+    ) -> Mapping[int, "TrainingStats"]:
+        _ = sync
+        return MappingProxyType({})
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionLifecycleBinding:
+    """The complete lifecycle capability of one native execution."""
+
+    stats: Callable[[bool], "TrainingStats"]
+    is_enabled: Callable[[], bool]
+    synchronize: Callable[[], None]
+    per_request_stats: PerRequestStatsService = field(
+        default_factory=NoPerRequestStats
+    )
+
+    def read_and_reset_stats(self, sync: bool) -> "TrainingStats":
+        return self.stats(bool(sync))
+
+    def read_and_reset_per_request_stats(
+        self, sync: bool
+    ) -> Mapping[int, "TrainingStats"]:
+        match self.per_request_stats:
+            case PerRequestStats(read=reader):
+                return reader(bool(sync))
+            case NoPerRequestStats():
+                return MappingProxyType({})
+
+
+ExecutionLifecycle = NoExecutionLifecycle | ExecutionLifecycleBinding
+
+
+@dataclass(frozen=True, slots=True)
 class WorkloadExecutionBindings:
     """Process-local callables that are deliberately absent from signed JSON."""
 
     declarations: tuple["WorkloadDeclaration", ...]
-    provided_inputs: Mapping[str, Callable[[int], object]] = field(
-        default_factory=dict[str, Callable[[int], object]]
-    )
-    output_sinks: Mapping[str, Callable[[object, int], None]] = field(
-        default_factory=dict[str, Callable[[object, int], None]]
-    )
+    ports: RuntimePortRegistry = field(default_factory=RuntimePortRegistry)
     state_versions: Mapping[str, StateVersionBinding] = field(
         default_factory=dict[str, StateVersionBinding]
     )
-    sampler_provider: "SamplerModifierProvider | None" = None
+    sampler: SamplerBinding = field(default_factory=NoSamplerBinding)
     diagnostics_readers: Mapping[
         str, Callable[[], Mapping[str, int | float]]
     ] = field(
         default_factory=dict[str, Callable[[], Mapping[str, int | float]]]
     )
-    stats_reader: Callable[[bool], "TrainingStats"] | None = None
-    per_request_stats_reader: Callable[
-        [bool], Mapping[int, "TrainingStats"]
-    ] | None = None
-    enabled_setter: Callable[[bool], None] | None = None
-    enabled_predicate: Callable[[], bool] | None = None
-    synchronizer: Callable[[], None] | None = None
+    lifecycle: ExecutionLifecycle = field(default_factory=NoExecutionLifecycle)
     residual_paths: Mapping["ResidualLocator", str] = field(
         default_factory=dict["ResidualLocator", str]
     )
@@ -606,22 +656,8 @@ class WorkloadExecutionBindings:
     def __post_init__(self) -> None:
         if not self.declarations:
             raise ValueError("declarations must not be empty")
-        if any(not name for name in self.provided_inputs):
-            raise ValueError("provided input names must not be empty")
-        if any(not name for name in self.output_sinks):
-            raise ValueError("output sink names must not be empty")
         if any(not resource for resource in self.state_versions):
             raise ValueError("state-version resource names must not be empty")
-        object.__setattr__(
-            self,
-            "provided_inputs",
-            MappingProxyType(dict(self.provided_inputs)),
-        )
-        object.__setattr__(
-            self,
-            "output_sinks",
-            MappingProxyType(dict(self.output_sinks)),
-        )
         object.__setattr__(
             self, "state_versions", MappingProxyType(dict(self.state_versions))
         )
@@ -667,6 +703,21 @@ class _ImmediateEvent:
         return True
 
 
+@dataclass(frozen=True, slots=True)
+class _NoRegionValueStore:
+    """A signed execution with no Region values to retain."""
+
+    def prepare_step(self, step_id: int) -> None:
+        _ = step_id
+
+    def finish_step(self, step_id: int) -> None:
+        _ = step_id
+
+    @property
+    def retained_value_count(self) -> int:
+        return 0
+
+
 @dataclass(slots=True)
 class NativeWorkloadExecution:
     """One complete, immutable workload plan bound to process-local handles."""
@@ -682,10 +733,14 @@ class NativeWorkloadExecution:
     _event_nodes: Mapping[BackendObservableEvent, tuple[NodeKey, ...]] = field(
         default_factory=dict[BackendObservableEvent, tuple[NodeKey, ...]]
     )
-    _value_store: "_RegionValueStore | None" = None
-    _state_versions: StateVersionRegistry | None = None
+    _value_store: "_RegionValueStore | _NoRegionValueStore" = field(
+        default_factory=_NoRegionValueStore
+    )
+    _state_versions: StateVersionRegistry = field(
+        default_factory=StateVersionRegistry
+    )
     _artifact_report: tuple[tuple[str, str], ...] = ()
-    _sampler_provider: "SamplerModifierProvider | None" = None
+    _sampler: SamplerBinding = field(default_factory=NoSamplerBinding)
     _diagnostics_readers: Mapping[
         str, Callable[[], Mapping[str, int | float]]
     ] = field(
@@ -693,12 +748,7 @@ class NativeWorkloadExecution:
             str, Callable[[], Mapping[str, int | float]]
         ]
     )
-    _stats_reader: Callable[[bool], "TrainingStats"] | None = None
-    _per_request_stats_reader: Callable[
-        [bool], Mapping[int, "TrainingStats"]
-    ] | None = None
-    _enabled_setter: Callable[[bool], None] | None = None
-    _synchronizer: Callable[[], None] | None = None
+    _lifecycle: ExecutionLifecycle = field(default_factory=NoExecutionLifecycle)
     _backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
         default_factory=dict[str, "BackendRegionBinderSlot"]
     )
@@ -804,8 +854,7 @@ class NativeWorkloadExecution:
         if self._prepared_step >= 0:
             self.finish_step(self._prepared_step)
         self.executor.prepare_step(step)
-        if self._value_store is not None:
-            self._value_store.prepare_step(step)
+        self._value_store.prepare_step(step)
         self._prepared_step = step
         self._executed_nodes.clear()
 
@@ -819,8 +868,7 @@ class NativeWorkloadExecution:
             raise RuntimeError("cannot retire a native workload step from another epoch")
         self._join_side_streams()
         self.executor.finish_step(step)
-        if self._value_store is not None:
-            self._value_store.finish_step(step)
+        self._value_store.finish_step(step)
         self._cost_probe.harvest()
         self._prepared_step = -1
         self._executed_nodes.clear()
@@ -875,22 +923,17 @@ class NativeWorkloadExecution:
 
     @property
     def retained_value_count(self) -> int:
-        if self._value_store is None:
-            return 0
         return self._value_store.retained_value_count
 
     @property
-    def state_versions(self) -> StateVersionRegistry | None:
+    def state_versions(self) -> StateVersionRegistry:
         return self._state_versions
 
     def state_version_report(self) -> tuple[tuple[str, object, int], ...]:
         """Project observed versions onto the closed JSON control-plane key set."""
 
-        registry = self._state_versions
-        if registry is None:
-            return ()
         report: list[tuple[str, object, int]] = []
-        for resource, key, version in registry.observed_versions():
+        for resource, key, version in self._state_versions.observed_versions():
             if key is not None and (
                 isinstance(key, bool) or not isinstance(key, (str, int))
             ):
@@ -918,7 +961,11 @@ class NativeWorkloadExecution:
         return self._requires_decode_hidden
 
     def sampler_modifier_provider(self) -> "SamplerModifierProvider | None":
-        return self._sampler_provider
+        match self._sampler:
+            case SamplerRuntimeBinding(provider=provider):
+                return provider
+            case NoSamplerBinding():
+                return None
 
     def read_resource_diagnostics(self) -> Mapping[str, Mapping[str, int | float]]:
         """Return a validated, JSON-safe snapshot of local workload resources.
@@ -948,18 +995,12 @@ class NativeWorkloadExecution:
         return MappingProxyType(dict(sorted(result.items())))
 
     def read_and_reset_stats(self, *, sync: bool = True) -> "TrainingStats":
-        from tllm.contracts.consumer_stats import TrainingStats
-
-        if self._stats_reader is None:
-            return TrainingStats(loss_avg=0.0, loss_count=0)
-        return self._stats_reader(bool(sync))
+        return self._lifecycle.read_and_reset_stats(bool(sync))
 
     def read_and_reset_per_request_stats(
         self, *, sync: bool = True
     ) -> Mapping[int, "TrainingStats"]:
-        if self._per_request_stats_reader is None:
-            return {}
-        return self._per_request_stats_reader(bool(sync))
+        return self._lifecycle.read_and_reset_per_request_stats(bool(sync))
 
     def set_enabled(self, enabled: bool) -> None:
         _ = enabled
@@ -969,8 +1010,7 @@ class NativeWorkloadExecution:
         )
 
     def synchronize(self) -> None:
-        if self._synchronizer is not None:
-            self._synchronizer()
+        self._lifecycle.synchronize()
 
     def read_workgraph_runtime_stats(self) -> "WorkGraphRuntimeStats":
         return runtime_stats_from_executor(self.executor.stats)
@@ -997,6 +1037,20 @@ class NativeWorkloadExecution:
         return self._shape_specializations.acknowledge(dedup_keys)
 
 
+@dataclass(frozen=True, slots=True)
+class NoStagedExecution:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class StagedExecution:
+    execution: NativeWorkloadExecution
+    activated: bool
+
+
+StagedExecutionState = NoStagedExecution | StagedExecution
+
+
 class NativeWorkloadExecutionStore:
     """Safe-point publication and retirement for native Region executors."""
 
@@ -1005,13 +1059,11 @@ class NativeWorkloadExecutionStore:
         "_current",
         "_retired",
         "_staged",
-        "_staged_activated",
     )
 
     def __init__(self, initial: NativeWorkloadExecution) -> None:
         self._current = initial
-        self._staged: NativeWorkloadExecution | None = None
-        self._staged_activated = False
+        self._staged: StagedExecutionState = NoStagedExecution()
         self._active_steps: dict[int, NativeWorkloadExecution] = {}
         self._retired: list[NativeWorkloadExecution] = []
 
@@ -1020,7 +1072,7 @@ class NativeWorkloadExecutionStore:
         return self._current
 
     @property
-    def staged(self) -> NativeWorkloadExecution | None:
+    def staged(self) -> StagedExecutionState:
         return self._staged
 
     @property
@@ -1029,14 +1081,19 @@ class NativeWorkloadExecutionStore:
 
     @property
     def staged_activated(self) -> bool:
-        return self._staged is not None and self._staged_activated
+        match self._staged:
+            case StagedExecution(activated=activated):
+                return activated
+            case NoStagedExecution():
+                return False
 
     @property
     def next_execution(self) -> NativeWorkloadExecution:
-        staged = self._staged
-        if staged is not None and self._staged_activated:
-            return staged
-        return self._current
+        match self._staged:
+            case StagedExecution(execution=execution, activated=True):
+                return execution
+            case StagedExecution() | NoStagedExecution():
+                return self._current
 
     def stage(
         self,
@@ -1044,30 +1101,35 @@ class NativeWorkloadExecutionStore:
         *,
         activation_required: bool = False,
     ) -> None:
-        if self._staged is not None:
-            raise RuntimeError("a native workload epoch is already staged")
+        match self._staged:
+            case StagedExecution():
+                raise RuntimeError("a native workload epoch is already staged")
+            case NoStagedExecution():
+                pass
         if execution.plan_epoch <= self._current.plan_epoch:
             raise ValueError("staged native workload epoch must be strictly newer")
-        self._staged = execution
-        self._staged_activated = not bool(activation_required)
+        self._staged = StagedExecution(
+            execution, activated=not bool(activation_required)
+        )
 
     def activate_staged(self, plan_epoch: int) -> bool:
-        staged = self._staged
-        if staged is None:
-            return False
-        if staged.plan_epoch != int(plan_epoch):
-            raise RuntimeError("staged native workload epoch identity mismatch")
-        self._staged_activated = True
-        return True
+        match self._staged:
+            case NoStagedExecution():
+                return False
+            case StagedExecution(execution=execution):
+                if execution.plan_epoch != int(plan_epoch):
+                    raise RuntimeError("staged native workload epoch identity mismatch")
+                self._staged = StagedExecution(execution, activated=True)
+                return True
 
     def abort_staged(self) -> bool:
-        staged = self._staged
-        if staged is None:
-            return False
-        self._staged = None
-        self._staged_activated = False
-        staged.close()
-        return True
+        match self._staged:
+            case NoStagedExecution():
+                return False
+            case StagedExecution(execution=execution):
+                self._staged = NoStagedExecution()
+                execution.close()
+                return True
 
     def prepare_step(self, step_id: int) -> NativeWorkloadExecution:
         step = int(step_id)
@@ -1078,13 +1140,14 @@ class NativeWorkloadExecutionStore:
             return active
         if self._active_steps:
             raise RuntimeError("prior native workload steps must retire before prepare")
-        staged = self._staged
-        if staged is not None and self._staged_activated:
-            previous = self._current
-            self._current = staged
-            self._staged = None
-            self._staged_activated = False
-            self._retired.append(previous)
+        match self._staged:
+            case StagedExecution(execution=execution, activated=True):
+                previous = self._current
+                self._current = execution
+                self._staged = NoStagedExecution()
+                self._retired.append(previous)
+            case StagedExecution() | NoStagedExecution():
+                pass
         self._current.prepare_step(step)
         self._active_steps[step] = self._current
         return self._current
@@ -1117,14 +1180,13 @@ class NativeWorkloadExecutionStore:
         return len(ready)
 
     def close(self) -> None:
-        executions = (
-            self._current,
-            *((self._staged,) if self._staged is not None else ()),
-            *self._retired,
-        )
+        match self._staged:
+            case StagedExecution(execution=staged):
+                executions = (self._current, staged, *self._retired)
+            case NoStagedExecution():
+                executions = (self._current, *self._retired)
         self._active_steps.clear()
-        self._staged = None
-        self._staged_activated = False
+        self._staged = NoStagedExecution()
         self._retired.clear()
         seen: set[int] = set()
         for execution in executions:
@@ -1144,7 +1206,7 @@ class _RegionValueStore:
         "_hidden_inputs",
         "_materializations",
         "_state_versions",
-        "_enabled_predicate",
+        "_lifecycle",
         "_values",
         "_step_id",
     )
@@ -1153,16 +1215,16 @@ class _RegionValueStore:
         self,
         *,
         runtime: "ResidualRuntimeState",
-        providers: Mapping[str, Callable[[int], object]],
-        sinks: Mapping[str, Callable[[object, int], None]],
+        providers: Mapping[str, RuntimeInputBinding[object]],
+        sinks: Mapping[str, RuntimeOutputBinding[object]],
         artifacts: tuple["RegionCallableArtifact", ...],
         materializations: _SignedMaterializationBindings,
         state_versions: StateVersionRegistry,
-        enabled_predicate: Callable[[], bool] | None,
+        lifecycle: ExecutionLifecycle,
     ) -> None:
         self._runtime = runtime
         self._state_versions = state_versions
-        self._enabled_predicate = enabled_predicate
+        self._lifecycle = lifecycle
         self._providers = providers
         self._sinks = sinks
         self._materializations = materializations
@@ -1198,7 +1260,7 @@ class _RegionValueStore:
         artifact: "RegionCallableArtifact",
         context: PhysicalExecutionContext,
     ) -> None:
-        if self._enabled_predicate is not None and not self._enabled_predicate():
+        if not self._lifecycle.is_enabled():
             self.commit_outputs(
                 artifact,
                 context,
@@ -1221,7 +1283,7 @@ class _RegionValueStore:
         self.commit_outputs(artifact, context, outputs)
 
     def is_enabled(self) -> bool:
-        return self._enabled_predicate is None or self._enabled_predicate()
+        return self._lifecycle.is_enabled()
 
     def resolve_inputs(
         self,
@@ -1250,9 +1312,9 @@ class _RegionValueStore:
                 RegionInputKind.SAMPLER_LOGITS,
                 RegionInputKind.SAMPLED_TOKENS,
             ):
-                inputs[binding.binding_id] = self._providers[binding.source](
-                    context.step_id
-                )
+                inputs[binding.binding_id] = self._providers[
+                    binding.source
+                ].read(context.step_id)
             elif binding.kind is RegionInputKind.HIDDEN:
                 inputs[binding.binding_id] = _hidden_value(
                     self._runtime,
@@ -1282,7 +1344,7 @@ class _RegionValueStore:
                 RegionOutputKind.SAMPLER,
             ):
                 if value is not SKIPPED:
-                    self._sinks[binding.target](value, context.step_id)
+                    self._sinks[binding.target].publish(value, context.step_id)
             elif binding.kind is RegionOutputKind.MATERIALIZED:
                 self._materializations.output_binding_for(
                     artifact.region_id, binding.binding_id
@@ -1743,19 +1805,19 @@ def _local_binding_requirements(
         bindings.state_versions,
         effects,
     )
-    missing_provided = sorted(provided.difference(bindings.provided_inputs))
+    missing_provided = sorted(provided.difference(bindings.ports.inputs))
     if missing_provided:
         raise RuntimeError(
             "native Region missing provided input binding(s): "
             + ", ".join(missing_provided)
         )
-    missing_sinks = sorted(sinks.difference(bindings.output_sinks))
+    missing_sinks = sorted(sinks.difference(bindings.ports.outputs))
     if missing_sinks:
         raise RuntimeError(
             "native Region missing output sink binding(s): " + ", ".join(missing_sinks)
         )
-    unexpected_provided = sorted(set(bindings.provided_inputs) - provided)
-    unexpected_sinks = sorted(set(bindings.output_sinks) - sinks)
+    unexpected_provided = sorted(set(bindings.ports.inputs) - provided)
+    unexpected_sinks = sorted(set(bindings.ports.outputs) - sinks)
     if unexpected_provided or unexpected_sinks:
         raise RuntimeError(
             "native Region runtime binding coverage mismatch: "
@@ -2030,12 +2092,12 @@ def _native_workload_execution(
 
     value_store = _RegionValueStore(
         runtime=runtime,
-        providers=bindings.provided_inputs,
-        sinks=bindings.output_sinks,
+        providers=bindings.ports.inputs,
+        sinks=bindings.ports.outputs,
         artifacts=artifacts,
         materializations=materializations,
         state_versions=state_versions,
-        enabled_predicate=bindings.enabled_predicate,
+        lifecycle=bindings.lifecycle,
     )
     handlers: dict[
         NodeKey | ExecutorKey, Callable[[PhysicalExecutionContext], None]
@@ -2148,14 +2210,9 @@ def _native_workload_execution(
             (artifact.region_id, artifact.artifact_key)
             for artifact in registry.artifacts
         ),
-        _sampler_provider=bindings.sampler_provider,
+        _sampler=bindings.sampler,
         _diagnostics_readers=bindings.diagnostics_readers,
-        _stats_reader=bindings.stats_reader,
-        _per_request_stats_reader=bindings.per_request_stats_reader,
-        # Enable state is a signed specialization/static-binding input. It
-        # must never provide a mutation channel into an already-bound epoch.
-        _enabled_setter=None,
-        _synchronizer=bindings.synchronizer,
+        _lifecycle=bindings.lifecycle,
         _backend_region_binders=bindings.backend_region_binders,
         _requires_decode_hidden=bool(hidden_bindings),
         _shape_specializations=shape_specializations,
@@ -2184,10 +2241,15 @@ def build_native_workload_execution(
 
 
 __all__ = [
+    "ExecutionLifecycleBinding",
     "NativeWorkloadExecution",
     "NativeWorkloadExecutionStore",
+    "NoExecutionLifecycle",
+    "NoStagedExecution",
     "StateVersionBinding",
     "StateVersionRegistry",
+    "StagedExecution",
+    "StagedExecutionState",
     "WorkloadExecutionBindings",
     "build_native_workload_execution",
 ]

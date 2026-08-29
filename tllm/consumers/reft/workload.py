@@ -10,6 +10,7 @@ from tllm.kit.workload import Workload
 from tllm.workload import (
     NumericConstraint,
     ConfigField,
+    ConfigKind,
     PublishedModule,
     State,
     WorkloadConfig,
@@ -18,21 +19,21 @@ from tllm.workload import (
 )
 
 
-_REFT_ENABLED = ConfigField(True)
+_REFT_ENABLED = ConfigField.boolean(True)
 
 
 class ReftConfig(WorkloadConfig):
     enabled: bool = cast(bool, _REFT_ENABLED)
-    layers: tuple[int, ...] = config_field(default=(15,))
-    rank: int = config_field(default=4, constraint=NumericConstraint.POSITIVE)
+    layers: tuple[int, ...] = config_field(default=(15,), kind=ConfigKind.INT_TUPLE)
+    rank: int = config_field(default=4, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE)
     first_tokens: int = config_field(
-        default=0, constraint=NumericConstraint.NONNEGATIVE
+        default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     last_tokens: int = config_field(
-        default=2, constraint=NumericConstraint.NONNEGATIVE
+        default=2, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     learning_rate: float = config_field(
-        default=4e-3, constraint=NumericConstraint.POSITIVE
+        default=4e-3, kind=ConfigKind.FLOAT, constraint=NumericConstraint.POSITIVE
     )
 
 

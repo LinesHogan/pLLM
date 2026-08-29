@@ -16,6 +16,15 @@ from tllm.consumers.ttrl.rewards import TTRLClosedLoopIntent
 from tllm.consumers.ttrl.workload import TTRLConfig, TTRLWorkload
 from tllm.runtime.runtime import TllmRuntime
 
+NativeWorkloadSet = (
+    DummyWorkload
+    | ESampWorkload
+    | OverRIDEWorkload
+    | ReftWorkload
+    | TTRLWorkload
+    | RecirculationWorkload
+)
+
 
 def declarations() -> tuple[
     DummyWorkload,
@@ -35,21 +44,35 @@ def declarations() -> tuple[
     )
 
 
-def typed_ports(runtime: TllmRuntime, intent: TTRLClosedLoopIntent) -> None:
+def runtime_composition() -> TllmRuntime[NativeWorkloadSet]:
+    """Keep workload construction and runtime admission in one strict fixture."""
+
+    runtime = TllmRuntime(workloads=declarations())
+    typed_workloads: tuple[NativeWorkloadSet, ...] = runtime.workloads
+    del typed_workloads
+    return runtime
+
+
+def typed_ports(
+    runtime: TllmRuntime[TTRLWorkload],
+    workload: TTRLWorkload,
+    intent: TTRLClosedLoopIntent,
+) -> None:
     hidden = torch.zeros(2, 8)
     rewards = torch.zeros(2)
     hidden_sequence: int = runtime.stage(TTRLWorkload.train_hidden, hidden)
     reward_sequence: int = runtime.stage(TTRLWorkload.train_rewards, rewards)
     intent_sequence: int = runtime.stage(TTRLWorkload.pending_intent, intent)
     controls: tuple[TTRLClosedLoopIntent, ...] = runtime.drain(TTRLWorkload.control)
-    active: TTRLWorkload = runtime.local_workload(TTRLWorkload)
+    active: TTRLWorkload = runtime.local_workload(workload)
     del hidden_sequence, reward_sequence, intent_sequence, controls, active
 
 
 def typed_publication(
-    runtime: TllmRuntime,
+    runtime: TllmRuntime[ReftWorkload],
+    workload: ReftWorkload,
     state: dict[str, torch.Tensor],
 ) -> int:
-    published: ReftParameters = runtime.local_workload(ReftWorkload).intervention
+    published: ReftParameters = runtime.local_workload(workload).intervention
     del published
     return runtime.publish(ReftWorkload.intervention, state)

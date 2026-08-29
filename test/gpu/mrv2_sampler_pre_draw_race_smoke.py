@@ -32,6 +32,7 @@ from tllm.runtime import residual_runtime
 from tllm.runtime.sampler_bridge.types import CandidateModifierState
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import WorkloadExecutionBindings
+from tllm.runtime.workload_bindings import RuntimeOutputBinding, RuntimePortRegistry
 from tllm.schedule import (
     BackendObservableEvent,
     CompileOptions,
@@ -239,9 +240,15 @@ def main() -> None:
 
     bindings = WorkloadExecutionBindings(
         declarations=(declaration,),
-        output_sinks={
-            "answer": lambda value, step_id: observer.outputs.append((step_id, value))
-        },
+        ports=RuntimePortRegistry(
+            outputs={
+                "answer": RuntimeOutputBinding(
+                    lambda value, step_id: observer.outputs.append(
+                        (step_id, value)
+                    )
+                )
+            }
+        ),
     )
     runner = SimpleNamespace(model=object())
     sampler = _SamplerDouble(device)

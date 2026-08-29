@@ -9,12 +9,18 @@ from types import SimpleNamespace
 
 from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.consumer import DummyConsumer
+from tllm.ports.consumer import BaseConsumer
 from tllm.runtime.runtime import TllmRuntime, active_runtime, default_runtime
 
 
-class _Consumer:
+class _Consumer(BaseConsumer[object]):
     def __init__(self, cid: str) -> None:
-        self.consumer_id = cid
+        self._consumer_id = cid
+        self.config = object()
+
+    @property
+    def consumer_id(self) -> str:
+        return self._consumer_id
 
     def flows(self):
         return ()
@@ -34,12 +40,16 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         clear.assert_called_once()
         register.assert_called_once()
 
-    def test_workloads_are_instance_scoped_and_legacy_consumers_are_adapted(self) -> None:
+    def test_consumers_are_instance_scoped(self) -> None:
         consumer = _Consumer("workload")
-        runtime = TllmRuntime(workloads=(consumer,))
+        runtime = TllmRuntime(consumers=(consumer,))
 
-        self.assertEqual(runtime.workloads, (consumer,))
+        self.assertEqual(runtime.workloads, ())
         self.assertEqual(runtime.consumers, (consumer,))
+
+    def test_consumers_cannot_hide_in_workloads(self) -> None:
+        with self.assertRaisesRegex(TypeError, "pass legacy consumers"):
+            TllmRuntime(workloads=(_Consumer("workload"),))
 
     def test_declared_pure_workload_is_admitted_for_native_region_binding(self) -> None:
         from tllm.workload import Before, task, workload
@@ -128,11 +138,17 @@ class TllmRuntimeUnitTest(unittest.TestCase):
 
     def test_root_make_llm_routes_canonical_workloads_keyword(self) -> None:
         import tllm
+        from tllm.workload import Before, task, workload
 
-        consumer = _Consumer("root")
+        @workload(id="root.make-llm")
+        class RootWorkload:
+            @task(timing=Before("step.end"))
+            def run(self) -> None:
+                return None
+
         llm = object()
         with mock.patch("tllm.runtime.runtime.TllmRuntime.make_llm", return_value=llm) as make:
-            result = tllm.make_llm(model_name="model", workloads=(consumer,))
+            result = tllm.make_llm(model_name="model", workloads=(RootWorkload(),))
 
         self.assertIs(result, llm)
         self.assertEqual(make.call_args.kwargs, {"model_name": "model"})

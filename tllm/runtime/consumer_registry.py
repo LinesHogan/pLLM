@@ -10,16 +10,16 @@ from tllm.ports.consumer import BaseConsumer
 
 class ConsumerRegistry:
     def __init__(self) -> None:
-        self._consumers: List[BaseConsumer] = []
+        self._consumers: List[BaseConsumer[object]] = []
 
-    def register(self, consumer: BaseConsumer) -> None:
+    def register(self, consumer: BaseConsumer[object]) -> None:
         self._consumers.append(consumer)
 
     def clear(self) -> None:
         self._consumers.clear()
 
-    def consumers(self) -> List[BaseConsumer]:
+    def consumers(self) -> List[BaseConsumer[object]]:
         return list(self._consumers)
 
-    def replace_all(self, consumers: Iterable[BaseConsumer]) -> None:
+    def replace_all(self, consumers: Iterable[BaseConsumer[object]]) -> None:
         self._consumers = list(consumers)

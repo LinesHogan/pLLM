@@ -20,7 +20,6 @@ import os
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import (
     TYPE_CHECKING,
-    Any,
     Callable,
     Mapping,
     Protocol,
@@ -30,6 +29,7 @@ from typing import (
 if TYPE_CHECKING:
     import torch
 
+    from tllm.contracts.runtime_context import RunnerLike
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
     from tllm.runtime.workload_execution import (
@@ -62,6 +62,9 @@ class _ExternalRunner(Protocol):
 class _ExternalModelConfig(Protocol):
     get_hidden_size: object
     dtype: object
+
+
+WireValue = None | str | int | float | bool | list["WireValue"] | dict[str, "WireValue"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +176,7 @@ def _runner_specialization_facts(
         dtype=dtype,
         device=device,
         model_layer_count=model_layer_count,
-        max_prefill_tokens=cast(int, max_prefill_tokens),
+        max_prefill_tokens=max_prefill_tokens,
     )
 
 
@@ -197,7 +200,15 @@ def _runner_has_loaded_model(runner: object | None) -> bool:
         return False
 
 
-def _to_plain(value: Any, *, _depth: int = 0) -> Any:
+def _hook_runner(runner: object | None) -> "RunnerLike":
+    """Narrow the foreign vLLM runner only at the hook-install boundary."""
+
+    if runner is None:
+        raise RuntimeError("worker has no model runner")
+    return cast("RunnerLike", runner)
+
+
+def _to_plain(value: object, *, _depth: int = 0) -> WireValue:
     """Convert stats payloads to msgpack-safe data; reject anything else."""
     if _depth > 8:
         raise TypeError(f"stats payload too deep: {type(value).__name__}")
@@ -205,10 +216,15 @@ def _to_plain(value: Any, *, _depth: int = 0) -> Any:
         return value
     if is_dataclass(value) and not isinstance(value, type):
         return _to_plain(asdict(value), _depth=_depth + 1)
-    if isinstance(value, dict):
-        return {str(k): _to_plain(v, _depth=_depth + 1) for k, v in value.items()}
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        return {
+            str(key): _to_plain(item, _depth=_depth + 1)
+            for key, item in mapping.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [_to_plain(v, _depth=_depth + 1) for v in value]
+        items = cast(list[object] | tuple[object, ...], value)
+        return [_to_plain(item, _depth=_depth + 1) for item in items]
     raise TypeError(
         f"stats payload value of type {type(value).__name__} is not wire-safe; "
         "resolve CUDA events/tensors to floats before returning"
@@ -247,6 +263,12 @@ def _wire_positive_int(value: object, label: str) -> int:
     return value
 
 
+def _wire_nonnegative_int(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise TypeError(f"{label} must be a non-negative integer")
+    return value
+
+
 def _workload_identity(signature: object, plan_epoch: object) -> tuple[str, int]:
     return (
         _wire_sha256(signature, "signature"),
@@ -267,21 +289,21 @@ class TllmWorkerExtension:
     def _tllm_worker_id(self) -> str:
         return f"{os.getpid()}:{id(self):x}"
 
-    def tllm_ping(self) -> dict[str, Any]:
+    def tllm_ping(self) -> dict[str, WireValue]:
         """Liveness/provenance probe: which process is answering."""
         from tllm.runtime import residual_runtime as core
 
         return {
             "pid": os.getpid(),
             "worker_id": self._tllm_worker_id(),
-            "patch_installed": bool(core._PATCH_INSTALLED),
-            "consumer": None if core.RUNTIME.consumer is None else str(core.RUNTIME.consumer.consumer_id),
+            "patch_installed": core.runtime_patch_installed(),
+            "consumer": core.active_consumer_id(),
             "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
             "fast_weight_enabled": bool(core.RUNTIME.config.fast_weight_enabled),
             "fast_weight_chunk_size": int(core.RUNTIME.config.fast_weight_chunk_size),
         }
 
-    def tllm_push_request_mapping(self, mappings: list[list[Any]]) -> int:
+    def tllm_push_request_mapping(self, mappings: list[list[object]]) -> int:
         """Install request_id -> (prompt_idx, sample_idx) rows.
 
         Each entry is ``[request_id, prompt_idx, sample_idx]``. Called by the
@@ -292,13 +314,15 @@ class TllmWorkerExtension:
 
         count = 0
         for entry in mappings:
-            request_id, prompt_idx, sample_idx = str(entry[0]), int(entry[1]), int(entry[2])
+            request_id = _wire_text(entry[0], "request_id")
+            prompt_idx = _wire_nonnegative_int(entry[1], "prompt_idx")
+            sample_idx = _wire_nonnegative_int(entry[2], "sample_idx")
             core.RUNTIME.reqid_to_promptidx[request_id] = prompt_idx
             core.RUNTIME.reqid_to_sampleidx[request_id] = sample_idx
             count += 1
         return count
 
-    def tllm_pull_stats(self, category: str = "all", sync: bool = True) -> dict[str, Any]:
+    def tllm_pull_stats(self, category: str = "all", sync: bool = True) -> dict[str, WireValue]:
         """Read and reset runtime stats, resolved to plain data child-side."""
         from tllm.runtime import residual_runtime as core
 
@@ -313,7 +337,7 @@ class TllmWorkerExtension:
         }
         if category not in supported:
             raise ValueError(f"unsupported stats category {category!r}; supported: {sorted(supported)}")
-        payload = {
+        payload: dict[str, WireValue] = {
             "esamp": {"loss_avg": 0.0, "loss_count": 0, "trace_losses": []},
             "esamp_per_request": {},
             "distiller_timing": {},
@@ -452,7 +476,7 @@ class TllmWorkerExtension:
             fail_on_unsupported=fail_on_unsupported,
         )
 
-    def tllm_register_consumer(self, name: str, config: dict[str, Any], primary: bool = False) -> None:
+    def tllm_register_consumer(self, name: str, config: dict[str, object], primary: bool = False) -> None:
         """Rebuild a consumer from its spec and activate it in this process."""
         from tllm.runtime import consumer_plugins as consumer_registry
         from tllm.runtime.mp.bootstrap import ConsumerSpec
@@ -827,12 +851,7 @@ class TllmWorkerExtension:
             if bindings is not None:
                 core.RUNTIME.native_schedule_graph = compilation.graph
                 core.RUNTIME.native_workloads_pending = True
-                core.RUNTIME.residual_raw_paths = dict(
-                    cast(
-                        "Mapping[ResidualLocator, str]",
-                        bindings.residual_paths,
-                    )
-                )
+                core.RUNTIME.residual_raw_paths = dict(bindings.residual_paths)
             execution = build_native_workload_execution(
                 compilation,
                 runtime=core.RUNTIME,
@@ -901,9 +920,7 @@ class TllmWorkerExtension:
         )
         if stage_replacement and bindings is not None:
             assert isinstance(previous, NativeWorkloadExecution)
-            replacement_paths = dict(
-                cast("Mapping[ResidualLocator, str]", bindings.residual_paths)
-            )
+            replacement_paths = dict(bindings.residual_paths)
             topology_changed = (
                 replacement_paths != dict(staged.residual_raw_paths)
                 or _decision_requires_hidden_taps(compilation.decision)
@@ -964,7 +981,10 @@ class TllmWorkerExtension:
         """Open a committed epoch only after the parent has all commit votes."""
 
         from tllm.runtime import residual_runtime as core
-        from tllm.runtime.workload_execution import NativeWorkloadExecution
+        from tllm.runtime.workload_execution import (
+            NativeWorkloadExecution,
+            StagedExecution,
+        )
 
         identity = (
             _wire_sha256(signature, "signature"),
@@ -985,8 +1005,11 @@ class TllmWorkerExtension:
         if staged.execution_staged_in_store:
             if store is None:
                 raise RuntimeError("worker lost its staged workload execution store")
-            if store.staged is not execution:
-                raise RuntimeError("worker staged workload execution store diverged")
+            match store.staged:
+                case StagedExecution(execution=staged_execution) if staged_execution is execution:
+                    pass
+                case _:
+                    raise RuntimeError("worker staged workload execution store diverged")
             store.activate_staged(identity[1])
         else:
             try:
@@ -994,9 +1017,7 @@ class TllmWorkerExtension:
                 if bindings is not None:
                     core.RUNTIME.native_schedule_graph = staged.compilation.graph
                     core.RUNTIME.native_workloads_pending = True
-                    core.RUNTIME.residual_raw_paths = dict(
-                        cast("Mapping[ResidualLocator, str]", bindings.residual_paths)
-                    )
+                    core.RUNTIME.residual_raw_paths = dict(bindings.residual_paths)
                     if _decision_requires_hidden_taps(staged.compilation.decision):
                         runner = _runner_of(self)
                         if not _runner_has_loaded_model(runner):
@@ -1009,7 +1030,7 @@ class TllmWorkerExtension:
 
                         staged.hook_transaction = setup_runtime_hooks_transactionally(
                             core=core,
-                            runner=cast("Any", runner),
+                            runner=_hook_runner(runner),
                         )
                 if isinstance(execution, NativeWorkloadExecution):
                     if store is None or store.current is not execution:
@@ -1064,17 +1085,22 @@ class TllmWorkerExtension:
         if staged.activated:
             raise RuntimeError("cannot abort a workload epoch after global activation")
         if staged.committed and staged.execution_staged_in_store:
+            from tllm.runtime.workload_execution import StagedExecution
+
             publication_store = staged.publication_store
             if publication_store is None:
                 raise RuntimeError("worker lost its staged workload execution store")
-            if publication_store.staged is not staged.execution:
-                if publication_store.current is staged.execution:
+            match publication_store.staged:
+                case StagedExecution(execution=execution) if execution is staged.execution:
+                    pass
+                case _:
+                    if publication_store.current is staged.execution:
+                        raise RuntimeError(
+                            "cannot abort a workload epoch after safe-point promotion"
+                        )
                     raise RuntimeError(
-                        "cannot abort a workload epoch after safe-point promotion"
+                        "worker workload execution store diverged before abort"
                     )
-                raise RuntimeError(
-                    "worker workload execution store diverged before abort"
-                )
         if staged.committed:
             hook_transaction = staged.hook_transaction
             if hook_transaction is not None:
@@ -1130,8 +1156,15 @@ class TllmWorkerExtension:
             raise RuntimeError("cannot finalize a workload decision before activation")
         store = staged.publication_store
         if store is not None:
+            from tllm.runtime.workload_execution import NoStagedExecution
+
+            match store.staged:
+                case NoStagedExecution():
+                    no_staged_execution = True
+                case _:
+                    no_staged_execution = False
             drained = (
-                store.staged is None
+                no_staged_execution
                 and store.current.plan_epoch == identity[1]
                 and store.retired_count == 0
             )
@@ -1192,9 +1225,18 @@ class TllmWorkerExtension:
         if not staged.activated:
             raise RuntimeError("cannot drain a workload decision before activation")
         store = staged.publication_store
+        from tllm.runtime.workload_execution import NoStagedExecution
+
+        no_staged_execution = False
+        if store is not None:
+            match store.staged:
+                case NoStagedExecution():
+                    no_staged_execution = True
+                case _:
+                    pass
         if (
             store is None
-            or store.staged is not None
+            or not no_staged_execution
             or store.current.plan_epoch != identity[1]
         ):
             return {

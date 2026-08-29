@@ -8,13 +8,13 @@ from typing import cast
 
 from tllm.contracts.consumer_stats import TrainingStats
 from tllm.runtime.workload_bindings import (
-    InputProvider,
     LocalRuntimeServices,
     NoPerRequestStats,
     NoRuntimeServices,
     NoSamplerBinding,
     NoWorkerBinding,
-    OutputSink,
+    RuntimeInputBinding,
+    RuntimeOutputBinding,
     RuntimePortRegistry,
     RuntimeStateRegistry,
     StateSnapshot,
@@ -55,8 +55,12 @@ class WorkloadRuntimeBindingTest(unittest.TestCase):
 
     def test_registries_are_immutable_and_lifecycle_is_closed(self) -> None:
         owner = _BindingOwner()
-        inputs: dict[str, InputProvider] = {"input": _input}
-        outputs: dict[str, OutputSink] = {"output": _output}
+        inputs: dict[str, RuntimeInputBinding[object]] = {
+            "input": RuntimeInputBinding(_input)
+        }
+        outputs: dict[str, RuntimeOutputBinding[object]] = {
+            "output": RuntimeOutputBinding(_output)
+        }
         snapshots: dict[str, StateSnapshot] = {"state": _snapshot}
         services = LocalRuntimeServices(
             cold_specialize=lambda _spec: None,
@@ -73,8 +77,8 @@ class WorkloadRuntimeBindingTest(unittest.TestCase):
             services=services,
         )
 
-        inputs["other"] = _input
-        outputs["other"] = _output
+        inputs["other"] = RuntimeInputBinding(_input)
+        outputs["other"] = RuntimeOutputBinding(_output)
         snapshots["other"] = _snapshot
         self.assertEqual(tuple(binding.ports.inputs), ("input",))
         self.assertEqual(tuple(binding.ports.outputs), ("output",))
@@ -83,7 +87,9 @@ class WorkloadRuntimeBindingTest(unittest.TestCase):
         self.assertEqual(services.diagnostics(), {"updates": 3})
 
         with self.assertRaises(TypeError):
-            cast(dict[str, InputProvider], binding.ports.inputs)["other"] = _input
+            cast(
+                dict[str, RuntimeInputBinding[object]], binding.ports.inputs
+            )["other"] = RuntimeInputBinding(_input)
 
 
 if __name__ == "__main__":

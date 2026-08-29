@@ -81,6 +81,15 @@ MODEL_HOOK_FLAG = "esamp_hook_installed"
 MODEL_HOOK_SPEC_ATTR = "esamp_hook_spec"
 
 
+def runtime_patch_installed() -> bool:
+    return _PATCH_INSTALLED
+
+
+def active_consumer_id() -> str | None:
+    consumer = RUNTIME.consumer
+    return None if consumer is None else str(consumer.consumer_id)
+
+
 
 def _ensure_dispatch_registry() -> ConsumerRegistry:
     if RUNTIME.consumer_registry is None:
@@ -889,7 +898,7 @@ def cold_specialize_workgraph(spec: "RuntimeSpecializationSpec") -> None:
     refresh_workgraph_capture_metadata()
 
 
-def register_dispatch_consumer(consumer: BaseConsumer) -> None:
+def register_dispatch_consumer(consumer: BaseConsumer[object]) -> None:
     _ensure_dispatch_registry().register(consumer)
     _refresh_dispatch_plan()
 
@@ -919,21 +928,9 @@ def runner_uses_compilation_or_cudagraph(runner: RunnerLike) -> bool:
     if mode != _graph_policy.GraphMode.EAGER:
         return True
 
-    # Structural fallback for runners that only expose the legacy flags.
-    use_cuda_graph = getattr(runner, "use_cuda_graph", None)
-    if use_cuda_graph is True:
-        return True
+    from tllm.runtime.vllm_adapter import legacy_runner_graph_enabled
 
-    cfg = getattr(runner, "compilation_config", None)
-    if cfg is None:
-        return False
-
-    level_raw = getattr(cfg, "level", 0)
-    try:
-        level = int(level_raw)
-    except Exception:
-        level = 0
-    return level > 0
+    return legacy_runner_graph_enabled(runner)
 
 
 def infer_hidden_dtype(layer: torch.nn.Module) -> torch.dtype:
@@ -1066,7 +1063,13 @@ def set_esamp_training_enabled(enabled: bool) -> None:
     from tllm.runtime.runtime import active_runtime
 
     runtime = active_runtime()
-    if runtime.has_native_workloads:
+    if RUNTIME.consumer is not None:
+        RUNTIME.consumer.set_enabled(enabled)
+        _refresh_dispatch_plan()
+    elif runtime.has_native_workloads and (
+        RUNTIME.workload_execution is not None
+        or RUNTIME.workload_execution_store is not None
+    ):
         from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
         from tllm.runtime.mp.control import active_control_plane
 
@@ -1075,9 +1078,6 @@ def set_esamp_training_enabled(enabled: bool) -> None:
         )
         refresh_exported_bootstrap_spec()
         return
-    if RUNTIME.consumer is not None:
-        RUNTIME.consumer.set_enabled(enabled)
-        _refresh_dispatch_plan()
     elif RUNTIME.workload_execution is not None:
         raise RuntimeError(
             "native ESamp enable changes require the owning coordinator runtime"
@@ -1249,7 +1249,7 @@ def read_and_reset_placement_stats() -> PlacementStats:
 
 
 def read_graph_debug_stats(*, mode: str = "model_bank") -> GraphDebugStats:
-    return _stats.read_graph_debug_stats(getattr(RUNTIME, "consumer", None), mode=mode)
+    return _stats.read_graph_debug_stats(RUNTIME.consumer, mode=mode)
 
 
 

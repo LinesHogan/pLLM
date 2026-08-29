@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING, cast
 
 from tllm.runtime.workload_bindings import (
     DiagnosticsRuntimeServices,
-    InputProvider,
     LocalRuntimeServices,
-    OutputSink,
-    PerRequestStats,
+    NoRuntimeServices,
+    NoSamplerBinding,
+    RuntimeInputBinding,
+    RuntimeOutputBinding,
+    RuntimePortRegistry,
     SamplerRuntimeBinding,
     WorkloadRuntimeBinding,
 )
@@ -23,7 +25,6 @@ from tllm.runtime.workload_bindings import (
 if TYPE_CHECKING:
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
-    from tllm.contracts.consumer_stats import TrainingStats
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
     from tllm.schedule import ResidualResourceBinding, WorkloadCompilation
@@ -92,12 +93,14 @@ def _json_object(encoded: str) -> dict[str, object]:
     return result
 
 
-# Historical names remain import-compatible while all native implementations
-# use the closed WorkloadRuntimeBinding surface.
-NativeWorkloadResources = WorkloadRuntimeBinding
-ReconstructedWorkload = WorkloadRuntimeBinding
+@dataclass(frozen=True, slots=True)
+class NoWorkloadRuntimeBinding:
+    """A pure declaration with no process-local runtime binding."""
+
+
+StaticRuntimeBinding = NoWorkloadRuntimeBinding | WorkloadRuntimeBinding
 StaticBackendBindingEntry = tuple[
-    str, WorkloadRuntimeBinding | None, WorkloadWorkerSpec
+    str, StaticRuntimeBinding, WorkloadWorkerSpec
 ]
 
 
@@ -110,6 +113,13 @@ def static_backend_binding_manifest_wire(
     # equality check against the coordinator-signed CompileOptions payload.
     records: list[dict[str, object]] = []
     for workload_id, resource, spec in entries:
+        match resource:
+            case WorkloadRuntimeBinding() as binding:
+                specialization_key = binding.specialization_key.items()
+                implementation_ids = binding.backend.binders
+            case NoWorkloadRuntimeBinding():
+                specialization_key = ()
+                implementation_ids = ()
         records.append(
             {
                 "workload_id": workload_id,
@@ -117,12 +127,10 @@ def static_backend_binding_manifest_wire(
                 "config": dict(spec.config),
                 "specialization_key": [
                     [name, value]
-                    for name, value in (
-                        () if resource is None else resource.specialization_key.items()
-                    )
+                    for name, value in specialization_key
                 ],
                 "backend_region_implementation_ids": sorted(
-                    () if resource is None else resource.backend.binders
+                    implementation_ids
                 ),
             }
         )
@@ -215,6 +223,8 @@ def reconstruct_worker_bindings(
     """Rebuild local resources; Rust proves the signed graph and facts."""
 
     from tllm.runtime.workload_execution import (
+        ExecutionLifecycleBinding,
+        NoExecutionLifecycle,
         StateVersionBinding,
         WorkloadExecutionBindings,
     )
@@ -318,8 +328,8 @@ def reconstruct_worker_bindings(
         for specialize in cold_specializers:
             specialize(specialization)
 
-    def merge_inputs() -> dict[str, InputProvider]:
-        merged: dict[str, InputProvider] = {}
+    def merge_inputs() -> dict[str, RuntimeInputBinding[object]]:
+        merged: dict[str, RuntimeInputBinding[object]] = {}
         for item in reconstructed:
             for name, callback in item.ports.inputs.items():
                 if name in merged:
@@ -329,8 +339,8 @@ def reconstruct_worker_bindings(
                 merged[name] = callback
         return merged
 
-    def merge_outputs() -> dict[str, OutputSink]:
-        merged: dict[str, OutputSink] = {}
+    def merge_outputs() -> dict[str, RuntimeOutputBinding[object]]:
+        merged: dict[str, RuntimeOutputBinding[object]] = {}
         for item in reconstructed:
             for name, callback in item.ports.outputs.items():
                 if name in merged:
@@ -361,12 +371,14 @@ def reconstruct_worker_bindings(
                     f"worker reconstruction references unknown state {resource!r}"
                 ) from exc
             state_versions[resource] = StateVersionBinding(state, snapshot)
-    providers = tuple(
-        sampler.provider
-        for item in reconstructed
-        if isinstance(sampler := item.sampler, SamplerRuntimeBinding)
-    )
-    if len(providers) > 1:
+    sampler_bindings: list[SamplerRuntimeBinding] = []
+    for item in reconstructed:
+        match item.sampler:
+            case SamplerRuntimeBinding() as sampler:
+                sampler_bindings.append(sampler)
+            case NoSamplerBinding():
+                pass
+    if len(sampler_bindings) > 1:
         raise RuntimeError("native worker reconstruction has multiple sampler providers")
     residual_paths: dict["ResidualLocator", str] = {}
     for item in reconstructed:
@@ -394,7 +406,7 @@ def reconstruct_worker_bindings(
                 diagnostics=reader
             ):
                 pass
-            case _:
+            case NoRuntimeServices():
                 continue
         workload_id = declaration.ir.workload_id
         if workload_id in diagnostics_readers:
@@ -406,57 +418,36 @@ def reconstruct_worker_bindings(
 
     lifecycle_service_list: list[LocalRuntimeServices] = []
     for item in reconstructed:
-        if isinstance(item.services, LocalRuntimeServices):
-            lifecycle_service_list.append(item.services)
+        match item.services:
+            case LocalRuntimeServices() as services:
+                lifecycle_service_list.append(services)
+            case DiagnosticsRuntimeServices() | NoRuntimeServices():
+                pass
     lifecycle_services = tuple(lifecycle_service_list)
-
-    def one_lifecycle_callback(
-        callbacks: tuple[Callable[..., object], ...], attribute: str
-    ) -> Callable[..., object] | None:
-        if len(callbacks) > 1:
-            raise RuntimeError(
-                f"native worker reconstruction has multiple {attribute} callbacks"
-            )
-        if not callbacks:
-            return None
-        return callbacks[0]
-
-    stats_reader = one_lifecycle_callback(
-        tuple(service.stats for service in lifecycle_services), "stats_reader"
-    )
-    per_request_stats_reader = one_lifecycle_callback(
-        tuple(
-            stats.read
-            for service in lifecycle_services
-            if isinstance(stats := service.per_request_stats, PerRequestStats)
-        ),
-        "per_request_stats_reader",
-    )
-    enabled_setter = one_lifecycle_callback(
-        tuple(service.set_enabled for service in lifecycle_services), "enabled_setter"
-    )
-    enabled_predicate = one_lifecycle_callback(
-        tuple(service.is_enabled for service in lifecycle_services), "enabled_predicate"
-    )
-    synchronizer = one_lifecycle_callback(
-        tuple(service.synchronize for service in lifecycle_services), "synchronizer"
-    )
+    if len(lifecycle_services) > 1:
+        raise RuntimeError(
+            "native worker reconstruction has multiple lifecycle service bindings"
+        )
 
     return WorkloadExecutionBindings(
         declarations=declarations,
-        provided_inputs=merge_inputs(),
-        output_sinks=merge_outputs(),
-        state_versions=state_versions,
-        sampler_provider=None if not providers else providers[0],
-        diagnostics_readers=diagnostics_readers,
-        stats_reader=cast(Callable[[bool], "TrainingStats"] | None, stats_reader),
-        per_request_stats_reader=cast(
-            Callable[[bool], Mapping[int, "TrainingStats"]] | None,
-            per_request_stats_reader,
+        ports=RuntimePortRegistry(
+            inputs=merge_inputs(),
+            outputs=merge_outputs(),
         ),
-        enabled_setter=cast(Callable[[bool], None] | None, enabled_setter),
-        enabled_predicate=cast(Callable[[], bool] | None, enabled_predicate),
-        synchronizer=cast(Callable[[], None] | None, synchronizer),
+        state_versions=state_versions,
+        sampler=(NoSamplerBinding() if not sampler_bindings else sampler_bindings[0]),
+        diagnostics_readers=diagnostics_readers,
+        lifecycle=(
+            NoExecutionLifecycle()
+            if not lifecycle_services
+            else ExecutionLifecycleBinding(
+                stats=lifecycle_services[0].stats,
+                is_enabled=lifecycle_services[0].is_enabled,
+                synchronize=lifecycle_services[0].synchronize,
+                per_request_stats=lifecycle_services[0].per_request_stats,
+            )
+        ),
         residual_paths=residual_paths,
         backend_region_binders=backend_region_binders,
         static_binding_entries=tuple(
@@ -470,6 +461,8 @@ def reconstruct_worker_bindings(
 
 __all__ = [
     "NativeWorkload",
+    "NoWorkloadRuntimeBinding",
+    "StaticBackendBindingEntry",
     "WorkloadWorkerSpec",
     "residual_resource_manifest_from_paths",
     "static_backend_binding_manifest_wire",

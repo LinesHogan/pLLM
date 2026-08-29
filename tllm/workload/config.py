@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Generic, Protocol, Self, TypeGuard, TypeVar, cast, dataclass_transform, overload
+from typing import Generic, Literal, Protocol, Self, TypeVar, cast, dataclass_transform, overload
 
 from tllm import _core
 
-T = TypeVar("T")
 ConfigAtom = bool | int | float | str | tuple[int, ...]
+T = TypeVar("T", bound=ConfigAtom)
+ConfigStrT = TypeVar("ConfigStrT", bound=str)
 
 
 class _ConfigNormalizer(Protocol):
@@ -35,16 +36,83 @@ class NumericConstraint(StrEnum):
     UNIT_INTERVAL = "unit_interval"
 
 
+class _ConfigFieldToken:
+    pass
+
+
+_CONFIG_FIELD_TOKEN = _ConfigFieldToken()
+
+
 class ConfigField(Generic[T]):
     """A config value on instances and a typed declaration reference on classes."""
 
     def __init__(
-        self, default: T, constraint: NumericConstraint = NumericConstraint.ANY
+        self,
+        default: T,
+        kind: ConfigKind,
+        constraint: NumericConstraint = NumericConstraint.ANY,
+        *,
+        _token: _ConfigFieldToken,
     ) -> None:
+        if _token is not _CONFIG_FIELD_TOKEN:
+            raise TypeError("ConfigField must use a nominal typed constructor")
         self.default = default
         self.name = ""
-        self.kind = _config_kind(default)
+        self.kind = kind
         self.constraint = constraint
+
+    @classmethod
+    def boolean(
+        cls,
+        default: bool,
+        constraint: NumericConstraint = NumericConstraint.ANY,
+    ) -> ConfigField[bool]:
+        return ConfigField(
+            default, ConfigKind.BOOL, constraint, _token=_CONFIG_FIELD_TOKEN
+        )
+
+    @classmethod
+    def integer(
+        cls,
+        default: int,
+        constraint: NumericConstraint = NumericConstraint.ANY,
+    ) -> ConfigField[int]:
+        return ConfigField(
+            default, ConfigKind.INT, constraint, _token=_CONFIG_FIELD_TOKEN
+        )
+
+    @classmethod
+    def floating(
+        cls,
+        default: float,
+        constraint: NumericConstraint = NumericConstraint.ANY,
+    ) -> ConfigField[float]:
+        return ConfigField(
+            default, ConfigKind.FLOAT, constraint, _token=_CONFIG_FIELD_TOKEN
+        )
+
+    @classmethod
+    def text(
+        cls,
+        default: ConfigStrT,
+        constraint: NumericConstraint = NumericConstraint.ANY,
+    ) -> ConfigField[ConfigStrT]:
+        return ConfigField(
+            default, ConfigKind.STR, constraint, _token=_CONFIG_FIELD_TOKEN
+        )
+
+    @classmethod
+    def integer_tuple(
+        cls,
+        default: tuple[int, ...],
+        constraint: NumericConstraint = NumericConstraint.ANY,
+    ) -> ConfigField[tuple[int, ...]]:
+        return ConfigField(
+            default,
+            ConfigKind.INT_TUPLE,
+            constraint,
+            _token=_CONFIG_FIELD_TOKEN,
+        )
 
     def __set_name__(self, owner: type[WorkloadConfig], name: str) -> None:
         self.name = name
@@ -74,12 +142,68 @@ class ConfigField(Generic[T]):
                 return ",".join(str(item) for item in cast(tuple[int, ...], value))
 
 
+@overload
 def config_field(
-    *, default: T, constraint: NumericConstraint = NumericConstraint.ANY
+    *,
+    default: bool,
+    kind: Literal[ConfigKind.BOOL],
+    constraint: NumericConstraint = NumericConstraint.ANY,
+) -> bool: ...
+
+
+@overload
+def config_field(
+    *,
+    default: int,
+    kind: Literal[ConfigKind.INT],
+    constraint: NumericConstraint = NumericConstraint.ANY,
+) -> int: ...
+
+
+@overload
+def config_field(
+    *,
+    default: float,
+    kind: Literal[ConfigKind.FLOAT],
+    constraint: NumericConstraint = NumericConstraint.ANY,
+) -> float: ...
+
+
+@overload
+def config_field(
+    *,
+    default: ConfigStrT,
+    kind: Literal[ConfigKind.STR],
+    constraint: NumericConstraint = NumericConstraint.ANY,
+) -> ConfigStrT: ...
+
+
+@overload
+def config_field(
+    *,
+    default: tuple[int, ...],
+    kind: Literal[ConfigKind.INT_TUPLE],
+    constraint: NumericConstraint = NumericConstraint.ANY,
+) -> tuple[int, ...]: ...
+
+
+def config_field(
+    *,
+    default: T,
+    kind: ConfigKind,
+    constraint: NumericConstraint = NumericConstraint.ANY,
 ) -> T:
     """PEP 681 field specifier; runtime stores a typed descriptor."""
 
-    return cast(T, ConfigField(default, constraint))
+    return cast(
+        T,
+        ConfigField(
+            default,
+            kind,
+            constraint,
+            _token=_CONFIG_FIELD_TOKEN,
+        ),
+    )
 
 
 @dataclass_transform(field_specifiers=(config_field,), frozen_default=True)
@@ -165,45 +289,6 @@ class WorkloadConfig:
         }
 
 
-def _config_kind(value: object) -> ConfigKind:
-    """Encode trusted class-definition defaults for the Rust schema boundary."""
-
-    if type(value) is bool:
-        return ConfigKind.BOOL
-    if type(value) is int:
-        return ConfigKind.INT
-    if type(value) is float:
-        return ConfigKind.FLOAT
-    if type(value) is str:
-        return ConfigKind.STR
-    if _is_int_tuple(value):
-        return ConfigKind.INT_TUPLE
-    raise TypeError(f"unsupported config default type: {type(value).__name__}")
-
-
-def _is_string_object_mapping(value: object) -> TypeGuard[Mapping[str, object]]:
-    if not isinstance(value, Mapping):
-        return False
-    mapping = cast(Mapping[object, object], value)
-    return all(isinstance(key, str) for key in mapping)
-
-
-def _is_int_tuple(value: object) -> TypeGuard[tuple[int, ...]]:
-    if not isinstance(value, tuple):
-        return False
-    items = cast(tuple[object, ...], value)
-    return all(type(item) is int for item in items)
-
-
-def _int_tuple_from_json(value: object) -> tuple[int, ...] | None:
-    if not isinstance(value, list):
-        return None
-    items = cast(list[object], value)
-    if any(type(item) is not int for item in items):
-        return None
-    return tuple(cast(list[int], items))
-
-
 def _decode_config_atom(value: object, field: ConfigField[ConfigAtom]) -> ConfigAtom:
     match field.kind:
         case ConfigKind.BOOL:
@@ -219,11 +304,10 @@ def _decode_config_atom(value: object, field: ConfigField[ConfigAtom]) -> Config
             if type(value) is str:
                 return value
         case ConfigKind.INT_TUPLE:
-            if _is_int_tuple(value):
-                return value
-            decoded_tuple = _int_tuple_from_json(value)
-            if decoded_tuple is not None:
-                return decoded_tuple
+            if type(value) is list:
+                list_items = cast(list[object], value)
+                if all(type(item) is int for item in list_items):
+                    return tuple(cast(list[int], list_items))
     raise TypeError(
         f"Rust config normalization returned an invalid {field.kind.value} value "
         f"for {field.name!r}"
@@ -234,16 +318,21 @@ def _decode_normalized_config(
     payload_json: str, fields: tuple[ConfigField[ConfigAtom], ...]
 ) -> dict[str, ConfigAtom]:
     decoded: object = json.loads(payload_json)
-    if not _is_string_object_mapping(decoded):
+    if not isinstance(decoded, Mapping):
         raise TypeError("Rust config normalization must return a JSON object")
+    mapping = cast(Mapping[object, object], decoded)
+    if not all(isinstance(key, str) for key in mapping):
+        raise TypeError("Rust config normalization returned non-string field names")
+    typed = cast(Mapping[str, object], mapping)
     expected = {field.name for field in fields}
-    if set(decoded) != expected:
+    if set(typed) != expected:
         raise ValueError("Rust config normalization returned an unexpected field set")
-    return {field.name: _decode_config_atom(decoded[field.name], field) for field in fields}
+    return {field.name: _decode_config_atom(typed[field.name], field) for field in fields}
 
 
 __all__ = [
     "ConfigField",
+    "ConfigKind",
     "NumericConstraint",
     "WorkloadConfig",
     "config_field",

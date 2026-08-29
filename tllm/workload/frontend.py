@@ -5,14 +5,14 @@ from __future__ import annotations
 import inspect
 import torch
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from types import FunctionType, MethodType
-from typing import Generic, Never, ParamSpec, Protocol, Self, TypeGuard, TypeVar, cast, get_origin, get_type_hints, overload
+from typing import TYPE_CHECKING, Generic, Never, ParamSpec, Protocol, Self, TypeVar, cast, get_origin, get_type_hints, overload
 from weakref import WeakKeyDictionary
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
-from tllm.workload.config import ConfigField, WorkloadConfig
+from tllm.workload.config import ConfigAtom, ConfigField, WorkloadConfig
 from tllm.workload.staging import StagedPort
 from tllm.workload.host import HostOutput
 from tllm.workload.ir import (
@@ -41,6 +41,9 @@ from tllm.workload.ir import (
     WorkloadIR,
 )
 
+if TYPE_CHECKING:
+    from tllm.ports.consumer import BaseConsumer
+
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -48,9 +51,7 @@ _T = TypeVar("_T")
 _REQUEST_KEY_FIELDS = frozenset({"request_id", "prompt_idx", "sample_idx"})
 
 
-def _name(value: object, label: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be str")
+def _name(value: str, label: str) -> str:
     if not value:
         raise ValueError(f"{label} must be non-empty")
     return value
@@ -76,25 +77,76 @@ def request_key(*fields: str) -> RequestKey:
     return RequestKey(tuple(fields))
 
 
+@dataclass(frozen=True, slots=True)
+class _FixedLearningRate:
+    value: float
+
+    def option(self) -> str:
+        if self.value <= 0:
+            raise ValueError("optimizer learning rate must be positive")
+        return self.value.hex()
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfiguredLearningRate:
+    field_name: str
+
+    def option(self) -> str:
+        return f"field:{self.field_name}"
+
+
+_LearningRate = _FixedLearningRate | _ConfiguredLearningRate
+
+
 class AdamWSpec(OptimizerSpec):
     def __init__(
         self,
         *,
-        lr: float | ConfigField[float],
+        lr: _LearningRate,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
     ) -> None:
-        if not isinstance(lr, ConfigField) and lr <= 0:
-            raise ValueError("AdamWSpec.lr must be positive")
         super().__init__(
             kind="adamw",
             options=(
                 ("betas", repr(tuple(float(value) for value in betas))),
                 ("eps", float(eps).hex()),
-                ("lr", f"field:{lr.name}" if isinstance(lr, ConfigField) else float(lr).hex()),
+                ("lr", lr.option()),
                 ("weight_decay", float(weight_decay).hex()),
             ),
+        )
+
+    @classmethod
+    def fixed(
+        cls,
+        lr: float,
+        *,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+    ) -> Self:
+        return cls(
+            lr=_FixedLearningRate(lr),
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+
+    @classmethod
+    def configured(
+        cls,
+        lr: ConfigField[float],
+        *,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+    ) -> Self:
+        return cls(
+            lr=_ConfiguredLearningRate(lr.name),
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
         )
 
 
@@ -110,25 +162,43 @@ class AdamSpec(OptimizerSpec):
     def __init__(
         self,
         *,
-        lr: float | ConfigField[float],
+        lr: _LearningRate,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
     ) -> None:
-        if not isinstance(lr, ConfigField) and lr <= 0:
-            raise ValueError("AdamSpec.lr must be positive")
         super().__init__(
             kind="adam",
             options=(
                 ("betas", repr(tuple(float(value) for value in betas))),
                 ("eps", float(eps).hex()),
-                ("lr", f"field:{lr.name}" if isinstance(lr, ConfigField) else float(lr).hex()),
+                ("lr", lr.option()),
             ),
         )
 
+    @classmethod
+    def fixed(
+        cls,
+        lr: float,
+        *,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+    ) -> Self:
+        return cls(lr=_FixedLearningRate(lr), betas=betas, eps=eps)
+
+    @classmethod
+    def configured(
+        cls,
+        lr: ConfigField[float],
+        *,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+    ) -> Self:
+        return cls(lr=_ConfiguredLearningRate(lr.name), betas=betas, eps=eps)
+
 
 StateValueT = TypeVar("StateValueT")
-ConfiguredT_co = TypeVar("ConfiguredT_co", covariant=True)
-ConfiguredT = TypeVar("ConfiguredT")
+ConfiguredT_co = TypeVar("ConfiguredT_co", bound=ConfigAtom, covariant=True)
+ConfiguredT = TypeVar("ConfiguredT", bound=ConfigAtom)
 PortT = TypeVar("PortT")
 PortT_co = TypeVar("PortT_co", covariant=True)
 
@@ -331,67 +401,66 @@ class PublishedModule(State[StateValueT]):
         self.port.__set_name__(owner, f"{name}__publish")
 
 
-def _state_id(state: State[object]) -> str:
+class _EffectState(Protocol):
+    @property
+    def optimizer(self) -> OptimizerSpec | None: ...
+
+    @property
+    def transition_kind(self) -> str: ...
+
+    def to_ir(self) -> StateIR: ...
+
+
+def _state_id(state: _EffectState) -> str:
     return state.to_ir().name
-
-
-def _is_state(member: object) -> TypeGuard[State[object]]:
-    return isinstance(member, State)
-
-
-def _is_published_module(
-    state: State[object],
-) -> TypeGuard[PublishedModule[object]]:
-    return isinstance(state, PublishedModule)
 
 
 @dataclass(frozen=True, slots=True)
 class StateEffect:
     kind: EffectKind
-    state: object | None
-    resource: str | None = None
+    state: _EffectState
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", EffectKind(self.kind))
         if self.kind is EffectKind.EXTERN_IO:
-            if self.state is not None:
-                raise ValueError("extern_io effects name an external resource, not a State")
-            object.__setattr__(
-                self, "resource", _name(self.resource, "extern_io resource")
-            )
-            return
-        if not _is_state(self.state):
-            raise TypeError(f"{self.kind.value} expects a State")
-        if self.resource is not None:
-            raise ValueError("only extern_io effects may name a raw resource")
+            raise ValueError("extern_io uses ExternalEffect, not StateEffect")
 
     @property
     def resource_name(self) -> str:
-        """The signed effect resource: the State name, or the extern channel."""
-        if self.kind is EffectKind.EXTERN_IO:
-            assert self.resource is not None
-            return self.resource
-        if not _is_state(self.state):
-            raise RuntimeError("state effect has no State")
         return _state_id(self.state)
 
 
-def read(state: object) -> StateEffect:
-    return _effect(EffectKind.READ, _require_state(state, "read"))
+@dataclass(frozen=True, slots=True)
+class ExternalEffect:
+    resource: str
+    kind: EffectKind = field(init=False, default=EffectKind.EXTERN_IO)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "resource", _name(self.resource, "extern_io resource"))
+
+    @property
+    def resource_name(self) -> str:
+        return self.resource
 
 
-def current(state: object) -> StateEffect:
-    return _effect(EffectKind.CURRENT, _require_state(state, "current"))
+WorkloadEffect = StateEffect | ExternalEffect
 
 
-def transition(state: object) -> StateEffect:
-    state = _require_state(state, "transition")
+def read(state: State[StateValueT]) -> StateEffect:
+    return _effect(EffectKind.READ, state)
+
+
+def current(state: State[StateValueT]) -> StateEffect:
+    return _effect(EffectKind.CURRENT, state)
+
+
+def transition(state: State[StateValueT]) -> StateEffect:
     if state.optimizer is None and state.transition_kind == "optimizer":
         raise ValueError("transition requires a State optimizer or explicit version conversion")
     return StateEffect(EffectKind.TRANSITION, state)
 
 
-def maybe_transition(state: object) -> StateEffect:
+def maybe_transition(state: State[StateValueT]) -> StateEffect:
     """Declare a *conditional* transition: the version may or may not advance.
 
     Use this when whether the update fires is data-dependent and cannot be
@@ -403,7 +472,6 @@ def maybe_transition(state: object) -> StateEffect:
     conditional transition therefore never weakens the signed ordering
     contract; it only widens the audited version delta.
     """
-    state = _require_state(state, "maybe_transition")
     if state.optimizer is None and state.transition_kind == "optimizer":
         raise ValueError(
             "maybe_transition requires a State optimizer or explicit version conversion"
@@ -411,11 +479,11 @@ def maybe_transition(state: object) -> StateEffect:
     return StateEffect(EffectKind.TRANSITION_MAYBE, state)
 
 
-def next(state: object) -> StateEffect:
-    return _effect(EffectKind.NEXT, _require_state(state, "next"))
+def next(state: State[StateValueT]) -> StateEffect:
+    return _effect(EffectKind.NEXT, state)
 
 
-def extern_io(resource: str) -> StateEffect:
+def extern_io(resource: str) -> ExternalEffect:
     """Declare an external I/O effect on a named channel (e.g. "trace:file").
 
     The resource names the external channel, not a workload State.  A task
@@ -427,17 +495,11 @@ def extern_io(resource: str) -> StateEffect:
     while extern_io says the task *observes or mutates something outside* the
     signed state model regardless of who runs it.
     """
-    return StateEffect(EffectKind.EXTERN_IO, None, resource)
+    return ExternalEffect(resource)
 
 
-def _effect(kind: EffectKind, state: State[object]) -> StateEffect:
+def _effect(kind: EffectKind, state: _EffectState) -> StateEffect:
     return StateEffect(kind, state)
-
-
-def _require_state(value: object, operation: str) -> State[object]:
-    if not _is_state(value):
-        raise TypeError(f"{operation} expects a State")
-    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -887,7 +949,7 @@ class ExecutorRegistry:
 class TaskDecl:
     inputs: tuple[tuple[str, InputSpec], ...]
     outputs: tuple[tuple[str, OutputSpec], ...]
-    effects: tuple[StateEffect, ...]
+    effects: tuple[WorkloadEffect, ...]
     timing: Timing
     implementations: tuple[ExternImplementation, ...]
     domain: Domain
@@ -944,7 +1006,7 @@ def task(
     *,
     inputs: Mapping[str, InputSpec] | None = None,
     outputs: Mapping[str, OutputSpec] | None = None,
-    effects: tuple[StateEffect, ...] = (),
+    effects: tuple[WorkloadEffect, ...] = (),
     timing: Timing = Before("step.end"),
     implementation: ExternImplementation | tuple[ExternImplementation, ...] | None = None,
     domain: Domain = Domain("scalar"),
@@ -958,7 +1020,7 @@ def task(
     *,
     inputs: Mapping[str, InputSpec] | None = None,
     outputs: Mapping[str, OutputSpec] | None = None,
-    effects: tuple[StateEffect, ...] = (),
+    effects: tuple[WorkloadEffect, ...] = (),
     timing: Timing = Before("step.end"),
     implementation: ExternImplementation | tuple[ExternImplementation, ...] | None = None,
     domain: Domain = Domain("scalar"),
@@ -1040,6 +1102,32 @@ class WorkloadAuthority(str, Enum):
     LEGACY_ADAPTER = "legacy_adapter"
 
 
+LegacyConsumerFactory = Callable[[object], "BaseConsumer[object]"]
+
+
+@dataclass(frozen=True, slots=True)
+class NoLegacyConsumerAdapter:
+    def build(self, instance: object) -> "BaseConsumer[object]":
+        _ = instance
+        raise RuntimeError("workload definition has no legacy consumer binding")
+
+
+NO_LEGACY_CONSUMER_ADAPTER = NoLegacyConsumerAdapter()
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyConsumerAdapter:
+    """Explicit compatibility binding captured when a workload is declared."""
+
+    factory: LegacyConsumerFactory
+
+    def build(self, instance: object) -> "BaseConsumer[object]":
+        return self.factory(instance)
+
+
+LegacyConsumerBinding = NoLegacyConsumerAdapter | LegacyConsumerAdapter
+
+
 @dataclass(frozen=True, slots=True)
 class WorkloadDefinition:
     workload_id: str
@@ -1054,6 +1142,7 @@ class WorkloadDefinition:
     states: tuple[State[object], ...] = ()
     staged_ports: tuple[StagedPort[object], ...] = ()
     host_outputs: tuple[HostOutput[object], ...] = ()
+    legacy_consumer: LegacyConsumerBinding = NO_LEGACY_CONSUMER_ADAPTER
 
 
 @dataclass(frozen=True, slots=True)
@@ -1072,6 +1161,7 @@ class NativeWorkloadDefinition:
     states: tuple[State[object], ...] = ()
     staged_ports: tuple[StagedPort[object], ...] = ()
     host_outputs: tuple[HostOutput[object], ...] = ()
+    legacy_consumer: LegacyConsumerBinding = NO_LEGACY_CONSUMER_ADAPTER
 
 
 _Definition = WorkloadDefinition | NativeWorkloadDefinition
@@ -1119,9 +1209,25 @@ def workload(
     approximation_criteria: ApproximationCriteria | None = None,
     config: type[WorkloadConfig] | None = None,
     enabled: ConfigField[bool] | None = None,
+    legacy_consumer: LegacyConsumerFactory | None = None,
 ) -> type[_T] | Callable[[type[_T]], type[_T]]:
     def decorate(target: type[_T]) -> type[_T]:
         policy = ApproximationPolicy(approximation)
+        resolved_authority = WorkloadAuthority(authority)
+        if resolved_authority is WorkloadAuthority.LEGACY_ADAPTER:
+            if legacy_consumer is None:
+                raise TypeError(
+                    "legacy-adapter workload declaration requires legacy_consumer="
+                )
+            legacy_binding: LegacyConsumerBinding = LegacyConsumerAdapter(
+                legacy_consumer
+            )
+        else:
+            if legacy_consumer is not None:
+                raise TypeError(
+                    "legacy_consumer= is only valid with LEGACY_ADAPTER authority"
+                )
+            legacy_binding = NO_LEGACY_CONSUMER_ADAPTER
         if approximation_criteria is not None:
             if policy is ApproximationPolicy.EXACT:
                 raise ValueError(
@@ -1132,27 +1238,41 @@ def workload(
             definition: _Definition = WorkloadDefinition(
                 _name(workload_id, "workload.id"),
                 policy,
-                WorkloadAuthority(authority),
+                resolved_authority,
                 approximation_criteria,
+                legacy_consumer=legacy_binding,
             )
         elif config is not None and enabled is not None:
+            if resolved_authority is WorkloadAuthority.LEGACY_ADAPTER:
+                raise TypeError(
+                    "legacy-adapter declarations cannot use the native config surface"
+                )
             definition = NativeWorkloadDefinition(
                 workload_id=_name(workload_id, "workload.id"),
                 approximation=policy,
-                authority=WorkloadAuthority(authority),
+                authority=resolved_authority,
                 approximation_criteria=approximation_criteria,
                 config_type=config,
                 enabled=ConfigFieldValue(enabled.name),
+                legacy_consumer=legacy_binding,
             )
         else:
             raise TypeError(
                 "native workload config and enabled ConfigField must be declared together"
             )
         members = _class_members(target)
-        states = tuple(member for _name_, member in members if _is_state(member))
+        state_list: list[State[object]] = []
+        for _name_, member in members:
+            if isinstance(member, State):
+                state_list.append(cast(State[object], member))
+        states = tuple(state_list)
         author_tasks = _author_task_definitions(target)
-        tasks = _expanded_task_definitions(target, author_tasks)
+        tasks = _expanded_task_definitions(author_tasks, states)
         hidden_inputs, sampler_outputs, gradient_tasks, sampler_inputs = _author_metadata(tasks)
+        published_ports: list[StagedPort[object]] = []
+        for state in states:
+            if isinstance(state, PublishedModule):
+                published_ports.append(cast(StagedPort[object], state.port))
         definition = replace(
             definition,
             tasks=tasks,
@@ -1162,7 +1282,7 @@ def workload(
             sampler_inputs=sampler_inputs,
             states=states,
             staged_ports=(
-                *(state.port for state in states if _is_published_module(state)),
+                *published_ports,
                 *(
                     cast(StagedPort[object], member)
                     for _name_, member in members
@@ -1203,11 +1323,9 @@ def task_declaration(function: FunctionType) -> TaskDecl:
 
 
 def _expanded_task_definitions(
-    target: type[object], author_tasks: tuple[TaskDefinition, ...]
+    author_tasks: tuple[TaskDefinition, ...],
+    states: tuple[State[object], ...],
 ) -> tuple[TaskDefinition, ...]:
-    states = tuple(
-        member for _name_, member in _class_members(target) if _is_state(member)
-    )
     publishers = _published_module_tasks(states)
     optimized = _optimized_task_definitions(author_tasks)
     source_order = {
@@ -1233,9 +1351,10 @@ def _published_module_tasks(
 ) -> tuple[TaskDefinition, ...]:
     generated: list[TaskDefinition] = []
     for state in states:
-        if not _is_published_module(state):
+        if not isinstance(state, PublishedModule):
             continue
-        generated_name = f"publish__{_state_id(state)}"
+        published = state
+        generated_name = f"publish__{_state_id(published)}"
 
         def publisher_executor(
             published: PublishedModule[object],
@@ -1252,9 +1371,9 @@ def _published_module_tasks(
             TaskDefinition(
                 name=generated_name,
                 declaration=TaskDecl(
-                    inputs=(("values", StagedInput(state.port)),),
+                    inputs=(("values", StagedInput(published.port)),),
                     outputs=(),
-                    effects=(transition(state),),
+                    effects=(transition(published),),
                     timing=Before("next.prepare"),
                     implementations=(ExternImplementation(
                         namespace="tllm.workload",
@@ -1266,7 +1385,7 @@ def _published_module_tasks(
                     domain=Domain("scalar"),
                     accesses=(),
                 ),
-                executor=publisher_executor(state),
+                executor=publisher_executor(published),
             )
         )
     return tuple(generated)
@@ -1338,12 +1457,18 @@ def _optimized_task_definitions(
             if not isinstance(output, OptimizeOutput):
                 rewritten_outputs.append((output_name, output))
                 continue
-            if not any(
-                effect.kind is EffectKind.READ
-                and effect.state is output.trainable_state()
-                for effect in effects
-            ):
-                effects.append(read(output.trainable_state()))
+            trainable_state = output.trainable_state()
+            has_read_effect = False
+            for effect in effects:
+                match effect:
+                    case StateEffect(kind=EffectKind.READ, state=state):
+                        has_read_effect = state is trainable_state
+                    case ExternalEffect() | StateEffect():
+                        pass
+                if has_read_effect:
+                    break
+            if not has_read_effect:
+                effects.append(read(trainable_state))
             rewritten_outputs.append((output_name, TemporaryOutput()))
             pending.append((task_name, output_name, output))
         expanded.append(
@@ -1445,8 +1570,7 @@ def _class_members(cls: type[object]) -> tuple[tuple[str, object], ...]:
 
 
 def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
-    members = _class_members(cls)
-    states = tuple(value for _, value in members if _is_state(value))
+    states = definition.states
     if len({_state_id(state) for state in states}) != len(states):
         raise ValueError("workload contains duplicate state names")
     parameter_owners: dict[str, str] = {}
@@ -1477,15 +1601,18 @@ def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
         function = entry.executor
         declaration = entry.declaration
         for effect in declaration.effects:
-            if effect.kind is EffectKind.EXTERN_IO:
-                if effect.resource_name in {_state_id(state) for state in states}:
-                    raise ValueError(
-                        f"task {name!r} extern_io channel {effect.resource_name!r} "
-                        "collides with a state name"
-                    )
-                continue  # extern channels are validated on the effect itself
-            if id(effect.state) not in known_state_ids:
-                raise ValueError(f"task {name!r} references state from another workload")
+            match effect:
+                case ExternalEffect(resource_name=resource_name):
+                    if resource_name in {_state_id(state) for state in states}:
+                        raise ValueError(
+                            f"task {name!r} extern_io channel {resource_name!r} "
+                            "collides with a state name"
+                        )
+                case StateEffect(state=state):
+                    if id(state) not in known_state_ids:
+                        raise ValueError(
+                            f"task {name!r} references state from another workload"
+                        )
         for parameter, input_spec in declaration.inputs:
             if isinstance(input_spec, ResultInput):
                 if input_spec.task not in known_task_names:
@@ -1644,11 +1771,13 @@ __all__ = [
     "Between",
     "Domain",
     "ExecutorRegistry",
+    "ExternalEffect",
     "ExternImplementation",
     "Index",
     "RequestKey",
     "State",
     "StateEffect",
+    "WorkloadEffect",
     "WorkloadDeclaration",
     "WorkloadAuthority",
     "current",

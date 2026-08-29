@@ -159,7 +159,7 @@ def main() -> int:
             )
 
         # Stage one closed-loop batch (host API) and publish target, then step.
-        active_workload = runtime.local_workload(TTRLWorkload)
+        active_workload = runtime.local_workload(workload)
         spec = active_workload.specialization
         trace = GenerationTraceBatch(
             entries=tuple(

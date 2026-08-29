@@ -21,6 +21,7 @@ from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import WorkloadExecutionBindings
+from tllm.runtime.workload_bindings import RuntimeOutputBinding, RuntimePortRegistry
 from tllm.schedule import (
     CompileOptions,
     ResidualResourceBinding,
@@ -88,11 +89,15 @@ def main() -> None:
     outputs: list[torch.Tensor] = []
     bindings = WorkloadExecutionBindings(
         declarations=(declaration,),
-        output_sinks={
-            "answer": lambda value, _step_id: outputs.append(
-                cast(torch.Tensor, value).detach().clone()
-            )
-        },
+        ports=RuntimePortRegistry(
+            outputs={
+                "answer": RuntimeOutputBinding(
+                    lambda value, _step_id: outputs.append(
+                        cast(torch.Tensor, value).detach().clone()
+                    )
+                )
+            }
+        ),
         residual_paths={locator: path},
     )
 

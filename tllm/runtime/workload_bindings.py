@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from tllm.contracts.consumer_stats import TrainingStats
 from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
@@ -22,25 +22,41 @@ if TYPE_CHECKING:
     from tllm.runtime.workload_plugins import NativeWorkload, WorkloadWorkerSpec
 
 
-InputProvider = Callable[[int], object]
-OutputSink = Callable[[object, int], None]
 StateSnapshot = Callable[[int], Mapping[Hashable, int]]
+InputValueT_co = TypeVar("InputValueT_co", covariant=True)
+OutputValueT_contra = TypeVar("OutputValueT_contra", contravariant=True)
 
 
-CallbackT = TypeVar("CallbackT", bound=Callable[..., object])
+@dataclass(frozen=True, slots=True)
+class RuntimeInputBinding(Generic[InputValueT_co]):
+    provider: Callable[[int], InputValueT_co]
+
+    def read(self, step_id: int) -> InputValueT_co:
+        return self.provider(step_id)
 
 
-def _frozen_callbacks(bindings: Mapping[str, CallbackT]) -> Mapping[str, CallbackT]:
+@dataclass(frozen=True, slots=True)
+class RuntimeOutputBinding(Generic[OutputValueT_contra]):
+    sink: Callable[[OutputValueT_contra, int], None]
+
+    def publish(self, value: OutputValueT_contra, step_id: int) -> None:
+        self.sink(value, step_id)
+
+
+BindingT = TypeVar("BindingT")
+
+
+def _frozen_bindings(bindings: Mapping[str, BindingT]) -> Mapping[str, BindingT]:
     if any(not name for name in bindings):
         raise ValueError("runtime binding names must be non-empty")
     return MappingProxyType(dict(bindings))
 
 
-def _empty_input_providers() -> Mapping[str, InputProvider]:
+def _empty_input_providers() -> Mapping[str, RuntimeInputBinding[object]]:
     return MappingProxyType({})
 
 
-def _empty_output_sinks() -> Mapping[str, OutputSink]:
+def _empty_output_sinks() -> Mapping[str, RuntimeOutputBinding[object]]:
     return MappingProxyType({})
 
 
@@ -64,12 +80,16 @@ def _empty_residual_paths() -> Mapping["ResidualLocator", str]:
 class RuntimePortRegistry:
     """The complete local endpoint registry for a compiled workload."""
 
-    inputs: Mapping[str, InputProvider] = field(default_factory=_empty_input_providers)
-    outputs: Mapping[str, OutputSink] = field(default_factory=_empty_output_sinks)
+    inputs: Mapping[str, RuntimeInputBinding[object]] = field(
+        default_factory=_empty_input_providers
+    )
+    outputs: Mapping[str, RuntimeOutputBinding[object]] = field(
+        default_factory=_empty_output_sinks
+    )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "inputs", _frozen_callbacks(self.inputs))
-        object.__setattr__(self, "outputs", _frozen_callbacks(self.outputs))
+        object.__setattr__(self, "inputs", _frozen_bindings(self.inputs))
+        object.__setattr__(self, "outputs", _frozen_bindings(self.outputs))
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +99,7 @@ class RuntimeStateRegistry:
     snapshots: Mapping[str, StateSnapshot] = field(default_factory=_empty_state_snapshots)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "snapshots", _frozen_callbacks(self.snapshots))
+        object.__setattr__(self, "snapshots", _frozen_bindings(self.snapshots))
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,15 +221,15 @@ class WorkloadRuntimeBinding:
 __all__ = [
     "BackendRuntimeBinding",
     "DiagnosticsRuntimeServices",
-    "InputProvider",
     "LocalRuntimeServices",
     "NoPerRequestStats",
     "NoRuntimeServices",
     "NoSamplerBinding",
     "NoWorkerBinding",
-    "OutputSink",
     "PerRequestStats",
     "RuntimePortRegistry",
+    "RuntimeInputBinding",
+    "RuntimeOutputBinding",
     "RuntimeStateRegistry",
     "SamplerRuntimeBinding",
     "StateSnapshot",

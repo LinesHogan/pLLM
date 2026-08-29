@@ -98,7 +98,7 @@ def _stateful_declaration():
             scope=StateScope.REQUEST,
             key=request_key("request_id"),
             parameters="model",
-            optimizer=AdamWSpec(lr=1e-3),
+            optimizer=AdamWSpec.fixed(1e-3),
         )
 
         @task(

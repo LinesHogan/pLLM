@@ -14,14 +14,6 @@ from tllm.runtime.backend_region_binders import (
 )
 from tllm.runtime.workload_execution import BackendObservableEvent
 
-def _worker_registry(runtime: object) -> BackendRegionStagerRegistry | None:
-    registry = getattr(runtime, "backend_region_stager_registry", None)
-    if registry is None:
-        return None
-    if not isinstance(registry, BackendRegionStagerRegistry):
-        raise TypeError("backend_region_stager_registry must be BackendRegionStagerRegistry")
-    return registry
-
 
 def stage_signed_backend_region_event(
     *,
@@ -34,18 +26,23 @@ def stage_signed_backend_region_event(
 ) -> bool:
     """Stage exactly the backend bindings selected by the signed event record."""
 
-    if not isinstance(event, BackendObservableEvent):
-        raise TypeError("backend Region event must be BackendObservableEvent")
     execution = getattr(runtime, "workload_execution", None)
     if execution is None:
         return False
     stages = execution.backend_region_binder_stages(event)
     if not stages:
         return False
-    registry = _worker_registry(runtime)
-    # Preserve the raw backend value: BackendRegionStageContext owns the
-    # non-coercing signed step-id check.
-    resolved_step_id = getattr(runtime, "event_step_id", 0) if step_id is None else step_id
+    registry = getattr(runtime, "backend_region_stager_registry", None)
+    if registry is not None and not isinstance(registry, BackendRegionStagerRegistry):
+        raise TypeError(
+            "backend_region_stager_registry must be BackendRegionStagerRegistry"
+        )
+    raw_step_id = (
+        getattr(runtime, "event_step_id", 0) if step_id is None else step_id
+    )
+    if type(raw_step_id) is not int or raw_step_id < 0:
+        raise ValueError("step_id must be a non-negative int")
+    resolved_step_id = raw_step_id
     for stage in stages:
         try:
             slot = execution.backend_region_binders[stage.implementation_id]

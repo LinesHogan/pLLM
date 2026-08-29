@@ -109,7 +109,7 @@ class ReftWorkloadUnitTest(unittest.TestCase):
         finally:
             handle.restore()
         self.assertEqual(runtime.local_workload.call_count, 3)
-        runtime.local_workload.assert_called_with(ReftWorkload)
+        runtime.local_workload.assert_called_with(initial)
 
     def test_config_constraints_are_rust_validated(self) -> None:
         with self.assertRaisesRegex(ValueError, "constraint"):
