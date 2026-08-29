@@ -131,7 +131,7 @@ def _recurrence(
         f"recirculation.vllm-prefill/rows-{row_count}",
         PREFILL_BINDER_IMPLEMENTATION_ID,
         _core.TypedStageAdmission.prefill_reject(),
-        _core.TypedStageFusionPolicy.serial(),
+        _core.TypedStageFusionPolicy.automatic(),
         operations,
         dependencies,
         tuple(_output(token) for token in range(row_count)),

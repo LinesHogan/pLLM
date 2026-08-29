@@ -315,6 +315,19 @@ class State(Generic[StateValueT]):
             transition="host_publish",
         )
 
+    @classmethod
+    def service(
+        cls, *, transition: str = "service_transition"
+    ) -> "ServiceState[StateValueT]":
+        """Declare replica-owned typed service state with an explicit transition."""
+
+        return ServiceState(
+            scope=StateScope.REPLICA,
+            parameters=None,
+            optimizer=None,
+            transition=transition,
+        )
+
     def __set_name__(self, owner: type[object], name: str) -> None:
         self._owner = owner
         self._name = _name(name, "State name")
@@ -375,6 +388,10 @@ class State(Generic[StateValueT]):
 
 class TrainableState(State[StateValueT]):
     optimizer: OptimizerSpec
+
+
+class ServiceState(State[StateValueT]):
+    """Non-optimizer state mutated only by a signed extern task."""
 
 
 class PublishedModule(State[StateValueT]):
@@ -559,6 +576,7 @@ class TemporaryOutput:
 class OptimizeOutput:
     _state: object
     at: Before | After | Between
+    conditional: bool = False
 
     def trainable_state(self) -> TrainableState[object]:
         return cast(TrainableState[object], self._state)
@@ -652,9 +670,17 @@ def host_output(port: HostOutput[PortT]) -> HostOutputSpec[PortT]:
 
 
 def optimize(
-    state: TrainableState[object], *, at: Before | After | Between
+    state: TrainableState[StateValueT], *, at: Before | After | Between
 ) -> OptimizeOutput:
     return OptimizeOutput(state, at)
+
+
+def maybe_optimize(
+    state: TrainableState[StateValueT], *, at: Before | After | Between
+) -> OptimizeOutput:
+    """Optimize only when the task returns a Tensor instead of ``None``."""
+
+    return OptimizeOutput(state, at, conditional=True)
 
 
 class _SamplerOutputs:
@@ -954,6 +980,22 @@ class TaskDecl:
     implementations: tuple[ExternImplementation, ...]
     domain: Domain
     accesses: tuple[AffineAccess, ...]
+    predicate: ConfigPredicate | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigPredicate:
+    field_name: str
+    expected: ConfigAtom
+
+    def matches(self, config: WorkloadConfig) -> bool:
+        return config.raw_value(self.field_name) == self.expected
+
+
+def when(field: ConfigField[ConfiguredT], expected: ConfiguredT) -> ConfigPredicate:
+    """Select a semantic task variant from Rust-normalized config."""
+
+    return ConfigPredicate(field.name, expected)
 
 
 _TASK_DECLARATIONS: WeakKeyDictionary[FunctionType, TaskDecl] = WeakKeyDictionary()
@@ -968,19 +1010,32 @@ class TaskDefinition:
     executor: FunctionType
     generated_after: str | None = None
     is_gradient_task: bool = False
+    gradient_tensor_parameters: frozenset[str] = frozenset()
 
     def bind(self, instance: object) -> Callable[..., object]:
         bound = MethodType(self.executor, instance)
         if not self.is_gradient_task:
             return bound
 
-        def run_with_grad(
-            *args: torch.Tensor, **kwargs: torch.Tensor
-        ) -> object:
+        parameter_names = tuple(name for name, _source in self.declaration.inputs)
+
+        def run_with_grad(*args: object, **kwargs: object) -> object:
             with torch.inference_mode(False), torch.enable_grad():
                 return bound(
-                    *(value.clone() for value in args),
-                    **{key: value.clone() for key, value in kwargs.items()},
+                    *(
+                        cast(torch.Tensor, value).clone()
+                        if parameter_names[index] in self.gradient_tensor_parameters
+                        else value
+                        for index, value in enumerate(args)
+                    ),
+                    **{
+                        key: (
+                            cast(torch.Tensor, value).clone()
+                            if key in self.gradient_tensor_parameters
+                            else value
+                        )
+                        for key, value in kwargs.items()
+                    },
                 )
 
         return run_with_grad
@@ -1011,6 +1066,7 @@ def task(
     implementation: ExternImplementation | tuple[ExternImplementation, ...] | None = None,
     domain: Domain = Domain("scalar"),
     accesses: tuple[AffineAccess, ...] = (),
+    when: ConfigPredicate | None = None,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
 
 
@@ -1025,6 +1081,7 @@ def task(
     implementation: ExternImplementation | tuple[ExternImplementation, ...] | None = None,
     domain: Domain = Domain("scalar"),
     accesses: tuple[AffineAccess, ...] = (),
+    when: ConfigPredicate | None = None,
 ) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     task_inputs = _mapping(inputs, "task.inputs")
     task_outputs = _mapping(outputs, "task.outputs")
@@ -1089,6 +1146,7 @@ def task(
             implementations,
             domain,
             accesses,
+            when,
         )
         return target
 
@@ -1311,7 +1369,19 @@ def _author_task_definitions(target: type[object]) -> tuple[TaskDefinition, ...]
         declaration = _TASK_DECLARATIONS.get(member)
         if declaration is None:
             continue
-        definitions.append(TaskDefinition(name, declaration, member))
+        hints = get_type_hints(member)
+        definitions.append(
+            TaskDefinition(
+                name,
+                declaration,
+                member,
+                gradient_tensor_parameters=frozenset(
+                    parameter
+                    for parameter, _source in declaration.inputs
+                    if hints.get(parameter) is torch.Tensor
+                ),
+            )
+        )
     return tuple(definitions)
 
 
@@ -1437,7 +1507,7 @@ def _optimized_task_definitions(
 ) -> tuple[TaskDefinition, ...]:
     """Lower author-level optimize outputs to ordinary signed tasks."""
 
-    pending: list[tuple[str, str, OptimizeOutput]] = []
+    pending: list[tuple[str, str, OptimizeOutput, ConfigPredicate | None]] = []
     expanded: list[TaskDefinition] = []
     known_names = {entry.name for entry in author_tasks}
     for entry in author_tasks:
@@ -1470,7 +1540,7 @@ def _optimized_task_definitions(
             if not has_read_effect:
                 effects.append(read(trainable_state))
             rewritten_outputs.append((output_name, TemporaryOutput()))
-            pending.append((task_name, output_name, output))
+            pending.append((task_name, output_name, output, declaration.predicate))
         expanded.append(
             replace(
                 entry,
@@ -1484,7 +1554,7 @@ def _optimized_task_definitions(
         )
 
     generated: list[TaskDefinition] = []
-    for task_name, output_name, output in pending:
+    for task_name, output_name, output, predicate in pending:
         state = output.trainable_state()
         generated_name = f"{task_name}__optimize_{_state_id(state)}"
         if generated_name in known_names:
@@ -1497,13 +1567,26 @@ def _optimized_task_definitions(
 
             return apply_loss
 
+        def conditional_optimizer_executor(
+            state: TrainableState[object],
+        ) -> Callable[..., None]:
+            def apply_loss(
+                self: _OptimizerOwner, loss: torch.Tensor | None
+            ) -> None:
+                if loss is not None:
+                    self.optimize_state(state, loss)
+
+            return apply_loss
+
+        conditional = output.conditional
+
         generated.append(
             TaskDefinition(
                 name=generated_name,
                 declaration=TaskDecl(
                     inputs=(("loss", ResultInput(task_name, output_name)),),
                     outputs=(),
-                    effects=(transition(state),),
+                    effects=((maybe_transition(state) if conditional else transition(state)),),
                     timing=output.at,
                     implementations=(ExternImplementation(
                         namespace="tllm.workload",
@@ -1514,8 +1597,13 @@ def _optimized_task_definitions(
                     ),),
                     domain=Domain("scalar"),
                     accesses=(),
+                    predicate=predicate,
                 ),
-                executor=optimizer_executor(state),
+                executor=(
+                    conditional_optimizer_executor(state)
+                    if conditional
+                    else optimizer_executor(state)
+                ),
                 generated_after=task_name,
             )
         )
@@ -1723,6 +1811,68 @@ def definition_for_workload_class(cls: type[object]) -> _Definition | None:
     return _workload_definition_for(cls)
 
 
+class _ConfiguredWorkloadInstance(Protocol):
+    config: WorkloadConfig
+
+
+def _disabled_workload_noop(_instance: object) -> None:
+    pass
+
+
+_DISABLED_WORKLOAD_TASK = TaskDefinition(
+    name="__disabled__",
+    declaration=TaskDecl(
+        inputs=(),
+        outputs=(),
+        effects=(),
+        timing=Before("step.end"),
+        implementations=(
+            ExternImplementation(
+                namespace="tllm.workload",
+                name="disabled_noop",
+                version="1",
+                input_types=(),
+                output_types=("None",),
+            ),
+        ),
+        domain=Domain("scalar"),
+        accesses=(),
+    ),
+    executor=_disabled_workload_noop,
+)
+
+
+def _definition_for_instance(
+    instance: object, definition: _Definition
+) -> _Definition:
+    match definition:
+        case NativeWorkloadDefinition():
+            config = cast(_ConfiguredWorkloadInstance, instance).config
+        case WorkloadDefinition():
+            predicates = tuple(
+                entry.declaration.predicate
+                for entry in definition.tasks
+                if entry.declaration.predicate is not None
+            )
+            if not predicates:
+                return definition
+            raise TypeError("config predicates require a native WorkloadConfig")
+    enabled = definition.enabled.resolve(config)
+    if not enabled:
+        return replace(definition, tasks=(_DISABLED_WORKLOAD_TASK,))
+    return replace(
+        definition,
+        tasks=tuple(
+            entry
+            for entry in definition.tasks
+            if (
+                entry.declaration.predicate is None
+                or entry.declaration.predicate.matches(config)
+            )
+        ),
+    )
+
+
 def declare_workload(
     instance: object,
     *,
@@ -1733,10 +1883,11 @@ def declare_workload(
     definition = _workload_definition_for(type(instance))
     if definition is None:
         raise TypeError("instance class is not decorated with @workload")
-    ir = _build_ir(type(instance), definition)
+    specialized_definition = _definition_for_instance(instance, definition)
+    ir = _build_ir(type(instance), specialized_definition)
     executors: list[tuple[str, Callable[..., object]]] = []
     implementation_executors: list[tuple[str, str, Callable[..., object]]] = []
-    tasks_by_name = {entry.name: entry for entry in definition.tasks}
+    tasks_by_name = {entry.name: entry for entry in specialized_definition.tasks}
     for task in ir.tasks:
         entry = tasks_by_name[task.name]
         default_executor = entry.bind(instance)
@@ -1769,6 +1920,7 @@ __all__ = [
     "ApproximationCriteria",
     "Before",
     "Between",
+    "ConfigPredicate",
     "Domain",
     "ExecutorRegistry",
     "ExternalEffect",
@@ -1785,6 +1937,7 @@ __all__ = [
     "definition_for_workload_class",
     "hidden",
     "maybe_transition",
+    "maybe_optimize",
     "next",
     "provided",
     "read",
@@ -1796,5 +1949,6 @@ __all__ = [
     "task_declaration",
     "temporary",
     "transition",
+    "when",
     "workload",
 ]

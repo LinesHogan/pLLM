@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from tllm.contracts.backend_capability import BackendCapability
@@ -21,7 +21,8 @@ from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.typed_replay import TypedLayerReplayHandle
 
 if TYPE_CHECKING:
-    from tllm.ports.module_weight_view import ModuleWeightViewLocator
+    import torch
+    from tllm.runtime.parameter_overlay import OverlayLease, OverlayVersion
     from tllm.schedule import MainWorkloadTimeline
 
 
@@ -46,38 +47,26 @@ class GraphSafety(Enum):
 
 
 @dataclass(frozen=True)
-class ModuleWeightOverlayCapabilities:
-    """Backend support matrix for ``ModuleWeightView`` writes."""
+class VersionedParameterOverlayCapabilities:
+    """Generic immutable overlay installation and request-lease support."""
 
-    modules: frozenset[str]
-    write_modes: frozenset[str]
+    representations: frozenset[str]
+    scopes: frozenset[str]
     phases: frozenset[str]
-    request_keyed: bool
+    pinning: frozenset[str]
+    mixed_versions: bool
     graph_safety: GraphSafety = GraphSafety.EAGER_ONLY
     tensor_parallel_sizes: frozenset[int] = frozenset({1})
 
-    def __post_init__(self) -> None:
-        for field_name in ("modules", "write_modes", "phases"):
-            values = getattr(self, field_name)
-            if not isinstance(values, frozenset) or any(
-                not isinstance(value, str) or not value for value in values
-            ):
-                raise TypeError(f"{field_name} must be frozenset[str]")
-        if not isinstance(self.request_keyed, bool):
-            raise TypeError("request_keyed must be bool")
-        if not isinstance(self.graph_safety, GraphSafety):
-            raise TypeError("graph_safety must be GraphSafety")
-        if not isinstance(self.tensor_parallel_sizes, frozenset) or any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 1
-            for value in self.tensor_parallel_sizes
-        ):
-            raise TypeError("tensor_parallel_sizes must be frozenset[int >= 1]")
-
     def capability_names(self) -> frozenset[str]:
         return frozenset(
-            f"module_weight_view/{mode}/{phase}"
-            for mode in self.write_modes
-            for phase in self.phases
+            {
+                *(f"parameter_overlay/representation/{value}" for value in self.representations),
+                *(f"parameter_overlay/scope/{value}" for value in self.scopes),
+                *(f"parameter_overlay/phase/{value}" for value in self.phases),
+                *(f"parameter_overlay/pinning/{value}" for value in self.pinning),
+                f"parameter_overlay/mixed_versions/{str(self.mixed_versions).lower()}",
+            }
         )
 
 
@@ -146,7 +135,7 @@ class BackendCapabilities:
     tuple_sampler_return: bool
     split_execute_and_sample: bool
     graph_safety: GraphSafety = GraphSafety.EAGER_ONLY
-    module_weight_overlay: ModuleWeightOverlayCapabilities | None = None
+    parameter_overlay: VersionedParameterOverlayCapabilities | None = None
     model_region: ModelRegionCapabilities | None = None
     extensions: frozenset[BackendCapability] = frozenset()
     hidden_locators: frozenset[HiddenLocatorCapability] = frozenset()
@@ -170,24 +159,18 @@ class BackendCapabilities:
             )
 
     def capability_names(self) -> frozenset[str]:
-        overlay = self.module_weight_overlay
+        parameter_overlay = self.parameter_overlay
         region = self.model_region
         return (
-            (frozenset() if overlay is None else overlay.capability_names())
+            (
+                frozenset()
+                if parameter_overlay is None
+                else parameter_overlay.capability_names()
+            )
             | (frozenset() if region is None else region.capability_names())
             | frozenset(capability.value for capability in self.extensions)
             | frozenset(locator.value for locator in self.hidden_locators)
         )
-
-
-@dataclass(frozen=True)
-class ResolvedModuleWeightView:
-    """One backend-owned module target resolved from a logical locator."""
-
-    module: Any
-    layer: int
-    module_name: str
-    path: str
 
 
 @dataclass
@@ -198,7 +181,7 @@ class RunnerBinding:
     runner: Any
     capabilities: BackendCapabilities
     orig_methods: dict[str, Any] = field(default_factory=dict)
-    module_weight_overlay_handles: dict[str, Any] = field(default_factory=dict)
+    parameter_overlay_handles: dict[str, Any] = field(default_factory=dict)
     model_region_handles: dict[str, Any] = field(default_factory=dict)
     active: bool = True
 
@@ -240,24 +223,28 @@ class BackendDriver(Protocol):
     def unbind(self, binding: RunnerBinding) -> None:
         ...
 
-    def resolve_module_weight_view(
+    def install_parameter_overlay_version(
         self,
         *,
         binding: RunnerBinding,
-        locator: "ModuleWeightViewLocator",
-    ) -> ResolvedModuleWeightView:
+        version: "OverlayVersion",
+        tensors: Mapping[str, torch.Tensor],
+    ) -> None:
         ...
 
-    def install_module_weight_overlay(
-        self,
-        *,
-        binding: RunnerBinding,
-        locator: "ModuleWeightViewLocator",
-        installer: Callable[[object], Any],
-    ) -> Any:
+    def attach_parameter_overlay_request(
+        self, *, binding: RunnerBinding, lease: "OverlayLease"
+    ) -> None:
         ...
 
-    def restore_module_weight_overlays(self, binding: RunnerBinding) -> int:
+    def release_parameter_overlay_request(
+        self, *, binding: RunnerBinding, lease: "OverlayLease"
+    ) -> None:
+        ...
+
+    def remove_parameter_overlay_version(
+        self, *, binding: RunnerBinding, version: "OverlayVersion"
+    ) -> None:
         ...
 
     def install_typed_layer_replay(
@@ -291,7 +278,7 @@ class BackendDriver(Protocol):
     def runner_tensor_parallel_size(self, runner: Any) -> int:
         ...
 
-    def fast_weight_packed_row_plan_inputs(
+    def packed_row_plan_inputs(
         self,
         *,
         runner: Any,

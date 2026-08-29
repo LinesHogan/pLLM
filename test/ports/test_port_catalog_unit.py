@@ -27,7 +27,6 @@ class PortCatalogUnitTest(unittest.TestCase):
             "trajectory_event",
             "mlp_activation",
             "hidden_target",
-            "module_weight_view",
         ]
 
         self.assertEqual([kind.value for kind in PortKind], expected)

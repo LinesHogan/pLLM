@@ -432,7 +432,6 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 "run_prepare_inputs_post_producers",
                 side_effect=run_prepare_post_producers,
             ),
-            mock.patch.object(v027_mrv1._fast_weight, "update_fast_weight_metadata_from_runner"),
             mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
         ):
@@ -524,8 +523,6 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 side_effect=run_prepare_post_producers,
             ),
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
-            mock.patch.object(v027_mrv2._fast_weight, "update_fast_weight_metadata_from_runner"),
-            mock.patch.object(v027_mrv2._fast_weight, "maybe_install_fast_weight_wrappers"),
             mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),

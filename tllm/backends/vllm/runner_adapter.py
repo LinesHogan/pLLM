@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""Shared vLLM target resolution and lifecycle for module-weight overlays."""
+"""Shared vLLM runner binding and packed-row normalization."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
-
-from tllm.backends.protocol import (
-    ResolvedModuleWeightView,
-    RunnerBinding,
-    _RUNNER_BINDING_ATTR,
-    runner_binding_for,
-)
-from tllm.ports.module_weight_view import ModuleWeightViewLocator
+from tllm.backends.protocol import RunnerBinding, _RUNNER_BINDING_ATTR, runner_binding_for
 
 _BINDING_ATTR = _RUNNER_BINDING_ATTR
 
@@ -48,7 +40,7 @@ def _model_layers(model: object) -> Sequence[object]:
     if layers is None:
         layers = getattr(model, "layers", None)
     if layers is None or not hasattr(layers, "__len__") or not hasattr(layers, "__getitem__"):
-        raise RuntimeError("ModuleWeightView backend requires model.layers")
+        raise RuntimeError("vLLM runner adapter requires model.layers")
     return layers
 
 
@@ -59,7 +51,7 @@ def runner_model_identity(runner: object) -> int:
 def runner_model_layer_count(runner: object) -> int:
     model = getattr(runner, "model", None)
     if model is None:
-        raise RuntimeError("ModuleWeightView backend requires runner.model")
+        raise RuntimeError("vLLM runner adapter requires runner.model")
     return len(_model_layers(model))
 
 
@@ -236,88 +228,9 @@ def mrv2_packed_row_plan_inputs(
     )
 
 
-def resolve_module_weight_view(
-    *,
-    binding: RunnerBinding,
-    locator: ModuleWeightViewLocator,
-) -> ResolvedModuleWeightView:
-    if not binding.active:
-        raise RuntimeError("cannot resolve ModuleWeightView on an inactive runner binding")
-    if not isinstance(locator, ModuleWeightViewLocator):
-        raise TypeError("locator must be ModuleWeightViewLocator")
-    overlay = binding.capabilities.module_weight_overlay
-    if overlay is None or locator.module not in overlay.modules:
-        raise RuntimeError(
-            f"backend {binding.capabilities.backend_id!r} does not support "
-            f"ModuleWeightView module {locator.module!r}"
-        )
-    model = getattr(binding.runner, "model", None)
-    if model is None:
-        raise RuntimeError("ModuleWeightView backend requires runner.model")
-    layers = _model_layers(model)
-    raw_layer = int(locator.layer)
-    layer = raw_layer if raw_layer >= 0 else len(layers) + raw_layer
-    if layer < 0 or layer >= len(layers):
-        raise RuntimeError(f"ModuleWeightView layer index out of range: {raw_layer}")
-    module = getattr(layers[layer], locator.module, None)
-    if module is None:
-        raise RuntimeError(
-            f"ModuleWeightView target model.layers.{layer}.{locator.module} does not exist"
-        )
-    return ResolvedModuleWeightView(
-        module=module,
-        layer=layer,
-        module_name=locator.module,
-        path=f"model.layers.{layer}.{locator.module}",
-    )
-
-
-def _handle_key(target: ResolvedModuleWeightView, locator: ModuleWeightViewLocator) -> str:
-    return f"{target.path}:{locator.phase}:wrapper"
-
-
-def install_module_weight_overlay(
-    *,
-    binding: RunnerBinding,
-    locator: ModuleWeightViewLocator,
-    installer: Callable[[object], Any],
-) -> Any:
-    if not callable(installer):
-        raise TypeError("installer must be callable")
-    target = resolve_module_weight_view(binding=binding, locator=locator)
-    key = _handle_key(target, locator)
-    existing = binding.module_weight_overlay_handles.get(key)
-    if existing is not None:
-        return existing
-    original_forward = getattr(target.module, "forward", None)
-    if not callable(original_forward):
-        raise RuntimeError(f"ModuleWeightView target {target.path} must expose callable forward")
-    try:
-        handle = installer(target.module)
-        if not callable(getattr(handle, "restore", None)):
-            raise TypeError("module weight overlay installer must return a restorable handle")
-    except Exception:
-        setattr(target.module, "forward", original_forward)
-        raise
-    binding.module_weight_overlay_handles[key] = handle
-    return handle
-
-
-def restore_module_weight_overlays(binding: RunnerBinding) -> int:
-    restored = 0
-    for key, handle in list(binding.module_weight_overlay_handles.items()):
-        try:
-            handle.restore()
-        finally:
-            binding.module_weight_overlay_handles.pop(key, None)
-        restored += 1
-    return restored
-
-
 def unbind_runner(binding: RunnerBinding) -> None:
     if not binding.active:
         return
-    restore_module_weight_overlays(binding)
     binding.active = False
     if getattr(binding.runner, _BINDING_ATTR, None) is binding:
         delattr(binding.runner, _BINDING_ATTR)
@@ -327,11 +240,8 @@ __all__ = [
     "PackedRowPlanInputs",
     "ensure_runner_binding",
     "get_runner_binding",
-    "install_module_weight_overlay",
     "mrv1_packed_row_plan_inputs",
     "mrv2_packed_row_plan_inputs",
-    "resolve_module_weight_view",
-    "restore_module_weight_overlays",
     "runner_active_request_count",
     "runner_model_identity",
     "runner_model_layer_count",

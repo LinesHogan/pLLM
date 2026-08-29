@@ -120,7 +120,7 @@ fallback 为零。本次冻结按要求没有运行吞吐 benchmark。
 | `tllm.program` `@flow` / `@extern` | 兼容 declaration/lowering lane |
 | `tllm.consumers.*` | 完整 workload adapter 或 benchmark baseline |
 | legacy ESamp program/手工训练 | 显式迁移与 paired-benchmark baseline |
-| Override、TTRL、FTTT、TLM、fast-weight/In-Place-TTT、GTTA | 完整 adapter，直到拥有签名 native executor |
+| Override、TTRL、FTTT、TLM、In-Place-TTT、GTTA | native workload authority；无 legacy consumer 或 Program 实现 |
 | consumer stream/event/plan store/recurrence scheduler/shadow snapshot | legacy detail，不得成为 Region physical authority |
 | vLLM model 专用 adapter | backend quarantine，只暴露 typed capability/binder contract |
 

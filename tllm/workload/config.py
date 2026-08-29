@@ -51,6 +51,7 @@ class ConfigField(Generic[T]):
         default: T,
         kind: ConfigKind,
         constraint: NumericConstraint = NumericConstraint.ANY,
+        choices: tuple[str, ...] = (),
         *,
         _token: _ConfigFieldToken,
     ) -> None:
@@ -60,6 +61,7 @@ class ConfigField(Generic[T]):
         self.name = ""
         self.kind = kind
         self.constraint = constraint
+        self.choices = choices
 
     @classmethod
     def boolean(
@@ -99,6 +101,18 @@ class ConfigField(Generic[T]):
     ) -> ConfigField[ConfigStrT]:
         return ConfigField(
             default, ConfigKind.STR, constraint, _token=_CONFIG_FIELD_TOKEN
+        )
+
+    @classmethod
+    def choice(
+        cls, default: ConfigStrT, choices: tuple[ConfigStrT, ...]
+    ) -> ConfigField[ConfigStrT]:
+        return ConfigField(
+            default,
+            ConfigKind.STR,
+            NumericConstraint.ANY,
+            tuple(choices),
+            _token=_CONFIG_FIELD_TOKEN,
         )
 
     @classmethod
@@ -242,6 +256,7 @@ class WorkloadConfig:
                     "name": field.name,
                     "kind": field.kind.value,
                     "constraint": field.constraint.value,
+                    "choices": field.choices,
                 }
                 for field in fields
             ]

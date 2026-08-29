@@ -140,7 +140,7 @@ intentionally not run for this freeze.
 | `tllm.program` `@flow` / `@extern` | Compatibility declaration/lowering lane |
 | `tllm.consumers.*` | Complete workload adapter or benchmark baseline |
 | Legacy ESamp program/hand-tuned training | Explicit migration and paired-benchmark baseline |
-| Override, TTRL, FTTT, TLM, fast-weight/In-Place-TTT, GTTA | Complete adapters until each has a signed native executor |
+| Override, TTRL, FTTT, TLM, In-Place-TTT, GTTA | Native workload authority; no legacy consumer or Program implementation |
 | Consumer streams/events/plan stores/recurrence schedulers/shadow snapshots | Legacy detail; never Region physical authority |
 | vLLM model-specific adapters | Backend quarantine exposing typed capability/binder contracts only |
 

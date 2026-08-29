@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""TLM consumer package."""
+"""Native TLM q/v LoRA workload."""
 
-from tllm.consumers.tlm.config import TLMConsumerConfig
-from tllm.consumers.tlm.consumer import TLMConsumer, TLMStats
-from tllm.consumers.tlm.trainer import (
-    HFPEFTTLMTrainer,
+from tllm.consumers.tlm.workload import (
+    TLMConfig,
+    TLMMode,
+    TLMPublication,
     TLMTrainBatch,
-    TLMTrainResult,
+    TLMTrainingModel,
+    TLMWorkload,
     official_tlm_loss,
+    sentence_cross_entropy,
 )
 
 __all__ = [
-    "TLMConsumer",
-    "TLMConsumerConfig",
-    "HFPEFTTLMTrainer",
-    "TLMStats",
+    "TLMConfig",
+    "TLMMode",
+    "TLMPublication",
     "TLMTrainBatch",
-    "TLMTrainResult",
+    "TLMTrainingModel",
+    "TLMWorkload",
     "official_tlm_loss",
+    "sentence_cross_entropy",
 ]

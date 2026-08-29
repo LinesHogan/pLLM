@@ -82,6 +82,7 @@ if TYPE_CHECKING:
 # The runtime the process-wide class hooks currently dispatch to.
 _active_runtime: "TllmRuntime[object] | None" = None
 StagedT = TypeVar("StagedT")
+SecondStagedT = TypeVar("SecondStagedT")
 HostOutputT = TypeVar("HostOutputT")
 RuntimeWorkloadT = TypeVar("RuntimeWorkloadT")
 PublishedModuleT = TypeVar("PublishedModuleT", bound="torch.nn.Module")
@@ -305,8 +306,84 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                     stacklevel=2,
                 )
 
+    def stage_pair(
+        self,
+        first_port: "StagedPort[StagedT]",
+        first_value: StagedT,
+        second_port: "StagedPort[SecondStagedT]",
+        second_value: SecondStagedT,
+    ) -> tuple[int, int]:
+        """Atomically stage two typed ports under one transaction identity."""
+
+        self._require_workload_live()
+        first = cast(
+            "_StagedWorkload[StagedT]",
+            self._local_workload_by_type(first_port.owner),
+        )
+        second = cast(
+            "_StagedWorkload[SecondStagedT]",
+            self._local_workload_by_type(second_port.owner),
+        )
+        self._port_transaction_sequence += 1
+        transaction = (
+            f"{self._port_transaction_owner}:{self._port_transaction_sequence}"
+        )
+        entries = (
+            (first, first_port.key, first_value),
+            (second, second_port.key, second_value),
+        )
+        from tllm.runtime.mp.control import active_control_plane
+
+        plane = active_control_plane()
+        encoded_payloads = ()
+        if plane is not None:
+            from tllm.runtime.mp.port_wire import encode_port_payload
+
+            encoded_payloads = (
+                encode_port_payload(first_value),
+                encode_port_payload(second_value),
+            )
+        prepared = 0
+        remote_prepared = 0
+        try:
+            for workload, key, value in entries:
+                workload.prepare_port(key, transaction, value)
+                prepared += 1
+            if plane is not None:
+                quorum = plane.worker_quorum()
+                for (_workload, key, _value), encoded in zip(
+                    entries, encoded_payloads, strict=True
+                ):
+                    plane.prepare_workload_port(
+                        key, transaction, encoded.wire, quorum=quorum
+                    )
+                    remote_prepared += 1
+                for _workload, key, _value in entries:
+                    plane.commit_workload_port(key, transaction, quorum=quorum)
+            return (
+                first.commit_port(first_port.key, transaction),
+                second.commit_port(second_port.key, transaction),
+            )
+        except Exception:
+            for workload, key, _value in entries[:prepared]:
+                workload.abort_port(key, transaction)
+            if plane is not None and remote_prepared:
+                quorum = plane.worker_quorum()
+                for _workload, key, _value in entries[:remote_prepared]:
+                    plane.abort_workload_port(key, transaction, quorum=quorum)
+            raise
+        finally:
+            for encoded in encoded_payloads:
+                encoded.release()
+
     def drain(self, port: "HostOutput[HostOutputT]") -> tuple[HostOutputT, ...]:
         """Drain typed outputs published by signed workload tasks."""
+
+        from tllm.runtime.mp.control import active_control_plane
+
+        plane = active_control_plane()
+        if plane is not None:
+            return cast(tuple[HostOutputT, ...], plane.drain_workload_output(port.key))
 
         workload = cast(
             "_HostOutputWorkload[HostOutputT]",
@@ -562,6 +639,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 "one compilation cannot mix native Region authority with legacy adapters"
             )
         from tllm.runtime.workload_execution import (
+            CompositeExecutionLifecycleBinding,
             ExecutionLifecycleBinding,
             NoExecutionLifecycle,
             StateVersionBinding,
@@ -597,6 +675,9 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
         residual_paths: dict["ResidualLocator", str] = {}
         backend_region_binders: dict[str, "BackendRegionBinderSlot"] = {}
+        from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
+
+        parameter_overlays: dict[OverlayChannel, OverlayVersionStore] = {}
         lifecycle_services: list[LocalRuntimeServices] = []
         multiple = len(declarations) > 1
         for declaration in declarations:
@@ -670,12 +751,16 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                     + ", ".join(sorted(binder_overlap))
                 )
             backend_region_binders.update(resources.backend.binders)
+            overlay_overlap = set(parameter_overlays).intersection(
+                resources.parameter_overlays
+            )
+            if overlay_overlap:
+                raise RuntimeError(
+                    "duplicate native parameter overlay channel binding"
+                )
+            parameter_overlays.update(resources.parameter_overlays)
         if len(sampler_bindings) > 1:
             raise RuntimeError("native Region plan supports at most one sampler provider")
-        if len(lifecycle_services) > 1:
-            raise RuntimeError(
-                "native Region plan has multiple lifecycle service bindings"
-            )
         state_versions: dict[str, StateVersionBinding] = {}
         for resource, snapshot in snapshots.items():
             try:
@@ -698,15 +783,30 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             lifecycle=(
                 NoExecutionLifecycle()
                 if not lifecycle_services
-                else ExecutionLifecycleBinding(
-                    stats=lifecycle_services[0].stats,
-                    is_enabled=lifecycle_services[0].is_enabled,
-                    synchronize=lifecycle_services[0].synchronize,
-                    per_request_stats=lifecycle_services[0].per_request_stats,
+                else (
+                    ExecutionLifecycleBinding(
+                        stats=lifecycle_services[0].stats,
+                        is_enabled=lifecycle_services[0].is_enabled,
+                        synchronize=lifecycle_services[0].synchronize,
+                        per_request_stats=lifecycle_services[0].per_request_stats,
+                    )
+                    if len(lifecycle_services) == 1
+                    else CompositeExecutionLifecycleBinding(
+                        tuple(
+                            ExecutionLifecycleBinding(
+                                stats=service.stats,
+                                is_enabled=service.is_enabled,
+                                synchronize=service.synchronize,
+                                per_request_stats=service.per_request_stats,
+                            )
+                            for service in lifecycle_services
+                        )
+                    )
                 )
             ),
             residual_paths=residual_paths,
             backend_region_binders=backend_region_binders,
+            parameter_overlays=parameter_overlays,
             static_binding_entries=static_binding_entries,
         )
 

@@ -7,7 +7,6 @@ from tllm.ports.hidden_target import HiddenTarget, HiddenTargetLocator
 from tllm.ports.kv_cache import KVCache, KVLocator
 from tllm.ports.logits import Logits, LogitsLocator
 from tllm.ports.mlp_activation import MLPActivation, MLPActivationLocator
-from tllm.ports.module_weight_view import ModuleWeightView, ModuleWeightViewLocator
 from tllm.ports.prompt_context import PromptContext, PromptContextLocator
 from tllm.ports.reward_outcome import RewardOutcome, RewardOutcomeLocator
 from tllm.ports.retry_control import RetryControl, RetryControlLocator
@@ -33,8 +32,6 @@ __all__ = [
     "LogitsLocator",
     "MLPActivation",
     "MLPActivationLocator",
-    "ModuleWeightView",
-    "ModuleWeightViewLocator",
     "PortKind",
     "PortRead",
     "PortWrite",

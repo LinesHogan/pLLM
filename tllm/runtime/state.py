@@ -20,11 +20,9 @@ from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.runtime.fast_weight.state import DownProjFastWeightOverlayHandle, FastWeightState
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeStore
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlStore
-from tllm.runtime.token_batch_metadata import RuntimeTokenBatchMeta, RuntimeTokenPhase
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
@@ -34,7 +32,6 @@ from tllm.runtime.stats import PlacementStats
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
 
 if TYPE_CHECKING:
-    from tllm.backends.protocol import RunnerBinding
     from tllm.schedule import ScheduleGraph, WorkloadCompilation
     from tllm.runtime.workload_execution import (
         NativeWorkloadExecution,
@@ -76,17 +73,6 @@ class ResidualRuntimeConfig:
     adaptation_stream_mode: AdaptationStreamMode = "dual"
     adaptation_stream_priority: int = 0
     compact_capture_lane: bool = False
-    fast_weight_enabled: bool = False
-    fast_weight_layers: tuple[int, ...] = (0,)
-    fast_weight_chunk_size: int = 4096
-    fast_weight_lr: float = 1e-3
-    fast_weight_mode: str = "exact"
-    fast_weight_decode_update_enabled: bool = False
-    fast_weight_key_mode: str = "static"
-    fast_weight_static_request_id: str = "__tllm_fast_weight_static__"
-    fast_weight_max_slots: int = 64
-    fast_weight_max_bytes: int = 0
-    fast_weight_fail_on_unsupported: bool = False
 
 
 @dataclass
@@ -170,16 +156,6 @@ class ResidualRuntimeState:
     last_reward_outcomes: RewardOutcomeBatch | None = None
     last_retry_controls: RetryControlBatch | None = None
     last_update_barriers: UpdateBarrierBatch | None = None
-    fast_weight_state: Optional[FastWeightState] = None
-    fast_weight_binding: RunnerBinding | None = None
-    fast_weight_handles: dict[str, DownProjFastWeightOverlayHandle] = field(default_factory=dict)
-    fast_weight_hook_spec: Optional[tuple[object, ...]] = None
-    fast_weight_phase: RuntimeTokenPhase = "prefill"
-    fast_weight_current_token_batch_meta: Optional[RuntimeTokenBatchMeta] = None
-    fast_weight_installed_count: int = 0
-    fast_weight_skipped_count: int = 0
-    test_time_lora_store: object | None = None
-    test_time_lora_publisher: object | None = None
 
     def reset_step(self) -> None:
         self.decode_count = 0
@@ -192,7 +168,6 @@ class ResidualRuntimeState:
         self.decode_sample_idx_tensor = None
         self.decode_compact_count = 0
         self.decode_compact_row_ids = ()
-        self.fast_weight_current_token_batch_meta = None
         self.decode_post_logits_launched_step_id = -1
         self.sampler_precompute.reset_step()
 

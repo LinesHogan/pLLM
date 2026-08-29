@@ -13,7 +13,7 @@ tLLM 是 vLLM 的附加载荷编译器。新工作负载用 `tllm.workload` 声�
 4. [编写 consumer](write-a-consumer.md) — `tllm.workload` 指南和 legacy Program 兼容 API。
 5. [架构](architecture.md) — Region 执行栈与兼容层。
 6. [ESamp 参考](esamp.md) — 内置的 test-time training consumer。
-7. [适配 In-Place TTT](inplace-ttt.md) — 改模型自身权重的算法：学习一半是 Program，应用一半是 backend 提供的权重 overlay。
+7. [Native In-Place TTT](inplace-ttt.md) — 签名 exact fast-weight task 与通用 immutable overlay。
 8. [TLM q/v LoRA](tlm.md) — 完整 HF/PEFT side training，以及通过 vLLM 原生 LoRA 路径发布不可变版本。
 
 ## 一段话心智模型

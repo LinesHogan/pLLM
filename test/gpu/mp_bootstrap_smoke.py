@@ -2,7 +2,7 @@
 """GPU smoke: tLLM bootstrap under VLLM_ENABLE_V1_MULTIPROCESSING=1.
 
 The smallest architecture proof for multiprocess mode: a registered builtin
-consumer (dummy) plus a marker probe must execute inside the EngineCore child
+consumer (the retained ESamp benchmark adapter) plus a marker probe must execute inside the EngineCore child
 process, not the parent. Verification:
 
 * generation completes under mp=1 on the selected runner;
@@ -45,7 +45,7 @@ def main() -> int:
 
     from tllm.consumers import registry as consumer_registry
     from tllm.consumers.base import BaseConsumer
-    from tllm.consumers.dummy.config import DummyConsumerConfig
+    from tllm.consumers.esamp.config import ESampConsumerConfig
     from tllm.ports.base import ConsumerFlow
     from tllm.ports.request_meta import RequestMeta
     from tllm.runtime import residual_runtime as core
@@ -76,7 +76,7 @@ def main() -> int:
 
     consumer_registry.activate_consumer(
         consumer_registry.build_consumer(
-            "dummy", DummyConsumerConfig(export_every_n_steps=8, export_max_rows=64)
+            "esamp", ESampConsumerConfig(enable_esamp_training=False)
         ),
         primary=True,
     )

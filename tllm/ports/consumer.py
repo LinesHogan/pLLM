@@ -78,11 +78,6 @@ class BaseConsumer(ABC, Generic[ConfigT]):
         _ = layer_count
         return None
 
-    def runtime_adapter_store(self) -> object | None:
-        """Optionally expose a backend-neutral immutable adapter store."""
-
-        return None
-
     def consume_bundle(self, bundle: PortBundle, ctx: RuntimeContext) -> None:
         """Public flow-based consumption surface."""
         _ = (bundle, ctx)

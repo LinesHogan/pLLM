@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from typing import cast
+from typing import Literal, cast
 
 import torch
 from tllm.kit.workload import Workload
@@ -21,11 +21,13 @@ from tllm.workload import (
     StagedPort,
     WorkloadConfig,
     config_field,
+    declare_workload,
     hidden,
     optimize,
     staged,
     task,
     workload,
+    when,
 )
 
 _LEARNING_RATE = ConfigField.floating(3e-4)
@@ -37,6 +39,27 @@ class _Config(WorkloadConfig):
     layer_path: str = config_field(
         default="model.layers.0", kind=ConfigKind.STR
     )
+
+
+_MODE = ConfigField.choice("online", ("online", "offline"))
+
+
+class _ModeConfig(WorkloadConfig):
+    enabled: bool = config_field(default=True, kind=ConfigKind.BOOL)
+    mode: Literal["online", "offline"] = cast(
+        Literal["online", "offline"], _MODE
+    )
+
+
+@workload(id="author.mode", config=_ModeConfig, enabled=_ModeConfig.enabled)
+class _ModeWorkload(Workload[_ModeConfig]):
+    @task(when=when(_MODE, "online"))
+    def online(self) -> None:
+        pass
+
+    @task(when=when(_MODE, "offline"))
+    def offline(self) -> None:
+        pass
 
 
 @workload(id="author.probe", config=_Config, enabled=_Config.enabled)
@@ -98,6 +121,18 @@ class _PublishedWorkload(Workload[_Config]):
 
 
 class WorkloadAuthorApiUnitTest(unittest.TestCase):
+    def test_rust_normalized_choice_selects_one_signed_semantic_variant(self) -> None:
+        self.assertEqual(
+            declare_workload(_ModeWorkload(_ModeConfig(mode="online"))).ir.schedule,
+            ("online",),
+        )
+        self.assertEqual(
+            declare_workload(_ModeWorkload(_ModeConfig(mode="offline"))).ir.schedule,
+            ("offline",),
+        )
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            _ModeConfig(mode="invalid")
+
     def test_decorator_derives_author_metadata_and_residual_manifest(self) -> None:
         workload_instance = _AuthorWorkload(_Config(layer_path="model.layers.4"))
         resources = workload_instance.native_workload_resources()

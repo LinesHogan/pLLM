@@ -31,12 +31,17 @@ class WorkloadPortOwner(Protocol):
 
     def abort_port(self, key: str, transaction: str) -> None: ...
 
+    def owns_output(self, key: str) -> bool: ...
+
+    def drain_output(self, key: str) -> tuple[object, ...]: ...
+
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationInput,
     RegionShapeSpecializationRequest,
 )
 from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
+from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
 from tllm.runtime.workload_bindings import (
     NoPerRequestStats,
     NoSamplerBinding,
@@ -624,7 +629,57 @@ class ExecutionLifecycleBinding:
                 return MappingProxyType({})
 
 
-ExecutionLifecycle = NoExecutionLifecycle | ExecutionLifecycleBinding
+def _combined_training_stats(
+    values: tuple["TrainingStats", ...],
+) -> "TrainingStats":
+    from tllm.contracts.consumer_stats import TrainingStats
+
+    count = sum(value.loss_count for value in values)
+    total = sum(value.loss_avg * value.loss_count for value in values)
+    return TrainingStats(
+        loss_avg=0.0 if count == 0 else total / count,
+        loss_count=count,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeExecutionLifecycleBinding:
+    """Independent lifecycle services composed without shared authority."""
+
+    bindings: tuple[ExecutionLifecycleBinding, ...]
+
+    def read_and_reset_stats(self, sync: bool) -> "TrainingStats":
+        return _combined_training_stats(
+            tuple(binding.read_and_reset_stats(sync) for binding in self.bindings)
+        )
+
+    def read_and_reset_per_request_stats(
+        self, sync: bool
+    ) -> Mapping[int, "TrainingStats"]:
+        grouped: dict[int, list["TrainingStats"]] = {}
+        for binding in self.bindings:
+            for key, value in binding.read_and_reset_per_request_stats(sync).items():
+                grouped.setdefault(key, []).append(value)
+        return MappingProxyType(
+            {
+                key: _combined_training_stats(tuple(values))
+                for key, values in grouped.items()
+            }
+        )
+
+    def is_enabled(self) -> bool:
+        return any(binding.is_enabled() for binding in self.bindings)
+
+    def synchronize(self) -> None:
+        for binding in self.bindings:
+            binding.synchronize()
+
+
+ExecutionLifecycle = (
+    NoExecutionLifecycle
+    | ExecutionLifecycleBinding
+    | CompositeExecutionLifecycleBinding
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,6 +703,9 @@ class WorkloadExecutionBindings:
     )
     backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
         default_factory=dict[str, "BackendRegionBinderSlot"]
+    )
+    parameter_overlays: Mapping[OverlayChannel, OverlayVersionStore] = field(
+        default_factory=dict[OverlayChannel, OverlayVersionStore]
     )
     # These are immutable live resource snapshots, not signed payloads.  The
     # local execution gate serializes them immediately before artifacts bind.
@@ -684,6 +742,11 @@ class WorkloadExecutionBindings:
             self,
             "backend_region_binders",
             MappingProxyType(dict(self.backend_region_binders)),
+        )
+        object.__setattr__(
+            self,
+            "parameter_overlays",
+            MappingProxyType(dict(self.parameter_overlays)),
         )
 
 
@@ -752,6 +815,9 @@ class NativeWorkloadExecution:
     _backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
         default_factory=dict[str, "BackendRegionBinderSlot"]
     )
+    parameter_overlays: Mapping[OverlayChannel, OverlayVersionStore] = field(
+        default_factory=dict[OverlayChannel, OverlayVersionStore]
+    )
     _requires_decode_hidden: bool = False
     _shape_specializations: _NativeShapeSpecializationQueue = field(
         default_factory=_NativeShapeSpecializationQueue
@@ -812,6 +878,12 @@ class NativeWorkloadExecution:
             if workload.owns_port(key):
                 workload.abort_port(key, transaction)
                 return
+        raise KeyError(key)
+
+    def drain_output(self, key: str) -> tuple[object, ...]:
+        for workload in self._workload_instances:
+            if workload.owns_output(key):
+                return workload.drain_output(key)
         raise KeyError(key)
 
     @property
@@ -2214,6 +2286,7 @@ def _native_workload_execution(
         _diagnostics_readers=bindings.diagnostics_readers,
         _lifecycle=bindings.lifecycle,
         _backend_region_binders=bindings.backend_region_binders,
+        parameter_overlays=bindings.parameter_overlays,
         _requires_decode_hidden=bool(hidden_bindings),
         _shape_specializations=shape_specializations,
         _side_streams=side_streams,

@@ -11,6 +11,7 @@ required.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from math import isfinite
@@ -542,6 +543,29 @@ class ControlPlane:
             raise RuntimeError("workload port prepare reply identity mismatch")
         return replies
 
+    def drain_workload_output(self, key: str) -> tuple[object, ...]:
+        from tllm.runtime.mp.port_wire import decode_inline_port_payload
+
+        replies = tuple(self.call("tllm_drain_workload_output", key))
+        if not replies:
+            raise RuntimeError("workload output drain has no worker quorum")
+        normalized: list[str] = []
+        values_wire: list[Mapping[str, object]] = []
+        for reply in replies:
+            if reply["key"] != key or not reply["worker_id"]:
+                raise RuntimeError("workload output drain identity mismatch")
+            values = reply["values"]
+            if type(values) is not list:
+                raise TypeError("workload output drain values must be a list")
+            normalized.append(
+                json.dumps(values, sort_keys=True, separators=(",", ":"))
+            )
+            if not values_wire:
+                values_wire = values
+        if len(set(normalized)) != 1:
+            raise RuntimeError("workload output quorum values diverged")
+        return tuple(decode_inline_port_payload(value) for value in values_wire)
+
     def commit_workload_port(
         self,
         key: str,
@@ -901,33 +925,3 @@ class ControlPlane:
                 raise ValueError("shape-specialization acknowledgement identity mismatch")
             acknowledged.append(reply_keys)
         return acknowledged
-
-    def set_fast_weight_enabled(
-        self,
-        enabled: bool,
-        *,
-        layers: Iterable[int] | None = None,
-        chunk_size: int | None = None,
-        learning_rate: float | None = None,
-        mode: str | None = None,
-        decode_update_enabled: bool | None = None,
-        key_mode: str | None = None,
-        max_slots: int | None = None,
-        max_bytes: int | None = None,
-        fail_on_unsupported: bool | None = None,
-        timeout: float | None = None,
-    ) -> None:
-        self.call(
-            "tllm_set_fast_weight_enabled",
-            bool(enabled),
-            None if layers is None else [int(layer) for layer in layers],
-            chunk_size,
-            learning_rate,
-            mode,
-            decode_update_enabled,
-            key_mode,
-            max_slots,
-            max_bytes,
-            fail_on_unsupported,
-            timeout=timeout,
-        )

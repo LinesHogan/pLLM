@@ -76,14 +76,7 @@ def main() -> int:
             print(f"FAIL: live worker enable did not produce training stats: {enabled}")
             return 1
 
-        core.set_fast_weight_enabled(False, chunk_size=123)
         replies = ControlPlane(llm).ping(timeout=60.0)
-        if any(bool(reply["fast_weight_enabled"]) for reply in replies):
-            print(f"FAIL: fast-weight disable flag did not reach every worker: {replies}")
-            return 1
-        if any(int(reply["fast_weight_chunk_size"]) != 123 for reply in replies):
-            print(f"FAIL: fast-weight options did not reach every worker: {replies}")
-            return 1
         print(
             f"OK: mp runtime controls reached worker (runner={args.runner}, "
             f"loss_count={enabled.loss_count}, replies={replies})"

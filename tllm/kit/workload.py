@@ -6,7 +6,7 @@ import ast
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import ClassVar, Generic, Protocol, TypeVar, cast
+from typing import ClassVar, Generic, TypeVar, cast
 
 import torch
 
@@ -21,6 +21,7 @@ from tllm.kit.backend import (
 )
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
 from tllm.runtime.workload_sinks import SinkStore
+from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
     WorkloadWorkerSpec,
@@ -33,6 +34,7 @@ from tllm.runtime.workload_bindings import (
     RuntimeInputBinding,
     RuntimeOutputBinding,
     RuntimeStateRegistry,
+    StateSnapshot,
     RuntimeServices,
     SamplerRuntimeBinding,
     WorkerRuntimeBinding,
@@ -42,6 +44,7 @@ from tllm.workload.config import ConfigAtom, WorkloadConfig
 from tllm.workload.frontend import (
     NoConfiguredValue,
     PublishedModule,
+    ServiceState,
     State,
     SamplerOutput,
     TrainableState,
@@ -51,6 +54,7 @@ from tllm.workload.frontend import (
     definition_for_workload_class,
 )
 from tllm.workload.ir import OptimizerSpec
+from tllm.workload.ir import EffectKind
 from tllm.workload.ir import ValueSourceKind
 from tllm.workload.staging import RuntimePortStore, StagedPort
 from tllm.workload.host import HostOutput, RuntimeHostOutputStore
@@ -73,19 +77,10 @@ class _Specialized:
     versions: dict[str, int]
 
 
-class _StateVersionOwner(Protocol):
-    @property
-    def state_version(self) -> int: ...
-
-
 class _WorkloadAccounting:
-    def __init__(self, owner: _StateVersionOwner) -> None:
-        self._owner = owner
+    def __init__(self) -> None:
         self._losses: list[torch.Tensor] = []
         self._updates = 0
-
-    def state_snapshot(self, _step_id: int) -> Mapping[Hashable, int]:
-        return MappingProxyType({None: self._owner.state_version})
 
     def record(self, loss: torch.Tensor) -> None:
         self._losses.append(loss.detach().float())
@@ -138,7 +133,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         self.config = config
         self.backend = backend
         self._lifecycle: _Unspecialized | _Specialized = _Unspecialized()
-        self._accounting = _WorkloadAccounting(self)
+        self._accounting = _WorkloadAccounting()
         self._port_store = RuntimePortStore()
         self._staged_ports_by_key = {
             port.key: port for port in type(self)._staged_ports()
@@ -159,13 +154,9 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     @classmethod
     def _states(
         cls,
-    ) -> tuple[TrainableState[torch.nn.Module] | PublishedModule[torch.nn.Module], ...]:
+    ) -> tuple[State[torch.nn.Module], ...]:
         return cast(
-            tuple[
-                TrainableState[torch.nn.Module]
-                | PublishedModule[torch.nn.Module],
-                ...,
-            ],
+            tuple[State[torch.nn.Module], ...],
             cls._definition().states,
         )
 
@@ -197,12 +188,16 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     @property
     def state_version(self) -> int:
+        states = type(self)._states()
+        if len(states) != 1:
+            raise RuntimeError(f"{type(self).__name__} has no single State")
+        return self.state_version_for(states[0])
+
+    def state_version_for(self, state: State[StateValueT]) -> int:
         match self._lifecycle:
-            case _Specialized(versions=versions) if len(versions) == 1:
-                return next(iter(versions.values()))
-            case _Specialized():
-                raise RuntimeError(f"{type(self).__name__} has no single State")
-            case _:
+            case _Specialized(versions=versions):
+                return versions[state.name]
+            case _Unspecialized():
                 return 0
 
     def state_value(self, state: State[StateValueT]) -> StateValueT:
@@ -236,6 +231,8 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                         )
                     case PublishedModule():
                         pass
+                    case State():
+                        pass
         self.backend.specialize(spec)
         self._lifecycle = _Specialized(
             spec=spec,
@@ -246,7 +243,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         self._resources = self._assemble_resources()
 
     def optimize_state(
-        self, state: TrainableState[torch.nn.Module], loss: torch.Tensor
+        self, state: TrainableState[StateValueT], loss: torch.Tensor
     ) -> None:
         match self._lifecycle:
             case _Specialized(optimizers=optimizers, versions=versions):
@@ -273,9 +270,29 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             case _:
                 raise RuntimeError(f"State {state.name!r} is not specialized")
 
+    def advance_state(self, state: ServiceState[StateValueT]) -> int:
+        """Advance service state from inside its signed transition task."""
+
+        if state not in type(self)._states():
+            raise ValueError("service state belongs to another workload")
+        match self._lifecycle:
+            case _Specialized(versions=versions):
+                versions[state.name] += 1
+                return versions[state.name]
+            case _:
+                raise RuntimeError(f"State {state.name!r} is not specialized")
+
     def residual_paths(self) -> Mapping[ResidualLocator, str]:
+        active_hidden = {
+            (input_.layer, input_.site, input_.phase)
+            for task in declare_workload(self).ir.tasks
+            for input_ in task.inputs
+            if input_.kind is ValueSourceKind.HIDDEN
+        }
         paths: dict[ResidualLocator, str] = {}
         for source in type(self)._definition().hidden_inputs:
+            if (source.layer, source.site.value, source.phase.value) not in active_hidden:
+                continue
             match source.path:
                 case NoConfiguredValue():
                     continue
@@ -310,6 +327,11 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     def native_workload_resources(self) -> WorkloadRuntimeBinding:
         return self._resources
 
+    def parameter_overlay_bindings(
+        self,
+    ) -> Mapping[OverlayChannel, OverlayVersionStore]:
+        return MappingProxyType({})
+
     def stage_port(self, port: StagedPort[PortValueT], value: PortValueT) -> int:
         if port not in type(self)._staged_ports():
             raise ValueError("staged port belongs to another workload")
@@ -321,6 +343,13 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     def owns_port(self, key: str) -> bool:
         return key in self._staged_ports_by_key
+
+    def owns_output(self, key: str) -> bool:
+        return any(port.key == key for port in type(self)._host_outputs())
+
+    def drain_output(self, key: str) -> tuple[object, ...]:
+        port = next(port for port in type(self)._host_outputs() if port.key == key)
+        return port.drain(self._host_output_store)
 
     def commit_port(self, key: str, transaction: str) -> int:
         return self._port_store.commit(key, transaction)
@@ -361,14 +390,37 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     def _assemble_resources(self) -> WorkloadRuntimeBinding:
         definition = type(self)._definition()
-        state_snapshots = {
-            state.name: self._accounting.state_snapshot for state in type(self)._states()
+        active_ir = declare_workload(self).ir
+        active_inputs = {
+            input_.source for task in active_ir.tasks for input_ in task.inputs
+        }
+        active_outputs = {
+            output.target for task in active_ir.tasks for output in task.outputs
+        }
+        active_states = {
+            effect.state
+            for task in active_ir.tasks
+            for effect in task.effects
+            if effect.kind is not EffectKind.EXTERN_IO
+        }
+
+        def snapshot_for(state: State[torch.nn.Module]) -> StateSnapshot:
+            def snapshot(_step_id: int) -> Mapping[Hashable, int]:
+                return MappingProxyType({None: self.state_version_for(state)})
+
+            return snapshot
+
+        state_snapshots: dict[str, StateSnapshot] = {
+            state.name: snapshot_for(state)
+            for state in type(self)._states()
+            if state.name in active_states
         }
         provided_inputs = {
             port.key: RuntimeInputBinding(
                 lambda step_id, port=port: port.take(self._port_store, step_id)
             )
             for port in type(self)._staged_ports()
+            if port.key in active_inputs
         }
         sampler_providers: dict[ValueSourceKind, RuntimeInputBinding[object]] = {
             ValueSourceKind.SAMPLER_REQUEST_IDS: RuntimeInputBinding(
@@ -385,6 +437,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             {
                 kind.value: sampler_providers[kind]
                 for kind in definition.sampler_inputs
+                if kind.value in active_inputs
             }
         )
         backend_binding = self.backend.runtime_binding()
@@ -394,26 +447,48 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 output_sinks = {}
                 sampler_binding = NoSamplerBinding()
             case _SamplerBinding(policy=policy, provider=sampler):
-                def publish_sampler(value: object, step_id: int) -> None:
-                    self._sinks.publish(policy.name, cast(torch.Tensor, value), step_id)
+                if policy.name not in active_outputs:
+                    output_sinks = {}
+                    sampler_binding = NoSamplerBinding()
+                else:
+                    def publish_sampler(value: object, step_id: int) -> None:
+                        self._sinks.publish(policy.name, cast(torch.Tensor, value), step_id)
 
-                output_sinks = {
-                    policy.name: RuntimeOutputBinding(publish_sampler)
-                }
-                sampler_binding = SamplerRuntimeBinding(sampler)
+                    output_sinks = {
+                        policy.name: RuntimeOutputBinding(publish_sampler)
+                    }
+                    sampler_binding = SamplerRuntimeBinding(sampler)
         output_sinks.update(
             {
                 port.key: RuntimeOutputBinding(
                     port.runtime_publisher(self._host_output_store)
                 )
                 for port in type(self)._host_outputs()
+                if port.key in active_outputs
             }
         )
+        active_backend_outputs = {
+            name: binding
+            for name, binding in backend_binding.ports.outputs.items()
+            if name in active_outputs
+        }
+        backend_output_overlap = set(output_sinks).intersection(active_backend_outputs)
+        if backend_output_overlap:
+            raise RuntimeError(
+                "workload and backend declare duplicate output bindings: "
+                + ", ".join(sorted(backend_output_overlap))
+            )
+        output_sinks.update(active_backend_outputs)
+        active_backend_inputs = {
+            name: binding
+            for name, binding in backend_binding.ports.inputs.items()
+            if name in active_inputs
+        }
         services = self.runtime_services()
         return WorkloadRuntimeBinding(
             owner=self,
             ports=RuntimePortRegistry(
-                inputs={**provided_inputs, **backend_binding.ports.inputs},
+                inputs={**provided_inputs, **active_backend_inputs},
                 outputs=output_sinks,
             ),
             states=RuntimeStateRegistry(snapshots=state_snapshots),
@@ -435,6 +510,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 )
             ),
             backend=backend_binding,
+            parameter_overlays=self.parameter_overlay_bindings(),
         )
 
     def runtime_services(self) -> RuntimeServices:

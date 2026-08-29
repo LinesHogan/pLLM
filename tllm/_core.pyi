@@ -252,6 +252,8 @@ class TypedStageAdmission:
 
 class TypedStageFusionPolicy:
     @staticmethod
+    def automatic() -> TypedStageFusionPolicy: ...
+    @staticmethod
     def serial() -> TypedStageFusionPolicy: ...
     @staticmethod
     def ordered(

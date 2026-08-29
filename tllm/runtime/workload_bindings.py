@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 from tllm.contracts.consumer_stats import TrainingStats
 from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
 from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
 
 if TYPE_CHECKING:
     from tllm.ports.residual_stream import ResidualLocator
@@ -73,6 +74,10 @@ def _empty_specialization_key() -> Mapping[str, str]:
 
 
 def _empty_residual_paths() -> Mapping["ResidualLocator", str]:
+    return MappingProxyType({})
+
+
+def _empty_parameter_overlays() -> Mapping[OverlayChannel, OverlayVersionStore]:
     return MappingProxyType({})
 
 
@@ -207,6 +212,9 @@ class WorkloadRuntimeBinding:
         default_factory=_empty_residual_paths
     )
     backend: BackendRuntimeBinding = field(default_factory=BackendRuntimeBinding)
+    parameter_overlays: Mapping[OverlayChannel, OverlayVersionStore] = field(
+        default_factory=_empty_parameter_overlays
+    )
 
     def __post_init__(self) -> None:
         if any(not name or not value for name, value in self.specialization_key.items()):
@@ -217,6 +225,11 @@ class WorkloadRuntimeBinding:
             MappingProxyType(dict(sorted(self.specialization_key.items()))),
         )
         object.__setattr__(self, "residual_paths", MappingProxyType(dict(self.residual_paths)))
+        object.__setattr__(
+            self,
+            "parameter_overlays",
+            MappingProxyType(dict(self.parameter_overlays)),
+        )
 
 __all__ = [
     "BackendRuntimeBinding",

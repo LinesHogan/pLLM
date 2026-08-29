@@ -1,11 +1,9 @@
 {
-  "comment": "Basic-tier pyright baseline (only-decrease). Regenerate with `python tools/check_typing.py --rebase`.",
-  "total": 159,
+  "comment": "Basic-tier pyright baseline (only-decrease). --rebase refuses total or per-bucket regressions.",
+  "total": 156,
   "buckets": {
     "tllm/common/state.py": 1,
     "tllm/consumers/esamp": 20,
-    "tllm/consumers/gtta": 1,
-    "tllm/consumers/inplace_ttt": 2,
     "tllm/runtime/consumer_compat.py": 1,
     "tllm/runtime/graph_policy.py": 2,
     "tllm/runtime/sampler_bridge": 102,

@@ -110,7 +110,7 @@ def _stage_typed_recirculation(
     driver = binding.driver
     handle = driver.install_typed_layer_replay(runtime=context.runtime, runner=context.runner)
     try:
-        columns = driver.fast_weight_packed_row_plan_inputs(
+        columns = driver.packed_row_plan_inputs(
             runner=context.runner,
             num_scheduled_tokens=context.num_scheduled_tokens,
             input_batch=context.input_batch,

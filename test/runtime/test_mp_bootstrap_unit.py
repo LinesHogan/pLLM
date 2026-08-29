@@ -13,10 +13,9 @@ import torch
 
 from tllm.common.dataclass_json import dataclass_from_dict, dataclass_to_jsonable
 from tllm.common.state import ensure_v1_env
-from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
-from tllm.consumers.inplace_ttt.config import InPlaceTTTConsumerConfig
+from tllm.consumers.inplace_ttt.workload import InPlaceTTTConfig
 from tllm.consumers import registry as consumer_registry
 from tllm.runtime import residual_runtime
 from tllm.runtime.mp import bootstrap
@@ -53,11 +52,11 @@ class DataclassJsonUnitTest(unittest.TestCase):
         self.assertAlmostEqual(rebuilt.distiller_beta, 0.5)
 
     def test_tuple_literal_field_round_trips(self) -> None:
-        config = InPlaceTTTConsumerConfig(phases=("prefill", "decode"), target_layer=-1)
-        data = dataclass_to_jsonable(config)
-        self.assertEqual(data["phases"], ["prefill", "decode"])
-        rebuilt = dataclass_from_dict(InPlaceTTTConsumerConfig, data)
-        self.assertEqual(rebuilt.phases, ("prefill", "decode"))
+        config = InPlaceTTTConfig(layers=(0, -1))
+        data = config.to_wire()
+        self.assertEqual(data["layers"], (0, -1))
+        rebuilt = InPlaceTTTConfig.from_wire(data)
+        self.assertEqual(rebuilt.layers, (0, -1))
 
     def test_unsafe_values_raise_at_capture_time(self) -> None:
         with self.assertRaises(TypeError):
@@ -105,7 +104,9 @@ class BootstrapSpecUnitTest(unittest.TestCase):
             target_layer_path="model.model.layers[-1].input_layernorm",
         )
         consumer_registry.activate_consumer(
-            consumer_registry.build_consumer("dummy", DummyConsumerConfig(consumer_id="dummy_mp")),
+            consumer_registry.build_consumer(
+                "esamp", ESampConsumerConfig(consumer_id="esamp_mp")
+            ),
             primary=True,
         )
 
@@ -126,9 +127,9 @@ class BootstrapSpecUnitTest(unittest.TestCase):
     def test_spec_json_round_trip(self) -> None:
         spec = BootstrapSpec(
             runtime_config={"graph_scratch_rows": 4},
-            primary_consumer=ConsumerSpec(name="dummy", config={"consumer_id": "d"}),
-            consumers=(ConsumerSpec(name="gtta", config={"consumer_id": "g"}),),
-            enable_flags={"fast_weight_enabled": True},
+            primary_consumer=ConsumerSpec(name="esamp", config={"consumer_id": "d"}),
+            consumers=(),
+            enable_flags={"esamp_training_enabled": True},
         )
         path = bootstrap.write_bootstrap_spec(spec)
         try:
@@ -145,7 +146,7 @@ class BootstrapSpecUnitTest(unittest.TestCase):
         self._configure_dummy_runtime()
         spec = bootstrap.capture_bootstrap_spec()
         self.assertIsNotNone(spec.primary_consumer)
-        self.assertEqual(spec.primary_consumer.name, "dummy")
+        self.assertEqual(spec.primary_consumer.name, "esamp")
 
         # Simulate a fresh child process runtime.
         residual_runtime.set_runtime_consumer(None)
@@ -156,11 +157,11 @@ class BootstrapSpecUnitTest(unittest.TestCase):
         bootstrap.apply_bootstrap_spec(spec)
         self.assertTrue(bootstrap.runtime_matches_spec(spec))
         consumer = residual_runtime.RUNTIME.consumer
-        self.assertEqual(getattr(consumer.config, "consumer_id"), "dummy_mp")
+        self.assertEqual(getattr(consumer.config, "consumer_id"), "esamp_mp")
         self.assertEqual(residual_runtime.RUNTIME.config.graph_scratch_rows, 4)
         self.assertEqual(
             spec.enable_flags,
-            {"fast_weight_enabled": False},
+            {"esamp_training_enabled": True},
         )
 
     def test_plugin_no_spec_is_noop(self) -> None:
@@ -181,7 +182,7 @@ class BootstrapSpecUnitTest(unittest.TestCase):
             self.assertTrue(bootstrap.runtime_matches_spec(bootstrap.read_bootstrap_spec(path)))
             tllm_general_plugin()  # second run must be a no-op beyond checks
         self.assertEqual(install.call_count, 2)
-        self.assertEqual(getattr(residual_runtime.RUNTIME.consumer.config, "consumer_id"), "dummy_mp")
+        self.assertEqual(getattr(residual_runtime.RUNTIME.consumer.config, "consumer_id"), "esamp_mp")
 
     def test_spec_is_frozen(self) -> None:
         spec = BootstrapSpec(runtime_config={})

@@ -7,8 +7,8 @@ import unittest
 from unittest import mock
 from types import SimpleNamespace
 
-from tllm.consumers.dummy.config import DummyConsumerConfig
-from tllm.consumers.dummy.consumer import DummyConsumer
+from tllm.consumers.esamp.config import ESampConsumerConfig
+from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.ports.consumer import BaseConsumer
 from tllm.runtime.runtime import TllmRuntime, active_runtime, default_runtime
 
@@ -156,7 +156,9 @@ class TllmRuntimeUnitTest(unittest.TestCase):
     def test_runtime_registration_and_clear_forward_to_active_plane(self) -> None:
         runtime = TllmRuntime()
         plane = mock.Mock()
-        consumer = DummyConsumer(DummyConsumerConfig(consumer_id="runtime_plane"))
+        consumer = ESampConsumer(
+            ESampConsumerConfig(consumer_id="runtime_plane")
+        )
         with mock.patch("tllm.runtime.runtime._active_runtime", runtime), mock.patch(
             "tllm.runtime.mp.control.active_control_plane", return_value=plane
         ), mock.patch("tllm.runtime.residual_runtime.register_dispatch_consumer") as register, mock.patch(
@@ -168,7 +170,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         register.assert_called_once_with(consumer)
         clear.assert_called_once_with()
         plane.register_consumer.assert_called_once()
-        self.assertEqual(plane.register_consumer.call_args.args[0], "dummy")
+        self.assertEqual(plane.register_consumer.call_args.args[0], "esamp")
         plane.clear_consumers.assert_called_once_with()
         self.assertEqual(refresh.call_count, 2)
 

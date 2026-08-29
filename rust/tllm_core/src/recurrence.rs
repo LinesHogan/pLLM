@@ -470,6 +470,13 @@ struct TypedStageFusionPolicy {
 #[pymethods]
 impl TypedStageFusionPolicy {
     #[staticmethod]
+    fn automatic() -> Self {
+        Self {
+            value: "auto".into(),
+        }
+    }
+
+    #[staticmethod]
     fn serial() -> Self {
         Self {
             value: "none".into(),
@@ -584,6 +591,7 @@ struct TypedRecurrencePlan {
 struct FusionPolicy {
     max_rows: usize,
     internalized_edges: BTreeSet<String>,
+    automatic: bool,
 }
 
 fn is_nonempty(value: &str) -> bool {
@@ -595,6 +603,14 @@ fn parse_fusion_policy(value: &str) -> PyResult<FusionPolicy> {
         return Ok(FusionPolicy {
             max_rows: 1,
             internalized_edges: BTreeSet::new(),
+            automatic: false,
+        });
+    }
+    if value == "auto" {
+        return Ok(FusionPolicy {
+            max_rows: 2,
+            internalized_edges: BTreeSet::new(),
+            automatic: true,
         });
     }
     let (max_rows_field, edge_field) = value
@@ -639,6 +655,7 @@ fn parse_fusion_policy(value: &str) -> PyResult<FusionPolicy> {
     Ok(FusionPolicy {
         max_rows,
         internalized_edges,
+        automatic: false,
     })
 }
 
@@ -894,8 +911,14 @@ fn stable_group_order(
 }
 
 fn compile_typed(spec: FiniteRecurrenceSpec) -> PyResult<TypedRecurrencePlan> {
-    let (policy, operation_index, producer) = validate_spec(&spec)?;
+    let (mut policy, operation_index, producer) = validate_spec(&spec)?;
     let dependencies = derived_dependencies(&spec, &producer);
+    if policy.automatic {
+        policy.internalized_edges = dependencies
+            .iter()
+            .map(|dependency| dependency.kind.clone())
+            .collect();
+    }
     let order = stable_topological_order(&spec.operations, &operation_index, &dependencies)?;
     let mut inbound: HashMap<&str, Vec<&TypedDependency>> = HashMap::new();
     for dependency in &dependencies {

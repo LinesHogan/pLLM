@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tllm import _core
-from tllm.backends.vllm.module_weight_overlay import PackedRowPlanInputs
+from tllm.backends.vllm.runner_adapter import PackedRowPlanInputs
 from tllm.runtime.step_session import StepSession
 
 

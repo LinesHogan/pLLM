@@ -6,7 +6,7 @@ from __future__ import annotations
 import unittest
 
 from tllm.contracts.port_bundle import BundleKey, PortBundle
-from tllm.consumers.dummy.config import DummyConsumerConfig
+from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers import registry as consumer_registry
 from tllm.ports.base import (
     ConsumerFlow,
@@ -128,7 +128,7 @@ class DispatchPlanTimingValidationUnitTest(unittest.TestCase):
     """DispatchPlan.build runs flow timing contracts through the Rust compiler."""
 
     def test_builtin_consumers_validate(self) -> None:
-        consumer = consumer_registry.build_consumer("dummy", DummyConsumerConfig())
+        consumer = consumer_registry.build_consumer("esamp", ESampConsumerConfig())
         plan = DispatchPlan.build([consumer])
         self.assertTrue(plan.has_active_targets())
 

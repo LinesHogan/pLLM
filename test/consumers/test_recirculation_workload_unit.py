@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 import torch
 
-from tllm.backends.vllm import module_weight_overlay
+from tllm.backends.vllm import runner_adapter
 from tllm.backends.protocol import OrderedRowFusionCapabilities
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
@@ -241,7 +241,7 @@ def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() ->
     assert isinstance(services, LocalRuntimeServices)
     services.cold_specialize(_cold_spec())
 
-    columns = module_weight_overlay.PackedRowPlanInputs(
+    columns = runner_adapter.PackedRowPlanInputs(
         request_ids=("request-0",),
         scheduled_tokens=(2,),
         prompt_tokens=(2,),
@@ -253,7 +253,7 @@ def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() ->
     driver = SimpleNamespace(
         install_typed_layer_replay=lambda **_: handle,
         restore_typed_layer_replay=lambda **_: 0,
-        fast_weight_packed_row_plan_inputs=lambda **_: columns,
+        packed_row_plan_inputs=lambda **_: columns,
     )
     binding = SimpleNamespace(active=True, driver=driver)
     context = BackendRegionStageContext(
@@ -336,7 +336,7 @@ def test_runtime_row_shape_miss_fails_closed_without_hook_compilation() -> None:
     services = workload.native_workload_resources().services
     assert isinstance(services, LocalRuntimeServices)
     services.cold_specialize(_cold_spec())
-    columns = module_weight_overlay.PackedRowPlanInputs(
+    columns = runner_adapter.PackedRowPlanInputs(
         request_ids=("request-0",),
         scheduled_tokens=(3,),
         prompt_tokens=(3,),
@@ -346,7 +346,7 @@ def test_runtime_row_shape_miss_fails_closed_without_hook_compilation() -> None:
     driver = SimpleNamespace(
         install_typed_layer_replay=lambda **_: handle,
         restore_typed_layer_replay=lambda **_: 0,
-        fast_weight_packed_row_plan_inputs=lambda **_: columns,
+        packed_row_plan_inputs=lambda **_: columns,
     )
     binding = SimpleNamespace(active=True, driver=driver)
     context = BackendRegionStageContext(

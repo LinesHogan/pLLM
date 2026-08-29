@@ -29,7 +29,6 @@ class PortKind(str, Enum):
     TRAJECTORY_EVENT = "trajectory_event"
     MLP_ACTIVATION = "mlp_activation"
     HIDDEN_TARGET = "hidden_target"
-    MODULE_WEIGHT_VIEW = "module_weight_view"
 
 
 class FlowWindow(StrEnum):

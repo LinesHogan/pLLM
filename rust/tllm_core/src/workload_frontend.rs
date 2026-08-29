@@ -31,6 +31,8 @@ struct ConfigFieldSchema {
     name: String,
     kind: ConfigKind,
     constraint: NumericConstraint,
+    #[serde(default)]
+    choices: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +49,7 @@ fn normalize_value(
     name: &str,
     kind: ConfigKind,
     constraint: NumericConstraint,
+    choices: &[String],
     value: Value,
 ) -> PyResult<Value> {
     let normalized = match kind {
@@ -72,6 +75,19 @@ fn normalize_value(
             "config field {name:?} does not match its declared type"
         ))),
     }?;
+    if !choices.is_empty() {
+        let text = normalized.as_str().ok_or_else(|| {
+            error(format!(
+                "config field {name:?} uses choices on a non-string type"
+            ))
+        })?;
+        if !choices.iter().any(|choice| choice == text) {
+            return Err(error(format!(
+                "config field {name:?} must be one of: {}",
+                choices.join(", ")
+            )));
+        }
+    }
     if !matches!(constraint, NumericConstraint::Any) {
         let number = normalized.as_f64().ok_or_else(|| {
             error(format!(
@@ -109,7 +125,7 @@ fn normalize_workload_config(schema_json: &str, payload_json: &str) -> PyResult<
                 "workload config field names must be non-empty and unique",
             ));
         }
-        fields.insert(field.name, (field.kind, field.constraint));
+        fields.insert(field.name, (field.kind, field.constraint, field.choices));
     }
     if payload.keys().collect::<BTreeSet<_>>() != fields.keys().collect::<BTreeSet<_>>() {
         return Err(error(
@@ -119,12 +135,12 @@ fn normalize_workload_config(schema_json: &str, payload_json: &str) -> PyResult<
 
     let normalized = fields
         .into_iter()
-        .map(|(name, (kind, constraint))| {
+        .map(|(name, (kind, constraint, choices))| {
             let value = payload
                 .get(&name)
                 .cloned()
                 .expect("exact config field set validated");
-            normalize_value(&name, kind, constraint, value).map(|value| (name, value))
+            normalize_value(&name, kind, constraint, &choices, value).map(|value| (name, value))
         })
         .collect::<PyResult<Map<String, Value>>>()?;
     serde_json::to_string(&normalized)

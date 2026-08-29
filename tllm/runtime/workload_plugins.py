@@ -223,6 +223,7 @@ def reconstruct_worker_bindings(
     """Rebuild local resources; Rust proves the signed graph and facts."""
 
     from tllm.runtime.workload_execution import (
+        CompositeExecutionLifecycleBinding,
         ExecutionLifecycleBinding,
         NoExecutionLifecycle,
         StateVersionBinding,
@@ -389,6 +390,9 @@ def reconstruct_worker_bindings(
             )
         residual_paths.update(item.residual_paths)
     backend_region_binders: dict[str, "BackendRegionBinderSlot"] = {}
+    from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
+
+    parameter_overlays: dict[OverlayChannel, OverlayVersionStore] = {}
     for item in reconstructed:
         overlap = set(backend_region_binders).intersection(item.backend.binders)
         if overlap:
@@ -398,6 +402,14 @@ def reconstruct_worker_bindings(
                 + ", ".join(sorted(overlap))
             )
         backend_region_binders.update(item.backend.binders)
+        overlay_overlap = set(parameter_overlays).intersection(
+            item.parameter_overlays
+        )
+        if overlay_overlap:
+            raise RuntimeError(
+                "native worker reconstruction has duplicate parameter overlay channels"
+            )
+        parameter_overlays.update(item.parameter_overlays)
 
     diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
     for declaration, item in zip(declarations, reconstructed, strict=True):
@@ -424,10 +436,6 @@ def reconstruct_worker_bindings(
             case DiagnosticsRuntimeServices() | NoRuntimeServices():
                 pass
     lifecycle_services = tuple(lifecycle_service_list)
-    if len(lifecycle_services) > 1:
-        raise RuntimeError(
-            "native worker reconstruction has multiple lifecycle service bindings"
-        )
 
     return WorkloadExecutionBindings(
         declarations=declarations,
@@ -441,15 +449,30 @@ def reconstruct_worker_bindings(
         lifecycle=(
             NoExecutionLifecycle()
             if not lifecycle_services
-            else ExecutionLifecycleBinding(
-                stats=lifecycle_services[0].stats,
-                is_enabled=lifecycle_services[0].is_enabled,
-                synchronize=lifecycle_services[0].synchronize,
-                per_request_stats=lifecycle_services[0].per_request_stats,
+            else (
+                ExecutionLifecycleBinding(
+                    stats=lifecycle_services[0].stats,
+                    is_enabled=lifecycle_services[0].is_enabled,
+                    synchronize=lifecycle_services[0].synchronize,
+                    per_request_stats=lifecycle_services[0].per_request_stats,
+                )
+                if len(lifecycle_services) == 1
+                else CompositeExecutionLifecycleBinding(
+                    tuple(
+                        ExecutionLifecycleBinding(
+                            stats=service.stats,
+                            is_enabled=service.is_enabled,
+                            synchronize=service.synchronize,
+                            per_request_stats=service.per_request_stats,
+                        )
+                        for service in lifecycle_services
+                    )
+                )
             )
         ),
         residual_paths=residual_paths,
         backend_region_binders=backend_region_binders,
+        parameter_overlays=parameter_overlays,
         static_binding_entries=tuple(
             (declaration.ir.workload_id, resource, spec)
             for declaration, resource, spec in zip(

@@ -65,14 +65,7 @@ class ConsumerRegistryUnitTest(unittest.TestCase):
         self.assertEqual(
             registered_consumers(),
             (
-                "dummy",
                 "esamp",
-                "fttt",
-                "gtta",
-                "inplace_ttt",
-                "override",
-                "tlm",
-                "ttrl",
             ),
         )
 

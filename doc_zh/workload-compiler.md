@@ -173,17 +173,17 @@ prefill 路径。CUDA Graph、EngineCore MP、decode recurrence、speculative de
 model-family 支持仍在已验证边界之外。旧 standalone/vLLM 专用 workload class、legacy Rust
 planner 与 model-region adapter 已删除。
 
-Dummy、ESamp、TTRL、ReFT、OverRIDE 与 Recirculation 都已有 native workload definition。仍需
-保留的 legacy consumer 与 Program 实现均明确标为兼容或 benchmark 路径，不会隐藏在 native
-workload class 后面充当另一套实现。
+Dummy、FTTT、GTTA、In-Place-TTT、TLM、TTRL、ReFT、OverRIDE、Recirculation 与
+ESamp 都已有 native workload definition。只有 ESamp 在最终 parity/吞吐门禁关闭前保留
+显式命名的 legacy/Program benchmark baseline。
 
 独立 Dummy workload 现在是完整的 `NativeWorkload`。它的 typed singleton extern
 Region 使用通用 Region executor，并返回闭合 `WorkloadRuntimeBinding`，其中包含 layer-0
 residual path、CPU-export service、specialization identity 和 worker reconstruction。它不再
 注册或查询 legacy `DummyConsumer`，旧的 Dummy 专用物化分支已删除。
 缺少 binding、`eager_only` capability 或已解析 residual resource 都会 fail closed。
-`feedback_interval > 0` 仍是 legacy-only 的逐步 drain 特性，native declaration 会拒绝；
-非默认 legacy `capture_policy` 也会被拒绝，而不是被静默忽略。
+旧 `feedback_interval` 与 `capture_policy` 兼容开关已随 `DummyConsumer` 退役；native
+同步通过显式 service 完成。
 
 ## 当前验证边界
 

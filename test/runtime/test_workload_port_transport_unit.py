@@ -18,7 +18,9 @@ from tllm.runtime.mp.control import ControlPlane
 from tllm.runtime.mp import port_wire
 from tllm.runtime.mp.port_wire import (
     SharedPortPayload,
+    decode_inline_port_payload,
     decode_port_payload,
+    encode_inline_port_payload,
     encode_port_payload,
 )
 from tllm.runtime.mp.worker_extension import TllmWorkerExtension
@@ -53,6 +55,7 @@ class _Execution:
 
 class _PortOwner:
     batch: StagedPort[torch.Tensor] = StagedPort()
+    metadata: StagedPort[_Payload] = StagedPort()
 
 
 class _OutputOwner:
@@ -235,6 +238,46 @@ def _runtime_with_local_port() -> tuple[TllmRuntime, _LocalPortWorkload]:
 
 
 class WorkloadPortTransportUnitTest(unittest.TestCase):
+    def test_inline_output_wire_round_trips_tensor_and_typed_dataclass(self) -> None:
+        tensor = torch.arange(4, dtype=torch.float32)
+        decoded_tensor = decode_inline_port_payload(
+            encode_inline_port_payload(tensor)
+        )
+        self.assertTrue(torch.equal(cast(torch.Tensor, decoded_tensor), tensor))
+        self.assertEqual(
+            decode_inline_port_payload(
+                encode_inline_port_payload(_Payload("output", 4))
+            ),
+            _Payload("output", 4),
+        )
+
+    def test_stage_pair_commits_or_rolls_back_both_ports_as_one_transaction(self) -> None:
+        runtime, local = _runtime_with_local_port()
+        tensor = torch.ones(2)
+        metadata = _Payload("pair", 2)
+
+        self.assertEqual(
+            runtime.stage_pair(
+                _PortOwner.batch,
+                tensor,
+                _PortOwner.metadata,
+                metadata,
+            ),
+            (1, 1),
+        )
+        self.assertIs(local.store.take(_PortOwner.batch.key), tensor)
+        self.assertEqual(local.store.take(_PortOwner.metadata.key), metadata)
+
+        _PortOwner.metadata.stage(local.store, _Payload("occupied", 1))
+        with self.assertRaisesRegex(RuntimeError, "pending value"):
+            runtime.stage_pair(
+                _PortOwner.batch,
+                tensor,
+                _PortOwner.metadata,
+                metadata,
+            )
+        self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+
     def test_local_workload_never_borrows_a_foreign_active_runtime(self) -> None:
         runtime, local = _runtime_with_local_port()
         compilation = SimpleNamespace(

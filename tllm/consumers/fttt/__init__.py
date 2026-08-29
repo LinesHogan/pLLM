@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""FTTT consumer package."""
+"""Native FTTT feedback-edit workload."""
 
-from tllm.consumers.fttt.config import FTTTConsumerConfig
-from tllm.consumers.fttt.consumer import FTTTClosedLoopIntent, FTTTConsumer, FTTTStats
 from tllm.consumers.fttt.feedback import (
     FTTTInstanceState,
     FTTTJudge,
     FTTTJudgeResult,
     FeedbackRecord,
 )
-from tllm.consumers.fttt.program import FTTTProgram
+from tllm.consumers.fttt.workload import (
+    FTTTClosedLoopIntent,
+    FTTTConfig,
+    FTTTFeedbackService,
+    FTTTTrainingBatch,
+    FTTTTrainingPlan,
+    FTTTWorkload,
+)
 
 __all__ = [
     "FTTTClosedLoopIntent",
-    "FTTTConsumer",
-    "FTTTConsumerConfig",
+    "FTTTConfig",
+    "FTTTFeedbackService",
     "FTTTInstanceState",
     "FTTTJudge",
     "FTTTJudgeResult",
-    "FTTTProgram",
-    "FTTTStats",
+    "FTTTTrainingBatch",
+    "FTTTTrainingPlan",
+    "FTTTWorkload",
     "FeedbackRecord",
 ]

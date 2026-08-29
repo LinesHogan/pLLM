@@ -229,10 +229,10 @@ speculative decoding, PP/DP, and general model-family support remain outside
 its verified boundary. The old standalone and vLLM-specific workload classes,
 legacy Rust planner, and model-region adapter have been removed.
 
-Dummy, ESamp, TTRL, ReFT, OverRIDE, and Recirculation all have native workload
-definitions. Legacy consumer and Program implementations remain explicitly
-named compatibility or benchmark paths where still needed; they are not
-alternate implementations hidden behind native workload classes.
+Dummy, FTTT, GTTA, In-Place-TTT, TLM, TTRL, ReFT, OverRIDE, Recirculation,
+and ESamp all have native workload definitions. Only ESamp retains explicitly
+named legacy/Program benchmark baselines while its final parity and throughput
+gate remains open.
 
 The standalone Dummy workload is now a complete `NativeWorkload`. Its typed
 singleton extern Region uses the generic Region executor and returns a closed
@@ -241,15 +241,15 @@ specialization identity, and worker reconstruction.
 It neither registers nor consults a legacy `DummyConsumer`, and the old
 Dummy-specific materialization branch has been removed. Missing bindings,
 the `eager_only` capability, or a resolved residual resource fail closed.
-`feedback_interval > 0` remains a legacy-only per-step drain feature and is
-rejected by the native declaration; non-default legacy `capture_policy`
-values are likewise rejected instead of being ignored.
+The old `feedback_interval` and `capture_policy` compatibility knobs were
+retired with `DummyConsumer`; native synchronization is an explicit service.
 
 ## Current verification boundary
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, short GPU correctness smokes
-cover the generic native Dummy, native Recirculation vLLM prefill, and native
-ESamp declarations in exact eager, in-process MRv1 and MRv2. Recirculation
+cover native Dummy, Recirculation, ESamp, and TLM. TLM's MRv2 eager smoke
+performs real HF/PEFT training and installs the published generic LoRA version;
+Recirculation
 reported typed layer replay with zero fallback. The latest ESamp run recorded `loss_count=6`,
 `update_count=6`, `state_version=6`, and `fallback_count=0`. Native ESamp
 exact eager Regions also passed EngineCore MP correctness on both runners:

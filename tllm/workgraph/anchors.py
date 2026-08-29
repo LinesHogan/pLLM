@@ -59,15 +59,6 @@ def _validate_capabilities(capabilities: object) -> BackendCapabilities:
         raise TypeError(
             "BackendCapabilities.extensions must be frozenset[BackendCapability]"
         )
-    overlay = capabilities.module_weight_overlay
-    if overlay is not None:
-        from tllm.backends.protocol import ModuleWeightOverlayCapabilities
-
-        if not isinstance(overlay, ModuleWeightOverlayCapabilities):  # pyright: ignore[reportUnnecessaryIsInstance]  # boundary guard for untyped callers
-            raise TypeError(
-                "BackendCapabilities.module_weight_overlay must be "
-                "ModuleWeightOverlayCapabilities or None"
-            )
     region = capabilities.model_region
     if region is not None:
         from tllm.backends.protocol import ModelRegionCapabilities

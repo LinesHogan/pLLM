@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""GTTA consumer package."""
+"""Native GTTA trajectory-memory workload."""
 
-from tllm.consumers.gtta.bfcl_toy import (
-    BFCLToyStepResult,
-    BFCLToyTask,
-    execute_bfcl_toy_action,
-    load_bfcl_toy_tasks,
+from tllm.consumers.gtta.workload import (
+    DynamicsEvent,
+    GTTAConfig,
+    GTTADynamicsState,
+    GTTAEnvironmentService,
+    GTTAQuery,
+    GTTAQueryResult,
+    GTTATrajectoryBatch,
+    GTTAUpdateReceipt,
+    GTTAWorkload,
+    TrajectoryFeedback,
 )
-from tllm.consumers.gtta.config import GTTAConsumerConfig, TrajectoryFeedback, parse_reward
-from tllm.consumers.gtta.consumer import DynamicsEvent, GTTAConsumer, GTTAStats
 
 __all__ = [
-    "BFCLToyStepResult",
-    "BFCLToyTask",
     "DynamicsEvent",
-    "GTTAConsumer",
-    "GTTAConsumerConfig",
-    "GTTAStats",
+    "GTTAConfig",
+    "GTTADynamicsState",
+    "GTTAEnvironmentService",
+    "GTTAQuery",
+    "GTTAQueryResult",
+    "GTTATrajectoryBatch",
+    "GTTAUpdateReceipt",
+    "GTTAWorkload",
     "TrajectoryFeedback",
-    "execute_bfcl_toy_action",
-    "load_bfcl_toy_tasks",
-    "parse_reward",
 ]

@@ -28,6 +28,9 @@ def _runtime() -> SimpleNamespace:
         decode_request_ids=(),
         launch_consumer_from_hooks=False,
         path_hotspot_enabled=False,
+        workload_execution=None,
+        reqid_to_promptidx={},
+        reqid_to_sampleidx={},
     )
 
 
@@ -76,8 +79,6 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv1._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
             mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
             mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
-            mock.patch.object(v027_mrv1._fast_weight, "update_fast_weight_metadata_from_runner"),
-            mock.patch.object(v027_mrv1._fast_weight, "maybe_install_fast_weight_wrappers"),
             mock.patch.object(v027_mrv1._model_region, "prepare_model_region_step"),
             mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
@@ -95,7 +96,6 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             with (
                 mock.patch.object(v027_mrv1._hooks, "maybe_launch_post_logits_decode_work"),
                 mock.patch.object(v027_mrv1._hooks, "run_execute_model_post_producers"),
-                mock.patch.object(v027_mrv1._hooks, "_check_fast_weight_static_key_request_count"),
                 mock.patch.object(v027_mrv1._hooks._hidden_bridge, "dispatch_deferred_layer_batches"),
             ):
                 v027_mrv1._hooks.wrapped_execute_model(
@@ -135,8 +135,6 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv2._hooks, "run_prepare_inputs_post_producers"),
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
             mock.patch.object(v027_mrv2._hooks, "maybe_launch_post_logits_decode_work"),
-            mock.patch.object(v027_mrv2._fast_weight, "update_fast_weight_metadata_from_runner"),
-            mock.patch.object(v027_mrv2._fast_weight, "maybe_install_fast_weight_wrappers"),
             mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
@@ -201,8 +199,6 @@ def test_mixed_scheduler_batch_is_rust_derived_for_the_full_mrv2_lifecycle() -> 
         mock.patch.object(v027_mrv2._hooks, "run_prepare_inputs_post_producers"),
         mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
         mock.patch.object(v027_mrv2._hooks, "maybe_launch_post_logits_decode_work"),
-        mock.patch.object(v027_mrv2._fast_weight, "update_fast_weight_metadata_from_runner"),
-        mock.patch.object(v027_mrv2._fast_weight, "maybe_install_fast_weight_wrappers"),
         mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
         mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
         mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
@@ -361,10 +357,7 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
         mock.patch.object(v027_mrv1._hooks, "run_execute_model_post_producers"),
         mock.patch.object(v027_mrv1._hooks, "maybe_launch_post_logits_decode_work"),
-        mock.patch.object(v027_mrv1._hooks, "_check_fast_weight_static_key_request_count"),
         mock.patch.object(v027_mrv1._hooks._hidden_bridge, "dispatch_deferred_layer_batches"),
-        mock.patch.object(v027_mrv1._fast_weight, "update_fast_weight_metadata_from_runner"),
-        mock.patch.object(v027_mrv1._fast_weight, "maybe_install_fast_weight_wrappers"),
         mock.patch.object(v027_mrv1._model_region, "prepare_model_region_step"),
         mock.patch.object(v027_mrv1._model_region, "stage_signed_backend_region_event"),
         mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
@@ -391,7 +384,6 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
         mock.patch.object(v027_mrv1._hooks, "run_execute_model_post_producers"),
         mock.patch.object(v027_mrv1._hooks, "maybe_launch_post_logits_decode_work"),
-        mock.patch.object(v027_mrv1._hooks, "_check_fast_weight_static_key_request_count"),
     ):
         actual_runner.execute_model()
     assert v027_mrv1.get_step_session(actual_runner) is None
@@ -413,6 +405,7 @@ def test_signed_prepare_post_binder_stages_after_pre_and_prepare_producers(
 
     runtime = _runtime()
     runtime.workload_execution = SimpleNamespace(
+        parameter_overlays={},
         backend_region_binders={implementation_id: slot},
         backend_region_binder_stages=lambda event: (
             (
@@ -451,8 +444,6 @@ def test_signed_prepare_post_binder_stages_after_pre_and_prepare_producers(
                 "run_prepare_inputs_post_producers",
                 side_effect=lambda **_kwargs: order.append("producers"),
             ),
-            mock.patch.object(v027_mrv1._fast_weight, "update_fast_weight_metadata_from_runner"),
-            mock.patch.object(v027_mrv1._fast_weight, "maybe_install_fast_weight_wrappers"),
             mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
         ):
@@ -474,8 +465,6 @@ def test_signed_prepare_post_binder_stages_after_pre_and_prepare_producers(
                 "run_prepare_inputs_post_producers",
                 side_effect=lambda **_kwargs: order.append("producers"),
             ),
-            mock.patch.object(v027_mrv2._fast_weight, "update_fast_weight_metadata_from_runner"),
-            mock.patch.object(v027_mrv2._fast_weight, "maybe_install_fast_weight_wrappers"),
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
         ):
             from tllm.runtime.step_session import StepSession, set_step_session

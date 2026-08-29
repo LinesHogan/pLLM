@@ -299,8 +299,6 @@ class TllmWorkerExtension:
             "patch_installed": core.runtime_patch_installed(),
             "consumer": core.active_consumer_id(),
             "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
-            "fast_weight_enabled": bool(core.RUNTIME.config.fast_weight_enabled),
-            "fast_weight_chunk_size": int(core.RUNTIME.config.fast_weight_chunk_size),
         }
 
     def tllm_push_request_mapping(self, mappings: list[list[object]]) -> int:
@@ -429,6 +427,20 @@ class TllmWorkerExtension:
             "aborted": True,
         }
 
+    def tllm_drain_workload_output(self, key: str) -> dict[str, object]:
+        from tllm.runtime import residual_runtime as core
+        from tllm.runtime.mp.port_wire import encode_inline_port_payload
+
+        store = core.RUNTIME.workload_execution_store
+        execution = store.current if store is not None else core.RUNTIME.workload_execution
+        if execution is None:
+            raise RuntimeError("worker has no active workload execution")
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "key": key,
+            "values": [encode_inline_port_payload(value) for value in execution.drain_output(key)],
+        }
+
     def tllm_apply_enable_flags(self, flags: dict[str, bool]) -> None:
         """Apply supported enable flags to this process's runtime."""
         from tllm.runtime import residual_runtime as core
@@ -447,34 +459,6 @@ class TllmWorkerExtension:
                     "cold workload epoch"
                 )
             core.set_esamp_training_enabled(bool(flags["esamp_training_enabled"]))
-
-    def tllm_set_fast_weight_enabled(
-        self,
-        enabled: bool,
-        layers: list[int] | None = None,
-        chunk_size: int | None = None,
-        learning_rate: float | None = None,
-        mode: str | None = None,
-        decode_update_enabled: bool | None = None,
-        key_mode: str | None = None,
-        max_slots: int | None = None,
-        max_bytes: int | None = None,
-        fail_on_unsupported: bool | None = None,
-    ) -> None:
-        from tllm.runtime import residual_runtime as core
-
-        core.set_fast_weight_enabled(
-            bool(enabled),
-            layers=layers,
-            chunk_size=chunk_size,
-            learning_rate=learning_rate,
-            mode=mode,
-            decode_update_enabled=decode_update_enabled,
-            key_mode=key_mode,
-            max_slots=max_slots,
-            max_bytes=max_bytes,
-            fail_on_unsupported=fail_on_unsupported,
-        )
 
     def tllm_register_consumer(self, name: str, config: dict[str, object], primary: bool = False) -> None:
         """Rebuild a consumer from its spec and activate it in this process."""

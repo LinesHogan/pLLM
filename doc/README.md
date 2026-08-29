@@ -15,7 +15,7 @@ compatibility, not as the optimization model.
 4. [Write a consumer](write-a-consumer.md) — `tllm.workload` guidance plus the legacy Program compatibility API.
 5. [Architecture](architecture.md) — the Region execution stack and compatibility layers.
 6. [ESamp reference](esamp.md) — the built-in test-time training consumer.
-7. [Adapting In-Place TTT](inplace-ttt.md) — algorithms that edit the model's own weights: the learning half is a Program, the application half is a backend-provided weight overlay.
+7. [Native In-Place TTT](inplace-ttt.md) — signed exact fast-weight tasks and shared immutable overlays.
 8. [TLM q/v LoRA](tlm.md) — full HF/PEFT side training and immutable versions through vLLM's native LoRA path.
 
 ## The one-paragraph mental model

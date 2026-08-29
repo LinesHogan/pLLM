@@ -14,7 +14,6 @@ from unittest import mock
 import torch
 
 from tllm import _core
-from tllm.consumers.dummy.config import DummyConsumerConfig
 from tllm.consumers.dummy.workload import DummyConfig
 from tllm.consumers.dummy.workload import DummyWorkload
 from tllm.consumers.esamp.config import ESampConsumerConfig
@@ -502,11 +501,13 @@ class ControlPlaneUnitTest(unittest.TestCase):
         try:
             from tllm.common.dataclass_json import dataclass_to_jsonable
 
-            config = dataclass_to_jsonable(DummyConsumerConfig(consumer_id="plane_dummy"))
-            plane.register_consumer("dummy", config, primary=True)
+            config = dataclass_to_jsonable(
+                ESampConsumerConfig(consumer_id="plane_esamp")
+            )
+            plane.register_consumer("esamp", config, primary=True)
             consumer = residual_runtime.RUNTIME.consumer
             self.assertIsNotNone(consumer)
-            self.assertEqual(consumer.config.consumer_id, "plane_dummy")
+            self.assertEqual(consumer.config.consumer_id, "plane_esamp")
         finally:
             residual_runtime.set_runtime_consumer(saved)
 
@@ -542,34 +543,6 @@ class ControlPlaneUnitTest(unittest.TestCase):
             self.assertEqual(residual_runtime.RUNTIME.placement_stats.moved_dispatch_count, 0)
         finally:
             residual_runtime.RUNTIME.placement_stats = saved
-
-    def test_fast_weight_options_round_trip_without_magic_mapping(self) -> None:
-        plane = ControlPlane(_FakeLLM())
-        with mock.patch("tllm.runtime.residual_runtime.set_fast_weight_enabled") as setter:
-            plane.set_fast_weight_enabled(
-                True,
-                layers=(2, 4),
-                chunk_size=128,
-                learning_rate=0.25,
-                mode="exact",
-                decode_update_enabled=True,
-                key_mode="request_sample",
-                max_slots=7,
-                max_bytes=1024,
-                fail_on_unsupported=True,
-            )
-        setter.assert_called_once_with(
-            True,
-            layers=[2, 4],
-            chunk_size=128,
-            learning_rate=0.25,
-            mode="exact",
-            decode_update_enabled=True,
-            key_mode="request_sample",
-            max_slots=7,
-            max_bytes=1024,
-            fail_on_unsupported=True,
-        )
 
     def test_parent_rejects_legacy_workload_without_an_immutable_worker_spec(self) -> None:
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver

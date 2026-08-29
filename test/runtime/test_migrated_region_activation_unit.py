@@ -414,7 +414,6 @@ class MigratedRegionMigratedRegionActivationUnitTest(unittest.TestCase):
         state = ResidualRuntimeState()
         state.event_step_id = 17
         state.launch_consumer_from_hooks = True
-        state.fast_weight_phase = "decode"
         order: list[tuple[str, object]] = []
         runner = SimpleNamespace(model=None)
 
@@ -459,9 +458,6 @@ class MigratedRegionMigratedRegionActivationUnitTest(unittest.TestCase):
         ), mock.patch.object(
             port_runtime_hooks._sampler_patch,
             "maybe_prepare_sampler_decode_step",
-        ), mock.patch.object(
-            port_runtime_hooks._fast_weight,
-            "update_fast_weight_phase_from_runner",
         ):
             port_runtime_hooks.wrapped_prepare_inputs(
                 core=residual_runtime,

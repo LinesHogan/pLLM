@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, is_dataclass
 from multiprocessing.shared_memory import SharedMemory
@@ -144,4 +145,40 @@ def decode_port_payload(wire: Mapping[str, object]) -> object:
     raise ValueError(f"unsupported staged payload kind {kind!r}")
 
 
-__all__ = ["EncodedPortPayload", "decode_port_payload", "encode_port_payload"]
+def encode_inline_port_payload(value: object) -> dict[str, object]:
+    if isinstance(value, torch.Tensor):
+        payload = save({"value": value.detach().cpu().contiguous()})
+        return {
+            "kind": "inline_tensor",
+            "device": str(value.device),
+            "payload": base64.b64encode(payload).decode("ascii"),
+        }
+    if is_dataclass(value) and not isinstance(value, type):
+        value_type = type(value)
+        return {
+            "kind": "dataclass",
+            "type": f"{value_type.__module__}:{value_type.__qualname__}",
+            "json": json.dumps(
+                dataclass_to_jsonable(value),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+    raise TypeError(f"unsupported inline payload type {type(value).__name__}")
+
+
+def decode_inline_port_payload(wire: Mapping[str, object]) -> object:
+    if wire["kind"] == "inline_tensor":
+        device = torch.device(str(wire["device"]))
+        payload = base64.b64decode(str(wire["payload"]).encode("ascii"))
+        return load(payload)["value"].to(device)
+    return decode_port_payload(wire)
+
+
+__all__ = [
+    "EncodedPortPayload",
+    "decode_inline_port_payload",
+    "decode_port_payload",
+    "encode_inline_port_payload",
+    "encode_port_payload",
+]

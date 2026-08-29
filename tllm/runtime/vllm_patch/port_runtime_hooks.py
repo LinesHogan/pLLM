@@ -28,7 +28,6 @@ from tllm.runtime.vllm_patch.adapters import (
 )
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
-from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.stats import PlacementStats
@@ -289,10 +288,6 @@ def _needs_device_decode_metadata(runtime: PortRuntimeStateLike) -> bool:
     if bool(plan.requires_device_decode_metadata()):
         return True
     return _sampler_patch.runtime_has_active_sampler_provider(runtime)
-
-
-def _check_fast_weight_static_key_request_count(*, core: Any, runner: Any) -> None:
-    _fast_weight.require_static_key_single_request(core.RUNTIME, runner)
 
 
 def store_decode_localization(
@@ -750,20 +745,6 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
 def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
-        if isinstance(out, tuple):
-            view = _prepare_inputs_adapter().unpack_prepare_inputs_output(
-                runner=runner,
-                scheduler_output=scheduler_output,
-                out=out,
-            )
-            _fast_weight.update_fast_weight_metadata_from_runner(
-                core.RUNTIME,
-                runner,
-                num_scheduled_tokens_np=view.num_scheduled_tokens_np,
-            )
-            _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
-        else:
-            _fast_weight.update_fast_weight_phase_from_runner(core.RUNTIME, runner)
         return out
     from tllm.runtime import residual_runtime as _residual_runtime
 
@@ -810,12 +791,6 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
                 prepare_inputs_view=view,
             ),
         )
-        _fast_weight.update_fast_weight_metadata_from_runner(
-            core.RUNTIME,
-            runner,
-            num_scheduled_tokens_np=view.num_scheduled_tokens_np,
-        )
-        _fast_weight.maybe_install_fast_weight_wrappers(runtime=core.RUNTIME, runner=runner)
         t3 = time.perf_counter() if trace_hotspots else 0.0
         record_path_hotspot_cpu(core, "prepare_inputs.decode_localization_cpu", t2, t3)
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
@@ -831,7 +806,6 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         )
     else:
         _clear_decode_localization(core)
-        core.RUNTIME.fast_weight_phase = "prefill"
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=core.RUNTIME, runner=runner)
     return out
 
@@ -849,7 +823,6 @@ def wrapped_execute_model(
     phase_after_inputs: Callable[[], str | None] | None = None,
 ) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
-        _check_fast_weight_static_key_request_count(core=core, runner=runner)
         return core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
     if not execute_pre_already_dispatched:
         if before_runtime_event is not None:
@@ -867,7 +840,6 @@ def wrapped_execute_model(
         core.RUNTIME.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         setup_runtime_hooks_if_active(core=core, runner=runner)
-    _check_fast_weight_static_key_request_count(core=core, runner=runner)
     trace_hotspots = path_hotspots_enabled(core)
     t0 = time.perf_counter() if trace_hotspots else 0.0
     out = core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)

@@ -24,18 +24,18 @@ from tllm.backends.protocol import (
     BackendCapabilities,
     GraphSafety,
     ModelRegionCapabilities,
-    ModuleWeightOverlayCapabilities,
     OrderedRowFusionCapabilities,
     RunnerBinding,
     SamplerStage,
     UnsupportedBackendError,
+    VersionedParameterOverlayCapabilities,
 )
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.backend_capability import BackendCapability
-from tllm.backends.vllm import module_weight_overlay as _module_weight_overlay
+from tllm.backends.vllm import runner_adapter as _runner_adapter
 from tllm.backends.vllm import model_region as _model_region
 from tllm.backends.vllm import scheduler_batch_phase as _scheduler_batch_phase
-from tllm.backends.vllm import test_time_lora as _test_time_lora
+from tllm.backends.vllm import versioned_parameter_overlay as _parameter_overlay
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
 from tllm.backends.vllm.workgraph_runtime import (
     cold_compile_loaded_workloads,
@@ -44,7 +44,6 @@ from tllm.backends.vllm.workgraph_runtime import (
     runner_tensor_parallel_size,
 )
 from tllm.runtime import active_targets
-from tllm.runtime.fast_weight import runtime as _fast_weight
 from tllm.runtime.step_session import (
     StepSession,
     StepState,
@@ -196,7 +195,7 @@ def _wrapped_prepare_inputs(
             "the engine called it with a legacy single-argument shape. "
             "Refusing to guess: install a matching backend driver."
         )
-    _test_time_lora.sync_mrv1_before_prepare(
+    _parameter_overlay.sync_mrv1_before_prepare(
         runtime=runtime,
         runner=runner,
         scheduler_output=scheduler_output,
@@ -209,13 +208,6 @@ def _wrapped_prepare_inputs(
             out=out,
             num_scheduled_tokens=num_scheduled_tokens,
         )
-        _fast_weight.update_fast_weight_metadata_from_runner(
-            runtime,
-            runner,
-            num_scheduled_tokens_np=view.num_scheduled_tokens_np,
-            driver=driver or V027MRv1Driver(),
-        )
-        _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
         _model_region.prepare_model_region_step(
             runtime=runtime,
             runner=runner,
@@ -224,7 +216,7 @@ def _wrapped_prepare_inputs(
         return out
 
     active_driver = driver or V027MRv1Driver()
-    batch_columns = active_driver.fast_weight_packed_row_plan_inputs(
+    batch_columns = active_driver.packed_row_plan_inputs(
         runner=runner,
         num_scheduled_tokens=num_scheduled_tokens,
         input_batch=None,
@@ -278,13 +270,6 @@ def _wrapped_prepare_inputs(
             prepare_inputs_view=view,
         ),
     )
-    _fast_weight.update_fast_weight_metadata_from_runner(
-        runtime,
-        runner,
-        num_scheduled_tokens_np=view.num_scheduled_tokens_np,
-        driver=driver or V027MRv1Driver(),
-    )
-    _fast_weight.maybe_install_fast_weight_wrappers(runtime=runtime, runner=runner)
     _model_region.prepare_model_region_step(
         runtime=runtime,
         runner=runner,
@@ -439,11 +424,12 @@ class V027MRv1Driver:
             hidden_locators=frozenset(
                 {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
             ),
-            module_weight_overlay=ModuleWeightOverlayCapabilities(
-                modules=frozenset({"mlp"}),
-                write_modes=frozenset({"wrapper"}),
+            parameter_overlay=VersionedParameterOverlayCapabilities(
+                representations=frozenset({"low_rank_add"}),
+                scopes=frozenset({"global"}),
                 phases=frozenset({"prefill", "decode"}),
-                request_keyed=True,
+                pinning=frozenset({"latest_at_admission"}),
+                mixed_versions=True,
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
             ),
@@ -472,25 +458,6 @@ class V027MRv1Driver:
             static_headroom_bytes=static_headroom_bytes,
         )
 
-    def resolve_module_weight_view(self, *, binding: RunnerBinding, locator: Any) -> Any:
-        return _module_weight_overlay.resolve_module_weight_view(binding=binding, locator=locator)
-
-    def install_module_weight_overlay(
-        self,
-        *,
-        binding: RunnerBinding,
-        locator: Any,
-        installer: Any,
-    ) -> Any:
-        return _module_weight_overlay.install_module_weight_overlay(
-            binding=binding,
-            locator=locator,
-            installer=installer,
-        )
-
-    def restore_module_weight_overlays(self, binding: RunnerBinding) -> int:
-        return _module_weight_overlay.restore_module_weight_overlays(binding)
-
     def install_typed_layer_replay(self, *, runtime: Any, runner: Any) -> Any:
         from tllm.backends.vllm import typed_layer_replay
 
@@ -504,25 +471,25 @@ class V027MRv1Driver:
         return typed_layer_replay.restore_typed_layer_replay(runtime)
 
     def runner_model_identity(self, runner: Any) -> int:
-        return _module_weight_overlay.runner_model_identity(runner)
+        return _runner_adapter.runner_model_identity(runner)
 
     def runner_active_request_count(self, runner: Any) -> int:
-        return _module_weight_overlay.runner_active_request_count(runner)
+        return _runner_adapter.runner_active_request_count(runner)
 
     def runner_model_layer_count(self, runner: Any) -> int:
-        return _module_weight_overlay.runner_model_layer_count(runner)
+        return _runner_adapter.runner_model_layer_count(runner)
 
     def runner_tensor_parallel_size(self, runner: Any) -> int:
-        return _module_weight_overlay.runner_tensor_parallel_size(runner)
+        return _runner_adapter.runner_tensor_parallel_size(runner)
 
-    def fast_weight_packed_row_plan_inputs(
+    def packed_row_plan_inputs(
         self,
         *,
         runner: Any,
         num_scheduled_tokens: Any | None,
         input_batch: Any | None,
     ) -> Any:
-        return _module_weight_overlay.mrv1_packed_row_plan_inputs(
+        return _runner_adapter.mrv1_packed_row_plan_inputs(
             runner=runner,
             num_scheduled_tokens=num_scheduled_tokens,
             input_batch=input_batch,
@@ -546,12 +513,11 @@ class V027MRv1Driver:
         core._ORIG_SAMPLE_TOKENS = orig_sample_tokens
 
         def _load_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            _module_weight_overlay.ensure_runner_binding(driver=self, runner=runner)
+            _runner_adapter.ensure_runner_binding(driver=self, runner=runner)
             out = _hooks.wrapped_load_model(core=core, runner=runner, args=args, kwargs=kwargs)
-            _test_time_lora.maybe_bind_publisher(
+            _parameter_overlay.maybe_bind_publisher(
                 runtime=core.RUNTIME,
                 runner=runner,
-                runner_family="mrv1",
             )
             from tllm.runtime.graph_policy import resolve_graph_mode
 
@@ -634,4 +600,4 @@ class V027MRv1Driver:
         _sampler_mrv1.install_sampler_patch_v027(core=core)
 
     def unbind(self, binding: RunnerBinding) -> None:
-        _module_weight_overlay.unbind_runner(binding)
+        _runner_adapter.unbind_runner(binding)

@@ -22,7 +22,7 @@ from tllm.backends.protocol import (
     RunnerBinding,
     ordered_row_fusion_policy_fingerprint,
 )
-from tllm.backends.vllm import module_weight_overlay as _overlay
+from tllm.backends.vllm import runner_adapter as _runner_adapter
 from tllm.contracts.typed_replay import (
     LayerReplayState,
     TypedLayerReplayStep,
@@ -359,7 +359,7 @@ class VllmTypedLayerReplayHandle:
 
 
 def _require_binding(*, runtime: object, runner: object) -> RunnerBinding:
-    binding = _overlay.get_runner_binding(runner)
+    binding = _runner_adapter.get_runner_binding(runner)
     if not isinstance(binding, RunnerBinding) or not binding.active:
         raise RuntimeError("typed vLLM layer replay requires an active RunnerBinding")
     capability = binding.capabilities.model_region

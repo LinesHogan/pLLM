@@ -73,13 +73,6 @@ _BUILTIN_PLUGIN_MODULES = {
     name: f"tllm.consumers.{name}.register"
     for name in (
         "esamp",
-        "fttt",
-        "gtta",
-        "inplace_ttt",
-        "override",
-        "tlm",
-        "ttrl",
-        "dummy",
     )
 }
 _CONSUMER_PLUGINS: dict[str, ConsumerPluginSpec[Any, Any]] = {}

@@ -54,12 +54,10 @@ class DispatchPlan:
         by_event: Dict[str, List[DispatchTarget]],
         flow_targets: List[FlowDispatchTarget],
         recurrence_targets: List[RecurrenceDispatchTarget] | None = None,
-        adapter_stores: List[object] | None = None,
     ) -> None:
         self._by_event = by_event
         self._flow_targets = flow_targets
         self._recurrence_targets = list(recurrence_targets or ())
-        self._adapter_stores = list(adapter_stores or ())
         self._graph_mode = "eager"
         self._fusion_groups: tuple[tuple[str, ...], ...] = ()
         self._fusion_rejections: tuple[tuple[str, str], ...] = ()
@@ -86,15 +84,7 @@ class DispatchPlan:
         by_event: Dict[str, List[DispatchTarget]] = {}
         flow_records: List[tuple[str, BaseConsumer, ConsumerFlow]] = []
         recurrence_targets: List[RecurrenceDispatchTarget] = []
-        adapter_stores: List[object] = []
         for consumer in consumers:
-            adapter_store = (
-                consumer.runtime_adapter_store()
-                if isinstance(consumer, BaseConsumer)
-                else None
-            )
-            if adapter_store is not None:
-                adapter_stores.append(adapter_store)
             recurrence = (
                 consumer.recurrence_requirements()
                 if isinstance(consumer, BaseConsumer)
@@ -135,7 +125,6 @@ class DispatchPlan:
             by_event=by_event,
             flow_targets=flow_targets,
             recurrence_targets=recurrence_targets,
-            adapter_stores=adapter_stores,
         )
         # Preserve the public DispatchPlan validation contract before the Rust
         # compiler builds WAW edges from the same descriptors.
@@ -185,9 +174,6 @@ class DispatchPlan:
 
     def recurrence_targets(self) -> List[RecurrenceDispatchTarget]:
         return list(self._recurrence_targets)
-
-    def runtime_adapter_stores(self) -> List[object]:
-        return list(self._adapter_stores)
 
     def validate_recurrence_admission(
         self,
@@ -293,7 +279,6 @@ class DispatchPlan:
         return (
             (not self._flow_targets)
             and (not self._recurrence_targets)
-            and (not self._adapter_stores)
             and all((not targets) for targets in self._by_event.values())
         )
 
@@ -337,18 +322,6 @@ class DispatchPlan:
                 writes.append((str(target.consumer.consumer_id), target.flow, write))
         return writes
 
-    def module_weight_writes(self) -> List[tuple[str, ConsumerFlow, PortWrite]]:
-        """All declared module-weight writes as (consumer_id, flow, write)."""
-        writes: List[tuple[str, ConsumerFlow, PortWrite]] = []
-        for target in self._flow_targets:
-            for write in target.flow.writes:
-                if write.kind != PortKind.MODULE_WEIGHT_VIEW:
-                    continue
-                if write.locator is None:
-                    continue
-                writes.append((str(target.consumer.consumer_id), target.flow, write))
-        return writes
-
     def required_residual_writes(self) -> set[tuple[int, str, str]]:
         required: set[tuple[int, str, str]] = set()
         for _consumer_id, _flow, write in self.residual_writes():
@@ -366,7 +339,7 @@ class DispatchPlan:
         """Legacy residual-only check retained for its public error contract.
 
         The Rust placement compiler performs the authoritative structural
-        conflict check for every port kind, including ModuleWeightView.
+        conflict check for every retained port kind.
         """
         by_locator: Dict[tuple[int, str, str], List[tuple[str, int, str]]] = {}
         for consumer_id, _flow, write in self.residual_writes():

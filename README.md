@@ -17,8 +17,8 @@ fine-grained for analysis, while `ExecutionRegion` is the coarse-grained
 physical execution unit. Rust validates and signs a Region-authoritative
 `ScheduleDecision`; Python only mechanically binds its artifact, resources,
 anchor, and explicit cross-Region fences. Existing
-Program and `BaseConsumer` implementations remain migration compatibility
-inputs for workloads that have not completed native takeover; they are not the
+Program and `BaseConsumer` implementations remain only as explicit ESamp
+migration/benchmark baselines until its final takeover gate closes; they are not the
 optimization model. A workload without an eligible native executor or complete
 legacy adapter fails before vLLM construction instead of being silently skipped.
 
@@ -221,7 +221,7 @@ The full paired in-engine benchmark (5 alternating rounds, gate: program/legacy 
 
 - Test-time training algorithms that learn during generation. `esamp`, `ttrl`, `fttt`, and `override` use `tllm.program`; TLM uses a full HF/PEFT side model because its official-family update trains internal `q_proj/v_proj` LoRA rather than a hidden-to-logits surrogate.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
-- Algorithms that edit the model's own weights (In-Place-TTT style) via the fast-weight overlay — see [adapting In-Place TTT](doc/inplace-ttt.md).
+- Native exact In-Place-TTT with request-scoped immutable overlays — see [Native In-Place TTT](doc/inplace-ttt.md).
 - Experimental prefill recurrences such as Recirculation through the eager
   model-region/KV materializer. This path is ongoing and is not yet covered by
   the CUDA Graph performance claims above.
