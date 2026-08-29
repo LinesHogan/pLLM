@@ -21,16 +21,42 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Protocol, Sequence, TypeVar, cast
-import weakref
+from typing import TYPE_CHECKING, Protocol, Sequence, TypeVar, cast
 import warnings
 from uuid import uuid4
+
+from tllm.runtime.declaration_adapter import (
+    consumer_spec,
+    legacy_consumer,
+    register_legacy_consumer,
+    workload_definition,
+)
+from tllm.runtime.workload_bindings import (
+    DiagnosticsRuntimeServices,
+    LocalRuntimeServices,
+    NoPerRequestStats,
+    NoRuntimeServices,
+    NoSamplerBinding,
+    NoWorkerBinding,
+    PerRequestStats,
+    SamplerRuntimeBinding,
+    WorkerRuntimeBinding,
+)
+from tllm.runtime.vllm_adapter import (
+    VllmHandle,
+    bind_inprocess_runner,
+    bind_runner_owner,
+    create_llm,
+    install_generate_poll,
+)
+from tllm.runtime.torch_adapter import runtime_torch_values
 
 if TYPE_CHECKING:
     import torch
     from tllm.contracts.consumer_stats import TrainingStats
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
+    from tllm.runtime.mp.control import ControlPlane
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
     from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -46,16 +72,11 @@ if TYPE_CHECKING:
         MainWorkloadTimeline,
         WorkloadCompilation,
         WorkloadCompilerCoordinator,
-        PlanEpochAllocator,
     )
 
 
-# runner -> owning TllmRuntime. Weak on both sides: runners and runtimes are
-# collected freely; stale entries vanish.
-_RUNNER_RUNTIMES: "weakref.WeakKeyDictionary[Any, TllmRuntime]" = weakref.WeakKeyDictionary()
-
 # The runtime the process-wide class hooks currently dispatch to.
-_ACTIVE_RUNTIME: "TllmRuntime | None" = None
+_active_runtime: "TllmRuntime | None" = None
 StagedT = TypeVar("StagedT")
 HostOutputT = TypeVar("HostOutputT")
 RuntimeWorkloadT = TypeVar("RuntimeWorkloadT")
@@ -80,23 +101,21 @@ class _HostOutputWorkload(Protocol[HostOutputT]):
     ) -> tuple[HostOutputT, ...]: ...
 
 
-def bind_runner_runtime(runner: Any, runtime: "TllmRuntime") -> None:
-    _RUNNER_RUNTIMES[runner] = runtime
+def bind_runner_runtime(runner: object, runtime: "TllmRuntime") -> None:
+    bind_runner_owner(runner, runtime)
 
 
 
 def active_runtime() -> "TllmRuntime":
-    if _ACTIVE_RUNTIME is None:
+    if _active_runtime is None:
         return default_runtime()
-    return _ACTIVE_RUNTIME
+    return _active_runtime
 
 
 def _runtime_specialization_spec_from_wire(
     raw: Mapping[str, object],
 ) -> "RuntimeSpecializationSpec":
     """Map Rust-validated wire facts to the two concrete Torch value types."""
-
-    import torch
 
     from tllm.runtime.specialization import RuntimeSpecializationSpec
 
@@ -116,17 +135,7 @@ def _runtime_specialization_spec_from_wire(
     }
     if any(type(value) is not int for value in numeric_values.values()):
         raise RuntimeError("worker runtime specialization numeric facts must be exact ints")
-    if not dtype_wire.startswith("torch."):
-        raise RuntimeError("worker returned an invalid Torch dtype specialization")
-    dtype = getattr(torch, dtype_wire.removeprefix("torch."), None)
-    if not isinstance(dtype, torch.dtype) or str(dtype) != dtype_wire:
-        raise RuntimeError("worker returned an invalid Torch dtype specialization")
-    try:
-        device = torch.device(device_wire)
-    except (RuntimeError, TypeError, ValueError) as exc:
-        raise RuntimeError("worker returned an invalid Torch device specialization") from exc
-    if str(device) != device_wire:
-        raise RuntimeError("worker returned a noncanonical Torch device specialization")
+    device, dtype = runtime_torch_values(device_wire, dtype_wire)
     return RuntimeSpecializationSpec(
         rows=cast(int, numeric_values["rows"]),
         hidden_size=cast(int, numeric_values["hidden_size"]),
@@ -154,7 +163,7 @@ class TllmRuntime:
         )
         store = residual_runtime.RUNTIME.workload_execution_store
         if (
-            _ACTIVE_RUNTIME is self
+            _active_runtime is self
             and store is not None
             and compilation is not None
         ):
@@ -167,7 +176,7 @@ class TllmRuntime:
                 return candidate.workload_instance(workload_type)
         execution = residual_runtime.RUNTIME.workload_execution
         if (
-            _ACTIVE_RUNTIME is self
+            _active_runtime is self
             and execution is not None
             and compilation is not None
             and execution.compilation.decision.signature
@@ -187,10 +196,10 @@ class TllmRuntime:
         from tllm.runtime import residual_runtime
 
         store = residual_runtime.RUNTIME.workload_execution_store
-        if _ACTIVE_RUNTIME is self and store is not None:
+        if _active_runtime is self and store is not None:
             return store.current.workload_instance(workload_type)
         execution = residual_runtime.RUNTIME.workload_execution
-        if _ACTIVE_RUNTIME is self and execution is not None:
+        if _active_runtime is self and execution is not None:
             return execution.workload_instance(workload_type)
         try:
             workload = self._workloads_by_type[workload_type]
@@ -304,9 +313,9 @@ class TllmRuntime:
         self,
         *,
         backend: str = "auto",
-        producers: Sequence[Any] = (),
-        consumers: Sequence[Any] = (),
-        workloads: Sequence[Any] = (),
+        producers: Sequence[object] = (),
+        consumers: Sequence[object] = (),
+        workloads: Sequence[object] = (),
         workload_memory_budget_bytes: int = 0,
         workload_allow_serial_fallback: bool = True,
         workload_allow_side_stream: bool = False,
@@ -319,19 +328,19 @@ class TllmRuntime:
         workload_state_snapshots: Mapping[
             str, Callable[[int], Mapping[Hashable, int]]
         ] | None = None,
-        workload_worker_specs: Sequence[Any] = (),
+        workload_worker_specs: Sequence["WorkloadWorkerSpec"] = (),
     ) -> None:
         if backend != "auto":
             raise ValueError(
                 f"backend={backend!r}: only 'auto' is supported; backend selection "
                 "is structural (tllm.backends)"
             )
-        self.producers = tuple(producers)
-        self._workloads: list[Any] = list(workloads)
-        self._workloads_by_type = {
+        self.producers: tuple[object, ...] = tuple(producers)
+        self._workloads: list[object] = list(workloads)
+        self._workloads_by_type: dict[type[object], object] = {
             type(workload): workload for workload in self._workloads
         }
-        self._consumers: list[Any] = list(consumers)
+        self._consumers: list[object] = list(consumers)
         self._unadapted_workload_ids: list[str] = []
         self._native_workload_resources: dict[int, "NativeWorkloadResources"] = {}
         from tllm.schedule import CompileOptions
@@ -341,17 +350,10 @@ class TllmRuntime:
             allow_serial_fallback=workload_allow_serial_fallback,
             allow_side_stream=workload_allow_side_stream,
         )
-        if (
-            not isinstance(workload_persistent_state_bytes, int)
-            or isinstance(workload_persistent_state_bytes, bool)
-            or workload_persistent_state_bytes < 0
-        ):
+        if workload_persistent_state_bytes < 0:
             raise ValueError("workload_persistent_state_bytes must be a non-negative int")
         self._workload_persistent_state_bytes = workload_persistent_state_bytes
-        if workload_decision_cache_directory is not None and not (
-            isinstance(workload_decision_cache_directory, str)
-            and workload_decision_cache_directory
-        ):
+        if workload_decision_cache_directory == "":
             raise TypeError(
                 "workload_decision_cache_directory must be a non-empty str or None"
             )
@@ -359,15 +361,6 @@ class TllmRuntime:
         self._workload_provided_inputs = dict(workload_provided_inputs or {})
         self._workload_output_sinks = dict(workload_output_sinks or {})
         self._workload_state_snapshots = dict(workload_state_snapshots or {})
-        from tllm.runtime.workload_plugins import WorkloadWorkerSpec
-
-        if any(
-            not isinstance(spec, WorkloadWorkerSpec)
-            for spec in workload_worker_specs
-        ):
-            raise TypeError(
-                "workload_worker_specs must contain WorkloadWorkerSpec values"
-            )
         self._workload_worker_specs: tuple["WorkloadWorkerSpec", ...] = tuple(
             workload_worker_specs
         )
@@ -377,37 +370,36 @@ class TllmRuntime:
         self._workload_epoch_allocator = PlanEpochAllocator()
         self._workload_compilation: WorkloadCompilation | None = None
         self._pending_workload_finalizations: dict[
-            tuple[str, int], tuple[Any, "WorkloadCompilation", int]
+            tuple[str, int], tuple["ControlPlane", "WorkloadCompilation", int]
         ] = {}
         self._workload_fail_stop_reason: str | None = None
         self._port_transaction_owner = uuid4().hex
         self._port_transaction_sequence = 0
         self._shape_specialization_poll_lock = RLock()
         for workload_instance in self._workloads:
-            consumer = self._legacy_consumer_for(workload_instance)
+            definition = workload_definition(workload_instance)
+            consumer = legacy_consumer(workload_instance, definition)
             if consumer is None:
+                if definition is None:
+                    raise RuntimeError("native workload has no definition")
                 self._record_native_resources(workload_instance)
-                definition = self._workload_definition(workload_instance)
-                workload_id = (
-                    type(workload_instance).__qualname__
-                    if definition is None
-                    else definition.workload_id
-                )
-                self._unadapted_workload_ids.append(str(workload_id))
+                self._unadapted_workload_ids.append(definition.workload_id)
             elif consumer not in self._consumers:
                 self._consumers.append(consumer)
-        resource_worker_specs = tuple(
-            resources.worker_spec
-            for resources in self._native_workload_resources.values()
-            if resources.worker_spec is not None
-        )
+        resource_worker_specs: list["WorkloadWorkerSpec"] = []
+        for resources in self._native_workload_resources.values():
+            match resources.worker:
+                case WorkerRuntimeBinding(spec=spec):
+                    resource_worker_specs.append(spec)
+                case NoWorkerBinding():
+                    pass
         if resource_worker_specs:
             if self._workload_worker_specs:
                 raise RuntimeError(
                     "native workload worker specs cannot be supplied both by "
                     "resources and TllmRuntime"
                 )
-            self._workload_worker_specs = resource_worker_specs
+            self._workload_worker_specs = tuple(resource_worker_specs)
         if self._unadapted_workload_ids and self._consumers:
             raise RuntimeError(
                 "native Region authority cannot be coinstalled with legacy "
@@ -424,20 +416,18 @@ class TllmRuntime:
         )
 
         entries: list[tuple[str, str]] = []
-        native_resource_entries = []
+        native_resource_entries: list[
+            tuple[str, "NativeWorkloadResources | None"]
+        ] = []
         residual_paths: dict["ResidualLocator", str] = {}
         for workload_instance in self._workloads:
             if not self._is_native_workload_declaration(workload_instance):
                 continue
             resources = self._native_workload_resources.get(id(workload_instance))
-            definition = self._workload_definition(workload_instance)
+            definition = workload_definition(workload_instance)
             if definition is None:
                 continue
-            workload_id = (
-                type(workload_instance).__qualname__
-                if definition is None
-                else definition.workload_id
-            )
+            workload_id = definition.workload_id
             if resources is not None:
                 entries.extend(
                     (f"{workload_id}/{name}", value)
@@ -460,7 +450,14 @@ class TllmRuntime:
         normalized = tuple(sorted((*entries, *runtime_entries)))
         if len({name for name, _value in normalized}) != len(normalized):
             raise RuntimeError("native workload specialization keys must be unique")
-        static_binding_entries = ()
+        static_binding_entries: tuple[
+            tuple[
+                str,
+                "NativeWorkloadResources | None",
+                "WorkloadWorkerSpec",
+            ],
+            ...,
+        ] = ()
         if self._workload_worker_specs:
             if len(self._workload_worker_specs) != len(native_resource_entries):
                 raise RuntimeError(
@@ -490,7 +487,7 @@ class TllmRuntime:
 
         if not self._unadapted_workload_ids:
             return
-        specs: list[Any] = []
+        specs: list["WorkloadWorkerSpec"] = []
         resource_owned_count = 0
         for workload_instance in self._workloads:
             if id(workload_instance) not in self._native_workload_resources:
@@ -498,11 +495,13 @@ class TllmRuntime:
             resource_owned_count += 1
             self._record_native_resources(workload_instance)
             resources = self._native_workload_resources[id(workload_instance)]
-            if resources.worker_spec is None:
-                # A caller-supplied immutable spec remains authoritative for
-                # workloads which do not publish a resource-owned recipe.
-                return
-            specs.append(resources.worker_spec)
+            match resources.worker:
+                case WorkerRuntimeBinding(spec=spec):
+                    specs.append(spec)
+                case NoWorkerBinding():
+                    # A caller-supplied immutable spec remains authoritative for
+                    # workloads which do not publish a resource-owned recipe.
+                    return
         if resource_owned_count == 0:
             return
         fresh_specs = tuple(specs)
@@ -512,60 +511,23 @@ class TllmRuntime:
         self._refresh_resource_specialization_options()
         self._rebuild_workload_compiler()
 
-    def _record_native_resources(self, workload_instance: Any) -> None:
+    def _record_native_resources(self, workload_instance: object) -> None:
         """Bind nominal native resources once, outside every execution path."""
 
         from tllm.runtime.workload_plugins import (
             NativeWorkload,
-            NativeWorkloadResources,
         )
 
         if not isinstance(workload_instance, NativeWorkload):
             return
         resources = workload_instance.native_workload_resources()
-        if not isinstance(resources, NativeWorkloadResources):
-            raise TypeError(
-                "NativeWorkload.native_workload_resources() must return "
-                "NativeWorkloadResources"
-            )
-        if resources.workload is not workload_instance:
+        if resources.owner is not workload_instance:
             raise RuntimeError("native workload resources belong to another instance")
         self._native_workload_resources[id(workload_instance)] = resources
 
     @staticmethod
-    def _workload_definition(workload_instance: Any) -> Any | None:
-        try:
-            return type(workload_instance).__tllm_workload__
-        except AttributeError:
-            return None
-
-    @staticmethod
-    def _legacy_consumer_for(workload_instance: Any) -> Any | None:
-        """Resolve only declarations explicitly owned by the legacy adapter."""
-
-        definition = TllmRuntime._workload_definition(workload_instance)
-        if definition is None:
-            return workload_instance
-        from tllm.workload import WorkloadAuthority
-
-        if definition.authority is WorkloadAuthority.NATIVE_REGION:
-            return None
-        try:
-            adapter = workload_instance.legacy_consumer
-        except AttributeError:
-            raise RuntimeError(
-                "legacy-adapter workload declaration must provide legacy_consumer"
-            ) from None
-        consumer = adapter() if callable(adapter) else adapter
-        if consumer is None:
-            raise RuntimeError(
-                "legacy-adapter workload declaration returned no legacy_consumer"
-            )
-        return consumer
-
-    @staticmethod
-    def _is_native_workload_declaration(workload_instance: Any) -> bool:
-        definition = TllmRuntime._workload_definition(workload_instance)
+    def _is_native_workload_declaration(workload_instance: object) -> bool:
+        definition = workload_definition(workload_instance)
         if definition is None:
             return False
         from tllm.workload import WorkloadAuthority
@@ -573,11 +535,11 @@ class TllmRuntime:
         return definition.authority is WorkloadAuthority.NATIVE_REGION
 
     @property
-    def workloads(self) -> tuple[Any, ...]:
+    def workloads(self) -> tuple[object, ...]:
         return tuple(self._workloads)
 
     @property
-    def consumers(self) -> tuple[Any, ...]:
+    def consumers(self) -> tuple[object, ...]:
         return tuple(self._consumers)
 
     @property
@@ -646,24 +608,24 @@ class TllmRuntime:
             if resources is None:
                 continue
             provided_overlap = sorted(
-                set(provided_inputs).intersection(resources.provided_inputs)
+                set(provided_inputs).intersection(resources.ports.inputs)
             )
             if provided_overlap:
                 raise RuntimeError(
                     "duplicate native workload provided input binding(s): "
                     + ", ".join(provided_overlap)
                 )
-            provided_inputs.update(resources.provided_inputs)
+            provided_inputs.update(resources.ports.inputs)
             sink_overlap = sorted(
-                set(output_sinks).intersection(resources.output_sinks)
+                set(output_sinks).intersection(resources.ports.outputs)
             )
             if sink_overlap:
                 raise RuntimeError(
                     "duplicate native workload output sink binding(s): "
                     + ", ".join(sink_overlap)
                 )
-            output_sinks.update(resources.output_sinks)
-            for local_name, snapshot in resources.state_snapshots.items():
+            output_sinks.update(resources.ports.outputs)
+            for local_name, snapshot in resources.states.snapshots.items():
                 resource = (
                     f"{declaration.ir.workload_id}/{local_name}"
                     if multiple
@@ -674,26 +636,44 @@ class TllmRuntime:
                         f"duplicate native workload state binding {resource!r}"
                     )
                 snapshots[resource] = snapshot
-            if resources.sampler_provider is not None:
-                sampler_providers.append(resources.sampler_provider)
-            if resources.diagnostics_reader is not None:
+            match resources.sampler:
+                case SamplerRuntimeBinding(provider=provider):
+                    sampler_providers.append(provider)
+                case NoSamplerBinding():
+                    pass
+
+            match resources.services:
+                case LocalRuntimeServices() as services:
+                    diagnostic_callbacks = (services.diagnostics,)
+                    stats_readers.append(services.stats)
+                    enabled_setters.append(services.set_enabled)
+                    enabled_predicates.append(services.is_enabled)
+                    synchronizers.append(services.synchronize)
+                    match services.per_request_stats:
+                        case PerRequestStats(read=read):
+                            per_request_stats_readers.append(read)
+                        case NoPerRequestStats():
+                            pass
+                case DiagnosticsRuntimeServices(diagnostics=diagnostics):
+                    diagnostic_callbacks = (diagnostics,)
+                case NoRuntimeServices():
+                    diagnostic_callbacks = ()
+            for diagnostics in diagnostic_callbacks:
                 workload_id = declaration.ir.workload_id
                 if workload_id in diagnostics_readers:
                     raise RuntimeError(
                         "duplicate native workload diagnostics binding "
                         f"{workload_id!r}"
                     )
-                diagnostics_readers[workload_id] = resources.diagnostics_reader
+                diagnostics_readers[workload_id] = diagnostics
             overlap = set(residual_paths).intersection(resources.residual_paths)
             if overlap:
                 raise RuntimeError(
                     "native workloads declare duplicate residual locator bindings"
                 )
-            residual_paths.update(
-                cast("Mapping[ResidualLocator, str]", resources.residual_paths)
-            )
+            residual_paths.update(resources.residual_paths)
             binder_overlap = set(backend_region_binders).intersection(
-                resources.backend_region_binders
+                resources.backend.binders
             )
             if binder_overlap:
                 raise RuntimeError(
@@ -701,17 +681,7 @@ class TllmRuntime:
                     "binding(s): "
                     + ", ".join(sorted(binder_overlap))
                 )
-            backend_region_binders.update(resources.backend_region_binders)
-            if resources.stats_reader is not None:
-                stats_readers.append(resources.stats_reader)
-            if resources.per_request_stats_reader is not None:
-                per_request_stats_readers.append(resources.per_request_stats_reader)
-            if resources.enabled_setter is not None:
-                enabled_setters.append(resources.enabled_setter)
-            if resources.enabled_predicate is not None:
-                enabled_predicates.append(resources.enabled_predicate)
-            if resources.synchronizer is not None:
-                synchronizers.append(resources.synchronizer)
+            backend_region_binders.update(resources.backend.binders)
         if len(sampler_providers) > 1:
             raise RuntimeError("native Region plan supports at most one sampler provider")
         duplicates = tuple(
@@ -730,7 +700,7 @@ class TllmRuntime:
                 "native Region plan has ambiguous lifecycle callbacks: "
                 + ", ".join(duplicates)
             )
-        state_versions = {}
+        state_versions: dict[str, StateVersionBinding] = {}
         for resource, snapshot in snapshots.items():
             try:
                 state = state_by_resource[resource]
@@ -765,18 +735,12 @@ class TllmRuntime:
             static_binding_entries=static_binding_entries,
         )
 
-    def cold_specialize_workloads(self, spec: Any) -> None:
+    def cold_specialize_workloads(self, spec: "RuntimeSpecializationSpec") -> None:
         """Materialize native state before Region artifacts are compiled."""
 
         import json
-        from dataclasses import replace
-
         from tllm import _core
-        from tllm.runtime.specialization import RuntimeSpecializationSpec
         from tllm.schedule import CompileOptions
-
-        if not isinstance(spec, RuntimeSpecializationSpec):
-            raise TypeError("native workload specialization requires RuntimeSpecializationSpec")
         facts_json = json.dumps(
             {
                 "device": str(spec.device),
@@ -812,9 +776,12 @@ class TllmRuntime:
         self._workload_compile_options = specialized_options
         refreshed_resources = False
         for resources in self._native_workload_resources.values():
-            if resources.cold_specializer is not None:
-                resources.cold_specializer(spec)
-                refreshed_resources = True
+            match resources.services:
+                case LocalRuntimeServices(cold_specialize=specialize):
+                    specialize(spec)
+                    refreshed_resources = True
+                case NoRuntimeServices() | DiagnosticsRuntimeServices():
+                    pass
         if refreshed_resources:
             self._refresh_native_worker_specs()
         self._rebuild_workload_compiler()
@@ -866,7 +833,7 @@ class TllmRuntime:
         self,
         enabled: bool,
         *,
-        plane: Any | None = None,
+        plane: "ControlPlane | None" = None,
     ) -> bool:
         """Serialize an enable transition with all other cold epoch changes."""
 
@@ -910,26 +877,20 @@ class TllmRuntime:
         self._require_workload_live()
         if not self._unadapted_workload_ids:
             return False
-        if type(enabled) is not bool:
-            raise TypeError("native workload enabled state must be a bool")
-
-        mutable_resources = tuple(
-            resources
-            for resources in self._native_workload_resources.values()
-            if resources.enabled_setter is not None
-        )
-        if len(mutable_resources) != 1:
+        mutable_services: list[LocalRuntimeServices] = []
+        for resources in self._native_workload_resources.values():
+            match resources.services:
+                case LocalRuntimeServices() as services:
+                    mutable_services.append(services)
+                case NoRuntimeServices() | DiagnosticsRuntimeServices():
+                    pass
+        if len(mutable_services) != 1:
             raise RuntimeError(
                 "native enable transition requires exactly one declared "
                 "enable-state resource"
             )
-        resource = mutable_resources[0]
-        predicate = resource.enabled_predicate
-        if predicate is None:
-            raise RuntimeError(
-                "native enable transition requires an immutable enabled-state snapshot"
-            )
-        current_enabled = bool(predicate())
+        services = mutable_services[0]
+        current_enabled = services.is_enabled()
         if current_enabled == enabled:
             return False
 
@@ -938,8 +899,7 @@ class TllmRuntime:
         previous_compilation = self._workload_compilation
         previous_resources = dict(self._native_workload_resources)
         previous_specs = self._workload_worker_specs
-        setter = resource.enabled_setter
-        assert setter is not None
+        setter = services.set_enabled
         try:
             # The declaration owns the semantic mutation. Immediately replace
             # its local resource snapshot before rebuilding the signed inputs.
@@ -980,7 +940,7 @@ class TllmRuntime:
             raise RuntimeError(f"tLLM workload runtime is fail-stopped: {reason}")
 
     def _fail_stop_workloads(self, reason: str) -> None:
-        if not isinstance(reason, str) or not reason:
+        if not reason:
             raise TypeError("workload fail-stop reason must be a non-empty string")
         if self._workload_fail_stop_reason is None:
             self._workload_fail_stop_reason = reason
@@ -1072,7 +1032,7 @@ class TllmRuntime:
             raise
         return True
 
-    def apply_pending_worker_shape_specializations(self, plane: Any) -> bool:
+    def apply_pending_worker_shape_specializations(self, plane: "ControlPlane") -> bool:
         """Install one parent-compiled replacement for queued worker misses.
 
         Shape misses are immutable requests for the *current* worker epoch.
@@ -1085,10 +1045,10 @@ class TllmRuntime:
         with self._shape_specialization_poll_lock:
             return self._apply_pending_worker_shape_specializations_locked(plane)
 
-    def _apply_pending_worker_shape_specializations_locked(self, plane: Any) -> bool:
+    def _apply_pending_worker_shape_specializations_locked(
+        self, plane: "ControlPlane"
+    ) -> bool:
         """Run one serialized parent-side shape poll under the runtime lock."""
-
-        from tllm.runtime.mp.control import WorkerShapeSpecializationReply
 
         current = self._workload_compilation
         if current is None or current.physical is None:
@@ -1099,8 +1059,6 @@ class TllmRuntime:
                 "shape specialization currently requires exactly one TP=1 worker reply"
             )
         reply = replies[0]
-        if not isinstance(reply, WorkerShapeSpecializationReply):
-            raise TypeError("control plane returned an untyped shape-specialization reply")
         requests = reply.requests
         if not requests:
             # A globally activated replacement is promoted by the worker's
@@ -1152,7 +1110,7 @@ class TllmRuntime:
             raise
         return True
 
-    def register_consumer(self, consumer: Any) -> None:
+    def register_consumer(self, consumer: object) -> None:
         if self._unadapted_workload_ids:
             raise RuntimeError(
                 "native Region authority cannot be coinstalled with legacy "
@@ -1165,22 +1123,22 @@ class TllmRuntime:
 
             plane = active_control_plane()
             if plane is not None:
-                from tllm.runtime.consumer_plugins import spec_for_consumer
-
-                spec = spec_for_consumer(consumer)
+                spec = consumer_spec(consumer)
         self._consumers.append(consumer)
         if active_runtime() is self:
-            from tllm.runtime import residual_runtime
             from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
 
-            residual_runtime.register_dispatch_consumer(consumer)
+            register_legacy_consumer(consumer)
             refresh_exported_bootstrap_spec()
             if plane is not None and spec is not None:
                 plane.register_consumer(spec.name, spec.config)
 
-    def register_workload(self, workload_instance: Any) -> None:
-        consumer = self._legacy_consumer_for(workload_instance)
+    def register_workload(self, workload_instance: object) -> None:
+        definition = workload_definition(workload_instance)
+        consumer = legacy_consumer(workload_instance, definition)
         if consumer is None:
+            if definition is None:
+                raise RuntimeError("native workload has no definition")
             if self._consumers:
                 raise RuntimeError(
                     "native Region authority cannot be coinstalled with legacy "
@@ -1190,13 +1148,7 @@ class TllmRuntime:
             self._record_native_resources(workload_instance)
             self._refresh_resource_specialization_options()
             self._rebuild_workload_compiler()
-            definition = self._workload_definition(workload_instance)
-            workload_id = (
-                type(workload_instance).__qualname__
-                if definition is None
-                else definition.workload_id
-            )
-            self._unadapted_workload_ids.append(str(workload_id))
+            self._unadapted_workload_ids.append(definition.workload_id)
             return
         self._workloads.append(workload_instance)
         self._rebuild_workload_compiler()
@@ -1221,8 +1173,8 @@ class TllmRuntime:
         A runtime with no consumers of its own leaves any consumers already
         registered through the legacy façade untouched (backward compat).
         """
-        global _ACTIVE_RUNTIME
-        _ACTIVE_RUNTIME = self
+        global _active_runtime
+        _active_runtime = self
         from tllm.runtime import residual_runtime
 
         residual_runtime.publish_workload_compilation(None)
@@ -1239,9 +1191,7 @@ class TllmRuntime:
                 raise RuntimeError(
                     "native workloads declare duplicate residual locator bindings"
                 )
-            native_residual_paths.update(
-                cast("Mapping[ResidualLocator, str]", resources.residual_paths)
-            )
+            native_residual_paths.update(resources.residual_paths)
         if native_residual_paths:
             residual_runtime.RUNTIME.residual_raw_paths = native_residual_paths
         self._apply_consumers()
@@ -1257,10 +1207,9 @@ class TllmRuntime:
 
         residual_runtime.clear_dispatch_consumers()
         for consumer in self._consumers:
-            residual_runtime.register_dispatch_consumer(consumer)
+            register_legacy_consumer(consumer)
 
-    def make_llm(self, *args: Any, **kwargs: Any) -> Any:
-        from tllm.runtime import residual_runtime
+    def make_llm(self, *args: object, **kwargs: object) -> VllmHandle:
         from tllm.runtime.mp.control import set_active_control_plane
 
         # Resolve mixed-authority errors before constructing an engine. Pure
@@ -1268,11 +1217,11 @@ class TllmRuntime:
         _ = self.workload_execution_bindings
         set_active_control_plane(None)
         self.activate()
-        llm = residual_runtime.make_llm(*args, **kwargs)
+        llm = create_llm(args, dict(kwargs))
         self._bind_engine_runners(llm)
         return llm
 
-    def _bind_engine_runners(self, llm: Any) -> None:
+    def _bind_engine_runners(self, llm: object) -> None:
         """Record runner -> runtime routing for every live worker runner."""
         from tllm.runtime.mp.control import ControlPlane, set_active_control_plane
 
@@ -1288,21 +1237,11 @@ class TllmRuntime:
                 set_active_control_plane(plane)
                 self._install_shape_specialization_poll(llm, plane)
                 return
-        # Fallback for engines without a collective_rpc path (test doubles):
-        # walk the in-process executor directly.
-        def _bind(worker: Any) -> None:
-            runner = getattr(worker, "model_runner", None)
-            if runner is not None:
-                bind_runner_runtime(runner, self)
+        bind_inprocess_runner(llm, self)
 
-        engine = getattr(llm, "llm_engine", None)
-        core = getattr(engine, "engine_core", None)
-        executor = getattr(core, "model_executor", None)
-        driver = getattr(executor, "driver_worker", None)
-        if driver is not None:
-            _bind(driver)
-
-    def _install_shape_specialization_poll(self, llm: Any, plane: Any) -> None:
+    def _install_shape_specialization_poll(
+        self, llm: object, plane: "ControlPlane"
+    ) -> None:
         """Poll completed worker misses before the next user request.
 
         A shape miss intentionally fails its current worker step.  The parent
@@ -1313,24 +1252,7 @@ class TllmRuntime:
 
         if not self.has_compilable_workloads:
             return
-        try:
-            owner = llm._tllm_shape_specialization_poll_owner
-        except AttributeError:
-            owner = None
-        if owner is self:
-            return
-        if owner is not None:
-            raise RuntimeError(
-                "LLM already has a shape-specialization poll owned by another runtime"
-            )
-        try:
-            generate = llm.generate
-        except AttributeError:
-            return
-        if not callable(generate):
-            return
-
-        def generate_after_shape_poll(*call_args: Any, **call_kwargs: Any) -> Any:
+        def before_generate() -> None:
             # Keep the lock through the underlying call: after staging a
             # replacement, this request must reach the worker safe point
             # before another caller observes the parent-only next epoch.
@@ -1338,12 +1260,10 @@ class TllmRuntime:
                 self._require_workload_live()
                 self.apply_pending_worker_shape_specializations(plane)
                 self._require_workload_live()
-                return generate(*call_args, **call_kwargs)
 
-        llm._tllm_shape_specialization_poll_owner = self
-        llm.generate = generate_after_shape_poll
+        install_generate_poll(llm, self, before_generate)
 
-    def _coordinate_worker_compilation(self, plane: Any) -> None:
+    def _coordinate_worker_compilation(self, plane: "ControlPlane") -> None:
         """Compile once in the parent from worker-reported pure timeline facts."""
 
         self._require_workload_live()
@@ -1386,15 +1306,9 @@ class TllmRuntime:
         normalized_options_json: list[str] = []
         current_options_json = self._workload_compile_options.to_json()
         for reply in replies:
-            timeline_raw = reply.get("timeline")
-            specialization_raw = reply.get("specialization")
-            if not isinstance(timeline_raw, Mapping) or (
-                specialization_raw is not None and type(specialization_raw) is not dict
-            ):
-                raise RuntimeError("worker returned an invalid workload timeline envelope")
-            timeline_payloads.append(timeline_raw)
+            timeline_payloads.append(reply.timeline)
             facts_json = json.dumps(
-                specialization_raw,
+                reply.specialization,
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=True,
@@ -1412,9 +1326,9 @@ class TllmRuntime:
             )
         specialized_options = CompileOptions.from_json(normalized_options_json[0])
         specialization = None
-        if timeline_payloads and replies[0].get("specialization") is not None:
+        if timeline_payloads and replies[0].specialization is not None:
             specialization = _runtime_specialization_spec_from_wire(
-                cast("Mapping[str, object]", replies[0]["specialization"])
+                replies[0].specialization
             )
         if specialization is not None:
             # The coordinator owns compilation of typed cold artifacts.  The
@@ -1439,7 +1353,7 @@ class TllmRuntime:
         self._install_workload_compilation_on_workers(plane, compilation)
 
     def _install_workload_compilation_on_workers(
-        self, plane: Any, compilation: "WorkloadCompilation"
+        self, plane: "ControlPlane", compilation: "WorkloadCompilation"
     ) -> None:
         """Install an already compiled immutable epoch on every TP=1 worker."""
 
@@ -1475,10 +1389,10 @@ class TllmRuntime:
         def validate_reports(
             reports: Sequence[Mapping[str, object]], *, committed: bool
         ) -> None:
-            from tllm.runtime.mp.control import _workload_install_report_from_wire
+            from tllm.runtime.mp.control import workload_install_report_from_wire
 
             typed_reports = tuple(
-                _workload_install_report_from_wire(report, committed=committed)
+                workload_install_report_from_wire(report, committed=committed)
                 for report in reports
             )
             if not typed_reports or any(
@@ -1676,11 +1590,11 @@ class TllmRuntime:
         return len(completed)
 
 
-_DEFAULT_RUNTIME: "TllmRuntime | None" = None
+_default_runtime: "TllmRuntime | None" = None
 
 
 def default_runtime() -> TllmRuntime:
-    global _DEFAULT_RUNTIME
-    if _DEFAULT_RUNTIME is None:
-        _DEFAULT_RUNTIME = TllmRuntime()
-    return _DEFAULT_RUNTIME
+    global _default_runtime
+    if _default_runtime is None:
+        _default_runtime = TllmRuntime()
+    return _default_runtime

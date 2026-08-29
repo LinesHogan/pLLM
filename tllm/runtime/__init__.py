@@ -13,18 +13,16 @@ from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
 from tllm.runtime.workload_execution import StateVersionBinding
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
-    NativeWorkloadResources,
-    ReconstructedWorkload,
     WorkloadWorkerSpec,
 )
+from tllm.runtime.workload_bindings import WorkloadRuntimeBinding
 
 __all__ = [
     "NativeWorkload",
     "BackendRegionBinderSlot",
-    "NativeWorkloadResources",
-    "ReconstructedWorkload",
     "StateVersionBinding",
     "TllmRuntime",
     "WorkloadWorkerSpec",
+    "WorkloadRuntimeBinding",
     "default_runtime",
 ]

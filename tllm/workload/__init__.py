@@ -1,5 +1,6 @@
 """Public auxiliary-workload declaration API."""
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from tllm.workload.frontend import (
@@ -17,14 +18,18 @@ from tllm.workload.frontend import (
     HiddenPhase,
     HiddenSite,
     Index,
+    NativeWorkloadDefinition,
     RequestKey,
     PublishedModule,
     State,
+    TrainableState,
     StateEffect,
     WorkloadAuthority,
     WorkloadDeclaration,
+    WorkloadDefinition,
     current,
     declare_workload,
+    definition_for_workload_class,
     extern,
     extern_io,
     hidden,
@@ -41,6 +46,7 @@ from tllm.workload.frontend import (
     sink,
     step_id,
     task,
+    task_declaration,
     temporary,
     transition,
     workload,
@@ -70,20 +76,32 @@ from tllm.workload.region_compiler import (
 )
 
 if TYPE_CHECKING:
-    # Type-checking view of the legacy bridge.  At runtime these names load
-    # lazily via __getattr__ below so `import tllm.workload` never pulls the
-    # legacy Program/workgraph frontend into a native-only process.
-    from tllm.workload.compat import dependence_effect_fingerprint, lower_program
+    from tllm.program.decl import StateSpec
 
 
-def __getattr__(name: str) -> object:
-    # The legacy adapter bridge (deleted at retirement) is the only legacy
-    # contact point; keep it explicit and lazy.
-    if name in ("dependence_effect_fingerprint", "lower_program"):
-        from tllm.workload import compat
+def lower_program(
+    instance: object,
+    *,
+    states: "Mapping[str, StateSpec]",
+    workload_id: str | None = None,
+) -> WorkloadIR:
+    from tllm.workload.compat import lower_program as lower_legacy_program
 
-        return getattr(compat, name)
-    raise AttributeError(f"module 'tllm.workload' has no attribute {name!r}")
+    return lower_legacy_program(
+        instance,
+        states=states,
+        workload_id=workload_id,
+    )
+
+
+def dependence_effect_fingerprint(
+    ir: WorkloadIR,
+) -> tuple[tuple[str, str, str, str], ...]:
+    from tllm.workload.compat import (
+        dependence_effect_fingerprint as legacy_fingerprint,
+    )
+
+    return legacy_fingerprint(ir)
 
 __all__ = [
     "AdamSpec",
@@ -104,6 +122,7 @@ __all__ = [
     "HiddenSite",
     "HostOutput",
     "Index",
+    "NativeWorkloadDefinition",
     "OptimizerSpec",
     "NumericConstraint",
     "RequestKey",
@@ -111,16 +130,19 @@ __all__ = [
     "RegionArtifactRegistry",
     "RegionCallableArtifact",
     "State",
+    "TrainableState",
     "StateEffect",
     "StateScope",
     "StagedPort",
     "WorkloadDeclaration",
+    "WorkloadDefinition",
     "WorkloadAuthority",
     "WorkloadEdgeKind",
     "WorkloadIR",
     "current",
     "dependence_effect_fingerprint",
     "declare_workload",
+    "definition_for_workload_class",
     "extern",
     "extern_io",
     "WorkloadConfig",
@@ -143,6 +165,7 @@ __all__ = [
     "step_id",
     "staged",
     "task",
+    "task_declaration",
     "temporary",
     "transition",
     "workload",

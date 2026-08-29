@@ -33,12 +33,6 @@ def lower_schedule_graph(
 ) -> ScheduleGraph:
     """Combine workload IRs without selecting order, placement, or buffers."""
 
-    if not isinstance(workloads, tuple) or any(
-        not isinstance(workload, WorkloadIR) for workload in workloads
-    ):
-        raise TypeError("workloads must be tuple[WorkloadIR, ...]")
-    if not isinstance(persistent_state_bytes, int) or isinstance(persistent_state_bytes, bool):
-        raise TypeError("persistent_state_bytes must be int")
     if persistent_state_bytes < 0:
         raise ValueError("persistent_state_bytes must be non-negative")
     semantic_keys = tuple(workload.semantic_key for workload in workloads)
@@ -87,6 +81,17 @@ def lower_schedule_graph(
             for state in workload.states
         )
         for task in workload.tasks:
+            common_capabilities: set[str] = {
+                capability
+                for capability in task.implementations[0].capabilities
+                if capability != "torch.export"
+            }
+            for implementation in task.implementations[1:]:
+                common_capabilities.intersection_update(
+                    capability
+                    for capability in implementation.capabilities
+                    if capability != "torch.export"
+                )
             tasks.append(
                 ScheduleTask(
                     task_id(workload, task.name),
@@ -107,18 +112,7 @@ def lower_schedule_graph(
                     # against the timeline and derives the Region's actual
                     # requirements from that selected declaration.
                     required_capabilities=tuple(
-                        sorted(
-                            set.intersection(
-                                *(
-                                    {
-                                        capability
-                                        for capability in implementation.capabilities
-                                        if capability != "torch.export"
-                                    }
-                                    for implementation in task.implementations
-                                )
-                            )
-                        )
+                        sorted(common_capabilities)
                     ),
                     capture_safe=(
                         not task.effects

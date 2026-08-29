@@ -7,9 +7,9 @@ import torch
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
-from functools import wraps
-from types import FunctionType
-from typing import Any, Generic, Never, ParamSpec, Protocol, Self, TypeVar, cast, get_origin, get_type_hints, overload
+from types import FunctionType, MethodType
+from typing import Generic, Never, ParamSpec, Protocol, Self, TypeGuard, TypeVar, cast, get_origin, get_type_hints, overload
+from weakref import WeakKeyDictionary
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.workload.config import ConfigField, WorkloadConfig
@@ -130,6 +130,11 @@ StateValueT = TypeVar("StateValueT")
 ConfiguredT_co = TypeVar("ConfiguredT_co", covariant=True)
 ConfiguredT = TypeVar("ConfiguredT")
 PortT = TypeVar("PortT")
+PortT_co = TypeVar("PortT_co", covariant=True)
+
+
+class _StateOwner(Protocol[StateValueT]):
+    def state_value(self, state: "State[StateValueT]") -> StateValueT: ...
 
 
 class ConfiguredValue(Protocol[ConfiguredT_co]):
@@ -164,7 +169,7 @@ NO_CONFIGURED_VALUE = NoConfiguredValue()
 
 
 class _PublishedModuleOwner(Protocol):
-    def _publish_module(
+    def publish_module(
         self,
         state: PublishedModule[object],
         values: Mapping[str, torch.Tensor],
@@ -172,7 +177,7 @@ class _PublishedModuleOwner(Protocol):
 
 
 class _OptimizerOwner(Protocol):
-    def _optimize_state(
+    def optimize_state(
         self, state: TrainableState[object], loss: torch.Tensor
     ) -> None: ...
 
@@ -203,25 +208,19 @@ class State(Generic[StateValueT]):
             parameters = ("__state_name__",)
         if isinstance(parameters, str):
             parameters = (parameters,)
-        if not isinstance(parameters, tuple) or not parameters or any(
-            not isinstance(parameter, str) or not parameter for parameter in parameters
-        ):
+        if not parameters or any(not parameter for parameter in parameters):
             raise TypeError("State.parameters must be a non-empty str or tuple[str, ...]")
         if self.scope is StateScope.REQUEST and key is None:
             raise ValueError("REQUEST State requires key=request_key(...)")
         if self.scope is not StateScope.REQUEST and key is not None:
             raise ValueError("only REQUEST State may declare a request_key")
-        if key is not None and not isinstance(key, RequestKey):
-            raise TypeError("State.key must be RequestKey or None")
-        if optimizer is not None and not isinstance(optimizer, OptimizerSpec):
-            raise TypeError("State.optimizer must be an OptimizerSpec")
         self.key = key
         self.parameters = parameters
         self.optimizer = optimizer
         self.transition_kind = _name(transition, "State.transition")
         self._name = ""
         self._owner: type[object] | None = None
-        self._initializer_name = ""
+        self._initializer: Callable[..., StateValueT] | None = None
 
     @classmethod
     def replica(
@@ -251,38 +250,41 @@ class State(Generic[StateValueT]):
         self._name = _name(name, "State name")
         if self._infer_parameter_name:
             self.parameters = (self._name,)
-        inherited = tuple(owner.__dict__.get("__tllm_states__", ()))
-        if self not in inherited:
-            setattr(owner, "__tllm_states__", (*inherited, self))
 
     @overload
     def __get__(self, instance: None, owner: type[object] | None = None) -> Self: ...
 
     @overload
-    def __get__(self, instance: object, owner: type[object] | None = None) -> StateValueT: ...
+    def __get__(
+        self,
+        instance: _StateOwner[StateValueT],
+        owner: type[object] | None = None,
+    ) -> StateValueT: ...
 
     def __get__(
-        self, instance: object | None, owner: type[object] | None = None
+        self,
+        instance: _StateOwner[StateValueT] | None,
+        owner: type[object] | None = None,
     ) -> "Self | StateValueT":
         if instance is None:
             return self
-        return instance._state_value(self)  # type: ignore[attr-defined,no-any-return]
+        return instance.state_value(self)
 
     def initialize(self, function: Callable[..., StateValueT]) -> Callable[..., StateValueT]:
         """Bind the cold initializer for this State."""
 
         if not callable(function):
             raise TypeError("State.initialize requires a callable")
-        if self._initializer_name:
+        if self._initializer is not None:
             raise RuntimeError(f"State {self.name!r} already has an initializer")
-        self._initializer_name = function.__name__
+        self._initializer = function
         return function
 
     @property
-    def initializer_name(self) -> str:
-        if not self._initializer_name:
+    def initializer(self) -> Callable[..., StateValueT]:
+        if self._initializer is None:
             raise RuntimeError(f"State {self.name!r} has no initializer")
-        return self._initializer_name
+        return self._initializer
 
     @property
     def name(self) -> str:
@@ -306,8 +308,22 @@ class TrainableState(State[StateValueT]):
 
 
 class PublishedModule(State[StateValueT]):
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        *,
+        scope: StateScope,
+        key: RequestKey | None = None,
+        parameters: str | tuple[str, ...] | None,
+        optimizer: OptimizerSpec | None = None,
+        transition: str = "host_publish",
+    ) -> None:
+        super().__init__(
+            scope=scope,
+            key=key,
+            parameters=parameters,
+            optimizer=optimizer,
+            transition=transition,
+        )
         self.port: StagedPort[Mapping[str, torch.Tensor]] = StagedPort()
 
     def __set_name__(self, owner: type[object], name: str) -> None:
@@ -315,10 +331,24 @@ class PublishedModule(State[StateValueT]):
         self.port.__set_name__(owner, f"{name}__publish")
 
 
+def _state_id(state: State[object]) -> str:
+    return state.to_ir().name
+
+
+def _is_state(member: object) -> TypeGuard[State[object]]:
+    return isinstance(member, State)
+
+
+def _is_published_module(
+    state: State[object],
+) -> TypeGuard[PublishedModule[object]]:
+    return isinstance(state, PublishedModule)
+
+
 @dataclass(frozen=True, slots=True)
 class StateEffect:
     kind: EffectKind
-    state: State | None
+    state: object | None
     resource: str | None = None
 
     def __post_init__(self) -> None:
@@ -330,7 +360,7 @@ class StateEffect:
                 self, "resource", _name(self.resource, "extern_io resource")
             )
             return
-        if not isinstance(self.state, State):
+        if not _is_state(self.state):
             raise TypeError(f"{self.kind.value} expects a State")
         if self.resource is not None:
             raise ValueError("only extern_io effects may name a raw resource")
@@ -341,27 +371,27 @@ class StateEffect:
         if self.kind is EffectKind.EXTERN_IO:
             assert self.resource is not None
             return self.resource
-        assert self.state is not None
-        return self.state.name
+        if not _is_state(self.state):
+            raise RuntimeError("state effect has no State")
+        return _state_id(self.state)
 
 
-def read(state: State) -> StateEffect:
-    return _effect(EffectKind.READ, state)
+def read(state: object) -> StateEffect:
+    return _effect(EffectKind.READ, _require_state(state, "read"))
 
 
-def current(state: State) -> StateEffect:
-    return _effect(EffectKind.CURRENT, state)
+def current(state: object) -> StateEffect:
+    return _effect(EffectKind.CURRENT, _require_state(state, "current"))
 
 
-def transition(state: State) -> StateEffect:
-    if not isinstance(state, State):
-        raise TypeError("transition expects a State")
+def transition(state: object) -> StateEffect:
+    state = _require_state(state, "transition")
     if state.optimizer is None and state.transition_kind == "optimizer":
         raise ValueError("transition requires a State optimizer or explicit version conversion")
     return StateEffect(EffectKind.TRANSITION, state)
 
 
-def maybe_transition(state: State) -> StateEffect:
+def maybe_transition(state: object) -> StateEffect:
     """Declare a *conditional* transition: the version may or may not advance.
 
     Use this when whether the update fires is data-dependent and cannot be
@@ -373,8 +403,7 @@ def maybe_transition(state: State) -> StateEffect:
     conditional transition therefore never weakens the signed ordering
     contract; it only widens the audited version delta.
     """
-    if not isinstance(state, State):
-        raise TypeError("maybe_transition expects a State")
+    state = _require_state(state, "maybe_transition")
     if state.optimizer is None and state.transition_kind == "optimizer":
         raise ValueError(
             "maybe_transition requires a State optimizer or explicit version conversion"
@@ -382,8 +411,8 @@ def maybe_transition(state: State) -> StateEffect:
     return StateEffect(EffectKind.TRANSITION_MAYBE, state)
 
 
-def next(state: State) -> StateEffect:
-    return _effect(EffectKind.NEXT, state)
+def next(state: object) -> StateEffect:
+    return _effect(EffectKind.NEXT, _require_state(state, "next"))
 
 
 def extern_io(resource: str) -> StateEffect:
@@ -401,10 +430,14 @@ def extern_io(resource: str) -> StateEffect:
     return StateEffect(EffectKind.EXTERN_IO, None, resource)
 
 
-def _effect(kind: EffectKind, state: State) -> StateEffect:
-    if not isinstance(state, State):
-        raise TypeError(f"{kind.value} expects a State")
+def _effect(kind: EffectKind, state: State[object]) -> StateEffect:
     return StateEffect(kind, state)
+
+
+def _require_state(value: object, operation: str) -> State[object]:
+    if not _is_state(value):
+        raise TypeError(f"{operation} expects a State")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,8 +474,8 @@ class StepIdInput:
 
 
 @dataclass(frozen=True, slots=True)
-class StagedInput(Generic[PortT]):
-    port: StagedPort[PortT]
+class StagedInput(Generic[PortT_co]):
+    port: StagedPort[PortT_co]
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,8 +518,8 @@ class SamplerOutputKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class HostOutputSpec(Generic[PortT]):
-    port: HostOutput[PortT]
+class HostOutputSpec(Generic[PortT_co]):
+    port: HostOutput[PortT_co]
 
 
 InputSpec = (
@@ -494,11 +527,11 @@ InputSpec = (
     | ResultInput
     | ProvidedInput
     | StepIdInput
-    | StagedInput
+    | StagedInput[object]
     | SamplerRuntimeInput
 )
 OutputSpec = (
-    SinkOutput | TemporaryOutput | OptimizeOutput | SamplerOutput | HostOutputSpec
+    SinkOutput | TemporaryOutput | OptimizeOutput | SamplerOutput | HostOutputSpec[object]
 )
 
 
@@ -559,12 +592,6 @@ def host_output(port: HostOutput[PortT]) -> HostOutputSpec[PortT]:
 def optimize(
     state: TrainableState[object], *, at: Before | After | Between
 ) -> OptimizeOutput:
-    if not isinstance(state, State):
-        raise TypeError("optimize expects a State")
-    if state.optimizer is None:
-        raise ValueError("optimize requires a State with an optimizer")
-    if not isinstance(at, (Before, After, Between)):
-        raise TypeError("optimize.at must be a workload timing")
     return OptimizeOutput(state, at)
 
 
@@ -671,7 +698,7 @@ class AffineExpr:
         return _as_affine(other)._combine(self, -1)
 
     def __mul__(self, factor: int) -> "AffineExpr":
-        if not isinstance(factor, int) or isinstance(factor, bool):
+        if isinstance(factor, bool):
             raise TypeError("affine expressions may only be multiplied by an int")
         return AffineExpr(tuple((name, value * factor) for name, value in self.coefficients), self.constant * factor)
 
@@ -713,9 +740,9 @@ def _as_affine(value: int | Index | AffineExpr) -> AffineExpr:
         return value
     if isinstance(value, Index):
         return value.expr()
-    if isinstance(value, int) and not isinstance(value, bool):
-        return AffineExpr((), value)
-    raise TypeError("expected an affine Index, AffineExpr, or int")
+    if isinstance(value, bool):
+        raise TypeError("expected an affine Index, AffineExpr, or int")
+    return AffineExpr((), value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -727,12 +754,10 @@ class Domain:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "Domain.name"))
-        if not isinstance(self.indices, tuple) or any(not isinstance(index, Index) for index in self.indices):
-            raise TypeError("Domain.indices must be tuple[Index, ...]")
         names = tuple(index.name for index in self.indices)
         if len(names) != len(set(names)):
             raise ValueError("Domain index names must be unique")
-        if not isinstance(self.parameters, tuple) or any(not isinstance(value, str) or not value for value in self.parameters):
+        if any(not value for value in self.parameters):
             raise TypeError("Domain.parameters must be tuple[str, ...]")
 
     def to_ir(self) -> DomainIR:
@@ -771,11 +796,17 @@ class ExternImplementation:
     derive_types: bool = False
 
     def __post_init__(self) -> None:
-        for field_name in ("namespace", "name", "version"):
-            object.__setattr__(self, field_name, _name(getattr(self, field_name), f"ExternImplementation.{field_name}"))
-        for field_name in ("input_types", "output_types", "capabilities"):
-            value = getattr(self, field_name)
-            if not isinstance(value, tuple) or any(not isinstance(item, str) or not item for item in value):
+        object.__setattr__(
+            self, "namespace", _name(self.namespace, "ExternImplementation.namespace")
+        )
+        object.__setattr__(self, "name", _name(self.name, "ExternImplementation.name"))
+        object.__setattr__(self, "version", _name(self.version, "ExternImplementation.version"))
+        for values, field_name in (
+            (self.input_types, "input_types"),
+            (self.output_types, "output_types"),
+            (self.capabilities, "capabilities"),
+        ):
+            if any(not item for item in values):
                 raise TypeError(f"ExternImplementation.{field_name} must be tuple[str, ...]")
         if self.derive_types and (self.input_types or self.output_types):
             raise ValueError(
@@ -799,7 +830,7 @@ class ExternImplementation:
         )
 
 
-def extern(key: str, *, capabilities: tuple[str, ...] = ()) -> ExternImplementation:
+def extern(key: object, *, capabilities: tuple[str, ...] = ()) -> ExternImplementation:
     """Declare an extern implementation by key; task() derives the signed
     input/output types from the function annotations."""
     if not isinstance(key, str):
@@ -863,15 +894,41 @@ class TaskDecl:
     accesses: tuple[AffineAccess, ...]
 
 
-def _mapping(value: Mapping[str, _T] | None, expected: tuple[type, ...], label: str) -> tuple[tuple[str, _T], ...]:
+_TASK_DECLARATIONS: WeakKeyDictionary[FunctionType, TaskDecl] = WeakKeyDictionary()
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDefinition:
+    """One immutable task specification and its author or generated executor."""
+
+    name: str
+    declaration: TaskDecl
+    executor: FunctionType
+    generated_after: str | None = None
+    is_gradient_task: bool = False
+
+    def bind(self, instance: object) -> Callable[..., object]:
+        bound = MethodType(self.executor, instance)
+        if not self.is_gradient_task:
+            return bound
+
+        def run_with_grad(
+            *args: torch.Tensor, **kwargs: torch.Tensor
+        ) -> object:
+            with torch.inference_mode(False), torch.enable_grad():
+                return bound(
+                    *(value.clone() for value in args),
+                    **{key: value.clone() for key, value in kwargs.items()},
+                )
+
+        return run_with_grad
+
+
+def _mapping(value: Mapping[str, _T] | None, label: str) -> tuple[tuple[str, _T], ...]:
     if value is None:
         return ()
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{label} must be a mapping")
     result: list[tuple[str, _T]] = []
     for key, item in value.items():
-        if not isinstance(item, expected):
-            raise TypeError(f"{label}[{key!r}] has unsupported descriptor {type(item).__name__}")
         result.append((_name(key, f"{label} key"), item))
     return tuple(result)
 
@@ -907,45 +964,14 @@ def task(
     domain: Domain = Domain("scalar"),
     accesses: tuple[AffineAccess, ...] = (),
 ) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
-    task_inputs = _mapping(
-        inputs,
-        (
-            HiddenInput,
-            ResultInput,
-            ProvidedInput,
-            StepIdInput,
-            StagedInput,
-            SamplerRuntimeInput,
-        ),
-        "task.inputs",
-    )
-    task_outputs = _mapping(
-        outputs,
-        (
-            SinkOutput,
-            TemporaryOutput,
-            OptimizeOutput,
-            SamplerOutput,
-            HostOutputSpec,
-        ),
-        "task.outputs",
-    )
-    if not isinstance(effects, tuple) or any(not isinstance(effect, StateEffect) for effect in effects):
-        raise TypeError("task.effects must be tuple[StateEffect, ...]")
-    if not isinstance(timing, (Before, After, Between)):
-        raise TypeError("task.timing must be Before, After, or Between")
+    task_inputs = _mapping(inputs, "task.inputs")
+    task_outputs = _mapping(outputs, "task.outputs")
     if implementation is None:
         implementations: tuple[ExternImplementation, ...] = ()
     elif isinstance(implementation, ExternImplementation):
         implementations = (implementation,)
-    elif isinstance(implementation, tuple) and all(isinstance(item, ExternImplementation) for item in implementation):
-        implementations = implementation
     else:
-        raise TypeError("task.implementation must be ExternImplementation or tuple")
-    if not isinstance(domain, Domain):
-        raise TypeError("task.domain must be Domain")
-    if not isinstance(accesses, tuple) or any(not isinstance(access, AffineAccess) for access in accesses):
-        raise TypeError("task.accesses must be tuple[AffineAccess, ...]")
+        implementations = implementation
 
     def decorate(target: Callable[_P, _R]) -> Callable[_P, _R]:
         nonlocal implementations
@@ -993,16 +1019,16 @@ def task(
                     for item in implementations
                 )
 
-        @wraps(target)
-        def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            return target(*args, **kwargs)
-
-        setattr(
-            wrapped,
-            "__tllm_task__",
-            TaskDecl(task_inputs, task_outputs, effects, timing, implementations, domain, accesses),
+        _TASK_DECLARATIONS[target] = TaskDecl(
+            task_inputs,
+            task_outputs,
+            effects,
+            timing,
+            implementations,
+            domain,
+            accesses,
         )
-        return wrapped
+        return target
 
     return decorate if function is None else decorate(function)
 
@@ -1020,10 +1046,14 @@ class WorkloadDefinition:
     approximation: ApproximationPolicy
     authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION
     approximation_criteria: ApproximationCriteria | None = None
+    tasks: tuple[TaskDefinition, ...] = ()
     hidden_inputs: tuple[HiddenInput, ...] = ()
     sampler_outputs: tuple[SamplerOutput, ...] = ()
     gradient_tasks: tuple[str, ...] = ()
     sampler_inputs: tuple[ValueSourceKind, ...] = ()
+    states: tuple[State[object], ...] = ()
+    staged_ports: tuple[StagedPort[object], ...] = ()
+    host_outputs: tuple[HostOutput[object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1034,13 +1064,18 @@ class NativeWorkloadDefinition:
     approximation_criteria: ApproximationCriteria | None
     config_type: type[WorkloadConfig]
     enabled: ConfigFieldValue[bool]
+    tasks: tuple[TaskDefinition, ...] = ()
     hidden_inputs: tuple[HiddenInput, ...] = ()
     sampler_outputs: tuple[SamplerOutput, ...] = ()
     gradient_tasks: tuple[str, ...] = ()
     sampler_inputs: tuple[ValueSourceKind, ...] = ()
+    states: tuple[State[object], ...] = ()
+    staged_ports: tuple[StagedPort[object], ...] = ()
+    host_outputs: tuple[HostOutput[object], ...] = ()
 
 
 _Definition = WorkloadDefinition | NativeWorkloadDefinition
+_WORKLOAD_DEFINITIONS: WeakKeyDictionary[type[object], _Definition] = WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1082,27 +1117,17 @@ def workload(
     approximation: ApproximationPolicy = ApproximationPolicy.EXACT,
     authority: WorkloadAuthority = WorkloadAuthority.NATIVE_REGION,
     approximation_criteria: ApproximationCriteria | None = None,
-    config: type | None = None,
-    enabled: bool | ConfigField[bool] | None = None,
+    config: type[WorkloadConfig] | None = None,
+    enabled: ConfigField[bool] | None = None,
 ) -> type[_T] | Callable[[type[_T]], type[_T]]:
     def decorate(target: type[_T]) -> type[_T]:
-        if not isinstance(target, type):
-            raise TypeError("workload must decorate a class")
         policy = ApproximationPolicy(approximation)
         if approximation_criteria is not None:
-            if not isinstance(approximation_criteria, ApproximationCriteria):
-                raise TypeError(
-                    "workload.approximation_criteria must be ApproximationCriteria or None"
-                )
             if policy is ApproximationPolicy.EXACT:
                 raise ValueError(
                     "an exact workload must not declare approximation criteria"
                 )
         workload_id = id or f"{target.__module__}.{target.__qualname__}"
-        if config is not None and not isinstance(config, type):
-            raise TypeError("workload.config must be a config type")
-        if enabled is not None and not isinstance(enabled, ConfigField):
-            raise TypeError("workload.enabled must be a ConfigField")
         if config is None and enabled is None:
             definition: _Definition = WorkloadDefinition(
                 _name(workload_id, "workload.id"),
@@ -1110,11 +1135,7 @@ def workload(
                 WorkloadAuthority(authority),
                 approximation_criteria,
             )
-        elif (
-            isinstance(config, type)
-            and issubclass(config, WorkloadConfig)
-            and isinstance(enabled, ConfigField)
-        ):
+        elif config is not None and enabled is not None:
             definition = NativeWorkloadDefinition(
                 workload_id=_name(workload_id, "workload.id"),
                 approximation=policy,
@@ -1127,19 +1148,34 @@ def workload(
             raise TypeError(
                 "native workload config and enabled ConfigField must be declared together"
             )
-        _expand_published_modules(target)
-        _expand_optimized_outputs(target)
-        hidden_inputs, sampler_outputs, gradient_tasks, sampler_inputs = (
-            _author_metadata(target)
-        )
+        members = _class_members(target)
+        states = tuple(member for _name_, member in members if _is_state(member))
+        author_tasks = _author_task_definitions(target)
+        tasks = _expanded_task_definitions(target, author_tasks)
+        hidden_inputs, sampler_outputs, gradient_tasks, sampler_inputs = _author_metadata(tasks)
         definition = replace(
             definition,
+            tasks=tasks,
             hidden_inputs=hidden_inputs,
             sampler_outputs=sampler_outputs,
             gradient_tasks=gradient_tasks,
             sampler_inputs=sampler_inputs,
+            states=states,
+            staged_ports=(
+                *(state.port for state in states if _is_published_module(state)),
+                *(
+                    cast(StagedPort[object], member)
+                    for _name_, member in members
+                    if isinstance(member, StagedPort)
+                ),
+            ),
+            host_outputs=tuple(
+                cast(HostOutput[object], member)
+                for _name_, member in members
+                if isinstance(member, HostOutput)
+            ),
         )
-        setattr(target, "__tllm_workload__", definition)
+        _WORKLOAD_DEFINITIONS[target] = definition
         # Validate at class definition time without constructing an instance.
         _build_ir(target, definition)
         return target
@@ -1147,14 +1183,59 @@ def workload(
     return decorate if cls is None else decorate(cls)
 
 
-def _expand_published_modules(target: type[object]) -> None:
-    states = cast(
-        tuple[State[object], ...], target.__dict__.get("__tllm_states__", ())
-    )
-    for state in states:
-        if not isinstance(state, PublishedModule):
+def _author_task_definitions(target: type[object]) -> tuple[TaskDefinition, ...]:
+    definitions: list[TaskDefinition] = []
+    for name, member in _class_members(target):
+        if not isinstance(member, FunctionType):
             continue
-        generated_name = f"publish__{state.name}"
+        declaration = _TASK_DECLARATIONS.get(member)
+        if declaration is None:
+            continue
+        definitions.append(TaskDefinition(name, declaration, member))
+    return tuple(definitions)
+
+
+def task_declaration(function: FunctionType) -> TaskDecl:
+    try:
+        return _TASK_DECLARATIONS[function]
+    except KeyError as exc:
+        raise TypeError("function is not decorated with @task") from exc
+
+
+def _expanded_task_definitions(
+    target: type[object], author_tasks: tuple[TaskDefinition, ...]
+) -> tuple[TaskDefinition, ...]:
+    states = tuple(
+        member for _name_, member in _class_members(target) if _is_state(member)
+    )
+    publishers = _published_module_tasks(states)
+    optimized = _optimized_task_definitions(author_tasks)
+    source_order = {
+        definition.name: index
+        for index, definition in enumerate((*author_tasks, *publishers))
+    }
+
+    def task_position(entry: TaskDefinition) -> tuple[int, bool]:
+        if entry.generated_after is not None:
+            return source_order[entry.generated_after], True
+        return source_order[entry.name], False
+
+    return tuple(
+        sorted(
+            (*optimized, *publishers),
+            key=task_position,
+        )
+    )
+
+
+def _published_module_tasks(
+    states: tuple[State[object], ...],
+) -> tuple[TaskDefinition, ...]:
+    generated: list[TaskDefinition] = []
+    for state in states:
+        if not _is_published_module(state):
+            continue
+        generated_name = f"publish__{_state_id(state)}"
 
         def publisher_executor(
             published: PublishedModule[object],
@@ -1163,29 +1244,36 @@ def _expand_published_modules(target: type[object]) -> None:
                 self: _PublishedModuleOwner,
                 values: Mapping[str, torch.Tensor],
             ) -> None:
-                self._publish_module(published, values)
+                self.publish_module(published, values)
 
             return publish
 
-        generated = task(
-            inputs={"values": StagedInput(state.port)},
-            effects=(transition(state),),
-            timing=Before("next.prepare"),
-            implementation=ExternImplementation(
-                namespace="tllm.workload",
-                name="published_module_transition",
-                version="1",
-                input_types=("Mapping",),
-                output_types=("None",),
-            ),
-        )(publisher_executor(state))
-        generated.__name__ = generated_name
-        generated.__qualname__ = f"{target.__qualname__}.{generated_name}"
-        setattr(target, generated_name, generated)
+        generated.append(
+            TaskDefinition(
+                name=generated_name,
+                declaration=TaskDecl(
+                    inputs=(("values", StagedInput(state.port)),),
+                    outputs=(),
+                    effects=(transition(state),),
+                    timing=Before("next.prepare"),
+                    implementations=(ExternImplementation(
+                        namespace="tllm.workload",
+                        name="published_module_transition",
+                        version="1",
+                        input_types=("Mapping",),
+                        output_types=("None",),
+                    ),),
+                    domain=Domain("scalar"),
+                    accesses=(),
+                ),
+                executor=publisher_executor(state),
+            )
+        )
+    return tuple(generated)
 
 
 def _author_metadata(
-    target: type[object],
+    tasks: tuple[TaskDefinition, ...],
 ) -> tuple[
     tuple[HiddenInput, ...],
     tuple[SamplerOutput, ...],
@@ -1196,10 +1284,8 @@ def _author_metadata(
     sampler_outputs: list[SamplerOutput] = []
     gradient_tasks: list[str] = []
     sampler_inputs: list[ValueSourceKind] = []
-    for name, member in _class_members(target):
-        declaration = _member_metadata(member).get("__tllm_task__")
-        if not isinstance(declaration, TaskDecl):
-            continue
+    for definition in tasks:
+        declaration = definition.declaration
         hidden_inputs.extend(
             source
             for _parameter, source in declaration.inputs
@@ -1215,8 +1301,8 @@ def _author_metadata(
             for _parameter, source in declaration.inputs
             if isinstance(source, SamplerRuntimeInput)
         )
-        if _member_metadata(member).get("__tllm_gradient_task__", False):
-            gradient_tasks.append(name)
+        if definition.is_gradient_task:
+            gradient_tasks.append(definition.name)
     if len(sampler_outputs) > 1:
         raise ValueError("one workload may declare at most one sampler output")
     return (
@@ -1227,20 +1313,24 @@ def _author_metadata(
     )
 
 
-def _expand_optimized_outputs(target: type[object]) -> None:
+def _optimized_task_definitions(
+    author_tasks: tuple[TaskDefinition, ...],
+) -> tuple[TaskDefinition, ...]:
     """Lower author-level optimize outputs to ordinary signed tasks."""
 
     pending: list[tuple[str, str, OptimizeOutput]] = []
-    for task_name, member in tuple(vars(target).items()):
-        declaration = _member_metadata(member).get("__tllm_task__")
-        if not isinstance(declaration, TaskDecl):
-            continue
+    expanded: list[TaskDefinition] = []
+    known_names = {entry.name for entry in author_tasks}
+    for entry in author_tasks:
+        task_name = entry.name
+        declaration = entry.declaration
         optimized = [
             (output_name, output)
             for output_name, output in declaration.outputs
             if isinstance(output, OptimizeOutput)
         ]
         if not optimized:
+            expanded.append(entry)
             continue
         effects = list(declaration.effects)
         rewritten_outputs: list[tuple[str, OutputSpec]] = []
@@ -1256,47 +1346,55 @@ def _expand_optimized_outputs(target: type[object]) -> None:
                 effects.append(read(output.trainable_state()))
             rewritten_outputs.append((output_name, TemporaryOutput()))
             pending.append((task_name, output_name, output))
-        setattr(
-            member,
-            "__tllm_task__",
+        expanded.append(
             replace(
-                declaration,
-                outputs=tuple(rewritten_outputs),
-                effects=tuple(effects),
-            ),
+                entry,
+                declaration=replace(
+                    declaration,
+                    outputs=tuple(rewritten_outputs),
+                    effects=tuple(effects),
+                ),
+                is_gradient_task=True,
+            )
         )
-        setattr(member, "__tllm_gradient_task__", True)
 
+    generated: list[TaskDefinition] = []
     for task_name, output_name, output in pending:
         state = output.trainable_state()
-        generated_name = f"{task_name}__optimize_{state.name}"
-        if hasattr(target, generated_name):
+        generated_name = f"{task_name}__optimize_{_state_id(state)}"
+        if generated_name in known_names:
             raise ValueError(f"generated optimizer task {generated_name!r} already exists")
+        known_names.add(generated_name)
 
         def optimizer_executor(state: TrainableState[object]) -> Callable[..., None]:
             def apply_loss(self: _OptimizerOwner, loss: torch.Tensor) -> None:
-                self._optimize_state(state, loss)
+                self.optimize_state(state, loss)
 
             return apply_loss
 
-        apply_loss = optimizer_executor(state)
-
-        apply_loss.__name__ = generated_name
-        apply_loss.__qualname__ = f"{target.__qualname__}.{generated_name}"
-        generated = task(
-            inputs={"loss": ResultInput(task_name, output_name)},
-            effects=(transition(state),),
-            timing=output.at,
-            implementation=ExternImplementation(
-                namespace="tllm.workload",
-                name="optimizer_transition",
-                version="1",
-                input_types=("Tensor",),
-                output_types=("None",),
-            ),
-        )(apply_loss)
-        setattr(generated, "__tllm_generated_after__", task_name)
-        setattr(target, generated_name, generated)
+        generated.append(
+            TaskDefinition(
+                name=generated_name,
+                declaration=TaskDecl(
+                    inputs=(("loss", ResultInput(task_name, output_name)),),
+                    outputs=(),
+                    effects=(transition(state),),
+                    timing=output.at,
+                    implementations=(ExternImplementation(
+                        namespace="tllm.workload",
+                        name="optimizer_transition",
+                        version="1",
+                        input_types=("Tensor",),
+                        output_types=("None",),
+                    ),),
+                    domain=Domain("scalar"),
+                    accesses=(),
+                ),
+                executor=optimizer_executor(state),
+                generated_after=task_name,
+            )
+        )
+    return (*expanded, *generated)
 
 
 def _timing_ir(value: Timing) -> TimingIR:
@@ -1346,69 +1444,47 @@ def _class_members(cls: type[object]) -> tuple[tuple[str, object], ...]:
     return tuple(members.items())
 
 
-def _member_metadata(member: object) -> Mapping[str, object]:
-    try:
-        return vars(member)
-    except TypeError:
-        return {}
-
-
 def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
     members = _class_members(cls)
-    states = tuple(value for _, value in members if isinstance(value, State))
-    if len({state.name for state in states}) != len(states):
+    states = tuple(value for _, value in members if _is_state(value))
+    if len({_state_id(state) for state in states}) != len(states):
         raise ValueError("workload contains duplicate state names")
     parameter_owners: dict[str, str] = {}
     for state in states:
         for parameter in state.parameters:
             prior = parameter_owners.get(parameter)
             if prior is not None:
-                raise ValueError(f"parameter {parameter!r} is owned by both {prior!r} and {state.name!r}")
-            parameter_owners[parameter] = state.name
+                raise ValueError(f"parameter {parameter!r} is owned by both {prior!r} and {_state_id(state)!r}")
+            parameter_owners[parameter] = _state_id(state)
 
-    raw_tasks: list[tuple[str, Callable[..., object], TaskDecl]] = []
-    for name, member in members:
-        try:
-            declaration = member.__tllm_task__  # type: ignore[attr-defined]
-        except AttributeError:
-            declaration = None
-        if isinstance(declaration, TaskDecl):
-            raw_tasks.append((name, cast(Callable[..., object], member), declaration))
-    source_order = {name: index for index, (name, _member, _decl) in enumerate(raw_tasks)}
-
-    def task_sort_key(
-        entry: tuple[str, Callable[..., object], TaskDecl],
-    ) -> tuple[int, int]:
-        generated_after = cast(
-            str,
-            _member_metadata(entry[1]).get("__tllm_generated_after__", entry[0]),
-        )
-        return (
-            source_order.get(generated_after, source_order[entry[0]]),
-            int("__tllm_generated_after__" in _member_metadata(entry[1])),
-        )
-
-    raw_tasks.sort(
-        key=task_sort_key
-    )
-    known_states = set(states)
-    known_task_names = {name for name, _, _ in raw_tasks}
-    output_names = {name: {output for output, _ in decl.outputs} for name, _, decl in raw_tasks}
+    raw_tasks = definition.tasks
+    task_names = tuple(entry.name for entry in raw_tasks)
+    if len(task_names) != len(set(task_names)):
+        raise ValueError("workload contains duplicate task names")
+    known_state_ids = {id(state) for state in states}
+    known_task_names = set(task_names)
+    output_names = {
+        entry.name: {output for output, _ in entry.declaration.outputs}
+        for entry in raw_tasks
+    }
     task_irs: list[TaskIR] = []
     edges: list[WorkloadEdge] = []
     values: list[ValueIR] = []
     consumers: dict[tuple[str, str], list[str]] = {}
 
-    for ordinal, (name, function, declaration) in enumerate(raw_tasks):
+    for ordinal, entry in enumerate(raw_tasks):
+        name = entry.name
+        function = entry.executor
+        declaration = entry.declaration
         for effect in declaration.effects:
             if effect.kind is EffectKind.EXTERN_IO:
-                if effect.resource_name in {state.name for state in states}:
+                if effect.resource_name in {_state_id(state) for state in states}:
                     raise ValueError(
                         f"task {name!r} extern_io channel {effect.resource_name!r} "
                         "collides with a state name"
                     )
                 continue  # extern channels are validated on the effect itself
-            if effect.state not in known_states:
+            if id(effect.state) not in known_state_ids:
                 raise ValueError(f"task {name!r} references state from another workload")
         for parameter, input_spec in declaration.inputs:
             if isinstance(input_spec, ResultInput):
@@ -1506,6 +1582,20 @@ def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
     )
 
 
+def _workload_definition_for(cls: type[object]) -> _Definition | None:
+    """Find the immutable definition without reflecting task attributes."""
+
+    for candidate in cls.__mro__:
+        definition = _WORKLOAD_DEFINITIONS.get(candidate)
+        if definition is not None:
+            return definition
+    return None
+
+
+def definition_for_workload_class(cls: type[object]) -> _Definition | None:
+    return _workload_definition_for(cls)
+
+
 def declare_workload(
     instance: object,
     *,
@@ -1513,23 +1603,16 @@ def declare_workload(
 ) -> WorkloadDeclaration:
     if isinstance(instance, type):
         raise TypeError("declare_workload expects a workload instance")
-    if executor_registry is not None and not isinstance(
-        executor_registry, ExecutorRegistry
-    ):
-        raise TypeError("executor_registry must be ExecutorRegistry or None")
-    try:
-        definition = type(instance).__tllm_workload__  # type: ignore[attr-defined]
-    except AttributeError:
-        definition = None
-    if not isinstance(definition, (WorkloadDefinition, NativeWorkloadDefinition)):
+    definition = _workload_definition_for(type(instance))
+    if definition is None:
         raise TypeError("instance class is not decorated with @workload")
     ir = _build_ir(type(instance), definition)
     executors: list[tuple[str, Callable[..., object]]] = []
     implementation_executors: list[tuple[str, str, Callable[..., object]]] = []
+    tasks_by_name = {entry.name: entry for entry in definition.tasks}
     for task in ir.tasks:
-        default_executor = getattr(instance, task.name)
-        if not callable(default_executor):
-            raise TypeError(f"workload task {task.name!r} is not callable")
+        entry = tasks_by_name[task.name]
+        default_executor = entry.bind(instance)
         executors.append((task.name, default_executor))
         for implementation in task.implementations:
             executor = default_executor
@@ -1570,6 +1653,7 @@ __all__ = [
     "WorkloadAuthority",
     "current",
     "declare_workload",
+    "definition_for_workload_class",
     "hidden",
     "maybe_transition",
     "next",
@@ -1580,6 +1664,7 @@ __all__ = [
     "sink",
     "step_id",
     "task",
+    "task_declaration",
     "temporary",
     "transition",
     "workload",

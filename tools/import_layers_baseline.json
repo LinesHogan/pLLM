@@ -75,6 +75,7 @@
       "tllm.runtime.mp.worker_extension -> tllm.schedule",
       "tllm.runtime.mp.worker_extension -> tllm.schedule.contracts",
       "tllm.runtime.mp.worker_extension -> tllm.schedule.timeline",
+      "tllm.runtime.declaration_adapter -> tllm.workload",
       "tllm.runtime.residual_runtime -> tllm.schedule",
       "tllm.runtime.runtime -> tllm.schedule",
       "tllm.runtime.runtime -> tllm.workload",

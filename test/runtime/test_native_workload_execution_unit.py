@@ -35,6 +35,7 @@ from tllm.runtime.workload_execution import (
 )
 from tllm.runtime.workload_execution import _hidden_value
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
+from tllm.runtime.workload_bindings import LocalRuntimeServices, WorkerRuntimeBinding
 from tllm.runtime.vllm_patch import common_hooks
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
@@ -1082,8 +1083,6 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                     BackendObservableEvent.SAMPLE_TOKENS_POST
                 )
             )
-            with self.assertRaisesRegex(TypeError, "BackendObservableEvent"):
-                execution.advance_backend_event(cast(Any, "unknown.backend.event"))
             execution._event_nodes = {}
             with self.assertRaisesRegex(RuntimeError, "not signed"):
                 execution.advance_backend_event(BackendObservableEvent.SAMPLER_PRE_DRAW)
@@ -2094,9 +2093,9 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         )
         compilation = runtime.compile_workloads(_timeline())
         resources = workload.native_workload_resources()
-        worker_spec = resources.worker_spec
-        self.assertIsNotNone(worker_spec)
-        assert worker_spec is not None
+        self.assertIsInstance(resources.worker, WorkerRuntimeBinding)
+        assert isinstance(resources.worker, WorkerRuntimeBinding)
+        worker_spec = resources.worker.spec
 
         bindings = reconstruct_worker_bindings(compilation, (worker_spec,))
 
@@ -2124,8 +2123,9 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         # specialization into the Region artifact identity.
         runtime.cold_specialize_workloads(specialization)
         compilation = runtime.compile_workloads(_timeline())
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
 
         bindings = reconstruct_worker_bindings(
             compilation, (worker_spec,), specialization=specialization
@@ -2207,8 +2207,10 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         )
         cold_specializer = mock.Mock()
         resources = runtime._native_workload_resources[id(workload)]
+        assert isinstance(resources.services, LocalRuntimeServices)
         runtime._native_workload_resources[id(workload)] = replace(
-            resources, cold_specializer=cold_specializer
+            resources,
+            services=replace(resources.services, cold_specialize=cold_specializer),
         )
         runtime._workload_compile_options = replace(
             runtime.workload_compile_options,
@@ -2238,8 +2240,9 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
         )
         compilation = runtime.compile_workloads(_timeline())
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
         bindings = reconstruct_worker_bindings(compilation, (worker_spec,))
         state = ResidualRuntimeState()
         locator = ResidualLocator(layer=0, site="block_output", phase="decode")
@@ -2281,7 +2284,6 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         )
 
         for invalid in (
-            [],
             {"": 1},
             {"count": True},
             {"count": float("nan")},

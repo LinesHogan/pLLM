@@ -32,6 +32,11 @@ from tllm.runtime.workload_plugins import (
     WorkloadWorkerSpec,
     static_backend_binding_manifest_wire,
 )
+from tllm.runtime.workload_bindings import (
+    BackendRuntimeBinding,
+    LocalRuntimeServices,
+    WorkerRuntimeBinding,
+)
 from tllm.schedule import BackendObservableEvent, RegionImplementationKind
 from tllm.consumers.recirculation import native_backend
 from tllm.consumers.recirculation import stage_definition
@@ -105,8 +110,8 @@ def test_local_recirculation_static_resources_must_match_signed_plan() -> None:
     bindings = runtime.workload_execution_bindings
     assert bindings is not None
     resources = workload.native_workload_resources()
-    spec = resources.worker_spec
-    assert spec is not None
+    assert isinstance(resources.worker, WorkerRuntimeBinding)
+    spec = resources.worker.spec
 
     changed_config = WorkloadWorkerSpec(
         factory=spec.factory,
@@ -119,9 +124,10 @@ def test_local_recirculation_static_resources_must_match_signed_plan() -> None:
     changed_binder_id = "tllm.recirculation:other@1"
     changed_binder = replace(
         resources,
-        backend_region_binders={
-            changed_binder_id: BackendRegionBinderSlot(changed_binder_id)
-        },
+        backend=BackendRuntimeBinding(
+            ports=resources.backend.ports,
+            binders={changed_binder_id: BackendRegionBinderSlot(changed_binder_id)},
+        ),
     )
     for label, entry in (
         (
@@ -231,7 +237,9 @@ def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() ->
     workload = RecirculationWorkload(
         RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2, beta=0.8)
     )
-    workload.native_workload_resources().cold_specializer(_cold_spec())
+    services = workload.native_workload_resources().services
+    assert isinstance(services, LocalRuntimeServices)
+    services.cold_specialize(_cold_spec())
 
     columns = module_weight_overlay.PackedRowPlanInputs(
         request_ids=("request-0",),
@@ -289,9 +297,12 @@ def test_worker_reconstruction_loads_signed_artifact_without_any_compile() -> No
     coordinator = RecirculationWorkload(
         RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2, beta=0.8)
     )
-    coordinator.native_workload_resources().cold_specializer(_cold_spec())
-    spec = coordinator.native_workload_resources().worker_spec
-    assert spec is not None
+    services = coordinator.native_workload_resources().services
+    assert isinstance(services, LocalRuntimeServices)
+    services.cold_specialize(_cold_spec())
+    worker = coordinator.native_workload_resources().worker
+    assert isinstance(worker, WorkerRuntimeBinding)
+    spec = worker.spec
     expected_signature = coordinator.native_workload_resources().specialization_key[
         "stage_artifact_bundle"
     ]
@@ -322,7 +333,9 @@ def test_runtime_row_shape_miss_fails_closed_without_hook_compilation() -> None:
     workload = RecirculationWorkload(
         RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2, beta=0.8)
     )
-    workload.native_workload_resources().cold_specializer(_cold_spec())
+    services = workload.native_workload_resources().services
+    assert isinstance(services, LocalRuntimeServices)
+    services.cold_specialize(_cold_spec())
     columns = module_weight_overlay.PackedRowPlanInputs(
         request_ids=("request-0",),
         scheduled_tokens=(3,),

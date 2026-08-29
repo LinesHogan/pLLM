@@ -15,6 +15,7 @@ from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.region_cost_probe import RegionCostProbe
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.sampler_bridge.types import SamplerStepView
+from tllm.runtime.workload_bindings import SamplerRuntimeBinding
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
 
@@ -154,8 +155,8 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
             residual_runtime.advance_workload_anchor(regions[0].placement_anchor)
             # Stage the sampler-boundary training rows exactly as the bridge
             # does between the reweight and train region advances.
-            provider = workload.native_workload_resources().sampler_provider
-            assert provider is not None
+            sampler = workload.native_workload_resources().sampler
+            assert isinstance(sampler, SamplerRuntimeBinding)
             view = SamplerStepView(
                 engine_step_id=7,
                 phase="decode",
@@ -172,9 +173,9 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
                 model=object(),
                 runner=object(),
             )
-            modifier = provider.prepare_step(view)
+            modifier = sampler.provider.prepare_step(view)
             assert modifier is not None
-            provider.after_sample(view, torch.tensor([2, 4], dtype=torch.long))  # type: ignore[attr-defined]
+            sampler.provider.after_sample(view, torch.tensor([2, 4], dtype=torch.long))
             for region in regions[1:]:
                 residual_runtime.advance_workload_anchor(region.placement_anchor)
             execution = state.workload_execution

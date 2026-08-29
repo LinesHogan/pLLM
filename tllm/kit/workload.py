@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass
-from functools import wraps
 from types import MappingProxyType
 from typing import ClassVar, Generic, Protocol, TypeVar, cast
 
@@ -24,8 +23,18 @@ from tllm.runtime.sampler_bridge.context import SamplerStepContext
 from tllm.runtime.workload_sinks import SinkStore
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
-    NativeWorkloadResources,
     WorkloadWorkerSpec,
+)
+from tllm.runtime.workload_bindings import (
+    LocalRuntimeServices,
+    NoRuntimeServices,
+    NoSamplerBinding,
+    RuntimePortRegistry,
+    RuntimeStateRegistry,
+    RuntimeServices,
+    SamplerRuntimeBinding,
+    WorkerRuntimeBinding,
+    WorkloadRuntimeBinding,
 )
 from tllm.workload.config import ConfigAtom, WorkloadConfig
 from tllm.workload.frontend import (
@@ -37,6 +46,7 @@ from tllm.workload.frontend import (
     WorkloadDeclaration,
     NativeWorkloadDefinition,
     declare_workload,
+    definition_for_workload_class,
 )
 from tllm.workload.ir import OptimizerSpec
 from tllm.workload.ir import ValueSourceKind
@@ -115,12 +125,6 @@ _SamplerState = _NoSampler | _SamplerBinding
 class Workload(NativeWorkload, Generic[ConfigT]):
     """Native workload with typed config, state, and non-optional public accessors."""
 
-    __tllm_workload__: ClassVar[NativeWorkloadDefinition]
-    __tllm_states__: ClassVar[
-        tuple[TrainableState[torch.nn.Module] | PublishedModule[torch.nn.Module], ...]
-    ] = ()
-    __tllm_staged_ports__: ClassVar[tuple[StagedPort[object], ...]] = ()
-    __tllm_host_outputs__: ClassVar[tuple[HostOutput[object], ...]] = ()
     backend_type: ClassVar[type[WorkloadBackendAdapter]] = NoBackendAdapter
 
     def __init__(self, config: ConfigT) -> None:
@@ -135,24 +139,41 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         self._accounting = _WorkloadAccounting(self)
         self._port_store = RuntimePortStore()
         self._staged_ports_by_key = {
-            port.key: port for port in type(self).__tllm_staged_ports__
+            port.key: port for port in type(self)._staged_ports()
         }
         self._host_output_store = RuntimeHostOutputStore()
         self._sinks = SinkStore()
         self._sampler_context = SamplerStepContext()
         self._sampler = self._create_sampler_binding()
-        self._bind_gradient_tasks()
         self._resources = self._assemble_resources()
 
     @classmethod
     def _definition(cls) -> NativeWorkloadDefinition:
-        return cls.__tllm_workload__
+        definition = definition_for_workload_class(cls)
+        if not isinstance(definition, NativeWorkloadDefinition):
+            raise TypeError(f"{cls.__qualname__} has no native workload definition")
+        return definition
 
     @classmethod
     def _states(
         cls,
     ) -> tuple[TrainableState[torch.nn.Module] | PublishedModule[torch.nn.Module], ...]:
-        return cls.__tllm_states__
+        return cast(
+            tuple[
+                TrainableState[torch.nn.Module]
+                | PublishedModule[torch.nn.Module],
+                ...,
+            ],
+            cls._definition().states,
+        )
+
+    @classmethod
+    def _staged_ports(cls) -> tuple[StagedPort[object], ...]:
+        return cls._definition().staged_ports
+
+    @classmethod
+    def _host_outputs(cls) -> tuple[HostOutput[object], ...]:
+        return cls._definition().host_outputs
 
     @property
     def specialization(self) -> RuntimeSpecializationSpec:
@@ -182,26 +203,12 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             case _:
                 return 0
 
-    def _state_value(self, state: State[StateValueT]) -> StateValueT:
+    def state_value(self, state: State[StateValueT]) -> StateValueT:
         match self._lifecycle:
             case _Specialized(values=values):
                 return cast(StateValueT, values[state.name])
             case _:
                 raise RuntimeError(f"State {state.name!r} is not specialized")
-
-    def _bind_gradient_tasks(self) -> None:
-        for name in type(self)._definition().gradient_tasks:
-            bound = getattr(self, name)
-
-            @wraps(bound)
-            def run_with_grad(*args, _bound=bound, **kwargs):
-                with torch.inference_mode(False), torch.enable_grad():
-                    return _bound(
-                        *(value.clone() for value in args),
-                        **{key: value.clone() for key, value in kwargs.items()},
-                    )
-
-            setattr(self, name, run_with_grad)
 
     def cold_specialize(self, spec: RuntimeSpecializationSpec) -> None:
         match self._lifecycle:
@@ -218,13 +225,12 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         optimizers: dict[str, torch.optim.Optimizer] = {}
         with torch.inference_mode(False), torch.enable_grad():
             for state in type(self)._states():
-                initializer = getattr(self, state.initializer_name)
-                value = cast(torch.nn.Module, initializer(spec))
+                value = state.initializer(self, spec)
                 values[state.name] = value
                 match state:
                     case TrainableState(optimizer=optimizer):
                         optimizers[state.name] = _build_optimizer(
-                            cast(OptimizerSpec, optimizer), value, self.config
+                            optimizer, value, self.config
                         )
                     case PublishedModule():
                         pass
@@ -237,7 +243,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         )
         self._resources = self._assemble_resources()
 
-    def _optimize_state(
+    def optimize_state(
         self, state: TrainableState[torch.nn.Module], loss: torch.Tensor
     ) -> None:
         match self._lifecycle:
@@ -247,17 +253,17 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 raise RuntimeError(f"State {state.name!r} is not specialized")
         with torch.inference_mode(False), torch.enable_grad():
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            torch.autograd.backward(loss)
             optimizer.step()
         versions[state.name] += 1
         self._accounting.record(loss)
 
-    def _publish_module(
+    def publish_module(
         self,
         state: PublishedModule[torch.nn.Module],
         values: Mapping[str, torch.Tensor],
     ) -> None:
-        module = self._state_value(state)
+        module = self.state_value(state)
         module.load_state_dict(values, strict=True)
         match self._lifecycle:
             case _Specialized(versions=versions):
@@ -299,11 +305,11 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             ),
         )
 
-    def native_workload_resources(self) -> NativeWorkloadResources:
+    def native_workload_resources(self) -> WorkloadRuntimeBinding:
         return self._resources
 
     def stage_port(self, port: StagedPort[PortValueT], value: PortValueT) -> int:
-        if port not in type(self).__tllm_staged_ports__:
+        if port not in type(self)._staged_ports():
             raise ValueError("staged port belongs to another workload")
         return port.stage(self._port_store, value)
 
@@ -321,7 +327,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         self._port_store.abort(key, transaction)
 
     def drain_port(self, port: HostOutput[PortValueT]) -> tuple[PortValueT, ...]:
-        if port not in type(self).__tllm_host_outputs__:
+        if port not in type(self)._host_outputs():
             raise ValueError("host output belongs to another workload")
         return port.drain(self._host_output_store)
 
@@ -334,7 +340,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         return declare_workload(self)
 
     @classmethod
-    def reconstruct(cls, raw: Mapping[str, object]) -> NativeWorkloadResources:
+    def reconstruct(cls, raw: Mapping[str, object]) -> WorkloadRuntimeBinding:
         config_type = cls._definition().config_type
         config_wire = {
             name: raw[name]
@@ -346,28 +352,21 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 cast(Mapping[str, ConfigAtom], config_wire)
             ),
         )
-        if cls.backend_type is NoBackendAdapter:
-            return cls(config).native_workload_resources()
-        instance = cls.__new__(cls)
-        instance._initialize(
-            config,
-            cls.backend_type.reconstruct(config, raw),
-        )
+        instance = cls(config)
+        instance.backend = cls.backend_type.reconstruct(config, raw)
+        instance._resources = instance._assemble_resources()
         return instance.native_workload_resources()
 
-    def _assemble_resources(self) -> NativeWorkloadResources:
+    def _assemble_resources(self) -> WorkloadRuntimeBinding:
         definition = type(self)._definition()
-        enabled = definition.enabled.resolve(self.config)
         state_snapshots = {
             state.name: self._accounting.state_snapshot for state in type(self)._states()
         }
-        states = type(self)._states()
-
         def input_provider(port: StagedPort[object]) -> Callable[[int], object]:
             return lambda step_id: port.take(self._port_store, step_id)
 
         provided_inputs = {
-            port.key: input_provider(port) for port in type(self).__tllm_staged_ports__
+            port.key: input_provider(port) for port in type(self)._staged_ports()
         }
         sampler_providers: dict[ValueSourceKind, Callable[[int], object]] = {
             ValueSourceKind.SAMPLER_REQUEST_IDS: self._sampler_context.request_ids,
@@ -381,53 +380,64 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             }
         )
         backend_binding = self.backend.runtime_binding()
-        provided_inputs.update(backend_binding.provided_inputs)
         output_sinks: dict[str, Callable[[object, int], None]]
         match self._sampler:
             case _NoSampler():
                 output_sinks = {}
-                sampler_provider = None
+                sampler_binding = NoSamplerBinding()
             case _SamplerBinding(policy=policy, provider=sampler):
                 def publish_sampler(value: object, step_id: int) -> None:
                     self._sinks.publish(policy.name, cast(torch.Tensor, value), step_id)
 
                 output_sinks = {policy.name: publish_sampler}
-                sampler_provider = sampler
+                sampler_binding = SamplerRuntimeBinding(sampler)
         output_sinks.update(
             {
                 port.key: port.runtime_publisher(self._host_output_store)
-                for port in type(self).__tllm_host_outputs__
+                for port in type(self)._host_outputs()
             }
         )
-        return NativeWorkloadResources(
-            workload=self,
-            provided_inputs=provided_inputs,
-            output_sinks=output_sinks,
-            state_snapshots=state_snapshots,
-            cold_specializer=(
-                self.cold_specialize
-                if states or type(self).backend_type is not NoBackendAdapter
-                else None
+        services = self.runtime_services()
+        return WorkloadRuntimeBinding(
+            owner=self,
+            ports=RuntimePortRegistry(
+                inputs={**provided_inputs, **backend_binding.ports.inputs},
+                outputs=output_sinks,
             ),
-            diagnostics_reader=self._diagnostics,
-            stats_reader=self._accounting.read,
-            enabled_setter=self.set_enabled,
-            sampler_provider=sampler_provider,
-            enabled_predicate=lambda: enabled,
+            states=RuntimeStateRegistry(snapshots=state_snapshots),
+            services=services,
+            sampler=sampler_binding,
             specialization_key={
                 "workload": definition.workload_id,
                 **self.config.specialization_key(),
                 **self.backend.specialization_key(),
             },
             residual_paths=self.residual_paths(),
-            worker_spec=WorkloadWorkerSpec(
-                factory=f"{type(self).__module__}:{type(self).__qualname__}.reconstruct",
-                config={
-                    **self.config.to_wire(),
-                    **self.backend.worker_wire(),
-                },
+            worker=WorkerRuntimeBinding(
+                WorkloadWorkerSpec(
+                    factory=f"{type(self).__module__}:{type(self).__qualname__}.reconstruct",
+                    config={
+                        **self.config.to_wire(),
+                        **self.backend.worker_wire(),
+                    },
+                )
             ),
-            backend_region_binders=backend_binding.binders,
+            backend=backend_binding,
+        )
+
+    def runtime_services(self) -> RuntimeServices:
+        enabled = type(self)._definition().enabled.resolve(self.config)
+        return (
+            LocalRuntimeServices(
+                cold_specialize=self.cold_specialize,
+                diagnostics=self._diagnostics,
+                stats=self._accounting.read,
+                set_enabled=self.set_enabled,
+                is_enabled=lambda: enabled,
+                synchronize=lambda: None,
+            )
+            if type(self)._states() or self.backend.requires_specialization
+            else NoRuntimeServices()
         )
 
     def _diagnostics(self) -> Mapping[str, int]:
@@ -446,16 +456,49 @@ def _build_optimizer(
     config: WorkloadConfig,
 ) -> torch.optim.Optimizer:
     parameters = list(value.parameters())
-    options: dict[str, object] = {}
-    for name, encoded in spec.options:
-        if encoded.startswith("field:"):
-            options[name] = config.to_wire()[encoded.removeprefix("field:")]
-        elif name == "betas":
-            options[name] = ast.literal_eval(encoded)
-        else:
-            options[name] = float.fromhex(encoded)
-    optimizer_type = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}[spec.kind]
-    return optimizer_type(parameters, foreach=False, **options)  # type: ignore[arg-type]
+    options = dict(spec.options)
+    lr = _optimizer_float(options["lr"], config)
+    eps = float.fromhex(options["eps"])
+    betas = _optimizer_betas(options["betas"])
+    match spec.kind:
+        case "adam":
+            return torch.optim.Adam(
+                parameters,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                foreach=False,
+            )
+        case "adamw":
+            return torch.optim.AdamW(
+                parameters,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=float.fromhex(options["weight_decay"]),
+                foreach=False,
+            )
+        case unsupported:
+            raise ValueError(f"unsupported optimizer kind {unsupported!r}")
+
+
+def _optimizer_float(encoded: str, config: WorkloadConfig) -> float:
+    if not encoded.startswith("field:"):
+        return float.fromhex(encoded)
+    value = config.raw_value(encoded.removeprefix("field:"))
+    if type(value) is not float:
+        raise TypeError("optimizer float field did not resolve to a float")
+    return value
+
+
+def _optimizer_betas(encoded: str) -> tuple[float, float]:
+    value: object = ast.literal_eval(encoded)
+    if not isinstance(value, tuple):
+        raise TypeError("optimizer betas must be a pair of floats")
+    items = cast(tuple[object, ...], value)
+    if len(items) != 2 or any(type(item) is not float for item in items):
+        raise TypeError("optimizer betas must be a pair of floats")
+    return cast(tuple[float, float], items)
 
 
 __all__ = ["Workload"]

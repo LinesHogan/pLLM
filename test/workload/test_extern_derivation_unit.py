@@ -15,17 +15,23 @@ import unittest
 
 import torch
 
-from tllm.workload import result, task
+from tllm.workload import (
+    definition_for_workload_class,
+    result,
+    task,
+    task_declaration,
+)
 from tllm.workload.frontend import ExternImplementation, _annotation_type_name, extern
 
 
-def _extern_tasks(cls: type) -> list[tuple[str, object]]:
-    found = []
-    for name, member in inspect.getmembers(cls, inspect.isfunction):
-        decl = getattr(member, "__tllm_task__", None)
-        if decl is not None and decl.implementations:
-            found.append((name, member))
-    return found
+def _extern_tasks(cls: type) -> list[tuple[str, object, object]]:
+    definition = definition_for_workload_class(cls)
+    assert definition is not None
+    return [
+        (entry.name, entry.executor, entry.declaration)
+        for entry in definition.tasks
+        if entry.declaration.implementations and entry.generated_after is None
+    ]
 
 
 class ExternDerivationGoldenTest(unittest.TestCase):
@@ -44,8 +50,7 @@ class ExternDerivationGoldenTest(unittest.TestCase):
             ReftWorkload,
             TTRLWorkload,
         ):
-            for task_name, member in _extern_tasks(cls):
-                decl = member.__tllm_task__
+            for task_name, member, decl in _extern_tasks(cls):
                 hints = typing.get_type_hints(member)
                 parameters = [
                     name
@@ -76,7 +81,9 @@ class ExternDerivationGoldenTest(unittest.TestCase):
                         f"{cls.__name__}.{task_name} {impl.key} output_types drift",
                     )
                     checked += 1
-        self.assertGreaterEqual(checked, 6)  # one per known extern task
+        # Generated optimizer/publish transitions are definition-owned entries,
+        # not class methods. This test covers only author-declared extern tasks.
+        self.assertGreaterEqual(checked, 3)
 
 
 class ExternConstructorTest(unittest.TestCase):
@@ -110,7 +117,7 @@ class ExternConstructorTest(unittest.TestCase):
         def update(loss: torch.Tensor) -> None:
             del loss
 
-        decl = update.__tllm_task__
+        decl = task_declaration(update)
         (impl,) = decl.implementations
         self.assertFalse(impl.derive_types)
         self.assertEqual(impl.input_types, ("Tensor",))

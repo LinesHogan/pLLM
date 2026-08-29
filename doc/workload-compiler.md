@@ -167,7 +167,7 @@ any mismatch.
 
 Native MP execution requires explicit `WorkloadWorkerSpec` records. Only an
 importable factory name and pure JSON config cross the control plane; the
-factory rebuilds declarations and process-local callbacks inside the worker.
+factory rebuilds one complete typed `WorkloadRuntimeBinding` inside the worker.
 After validation and materialization, every worker reports its actual ordered
 `(region_id, artifact_key)` set. The parent requires exact equality with the
 signed decision before accepting the epoch; Python callables are never
@@ -178,12 +178,11 @@ on EngineCore MP MRv1 and MRv2. That evidence covers worker reconstruction,
 signature/artifact agreement, training, state-version advancement, and sampler
 intervention; it is a correctness result, not a performance measurement.
 
-`NativeWorkloadResources` is the explicit process-local resource contract for
-a native declaration. It owns the declaration plus any named input providers,
-output sinks, state-version snapshots, cold specialization callback, sampler
-provider, statistics and enablement callbacks, residual-path bindings,
-specialization key, and optional worker reconstruction recipe. These objects
-are deliberately local: only `WorkloadWorkerSpec`'s importable factory and
+`WorkloadRuntimeBinding` is the closed process-local contract for a native
+declaration. It contains immutable port, state, and backend registries plus
+explicit service, sampler, and worker variants; absence is an empty registry
+or a `No*` variant, never a nullable callback field. These objects are
+deliberately local: only `WorkloadWorkerSpec`'s importable factory and
 pure JSON configuration cross an MP control plane. Worker reconstruction
 cold-specializes against the parent-signed runtime specialization envelope,
 re-declares and compares the complete schedule graph, then materializes and
@@ -236,9 +235,9 @@ named compatibility or benchmark paths where still needed; they are not
 alternate implementations hidden behind native workload classes.
 
 The standalone Dummy workload is now a complete `NativeWorkload`. Its typed
-singleton extern Region uses the generic Region executor and explicit
-`NativeWorkloadResources` for the layer-0 residual path, CPU-export worker,
-synchronization callback, specialization identity, and worker reconstruction.
+singleton extern Region uses the generic Region executor and returns a closed
+`WorkloadRuntimeBinding` for the layer-0 residual path, CPU-export service,
+specialization identity, and worker reconstruction.
 It neither registers nor consults a legacy `DummyConsumer`, and the old
 Dummy-specific materialization branch has been removed. Missing bindings,
 the `eager_only` capability, or a resolved residual resource fail closed.

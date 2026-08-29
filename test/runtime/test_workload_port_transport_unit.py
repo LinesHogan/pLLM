@@ -247,7 +247,7 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
         )
         foreign_runtime, _ = _runtime_with_local_port()
         with (
-            mock.patch("tllm.runtime.runtime._ACTIVE_RUNTIME", foreign_runtime),
+            mock.patch("tllm.runtime.runtime._active_runtime", foreign_runtime),
             mock.patch.object(
                 residual_runtime.RUNTIME,
                 "workload_execution",
@@ -267,7 +267,7 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
         staged = _ExecutionView(_OutputWorkload("staged"))
         store = SimpleNamespace(current=current, next_execution=staged)
         with (
-            mock.patch("tllm.runtime.runtime._ACTIVE_RUNTIME", runtime),
+            mock.patch("tllm.runtime.runtime._active_runtime", runtime),
             mock.patch.object(
                 residual_runtime.RUNTIME,
                 "workload_execution_store",

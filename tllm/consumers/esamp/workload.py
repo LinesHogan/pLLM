@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 import torch.nn.functional as F
@@ -14,8 +14,10 @@ from tllm.workload import (
     AdamWSpec,
     Before,
     Between,
+    ConfigField,
     NumericConstraint,
     State,
+    TrainableState,
     WorkloadConfig,
     config_field,
     hidden,
@@ -26,6 +28,9 @@ from tllm.workload import (
 )
 
 
+_ESAMP_ENABLED = ConfigField(True)
+
+
 class ESampConfig(WorkloadConfig):
     source_layer_path: str = config_field(
         default="model.model.layers[0].input_layernorm"
@@ -33,7 +38,7 @@ class ESampConfig(WorkloadConfig):
     target_layer_path: str = config_field(
         default="model.model.layers[-1].input_layernorm"
     )
-    enabled: bool = config_field(default=True)
+    enabled: bool = cast(bool, _ESAMP_ENABLED)
     distiller_hidden_dim: int = config_field(
         default=128, constraint=NumericConstraint.POSITIVE
     )
@@ -50,10 +55,11 @@ class ESampConfig(WorkloadConfig):
     )
 
 
-@workload(id="esamp", config=ESampConfig, enabled=ESampConfig.enabled)
 class ESampWorkload(Workload[ESampConfig]):
-    distiller: State[LowRankGatedResidualModel] = State.replica(
-        optimizer=AdamWSpec(lr=ESampConfig.distiller_lr)
+    distiller: State[LowRankGatedResidualModel] = (
+        State[LowRankGatedResidualModel].replica(
+            optimizer=AdamWSpec(lr=ESampConfig.distiller_lr)
+        )
     )
 
     @distiller.initialize
@@ -89,7 +95,9 @@ class ESampWorkload(Workload[ESampConfig]):
                 enabled=ESampConfig.intervention,
                 backend=ESampConfig.sampler_backend,
             ),
-            "loss": optimize(distiller, at=Before("next.prepare")),
+            "loss": optimize(
+                cast(TrainableState[object], distiller), at=Before("next.prepare")
+            ),
         },
         timing=Between("model.execute", "sampler.pre_draw"),
     )
@@ -98,6 +106,9 @@ class ESampWorkload(Workload[ESampConfig]):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prediction = self.distiller(source)
         return prediction, F.mse_loss(prediction.float(), target.float())
+
+
+workload(ESampWorkload, id="esamp", config=ESampConfig, enabled=_ESAMP_ENABLED)
 
 
 __all__ = ["ESampConfig", "ESampWorkload"]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch.nn import functional as F
 
@@ -11,8 +13,10 @@ from tllm.workload import (
     AdamSpec,
     Before,
     Between,
+    ConfigField,
     NumericConstraint,
     State,
+    TrainableState,
     WorkloadConfig,
     config_field,
     extern,
@@ -27,8 +31,11 @@ from tllm.workload import (
 )
 
 
+_OVERRIDE_ENABLED = ConfigField(True)
+
+
 class OverRIDEConfig(WorkloadConfig):
-    enabled: bool = config_field(default=True)
+    enabled: bool = cast(bool, _OVERRIDE_ENABLED)
     hidden_size: int = config_field(
         default=0, constraint=NumericConstraint.NONNEGATIVE
     )
@@ -79,9 +86,8 @@ def iteration_from_request_id(request_id: str) -> int:
     return int(prefix) + 1 if separator and prefix.isdigit() else 1
 
 
-@workload(id="override", config=OverRIDEConfig, enabled=OverRIDEConfig.enabled)
 class OverRIDEWorkload(Workload[OverRIDEConfig]):
-    heads: State[OverRIDEHeads] = State.replica(
+    heads: State[OverRIDEHeads] = State[OverRIDEHeads].replica(
         optimizer=AdamSpec(lr=OverRIDEConfig.learning_rate)
     )
 
@@ -165,7 +171,11 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
             "base_logits": sampler.logits(),
             "tokens": sampler.sampled_tokens(),
         },
-        outputs={"loss": optimize(heads, at=Before("step.end"))},
+        outputs={
+            "loss": optimize(
+                cast(TrainableState[object], heads), at=Before("step.end")
+            )
+        },
         timing=Between("token.commit", "step.end"),
     )
     def train(
@@ -184,6 +194,14 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
             selected_hidden, train_heads.to(hidden.device)
         ).to(selected_logits.dtype)
         return F.cross_entropy(logits, selected_tokens)
+
+
+workload(
+    OverRIDEWorkload,
+    id="override",
+    config=OverRIDEConfig,
+    enabled=_OVERRIDE_ENABLED,
+)
 
 
 __all__ = [

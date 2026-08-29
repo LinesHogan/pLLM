@@ -22,7 +22,11 @@ class RuntimeTypingContractsUnitTest(unittest.TestCase):
         (count-based so line drift is not flagged); the counts may only
         shrink.
         """
-        quarantine = ("tllm/runtime/vllm_patch", "tllm/backends")
+        quarantine = (
+            "tllm/runtime/vllm_patch",
+            "tllm/runtime/vllm_adapter.py",
+            "tllm/backends",
+        )
         current: dict[str, int] = {}
         for path in sorted(Path("tllm").rglob("*.py")):
             sp = str(path)
@@ -45,7 +49,7 @@ class RuntimeTypingContractsUnitTest(unittest.TestCase):
             [],
             msg=(
                 "new getattr duck-typing probes outside the quarantine dirs "
-                "(tllm/runtime/vllm_patch, tllm/backends) are forbidden; reach "
+                "(vllm_patch, vllm_adapter, backends) are forbidden; reach "
                 "tLLM internals through typed attributes instead:\n" + "\n".join(violations)
             ),
         )

@@ -23,6 +23,7 @@ from tllm.runtime.workload_plugins import (
     reconstruct_worker_bindings,
     static_backend_binding_manifest_wire,
 )
+from tllm.runtime.workload_bindings import BackendRuntimeBinding, WorkloadRuntimeBinding
 from tllm.schedule import (
     BackendObservableEvent,
     CompileOptions,
@@ -277,7 +278,7 @@ class BackendRegionBinderSlotTest(unittest.TestCase):
         @workload(id="backend-region-binder.reconstruct.alpha")
         class Alpha(NativeWorkload):
             def __init__(self) -> None:
-                self.resources = NativeWorkloadResources(workload=self)
+                self.resources = WorkloadRuntimeBinding(owner=self)
 
             def native_workload_resources(self) -> NativeWorkloadResources:
                 return self.resources
@@ -289,7 +290,7 @@ class BackendRegionBinderSlotTest(unittest.TestCase):
         @workload(id="backend-region-binder.reconstruct.beta")
         class Beta(NativeWorkload):
             def __init__(self) -> None:
-                self.resources = NativeWorkloadResources(workload=self)
+                self.resources = WorkloadRuntimeBinding(owner=self)
 
             def native_workload_resources(self) -> NativeWorkloadResources:
                 return self.resources
@@ -301,17 +302,17 @@ class BackendRegionBinderSlotTest(unittest.TestCase):
         alpha = Alpha()
         beta = Beta()
         shared_key = "test.backend:extern@1"
-        alpha.resources = NativeWorkloadResources(
-            workload=alpha,
-            backend_region_binders={
-                shared_key: BackendRegionBinderSlot(shared_key)
-            },
+        alpha.resources = WorkloadRuntimeBinding(
+            owner=alpha,
+            backend=BackendRuntimeBinding(
+                binders={shared_key: BackendRegionBinderSlot(shared_key)}
+            ),
         )
-        beta.resources = NativeWorkloadResources(
-            workload=beta,
-            backend_region_binders={
-                shared_key: BackendRegionBinderSlot(shared_key)
-            },
+        beta.resources = WorkloadRuntimeBinding(
+            owner=beta,
+            backend=BackendRuntimeBinding(
+                binders={shared_key: BackendRegionBinderSlot(shared_key)}
+            ),
         )
         specs = (
             WorkloadWorkerSpec("test.backend:alpha@1", {}),

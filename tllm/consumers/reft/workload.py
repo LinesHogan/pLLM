@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import torch
+from typing import cast
 
+import torch
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.kit.workload import Workload
 from tllm.workload import (
     NumericConstraint,
+    ConfigField,
     PublishedModule,
     State,
     WorkloadConfig,
@@ -16,8 +18,11 @@ from tllm.workload import (
 )
 
 
+_REFT_ENABLED = ConfigField(True)
+
+
 class ReftConfig(WorkloadConfig):
-    enabled: bool = config_field(default=True)
+    enabled: bool = cast(bool, _REFT_ENABLED)
     layers: tuple[int, ...] = config_field(default=(15,))
     rank: int = config_field(default=4, constraint=NumericConstraint.POSITIVE)
     first_tokens: int = config_field(
@@ -54,9 +59,10 @@ class ReftParameters(torch.nn.Module):
         self.rotate = torch.nn.Parameter(rotate.to(device=device, dtype=dtype))
 
 
-@workload(id="reft", config=ReftConfig, enabled=ReftConfig.enabled)
 class ReftWorkload(Workload[ReftConfig]):
-    intervention: PublishedModule[ReftParameters] = State.published_module()
+    intervention: PublishedModule[ReftParameters] = (
+        State[ReftParameters].published_module()
+    )
 
     @intervention.initialize
     def init_intervention(self, spec: RuntimeSpecializationSpec) -> ReftParameters:
@@ -75,6 +81,9 @@ class ReftWorkload(Workload[ReftConfig]):
             rows, weight, self.intervention.source_b[layer_slot]
         )
         return (projected - rows @ rotate) @ rotate.transpose(0, 1)
+
+
+workload(ReftWorkload, id="reft", config=ReftConfig, enabled=_REFT_ENABLED)
 
 
 __all__ = ["ReftConfig", "ReftParameters", "ReftWorkload"]

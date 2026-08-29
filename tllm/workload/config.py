@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Generic, Protocol, Self, TypeVar, cast, dataclass_transform, overload
+from typing import Generic, Protocol, Self, TypeGuard, TypeVar, cast, dataclass_transform, overload
 
 from tllm import _core
 
@@ -46,10 +46,8 @@ class ConfigField(Generic[T]):
         self.kind = _config_kind(default)
         self.constraint = constraint
 
-    def __set_name__(self, owner: type[object], name: str) -> None:
+    def __set_name__(self, owner: type[WorkloadConfig], name: str) -> None:
         self.name = name
-        fields = tuple(owner.__dict__.get("__config_fields__", ()))
-        setattr(owner, "__config_fields__", (*fields, self))
 
     @overload
     def __get__(self, instance: None, owner: type[object] | None = None) -> ConfigField[T]: ...
@@ -62,7 +60,7 @@ class ConfigField(Generic[T]):
     ) -> ConfigField[T] | T:
         if instance is None:
             return self
-        return cast(T, instance._config_values[self.name])
+        return cast(T, instance.raw_value(self.name))
 
     def specialization_value(self, value: ConfigAtom) -> str:
         match self.kind:
@@ -91,6 +89,25 @@ class WorkloadConfig:
     __config_fields__: tuple[ConfigField[ConfigAtom], ...] = ()
     _config_values: dict[str, ConfigAtom]
 
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        fields: dict[str, ConfigField[ConfigAtom]] = {}
+        for base in reversed(cls.__mro__[1:-1]):
+            inherited = cast(
+                tuple[ConfigField[ConfigAtom], ...],
+                base.__dict__.get("__config_fields__", ()),
+            )
+            fields.update((field.name, field) for field in inherited)
+        fields.update(
+            (
+                name,
+                cast(ConfigField[ConfigAtom], value),
+            )
+            for name, value in cls.__dict__.items()
+            if isinstance(value, ConfigField)
+        )
+        cls.__config_fields__ = tuple(fields.values())
+
     def __init__(self, **values: ConfigAtom) -> None:
         fields = type(self).__config_fields__
         payload = {field.name: field.default for field in fields}
@@ -109,14 +126,12 @@ class WorkloadConfig:
             json.dumps(schema, sort_keys=True, separators=(",", ":")),
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
-        decoded = json.loads(normalized)
+        decoded = _decode_normalized_config(normalized, fields)
         object.__setattr__(
             self,
             "_config_values",
             {
-                field.name: tuple(decoded[field.name])
-                if type(field.default) is tuple
-                else decoded[field.name]
+                field.name: decoded[field.name]
                 for field in fields
             },
         )
@@ -161,9 +176,70 @@ def _config_kind(value: object) -> ConfigKind:
         return ConfigKind.FLOAT
     if type(value) is str:
         return ConfigKind.STR
-    if type(value) is tuple and all(type(item) is int for item in value):
+    if _is_int_tuple(value):
         return ConfigKind.INT_TUPLE
     raise TypeError(f"unsupported config default type: {type(value).__name__}")
+
+
+def _is_string_object_mapping(value: object) -> TypeGuard[Mapping[str, object]]:
+    if not isinstance(value, Mapping):
+        return False
+    mapping = cast(Mapping[object, object], value)
+    return all(isinstance(key, str) for key in mapping)
+
+
+def _is_int_tuple(value: object) -> TypeGuard[tuple[int, ...]]:
+    if not isinstance(value, tuple):
+        return False
+    items = cast(tuple[object, ...], value)
+    return all(type(item) is int for item in items)
+
+
+def _int_tuple_from_json(value: object) -> tuple[int, ...] | None:
+    if not isinstance(value, list):
+        return None
+    items = cast(list[object], value)
+    if any(type(item) is not int for item in items):
+        return None
+    return tuple(cast(list[int], items))
+
+
+def _decode_config_atom(value: object, field: ConfigField[ConfigAtom]) -> ConfigAtom:
+    match field.kind:
+        case ConfigKind.BOOL:
+            if type(value) is bool:
+                return value
+        case ConfigKind.INT:
+            if type(value) is int:
+                return value
+        case ConfigKind.FLOAT:
+            if type(value) is float:
+                return value
+        case ConfigKind.STR:
+            if type(value) is str:
+                return value
+        case ConfigKind.INT_TUPLE:
+            if _is_int_tuple(value):
+                return value
+            decoded_tuple = _int_tuple_from_json(value)
+            if decoded_tuple is not None:
+                return decoded_tuple
+    raise TypeError(
+        f"Rust config normalization returned an invalid {field.kind.value} value "
+        f"for {field.name!r}"
+    )
+
+
+def _decode_normalized_config(
+    payload_json: str, fields: tuple[ConfigField[ConfigAtom], ...]
+) -> dict[str, ConfigAtom]:
+    decoded: object = json.loads(payload_json)
+    if not _is_string_object_mapping(decoded):
+        raise TypeError("Rust config normalization must return a JSON object")
+    expected = {field.name for field in fields}
+    if set(decoded) != expected:
+        raise ValueError("Rust config normalization returned an unexpected field set")
+    return {field.name: _decode_config_atom(decoded[field.name], field) for field in fields}
 
 
 __all__ = [

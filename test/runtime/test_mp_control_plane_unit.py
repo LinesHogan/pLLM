@@ -37,11 +37,15 @@ from tllm.runtime.mp.worker_extension import (
 )
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
-    NativeWorkloadResources,
     ReconstructedWorkload,
     WorkloadWorkerSpec,
     reconstruct_worker_bindings,
     static_backend_binding_manifest_wire,
+)
+from tllm.runtime.workload_bindings import (
+    DiagnosticsRuntimeServices,
+    WorkerRuntimeBinding,
+    WorkloadRuntimeBinding,
 )
 from tllm.workload import Between, task, workload
 
@@ -72,16 +76,18 @@ def _reconstruct_native_mp_workload_with_static_binding(
 class _StatusAlphaWorkload(NativeWorkload):
     def __init__(self, metric: int) -> None:
         self._metric = metric
-        self._resources = NativeWorkloadResources(
-            workload=self,
-            diagnostics_reader=lambda: {"metric": self._metric},
-            worker_spec=WorkloadWorkerSpec(
-                factory=f"{__name__}:_reconstruct_status_alpha_workload",
-                config={"metric": metric},
+        self._resources = WorkloadRuntimeBinding(
+            owner=self,
+            services=DiagnosticsRuntimeServices(lambda: {"metric": self._metric}),
+            worker=WorkerRuntimeBinding(
+                WorkloadWorkerSpec(
+                    factory=f"{__name__}:_reconstruct_status_alpha_workload",
+                    config={"metric": metric},
+                )
             ),
         )
 
-    def native_workload_resources(self) -> NativeWorkloadResources:
+    def native_workload_resources(self) -> WorkloadRuntimeBinding:
         return self._resources
 
     @task(timing=Between("model.execute", "step.end"))
@@ -93,16 +99,18 @@ class _StatusAlphaWorkload(NativeWorkload):
 class _StatusBetaWorkload(NativeWorkload):
     def __init__(self, metric: int) -> None:
         self._metric = metric
-        self._resources = NativeWorkloadResources(
-            workload=self,
-            diagnostics_reader=lambda: {"metric": self._metric},
-            worker_spec=WorkloadWorkerSpec(
-                factory=f"{__name__}:_reconstruct_status_beta_workload",
-                config={"metric": metric},
+        self._resources = WorkloadRuntimeBinding(
+            owner=self,
+            services=DiagnosticsRuntimeServices(lambda: {"metric": self._metric}),
+            worker=WorkerRuntimeBinding(
+                WorkloadWorkerSpec(
+                    factory=f"{__name__}:_reconstruct_status_beta_workload",
+                    config={"metric": metric},
+                )
             ),
         )
 
-    def native_workload_resources(self) -> NativeWorkloadResources:
+    def native_workload_resources(self) -> WorkloadRuntimeBinding:
         return self._resources
 
     @task(timing=Between("model.execute", "step.end"))
@@ -119,13 +127,13 @@ def _status_metric(raw: Mapping[str, object]) -> int:
 
 def _reconstruct_status_alpha_workload(
     raw: Mapping[str, object],
-) -> NativeWorkloadResources:
+) -> WorkloadRuntimeBinding:
     return _StatusAlphaWorkload(_status_metric(raw)).native_workload_resources()
 
 
 def _reconstruct_status_beta_workload(
     raw: Mapping[str, object],
-) -> NativeWorkloadResources:
+) -> WorkloadRuntimeBinding:
     return _StatusBetaWorkload(_status_metric(raw)).native_workload_resources()
 
 
@@ -776,8 +784,8 @@ class ControlPlaneUnitTest(unittest.TestCase):
             runtime._coordinate_worker_compilation(plane)
 
         resources = workload.native_workload_resources()
-        worker_spec = resources.worker_spec
-        assert worker_spec is not None
+        assert isinstance(resources.worker, WorkerRuntimeBinding)
+        worker_spec = resources.worker.spec
         assert "typed_stage_artifact_bundle" in worker_spec.config
         assert definition_compile.call_count == 1
         assert artifact_compile.call_count == 0
@@ -1084,8 +1092,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 static_headroom_bytes=1 << 20,
             )
         )
-        worker_spec = workload_instance.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload_instance.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
 
         model = _HookModel()
         layer = model.model.layers[0]
@@ -1852,9 +1861,10 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 static_headroom_bytes=1 << 20,
             )
         )
-        worker_spec = workload.native_workload_resources().worker_spec
-        self.assertIsNotNone(worker_spec)
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        self.assertIsInstance(worker, WorkerRuntimeBinding)
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
         extension = TllmWorkerExtension()
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
@@ -1926,8 +1936,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 static_headroom_bytes=1 << 20,
             )
         )
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
         extension = TllmWorkerExtension()
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
@@ -2066,11 +2077,14 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 static_headroom_bytes=1 << 20,
             )
         )
-        specs = tuple(
-            workload.native_workload_resources().worker_spec
+        workers = tuple(
+            workload.native_workload_resources().worker
             for workload in (alpha, beta)
         )
-        self.assertTrue(all(spec is not None for spec in specs))
+        self.assertTrue(all(isinstance(worker, WorkerRuntimeBinding) for worker in workers))
+        specs = tuple(
+            worker.spec for worker in workers if isinstance(worker, WorkerRuntimeBinding)
+        )
         extension = TllmWorkerExtension()
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),
@@ -2148,8 +2162,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 static_headroom_bytes=1 << 20,
             )
         )
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
         extension = TllmWorkerExtension()
         extension.model_runner = SimpleNamespace(
             device=torch.device("cpu"),

@@ -22,6 +22,7 @@ from tllm.runtime.generation_trace_runtime import (
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
+from tllm.runtime.workload_bindings import LocalRuntimeServices, WorkerRuntimeBinding
 
 _HIDDEN = 8
 
@@ -140,9 +141,9 @@ class TTRLWorkloadUnitTest(unittest.TestCase):
                 for entry in published.retry_schedule
             )
         )
-        stats_reader = workload.native_workload_resources().stats_reader
-        assert stats_reader is not None
-        self.assertEqual(stats_reader(False).loss_count, 1)
+        services = workload.native_workload_resources().services
+        assert isinstance(services, LocalRuntimeServices)
+        self.assertEqual(services.stats(False).loss_count, 1)
 
     def test_missing_staged_batch_skips_without_version_change(self) -> None:
         workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
@@ -153,18 +154,18 @@ class TTRLWorkloadUnitTest(unittest.TestCase):
     def test_worker_reconstruction_keeps_typed_ports(self) -> None:
         workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
         resources = workload.native_workload_resources()
-        spec = resources.worker_spec
-        assert spec is not None
+        assert isinstance(resources.worker, WorkerRuntimeBinding)
+        spec = resources.worker.spec
         rebuilt = TTRLWorkload.reconstruct(spec.config)
         self.assertEqual(
-            set(rebuilt.provided_inputs),
+            set(rebuilt.ports.inputs),
             {
                 TTRLWorkload.train_hidden.key,
                 TTRLWorkload.train_rewards.key,
                 TTRLWorkload.pending_intent.key,
             },
         )
-        self.assertEqual(set(rebuilt.output_sinks), {TTRLWorkload.control.key})
+        self.assertEqual(set(rebuilt.ports.outputs), {TTRLWorkload.control.key})
 
 
 if __name__ == "__main__":

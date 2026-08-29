@@ -37,6 +37,7 @@ from tllm.runtime.backend_region_binders import (
 )
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.kit.backend import BackendRuntimeBinding
+from tllm.runtime.workload_bindings import RuntimePortRegistry
 from tllm.workload import WorkloadConfig
 
 _PLAN_INPUT = "typed_recurrence_stage"
@@ -206,6 +207,10 @@ class RecirculationBackend:
             backend_stager=self._stage,
         )
 
+    @property
+    def requires_specialization(self) -> bool:
+        return True
+
     @classmethod
     def create(cls, config: WorkloadConfig) -> "RecirculationBackend":
         return cls(cast(RecirculationSettings, config))
@@ -294,7 +299,7 @@ class RecirculationBackend:
 
     def runtime_binding(self) -> BackendRuntimeBinding:
         return BackendRuntimeBinding(
-            provided_inputs={_PLAN_INPUT: self.plan_for_step},
+            ports=RuntimePortRegistry(inputs={_PLAN_INPUT: self.plan_for_step}),
             binders={PREFILL_BINDER_IMPLEMENTATION_ID: self.binder},
         )
 

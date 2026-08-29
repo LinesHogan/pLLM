@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
 from types import MappingProxyType
+from typing import cast
 
 import torch
 
@@ -12,8 +12,10 @@ from tllm.consumers.dummy.stream_runtime import DummyStreamRuntime
 from tllm.consumers.dummy.transfer import clone_hidden_to_cpu
 from tllm.consumers.dummy.worker import DummyCpuWorker
 from tllm.kit.workload import Workload
+from tllm.runtime.workload_bindings import LocalRuntimeServices
 from tllm.workload import (
     Before,
+    ConfigField,
     NumericConstraint,
     WorkloadConfig,
     config_field,
@@ -25,8 +27,11 @@ from tllm.workload import (
 )
 
 
+_DUMMY_ENABLED = ConfigField(True)
+
+
 class DummyConfig(WorkloadConfig):
-    enabled: bool = config_field(default=True)
+    enabled: bool = cast(bool, _DUMMY_ENABLED)
     enable_async: bool = config_field(default=True)
     export_to_cpu: bool = config_field(default=True)
     max_queue_size: int = config_field(
@@ -90,15 +95,19 @@ class DummyExporter:
         return MappingProxyType(values)
 
 
-@workload(id="dummy", config=DummyConfig, enabled=DummyConfig.enabled)
 class DummyWorkload(Workload[DummyConfig]):
     def __init__(self, config: DummyConfig = DummyConfig()) -> None:
         self.exporter = DummyExporter(config)
         super().__init__(config)
-        self._resources = replace(
-            self._resources,
-            diagnostics_reader=self.exporter.diagnostics,
-            synchronizer=self.exporter.synchronize,
+
+    def runtime_services(self) -> LocalRuntimeServices:
+        return LocalRuntimeServices(
+            cold_specialize=self.cold_specialize,
+            diagnostics=self.exporter.diagnostics,
+            stats=self._accounting.read,
+            set_enabled=self.set_enabled,
+            is_enabled=lambda: self.config.enabled,
+            synchronize=self.exporter.synchronize,
         )
 
     @task(
@@ -116,6 +125,9 @@ class DummyWorkload(Workload[DummyConfig]):
     )
     def export_hidden(self, hidden_rows: torch.Tensor, step_id: int) -> None:
         self.exporter.export(hidden_rows, step_id)
+
+
+workload(DummyWorkload, id="dummy", config=DummyConfig, enabled=_DUMMY_ENABLED)
 
 
 __all__ = ["DummyConfig", "DummyExporter", "DummyWorkload"]

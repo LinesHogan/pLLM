@@ -146,8 +146,6 @@ class StagedPort(Generic[T]):
         self.name = name
         self.owner = owner
         self.key = f"{owner.__module__}.{owner.__qualname__}:{name}"
-        ports = tuple(owner.__dict__.get("__tllm_staged_ports__", ()))
-        setattr(owner, "__tllm_staged_ports__", (*ports, self))
 
     def stage(self, store: RuntimePortStore, value: T) -> int:
         return store.stage(self.key, value)

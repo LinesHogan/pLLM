@@ -178,7 +178,7 @@ def _workload_status_from_wire(payload: object) -> dict[str, object]:
     }
 
 
-def _workload_install_report_from_wire(
+def workload_install_report_from_wire(
     payload: object,
     *,
     committed: bool,
@@ -303,6 +303,29 @@ class WorkerWorkloadActivationReply:
             plan_epoch=_positive_wire_int(fields["plan_epoch"], "activation.plan_epoch"),
             activated=activated,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerWorkloadTimelineReply:
+    timeline: Mapping[str, object]
+    specialization: Mapping[str, object] | None
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerWorkloadTimelineReply":
+        fields = _exact_wire_object(
+            payload,
+            "workload timeline reply",
+            frozenset({"timeline", "specialization"}),
+        )
+        timeline = fields["timeline"]
+        specialization = fields["specialization"]
+        if type(timeline) is not dict:
+            raise TypeError("workload timeline reply.timeline must be a JSON object")
+        if specialization is not None and type(specialization) is not dict:
+            raise TypeError(
+                "workload timeline reply.specialization must be a JSON object or null"
+            )
+        return cls(timeline, specialization)
 
 
 def _port_reply_identity(
@@ -583,9 +606,9 @@ class ControlPlane:
         *,
         configured_budget: int = 0,
         timeout: float | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[WorkerWorkloadTimelineReply]:
         return [
-            dict(entry)
+            WorkerWorkloadTimelineReply.from_wire(entry)
             for entry in self.call(
                 "tllm_workload_timeline",
                 int(configured_budget),

@@ -22,6 +22,7 @@ from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
+from tllm.runtime.workload_bindings import SamplerRuntimeBinding
 
 _HIDDEN = 6
 _VOCAB = 11
@@ -154,12 +155,12 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
             regions = compilation.decision.execution_regions
             pre_draw = regions[0].placement_anchor
             residual_runtime.advance_workload_anchor(pre_draw)
-            provider = workload.native_workload_resources().sampler_provider
-            assert provider is not None
+            sampler = workload.native_workload_resources().sampler
+            assert isinstance(sampler, SamplerRuntimeBinding)
             view = _view(hidden)
-            modifier = provider.prepare_step(view)
+            modifier = sampler.provider.prepare_step(view)
             self.assertIsNotNone(modifier)
-            provider.after_sample(view, torch.tensor([2, 3]))
+            sampler.provider.after_sample(view, torch.tensor([2, 3]))
             for region in regions:
                 if region.placement_anchor != pre_draw:
                     residual_runtime.advance_workload_anchor(region.placement_anchor)

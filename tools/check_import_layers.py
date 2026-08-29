@@ -151,6 +151,7 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.runtime.workload_plugins", "tllm.workload.lowering"),
         ("tllm.runtime.runtime", "tllm.schedule"),
         ("tllm.runtime.runtime", "tllm.workload"),
+        ("tllm.runtime.declaration_adapter", "tllm.workload"),
         # Leaf workload implementations may use only the public DSL facade.
         ("tllm.consumers.dummy.workload", "tllm.workload"),
         ("tllm.consumers.esamp.legacy_workload", "tllm.workload"),

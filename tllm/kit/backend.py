@@ -2,22 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Protocol, Self
 
-from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
 from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.runtime.workload_bindings import BackendRuntimeBinding
 from tllm.workload.config import WorkloadConfig
 
 
-@dataclass(frozen=True, slots=True)
-class BackendRuntimeBinding:
-    provided_inputs: Mapping[str, Callable[[int], object]]
-    binders: Mapping[str, BackendRegionBinderSlot]
-
-
 class WorkloadBackendAdapter(Protocol):
+    @property
+    def requires_specialization(self) -> bool: ...
+
     @classmethod
     def create(cls, config: WorkloadConfig) -> Self: ...
 
@@ -36,6 +32,10 @@ class WorkloadBackendAdapter(Protocol):
 
 
 class NoBackendAdapter:
+    @property
+    def requires_specialization(self) -> bool:
+        return False
+
     @classmethod
     def create(cls, config: WorkloadConfig) -> Self:
         del config
@@ -58,7 +58,7 @@ class NoBackendAdapter:
         return {}
 
     def runtime_binding(self) -> BackendRuntimeBinding:
-        return BackendRuntimeBinding({}, {})
+        return BackendRuntimeBinding()
 
 
 __all__ = [

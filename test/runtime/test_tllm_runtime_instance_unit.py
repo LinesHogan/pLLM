@@ -141,7 +141,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         runtime = TllmRuntime()
         plane = mock.Mock()
         consumer = DummyConsumer(DummyConsumerConfig(consumer_id="runtime_plane"))
-        with mock.patch("tllm.runtime.runtime._ACTIVE_RUNTIME", runtime), mock.patch(
+        with mock.patch("tllm.runtime.runtime._active_runtime", runtime), mock.patch(
             "tllm.runtime.mp.control.active_control_plane", return_value=plane
         ), mock.patch("tllm.runtime.residual_runtime.register_dispatch_consumer") as register, mock.patch(
             "tllm.runtime.residual_runtime.clear_dispatch_consumers"

@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     )
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.state import ResidualRuntimeState
+    from tllm.runtime.workload_plugins import StaticBackendBindingEntry
     from tllm.schedule import WorkloadCompilation
     from tllm.workload.frontend import WorkloadDeclaration
     from tllm.workload.region_compiler import RegionCallableArtifact
@@ -176,12 +177,8 @@ def lower_signed_materialization_bindings(
     lifetime, producer, or consumer count themselves.
     """
 
-    if not isinstance(graph, ScheduleGraph):
-        raise TypeError("graph must be ScheduleGraph")
-    if not isinstance(decision, ScheduleDecision) or decision.schema_version != 2:
+    if decision.schema_version != 2:
         raise TypeError("decision must be a ScheduleDecision schema v2")
-    if not isinstance(artifacts, tuple):
-        raise TypeError("artifacts must be tuple[RegionCallableArtifact, ...]")
 
     regions_by_id = {region.region_id: region for region in decision.execution_regions}
     artifacts_by_id: dict[str, RegionCallableArtifact] = {}
@@ -309,8 +306,6 @@ class _NativeShapeSpecializationQueue:
         self._requested: set[str] = set()
 
     def enqueue(self, request: RegionShapeSpecializationRequest) -> bool:
-        if not isinstance(request, RegionShapeSpecializationRequest):
-            raise TypeError("native shape specialization request must be typed")
         with self._lock:
             if request.dedup_key in self._requested:
                 return False
@@ -370,12 +365,6 @@ def _region_shape_specialization_request(
     process-local callable or graph identities.
     """
 
-    from tllm.schedule import WorkloadCompilation
-
-    if not isinstance(compilation, WorkloadCompilation):
-        raise TypeError("shape specialization requires WorkloadCompilation")
-    if not isinstance(context, PhysicalExecutionContext):
-        raise TypeError("shape specialization requires PhysicalExecutionContext")
     physical = compilation.physical
     if physical is None:
         raise RuntimeError("shape specialization requires a physical Region plan")
@@ -427,13 +416,6 @@ class StateVersionBinding:
     state: ScheduleState
     snapshot: Callable[[int], Mapping[Hashable, int]]
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.state, ScheduleState):
-            raise TypeError("StateVersionBinding.state must be ScheduleState")
-        if not callable(self.snapshot):
-            raise TypeError("StateVersionBinding.snapshot must be callable")
-
-
 class StateVersionRegistry:
     """Audits signed Region effects against concrete process-local versions."""
 
@@ -469,10 +451,6 @@ class StateVersionRegistry:
             )
         normalized: dict[str, StateVersionBinding] = {}
         for resource, binding in bindings.items():
-            if not isinstance(binding, StateVersionBinding):
-                raise TypeError(
-                    "state_versions must map resources to StateVersionBinding"
-                )
             expected = state_by_resource.get(resource)
             if expected is None or binding.state != expected:
                 raise RuntimeError(
@@ -488,15 +466,9 @@ class StateVersionRegistry:
         step_id: int,
     ) -> dict[Hashable, int]:
         raw = binding.snapshot(step_id)
-        if not isinstance(raw, Mapping):
-            raise TypeError("state version snapshot must be a mapping")
         result: dict[Hashable, int] = {}
         for key, version in raw.items():
-            try:
-                hash(key)
-            except TypeError as exc:
-                raise TypeError("state version snapshot keys must be hashable") from exc
-            if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            if version < 0:
                 raise ValueError("state versions must be non-negative ints")
             result[key] = version
         if binding.state.scope != "request" and len(result) != 1:
@@ -600,16 +572,20 @@ class WorkloadExecutionBindings:
 
     declarations: tuple["WorkloadDeclaration", ...]
     provided_inputs: Mapping[str, Callable[[int], object]] = field(
-        default_factory=dict
+        default_factory=dict[str, Callable[[int], object]]
     )
     output_sinks: Mapping[str, Callable[[object, int], None]] = field(
-        default_factory=dict
+        default_factory=dict[str, Callable[[object, int], None]]
     )
-    state_versions: Mapping[str, StateVersionBinding] = field(default_factory=dict)
+    state_versions: Mapping[str, StateVersionBinding] = field(
+        default_factory=dict[str, StateVersionBinding]
+    )
     sampler_provider: "SamplerModifierProvider | None" = None
     diagnostics_readers: Mapping[
         str, Callable[[], Mapping[str, int | float]]
-    ] = field(default_factory=dict)
+    ] = field(
+        default_factory=dict[str, Callable[[], Mapping[str, int | float]]]
+    )
     stats_reader: Callable[[bool], "TrainingStats"] | None = None
     per_request_stats_reader: Callable[
         [bool], Mapping[int, "TrainingStats"]
@@ -617,115 +593,62 @@ class WorkloadExecutionBindings:
     enabled_setter: Callable[[bool], None] | None = None
     enabled_predicate: Callable[[], bool] | None = None
     synchronizer: Callable[[], None] | None = None
-    residual_paths: Mapping["ResidualLocator", str] = field(default_factory=dict)
+    residual_paths: Mapping["ResidualLocator", str] = field(
+        default_factory=dict["ResidualLocator", str]
+    )
     backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
-        default_factory=dict
+        default_factory=dict[str, "BackendRegionBinderSlot"]
     )
     # These are immutable live resource snapshots, not signed payloads.  The
     # local execution gate serializes them immediately before artifacts bind.
-    static_binding_entries: tuple[object, ...] = ()
+    static_binding_entries: tuple["StaticBackendBindingEntry", ...] = ()
 
     def __post_init__(self) -> None:
-        from tllm.workload.frontend import WorkloadDeclaration
-
-        if not isinstance(self.declarations, tuple) or not self.declarations or any(
-            not isinstance(declaration, WorkloadDeclaration)
-            for declaration in self.declarations
-        ):
-            raise TypeError(
-                "declarations must be a non-empty tuple[WorkloadDeclaration, ...]"
-            )
-        for label, raw in (
-            ("provided_inputs", self.provided_inputs),
-            ("output_sinks", self.output_sinks),
-        ):
-            if not isinstance(raw, Mapping):
-                raise TypeError(f"{label} must be a mapping")
-            if any(
-                not isinstance(name, str) or not name or not callable(callback)
-                for name, callback in raw.items()
-            ):
-                raise TypeError(
-                    f"{label} must map non-empty str names to callables"
-                )
-            object.__setattr__(self, label, MappingProxyType(dict(raw)))
-        if not isinstance(self.state_versions, Mapping) or any(
-            not isinstance(resource, str)
-            or not resource
-            or not isinstance(binding, StateVersionBinding)
-            for resource, binding in self.state_versions.items()
-        ):
-            raise TypeError(
-                "state_versions must map non-empty resource names to StateVersionBinding"
-            )
+        if not self.declarations:
+            raise ValueError("declarations must not be empty")
+        if any(not name for name in self.provided_inputs):
+            raise ValueError("provided input names must not be empty")
+        if any(not name for name in self.output_sinks):
+            raise ValueError("output sink names must not be empty")
+        if any(not resource for resource in self.state_versions):
+            raise ValueError("state-version resource names must not be empty")
+        object.__setattr__(
+            self,
+            "provided_inputs",
+            MappingProxyType(dict(self.provided_inputs)),
+        )
+        object.__setattr__(
+            self,
+            "output_sinks",
+            MappingProxyType(dict(self.output_sinks)),
+        )
         object.__setattr__(
             self, "state_versions", MappingProxyType(dict(self.state_versions))
         )
-        if self.sampler_provider is not None:
-            from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
-
-            if not isinstance(self.sampler_provider, SamplerModifierProvider):
-                raise TypeError(
-                    "sampler_provider must implement SamplerModifierProvider"
-                )
-        if not isinstance(self.diagnostics_readers, Mapping) or any(
-            not isinstance(workload_id, str)
-            or not workload_id
-            or not callable(reader)
-            for workload_id, reader in self.diagnostics_readers.items()
-        ):
-            raise TypeError(
-                "diagnostics_readers must map non-empty workload IDs to callables"
-            )
+        if any(not workload_id for workload_id in self.diagnostics_readers):
+            raise ValueError("diagnostic workload IDs must not be empty")
         object.__setattr__(
             self,
             "diagnostics_readers",
             MappingProxyType(dict(self.diagnostics_readers)),
         )
-        for label in (
-            "stats_reader",
-            "per_request_stats_reader",
-            "enabled_setter",
-            "enabled_predicate",
-            "synchronizer",
-        ):
-            callback = getattr(self, label)
-            if callback is not None and not callable(callback):
-                raise TypeError(f"{label} must be callable or None")
-        from tllm.ports.residual_stream import ResidualLocator
-
-        if not isinstance(self.residual_paths, Mapping) or any(
-            not isinstance(locator, ResidualLocator)
-            or not isinstance(path, str)
-            or not path
-            for locator, path in self.residual_paths.items()
-        ):
-            raise TypeError(
-                "residual_paths must map ResidualLocator values to non-empty paths"
-            )
+        if any(not path for path in self.residual_paths.values()):
+            raise ValueError("residual paths must not be empty")
         object.__setattr__(
             self, "residual_paths", MappingProxyType(dict(self.residual_paths))
         )
-        from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
-
-        if not isinstance(self.backend_region_binders, Mapping) or any(
-            not isinstance(implementation_id, str)
-            or not implementation_id
-            or not isinstance(slot, BackendRegionBinderSlot)
-            or slot.implementation_id != implementation_id
+        if any(
+            not implementation_id or slot.implementation_id != implementation_id
             for implementation_id, slot in self.backend_region_binders.items()
         ):
-            raise TypeError(
-                "backend_region_binders must map implementation IDs to matching "
-                "BackendRegionBinderSlot values"
+            raise ValueError(
+                "backend binder IDs must match their binding slots"
             )
         object.__setattr__(
             self,
             "backend_region_binders",
             MappingProxyType(dict(self.backend_region_binders)),
         )
-        if not isinstance(self.static_binding_entries, tuple):
-            raise TypeError("static_binding_entries must be a tuple")
 
 
 class _SerialStream:
@@ -753,9 +676,11 @@ class NativeWorkloadExecution:
     completion_anchor: str
     _owned_consumers: tuple[object, ...]
     _workload_instances: tuple[WorkloadPortOwner, ...] = ()
-    _anchor_nodes: Mapping[str, tuple[NodeKey, ...]] = field(default_factory=dict)
+    _anchor_nodes: Mapping[str, tuple[NodeKey, ...]] = field(
+        default_factory=dict[str, tuple[NodeKey, ...]]
+    )
     _event_nodes: Mapping[BackendObservableEvent, tuple[NodeKey, ...]] = field(
-        default_factory=dict
+        default_factory=dict[BackendObservableEvent, tuple[NodeKey, ...]]
     )
     _value_store: "_RegionValueStore | None" = None
     _state_versions: StateVersionRegistry | None = None
@@ -763,7 +688,11 @@ class NativeWorkloadExecution:
     _sampler_provider: "SamplerModifierProvider | None" = None
     _diagnostics_readers: Mapping[
         str, Callable[[], Mapping[str, int | float]]
-    ] = field(default_factory=dict)
+    ] = field(
+        default_factory=dict[
+            str, Callable[[], Mapping[str, int | float]]
+        ]
+    )
     _stats_reader: Callable[[bool], "TrainingStats"] | None = None
     _per_request_stats_reader: Callable[
         [bool], Mapping[int, "TrainingStats"]
@@ -771,14 +700,14 @@ class NativeWorkloadExecution:
     _enabled_setter: Callable[[bool], None] | None = None
     _synchronizer: Callable[[], None] | None = None
     _backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
-        default_factory=dict
+        default_factory=dict[str, "BackendRegionBinderSlot"]
     )
     _requires_decode_hidden: bool = False
     _shape_specializations: _NativeShapeSpecializationQueue = field(
         default_factory=_NativeShapeSpecializationQueue
     )
     _prepared_step: int = -1
-    _executed_nodes: set[NodeKey] = field(default_factory=set)
+    _executed_nodes: set[NodeKey] = field(default_factory=set[NodeKey])
     _side_streams: tuple[object, ...] = ()
     _cost_probe: RegionCostProbe = field(default_factory=RegionCostProbe)
 
@@ -859,10 +788,6 @@ class NativeWorkloadExecution:
     ) -> tuple["BackendRegionBinderStage", ...]:
         """Return Rust-signed backend binders for one physical backend event."""
 
-        if not isinstance(backend_event, BackendObservableEvent):
-            raise TypeError(
-                "native workload backend event must be a BackendObservableEvent"
-            )
         stages: list["BackendRegionBinderStage"] = []
         for advance in self.compilation.decision.runtime_advance_plan:
             if advance.backend_event is not backend_event:
@@ -912,10 +837,6 @@ class NativeWorkloadExecution:
     def advance_backend_event(self, backend_event: BackendObservableEvent) -> bool:
         """Advance only the Region nodes signed for one backend event."""
 
-        if not isinstance(backend_event, BackendObservableEvent):
-            raise TypeError(
-                "native workload backend event must be a BackendObservableEvent"
-            )
         nodes = self._event_nodes.get(backend_event)
         if nodes is None:
             raise RuntimeError(
@@ -1010,13 +931,9 @@ class NativeWorkloadExecution:
         result: dict[str, Mapping[str, int | float]] = {}
         for workload_id, reader in self._diagnostics_readers.items():
             raw = reader()
-            if not isinstance(raw, Mapping):
-                raise TypeError(
-                    f"native diagnostics for {workload_id!r} must be a mapping"
-                )
             normalized: dict[str, int | float] = {}
             for name, value in raw.items():
-                if not isinstance(name, str) or not name:
+                if not name:
                     raise TypeError(
                         "native diagnostic names must be non-empty strings"
                     )
@@ -1035,10 +952,7 @@ class NativeWorkloadExecution:
 
         if self._stats_reader is None:
             return TrainingStats(loss_avg=0.0, loss_count=0)
-        result = self._stats_reader(bool(sync))
-        if not isinstance(result, TrainingStats):
-            raise TypeError("native workload stats reader returned an invalid value")
-        return result
+        return self._stats_reader(bool(sync))
 
     def read_and_reset_per_request_stats(
         self, *, sync: bool = True
@@ -1095,8 +1009,6 @@ class NativeWorkloadExecutionStore:
     )
 
     def __init__(self, initial: NativeWorkloadExecution) -> None:
-        if not isinstance(initial, NativeWorkloadExecution):
-            raise TypeError("initial execution must be NativeWorkloadExecution")
         self._current = initial
         self._staged: NativeWorkloadExecution | None = None
         self._staged_activated = False
@@ -1132,8 +1044,6 @@ class NativeWorkloadExecutionStore:
         *,
         activation_required: bool = False,
     ) -> None:
-        if not isinstance(execution, NativeWorkloadExecution):
-            raise TypeError("staged execution must be NativeWorkloadExecution")
         if self._staged is not None:
             raise RuntimeError("a native workload epoch is already staged")
         if execution.plan_epoch <= self._current.plan_epoch:
@@ -1471,15 +1381,16 @@ class _RegionCudaGraph:
         artifact: "RegionCallableArtifact",
         outputs: object,
     ) -> tuple[torch.Tensor, ...]:
-        if not isinstance(outputs, tuple) or len(outputs) != len(
-            artifact.output_keys
-        ):
+        if not isinstance(outputs, tuple):
             raise RuntimeError("captured Region returned an invalid output tuple")
-        if any(not isinstance(value, torch.Tensor) for value in outputs):
+        raw_outputs = cast(tuple[object, ...], outputs)
+        if len(raw_outputs) != len(artifact.output_keys):
+            raise RuntimeError("captured Region returned an invalid output tuple")
+        if any(not isinstance(value, torch.Tensor) for value in raw_outputs):
             raise RuntimeError(
                 f"capture-safe Region {artifact.region_id!r} requires Tensor outputs"
             )
-        return cast(tuple[torch.Tensor, ...], outputs)
+        return tuple(cast(torch.Tensor, value) for value in raw_outputs)
 
     def _capture(self, inputs: Mapping[str, torch.Tensor]) -> None:
         artifact = self._artifact
@@ -1704,10 +1615,7 @@ def _validate_hidden_resource_bindings(
 
     from tllm.ports.residual_stream import ResidualLocator
 
-    residual_paths = cast(
-        "Mapping[ResidualLocator, str]",
-        bindings.residual_paths,
-    )
+    residual_paths = bindings.residual_paths
     indexed: set[ResidualLocator] = set()
     paths: set[tuple[str, str, str]] = set()
     for region in compilation.decision.execution_regions:
@@ -1953,7 +1861,7 @@ def _bind_physical_region_nodes(
     """
 
     from tllm.schedule.physical import (
-        _node_key,
+        node_key_for_region,
         artifact_key_for_region,
         executor_key_for_region,
     )
@@ -1970,7 +1878,7 @@ def _bind_physical_region_nodes(
     regions = compilation.decision.execution_regions
     expected_by_node: dict[NodeKey, ExecutionRegion] = {}
     for region in regions:
-        node_key = _node_key(compilation.graph, region.region_id)
+        node_key = node_key_for_region(compilation.graph, region.region_id)
         if node_key in expected_by_node:
             raise RuntimeError(
                 f"duplicate signed Region node identity {node_key!s}"
@@ -2139,7 +2047,7 @@ def _native_workload_execution(
     node_by_region: dict[str, NodeKey] = {}
     for node, region, anchor, artifact_key in bound_nodes:
         artifact = registry.resolve(region.region_id)
-        stream_label = region.stream.value if region.stream is not None else "default"
+        stream_label = region.stream.value
         if node.capture_policy is not CapturePolicy.DISABLED:
             if not region.capture_safe:
                 raise RuntimeError(
@@ -2265,13 +2173,7 @@ def build_native_workload_execution(
 ) -> NativeWorkloadExecution | None:
     """Bind only an explicit native Region contract to its physical plan."""
 
-    from tllm.schedule import WorkloadCompilation
-
-    if not isinstance(compilation, WorkloadCompilation):
-        raise TypeError("native workload execution requires WorkloadCompilation")
     if bindings is not None:
-        if not isinstance(bindings, WorkloadExecutionBindings):
-            raise TypeError("bindings must be WorkloadExecutionBindings or None")
         return _native_workload_execution(
             compilation,
             runtime=runtime,

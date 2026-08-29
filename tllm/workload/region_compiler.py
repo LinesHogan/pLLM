@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import FunctionType, MappingProxyType
-from typing import cast
+from typing import TYPE_CHECKING, TypeGuard, cast
 
 import torch
 
@@ -33,6 +33,26 @@ class RegionParityError(RuntimeError):
     serial oracle (the same composed callable, run eagerly).  There is no
     silent fallback: the decision is rejected, never silently re-run.
     """
+
+
+if TYPE_CHECKING:
+
+    def _default_torch_compile(
+        model: Callable[..., tuple[object, ...]],
+        *,
+        fullgraph: bool,
+        dynamic: bool,
+    ) -> Callable[..., object]: ...
+
+else:
+
+    def _default_torch_compile(
+        model: Callable[..., tuple[object, ...]],
+        *,
+        fullgraph: bool,
+        dynamic: bool,
+    ) -> Callable[..., object]:
+        return torch.compile(model, fullgraph=fullgraph, dynamic=dynamic)
 
 
 def region_dtype_tolerance(dtype: torch.dtype) -> float:
@@ -269,8 +289,6 @@ class RegionCallableArtifact:
     parity: str = "eager"
 
     def execute(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
-        if not isinstance(inputs, Mapping):
-            raise TypeError("Region callable inputs must be a mapping")
         supplied = set(inputs)
         expected = set(self.input_keys)
         if supplied != expected:
@@ -301,7 +319,7 @@ def _execute_with_grad(
     with torch.inference_mode(False):
         with torch.enable_grad():
             result = callable_artifact(*(inputs[key] for key in input_keys))
-    if not isinstance(result, tuple) or len(result) != len(output_keys):
+    if len(result) != len(output_keys):
         raise RuntimeError("Region callable returned an invalid output tuple")
     return dict(zip(output_keys, result, strict=True))
 
@@ -316,14 +334,8 @@ class RegionArtifactRegistry:
         decision: ScheduleDecision,
         artifacts: tuple[RegionCallableArtifact, ...],
     ) -> None:
-        if not isinstance(decision, ScheduleDecision) or decision.schema_version != 2:
-            raise TypeError("decision must be a ScheduleDecision schema v2")
-        if not isinstance(artifacts, tuple) or any(
-            not isinstance(artifact, RegionCallableArtifact) for artifact in artifacts
-        ):
-            raise TypeError(
-                "artifacts must be tuple[RegionCallableArtifact, ...]"
-            )
+        if decision.schema_version != 2:
+            raise ValueError("decision must use ScheduleDecision schema v2")
         by_region: dict[str, RegionCallableArtifact] = {}
         for artifact in artifacts:
             if artifact.region_id in by_region:
@@ -381,13 +393,8 @@ class _TaskBinding:
 def _task_bindings(
     declarations: tuple[WorkloadDeclaration, ...],
 ) -> dict[str, _TaskBinding]:
-    if not declarations or any(
-        not isinstance(declaration, WorkloadDeclaration)
-        for declaration in declarations
-    ):
-        raise TypeError(
-            "declarations must be a non-empty tuple[WorkloadDeclaration, ...]"
-        )
+    if not declarations:
+        raise ValueError("declarations must be non-empty")
     multiple = len(declarations) > 1
     bindings: dict[str, _TaskBinding] = {}
     for declaration in declarations:
@@ -435,11 +442,15 @@ def _normalize_task_outputs(
         return ()
     if count == 1:
         return (result,)
-    if not isinstance(result, tuple) or len(result) != count:
+    if not _is_output_tuple(result) or len(result) != count:
         raise RuntimeError(
             f"Region task {invocation.task_id!r} must return a {count}-tuple"
         )
     return result
+
+
+def _is_output_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
+    return isinstance(value, tuple)
 
 
 def _torch_compile_adapter(
@@ -447,7 +458,7 @@ def _torch_compile_adapter(
     command: RegionCompileCommand,
     torch_compile: Callable[..., Callable[..., object]] | None,
 ) -> Callable[..., tuple[object, ...]]:
-    compiler = torch.compile if torch_compile is None else torch_compile
+    compiler = _default_torch_compile if torch_compile is None else torch_compile
     compiled = compiler(combined, fullgraph=command.fullgraph, dynamic=command.dynamic)
     if not callable(compiled):
         raise RuntimeError("torch_compile adapter did not return a callable Region artifact")
@@ -525,10 +536,6 @@ def materialize_region_callable(
 ) -> RegionCallableArtifact:
     """Compose one Region and optionally pass the complete callable to torch.compile."""
 
-    if not isinstance(region, ExecutionRegion):
-        raise TypeError("region must be ExecutionRegion")
-    if not isinstance(options, CompileOptions):
-        raise TypeError("options must be CompileOptions")
     bindings = _task_bindings(declarations)
     try:
         region_bindings = tuple(
@@ -634,8 +641,8 @@ def materialize_region_artifacts(
 ) -> tuple[RegionCallableArtifact, ...]:
     """Materialize every signed Region without changing its partition or order."""
 
-    if not isinstance(decision, ScheduleDecision) or decision.schema_version != 2:
-        raise TypeError("decision must be a ScheduleDecision schema v2")
+    if decision.schema_version != 2:
+        raise ValueError("decision must use ScheduleDecision schema v2")
     artifacts = tuple(
         materialize_region_callable(
             declarations,

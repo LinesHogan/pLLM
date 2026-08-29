@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import cast
 
 import torch
 from torch.nn import functional as F
@@ -20,9 +21,11 @@ from tllm.workload import (
     AdamSpec,
     Before,
     Between,
+    ConfigField,
     HostOutput,
     NumericConstraint,
     State,
+    TrainableState,
     StagedPort,
     WorkloadConfig,
     config_field,
@@ -37,9 +40,12 @@ from tllm.workload import (
 )
 
 
+_TTRL_ENABLED = ConfigField(True)
+
+
 class TTRLConfig(WorkloadConfig):
     consumer_id: str = config_field(default="ttrl")
-    enabled: bool = config_field(default=True)
+    enabled: bool = cast(bool, _TTRL_ENABLED)
     hidden_size: int = config_field(
         default=0, constraint=NumericConstraint.NONNEGATIVE
     )
@@ -106,9 +112,8 @@ def prepare_ttrl_training_batch(
     )
 
 
-@workload(id="ttrl", config=TTRLConfig, enabled=TTRLConfig.enabled)
 class TTRLWorkload(Workload[TTRLConfig]):
-    reward_model: State[TTRLRewardHead] = State.replica(
+    reward_model: State[TTRLRewardHead] = State[TTRLRewardHead].replica(
         optimizer=AdamSpec(lr=TTRLConfig.learning_rate)
     )
     train_hidden: StagedPort[torch.Tensor] = StagedPort()
@@ -128,7 +133,12 @@ class TTRLWorkload(Workload[TTRLConfig]):
             "hidden": staged(train_hidden),
             "rewards": staged(train_rewards),
         },
-        outputs={"loss": optimize(reward_model, at=Before("next.prepare"))},
+        outputs={
+            "loss": optimize(
+                cast(TrainableState[object], reward_model),
+                at=Before("next.prepare"),
+            )
+        },
         timing=Between("token.commit", "step.end"),
     )
     def train(self, hidden: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
@@ -152,6 +162,9 @@ class TTRLWorkload(Workload[TTRLConfig]):
                 for entry in intent.retry_schedule
             ),
         )
+
+
+workload(TTRLWorkload, id="ttrl", config=TTRLConfig, enabled=_TTRL_ENABLED)
 
 
 __all__ = [

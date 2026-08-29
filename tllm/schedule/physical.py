@@ -45,7 +45,7 @@ def executor_key_for_implementation(implementation_id: str) -> ExecutorKey:
     )
 
 
-def _node_key(graph: ScheduleGraph, task_id: str) -> NodeKey:
+def node_key_for_region(graph: ScheduleGraph, task_id: str) -> NodeKey:
     return NodeKey(
         namespace="workload_region",
         owner=_stable_digest(graph.workload_key, task_id),
@@ -93,7 +93,7 @@ def lower_physical_flow_plan(
     validate_schedule(graph, timeline, decision, options)
 
     node_by_region = {
-        region.region_id: _node_key(graph, region.region_id)
+        region.region_id: node_key_for_region(graph, region.region_id)
         for region in decision.execution_regions
     }
     incoming_fences: dict[str, list[FenceDependencyDesc]] = {

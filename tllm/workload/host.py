@@ -29,8 +29,6 @@ class HostOutput(Generic[T]):
         self.name = name
         self.owner = owner
         self.key = f"{owner.__module__}.{owner.__qualname__}:{name}"
-        ports = tuple(owner.__dict__.get("__tllm_host_outputs__", ()))
-        setattr(owner, "__tllm_host_outputs__", (*ports, self))
 
     def drain(self, store: RuntimeHostOutputStore) -> tuple[T, ...]:
         return cast(tuple[T, ...], store.drain(self.key))

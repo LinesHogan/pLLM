@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Protocol
+from typing import ClassVar, Protocol, cast
 
+from tllm.kit.backend import WorkloadBackendAdapter
 from tllm.kit.workload import Workload
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.workload import (
     AffineAccess,
     Before,
+    ConfigField,
     Domain,
     Index,
     NumericConstraint,
@@ -30,6 +32,7 @@ from tllm.consumers.recirculation.native_backend import (
 _PLAN_INPUT = "typed_recurrence_stage"
 _TOKEN = Index("token")
 _LAYER = Index("layer")
+_RECIRCULATION_ENABLED = ConfigField(True)
 
 
 class RecirculationStage(Protocol):
@@ -48,7 +51,7 @@ class RecirculationConfig(WorkloadConfig):
     ramp_tokens: int = config_field(
         default=0, constraint=NumericConstraint.NONNEGATIVE
     )
-    enabled: bool = config_field(default=True)
+    enabled: bool = cast(bool, _RECIRCULATION_ENABLED)
 
     def resolved_layers(self, layer_count: int) -> tuple[int, int]:
         source = self.source_layer if self.source_layer >= 0 else layer_count + self.source_layer
@@ -64,13 +67,8 @@ class RecirculationConfig(WorkloadConfig):
         return source, destination
 
 
-@workload(
-    id="recirculation",
-    config=RecirculationConfig,
-    enabled=RecirculationConfig.enabled,
-)
 class RecirculationWorkload(Workload[RecirculationConfig]):
-    backend_type: ClassVar[type[RecirculationBackend]] = RecirculationBackend
+    backend_type: ClassVar[type[WorkloadBackendAdapter]] = RecirculationBackend
     backend: RecirculationBackend
 
     @task(
@@ -98,6 +96,14 @@ class RecirculationWorkload(Workload[RecirculationConfig]):
     def bind_prefill(self, plan: RecirculationStage, step_id: int) -> None:
         del plan
         self.backend.invoke(step_id)
+
+
+workload(
+    RecirculationWorkload,
+    id="recirculation",
+    config=RecirculationConfig,
+    enabled=_RECIRCULATION_ENABLED,
+)
 
 
 __all__ = [

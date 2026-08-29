@@ -6,6 +6,7 @@ import unittest
 
 import torch
 from tllm.kit.workload import Workload
+from tllm.runtime.workload_bindings import LocalRuntimeServices
 
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
@@ -13,6 +14,7 @@ from tllm.workload import (
     Before,
     Between,
     State,
+    PublishedModule,
     StagedPort,
     WorkloadConfig,
     config_field,
@@ -79,6 +81,15 @@ class _StagedWorkload(Workload[_Config]):
         del batch
 
 
+@workload(id="author.published", config=_Config, enabled=_Config.enabled)
+class _PublishedWorkload(Workload[_Config]):
+    intervention: PublishedModule[torch.nn.Linear] = State.published_module()
+
+    @intervention.initialize
+    def init_intervention(self, spec: RuntimeSpecializationSpec) -> torch.nn.Module:
+        return torch.nn.Linear(spec.hidden_size, spec.hidden_size, bias=False)
+
+
 class WorkloadAuthorApiUnitTest(unittest.TestCase):
     def test_decorator_derives_author_metadata_and_residual_manifest(self) -> None:
         workload_instance = _AuthorWorkload(_Config(layer_path="model.layers.4"))
@@ -87,15 +98,16 @@ class WorkloadAuthorApiUnitTest(unittest.TestCase):
             {locator.layer: path for locator, path in resources.residual_paths.items()},
             {0: "model.layers.4"},
         )
-        self.assertTrue(resources.enabled_predicate())  # type: ignore[misc]
+        assert isinstance(resources.services, LocalRuntimeServices)
+        self.assertTrue(resources.services.is_enabled())
         self.assertNotIn("algorithm", vars(_AuthorWorkload))
         self.assertNotIn("config_type", vars(_AuthorWorkload))
 
     def test_state_initializer_binds_module_and_configured_optimizer(self) -> None:
         workload_instance = _AuthorWorkload(_Config(learning_rate=3e-4))
         resources = workload_instance.native_workload_resources()
-        assert resources.cold_specializer is not None
-        resources.cold_specializer(
+        assert isinstance(resources.services, LocalRuntimeServices)
+        resources.services.cold_specialize(
             RuntimeSpecializationSpec(
                 rows=2,
                 hidden_size=4,
@@ -125,13 +137,25 @@ class WorkloadAuthorApiUnitTest(unittest.TestCase):
             tuple(declaration.ir.schedule),
             ("train", "train__optimize_model"),
         )
+        self.assertNotIn("train__optimize_model", vars(_AuthorWorkload))
+        self.assertIn("train__optimize_model", dict(declaration.executors))
+
+    def test_generated_publish_task_is_definition_owned_not_class_injected(self) -> None:
+        declaration = _PublishedWorkload(_Config()).declaration()
+
+        self.assertEqual(
+            tuple(task.name for task in declaration.ir.tasks),
+            ("publish__intervention",),
+        )
+        self.assertNotIn("publish__intervention", vars(_PublishedWorkload))
+        self.assertIn("publish__intervention", dict(declaration.executors))
 
     def test_staged_port_is_typed_ir_and_missing_data_skips(self) -> None:
         workload_instance = _StagedWorkload(_Config())
         declaration = workload_instance.declaration()
         self.assertEqual(declaration.ir.tasks[0].inputs[0].kind.value, "staged")
         provider = next(
-            iter(workload_instance.native_workload_resources().provided_inputs.values())
+            iter(workload_instance.native_workload_resources().ports.inputs.values())
         )
         from tllm.workload.runtime_values import SKIPPED
 

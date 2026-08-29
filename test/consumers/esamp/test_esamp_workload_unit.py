@@ -18,6 +18,11 @@ from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
+from tllm.runtime.workload_bindings import (
+    LocalRuntimeServices,
+    SamplerRuntimeBinding,
+    WorkerRuntimeBinding,
+)
 from tllm.runtime.mp.worker_extension import (
     TllmWorkerExtension,
     _decision_requires_hidden_taps,
@@ -100,7 +105,9 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
     """Drive the real signed sink path: task output -> auto-bound store."""
     prediction, _loss = workload.predict_and_loss(torch.randn(2, 4), torch.randn(2, 4))
     with mock.patch.object(residual_runtime, "RUNTIME", _decode_state(2)):
-        workload.native_workload_resources().output_sinks["guidance"](prediction, step_id)
+        workload.native_workload_resources().ports.outputs["guidance"](
+            prediction, step_id
+        )
     return prediction
 
 
@@ -117,12 +124,13 @@ class ESampRegionUnitTest(unittest.TestCase):
 
         workload.set_enabled(False)
 
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
         self.assertFalse(worker_spec.config["enabled"])
         reconstructed = ESampWorkload.reconstruct(worker_spec.config)
-        assert reconstructed.enabled_predicate is not None
-        self.assertFalse(reconstructed.enabled_predicate())
+        assert isinstance(reconstructed.services, LocalRuntimeServices)
+        self.assertFalse(reconstructed.services.is_enabled())
 
     def test_new_worker_epoch_refreshes_the_current_enable_snapshot(self) -> None:
         workload = ESampWorkload(_config(enabled=True))
@@ -183,8 +191,9 @@ class ESampRegionUnitTest(unittest.TestCase):
             self.assertIs(workload.distiller, initial_model)
             self.assertIs(workload.optimizer, initial_optimizer)
             self.assertEqual(workload.state_version, initial_state_version)
-            worker_spec = workload.native_workload_resources().worker_spec
-            assert worker_spec is not None
+            worker = workload.native_workload_resources().worker
+            assert isinstance(worker, WorkerRuntimeBinding)
+            worker_spec = worker.spec
             self.assertFalse(worker_spec.config["enabled"])
 
             residual_runtime.prepare_physical_workgraph_step(1)
@@ -216,8 +225,9 @@ class ESampRegionUnitTest(unittest.TestCase):
             ),
             model=torch.nn.Module(),
         )
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
         state = residual_runtime.RUNTIME
         saved = (
             state.native_schedule_graph,
@@ -270,8 +280,9 @@ class ESampRegionUnitTest(unittest.TestCase):
         )
         runtime.cold_specialize_workloads(spec)
         compilation = runtime.compile_workloads(_timeline())
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
 
         bindings = reconstruct_worker_bindings(
             compilation, (worker_spec,), specialization=spec
@@ -295,8 +306,9 @@ class ESampRegionUnitTest(unittest.TestCase):
         )
         runtime.cold_specialize_workloads(expected)
         compilation = runtime.compile_workloads(_timeline())
-        worker_spec = workload.native_workload_resources().worker_spec
-        assert worker_spec is not None
+        worker = workload.native_workload_resources().worker
+        assert isinstance(worker, WorkerRuntimeBinding)
+        worker_spec = worker.spec
 
         with self.assertRaisesRegex(RuntimeError, "specialization does not match"):
             reconstruct_worker_bindings(
@@ -369,9 +381,9 @@ class ESampRegionUnitTest(unittest.TestCase):
         )
         self.assertEqual(workload.state_version, 1)
         self.assertEqual(stats.loss_count, 1)
-        diagnostics = workload.native_workload_resources().diagnostics_reader
-        assert diagnostics is not None
-        self.assertEqual(diagnostics()["guidance_rows"], 2)
+        services = workload.native_workload_resources().services
+        assert isinstance(services, LocalRuntimeServices)
+        self.assertEqual(services.diagnostics()["guidance_rows"], 2)
 
     def test_declaration_has_replica_state_and_no_legacy_adapter(self) -> None:
         workload = ESampWorkload(_config())
@@ -389,9 +401,9 @@ class ESampRegionUnitTest(unittest.TestCase):
     def test_cold_specialize_forward_update_and_stats(self) -> None:
         workload = ESampWorkload(_config())
         resources = workload.native_workload_resources()
-        self.assertEqual(resources.state_snapshots["distiller"](0), {None: 0})
-        diagnostics = resources.diagnostics_reader
-        assert diagnostics is not None
+        self.assertEqual(resources.states.snapshots["distiller"](0), {None: 0})
+        assert isinstance(resources.services, LocalRuntimeServices)
+        diagnostics = resources.services.diagnostics
         self.assertEqual(
             diagnostics(),
             {"guidance_rows": 0, "loss_count": 0, "update_count": 0},
@@ -423,7 +435,7 @@ class ESampRegionUnitTest(unittest.TestCase):
 
         after = tuple(parameter.detach() for parameter in workload.distiller.parameters())
         self.assertTrue(any(not torch.equal(old, new) for old, new in zip(before, after, strict=True)))
-        self.assertEqual(resources.state_snapshots["distiller"](0), {None: 1})
+        self.assertEqual(resources.states.snapshots["distiller"](0), {None: 1})
         self.assertEqual(
             diagnostics(),
             {"guidance_rows": 2, "loss_count": 1, "update_count": 1},
@@ -473,22 +485,24 @@ class ESampRegionUnitTest(unittest.TestCase):
         workload = _specialized_workload()
         _publish_guidance(workload, 11)
 
-        provider = workload.native_workload_resources().sampler_provider
-        assert provider is not None
+        sampler = workload.native_workload_resources().sampler
+        assert isinstance(sampler, SamplerRuntimeBinding)
         with mock.patch.object(
             workload.distiller,
             "forward",
             side_effect=AssertionError("sampler must not re-run the Region model"),
         ) as forward:
-            state = provider.prepare_step(_view(11))
+            state = sampler.provider.prepare_step(_view(11))
         forward.assert_not_called()
         self.assertIsNotNone(state)
         assert state is not None
         self.assertEqual(state.affected_row_ids.tolist(), [0, 1])
         self.assertEqual(tuple(state.pred_hidden.shape), (2, 4))
-        self.assertIsNone(provider.prepare_step(_view(12)))
+        self.assertIsNone(sampler.provider.prepare_step(_view(12)))
         with self.assertRaisesRegex(RuntimeError, "active step"):
-            provider.prepare_step(_view(11, request_ids=("different", "request-1")))
+            sampler.provider.prepare_step(
+                _view(11, request_ids=("different", "request-1"))
+            )
 
 
 if __name__ == "__main__":

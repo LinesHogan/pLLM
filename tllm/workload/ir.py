@@ -12,7 +12,7 @@ import json
 import math
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, StrEnum
-from typing import Any, Mapping, cast
+from typing import Mapping, TypeGuard
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 
@@ -100,26 +100,24 @@ class ValueTargetKind(StrEnum):
     SAMPLER = "sampler"
 
 
-def _nonempty(value: object, label: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be str")
+def _nonempty(value: str, label: str) -> str:
     if not value:
         raise ValueError(f"{label} must be non-empty")
     return value
 
 
-def _nonnegative(value: object, label: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
+def _nonnegative(value: int, label: str) -> int:
+    if isinstance(value, bool):
         raise TypeError(f"{label} must be int")
     if value < 0:
         raise ValueError(f"{label} must be non-negative")
     return value
 
 
-def _str_tuple(value: object, label: str) -> tuple[str, ...]:
-    if not isinstance(value, tuple) or any(not isinstance(item, str) or not item for item in value):
+def _str_tuple(value: tuple[str, ...], label: str) -> tuple[str, ...]:
+    if any(not item for item in value):
         raise TypeError(f"{label} must be tuple[non-empty str, ...]")
-    return cast(tuple[str, ...], value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,12 +127,8 @@ class OptimizerSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", _nonempty(self.kind, "OptimizerSpec.kind"))
-        if not isinstance(self.options, tuple):
-            raise TypeError("OptimizerSpec.options must be tuple")
         normalized: list[tuple[str, str]] = []
         for option in self.options:
-            if not isinstance(option, tuple) or len(option) != 2:
-                raise TypeError("OptimizerSpec.options must contain key/value tuples")
             normalized.append(
                 (_nonempty(option[0], "optimizer option key"), _nonempty(option[1], "optimizer option value"))
             )
@@ -159,8 +153,6 @@ class StateIR:
             raise ValueError("REQUEST StateIR requires a request_key")
         if self.scope is not StateScope.REQUEST and self.request_key:
             raise ValueError("only REQUEST StateIR may declare a request_key")
-        if self.optimizer is not None and not isinstance(self.optimizer, OptimizerSpec):
-            raise TypeError("StateIR.optimizer must be OptimizerSpec or None")
         object.__setattr__(self, "transition", _nonempty(self.transition, "StateIR.transition"))
 
 
@@ -261,8 +253,6 @@ class DomainIR:
         known = set(self.indices)
         normalized: list[tuple[str, str, str]] = []
         for bound in self.bounds:
-            if not isinstance(bound, tuple) or len(bound) != 3:
-                raise TypeError("DomainIR.bounds must contain (index, lower, upper) tuples")
             index, lower, upper = (str(part) for part in bound)
             if index not in known:
                 raise ValueError(f"DomainIR bound references unknown index {index!r}")
@@ -326,6 +316,14 @@ class WorkloadEdge:
         object.__setattr__(self, "kind", WorkloadEdgeKind(self.kind))
 
 
+def _is_object_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
+    return isinstance(value, tuple)
+
+
+def _is_object_mapping(value: object) -> TypeGuard[Mapping[object, object]]:
+    return isinstance(value, Mapping)
+
+
 def canonical_value(value: object) -> object:
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -333,9 +331,9 @@ def canonical_value(value: object) -> object:
         return value.hex()
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, tuple):
+    if _is_object_tuple(value):
         return [canonical_value(item) for item in value]
-    if isinstance(value, Mapping):
+    if _is_object_mapping(value):
         return {
             str(key): canonical_value(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))

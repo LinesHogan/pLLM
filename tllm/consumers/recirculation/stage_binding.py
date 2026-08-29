@@ -53,16 +53,19 @@ class _RecirculationMixCall:
 
 def _primitive_registry() -> PrimitiveAdapterRegistry:
     def replay(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
-        state, call = operands
-        return (call.execute(state),)  # type: ignore[union-attr]
+        state, call = cast(tuple[LayerReplayState, LayerReplayCall], operands)
+        return (call.execute(state),)
 
     def norm(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
-        state, call = operands
-        return (call.execute(state),)  # type: ignore[union-attr]
+        state, call = cast(tuple[LayerReplayState, FinalNormCall], operands)
+        return (call.execute(state),)
 
     def mix(_operation: object, operands: tuple[object, ...]) -> tuple[object, ...]:
-        source, destination, call = operands
-        return (call.execute(source, destination),)  # type: ignore[union-attr]
+        source, destination, call = cast(
+            tuple[LayerReplayState, LayerReplayState, _RecirculationMixCall],
+            operands,
+        )
+        return (call.execute(source, destination),)
 
     return PrimitiveAdapterRegistry(
         (

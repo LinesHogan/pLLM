@@ -7,12 +7,9 @@ from collections.abc import Mapping
 from tllm.program.decl import EdgeKind as ProgramEdgeKind
 from tllm.program.decl import StateSpec, declare_program
 from tllm.workgraph.frontend import (
-    ExternProgramDecl,
     FlowProgramDecl,
     HiddenSource,
-    LocalRef,
     PromptIdxKey,
-    ProvidedSource,
     RequestStateKey,
     ResultRef,
     SinkRef,
@@ -80,41 +77,36 @@ def lower_program(
     for node in declaration.nodes:
         node_decl = node.decl
         inputs: list[TaskInputIR] = []
-        if isinstance(node_decl, (FlowProgramDecl, ExternProgramDecl)):
-            for name, source in node_decl.inputs:
-                if isinstance(source, HiddenSource):
-                    inputs.append(
-                        TaskInputIR(
-                            name,
-                            ValueSourceKind.HIDDEN,
-                            f"hidden:{source.layer}:{source.site}:{source.phase}",
-                            layer=str(source.layer),
-                            layer_kind=(
-                                HiddenLayerKind.INDEX.value
-                                if isinstance(source.layer, int)
-                                else HiddenLayerKind.PATH.value
-                            ),
-                            site=HiddenSite(source.site),
-                            phase=HiddenPhase(source.phase),
-                        )
+        for name, source in node_decl.inputs:
+            if isinstance(source, HiddenSource):
+                inputs.append(
+                    TaskInputIR(
+                        name,
+                        ValueSourceKind.HIDDEN,
+                        f"hidden:{source.layer}:{source.site}:{source.phase}",
+                        layer=str(source.layer),
+                        layer_kind=HiddenLayerKind.INDEX.value,
+                        site=HiddenSite(source.site),
+                        phase=HiddenPhase(source.phase),
                     )
-                elif isinstance(source, ResultRef):
-                    inputs.append(
-                        TaskInputIR(
-                            name,
-                            ValueSourceKind.RESULT,
-                            source.flow,
-                            output=source.output,
-                        )
+                )
+            elif isinstance(source, ResultRef):
+                inputs.append(
+                    TaskInputIR(
+                        name,
+                        ValueSourceKind.RESULT,
+                        source.flow,
+                        output=source.output,
                     )
-                elif isinstance(source, ProvidedSource):
-                    inputs.append(TaskInputIR(name, ValueSourceKind.PROVIDED, name))
+                )
+            else:
+                inputs.append(TaskInputIR(name, ValueSourceKind.PROVIDED, name))
         outputs: list[TaskOutputIR] = []
         if isinstance(node_decl, FlowProgramDecl):
             for name, target in node_decl.outputs:
                 if isinstance(target, SinkRef):
                     outputs.append(TaskOutputIR(name, ValueTargetKind.SINK, target.name))
-                elif isinstance(target, LocalRef):
+                else:
                     outputs.append(TaskOutputIR(name, ValueTargetKind.TEMPORARY, f"temporary:{name}"))
         effects: tuple[EffectIR, ...] = ()
         if node_decl.state is not None:

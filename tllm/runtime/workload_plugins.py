@@ -5,16 +5,25 @@ from __future__ import annotations
 import importlib
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
+
+from tllm.runtime.workload_bindings import (
+    DiagnosticsRuntimeServices,
+    InputProvider,
+    LocalRuntimeServices,
+    OutputSink,
+    PerRequestStats,
+    SamplerRuntimeBinding,
+    WorkloadRuntimeBinding,
+)
 
 if TYPE_CHECKING:
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.contracts.consumer_stats import TrainingStats
-    from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
     from tllm.schedule import ResidualResourceBinding, WorkloadCompilation
@@ -25,18 +34,16 @@ class WorkloadWorkerSpec:
     """Pure-data recipe for rebuilding one workload inside a worker."""
 
     factory: str
-    config: Mapping[str, object] = field(default_factory=dict)
+    config: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        if not isinstance(self.factory, str) or ":" not in self.factory:
+        if ":" not in self.factory:
             raise ValueError("WorkloadWorkerSpec.factory must be 'module:qualname'")
         module_name, qualname = self.factory.split(":", 1)
         if not module_name or not qualname or any(
             not part or part == "<locals>" for part in qualname.split(".")
         ):
             raise ValueError("WorkloadWorkerSpec.factory must be importable")
-        if not isinstance(self.config, Mapping):
-            raise TypeError("WorkloadWorkerSpec.config must be a mapping")
         normalized = dict(self.config)
         try:
             encoded = json.dumps(
@@ -48,161 +55,61 @@ class WorkloadWorkerSpec:
             )
         except (TypeError, ValueError) as exc:
             raise TypeError("WorkloadWorkerSpec.config must be pure JSON data") from exc
-        decoded = json.loads(encoded)
-        if not isinstance(decoded, dict):
-            raise TypeError("WorkloadWorkerSpec.config must encode a JSON object")
-        object.__setattr__(self, "config", MappingProxyType(decoded))
+        object.__setattr__(self, "config", MappingProxyType(_json_object(encoded)))
 
     def to_wire(self) -> dict[str, object]:
         return {"factory": self.factory, "config": dict(self.config)}
 
     @classmethod
-    def from_wire(cls, raw: Mapping[str, object]) -> "WorkloadWorkerSpec":
-        if type(raw) is not dict or set(raw) != {"factory", "config"}:
+    def from_wire(cls, raw: object) -> "WorkloadWorkerSpec":
+        if type(raw) is not dict:
             raise ValueError(
                 "WorkloadWorkerSpec wire must contain exactly factory and config"
             )
-        factory = raw["factory"]
-        config = raw["config"]
+        wire = cast(dict[str, object], raw)
+        if set(wire) != {"factory", "config"}:
+            raise ValueError(
+                "WorkloadWorkerSpec wire must contain exactly factory and config"
+            )
+        factory = wire["factory"]
+        config = wire["config"]
         if type(factory) is not str:
             raise TypeError("WorkloadWorkerSpec wire factory must be a string")
         if type(config) is not dict:
             raise TypeError("WorkloadWorkerSpec wire config must be a JSON object")
-        return cls(factory=factory, config=config)
+        return cls(factory=factory, config=cast(dict[str, object], config))
 
 
-@dataclass(frozen=True, slots=True)
-class NativeWorkloadResources:
-    """Explicit process-local resources for one native workload declaration."""
-
-    workload: object
-    provided_inputs: Mapping[str, Callable[[int], object]] = field(default_factory=dict)
-    output_sinks: Mapping[str, Callable[[object, int], None]] = field(default_factory=dict)
-    state_snapshots: Mapping[
-        str, Callable[[int], Mapping[Hashable, int]]
-    ] = field(default_factory=dict)
-    cold_specializer: Callable[["RuntimeSpecializationSpec"], None] | None = None
-    sampler_provider: "SamplerModifierProvider | None" = None
-    diagnostics_reader: Callable[[], Mapping[str, int | float]] | None = None
-    stats_reader: Callable[[bool], "TrainingStats"] | None = None
-    per_request_stats_reader: Callable[[bool], Mapping[int, "TrainingStats"]] | None = None
-    enabled_setter: Callable[[bool], None] | None = None
-    enabled_predicate: Callable[[], bool] | None = None
-    synchronizer: Callable[[], None] | None = None
-    specialization_key: Mapping[str, str] = field(default_factory=dict)
-    residual_paths: Mapping["ResidualLocator", str] = field(default_factory=dict)
-    backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
-        default_factory=dict
-    )
-    worker_spec: WorkloadWorkerSpec | None = None
-
-    def __post_init__(self) -> None:
-        for label, bindings in (
-            ("provided_inputs", self.provided_inputs),
-            ("output_sinks", self.output_sinks),
-            ("state_snapshots", self.state_snapshots),
-        ):
-            if not isinstance(bindings, Mapping) or any(
-                not isinstance(name, str) or not name or not callable(callback)
-                for name, callback in bindings.items()
-            ):
-                raise TypeError(f"{label} must map non-empty names to callbacks")
-            object.__setattr__(self, label, MappingProxyType(dict(bindings)))
-        for label in (
-            "cold_specializer",
-            "diagnostics_reader",
-            "stats_reader",
-            "per_request_stats_reader",
-            "enabled_setter",
-            "enabled_predicate",
-            "synchronizer",
-        ):
-            callback = getattr(self, label)
-            if callback is not None and not callable(callback):
-                raise TypeError(f"{label} must be callable or None")
-        provider = self.sampler_provider
-        if provider is not None:
-            from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
-
-            if not isinstance(provider, SamplerModifierProvider):
-                raise TypeError(
-                    "sampler_provider must implement SamplerModifierProvider"
-                )
-        if not isinstance(self.specialization_key, Mapping) or any(
-            not isinstance(name, str)
-            or not name
-            or not isinstance(value, str)
-            or not value
-            for name, value in self.specialization_key.items()
-        ):
-            raise TypeError("specialization_key must map non-empty str keys to values")
-        object.__setattr__(
-            self,
-            "specialization_key",
-            MappingProxyType(dict(sorted(self.specialization_key.items()))),
-        )
-        from tllm.ports.residual_stream import ResidualLocator
-
-        if not isinstance(self.residual_paths, Mapping) or any(
-            not isinstance(locator, ResidualLocator)
-            or not isinstance(path, str)
-            or not path
-            for locator, path in self.residual_paths.items()
-        ):
-            raise TypeError(
-                "residual_paths must map ResidualLocator values to non-empty paths"
-            )
-        object.__setattr__(
-            self, "residual_paths", MappingProxyType(dict(self.residual_paths))
-        )
-        from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
-
-        if not isinstance(self.backend_region_binders, Mapping) or any(
-            not isinstance(implementation_id, str)
-            or not implementation_id
-            or not isinstance(slot, BackendRegionBinderSlot)
-            or slot.implementation_id != implementation_id
-            for implementation_id, slot in self.backend_region_binders.items()
-        ):
-            raise TypeError(
-                "backend_region_binders must map implementation IDs to matching "
-                "BackendRegionBinderSlot values"
-            )
-        object.__setattr__(
-            self,
-            "backend_region_binders",
-            MappingProxyType(dict(self.backend_region_binders)),
-        )
-        if self.worker_spec is not None and not isinstance(
-            self.worker_spec, WorkloadWorkerSpec
-        ):
-            raise TypeError("worker_spec must be WorkloadWorkerSpec or None")
+def _json_object(encoded: str) -> dict[str, object]:
+    decoded = cast(object, json.loads(encoded))
+    if type(decoded) is not dict:
+        raise TypeError("WorkloadWorkerSpec.config must encode a JSON object")
+    result: dict[str, object] = {}
+    for name, value in cast(dict[object, object], decoded).items():
+        if type(name) is not str:
+            raise TypeError("WorkloadWorkerSpec.config must use string keys")
+        result[name] = value
+    return result
 
 
-# Historical name retained at the worker-reconstruction API boundary.
-ReconstructedWorkload = NativeWorkloadResources
+# Historical names remain import-compatible while all native implementations
+# use the closed WorkloadRuntimeBinding surface.
+NativeWorkloadResources = WorkloadRuntimeBinding
+ReconstructedWorkload = WorkloadRuntimeBinding
+StaticBackendBindingEntry = tuple[
+    str, WorkloadRuntimeBinding | None, WorkloadWorkerSpec
+]
 
 
 def static_backend_binding_manifest_wire(
-    entries: tuple[object, ...],
+    entries: tuple[StaticBackendBindingEntry, ...],
 ) -> str:
     """Transport live static backend semantics for Rust comparison."""
 
     # Rust owns the closed schema, canonical ordering requirements, and the
     # equality check against the coordinator-signed CompileOptions payload.
     records: list[dict[str, object]] = []
-    for entry in entries:
-        if not isinstance(entry, tuple) or len(entry) != 3:
-            raise TypeError("static backend binding entries must be triples")
-        workload_id, resource, spec = entry
-        if not isinstance(workload_id, str):
-            raise TypeError("static backend binding workload ID must be a string")
-        if resource is not None and not isinstance(resource, NativeWorkloadResources):
-            raise TypeError(
-                "static backend binding resource must be NativeWorkloadResources or None"
-            )
-        if not isinstance(spec, WorkloadWorkerSpec):
-            raise TypeError("static backend binding spec must be WorkloadWorkerSpec")
+    for workload_id, resource, spec in entries:
         records.append(
             {
                 "workload_id": workload_id,
@@ -215,7 +122,7 @@ def static_backend_binding_manifest_wire(
                     )
                 ],
                 "backend_region_implementation_ids": sorted(
-                    () if resource is None else resource.backend_region_binders
+                    () if resource is None else resource.backend.binders
                 ),
             }
         )
@@ -233,7 +140,7 @@ class NativeWorkload(ABC):
     """Nominal marker for declarations that own complete native resources."""
 
     @abstractmethod
-    def native_workload_resources(self) -> NativeWorkloadResources:
+    def native_workload_resources(self) -> WorkloadRuntimeBinding:
         """Return immutable bindings without inspecting task bodies at runtime."""
 
 
@@ -242,15 +149,10 @@ def residual_resource_manifest_from_paths(
 ) -> tuple["ResidualResourceBinding", ...]:
     """Mechanically encode INDEX hidden locators as signed resource bindings."""
 
-    from tllm.ports.residual_stream import ResidualLocator
     from tllm.schedule import HiddenPhase, HiddenSite, ResidualResourceBinding
 
-    if not isinstance(paths, Mapping):
-        raise TypeError("residual resource paths must be a mapping")
     entries: list[ResidualResourceBinding] = []
     for locator, module_path in paths.items():
-        if not isinstance(locator, ResidualLocator):
-            raise TypeError("residual resource paths must use ResidualLocator keys")
         entries.append(
             ResidualResourceBinding(
                 layer_index=locator.layer,
@@ -263,7 +165,7 @@ def residual_resource_manifest_from_paths(
 
 
 def _residual_resource_manifest_wire(
-    resources: tuple[NativeWorkloadResources, ...],
+    resources: tuple[WorkloadRuntimeBinding, ...],
 ) -> str:
     """Transport worker resource identities without deciding their validity."""
 
@@ -291,7 +193,7 @@ def _residual_resource_manifest_wire(
     )
 
 
-def _resolve_factory(path: str) -> Callable[[Mapping[str, object]], ReconstructedWorkload]:
+def _resolve_factory(path: str) -> Callable[[Mapping[str, object]], WorkloadRuntimeBinding]:
     module_name, qualname = path.split(":", 1)
     value: object = importlib.import_module(module_name)
     for part in qualname.split("."):
@@ -299,7 +201,7 @@ def _resolve_factory(path: str) -> Callable[[Mapping[str, object]], Reconstructe
     if not callable(value):
         raise TypeError(f"workload worker factory {path!r} is not callable")
     return cast(
-        Callable[[Mapping[str, object]], ReconstructedWorkload],
+        Callable[[Mapping[str, object]], WorkloadRuntimeBinding],
         value,
     )
 
@@ -341,25 +243,21 @@ def reconstruct_worker_bindings(
             allow_nan=False,
         ),
     )
-    reconstructed: list[NativeWorkloadResources] = []
+    reconstructed: list[WorkloadRuntimeBinding] = []
     for spec in specs:
-        result = _resolve_factory(spec.factory)(spec.config)
-        if not isinstance(result, NativeWorkloadResources):
-            raise TypeError(
-                f"workload worker factory {spec.factory!r} must return NativeWorkloadResources"
-            )
-        reconstructed.append(result)
+        reconstructed.append(_resolve_factory(spec.factory)(spec.config))
     cold_specializers = tuple(
-        item.cold_specializer
+        services.cold_specialize
         for item in reconstructed
-        if item.cold_specializer is not None
+        if isinstance(services := item.services, LocalRuntimeServices)
+        and (item.states.snapshots or item.backend.binders)
     )
     if cold_specializers and specialization is None:
         raise RuntimeError(
             "native worker reconstruction requires cold specialization facts"
         )
     declarations = tuple(
-        declare_workload(item.workload) for item in reconstructed
+        declare_workload(item.owner) for item in reconstructed
     )
     expected_graph = lower_schedule_graph(
         tuple(declaration.ir for declaration in declarations),
@@ -420,13 +318,24 @@ def reconstruct_worker_bindings(
         for specialize in cold_specializers:
             specialize(specialization)
 
-    def merge_callbacks(attribute: str) -> dict[str, Callable[..., object]]:
-        merged: dict[str, Callable[..., object]] = {}
+    def merge_inputs() -> dict[str, InputProvider]:
+        merged: dict[str, InputProvider] = {}
         for item in reconstructed:
-            for name, callback in getattr(item, attribute).items():
+            for name, callback in item.ports.inputs.items():
                 if name in merged:
                     raise RuntimeError(
-                        f"worker reconstruction has duplicate {attribute} binding {name!r}"
+                        f"worker reconstruction has duplicate input binding {name!r}"
+                    )
+                merged[name] = callback
+        return merged
+
+    def merge_outputs() -> dict[str, OutputSink]:
+        merged: dict[str, OutputSink] = {}
+        for item in reconstructed:
+            for name, callback in item.ports.outputs.items():
+                if name in merged:
+                    raise RuntimeError(
+                        f"worker reconstruction has duplicate output binding {name!r}"
                     )
                 merged[name] = callback
         return merged
@@ -435,7 +344,7 @@ def reconstruct_worker_bindings(
     schedule_states = {state.resource: state for state in compilation.graph.states}
     state_versions: dict[str, StateVersionBinding] = {}
     for declaration, item in zip(declarations, reconstructed, strict=True):
-        for local_name, snapshot in item.state_snapshots.items():
+        for local_name, snapshot in item.states.snapshots.items():
             resource = (
                 f"{declaration.ir.workload_id}/{local_name}"
                 if multiple
@@ -453,9 +362,9 @@ def reconstruct_worker_bindings(
                 ) from exc
             state_versions[resource] = StateVersionBinding(state, snapshot)
     providers = tuple(
-        item.sampler_provider
+        sampler.provider
         for item in reconstructed
-        if item.sampler_provider is not None
+        if isinstance(sampler := item.sampler, SamplerRuntimeBinding)
     )
     if len(providers) > 1:
         raise RuntimeError("native worker reconstruction has multiple sampler providers")
@@ -469,20 +378,24 @@ def reconstruct_worker_bindings(
         residual_paths.update(item.residual_paths)
     backend_region_binders: dict[str, "BackendRegionBinderSlot"] = {}
     for item in reconstructed:
-        overlap = set(backend_region_binders).intersection(item.backend_region_binders)
+        overlap = set(backend_region_binders).intersection(item.backend.binders)
         if overlap:
             raise RuntimeError(
                 "native worker reconstruction has duplicate backend Region binder "
                 "binding(s): "
                 + ", ".join(sorted(overlap))
             )
-        backend_region_binders.update(item.backend_region_binders)
+        backend_region_binders.update(item.backend.binders)
 
     diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
     for declaration, item in zip(declarations, reconstructed, strict=True):
-        reader = item.diagnostics_reader
-        if reader is None:
-            continue
+        match item.services:
+            case LocalRuntimeServices(diagnostics=reader) | DiagnosticsRuntimeServices(
+                diagnostics=reader
+            ):
+                pass
+            case _:
+                continue
         workload_id = declaration.ir.workload_id
         if workload_id in diagnostics_readers:
             raise RuntimeError(
@@ -491,51 +404,59 @@ def reconstruct_worker_bindings(
             )
         diagnostics_readers[workload_id] = reader
 
-    def one_callback(attribute: str) -> Callable[..., object] | None:
-        callbacks = tuple(
-            callback
-            for item in reconstructed
-            if (callback := getattr(item, attribute)) is not None
-        )
+    lifecycle_service_list: list[LocalRuntimeServices] = []
+    for item in reconstructed:
+        if isinstance(item.services, LocalRuntimeServices):
+            lifecycle_service_list.append(item.services)
+    lifecycle_services = tuple(lifecycle_service_list)
+
+    def one_lifecycle_callback(
+        callbacks: tuple[Callable[..., object], ...], attribute: str
+    ) -> Callable[..., object] | None:
         if len(callbacks) > 1:
             raise RuntimeError(
                 f"native worker reconstruction has multiple {attribute} callbacks"
             )
-        return None if not callbacks else callbacks[0]
+        if not callbacks:
+            return None
+        return callbacks[0]
+
+    stats_reader = one_lifecycle_callback(
+        tuple(service.stats for service in lifecycle_services), "stats_reader"
+    )
+    per_request_stats_reader = one_lifecycle_callback(
+        tuple(
+            stats.read
+            for service in lifecycle_services
+            if isinstance(stats := service.per_request_stats, PerRequestStats)
+        ),
+        "per_request_stats_reader",
+    )
+    enabled_setter = one_lifecycle_callback(
+        tuple(service.set_enabled for service in lifecycle_services), "enabled_setter"
+    )
+    enabled_predicate = one_lifecycle_callback(
+        tuple(service.is_enabled for service in lifecycle_services), "enabled_predicate"
+    )
+    synchronizer = one_lifecycle_callback(
+        tuple(service.synchronize for service in lifecycle_services), "synchronizer"
+    )
 
     return WorkloadExecutionBindings(
         declarations=declarations,
-        provided_inputs=cast(
-            Mapping[str, Callable[[int], object]],
-            merge_callbacks("provided_inputs"),
-        ),
-        output_sinks=cast(
-            Mapping[str, Callable[[object, int], None]],
-            merge_callbacks("output_sinks"),
-        ),
+        provided_inputs=merge_inputs(),
+        output_sinks=merge_outputs(),
         state_versions=state_versions,
         sampler_provider=None if not providers else providers[0],
         diagnostics_readers=diagnostics_readers,
-        stats_reader=cast(
-            Callable[[bool], "TrainingStats"] | None,
-            one_callback("stats_reader"),
-        ),
+        stats_reader=cast(Callable[[bool], "TrainingStats"] | None, stats_reader),
         per_request_stats_reader=cast(
             Callable[[bool], Mapping[int, "TrainingStats"]] | None,
-            one_callback("per_request_stats_reader"),
+            per_request_stats_reader,
         ),
-        enabled_setter=cast(
-            Callable[[bool], None] | None,
-            one_callback("enabled_setter"),
-        ),
-        enabled_predicate=cast(
-            Callable[[], bool] | None,
-            one_callback("enabled_predicate"),
-        ),
-        synchronizer=cast(
-            Callable[[], None] | None,
-            one_callback("synchronizer"),
-        ),
+        enabled_setter=cast(Callable[[bool], None] | None, enabled_setter),
+        enabled_predicate=cast(Callable[[], bool] | None, enabled_predicate),
+        synchronizer=cast(Callable[[], None] | None, synchronizer),
         residual_paths=residual_paths,
         backend_region_binders=backend_region_binders,
         static_binding_entries=tuple(
@@ -549,8 +470,6 @@ def reconstruct_worker_bindings(
 
 __all__ = [
     "NativeWorkload",
-    "NativeWorkloadResources",
-    "ReconstructedWorkload",
     "WorkloadWorkerSpec",
     "residual_resource_manifest_from_paths",
     "static_backend_binding_manifest_wire",

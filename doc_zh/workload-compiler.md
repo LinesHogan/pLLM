@@ -126,7 +126,7 @@ decision 持久化到可配置目录，条目以不变的 compilation cache key 
 closed。
 
 native MP 执行要求显式提供 `WorkloadWorkerSpec`。控制面只传 importable factory 名称和
-纯 JSON config；factory 在 worker 内重建 declaration 和进程本地 callback。worker 完成
+纯 JSON config；factory 在 worker 内重建完整 typed `WorkloadRuntimeBinding`。worker 完成
 校验与物化后会上报实际、有序的 `(region_id, artifact_key)` 集合；父进程只有在它与签名
 decision 完全相等时才接受 epoch。Python callable 始终不会被序列化。
 
@@ -134,10 +134,9 @@ decision 完全相等时才接受 epoch。Python callable 始终不会被序列�
 验证，覆盖 worker reconstruction、signature/artifact 一致性、训练、state-version 推进和 sampler
 intervention；这只是正确性结果，不是性能测量。
 
-`NativeWorkloadResources` 是 native declaration 的显式进程本地资源契约。它拥有
-declaration，以及命名 input provider、output sink、state-version snapshot、cold
-specialization callback、sampler provider、统计与 enablement callback、residual-path
-binding、specialization key 和可选的 worker reconstruction recipe。这些对象刻意只存在于
+`WorkloadRuntimeBinding` 是 native declaration 的闭合进程本地契约。它包含不可变 port、
+state、backend registry，以及显式 service、sampler、worker variant；缺席由空 registry
+或 `No*` variant 表示，不使用 nullable callback 字段。这些对象刻意只存在于
 本进程：跨 MP 控制面只有 `WorkloadWorkerSpec` 的 importable factory 与纯 JSON config。
 worker reconstruction 会按父进程签名的 runtime specialization envelope 做 cold
 specialize，重新声明并比较完整 schedule graph，然后物化并上报有序的 Region artifact 集合。
@@ -179,9 +178,9 @@ Dummy、ESamp、TTRL、ReFT、OverRIDE 与 Recirculation 都已有 native worklo
 workload class 后面充当另一套实现。
 
 独立 Dummy workload 现在是完整的 `NativeWorkload`。它的 typed singleton extern
-Region 使用通用 Region executor，并通过显式 `NativeWorkloadResources` 绑定 layer-0
-residual path、CPU-export worker、synchronization callback、specialization identity 和 worker
-reconstruction。它不再注册或查询 legacy `DummyConsumer`，旧的 Dummy 专用物化分支已删除。
+Region 使用通用 Region executor，并返回闭合 `WorkloadRuntimeBinding`，其中包含 layer-0
+residual path、CPU-export service、specialization identity 和 worker reconstruction。它不再
+注册或查询 legacy `DummyConsumer`，旧的 Dummy 专用物化分支已删除。
 缺少 binding、`eager_only` capability 或已解析 residual resource 都会 fail closed。
 `feedback_interval > 0` 仍是 legacy-only 的逐步 drain 特性，native declaration 会拒绝；
 非默认 legacy `capture_policy` 也会被拒绝，而不是被静默忽略。
