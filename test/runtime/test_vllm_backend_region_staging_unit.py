@@ -35,7 +35,6 @@ def test_model_region_stages_the_signed_binder_at_its_signed_event() -> None:
     runtime = SimpleNamespace(
         event_step_id=19,
         dispatch_plan=None,
-        model_region_binding=None,
         workload_execution=SimpleNamespace(
             backend_region_binders={implementation_id: slot},
             backend_region_binder_stages=lambda event: (

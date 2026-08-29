@@ -94,29 +94,8 @@ def abort_model_region_step(runtime: object, step_id: int) -> bool:
     return False
 
 
-def install_model_region_executor(*, binding: object, runtime: object) -> object:
-    del binding, runtime
-    return None
-
-
-def restore_model_region_executors(binding: object) -> int:
-    del binding
-    return 0
-
-
-def restore_runtime_model_region(runtime: object) -> int:
-    if getattr(runtime, "workload_execution", None) is not None:
-        from tllm.backends.vllm.typed_layer_replay import restore_typed_layer_replay
-
-        return restore_typed_layer_replay(runtime)
-    return 0
-
-
 __all__ = [
     "abort_model_region_step",
-    "install_model_region_executor",
     "prepare_model_region_step",
-    "restore_model_region_executors",
-    "restore_runtime_model_region",
     "stage_signed_backend_region_event",
 ]

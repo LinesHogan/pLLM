@@ -260,17 +260,6 @@ class BackendDriver(Protocol):
     def restore_module_weight_overlays(self, binding: RunnerBinding) -> int:
         ...
 
-    def install_model_region_executor(
-        self,
-        *,
-        binding: RunnerBinding,
-        runtime: Any,
-    ) -> Any:
-        ...
-
-    def restore_model_region_executors(self, binding: RunnerBinding) -> int:
-        ...
-
     def install_typed_layer_replay(
         self,
         *,

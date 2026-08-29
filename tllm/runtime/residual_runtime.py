@@ -123,9 +123,6 @@ def _collect_workgraph_capture_metadata(
 def _refresh_dispatch_plan() -> None:
     consumers = _active_dispatch_consumers()
     if not consumers:
-        from tllm.runtime.model_region import restore_model_region_executors
-
-        restore_model_region_executors(RUNTIME)
         RUNTIME.test_time_lora_store = None
         RUNTIME.test_time_lora_publisher = None
         RUNTIME.dispatch_plan = None
@@ -151,10 +148,6 @@ def _refresh_dispatch_plan() -> None:
         RUNTIME.test_time_lora_publisher = None
     RUNTIME.test_time_lora_store = adapter_store
     RUNTIME.dispatch_plan = None if plan.is_empty() else plan
-    if not plan.recurrence_targets():
-        from tllm.runtime.model_region import restore_model_region_executors
-
-        restore_model_region_executors(RUNTIME)
     # Fail fast at startup when a consumer reads a migrated port kind that no
     # registered producer can serve (kinds still served by legacy hardcoded
     # producers are not enforced yet).

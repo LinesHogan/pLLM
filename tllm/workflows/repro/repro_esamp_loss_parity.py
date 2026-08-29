@@ -58,7 +58,7 @@ def _run_aligned_single_path(args) -> Dict[str, object]:
     _ = _runtime.RUNTIME
     if getattr(args, "sampling_seed", None) is None:
         args.sampling_seed = 1234
-    payload = benchmark._run_one_implementation(args, "esamp")
+    payload = benchmark._run_one_implementation(args, str(args.implementation))
     summary = _build_result_summary(
         payload=payload,
         guardrail_doc=str(PARITY_GUARDRAIL_DOC.relative_to(REPO_ROOT)),

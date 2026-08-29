@@ -75,6 +75,12 @@ class ProgramConfigValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ESampConsumerConfig(implementation="eager")
 
+    def test_native_selector_cannot_fall_through_to_legacy_consumer(self) -> None:
+        from tllm.consumers.esamp.register import build
+
+        with self.assertRaisesRegex(ValueError, "native @workload"):
+            build(ESampConsumerConfig(implementation="native"))
+
     def test_supported_program_config_passes(self) -> None:
         validate_program_config(ESampConsumerConfig(implementation="program"))
         validate_program_config(

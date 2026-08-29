@@ -460,17 +460,6 @@ class V027MRv2Driver:
     def restore_module_weight_overlays(self, binding: RunnerBinding) -> int:
         return _module_weight_overlay.restore_module_weight_overlays(binding)
 
-    def install_model_region_executor(
-        self, *, binding: RunnerBinding, runtime: Any
-    ) -> Any:
-        return _model_region.install_model_region_executor(
-            binding=binding,
-            runtime=runtime,
-        )
-
-    def restore_model_region_executors(self, binding: RunnerBinding) -> int:
-        return _model_region.restore_model_region_executors(binding)
-
     def install_typed_layer_replay(self, *, runtime: Any, runner: Any) -> Any:
         from tllm.backends.vllm import typed_layer_replay
 
@@ -556,5 +545,4 @@ class V027MRv2Driver:
         setattr(cls, self._HOOK_FLAG, True)
 
     def unbind(self, binding: RunnerBinding) -> None:
-        self.restore_model_region_executors(binding)
         _module_weight_overlay.unbind_runner(binding)

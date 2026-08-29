@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine
-from tllm.consumers.esamp.lm_head import (
+from tllm.runtime.vllm_patch.lm_head import (
     ResolvedLMHead,
     resolve_lm_head as _resolve_lm_head,
 )

@@ -1,6 +1,19 @@
 """Focused contracts for compiler-specific import-layer bridges."""
 
-from tools.check_import_layers import RULES, _collect, _is_allowed_target
+import json
+
+from tools.check_import_layers import (
+    BASELINE_PATH,
+    RULES,
+    _collect,
+    _is_allowed_target,
+    _rules_snapshot,
+)
+
+
+def test_baseline_rule_snapshot_matches_the_live_gate() -> None:
+    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    assert baseline["rules"] == _rules_snapshot()
 
 
 def test_workload_and_schedule_only_allow_their_declared_bridge() -> None:

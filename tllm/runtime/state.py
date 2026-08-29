@@ -178,7 +178,6 @@ class ResidualRuntimeState:
     fast_weight_current_token_batch_meta: Optional[RuntimeTokenBatchMeta] = None
     fast_weight_installed_count: int = 0
     fast_weight_skipped_count: int = 0
-    model_region_binding: object | None = None
     test_time_lora_store: object | None = None
     test_time_lora_publisher: object | None = None
 

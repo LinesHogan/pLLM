@@ -21,7 +21,7 @@ from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.consumers.esamp.config import BaseESampConsumer, ESampConsumerConfig
-from tllm.consumers.esamp.lm_head import resolve_lm_head
+from tllm.runtime.vllm_patch.lm_head import resolve_lm_head
 from tllm.consumers.esamp.program import ESampProgram
 from tllm.ports.base import (
     BufferOwnership,
