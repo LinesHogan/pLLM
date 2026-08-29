@@ -23,10 +23,10 @@ _MODULE_BY_NAME = {
     "ESampConsumerConfig": "tllm.consumers.esamp.config",
     "ESampProgram": "tllm.consumers.esamp.program",
     "ESampProgramConsumer": "tllm.consumers.esamp.program_consumer",
-    "ESampConfig": "tllm.consumers.esamp.region_workload",
+    "ESampConfig": "tllm.consumers.esamp.workload",
     "ESampSamplerModifierProvider": "tllm.consumers.esamp.sampler_provider",
-    "build_esamp_workload": "tllm.consumers.esamp.workload",
-    "ESampWorkload": "tllm.consumers.esamp.region_workload",
+    "build_esamp_workload": "tllm.consumers.esamp.legacy_workload",
+    "ESampWorkload": "tllm.consumers.esamp.workload",
 }
 
 

@@ -43,6 +43,15 @@ _WORKLOAD_STATUS_REPLY_FIELDS = frozenset(
 _WORKLOAD_INSTALL_REPLY_FIELDS = frozenset(
     {"signature", "plan_epoch", "artifacts", "native", "committed"}
 )
+_PORT_PREPARE_REPLY_FIELDS = frozenset(
+    {"worker_id", "key", "transaction", "prepared"}
+)
+_PORT_COMMIT_REPLY_FIELDS = frozenset(
+    {"worker_id", "key", "transaction", "committed", "sequence"}
+)
+_PORT_ABORT_REPLY_FIELDS = frozenset(
+    {"worker_id", "key", "transaction", "aborted"}
+)
 
 
 def _shape_digest(value: object, label: str) -> str:
@@ -296,6 +305,89 @@ class WorkerWorkloadActivationReply:
         )
 
 
+def _port_reply_identity(
+    fields: Mapping[str, object], label: str
+) -> tuple[str, str, str]:
+    worker_id = fields["worker_id"]
+    key = fields["key"]
+    transaction = fields["transaction"]
+    if type(worker_id) is not str or not worker_id:
+        raise TypeError(f"{label}.worker_id must be a non-empty string")
+    if type(key) is not str or not key:
+        raise TypeError(f"{label}.key must be a non-empty string")
+    if type(transaction) is not str or not transaction:
+        raise TypeError(f"{label}.transaction must be a non-empty string")
+    return worker_id, key, transaction
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPortQuorum:
+    worker_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPortPrepareReply:
+    worker_id: str
+    key: str
+    transaction: str
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerPortPrepareReply":
+        fields = _exact_wire_object(
+            payload, "port prepare reply", _PORT_PREPARE_REPLY_FIELDS
+        )
+        worker_id, key, transaction = _port_reply_identity(
+            fields, "port prepare reply"
+        )
+        if fields["prepared"] is not True:
+            raise ValueError("port prepare reply.prepared must be true")
+        return cls(worker_id, key, transaction)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPortCommitReply:
+    worker_id: str
+    key: str
+    transaction: str
+    sequence: int
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerPortCommitReply":
+        fields = _exact_wire_object(
+            payload, "port commit reply", _PORT_COMMIT_REPLY_FIELDS
+        )
+        worker_id, key, transaction = _port_reply_identity(
+            fields, "port commit reply"
+        )
+        if fields["committed"] is not True:
+            raise ValueError("port commit reply.committed must be true")
+        return cls(
+            worker_id,
+            key,
+            transaction,
+            _positive_wire_int(fields["sequence"], "port commit reply.sequence"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPortAbortReply:
+    worker_id: str
+    key: str
+    transaction: str
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerPortAbortReply":
+        fields = _exact_wire_object(
+            payload, "port abort reply", _PORT_ABORT_REPLY_FIELDS
+        )
+        worker_id, key, transaction = _port_reply_identity(
+            fields, "port abort reply"
+        )
+        if fields["aborted"] is not True:
+            raise ValueError("port abort reply.aborted must be true")
+        return cls(worker_id, key, transaction)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerStatsReply:
     esamp: TrainingStats
@@ -385,31 +477,95 @@ class ControlPlane:
     def synchronize(self, *, timeout: float | None = None) -> None:
         self.call("tllm_synchronize", timeout=timeout)
 
+    def worker_quorum(self, *, timeout: float | None = None) -> WorkerPortQuorum:
+        replies = self.ping(timeout=timeout)
+        if not replies:
+            raise RuntimeError("control plane has no live worker quorum")
+        worker_ids: list[str] = []
+        for reply in replies:
+            worker_id = reply.get("worker_id")
+            if type(worker_id) is not str or not worker_id:
+                raise TypeError("worker ping reply has no stable worker_id")
+            worker_ids.append(worker_id)
+        if len(worker_ids) != len(set(worker_ids)):
+            raise RuntimeError("worker ping quorum contains duplicate worker identities")
+        return WorkerPortQuorum(frozenset(worker_ids))
+
     def prepare_workload_port(
         self,
         key: str,
         transaction: str,
         wire: Mapping[str, object],
         *,
+        quorum: WorkerPortQuorum,
         timeout: float | None = None,
-    ) -> None:
-        self.call(
-            "tllm_prepare_workload_port",
-            key,
-            transaction,
-            dict(wire),
-            timeout=timeout,
+    ) -> tuple[WorkerPortPrepareReply, ...]:
+        replies = tuple(
+            WorkerPortPrepareReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_prepare_workload_port",
+                key,
+                transaction,
+                dict(wire),
+                timeout=timeout,
+            )
         )
+        if (
+            len(replies) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in replies) != quorum.worker_ids
+        ):
+            raise RuntimeError("workload port prepare quorum reply count mismatch")
+        if any(reply.key != key or reply.transaction != transaction for reply in replies):
+            raise RuntimeError("workload port prepare reply identity mismatch")
+        return replies
 
     def commit_workload_port(
-        self, key: str, transaction: str, *, timeout: float | None = None
-    ) -> None:
-        self.call("tllm_commit_workload_port", key, transaction, timeout=timeout)
+        self,
+        key: str,
+        transaction: str,
+        *,
+        quorum: WorkerPortQuorum,
+        timeout: float | None = None,
+    ) -> tuple[WorkerPortCommitReply, ...]:
+        replies = tuple(
+            WorkerPortCommitReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_commit_workload_port", key, transaction, timeout=timeout
+            )
+        )
+        if (
+            len(replies) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in replies) != quorum.worker_ids
+        ):
+            raise RuntimeError("workload port commit quorum reply count mismatch")
+        if any(reply.key != key or reply.transaction != transaction for reply in replies):
+            raise RuntimeError("workload port commit reply identity mismatch")
+        if len({reply.sequence for reply in replies}) != 1:
+            raise RuntimeError("workload port commit sequence quorum mismatch")
+        return replies
 
     def abort_workload_port(
-        self, key: str, transaction: str, *, timeout: float | None = None
-    ) -> None:
-        self.call("tllm_abort_workload_port", key, transaction, timeout=timeout)
+        self,
+        key: str,
+        transaction: str,
+        *,
+        quorum: WorkerPortQuorum,
+        timeout: float | None = None,
+    ) -> tuple[WorkerPortAbortReply, ...]:
+        replies = tuple(
+            WorkerPortAbortReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_abort_workload_port", key, transaction, timeout=timeout
+            )
+        )
+        if (
+            len(replies) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in replies) != quorum.worker_ids
+        ):
+            raise RuntimeError("workload port abort quorum reply count mismatch")
+        if any(reply.key != key or reply.transaction != transaction for reply in replies):
+            raise RuntimeError("workload port abort reply identity mismatch")
+        return replies
 
     def apply_enable_flags(self, flags: Mapping[str, bool], *, timeout: float | None = None) -> None:
         self.call("tllm_apply_enable_flags", {str(k): bool(v) for k, v in flags.items()}, timeout=timeout)

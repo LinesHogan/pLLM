@@ -59,7 +59,7 @@ def main() -> int:
     llm = runtime.make_llm(model_name=args.model, dtype="bfloat16", enforce_eager=True,
         gpu_memory_utilization=0.3, max_model_len=128, max_num_batched_tokens=128,
         enable_prefix_caching=False, seed=0)
-    install_reft_patch_on_llm(llm, workload)
+    install_reft_patch_on_llm(llm, runtime)
     greedy = SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True)
 
     def rollout(tag: str) -> list[str]:

@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from functools import wraps
 from types import FunctionType
-from typing import Any, Generic, Never, ParamSpec, Protocol, TypeVar, cast, get_origin, get_type_hints, overload
+from typing import Any, Generic, Never, ParamSpec, Protocol, Self, TypeVar, cast, get_origin, get_type_hints, overload
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.workload.config import ConfigField, WorkloadConfig
@@ -163,10 +163,10 @@ class NoConfiguredValue:
 NO_CONFIGURED_VALUE = NoConfiguredValue()
 
 
-class _PublishedStateOwner(Protocol):
-    def _publish_state(
+class _PublishedModuleOwner(Protocol):
+    def _publish_module(
         self,
-        state: PublishedState[object],
+        state: PublishedModule[object],
         values: Mapping[str, torch.Tensor],
     ) -> None: ...
 
@@ -238,8 +238,8 @@ class State(Generic[StateValueT]):
         )
 
     @classmethod
-    def published(cls) -> "PublishedState[StateValueT]":
-        return PublishedState(
+    def published_module(cls) -> "PublishedModule[StateValueT]":
+        return PublishedModule(
             scope=StateScope.REPLICA,
             parameters=None,
             optimizer=None,
@@ -256,14 +256,14 @@ class State(Generic[StateValueT]):
             setattr(owner, "__tllm_states__", (*inherited, self))
 
     @overload
-    def __get__(self, instance: None, owner: type[object] | None = None) -> "State[StateValueT]": ...
+    def __get__(self, instance: None, owner: type[object] | None = None) -> Self: ...
 
     @overload
     def __get__(self, instance: object, owner: type[object] | None = None) -> StateValueT: ...
 
     def __get__(
         self, instance: object | None, owner: type[object] | None = None
-    ) -> "State[StateValueT] | StateValueT":
+    ) -> "Self | StateValueT":
         if instance is None:
             return self
         return instance._state_value(self)  # type: ignore[attr-defined,no-any-return]
@@ -305,7 +305,7 @@ class TrainableState(State[StateValueT]):
     optimizer: OptimizerSpec
 
 
-class PublishedState(State[StateValueT]):
+class PublishedModule(State[StateValueT]):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.port: StagedPort[Mapping[str, torch.Tensor]] = StagedPort()
@@ -1127,7 +1127,7 @@ def workload(
             raise TypeError(
                 "native workload config and enabled ConfigField must be declared together"
             )
-        _expand_published_states(target)
+        _expand_published_modules(target)
         _expand_optimized_outputs(target)
         hidden_inputs, sampler_outputs, gradient_tasks, sampler_inputs = (
             _author_metadata(target)
@@ -1147,23 +1147,23 @@ def workload(
     return decorate if cls is None else decorate(cls)
 
 
-def _expand_published_states(target: type[object]) -> None:
+def _expand_published_modules(target: type[object]) -> None:
     states = cast(
         tuple[State[object], ...], target.__dict__.get("__tllm_states__", ())
     )
     for state in states:
-        if not isinstance(state, PublishedState):
+        if not isinstance(state, PublishedModule):
             continue
         generated_name = f"publish__{state.name}"
 
         def publisher_executor(
-            published: PublishedState[object],
+            published: PublishedModule[object],
         ) -> Callable[..., None]:
             def publish(
-                self: _PublishedStateOwner,
+                self: _PublishedModuleOwner,
                 values: Mapping[str, torch.Tensor],
             ) -> None:
-                self._publish_state(published, values)
+                self._publish_module(published, values)
 
             return publish
 
@@ -1173,7 +1173,7 @@ def _expand_published_states(target: type[object]) -> None:
             timing=Before("next.prepare"),
             implementation=ExternImplementation(
                 namespace="tllm.workload",
-                name="published_state_transition",
+                name="published_module_transition",
                 version="1",
                 input_types=("Mapping",),
                 output_types=("None",),

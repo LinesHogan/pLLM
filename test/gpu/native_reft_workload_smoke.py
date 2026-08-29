@@ -3,7 +3,7 @@
 
 Drives the real engine: install the LoReFT patch on the declared layer,
 verify the untouched baseline, push an intervention whose delta is large
-enough to flip greedy continuations, and assert the signed publish Region
+enough to flip greedy continuations, and assert the signed publish task
 lands it with an audited version bump.  Also asserts the prefill-only
 semantics observably: a decode-only continuation after the patched prefill
 is unaffected by further patch applications (the KV carries the effect).
@@ -49,7 +49,7 @@ def main() -> int:
     # in-process so the push and the audit are observable here.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
-    from tllm.consumers.reft.region_workload import ReftConfig, ReftWorkload
+    from tllm.consumers.reft.workload import ReftConfig, ReftWorkload
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.runtime import TllmRuntime
     from tllm.consumers.reft.vllm_patch import install_reft_patch_on_llm
@@ -80,17 +80,20 @@ def main() -> int:
         if compilation is None:
             raise AssertionError("native ReFT Region plan was not compiled")
         regions = compilation.decision.execution_regions
-        if len(regions) != 1 or tuple(regions[0].tasks) != ("publish",):
+        if len(regions) != 1 or tuple(regions[0].tasks) != (
+            "publish__intervention",
+        ):
             raise AssertionError(f"unexpected ReFT Region partition: {regions!r}")
         if regions[0].capture_safe:
             raise AssertionError("extern publish Region must be non-capture")
 
-        install_reft_patch_on_llm(llm, workload)
+        active_workload = runtime.local_workload(ReftWorkload)
+        install_reft_patch_on_llm(llm, runtime)
 
         prompts = ["The capital of France is", "Water is made of"]
         baseline = _greedy_tokens(llm, prompts, 8)
 
-        spec = workload.specialization
+        spec = active_workload.specialization
         hidden = spec.hidden_size
         # Large constant-direction delta: project onto the first rank
         # direction with a big bias, so the patched hidden moves far.
@@ -104,20 +107,23 @@ def main() -> int:
             ReftWorkload.intervention,
             {"source_w": source_w, "source_b": source_b, "rotate": rotate},
         )
-        if workload.state_version != 0:
+        if active_workload.state_version != 0:
             raise AssertionError("intervention went live before any engine step")
 
         # Land the push through the signed publish Region, then roll out.
         _greedy_tokens(llm, ["ping"], 1)
-        if workload.state_version != 1:
+        if active_workload.state_version != 1:
             raise AssertionError(
-                f"signed publish did not land the push: {workload.state_version}"
+                f"signed publish did not land the push: {active_workload.state_version}"
             )
         # The active epoch is promoted on the first user step; re-read it.
         execution = core.RUNTIME.workload_execution
         if execution is None:
             raise AssertionError("native ReFT execution disappeared after activation")
-        observed = execution.state_versions.observed_version("intervention", None)
+        state_versions = execution.state_versions
+        if state_versions is None:
+            raise AssertionError("native ReFT state-version registry disappeared")
+        observed = state_versions.observed_version("intervention", None)
         if observed != 1:
             raise AssertionError(f"audited intervention version must be 1, got {observed}")
 
@@ -144,7 +150,7 @@ def main() -> int:
                 {
                     "runner": args.runner,
                     "signature": compilation.decision.signature,
-                    "intervention_version": workload.state_version,
+                    "intervention_version": active_workload.state_version,
                     "baseline": [list(tokens) for tokens in baseline],
                     "patched": [list(tokens) for tokens in patched],
                     "execute_count": physical.execute_count,

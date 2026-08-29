@@ -202,6 +202,12 @@ class TypedOperand:
     binding_id: str | None
     value_id: str | None
     resource_id: str | None
+    @staticmethod
+    def seed(binding_id: str) -> TypedOperand: ...
+    @staticmethod
+    def region_value(value_id: str) -> TypedOperand: ...
+    @staticmethod
+    def backend_resource(resource_id: str) -> TypedOperand: ...
 
 class EffectKind:
     StateRead: EffectKind
@@ -213,6 +219,7 @@ class EffectKind:
 class TypedEffect:
     kind: EffectKind
     resource_id: str
+    def __init__(self, kind: EffectKind, resource_id: str) -> None: ...
 
 class TypedOperation:
     operation_id: str
@@ -221,6 +228,47 @@ class TypedOperation:
     operands: list[TypedOperand]
     results: list[str]
     effects: list[TypedEffect]
+    def __init__(
+        self,
+        operation_id: str,
+        primitive_key: str,
+        implementation_id: str,
+        operands: Sequence[TypedOperand],
+        results: Sequence[str],
+        effects: Sequence[TypedEffect] = (),
+    ) -> None: ...
+
+class TypedDependency:
+    source: str
+    target: str
+    kind: str
+    def __init__(self, source: str, target: str, kind: str) -> None: ...
+
+class TypedStageAdmission:
+    @staticmethod
+    def prefill_reject() -> TypedStageAdmission: ...
+    @staticmethod
+    def decode_reject() -> TypedStageAdmission: ...
+
+class TypedStageFusionPolicy:
+    @staticmethod
+    def serial() -> TypedStageFusionPolicy: ...
+    @staticmethod
+    def ordered(
+        max_rows: int, internalized_edges: Sequence[str]
+    ) -> TypedStageFusionPolicy: ...
+
+class TypedRecurrence:
+    def __init__(
+        self,
+        region_id: str,
+        implementation_id: str,
+        admission: TypedStageAdmission,
+        fusion_policy: TypedStageFusionPolicy,
+        operations: Sequence[TypedOperation],
+        dependencies: Sequence[TypedDependency],
+        retained_values: Sequence[str],
+    ) -> None: ...
 
 class TypedExecutionGroup:
     group_id: int
@@ -248,17 +296,40 @@ class TypedStageBinding:
     binding_id: str
     kind: str
     coordinates: list[int]
+    def __init__(
+        self, binding_id: str, kind: str, coordinates: Sequence[int]
+    ) -> None: ...
 
 class TypedStageOutputBinding:
     output_id: str
     value_id: str
     kind: str
     coordinates: list[int]
+    def __init__(
+        self,
+        output_id: str,
+        value_id: str,
+        kind: str,
+        coordinates: Sequence[int],
+    ) -> None: ...
 
 class TypedStageResourceBinding:
     resource_id: str
     kind: str
     coordinates: list[int]
+    def __init__(
+        self, resource_id: str, kind: str, coordinates: Sequence[int]
+    ) -> None: ...
+
+class TypedRecurrenceStageDefinition:
+    def __init__(
+        self,
+        row_count: int,
+        recurrence: TypedRecurrence,
+        seed_bindings: Sequence[TypedStageBinding],
+        resource_bindings: Sequence[TypedStageResourceBinding],
+        output_bindings: Sequence[TypedStageOutputBinding],
+    ) -> None: ...
 
 class TypedStageRequestSpan(TypedDict):
     """Closed evidence that one request owns a contiguous packed row span."""
@@ -306,6 +377,11 @@ class TypedPackedRecurrenceStageBinding:
     stage: TypedBoundRecurrenceStage
     observed_span: TypedObservedStageSpan
 
+class TypedPackedRecurrenceStageBatch:
+    admission: TypedStagePlanAdmission
+    total_rows: int
+    requests: list[TypedPackedRecurrenceStageBinding]
+
 class TypedRecurrenceSpecializationRequired(ValueError): ...
 
 class TypedStagePlanAdmission:
@@ -320,6 +396,17 @@ class TypedRecurrenceStageArtifactBundle:
     schema_version: int
     signature: str
     artifacts: list[TypedRecurrenceStageArtifactBundleEntry]
+    max_row_count: int
+    @staticmethod
+    def compile(
+        definitions: Sequence[TypedRecurrenceStageDefinition],
+    ) -> TypedRecurrenceStageArtifactBundle: ...
+    @staticmethod
+    def from_wire(bundle_json: str) -> TypedRecurrenceStageArtifactBundle: ...
+    def to_wire(self) -> str: ...
+    def bind_packed_plan(
+        self, row_plan: PackedPrefillRowPlan
+    ) -> TypedPackedRecurrenceStageBatch: ...
 
 def compile_typed_recurrence_stage_artifact(spec_json: str) -> TypedRecurrenceStageArtifact: ...
 def compile_typed_recurrence_stage_artifact_json(spec_json: str) -> str: ...
@@ -391,88 +478,6 @@ def plan_prefill_rows(
     computed_tokens: list[int],
     expected_total_rows: int | None = None,
 ) -> PackedPrefillRowPlan: ...
-
-# Legacy-only compatibility while historical vLLM replay is migrated.
-class RecirculationInputKind:
-    Seed: RecirculationInputKind
-    Ordinal: RecirculationInputKind
-
-class RecirculationPrefillGroupKind:
-    ModelLayer: RecirculationPrefillGroupKind
-    Mix: RecirculationPrefillGroupKind
-
-class RecirculationPrefillOpKind:
-    Normal: RecirculationPrefillOpKind
-    Mix: RecirculationPrefillOpKind
-    Recurrent: RecirculationPrefillOpKind
-
-class RecirculationPrefillOp:
-    ordinal: int
-    kind: RecirculationPrefillOpKind
-    token: int
-    layer: int
-    data_predecessor_ordinals: list[int]
-    model_input_kind: RecirculationInputKind | None
-    model_input_ordinal: int | None
-    mix_source_ordinal: int | None
-    mix_destination_ordinal: int | None
-    mix_final_normal_ordinal: int | None
-
-class RecirculationPrefillGroup:
-    ordinal: int
-    kind: RecirculationPrefillGroupKind
-    model_layer: int | None
-    operations: list[RecirculationPrefillOp]
-    release_after: list[int]
-
-class RecirculationPrefillSchedule:
-    token_count: int
-    layer_count: int
-    source_layer: int
-    destination_layer: int
-    kind: str
-    groups: list[RecirculationPrefillGroup]
-    final_normal_ordinals: list[int]
-    retained_ordinals: list[int]
-    fusion_rejections: list[tuple[int, int, str]]
-
-def compile_recirculation_prefill_schedule(
-    token_count: int,
-    layer_count: int,
-    source_layer: int,
-    destination_layer: int,
-    fusion_policy: str,
-) -> RecirculationPrefillSchedule: ...
-
-class RecirculationPrefillRequest:
-    request_id: str
-    request_ordinal: int
-    scheduled_tokens: int
-    prompt_tokens: int
-    computed_tokens: int
-    packed_row_start: int
-    packed_row_end: int
-    packed_row_indices: list[int]
-    token_position_start: int
-    token_position_end: int
-    token_positions: list[int]
-
-class RecirculationPrefillPlan:
-    schema_version: int
-    phase: str
-    layer_count: int
-    total_rows: int
-    requests: list[RecirculationPrefillRequest]
-
-def normalize_recirculation_prefill_plan(plan_json: str) -> str: ...
-def parse_recirculation_prefill_plan(plan_json: str) -> RecirculationPrefillPlan: ...
-def build_recirculation_prefill_plan(
-    request_ids: list[str],
-    scheduled_tokens: list[int],
-    prompt_tokens: list[int],
-    computed_tokens: list[int],
-    layer_count: int,
-) -> RecirculationPrefillPlan: ...
 
 class WorkGraphNodeKeyDescriptor(Protocol):
     namespace: str

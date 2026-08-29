@@ -64,7 +64,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
 
     def test_native_authority_rejects_an_unrelated_legacy_sidecar(self) -> None:
         """Mixed authority remains runtime-wide until resources declare ownership."""
-        from tllm.consumers.esamp.region_workload import (
+        from tllm.consumers.esamp.workload import (
             ESampConfig,
             ESampWorkload,
         )

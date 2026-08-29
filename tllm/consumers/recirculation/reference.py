@@ -8,7 +8,8 @@ from typing import Protocol
 
 import torch
 
-from tllm.consumers.recirculation.consumer import RecirculationConsumer
+from tllm.consumers.recirculation.mix import mix_recirculation_tensors
+from tllm.consumers.recirculation.spec import RecirculationSettings
 
 
 class ReferenceDecoder(Protocol):
@@ -37,12 +38,12 @@ class SerialRecirculationResult:
 
 def run_serial_recirculation(
     decoder: ReferenceDecoder,
-    consumer: RecirculationConsumer,
+    config: RecirculationSettings,
     token_ids: tuple[int, ...],
 ) -> SerialRecirculationResult:
     """Run the exact normal-logits/recurrent-KV ordering one token at a time."""
 
-    source_layer, destination_layer = consumer.config.resolved_layers(decoder.layer_count)
+    source_layer, destination_layer = config.resolved_layers(decoder.layer_count)
     logits: list[torch.Tensor] = []
     recurrent_states: list[torch.Tensor] = []
     for position, token_id in enumerate(token_ids):
@@ -64,7 +65,8 @@ def run_serial_recirculation(
         # The observable logits are from the normal pass.  The replay exists
         # solely to publish the upper-layer state consumed by later tokens.
         logits.append(decoder.project_logits(hidden))
-        recurrent = consumer.mix(
+        recurrent = mix_recirculation_tensors(
+            config,
             source,
             destination,
             torch.tensor([position], device=destination.device),

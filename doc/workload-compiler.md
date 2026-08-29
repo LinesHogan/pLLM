@@ -190,7 +190,7 @@ re-declares and compares the complete schedule graph, then materializes and
 reports its ordered Region artifact set. A specialization, graph, binding, or
 artifact mismatch rejects the epoch.
 
-`ESampConsumerConfig(implementation="region")` is a distinct native,
+`ESampConsumerConfig(implementation="native")` is a distinct native,
 CPU-covered ESamp declaration, not a wrapper around the legacy consumer. It
 owns replica state and its optimizer, cold-specializes the distiller, and has
 two signed Regions: `predict_and_loss` reads signed hidden inputs and publishes
@@ -218,29 +218,22 @@ rejects Regions with state effects, so the stateful ESamp `predict_and_loss` /
 model-backed native piecewise CUDA Graph path remains unverified and
 incomplete. These are capability boundaries, not throughput claims.
 
-Recirculation has two complete native Region declarations. The standalone
-declaration consumes an explicitly published, finite CPU
-`RecirculationExecutionRequest`; it owns the exact Rust-signed recurrence and
-returns an explicit result sink. The experimental vLLM declaration binds a
-Rust-signed typed recurrence stage at `Before("model.execute")` through
-`BackendRegionBinderSlot`. Its row admission, grouping, operation order,
-operands, effects, and `release_after` all come from Rust artifacts; the Python
-backend adapter only binds layer-replay resources. The eager MRv1/MRv2 GPU
-smokes exercise this native prefill path successfully. CUDA Graph, EngineCore
-MP, decode recurrence, speculative decoding, PP/DP, and general model-family
-support remain outside its verified boundary.
+Recirculation now has one production `RecirculationWorkload`. It binds a
+Rust-signed typed recurrence stage at `Before("model.execute")` through the
+generic backend-adapter seam. Rust IR constructors own schema and shape
+metadata; the Rust stage family owns canonicalization, signing, wire loading,
+packed-row admission, and exact artifact selection. Consumer-local Python only
+declares the Recirculation operations and binds signed coordinates to layer
+replay and mix resources. The eager MRv1/MRv2 GPU smokes exercise this native
+prefill path successfully. CUDA Graph, EngineCore MP, decode recurrence,
+speculative decoding, PP/DP, and general model-family support remain outside
+its verified boundary. The old standalone and vLLM-specific workload classes,
+legacy Rust planner, and model-region adapter have been removed.
 
-The older eager vLLM model-region adapter remains only as a numerical oracle and
-compatibility fixture. Its MRv1/MRv2 comparison selected the same token, with
-maximum BF16 logit difference `0.15625` and minimum cosine similarity
-`0.99995947`; it does not own the native physical plan.
-
-All remaining workloads other than native ESamp, standalone and vLLM
-Recirculation, and Dummy retain a complete legacy consumer or sidecar adapter.
-There is no partially authoritative native execution: a workload reaches
-physical takeover only when its complete resource, binding, specialization,
-and artifact contract is available; otherwise its existing adapter remains
-the authority.
+Dummy, ESamp, TTRL, ReFT, OverRIDE, and Recirculation all have native workload
+definitions. Legacy consumer and Program implementations remain explicitly
+named compatibility or benchmark paths where still needed; they are not
+alternate implementations hidden behind native workload classes.
 
 The standalone Dummy workload is now a complete `NativeWorkload`. Its typed
 singleton extern Region uses the generic Region executor and explicit

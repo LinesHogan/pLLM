@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU correctness smoke for the native eager-only Dummy ExecutionRegion.
+"""GPU correctness smoke for the native eager-only Dummy workload.
 
 This deliberately exercises ``DummyWorkload`` through ``TllmRuntime``.  It
 does not register or instantiate the legacy ``DummyConsumer``. CPU-export

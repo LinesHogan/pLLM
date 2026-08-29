@@ -9,7 +9,7 @@ import torch
 
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
-from tllm.consumers.ttrl.region_workload import (
+from tllm.consumers.ttrl.workload import (
     TTRLConfig,
     TTRLWorkload,
     prepare_ttrl_training_batch,

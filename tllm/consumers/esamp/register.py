@@ -15,7 +15,7 @@ def _build_esamp(config: ESampConsumerConfig) -> BaseConsumer:
         return ESampProgramConsumer(config)
     if str(config.implementation) == "region":
         raise ValueError(
-            "implementation='region' is a native @workload; use "
+            "implementation='native' is a native @workload; use "
             "build_esamp_workload(config) with TllmRuntime(workloads=...)"
         )
     return ESampConsumer(config)

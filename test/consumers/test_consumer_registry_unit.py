@@ -71,7 +71,6 @@ class ConsumerRegistryUnitTest(unittest.TestCase):
                 "gtta",
                 "inplace_ttt",
                 "override",
-                "recirculation",
                 "tlm",
                 "ttrl",
             ),

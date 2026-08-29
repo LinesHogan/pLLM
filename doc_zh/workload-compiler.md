@@ -143,7 +143,7 @@ worker reconstruction 会按父进程签名的 runtime specialization envelope �
 specialize，重新声明并比较完整 schedule graph，然后物化并上报有序的 Region artifact 集合。
 specialization、graph、binding 或 artifact 任一不匹配都会拒绝 epoch。
 
-`ESampConsumerConfig(implementation="region")` 是独立的 native、已由 CPU 测试覆盖的
+`ESampConsumerConfig(implementation="native")` 是独立的 native、已由 CPU 测试覆盖的
 ESamp declaration，而不是 legacy consumer 的包装。它拥有 replica state 及其 optimizer，
 对 distiller 做 cold specialize，并有两个签名 Region：`predict_and_loss` 读取签名 hidden
 input 并发布 guidance；显式的 `update` extern Region 消费其唯一的跨 Region
@@ -165,23 +165,18 @@ ESamp `predict_and_loss` / `update` 序列当前明确为 exact eager、non-capt
 model-backed native piecewise CUDA Graph 路径仍未验证且未完成。这些是 capability boundary，
 不是 throughput 结论。
 
-Recirculation 有两个完整的 native Region declaration。standalone declaration 消费显式发布的
-有限 CPU `RecirculationExecutionRequest`，拥有 Rust 签名的 exact recurrence，并将结果写入
-显式 sink。实验性的 vLLM declaration 通过 `BackendRegionBinderSlot` 在
-`Before("model.execute")` 绑定 Rust 签名的 typed recurrence stage。row admission、grouping、
-operation order、operand、effect 与 `release_after` 均来自 Rust artifact；Python backend adapter
-只绑定 layer-replay 资源。eager MRv1/MRv2 GPU smoke 已通过这条 native prefill 路径。CUDA
-Graph、EngineCore MP、decode recurrence、speculative decoding、PP/DP 与通用 model-family 支持仍在
-已验证边界之外。
+Recirculation 现在只有一个生产 `RecirculationWorkload`。它通过通用 backend-adapter seam 在
+`Before("model.execute")` 绑定 Rust 签名的 typed recurrence stage。Rust IR constructor 负责
+schema 与 shape metadata；Rust stage family 负责 canonicalization、签名、wire load、packed-row
+admission 与精确 artifact 选择。consumer-local Python 只声明 Recirculation operation，并把签名
+coordinate 绑定到 layer replay 与 mix resource。eager MRv1/MRv2 GPU smoke 已通过这条 native
+prefill 路径。CUDA Graph、EngineCore MP、decode recurrence、speculative decoding、PP/DP 与通用
+model-family 支持仍在已验证边界之外。旧 standalone/vLLM 专用 workload class、legacy Rust
+planner 与 model-region adapter 已删除。
 
-旧的 eager vLLM model-region adapter 只保留为数值 oracle 和兼容 fixture。其 MRv1/MRv2 对照
-选择相同 token，BF16 logit 最大差为 `0.15625`，最小 cosine similarity 为 `0.99995947`；它不拥有
-native physical plan。
-
-除 native ESamp、standalone/vLLM Recirculation 和 Dummy 以外，其余 workload 仍保留完整的
-legacy consumer 或 sidecar adapter。不存在部分权威的 native
-execution：只有在完整 resource、binding、specialization 和 artifact 契约都可用时，workload
-才进入 physical takeover；否则现有 adapter 继续保持 authority。
+Dummy、ESamp、TTRL、ReFT、OverRIDE 与 Recirculation 都已有 native workload definition。仍需
+保留的 legacy consumer 与 Program 实现均明确标为兼容或 benchmark 路径，不会隐藏在 native
+workload class 后面充当另一套实现。
 
 独立 Dummy workload 现在是完整的 `NativeWorkload`。它的 typed singleton extern
 Region 使用通用 Region executor，并通过显式 `NativeWorkloadResources` 绑定 layer-0

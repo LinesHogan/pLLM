@@ -10,7 +10,7 @@ from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
-from tllm.consumers.esamp.region_workload import ESampConfig, ESampWorkload
+from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime import residual_runtime

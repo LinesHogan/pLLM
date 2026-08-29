@@ -10,7 +10,7 @@ import torch
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
-from tllm.consumers.override.region_workload import (
+from tllm.consumers.override.workload import (
     OverRIDEConfig,
     OverRIDEWorkload,
     iteration_from_request_id,

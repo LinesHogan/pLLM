@@ -58,19 +58,16 @@ NATIVE_BINDING_FILES = (
 # execution, backend staging, and worker reconstruction may only load or bind
 # an artifact that is already signed.
 RECURRENCE_AUTHORITY_FILES = (
-    Path("tllm/consumers/recirculation/region_workload.py"),
-    Path("tllm/consumers/recirculation/vllm_region_workload.py"),
+    Path("tllm/consumers/recirculation/native_backend.py"),
+    Path("tllm/consumers/recirculation/workload.py"),
 )
 
 _RECURRENCE_HOT_FUNCTIONS = frozenset(
     {
-        "run_exact_recirculation_region",
-        "execute_exact",
-        "reconstruct_recirculation_region_workload",
         "_stage_typed_recirculation",
         "replay",
         "bind_prefill",
-        "reconstruct_vllm_recirculation_region_workload",
+        "reconstruct",
     }
 )
 
@@ -258,6 +255,8 @@ def _recurrence_hot_path_violations(path: Path, source: str) -> list[Violation]:
                 or leaf
                 in {
                     "build_recirculation_graph",
+                    "build_stage_definitions",
+                    "compile",
                     "_stage_artifact_spec",
                     "_bound_stage_facts",
                     "bind_typed_recurrence_stage",
@@ -271,7 +270,7 @@ def _recurrence_hot_path_violations(path: Path, source: str) -> list[Violation]:
                         ast.get_source_segment(source, node) or leaf,
                     )
                 )
-            if current in _RECURRENCE_HOT_FUNCTIONS and leaf == "loads":
+            if current in _RECURRENCE_HOT_FUNCTIONS and leaf in {"loads", "from_wire"}:
                 violations.append(
                     Violation(
                         path,

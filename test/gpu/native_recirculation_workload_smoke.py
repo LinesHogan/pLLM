@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU correctness smoke for native vLLM Recirculation ExecutionRegion takeover."""
+"""GPU correctness smoke for the native vLLM Recirculation workload."""
 
 from __future__ import annotations
 
@@ -26,18 +26,19 @@ def main() -> int:
     from tllm.consumers.recirculation import (
         PREFILL_BINDER_IMPLEMENTATION_ID,
         RecirculationConfig,
-        VllmRecirculationRegionWorkload,
+        RecirculationWorkload,
     )
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.runtime import TllmRuntime
     from tllm.schedule import RegionImplementationKind
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = VllmRecirculationRegionWorkload(
+    workload = RecirculationWorkload(
         RecirculationConfig(
             source_layer=8,
             destination_layer=4,
             alpha=0.02,
+            beta=0.98,
             ramp_tokens=2,
         )
     )

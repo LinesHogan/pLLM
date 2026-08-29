@@ -17,7 +17,7 @@ def build(config: TTRLConsumerConfig | None = None) -> TTRLConsumer:
     if resolved.implementation == "native":
         raise ValueError(
             "TTRL implementation='native' is a workload; build it "
-            "with tllm.consumers.ttrl.workload.build_ttrl_workload and pass it "
+            "with tllm.consumers.ttrl.legacy_workload.build_ttrl_workload and pass it "
             "to make_llm(..., workloads=(...)), not the legacy consumer plugin"
         )
     return PLUGIN.build(config)

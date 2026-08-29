@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from tllm.consumers.base import BaseConsumer
-from tllm.consumers.recirculation.config import RecirculationConfig
+from tllm.consumers.recirculation.config import LegacyRecirculationConfig
 from tllm.consumers.recirculation.graph import build_recirculation_graph
 from tllm.ports.base import ConsumerFlow
 from tllm.workgraph.recurrence import (
@@ -61,8 +61,8 @@ class _RecirculationRuntimeAdapter:
         return self.consumer.mix(source, destination, positions)
 
 
-class RecirculationConsumer(BaseConsumer[RecirculationConfig]):
-    def __init__(self, config: RecirculationConfig) -> None:
+class RecirculationConsumer(BaseConsumer[LegacyRecirculationConfig]):
+    def __init__(self, config: LegacyRecirculationConfig) -> None:
         self.config = config
 
     @property

@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""GPU correctness smoke for native TTRL ExecutionRegions under mp=1.
+"""GPU correctness smoke for the native TTRL workload under mp=1.
 
-Documented deferral: the TTRL closed loop is host-staged
-(``stage_completed_generations``) and there is no control-plane channel that
-pushes staged rows into workers, so in the MP topology the workers only run
-zero-row steps.  This smoke therefore validates exactly the reconstruction
-half: workers rebuild the signed Region artifacts from the worker spec, run
-zero-row steps through the signed audit, and report namespaced diagnostics —
-while the parent's zero-completion steps keep the state version at zero.
-Training under MP is an explicit follow-up (runtime-level host pull channel).
+The parent stages a synthetic hidden/reward batch through the typed port
+transaction. The EngineCore worker must reconstruct the workload, receive the
+shared safetensors payload, train on the next signed step, and report a nonzero
+loss/update count and reward-model version.
 """
 
 from __future__ import annotations
@@ -43,10 +39,10 @@ def _worker_diagnostics(status: Mapping[str, object]) -> dict[str, int | float]:
     raw_diagnostics = status.get("diagnostics")
     if type(raw_diagnostics) is not dict:
         raise AssertionError(f"worker diagnostics are not a JSON object: {status!r}")
-    raw_metrics = raw_diagnostics.get("ttrl.region")
+    raw_metrics = raw_diagnostics.get("ttrl")
     if type(raw_metrics) is not dict:
         raise AssertionError(
-            f"worker did not report namespaced TTRL Region diagnostics: {status!r}"
+            f"worker did not report namespaced TTRL diagnostics: {status!r}"
         )
     metrics: dict[str, int | float] = {}
     for name, value in raw_metrics.items():
@@ -57,15 +53,15 @@ def _worker_diagnostics(status: Mapping[str, object]) -> dict[str, int | float]:
         ):
             raise AssertionError(f"worker returned an invalid diagnostic value: {status!r}")
         metrics[name] = value
-    for name in ("loss_count", "update_count", "staged_reward_rows"):
+    for name in ("loss_count", "update_count"):
         value = metrics.get(name)
         if type(value) is not int:
             raise AssertionError(
                 f"worker TTRL diagnostics omitted integer {name!r}: {status!r}"
             )
-        if value != 0:
+        if value < 1:
             raise AssertionError(
-                "worker TTRL Region trained without a staged batch: "
+                "worker TTRL did not train from the staged batch: "
                 f"diagnostics={metrics!r} status={status!r}"
             )
     return metrics
@@ -105,15 +101,18 @@ def _worker_statuses(
         versions = status.get("state_versions")
         if not isinstance(versions, list):
             raise AssertionError(f"worker did not report state versions: {status!r}")
+        reward_versions: list[object] = []
         for raw_entry in versions:
             if not isinstance(raw_entry, Mapping):
                 continue
             entry = cast(Mapping[str, object], raw_entry)
-            if entry.get("resource") == "reward_model" and entry.get("version") != 0:
-                raise AssertionError(
-                    "worker TTRL reward-model version moved without a staged batch: "
-                    f"{status!r}"
-                )
+            if entry.get("resource") == "reward_model":
+                reward_versions.append(entry.get("version"))
+        if reward_versions != [1]:
+            raise AssertionError(
+                "worker TTRL reward-model version did not advance exactly once: "
+                f"{status!r}"
+            )
         _worker_diagnostics(status)
         normalized.append(status)
     return normalized
@@ -132,16 +131,15 @@ def main() -> int:
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     from vllm import SamplingParams
+    import torch
 
-    from tllm.consumers.ttrl.config import TTRLConsumerConfig
-    from tllm.consumers.ttrl.region_workload import TTRLRegionWorkload
+    from tllm.consumers.ttrl.workload import TTRLConfig, TTRLWorkload
     from tllm.runtime.mp.control import ControlPlane
     from tllm.runtime.runtime import TllmRuntime
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = TTRLRegionWorkload(
-        TTRLConsumerConfig(
-            implementation="region",
+    workload = TTRLWorkload(
+        TTRLConfig(
             rank=2,
             learning_rate=1e-3,
         )
@@ -190,12 +188,31 @@ def main() -> int:
             for index in range(int(args.batch_size))
         ]
         first = llm.generate(prompts, params, use_tqdm=False)
+        spec = workload.specialization
+        runtime.stage(
+            TTRLWorkload.train_hidden,
+            torch.randn(
+                int(args.batch_size),
+                spec.hidden_size,
+                device=spec.device,
+                dtype=spec.dtype,
+            ),
+        )
+        runtime.stage(
+            TTRLWorkload.train_rewards,
+            torch.linspace(
+                0.0,
+                1.0,
+                int(args.batch_size),
+                device=spec.device,
+                dtype=torch.float32,
+            ),
+        )
         second = llm.generate(prompts, params, use_tqdm=False)
         expected_counts = [int(args.max_new_tokens)] * int(args.batch_size)
         if _token_counts(first) != expected_counts or _token_counts(second) != expected_counts:
             raise AssertionError("native MP TTRL generation did not complete")
 
-        # Zero-row steps only: workers reconstruct and stay at version zero.
         statuses = _worker_statuses(
             plane.workload_status(),
             parent_pid=os.getpid(),

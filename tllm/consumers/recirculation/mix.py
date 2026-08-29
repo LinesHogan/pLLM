@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from tllm.consumers.recirculation.config import RecirculationConfig
+from tllm.consumers.recirculation.spec import RecirculationSettings
 from tllm.workgraph.recurrence import RecurrenceOp
 
 
 def mix_recirculation_tensors(
-    config: RecirculationConfig,
+    config: RecirculationSettings,
     source: torch.Tensor,
     destination: torch.Tensor,
     positions: torch.Tensor,
@@ -33,7 +33,7 @@ def mix_recirculation_tensors(
 
 
 class RecirculationMixAdapter:
-    def __init__(self, config: RecirculationConfig, *, layer_count: int) -> None:
+    def __init__(self, config: RecirculationSettings, *, layer_count: int) -> None:
         self.config = config
         self.source_layer, self.destination_layer = config.resolved_layers(layer_count)
 

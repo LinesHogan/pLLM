@@ -264,12 +264,16 @@ class TllmWorkerExtension:
     _tllm_last_finalized_workload: tuple[str, int] | None = None
     _tllm_last_drained_workload: tuple[str, int] | None = None
 
+    def _tllm_worker_id(self) -> str:
+        return f"{os.getpid()}:{id(self):x}"
+
     def tllm_ping(self) -> dict[str, Any]:
         """Liveness/provenance probe: which process is answering."""
         from tllm.runtime import residual_runtime as core
 
         return {
             "pid": os.getpid(),
+            "worker_id": self._tllm_worker_id(),
             "patch_installed": bool(core._PATCH_INSTALLED),
             "consumer": None if core.RUNTIME.consumer is None else str(core.RUNTIME.consumer.consumer_id),
             "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
@@ -343,22 +347,38 @@ class TllmWorkerExtension:
         from tllm.runtime import residual_runtime as core
         from tllm.runtime.mp.port_wire import decode_port_payload
 
-        execution = core.RUNTIME.workload_execution
+        store = core.RUNTIME.workload_execution_store
+        execution = (
+            store.next_execution
+            if store is not None
+            else core.RUNTIME.workload_execution
+        )
         if execution is None:
             raise RuntimeError("worker has no active workload execution")
         execution.prepare_port(key, transaction, decode_port_payload(wire))
-        return {"key": key, "transaction": transaction, "prepared": True}
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "key": key,
+            "transaction": transaction,
+            "prepared": True,
+        }
 
     def tllm_commit_workload_port(
         self, key: str, transaction: str
     ) -> dict[str, object]:
         from tllm.runtime import residual_runtime as core
 
-        execution = core.RUNTIME.workload_execution
+        store = core.RUNTIME.workload_execution_store
+        execution = (
+            store.next_execution
+            if store is not None
+            else core.RUNTIME.workload_execution
+        )
         if execution is None:
             raise RuntimeError("worker has no active workload execution")
         sequence = execution.commit_port(key, transaction)
         return {
+            "worker_id": self._tllm_worker_id(),
             "key": key,
             "transaction": transaction,
             "committed": True,
@@ -370,10 +390,20 @@ class TllmWorkerExtension:
     ) -> dict[str, object]:
         from tllm.runtime import residual_runtime as core
 
-        execution = core.RUNTIME.workload_execution
+        store = core.RUNTIME.workload_execution_store
+        execution = (
+            store.next_execution
+            if store is not None
+            else core.RUNTIME.workload_execution
+        )
         if execution is not None:
             execution.abort_port(key, transaction)
-        return {"key": key, "transaction": transaction, "aborted": True}
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "key": key,
+            "transaction": transaction,
+            "aborted": True,
+        }
 
     def tllm_apply_enable_flags(self, flags: dict[str, bool]) -> None:
         """Apply supported enable flags to this process's runtime."""

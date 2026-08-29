@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU correctness smoke for native ESamp ExecutionRegions under mp=1.
+"""GPU correctness smoke for native ESamp workloads under mp=1.
 
 This is intentionally a correctness-only, single-engine test.  The parent
 constructs a native workload, workers reconstruct the signed Region artifacts
@@ -154,7 +154,7 @@ def main() -> int:
 
     from vllm import SamplingParams
 
-    from tllm.consumers.esamp.region_workload import ESampConfig, ESampWorkload
+    from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
     from tllm.contracts.request_identity import resolve_request_identity
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane

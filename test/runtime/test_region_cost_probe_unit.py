@@ -8,7 +8,7 @@ import torch
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
-from tllm.consumers.override.region_workload import OverRIDEConfig, OverRIDEWorkload
+from tllm.consumers.override.workload import OverRIDEConfig, OverRIDEWorkload
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding

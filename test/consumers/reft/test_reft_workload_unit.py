@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
-from tllm.consumers.reft.region_workload import ReftConfig, ReftWorkload
-from tllm.consumers.reft.vllm_patch import _prompt_rows
+from tllm.consumers.reft.workload import ReftConfig, ReftWorkload
+from tllm.consumers.reft.vllm_patch import (
+    _prompt_rows,
+    install_reft_patch_on_llm,
+)
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -66,6 +70,47 @@ def _drive(runtime: TllmRuntime, compilation: object) -> int:
 
 
 class ReftWorkloadUnitTest(unittest.TestCase):
+    def test_llm_patch_resolves_active_workload_after_epoch_replacement(self) -> None:
+        class _Layer(torch.nn.Module):
+            def forward(
+                self,
+                positions: torch.Tensor,
+                hidden: torch.Tensor,
+                residual: torch.Tensor | None = None,
+            ) -> tuple[torch.Tensor]:
+                del positions, residual
+                return (hidden,)
+
+        model = torch.nn.Module()
+        body = torch.nn.Module()
+        body.layers = torch.nn.ModuleList([_Layer()])
+        model.model = body
+        llm = SimpleNamespace(
+            llm_engine=SimpleNamespace(
+                model_executor=SimpleNamespace(
+                    driver_worker=SimpleNamespace(
+                        model_runner=SimpleNamespace(model=model)
+                    )
+                )
+            )
+        )
+        initial = ReftWorkload(ReftConfig(layers=(0,), rank=_RANK))
+        replacement = ReftWorkload(ReftConfig(layers=(0,), rank=_RANK))
+        runtime = mock.create_autospec(TllmRuntime, instance=True)
+        runtime.local_workload.side_effect = [initial, initial, replacement]
+
+        handle = install_reft_patch_on_llm(llm, runtime)
+        try:
+            layer = body.layers[0]
+            positions = torch.arange(2)
+            hidden = torch.randn(2, _HIDDEN)
+            _ = layer(positions, hidden)
+            _ = layer(positions, hidden)
+        finally:
+            handle.restore()
+        self.assertEqual(runtime.local_workload.call_count, 3)
+        runtime.local_workload.assert_called_with(ReftWorkload)
+
     def test_config_constraints_are_rust_validated(self) -> None:
         with self.assertRaisesRegex(ValueError, "constraint"):
             ReftConfig(rank=0)

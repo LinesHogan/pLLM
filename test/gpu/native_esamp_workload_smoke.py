@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU correctness smoke for the native ESamp ExecutionRegion path.
+"""GPU correctness smoke for the native ESamp workload path.
 
 This deliberately constructs ``ESampWorkload`` through ``TllmRuntime``.
 It must never install a legacy/program consumer: the assertions below inspect
@@ -90,7 +90,7 @@ def main() -> int:
 
     from vllm import SamplingParams
 
-    from tllm.consumers.esamp.region_workload import ESampConfig, ESampWorkload
+    from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
     from tllm.contracts.request_identity import resolve_request_identity
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.runtime import TllmRuntime
@@ -148,7 +148,7 @@ def main() -> int:
         )
         if len(regions) != 2 or tuple(region.tasks for region in regions) != (
             ("predict_and_loss",),
-            ("update",),
+            ("predict_and_loss__optimize_distiller",),
         ):
             raise AssertionError(f"unexpected ESamp Region partition: {regions!r}")
         store = core.RUNTIME.workload_execution_store

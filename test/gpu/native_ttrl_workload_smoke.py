@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""GPU correctness smoke for the native TTRL ExecutionRegion path.
+"""GPU correctness smoke for the native TTRL workload path.
 
-The closed loop is host-staged (``stage_completed_generations``) and the
-control intents are published from the signed ``publish`` Region, so this
-smoke drives real engine steps with plain ``llm.generate`` and asserts the
-signed state-version audit, the three control stores, and the executor's
+The closed loop uses typed staged ports and one typed host output. This smoke
+drives real engine steps with plain ``llm.generate`` and asserts training,
+state-version advancement, published control intent, and the executor's
 non-capture contract.
 """
 
@@ -14,7 +13,6 @@ import argparse
 import json
 import os
 import sys
-import types
 from collections.abc import Mapping
 from math import isfinite
 
@@ -43,10 +41,10 @@ def _ttrl_diagnostics(execution: object) -> dict[str, int | float]:
     raw = execution.read_resource_diagnostics()
     if not isinstance(raw, Mapping):
         raise AssertionError(f"resource diagnostics are not a mapping: {raw!r}")
-    payload = raw.get("ttrl.region")
+    payload = raw.get("ttrl")
     if not isinstance(payload, Mapping):
         raise AssertionError(
-            f"native TTRL Region did not report namespaced diagnostics: {raw!r}"
+            f"native TTRL did not report namespaced diagnostics: {raw!r}"
         )
     metrics: dict[str, int | float] = {}
     for name, value in payload.items():
@@ -76,29 +74,28 @@ def main() -> int:
         raise ValueError("--max-new-tokens must be positive")
 
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.runner == "mrv2" else "0"
-    # The publish Region lands control intents on a host-bound runtime object;
-    # keep the engine in-process so the evidence is observable here.
+    # The host output is process-local; keep the engine in-process so it can be
+    # drained directly after the signed publish task.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     from vllm import SamplingParams
 
-    from tllm.consumers.ttrl.config import TTRLConsumerConfig
-    from tllm.consumers.ttrl.region_workload import TTRLRegionWorkload
+    from tllm.consumers.ttrl.workload import (
+        TTRLConfig,
+        TTRLWorkload,
+        prepare_ttrl_training_batch,
+    )
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.generation_trace_runtime import (
         CompletionTraceEntry,
         GenerationTraceBatch,
     )
-    from tllm.runtime.retry_control_runtime import read_retry_controls
-    from tllm.runtime.reward_outcome_runtime import read_reward_outcomes
     from tllm.runtime.runtime import TllmRuntime
-    from tllm.runtime.update_barrier_runtime import read_update_barriers
     from tllm.schedule import RegionImplementationKind
     from tllm.util.tools import shutdown_llm_instance
 
-    workload = TTRLRegionWorkload(
-        TTRLConsumerConfig(
-            implementation="region",
+    workload = TTRLWorkload(
+        TTRLConfig(
             rank=2,
             learning_rate=1e-3,
         )
@@ -128,7 +125,7 @@ def main() -> int:
         regions = compilation.decision.execution_regions
         if len(regions) != 3 or tuple(region.tasks for region in regions) != (
             ("train",),
-            ("update",),
+            ("train__optimize_reward_model",),
             ("publish",),
         ):
             raise AssertionError(f"unexpected TTRL Region partition: {regions!r}")
@@ -162,9 +159,8 @@ def main() -> int:
             )
 
         # Stage one closed-loop batch (host API) and publish target, then step.
-        spec = workload.specialization
-        if spec is None:
-            raise AssertionError("TTRL workload was not specialized with the model")
+        active_workload = runtime.local_workload(TTRLWorkload)
+        spec = active_workload.specialization
         trace = GenerationTraceBatch(
             entries=tuple(
                 CompletionTraceEntry(
@@ -181,11 +177,12 @@ def main() -> int:
             )
         )
         hidden_rows = torch.randn(3, spec.hidden_size, dtype=spec.dtype).to(spec.device)
-        intent = workload.stage_completed_generations(trace, hidden_rows)
-        if intent.training_row_count != 3:
-            raise AssertionError(f"unexpected staged TTRL intent: {intent!r}")
-        control = types.SimpleNamespace()
-        workload.bind_control_runtime(control)
+        batch = prepare_ttrl_training_batch(trace, hidden_rows)
+        if batch.intent.training_row_count != 3:
+            raise AssertionError(f"unexpected staged TTRL intent: {batch.intent!r}")
+        runtime.stage(TTRLWorkload.train_hidden, batch.hidden)
+        runtime.stage(TTRLWorkload.train_rewards, batch.rewards)
+        runtime.stage(TTRLWorkload.pending_intent, batch.intent)
 
         second = llm.generate(prompts, params, use_tqdm=False)
         execution = core.RUNTIME.workload_execution
@@ -202,27 +199,19 @@ def main() -> int:
             if counts != [int(args.max_new_tokens)] * 2:
                 raise AssertionError(f"generation did not complete: {counts}")
 
-        rewards = read_reward_outcomes(control)
-        retries = read_retry_controls(control)
-        barriers = read_update_barriers(control)
-        if (
-            len(rewards.entries) != 3
-            or len(retries.entries) != 3
-            or len(barriers.entries) != 1
-            or barriers.entries[0].state != "ready"
-        ):
+        published_outputs = runtime.drain(TTRLWorkload.control)
+        if len(published_outputs) != 1:
             raise AssertionError(
-                "TTRL publish Region did not land the control stores: "
-                f"rewards={rewards!r} retries={retries!r} barriers={barriers!r}"
+                f"TTRL publish task produced {len(published_outputs)} controls"
             )
-        published = workload.last_published_intent
-        if published is None or published.adapter_version_id != "ttrl:update:1":
+        published = published_outputs[0]
+        if published.adapter_version_id != "ttrl:update:1":
             raise AssertionError(f"TTRL publish stamped a stale version: {published!r}")
 
         diagnostics = _ttrl_diagnostics(execution)
         if diagnostics.get("update_count", 0) <= 0:
             raise AssertionError(
-                f"native TTRL Region did not train: diagnostics={diagnostics!r}"
+                f"native TTRL did not train: diagnostics={diagnostics!r}"
             )
         physical = execution.read_workgraph_runtime_stats()
         if (
@@ -242,7 +231,7 @@ def main() -> int:
                     "signature": compilation.decision.signature,
                     "state_version": version,
                     "adapter_version_id": published.adapter_version_id,
-                    "reward_rows": len(rewards.entries),
+                    "reward_rows": len(batch.rewards),
                     "diagnostics": diagnostics,
                     "execute_count": physical.execute_count,
                     "eager_count": physical.eager_count,

@@ -20,8 +20,13 @@ class SharedPortPayload:
     memory: SharedMemory
 
     def release(self) -> None:
-        self.memory.close()
-        self.memory.unlink()
+        try:
+            self.memory.close()
+        finally:
+            try:
+                self.memory.unlink()
+            except FileNotFoundError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,24 +41,33 @@ EncodedPortPayload = SharedPortPayload | InlinePortPayload
 
 
 def _shared_tensor_wire(tensors: Mapping[str, torch.Tensor], kind: str) -> EncodedPortPayload:
+    devices = {name: str(tensor.device) for name, tensor in tensors.items()}
     payload = save(
         {name: tensor.detach().cpu().contiguous() for name, tensor in tensors.items()}
     )
     memory = SharedMemory(create=True, size=len(payload))
-    buffer = memory.buf
-    if buffer is None:
-        memory.close()
-        memory.unlink()
-        raise RuntimeError("shared-memory port payload has no writable buffer")
-    buffer[: len(payload)] = payload
-    return SharedPortPayload(
+    encoded = SharedPortPayload(
         wire={
             "kind": kind,
             "shared_memory": memory.name,
             "size": len(payload),
+            "devices": devices,
         },
         memory=memory,
     )
+    buffer = memory.buf
+    try:
+        if buffer is None:
+            raise RuntimeError("shared-memory port payload has no writable buffer")
+        buffer[: len(payload)] = payload
+    except BaseException:
+        try:
+            if buffer is not None:
+                buffer.release()
+        finally:
+            encoded.release()
+        raise
+    return encoded
 
 
 def encode_port_payload(value: object) -> EncodedPortPayload:
@@ -87,16 +101,34 @@ def decode_port_payload(wire: Mapping[str, object]) -> object:
     if kind in ("tensor", "tensor_map"):
         memory_name = wire["shared_memory"]
         size = wire["size"]
-        if not isinstance(memory_name, str) or not isinstance(size, int):
+        raw_devices = wire["devices"]
+        if (
+            not isinstance(memory_name, str)
+            or not isinstance(size, int)
+            or type(raw_devices) is not dict
+        ):
             raise TypeError("shared staged payload metadata is invalid")
+        devices: dict[str, torch.device] = {}
+        for name, device_wire in raw_devices.items():
+            if type(name) is not str or type(device_wire) is not str:
+                raise TypeError("shared staged payload devices are invalid")
+            device = torch.device(device_wire)
+            if str(device) != device_wire:
+                raise ValueError("shared staged payload device is not canonical")
+            devices[name] = device
         memory = SharedMemory(name=memory_name)
         try:
             buffer = memory.buf
             if buffer is None:
                 raise RuntimeError("shared staged payload has no readable buffer")
-            tensors = load(bytes(buffer[:size]))
+            cpu_tensors = load(bytes(buffer[:size]))
         finally:
             memory.close()
+        if devices.keys() != cpu_tensors.keys():
+            raise ValueError("shared staged payload device keys do not match tensors")
+        tensors = {
+            name: tensor.to(devices[name]) for name, tensor in cpu_tensors.items()
+        }
         return tensors["value"] if kind == "tensor" else tensors
     if kind == "dataclass":
         type_path = wire["type"]

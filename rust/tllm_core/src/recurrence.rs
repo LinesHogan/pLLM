@@ -268,6 +268,39 @@ struct TypedOperand {
     resource_id: Option<String>,
 }
 
+#[pymethods]
+impl TypedOperand {
+    #[staticmethod]
+    fn seed(binding_id: String) -> Self {
+        Self {
+            kind: OperandKind::Seed,
+            binding_id: Some(binding_id),
+            value_id: None,
+            resource_id: None,
+        }
+    }
+
+    #[staticmethod]
+    fn region_value(value_id: String) -> Self {
+        Self {
+            kind: OperandKind::RegionValue,
+            binding_id: None,
+            value_id: Some(value_id),
+            resource_id: None,
+        }
+    }
+
+    #[staticmethod]
+    fn backend_resource(resource_id: String) -> Self {
+        Self {
+            kind: OperandKind::BackendResource,
+            binding_id: None,
+            value_id: None,
+            resource_id: Some(resource_id),
+        }
+    }
+}
+
 #[pyclass(frozen, eq, eq_int, hash)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -289,6 +322,14 @@ struct TypedEffect {
     resource_id: String,
 }
 
+#[pymethods]
+impl TypedEffect {
+    #[new]
+    fn new(kind: EffectKind, resource_id: String) -> Self {
+        Self { kind, resource_id }
+    }
+}
+
 #[pyclass]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,12 +349,58 @@ struct TypedOperation {
     effects: Vec<TypedEffect>,
 }
 
+#[pymethods]
+impl TypedOperation {
+    #[new]
+    #[pyo3(signature = (operation_id, primitive_key, implementation_id, operands, results, effects=Vec::new()))]
+    fn new(
+        py: Python<'_>,
+        operation_id: String,
+        primitive_key: String,
+        implementation_id: String,
+        operands: Vec<Py<TypedOperand>>,
+        results: Vec<String>,
+        effects: Vec<Py<TypedEffect>>,
+    ) -> Self {
+        Self {
+            operation_id,
+            primitive_key,
+            implementation_id,
+            operands: operands
+                .into_iter()
+                .map(|operand| operand.borrow(py).clone())
+                .collect(),
+            results,
+            effects: effects
+                .into_iter()
+                .map(|effect| effect.borrow(py).clone())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[pyclass]
 struct TypedDependency {
+    #[pyo3(get)]
     source: String,
+    #[pyo3(get)]
     target: String,
+    #[pyo3(get)]
     kind: String,
+}
+
+#[pymethods]
+impl TypedDependency {
+    #[new]
+    fn new(source: String, target: String, kind: String) -> Self {
+        Self {
+            source,
+            target,
+            kind,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -345,8 +432,66 @@ struct RowAdmission {
     mixed_batch: MixedBatchPolicy,
 }
 
+#[pyclass(frozen)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedStageAdmission {
+    value: RowAdmission,
+}
+
+#[pymethods]
+impl TypedStageAdmission {
+    #[staticmethod]
+    fn prefill_reject() -> Self {
+        Self {
+            value: RowAdmission {
+                allowed_phases: vec!["prefill".into()],
+                mixed_batch: MixedBatchPolicy::Reject,
+            },
+        }
+    }
+
+    #[staticmethod]
+    fn decode_reject() -> Self {
+        Self {
+            value: RowAdmission {
+                allowed_phases: vec!["decode".into()],
+                mixed_batch: MixedBatchPolicy::Reject,
+            },
+        }
+    }
+}
+
+#[pyclass(frozen)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedStageFusionPolicy {
+    value: String,
+}
+
+#[pymethods]
+impl TypedStageFusionPolicy {
+    #[staticmethod]
+    fn serial() -> Self {
+        Self {
+            value: "none".into(),
+        }
+    }
+
+    #[staticmethod]
+    fn ordered(max_rows: usize, mut internalized_edges: Vec<String>) -> PyResult<Self> {
+        internalized_edges.sort();
+        internalized_edges.dedup();
+        let value = format!(
+            "max_rows={max_rows};internalized_edges={}",
+            internalized_edges.join(",")
+        );
+        parse_fusion_policy(&value)?;
+        Ok(Self { value })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[pyclass(name = "TypedRecurrence")]
 struct FiniteRecurrenceSpec {
     schema_version: u64,
     region_id: String,
@@ -356,6 +501,39 @@ struct FiniteRecurrenceSpec {
     operations: Vec<TypedOperation>,
     dependencies: Vec<TypedDependency>,
     retained_values: Vec<String>,
+}
+
+#[pymethods]
+impl FiniteRecurrenceSpec {
+    #[new]
+    #[pyo3(signature = (region_id, implementation_id, admission, fusion_policy, operations, dependencies, retained_values))]
+    fn new(
+        py: Python<'_>,
+        region_id: String,
+        implementation_id: String,
+        admission: Py<TypedStageAdmission>,
+        fusion_policy: Py<TypedStageFusionPolicy>,
+        operations: Vec<Py<TypedOperation>>,
+        dependencies: Vec<Py<TypedDependency>>,
+        retained_values: Vec<String>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            region_id,
+            implementation_id,
+            row_admission: admission.borrow(py).value.clone(),
+            fusion_policy: fusion_policy.borrow(py).value.clone(),
+            operations: operations
+                .into_iter()
+                .map(|operation| operation.borrow(py).clone())
+                .collect(),
+            dependencies: dependencies
+                .into_iter()
+                .map(|dependency| dependency.borrow(py).clone())
+                .collect(),
+            retained_values,
+        }
+    }
 }
 
 #[pyclass]
@@ -873,6 +1051,18 @@ struct TypedStageBinding {
     coordinates: Vec<i64>,
 }
 
+#[pymethods]
+impl TypedStageBinding {
+    #[new]
+    fn new(binding_id: String, kind: String, coordinates: Vec<i64>) -> Self {
+        Self {
+            binding_id,
+            kind,
+            coordinates,
+        }
+    }
+}
+
 #[pyclass]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -883,6 +1073,18 @@ struct TypedStageResourceBinding {
     kind: String,
     #[pyo3(get)]
     coordinates: Vec<i64>,
+}
+
+#[pymethods]
+impl TypedStageResourceBinding {
+    #[new]
+    fn new(resource_id: String, kind: String, coordinates: Vec<i64>) -> Self {
+        Self {
+            resource_id,
+            kind,
+            coordinates,
+        }
+    }
 }
 
 #[pyclass]
@@ -899,8 +1101,22 @@ struct TypedStageOutputBinding {
     coordinates: Vec<i64>,
 }
 
+#[pymethods]
+impl TypedStageOutputBinding {
+    #[new]
+    fn new(output_id: String, value_id: String, kind: String, coordinates: Vec<i64>) -> Self {
+        Self {
+            output_id,
+            value_id,
+            kind,
+            coordinates,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[pyclass(name = "TypedRecurrenceStageDefinition")]
 struct TypedRecurrenceStageSpec {
     schema_version: u64,
     shape_specialization: Vec<(String, String)>,
@@ -910,6 +1126,48 @@ struct TypedRecurrenceStageSpec {
     seed_bindings: Vec<TypedStageBinding>,
     resource_bindings: Vec<TypedStageResourceBinding>,
     output_bindings: Vec<TypedStageOutputBinding>,
+}
+
+#[pymethods]
+impl TypedRecurrenceStageSpec {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        row_count: u64,
+        recurrence: Py<FiniteRecurrenceSpec>,
+        seed_bindings: Vec<Py<TypedStageBinding>>,
+        resource_bindings: Vec<Py<TypedStageResourceBinding>>,
+        output_bindings: Vec<Py<TypedStageOutputBinding>>,
+    ) -> Self {
+        let mut seed_bindings: Vec<_> = seed_bindings
+            .into_iter()
+            .map(|binding| binding.borrow(py).clone())
+            .collect();
+        seed_bindings.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
+        let mut resource_bindings: Vec<_> = resource_bindings
+            .into_iter()
+            .map(|binding| binding.borrow(py).clone())
+            .collect();
+        resource_bindings.sort_by(|left, right| left.resource_id.cmp(&right.resource_id));
+        let mut output_bindings: Vec<_> = output_bindings
+            .into_iter()
+            .map(|binding| binding.borrow(py).clone())
+            .collect();
+        output_bindings.sort_by(|left, right| left.output_id.cmp(&right.output_id));
+        Self {
+            schema_version: 1,
+            shape_specialization: vec![
+                ("stage/request_count".into(), "1".into()),
+                ("stage/row_count".into(), row_count.to_string()),
+            ],
+            row_count,
+            request_count: 1,
+            recurrence: recurrence.borrow(py).clone(),
+            seed_bindings,
+            resource_bindings,
+            output_bindings,
+        }
+    }
 }
 
 #[pyclass]
@@ -987,6 +1245,19 @@ enum TypedStagePlanAdmission {
     Noop,
 }
 
+/// One closed packed-plan result. `Noop` always carries an empty request list;
+/// `Execute` carries every request-local signed stage selected by Rust.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedPackedRecurrenceStageBatch {
+    #[pyo3(get)]
+    admission: TypedStagePlanAdmission,
+    #[pyo3(get)]
+    total_rows: i64,
+    #[pyo3(get)]
+    requests: Vec<TypedPackedRecurrenceStageBinding>,
+}
+
 #[pyclass]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TypedRecurrenceStageArtifactBundleEntry {
@@ -1008,6 +1279,58 @@ struct TypedRecurrenceStageArtifactBundle {
     signature: String,
     #[pyo3(get)]
     artifacts: Vec<TypedRecurrenceStageArtifactBundleEntry>,
+}
+
+#[pymethods]
+impl TypedRecurrenceStageArtifactBundle {
+    #[staticmethod]
+    fn compile(py: Python<'_>, definitions: Vec<Py<TypedRecurrenceStageSpec>>) -> PyResult<Self> {
+        let artifacts = definitions
+            .into_iter()
+            .map(|definition| {
+                let definition = definition.borrow(py).clone();
+                let row_count = definition.row_count;
+                stage_artifact_from_spec(definition).and_then(|artifact| {
+                    let artifact_json = serde_json::to_string(&artifact).map_err(|error| {
+                        validation_error(format!(
+                            "failed to encode typed recurrence stage artifact: {error}"
+                        ))
+                    })?;
+                    Ok(TypedRecurrenceStageArtifactBundleWireEntry {
+                        row_count,
+                        artifact_json,
+                    })
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        bundle_from_wire(1, artifacts)
+    }
+
+    #[staticmethod]
+    fn from_wire(bundle_json: &str) -> PyResult<Self> {
+        let wire: TypedRecurrenceStageArtifactBundleWire =
+            decode_json(bundle_json, "typed recurrence stage artifact bundle")?;
+        validate_stage_artifact_bundle_wire(wire)
+    }
+
+    fn to_wire(&self) -> PyResult<String> {
+        encode_stage_artifact_bundle(self)
+    }
+
+    #[getter]
+    fn max_row_count(&self) -> PyResult<u64> {
+        self.artifacts
+            .last()
+            .map(|entry| entry.row_count)
+            .ok_or_else(|| validation_error("typed recurrence stage artifact bundle is empty"))
+    }
+
+    fn bind_packed_plan(
+        &self,
+        row_plan: PyRef<'_, PackedPrefillRowPlan>,
+    ) -> PyResult<TypedPackedRecurrenceStageBatch> {
+        bind_stage_bundle_for_packed_plan(self, &row_plan)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1583,6 +1906,13 @@ fn admit_typed_recurrence_stage_bundle_for_packed_plan(
     bundle: PyRef<'_, TypedRecurrenceStageArtifactBundle>,
     row_plan: PyRef<'_, PackedPrefillRowPlan>,
 ) -> PyResult<TypedStagePlanAdmission> {
+    admit_stage_bundle_for_packed_plan(&bundle, &row_plan)
+}
+
+fn admit_stage_bundle_for_packed_plan(
+    bundle: &TypedRecurrenceStageArtifactBundle,
+    row_plan: &PackedPrefillRowPlan,
+) -> PyResult<TypedStagePlanAdmission> {
     let artifact = &bundle
         .artifacts
         .first()
@@ -1621,6 +1951,14 @@ fn admit_typed_recurrence_stage_bundle_for_packed_plan(
 fn bind_typed_recurrence_stage_bundle_for_packed_span(
     bundle: PyRef<'_, TypedRecurrenceStageArtifactBundle>,
     row_plan: PyRef<'_, PackedPrefillRowPlan>,
+    request_ordinal: i64,
+) -> PyResult<TypedPackedRecurrenceStageBinding> {
+    bind_stage_bundle_for_packed_span(&bundle, &row_plan, request_ordinal)
+}
+
+fn bind_stage_bundle_for_packed_span(
+    bundle: &TypedRecurrenceStageArtifactBundle,
+    row_plan: &PackedPrefillRowPlan,
     request_ordinal: i64,
 ) -> PyResult<TypedPackedRecurrenceStageBinding> {
     let span = row_plan
@@ -1681,17 +2019,45 @@ fn bind_typed_recurrence_stage_bundle_for_packed_span(
     )
 }
 
+fn bind_stage_bundle_for_packed_plan(
+    bundle: &TypedRecurrenceStageArtifactBundle,
+    row_plan: &PackedPrefillRowPlan,
+) -> PyResult<TypedPackedRecurrenceStageBatch> {
+    let admission = admit_stage_bundle_for_packed_plan(bundle, row_plan)?;
+    if admission == TypedStagePlanAdmission::Noop {
+        return Ok(TypedPackedRecurrenceStageBatch {
+            admission,
+            total_rows: row_plan.total_rows,
+            requests: Vec::new(),
+        });
+    }
+    let requests = row_plan
+        .request_spans
+        .iter()
+        .map(|span| bind_stage_bundle_for_packed_span(bundle, row_plan, span.request_ordinal))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(TypedPackedRecurrenceStageBatch {
+        admission,
+        total_rows: row_plan.total_rows,
+        requests,
+    })
+}
+
 #[pyfunction]
 fn compile_typed_recurrence_stage_artifact_bundle_json(spec_json: &str) -> PyResult<String> {
     let spec: TypedRecurrenceStageArtifactBundleSpec =
         decode_json(spec_json, "typed recurrence stage artifact bundle spec")?;
     let bundle = bundle_from_wire(spec.schema_version, spec.artifacts)?;
+    encode_stage_artifact_bundle(&bundle)
+}
+
+fn encode_stage_artifact_bundle(bundle: &TypedRecurrenceStageArtifactBundle) -> PyResult<String> {
     let wire = TypedRecurrenceStageArtifactBundleWire {
         schema_version: bundle.schema_version,
-        signature: bundle.signature,
+        signature: bundle.signature.clone(),
         artifacts: bundle
             .artifacts
-            .into_iter()
+            .iter()
             .map(|entry| {
                 serde_json::to_string(&entry.artifact)
                     .map(|artifact_json| TypedRecurrenceStageArtifactBundleWireEntry {
@@ -1834,16 +2200,22 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TypedOperand>()?;
     m.add_class::<TypedEffect>()?;
     m.add_class::<TypedOperation>()?;
+    m.add_class::<TypedDependency>()?;
+    m.add_class::<TypedStageAdmission>()?;
+    m.add_class::<TypedStageFusionPolicy>()?;
+    m.add_class::<FiniteRecurrenceSpec>()?;
     m.add_class::<TypedExecutionGroup>()?;
     m.add_class::<ExecutionGroupingKind>()?;
     m.add_class::<TypedRecurrencePlan>()?;
     m.add_class::<TypedStageBinding>()?;
     m.add_class::<TypedStageResourceBinding>()?;
     m.add_class::<TypedStageOutputBinding>()?;
+    m.add_class::<TypedRecurrenceStageSpec>()?;
     m.add_class::<TypedRecurrenceStageArtifact>()?;
     m.add_class::<TypedBoundRecurrenceStage>()?;
     m.add_class::<TypedObservedStageSpan>()?;
     m.add_class::<TypedPackedRecurrenceStageBinding>()?;
+    m.add_class::<TypedPackedRecurrenceStageBatch>()?;
     m.add_class::<TypedStagePlanAdmission>()?;
     m.add_class::<TypedRecurrenceStageArtifactBundleEntry>()?;
     m.add_class::<TypedRecurrenceStageArtifactBundle>()?;

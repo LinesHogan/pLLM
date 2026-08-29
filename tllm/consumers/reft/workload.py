@@ -1,4 +1,4 @@
-"""LoReFT activation intervention as a published State and generic mount."""
+"""LoReFT activation intervention as a published module and generic mount."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.kit.workload import Workload
 from tllm.workload import (
     NumericConstraint,
-    PublishedState,
+    PublishedModule,
     State,
     WorkloadConfig,
     config_field,
@@ -56,7 +56,7 @@ class ReftParameters(torch.nn.Module):
 
 @workload(id="reft", config=ReftConfig, enabled=ReftConfig.enabled)
 class ReftWorkload(Workload[ReftConfig]):
-    intervention: PublishedState[ReftParameters] = State.published()
+    intervention: PublishedModule[ReftParameters] = State.published_module()
 
     @intervention.initialize
     def init_intervention(self, spec: RuntimeSpecializationSpec) -> ReftParameters:

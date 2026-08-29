@@ -10,10 +10,6 @@ from tllm.contracts.hidden_locator import (
 )
 from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.request_meta_view import RowBatchMeta
-from tllm.contracts.recirculation import (
-    RECIRCULATION_PREFILL_BINDER_IMPLEMENTATION_ID,
-    RecirculationPrefillBindingConfig,
-)
 from tllm.contracts.runtime_context import RuntimeContext
 from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationInput,
@@ -33,6 +29,4 @@ __all__ = [
     "RuntimeContext",
     "RegionShapeSpecializationInput",
     "RegionShapeSpecializationRequest",
-    "RECIRCULATION_PREFILL_BINDER_IMPLEMENTATION_ID",
-    "RecirculationPrefillBindingConfig",
 ]

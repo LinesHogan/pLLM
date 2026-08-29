@@ -9,7 +9,7 @@ from tllm.workgraph.recurrence import JacobiPolicy
 
 
 @dataclass(frozen=True, slots=True)
-class RecirculationConfig:
+class LegacyRecirculationConfig:
     source_layer: int = -1
     destination_layer: int = 0
     alpha: float = 0.15
@@ -52,4 +52,6 @@ class RecirculationConfig:
         return source, destination
 
 
-__all__ = ["RecirculationConfig"]
+RecirculationConfig = LegacyRecirculationConfig
+
+__all__ = ["LegacyRecirculationConfig", "RecirculationConfig"]

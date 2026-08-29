@@ -21,8 +21,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, Sequence, TypeVar, cast
 import weakref
+import warnings
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
         WorkloadWorkerSpec,
     )
     from tllm.workload.staging import StagedPort
-    from tllm.workload.frontend import PublishedState
+    from tllm.workload.frontend import PublishedModule
     from tllm.workload.host import HostOutput
     from tllm.schedule import (
         CompileOptions,
@@ -57,6 +58,26 @@ _RUNNER_RUNTIMES: "weakref.WeakKeyDictionary[Any, TllmRuntime]" = weakref.WeakKe
 _ACTIVE_RUNTIME: "TllmRuntime | None" = None
 StagedT = TypeVar("StagedT")
 HostOutputT = TypeVar("HostOutputT")
+RuntimeWorkloadT = TypeVar("RuntimeWorkloadT")
+PublishedModuleT = TypeVar("PublishedModuleT", bound="torch.nn.Module")
+
+
+class _StagedWorkload(Protocol[StagedT]):
+    def stage_port(
+        self, port: "StagedPort[StagedT]", value: StagedT
+    ) -> int: ...
+
+    def prepare_port(self, key: str, transaction: str, value: object) -> None: ...
+
+    def commit_port(self, key: str, transaction: str) -> int: ...
+
+    def abort_port(self, key: str, transaction: str) -> None: ...
+
+
+class _HostOutputWorkload(Protocol[HostOutputT]):
+    def drain_port(
+        self, port: "HostOutput[HostOutputT]"
+    ) -> tuple[HostOutputT, ...]: ...
 
 
 def bind_runner_runtime(runner: Any, runtime: "TllmRuntime") -> None:
@@ -117,40 +138,162 @@ def _runtime_specialization_spec_from_wire(
 
 
 class TllmRuntime:
+    def local_workload(
+        self, workload_type: type[RuntimeWorkloadT]
+    ) -> RuntimeWorkloadT:
+        """Return the process-local instance that executes this workload type."""
+
+        self._require_workload_live()
+        from tllm.runtime import residual_runtime
+
+        compilation = self._workload_compilation
+        expected_epoch = (
+            compilation.physical.plan_epoch
+            if compilation is not None and compilation.physical is not None
+            else 1
+        )
+        store = residual_runtime.RUNTIME.workload_execution_store
+        if (
+            _ACTIVE_RUNTIME is self
+            and store is not None
+            and compilation is not None
+        ):
+            candidate = store.next_execution
+            if (
+                candidate.compilation.decision.signature
+                == compilation.decision.signature
+                and candidate.plan_epoch == expected_epoch
+            ):
+                return candidate.workload_instance(workload_type)
+        execution = residual_runtime.RUNTIME.workload_execution
+        if (
+            _ACTIVE_RUNTIME is self
+            and execution is not None
+            and compilation is not None
+            and execution.compilation.decision.signature
+            == compilation.decision.signature
+            and execution.plan_epoch == expected_epoch
+        ):
+            return execution.workload_instance(workload_type)
+        try:
+            workload = self._workloads_by_type[workload_type]
+        except KeyError as exc:
+            raise LookupError(workload_type.__qualname__) from exc
+        return cast(RuntimeWorkloadT, workload)
+
+    def _current_local_workload(
+        self, workload_type: type[RuntimeWorkloadT]
+    ) -> RuntimeWorkloadT:
+        from tllm.runtime import residual_runtime
+
+        store = residual_runtime.RUNTIME.workload_execution_store
+        if _ACTIVE_RUNTIME is self and store is not None:
+            return store.current.workload_instance(workload_type)
+        execution = residual_runtime.RUNTIME.workload_execution
+        if _ACTIVE_RUNTIME is self and execution is not None:
+            return execution.workload_instance(workload_type)
+        try:
+            workload = self._workloads_by_type[workload_type]
+        except KeyError as exc:
+            raise LookupError(workload_type.__qualname__) from exc
+        return cast(RuntimeWorkloadT, workload)
+
     def stage(self, port: "StagedPort[StagedT]", value: StagedT) -> int:
         """Stage one typed payload for the next signed workload step."""
 
-        workload = self._workloads_by_type[port.owner]
-        transaction = uuid4().hex
-        workload.prepare_port(port.key, transaction, value)
+        self._require_workload_live()
+        workload = cast(
+            "_StagedWorkload[StagedT]", self.local_workload(port.owner)
+        )
         from tllm.runtime.mp.control import active_control_plane
-        from tllm.runtime.mp.port_wire import encode_port_payload
 
         plane = active_control_plane()
-        encoded = encode_port_payload(value) if plane is not None else None
+        if plane is None:
+            return workload.stage_port(port, value)
+
+        from tllm.runtime.mp.port_wire import encode_port_payload
+
+        self._port_transaction_sequence += 1
+        transaction = (
+            f"{self._port_transaction_owner}:{self._port_transaction_sequence}"
+        )
+        quorum = plane.worker_quorum()
+        encoded = encode_port_payload(value)
+        local_prepared = False
+        remote_started = False
+        sequence_mismatch = False
         try:
-            if plane is not None and encoded is not None:
-                plane.prepare_workload_port(port.key, transaction, encoded.wire)
-                plane.commit_workload_port(port.key, transaction)
-            return workload.commit_port(port.key, transaction)
-        except Exception:
-            workload.abort_port(port.key, transaction)
-            if plane is not None:
-                plane.abort_workload_port(port.key, transaction)
+            workload.prepare_port(port.key, transaction, value)
+            local_prepared = True
+            remote_started = True
+            plane.prepare_workload_port(
+                port.key,
+                transaction,
+                encoded.wire,
+                quorum=quorum,
+            )
+            remote_commits = plane.commit_workload_port(
+                port.key,
+                transaction,
+                quorum=quorum,
+            )
+            local_sequence = workload.commit_port(port.key, transaction)
+            if local_sequence != remote_commits[0].sequence:
+                sequence_mismatch = True
+                raise RuntimeError(
+                    "workload port parent/worker sequence quorum mismatch"
+                )
+            return local_sequence
+        except Exception as exc:
+            rollback_failures: list[Exception] = []
+            if local_prepared:
+                try:
+                    workload.abort_port(port.key, transaction)
+                except Exception as rollback_error:
+                    rollback_failures.append(rollback_error)
+            if remote_started:
+                try:
+                    plane.abort_workload_port(
+                        port.key,
+                        transaction,
+                        quorum=quorum,
+                    )
+                except Exception as rollback_error:
+                    rollback_failures.append(rollback_error)
+            if rollback_failures:
+                self._fail_stop_workloads(
+                    "workload port transaction rollback did not reach its full quorum"
+                )
+                raise RuntimeError(
+                    "workload port publication failed and rollback quorum was not confirmed"
+                ) from exc
+            if sequence_mismatch:
+                self._fail_stop_workloads(
+                    "workload port parent and worker transaction histories diverged"
+                )
             raise
         finally:
-            if encoded is not None:
+            try:
                 encoded.release()
+            except Exception as cleanup_error:
+                warnings.warn(
+                    f"staged port shared-memory cleanup failed: {cleanup_error}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     def drain(self, port: "HostOutput[HostOutputT]") -> tuple[HostOutputT, ...]:
         """Drain typed outputs published by signed workload tasks."""
 
-        workload = self._workloads_by_type[port.owner]
+        workload = cast(
+            "_HostOutputWorkload[HostOutputT]",
+            self._current_local_workload(port.owner),
+        )
         return workload.drain_port(port)
 
     def publish(
         self,
-        state: "PublishedState[torch.nn.Module]",
+        state: "PublishedModule[PublishedModuleT]",
         values: "Mapping[str, torch.Tensor]",
     ) -> int:
         """Publish a complete typed State payload for the next safe point."""
@@ -237,6 +380,8 @@ class TllmRuntime:
             tuple[str, int], tuple[Any, "WorkloadCompilation", int]
         ] = {}
         self._workload_fail_stop_reason: str | None = None
+        self._port_transaction_owner = uuid4().hex
+        self._port_transaction_sequence = 0
         self._shape_specialization_poll_lock = RLock()
         for workload_instance in self._workloads:
             consumer = self._legacy_consumer_for(workload_instance)
@@ -1217,7 +1362,7 @@ class TllmRuntime:
         local_bindings = self.workload_execution_bindings
         if local_bindings is not None and not self._workload_worker_specs:
             raise RuntimeError(
-                "native Region workloads require an explicit worker reconstruction "
+                "native compiled workloads require an explicit worker reconstruction "
                 "spec; callable transport over the JSON control plane is forbidden"
             )
         if local_bindings is None and self._workload_worker_specs:
@@ -1310,7 +1455,7 @@ class TllmRuntime:
         local_bindings = self.workload_execution_bindings
         if local_bindings is not None and not self._workload_worker_specs:
             raise RuntimeError(
-                "native Region workloads require an explicit worker reconstruction "
+                "native compiled workloads require an explicit worker reconstruction "
                 "spec; callable transport over the JSON control plane is forbidden"
             )
         if local_bindings is None and self._workload_worker_specs:

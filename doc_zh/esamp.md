@@ -12,7 +12,7 @@ ESamp（*Large Language Models Explore by Latent Distilling*）是 tLLM 的参�
 
 | `implementation=` | 是什么 |
 |---|---|
-| `"region"` | native exact eager `ExecutionRegion` declaration。Rust 签名 Region 契约，Python 只机械绑定；不使用 legacy ESamp authority。已通过 MRv1/MRv2 的 in-process 与 EngineCore MP 正确性，loss/update/state-version/intervention 非零，fallback/replay 为零。这不是吞吐或 CUDA Graph 结论。 |
+| `"native"` | native exact eager workload。Rust 签名编译后的 task 契约，Python 只机械绑定；不使用 legacy ESamp authority。已通过 MRv1/MRv2 的 in-process 与 EngineCore MP 正确性，loss/update/state-version/intervention 非零，fallback/replay 为零。这不是吞吐或 CUDA Graph 结论。 |
 | `"program"` | 保留的 Program 迁移兼容 adapter：`tllm/consumers/esamp/program.py` 由 `@flow`/`@extern` 声明编译，使用 legacy lane 模型。 |
 | `"legacy"` | 手工调优管线（专用 train stream、per-slot 事件、Triton kernel）。保留为 benchmark 显式基线。 |
 
@@ -22,22 +22,22 @@ ESamp（*Large Language Models Explore by Latent Distilling*）是 tLLM 的参�
 from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
 from tllm.runtime import TllmRuntime
 
-workload = build_esamp_workload(ESampConsumerConfig(implementation="region"))
+workload = build_esamp_workload(ESampConsumerConfig(implementation="native"))
 runtime = TllmRuntime(workloads=(workload,))
 ```
 
-`"region"` 会拒绝 legacy-only 的 per-request/model-bank 模式、compact capture lane、row
+`"native"` 会拒绝 legacy-only 的 per-request/model-bank 模式、compact capture lane、row
 selection 与非 `post_filter_exact` sampler。model-backed native piecewise CUDA Graph 路径仍未验证
 且未完成；native ESamp 的证据仅为 eager 正确性。Program 与 legacy 仍是迁移/benchmark 路径，
-不是 native Region 吞吐证据。
+不是 native workload 吞吐证据。
 
 ## 主要配置项（`ESampConsumerConfig`）
 
-- `implementation`：`"region"`、`"program"` 或 `"legacy"`。
+- `implementation`：`"native"`、`"program"` 或 `"legacy"`。
 - `distiller_hidden_dim`、`distiller_lr`：模型 rank 容量与 AdamW 学习率。
 - `enable_distiller_intervention`、`distiller_beta`：sampler 引导开关与强度。
 - `distiller_sampler_backend`：候选过滤后端（默认 `post_filter_exact`）。
-- `model_bank_train_cudagraph`（仅 legacy）：legacy 引擎的整步 CUDA Graph；不适用于 native eager Region 路径。
+- `model_bank_train_cudagraph`（仅 legacy）：legacy 引擎的整步 CUDA Graph；不适用于 native eager workload 路径。
 
 ## Benchmark
 

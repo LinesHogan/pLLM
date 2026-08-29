@@ -77,7 +77,6 @@ _BUILTIN_PLUGIN_MODULES = {
         "gtta",
         "inplace_ttt",
         "override",
-        "recirculation",
         "tlm",
         "ttrl",
         "dummy",

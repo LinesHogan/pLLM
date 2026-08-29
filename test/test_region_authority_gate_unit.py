@@ -94,7 +94,7 @@ def test_rust_test_fixture_is_not_treated_as_production_authority() -> None:
 
 
 def test_gate_rejects_recurrence_compile_and_bundle_parse_on_hot_paths() -> None:
-    path = Path("tllm/consumers/recirculation/vllm_region_workload.py")
+    path = Path("tllm/consumers/recirculation/native_backend.py")
     violations = _recurrence_hot_path_violations(
         path,
         "def _stage_typed_recirculation(context):\n"
@@ -110,7 +110,7 @@ def test_gate_rejects_recurrence_compile_and_bundle_parse_on_hot_paths() -> None
 
 
 def test_gate_allows_explicit_cold_recurrence_compilation() -> None:
-    path = Path("tllm/consumers/recirculation/vllm_region_workload.py")
+    path = Path("tllm/consumers/recirculation/native_backend.py")
     assert _recurrence_hot_path_violations(
         path,
         "def compile_cold_artifacts(spec):\n"
@@ -119,7 +119,7 @@ def test_gate_allows_explicit_cold_recurrence_compilation() -> None:
 
 
 def test_gate_rejects_python_reconstruction_of_observed_stage_facts() -> None:
-    path = Path("tllm/consumers/recirculation/vllm_region_workload.py")
+    path = Path("tllm/consumers/recirculation/native_backend.py")
     violations = _recurrence_hot_path_violations(
         path,
         "def _stage_typed_recirculation(row_plan, artifact):\n"
@@ -132,3 +132,19 @@ def test_gate_rejects_python_reconstruction_of_observed_stage_facts() -> None:
         "native recurrence hot path may not infer admission from row phases",
         "native recurrence hot path may not compile or rebuild an artifact",
     }
+
+
+def test_gate_rejects_typed_stage_family_construction_on_hot_paths() -> None:
+    path = Path("tllm/consumers/recirculation/native_backend.py")
+    violations = _recurrence_hot_path_violations(
+        path,
+        "def _stage_typed_recirculation(context):\n"
+        "    definitions = build_stage_definitions(context)\n"
+        "    family = StageArtifactFamily.compile(definitions)\n"
+        "    return StageArtifactFamily.from_wire(family.to_wire())\n",
+    )
+    assert tuple(violation.rule for violation in violations) == (
+        "native recurrence hot path may not compile or rebuild an artifact",
+        "native recurrence hot path may not compile or rebuild an artifact",
+        "native recurrence hot path may not parse an artifact bundle",
+    )

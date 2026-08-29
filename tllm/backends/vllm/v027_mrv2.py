@@ -402,7 +402,7 @@ class V027MRv2Driver:
             extensions=frozenset(
                 {
                     BackendCapability.BACKEND_REGION_BINDER,
-                    BackendCapability.RECIRCULATION_PREFILL_BINDING,
+                    BackendCapability.TYPED_LAYER_REPLAY,
                 }
             ),
             hidden_locators=frozenset(

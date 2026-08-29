@@ -18,6 +18,7 @@ class _Empty:
 @dataclass(frozen=True, slots=True)
 class _Ready:
     sequence: int
+    transaction: str
     value: object
 
 
@@ -27,19 +28,46 @@ class _Prepared:
     value: object
 
 
+def _ordered_transaction(transaction: str) -> tuple[str, int] | None:
+    owner, separator, ordinal = transaction.rpartition(":")
+    if not separator or not owner or not ordinal.isdecimal():
+        return None
+    position = int(ordinal)
+    if position < 1:
+        return None
+    return owner, position
+
+
+@dataclass(frozen=True, slots=True)
+class _Finalized:
+    ordinal: int
+    consumed: bool
+
+
 class RuntimePortStore:
     """Type-erased storage hidden behind generic StagedPort boundaries."""
 
     def __init__(self) -> None:
         self._states: dict[str, _Empty | _Prepared | _Ready] = {}
-        self._sequence = 0
+        self._finalized: dict[tuple[str, str], _Finalized] = {}
+        self._sequences: dict[str, int] = {}
+        self._transaction_ordinals: dict[str, int] = {}
 
     def stage(self, key: str, value: object) -> int:
-        transaction = f"local:{self._sequence + 1}"
+        ordinal = self._transaction_ordinals.get(key, 0) + 1
+        self._transaction_ordinals[key] = ordinal
+        transaction = f"local:{key}:{ordinal}"
         self.prepare(key, transaction, value)
         return self.commit(key, transaction)
 
     def prepare(self, key: str, transaction: str, value: object) -> None:
+        ordered = _ordered_transaction(transaction)
+        if ordered is None:
+            raise ValueError("staged transaction must be owner:positive_ordinal")
+        owner, ordinal = ordered
+        finalized = self._finalized.get((key, owner))
+        if finalized is not None and ordinal <= finalized.ordinal:
+            raise RuntimeError("staged transaction is reused or out of order")
         match self._states.get(key, _Empty()):
             case _Empty():
                 self._states[key] = _Prepared(transaction, value)
@@ -49,9 +77,10 @@ class RuntimePortStore:
     def commit(self, key: str, transaction: str) -> int:
         match self._states.get(key, _Empty()):
             case _Prepared(transaction=observed, value=value) if observed == transaction:
-                self._sequence += 1
-                self._states[key] = _Ready(self._sequence, value)
-                return self._sequence
+                sequence = self._sequences.get(key, 0) + 1
+                self._sequences[key] = sequence
+                self._states[key] = _Ready(sequence, transaction, value)
+                return sequence
             case _:
                 raise RuntimeError("staged input transaction is not prepared")
 
@@ -59,8 +88,31 @@ class RuntimePortStore:
         match self._states.get(key, _Empty()):
             case _Prepared(transaction=observed) if observed == transaction:
                 self._states.pop(key)
+                self._record_finalized(key, transaction, consumed=False)
+            case _Ready(transaction=observed) if observed == transaction:
+                self._states.pop(key)
+                sequence = self._sequences[key] - 1
+                if sequence:
+                    self._sequences[key] = sequence
+                else:
+                    self._sequences.pop(key)
+                self._record_finalized(key, transaction, consumed=False)
             case _Empty():
-                pass
+                ordered = _ordered_transaction(transaction)
+                if ordered is None:
+                    raise ValueError(
+                        "staged transaction must be owner:positive_ordinal"
+                    )
+                owner, ordinal = ordered
+                finalized = self._finalized.get((key, owner))
+                if finalized is None or ordinal > finalized.ordinal:
+                    self._finalized[(key, owner)] = _Finalized(ordinal, False)
+                elif ordinal < finalized.ordinal:
+                    raise RuntimeError(
+                        "cannot confirm rollback for a superseded transaction"
+                    )
+                elif finalized.consumed:
+                    raise RuntimeError("cannot abort a consumed staged transaction")
             case _:
                 raise RuntimeError("cannot abort a different staged transaction")
 
@@ -70,8 +122,18 @@ class RuntimePortStore:
                 return SKIPPED
             case _Prepared():
                 raise RuntimeError("cannot consume an uncommitted staged input")
-            case _Ready(value=value):
+            case _Ready(transaction=transaction, value=value):
+                self._record_finalized(key, transaction, consumed=True)
                 return value
+
+    def _record_finalized(
+        self, key: str, transaction: str, *, consumed: bool
+    ) -> None:
+        ordered = _ordered_transaction(transaction)
+        if ordered is None:
+            raise ValueError("staged transaction must be owner:positive_ordinal")
+        owner, ordinal = ordered
+        self._finalized[(key, owner)] = _Finalized(ordinal, consumed)
 
 
 class StagedPort(Generic[T]):

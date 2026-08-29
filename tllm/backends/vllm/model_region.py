@@ -1,28 +1,18 @@
 """Generic vLLM binding for Rust-signed backend Regions.
 
 Native workload execution reaches this module only through signed backend
-events.  It binds a local slot to the exact stage identity selected by Rust;
+events. It binds a local slot to the exact stage identity selected by Rust;
 it does not classify a workload, interpret recurrence operation names, or
-construct a schedule.  Historical dispatch-plan replay remains isolated in
-``model_region_legacy`` and is loaded only when no native execution exists.
+construct a schedule.
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 from tllm.runtime.backend_region_binders import (
     BackendRegionStageContext,
     BackendRegionStagerRegistry,
 )
 from tllm.runtime.workload_execution import BackendObservableEvent
-
-
-def _legacy() -> object:
-    from tllm.backends.vllm import model_region_legacy
-
-    return model_region_legacy
-
 
 def _worker_registry(runtime: object) -> BackendRegionStagerRegistry | None:
     registry = getattr(runtime, "backend_region_stager_registry", None)
@@ -91,14 +81,8 @@ def prepare_model_region_step(
 ) -> object | None:
     """Compatibility entry point; native stages only at their signed event."""
 
-    if getattr(runtime, "workload_execution", None) is not None:
-        return None
-    return _legacy().prepare_model_region_step(
-        runtime=runtime,
-        runner=runner,
-        num_scheduled_tokens=num_scheduled_tokens,
-        input_batch=input_batch,
-    )
+    del runtime, runner, num_scheduled_tokens, input_batch
+    return None
 
 
 def abort_model_region_step(runtime: object, step_id: int) -> bool:
@@ -110,15 +94,17 @@ def abort_model_region_step(runtime: object, step_id: int) -> bool:
         for binder in execution.backend_region_binders.values():
             aborted = bool(binder.abort(step_id)) or aborted
         return abort_typed_layer_replay(runtime) or aborted
-    return _legacy().abort_model_region_step(runtime, step_id)
+    return False
 
 
 def install_model_region_executor(*, binding: object, runtime: object) -> object:
-    return _legacy().install_model_region_executor(binding=binding, runtime=runtime)
+    del binding, runtime
+    return None
 
 
 def restore_model_region_executors(binding: object) -> int:
-    return _legacy().restore_model_region_executors(binding)
+    del binding
+    return 0
 
 
 def restore_runtime_model_region(runtime: object) -> int:
@@ -126,15 +112,7 @@ def restore_runtime_model_region(runtime: object) -> int:
         from tllm.backends.vllm.typed_layer_replay import restore_typed_layer_replay
 
         return restore_typed_layer_replay(runtime)
-    return _legacy().restore_runtime_model_region(runtime)
-
-
-def __getattr__(name: str) -> Any:
-    """Keep legacy test/import compatibility without loading it on native paths."""
-
-    if name.startswith("__"):
-        raise AttributeError(name)
-    return getattr(_legacy(), name)
+    return 0
 
 
 __all__ = [

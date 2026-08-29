@@ -12,7 +12,10 @@ from tllm.backends.protocol import (
     ModelRegionCapabilities,
     OrderedRowFusionCapabilities,
 )
-from tllm.consumers.recirculation import RecirculationConfig, RecirculationConsumer
+from tllm.consumers.recirculation.config import (
+    LegacyRecirculationConfig as RecirculationConfig,
+)
+from tllm.consumers.recirculation.consumer import RecirculationConsumer
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.graph_policy import GraphMode
 from tllm.workgraph.jacobi import run_jacobi

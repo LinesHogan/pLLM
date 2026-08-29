@@ -12,7 +12,7 @@ ESamp (*Large Language Models Explore by Latent Distilling*) is tLLM's reference
 
 | `implementation=` | What it is |
 |---|---|
-| `"region"` | Native exact eager `ExecutionRegion` declaration. Rust signs the Region contract and Python mechanically binds it; it does not use a legacy ESamp authority. Correctness passed in-process and EngineCore MP on MRv1/MRv2, with nonzero loss/update/state-version/intervention and zero fallback/replay counts. This is not a throughput or CUDA Graph result. |
+| `"native"` | Native exact eager workload. Rust signs its compiled task contract and Python mechanically binds it; it does not use a legacy ESamp authority. Correctness passed in-process and EngineCore MP on MRv1/MRv2, with nonzero loss/update/state-version/intervention and zero fallback/replay counts. This is not a throughput or CUDA Graph result. |
 | `"program"` | Retained Program compatibility adapter: `tllm/consumers/esamp/program.py` is compiled from `@flow`/`@extern` declarations and uses the legacy lane model. |
 | `"legacy"` | The hand-tuned pipeline (dedicated train stream, per-slot staging events, Triton kernels). Kept as an explicit baseline for benchmarks. |
 
@@ -22,23 +22,23 @@ Select via config:
 from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
 from tllm.runtime import TllmRuntime
 
-workload = build_esamp_workload(ESampConsumerConfig(implementation="region"))
+workload = build_esamp_workload(ESampConsumerConfig(implementation="native"))
 runtime = TllmRuntime(workloads=(workload,))
 ```
 
-`"region"` rejects legacy-only per-request/model-bank modes, compact capture
+`"native"` rejects legacy-only per-request/model-bank modes, compact capture
 lanes, row selection, and non-`post_filter_exact` samplers. The model-backed
 native piecewise CUDA Graph path remains unverified and incomplete; the native
 ESamp verification is eager correctness only. Program and legacy remain
-migration/benchmark paths, not evidence of native Region throughput.
+migration/benchmark paths, not evidence of native workload throughput.
 
 ## Key config knobs (`ESampConsumerConfig`)
 
-- `implementation`: `"region"`, `"program"`, or `"legacy"`.
+- `implementation`: `"native"`, `"program"`, or `"legacy"`.
 - `distiller_hidden_dim`, `distiller_lr`: model rank capacity and AdamW learning rate.
 - `enable_distiller_intervention`, `distiller_beta`: sampler guidance on/off and strength.
 - `distiller_sampler_backend`: candidate filtering backend (default `post_filter_exact`).
-- `model_bank_train_cudagraph` (legacy only): whole-step CUDA graph capture in the legacy engine. It does not apply to the native eager Region path.
+- `model_bank_train_cudagraph` (legacy only): whole-step CUDA graph capture in the legacy engine. It does not apply to the native eager workload path.
 
 ## Benchmark
 

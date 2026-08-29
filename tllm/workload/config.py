@@ -131,6 +131,10 @@ class WorkloadConfig:
         return self._config_values[name]
 
     @classmethod
+    def field_names(cls) -> tuple[str, ...]:
+        return tuple(field.name for field in cls.__config_fields__)
+
+    @classmethod
     def from_wire(cls, values: Mapping[str, ConfigAtom]) -> Self:
         return cls(**dict(values))
 

@@ -1,108 +1,103 @@
-"""New-frontend ESamp declaration with a legacy execution adapter."""
+"""Exact ESamp workload expressed only as state, data flow, and algorithm."""
 
 from __future__ import annotations
 
-from tllm.consumers.esamp.config import ESampConsumerConfig
-from tllm.consumers.esamp.register import build as build_legacy_consumer
-from tllm.ports.consumer import BaseConsumer
+from typing import Literal
+
+import torch
+import torch.nn.functional as F
+
+from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.kit.workload import Workload
 from tllm.workload import (
     AdamWSpec,
     Before,
     Between,
+    NumericConstraint,
     State,
-    StateScope,
-    WorkloadAuthority,
+    WorkloadConfig,
+    config_field,
     hidden,
-    read,
-    request_key,
-    result,
-    sink,
+    optimize,
+    sampler,
     task,
-    temporary,
-    transition,
     workload,
 )
 
 
-def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
-    """Build a config-specialized declaration backed by the current runtime."""
-
-    resolved = config or ESampConsumerConfig()
-    if resolved.implementation == "native":
-        from tllm.consumers.esamp.region_workload import (
-            ESampConfig,
-            ESampWorkload,
-        )
-
-        if resolved.distiller_sampler_backend != "post_filter_exact":
-            raise ValueError(
-                "implementation='native' supports only "
-                "distiller_sampler_backend='post_filter_exact'"
-            )
-        return ESampWorkload(
-            ESampConfig(
-                source_layer_path=str(resolved.source_layer_path),
-                target_layer_path=str(resolved.target_layer_path),
-                enabled=bool(resolved.enable_esamp_training),
-                distiller_hidden_dim=int(resolved.distiller_hidden_dim),
-                distiller_lr=float(resolved.distiller_lr),
-                output_layernorm=bool(resolved.model_bank_use_output_layernorm),
-                intervention=bool(resolved.enable_distiller_intervention),
-                distiller_beta=float(resolved.distiller_beta),
-                sampler_backend="post_filter_exact",
-            )
-        )
-    identifier = str(resolved.consumer_id)
-    legacy = build_legacy_consumer(resolved)
-
-    if not resolved.enable_esamp_training:
-        @workload(id=identifier, authority=WorkloadAuthority.LEGACY_ADAPTER)
-        class DisabledESampWorkload:
-            @property
-            def legacy_consumer(self) -> BaseConsumer:
-                return legacy
-
-        return DisabledESampWorkload()
-
-    per_request = bool(resolved.per_request_models)
-    distiller = State(
-        scope=StateScope.REQUEST if per_request else StateScope.REPLICA,
-        key=request_key("request_id", "sample_idx") if per_request else None,
-        parameters="distiller",
-        optimizer=AdamWSpec(lr=float(resolved.distiller_lr)),
+class ESampConfig(WorkloadConfig):
+    source_layer_path: str = config_field(
+        default="model.model.layers[0].input_layernorm"
+    )
+    target_layer_path: str = config_field(
+        default="model.model.layers[-1].input_layernorm"
+    )
+    enabled: bool = config_field(default=True)
+    distiller_hidden_dim: int = config_field(
+        default=128, constraint=NumericConstraint.POSITIVE
+    )
+    distiller_lr: float = config_field(
+        default=1e-3, constraint=NumericConstraint.POSITIVE
+    )
+    output_layernorm: bool = config_field(default=True)
+    intervention: bool = config_field(default=False)
+    distiller_beta: float = config_field(
+        default=0.0, constraint=NumericConstraint.NONNEGATIVE
+    )
+    sampler_backend: Literal["post_filter_exact"] = config_field(
+        default="post_filter_exact"
     )
 
-    @workload(id=identifier, authority=WorkloadAuthority.LEGACY_ADAPTER)
-    class ESampWorkloadDeclaration:
-        state = distiller
 
-        @task(
-            inputs={
-                "source": hidden(resolved.source_layer_path, "block_output", "decode"),
-                "target": hidden(resolved.target_layer_path, "block_output", "decode"),
-            },
-            outputs={"prediction": sink("guidance"), "loss": temporary()},
-            effects=(read(state),),
-            timing=Between("model.execute", "sampler.pre_draw"),
+@workload(id="esamp", config=ESampConfig, enabled=ESampConfig.enabled)
+class ESampWorkload(Workload[ESampConfig]):
+    distiller: State[LowRankGatedResidualModel] = State.replica(
+        optimizer=AdamWSpec(lr=ESampConfig.distiller_lr)
+    )
+
+    @distiller.initialize
+    def init_distiller(
+        self, spec: RuntimeSpecializationSpec
+    ) -> LowRankGatedResidualModel:
+        return LowRankGatedResidualModel(
+            hidden_size=spec.hidden_size,
+            rank=min(self.config.distiller_hidden_dim, spec.hidden_size),
+            use_output_layernorm=self.config.output_layernorm,
+            device=spec.device,
+            dtype=spec.dtype,
         )
-        def predict_and_loss(
-            self, source: object, target: object
-        ) -> tuple[object, object]:
-            raise RuntimeError("ESamp workload is declaration-only during legacy takeover")
 
-        @task(
-            inputs={"loss": result("predict_and_loss", "loss")},
-            effects=(transition(state),),
-            timing=Before("next.prepare"),
-        )
-        def update(self, loss: object) -> None:
-            raise RuntimeError("ESamp workload is declaration-only during legacy takeover")
+    @task(
+        inputs={
+            "source": hidden(
+                0,
+                "block_output",
+                "decode",
+                path=ESampConfig.source_layer_path,
+            ),
+            "target": hidden(
+                -1,
+                "block_output",
+                "decode",
+                path=ESampConfig.target_layer_path,
+            ),
+        },
+        outputs={
+            "guidance": sampler.hidden_reweight(
+                beta=ESampConfig.distiller_beta,
+                enabled=ESampConfig.intervention,
+                backend=ESampConfig.sampler_backend,
+            ),
+            "loss": optimize(distiller, at=Before("next.prepare")),
+        },
+        timing=Between("model.execute", "sampler.pre_draw"),
+    )
+    def predict_and_loss(
+        self, source: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prediction = self.distiller(source)
+        return prediction, F.mse_loss(prediction.float(), target.float())
 
-        @property
-        def legacy_consumer(self) -> BaseConsumer:
-            return legacy
 
-    return ESampWorkloadDeclaration()
-
-
-__all__ = ["build_esamp_workload"]
+__all__ = ["ESampConfig", "ESampWorkload"]

@@ -131,6 +131,75 @@ def _bundle_for_rows(row_count: int, *, phase: str = "prefill") -> object:
     return _core.load_typed_recurrence_stage_artifact_bundle(wire)
 
 
+def _typed_definition(row_count: int) -> _core.TypedRecurrenceStageDefinition:
+    first = _core.TypedOperation(
+        "first",
+        "test.backend:first@1",
+        "test.backend:stage@1",
+        (
+            _core.TypedOperand.seed("seed/0"),
+            _core.TypedOperand.backend_resource("call/0"),
+        ),
+        ("v0",),
+    )
+    second = _core.TypedOperation(
+        "second",
+        "test.backend:second@1",
+        "test.backend:stage@1",
+        (
+            _core.TypedOperand.region_value("v0"),
+            _core.TypedOperand.backend_resource("call/1"),
+        ),
+        ("answer",),
+    )
+    recurrence = _core.TypedRecurrence(
+        f"test.typed-stage.rows-{row_count}",
+        "test.backend:stage@1",
+        _core.TypedStageAdmission.prefill_reject(),
+        _core.TypedStageFusionPolicy.serial(),
+        (first, second),
+        (_core.TypedDependency("first", "second", "data"),),
+        ("answer",),
+    )
+    return _core.TypedRecurrenceStageDefinition(
+        row_count,
+        recurrence,
+        (_core.TypedStageBinding("seed/0", "test.seed", (0,)),),
+        (
+            _core.TypedStageResourceBinding("call/1", "test.call", (1,)),
+            _core.TypedStageResourceBinding("call/0", "test.call", (0,)),
+        ),
+        (
+            _core.TypedStageOutputBinding(
+                "result/0", "answer", "test.result", (0,)
+            ),
+        ),
+    )
+
+
+def test_typed_stage_family_owns_canonicalization_wire_and_packed_binding() -> None:
+    family = _core.TypedRecurrenceStageArtifactBundle.compile(
+        tuple(_typed_definition(rows) for rows in range(1, 3))
+    )
+
+    assert family.max_row_count == 2
+    assert family.artifacts[1].artifact.resource_bindings[0].resource_id == "call/0"
+    loaded = _core.TypedRecurrenceStageArtifactBundle.from_wire(family.to_wire())
+    assert loaded.signature == family.signature
+
+    prefill = _core.plan_packed_prefill_rows([2], [2], [0])
+    batch = loaded.bind_packed_plan(prefill)
+    assert batch.admission == _core.TypedStagePlanAdmission.Execute
+    assert batch.total_rows == 2
+    assert len(batch.requests) == 1
+    assert batch.requests[0].stage.plan.retained_values == ["answer"]
+
+    decode = _core.plan_packed_prefill_rows([1], [1], [1])
+    noop = loaded.bind_packed_plan(decode)
+    assert noop.admission == _core.TypedStagePlanAdmission.Noop
+    assert noop.requests == []
+
+
 def test_rust_compiles_loads_and_binds_an_immutable_typed_stage_artifact() -> None:
     artifact = _core.compile_typed_recurrence_stage_artifact(_wire(_spec()))
 

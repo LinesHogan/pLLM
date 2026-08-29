@@ -16,6 +16,10 @@ from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.kit.sampler_output import DeclaredSamplerOutput
+from tllm.kit.backend import (
+    NoBackendAdapter,
+    WorkloadBackendAdapter,
+)
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
 from tllm.runtime.workload_sinks import SinkStore
 from tllm.runtime.workload_plugins import (
@@ -26,7 +30,7 @@ from tllm.runtime.workload_plugins import (
 from tllm.workload.config import ConfigAtom, WorkloadConfig
 from tllm.workload.frontend import (
     NoConfiguredValue,
-    PublishedState,
+    PublishedModule,
     State,
     SamplerOutput,
     TrainableState,
@@ -113,13 +117,20 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     __tllm_workload__: ClassVar[NativeWorkloadDefinition]
     __tllm_states__: ClassVar[
-        tuple[TrainableState[torch.nn.Module] | PublishedState[torch.nn.Module], ...]
+        tuple[TrainableState[torch.nn.Module] | PublishedModule[torch.nn.Module], ...]
     ] = ()
     __tllm_staged_ports__: ClassVar[tuple[StagedPort[object], ...]] = ()
     __tllm_host_outputs__: ClassVar[tuple[HostOutput[object], ...]] = ()
+    backend_type: ClassVar[type[WorkloadBackendAdapter]] = NoBackendAdapter
 
     def __init__(self, config: ConfigT) -> None:
+        self._initialize(config, type(self).backend_type.create(config))
+
+    def _initialize(
+        self, config: ConfigT, backend: WorkloadBackendAdapter
+    ) -> None:
         self.config = config
+        self.backend = backend
         self._lifecycle: _Unspecialized | _Specialized = _Unspecialized()
         self._accounting = _WorkloadAccounting(self)
         self._port_store = RuntimePortStore()
@@ -140,7 +151,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     @classmethod
     def _states(
         cls,
-    ) -> tuple[TrainableState[torch.nn.Module] | PublishedState[torch.nn.Module], ...]:
+    ) -> tuple[TrainableState[torch.nn.Module] | PublishedModule[torch.nn.Module], ...]:
         return cls.__tllm_states__
 
     @property
@@ -215,14 +226,16 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                         optimizers[state.name] = _build_optimizer(
                             cast(OptimizerSpec, optimizer), value, self.config
                         )
-                    case PublishedState():
+                    case PublishedModule():
                         pass
+        self.backend.specialize(spec)
         self._lifecycle = _Specialized(
             spec=spec,
             values=values,
             optimizers=optimizers,
             versions={state.name: 0 for state in type(self)._states()},
         )
+        self._resources = self._assemble_resources()
 
     def _optimize_state(
         self, state: TrainableState[torch.nn.Module], loss: torch.Tensor
@@ -239,9 +252,9 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         versions[state.name] += 1
         self._accounting.record(loss)
 
-    def _publish_state(
+    def _publish_module(
         self,
-        state: PublishedState[torch.nn.Module],
+        state: PublishedModule[torch.nn.Module],
         values: Mapping[str, torch.Tensor],
     ) -> None:
         module = self._state_value(state)
@@ -322,13 +335,25 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     @classmethod
     def reconstruct(cls, raw: Mapping[str, object]) -> NativeWorkloadResources:
+        config_type = cls._definition().config_type
+        config_wire = {
+            name: raw[name]
+            for name in config_type.field_names()
+        }
         config = cast(
             ConfigT,
-            cls._definition().config_type.from_wire(
-                cast(Mapping[str, ConfigAtom], raw)
+            config_type.from_wire(
+                cast(Mapping[str, ConfigAtom], config_wire)
             ),
         )
-        return cls(config).native_workload_resources()
+        if cls.backend_type is NoBackendAdapter:
+            return cls(config).native_workload_resources()
+        instance = cls.__new__(cls)
+        instance._initialize(
+            config,
+            cls.backend_type.reconstruct(config, raw),
+        )
+        return instance.native_workload_resources()
 
     def _assemble_resources(self) -> NativeWorkloadResources:
         definition = type(self)._definition()
@@ -355,6 +380,8 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 for kind in definition.sampler_inputs
             }
         )
+        backend_binding = self.backend.runtime_binding()
+        provided_inputs.update(backend_binding.provided_inputs)
         output_sinks: dict[str, Callable[[object, int], None]]
         match self._sampler:
             case _NoSampler():
@@ -377,7 +404,11 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             provided_inputs=provided_inputs,
             output_sinks=output_sinks,
             state_snapshots=state_snapshots,
-            cold_specializer=self.cold_specialize if states else None,
+            cold_specializer=(
+                self.cold_specialize
+                if states or type(self).backend_type is not NoBackendAdapter
+                else None
+            ),
             diagnostics_reader=self._diagnostics,
             stats_reader=self._accounting.read,
             enabled_setter=self.set_enabled,
@@ -386,12 +417,17 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             specialization_key={
                 "workload": definition.workload_id,
                 **self.config.specialization_key(),
+                **self.backend.specialization_key(),
             },
             residual_paths=self.residual_paths(),
             worker_spec=WorkloadWorkerSpec(
                 factory=f"{type(self).__module__}:{type(self).__qualname__}.reconstruct",
-                config=self.config.to_wire(),
+                config={
+                    **self.config.to_wire(),
+                    **self.backend.worker_wire(),
+                },
             ),
+            backend_region_binders=backend_binding.binders,
         )
 
     def _diagnostics(self) -> Mapping[str, int]:

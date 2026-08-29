@@ -15,9 +15,11 @@ from dataclasses import dataclass, field
 from math import isfinite
 from threading import Lock
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 import torch
+
+WorkloadInstanceT = TypeVar("WorkloadInstanceT")
 
 
 class WorkloadPortOwner(Protocol):
@@ -798,6 +800,21 @@ class NativeWorkloadExecution:
     def owns_consumer(self, consumer: object) -> bool:
         return any(owner is consumer for owner in self._owned_consumers)
 
+    def workload_instance(
+        self, workload_type: type[WorkloadInstanceT]
+    ) -> WorkloadInstanceT:
+        matches = tuple(
+            instance
+            for instance in self._workload_instances
+            if type(instance) is workload_type
+        )
+        if len(matches) != 1:
+            raise LookupError(
+                f"active execution has {len(matches)} instances of "
+                f"{workload_type.__qualname__}"
+            )
+        return cast(WorkloadInstanceT, matches[0])
+
     def prepare_port(self, key: str, transaction: str, value: object) -> None:
         for workload in self._workload_instances:
             if workload.owns_port(key):
@@ -1101,6 +1118,13 @@ class NativeWorkloadExecutionStore:
     @property
     def staged_activated(self) -> bool:
         return self._staged is not None and self._staged_activated
+
+    @property
+    def next_execution(self) -> NativeWorkloadExecution:
+        staged = self._staged
+        if staged is not None and self._staged_activated:
+            return staged
+        return self._current
 
     def stage(
         self,
@@ -1839,7 +1863,7 @@ def _plan_resources(
 ) -> PlanResources:
     physical = compilation.physical
     if physical is None:
-        raise RuntimeError("native Region workload has no materialized physical plan")
+        raise RuntimeError("native compiled workload has no materialized physical plan")
     if physical.buffer_buckets:
         raise RuntimeError("native Region buffer registry is not installed")
     unsupported = tuple(
@@ -1935,7 +1959,7 @@ def _bind_physical_region_nodes(
     )
     physical = compilation.physical
     if physical is None:
-        raise RuntimeError("native Region workload has no materialized physical plan")
+        raise RuntimeError("native compiled workload has no materialized physical plan")
     if (
         not physical.schedule_signature
         or physical.schedule_signature != compilation.decision.signature
@@ -2024,7 +2048,7 @@ def _bind_physical_region_nodes(
     return tuple(bound)
 
 
-def _region_workload_execution(
+def _native_workload_execution(
     compilation: "WorkloadCompilation",
     *,
     runtime: "ResidualRuntimeState",
@@ -2093,7 +2117,7 @@ def _region_workload_execution(
     )
     physical = compilation.physical
     if physical is None:
-        raise RuntimeError("native Region workload has no materialized physical plan")
+        raise RuntimeError("native compiled workload has no materialized physical plan")
     bound_nodes = _bind_physical_region_nodes(compilation)
 
     value_store = _RegionValueStore(
@@ -2248,7 +2272,7 @@ def build_native_workload_execution(
     if bindings is not None:
         if not isinstance(bindings, WorkloadExecutionBindings):
             raise TypeError("bindings must be WorkloadExecutionBindings or None")
-        return _region_workload_execution(
+        return _native_workload_execution(
             compilation,
             runtime=runtime,
             consumers=consumers,

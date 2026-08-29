@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from types import MethodType
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Protocol, cast
 
 import torch
 
-from tllm.consumers.reft.region_workload import ReftWorkload
+from tllm.consumers.reft.workload import ReftWorkload
+from tllm.runtime.runtime import TllmRuntime
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,13 +99,15 @@ def _prompt_rows(
     return (prefill & selected).nonzero(as_tuple=False).reshape(-1)
 
 
-def install_reft_patch(
-    model: torch.nn.Module, workload: ReftWorkload
+def _install_reft_patch(
+    model: torch.nn.Module,
+    initial_workload: ReftWorkload,
+    workload_provider: Callable[[], ReftWorkload],
 ) -> ReftPatchHandle:
     spec = _ReftPatchSpec(
-        layers=workload.config.layers,
-        first_tokens=workload.config.first_tokens,
-        last_tokens=workload.config.last_tokens,
+        layers=initial_workload.config.layers,
+        first_tokens=initial_workload.config.first_tokens,
+        last_tokens=initial_workload.config.last_tokens,
     )
     layers = _decoder_layers(model)
     wrapped: list[torch.nn.Module] = []
@@ -123,6 +127,7 @@ def install_reft_patch(
             **kwargs: object,
         ) -> object:
             output = _original(positions, hidden_states, residual, *args, **kwargs)  # type: ignore[operator]
+            workload = workload_provider()
             if workload.state_version == 0:
                 return output
             hidden = cast(tuple[torch.Tensor, ...], output)[0]
@@ -149,9 +154,22 @@ def install_reft_patch(
     return ReftPatchHandle(wrapped, forwards)
 
 
-def install_reft_patch_on_llm(llm: object, workload: ReftWorkload) -> ReftPatchHandle:
+def install_reft_patch(
+    model: torch.nn.Module, workload: ReftWorkload
+) -> ReftPatchHandle:
+    return _install_reft_patch(model, workload, lambda: workload)
+
+
+def install_reft_patch_on_llm(
+    llm: object, runtime: TllmRuntime
+) -> ReftPatchHandle:
     runner = llm.llm_engine.model_executor.driver_worker.model_runner  # type: ignore[attr-defined]
-    return install_reft_patch(runner.model, workload)
+    workload = runtime.local_workload(ReftWorkload)
+    return _install_reft_patch(
+        runner.model,
+        workload,
+        lambda: runtime.local_workload(ReftWorkload),
+    )
 
 
 __all__ = ["ReftPatchHandle", "install_reft_patch", "install_reft_patch_on_llm"]

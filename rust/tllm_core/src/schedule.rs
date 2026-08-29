@@ -1214,10 +1214,7 @@ fn affine_flow_dependences(
         while scatter.len() < 1 + max_rank {
             scatter.push("0".to_owned());
         }
-        schedule_entries.push(format!(
-            "{tuple} -> [{}]{suffix}",
-            scatter.join(", ")
-        ));
+        schedule_entries.push(format!("{tuple} -> [{}]{suffix}", scatter.join(", ")));
         for access in &task.accesses {
             let elements = access
                 .indices
@@ -1242,16 +1239,10 @@ fn affine_flow_dependences(
         return Some(String::new());
     }
     let context = Context::alloc();
-    let sink = UnionMap::read_from_str(
-        &context,
-        &format!("{prefix}{{ {} }}", reads.join("; ")),
-    )
-    .ok()?;
-    let must_source = UnionMap::read_from_str(
-        &context,
-        &format!("{prefix}{{ {} }}", writes.join("; ")),
-    )
-    .ok()?;
+    let sink =
+        UnionMap::read_from_str(&context, &format!("{prefix}{{ {} }}", reads.join("; "))).ok()?;
+    let must_source =
+        UnionMap::read_from_str(&context, &format!("{prefix}{{ {} }}", writes.join("; "))).ok()?;
     let schedule_map = UnionMap::read_from_str(
         &context,
         &format!("{prefix}{{ {} }}", schedule_entries.join("; ")),
@@ -1390,8 +1381,10 @@ fn affine_problem_strings(
                                     source_access.value
                                 )));
                             }
-                            let (source_variables, source_mapping) = relation_variables(source_task, "s");
-                            let (target_variables, target_mapping) = relation_variables(target_task, "d");
+                            let (source_variables, source_mapping) =
+                                relation_variables(source_task, "s");
+                            let (target_variables, target_mapping) =
+                                relation_variables(target_task, "d");
                             let constraints: Vec<String> = source_access
                                 .indices
                                 .iter()
@@ -2467,10 +2460,9 @@ fn drafts_can_merge(
     // Merging is per-policy: a shared Region would otherwise let a non-exact
     // workload's parity tolerance wash over an exact workload's outputs.
     let first_policy = task_approximation_policy(graph, graph.tasks[tasks[0]].task_id.as_str());
-    let mixes_policies = tasks
-        .iter()
-        .skip(1)
-        .any(|index| task_approximation_policy(graph, graph.tasks[*index].task_id.as_str()) != first_policy);
+    let mixes_policies = tasks.iter().skip(1).any(|index| {
+        task_approximation_policy(graph, graph.tasks[*index].task_id.as_str()) != first_policy
+    });
     if earliest >= before
         || implementation_kind == TaskImplementationKind::Extern
         || tasks
@@ -3470,9 +3462,7 @@ fn compile_impl(
                         ScheduleInputKind::Hidden => RegionInputKind::Hidden,
                         ScheduleInputKind::Provided => RegionInputKind::Provided,
                         ScheduleInputKind::Staged => RegionInputKind::Staged,
-                        ScheduleInputKind::SamplerRequestIds => {
-                            RegionInputKind::SamplerRequestIds
-                        }
+                        ScheduleInputKind::SamplerRequestIds => RegionInputKind::SamplerRequestIds,
                         ScheduleInputKind::SamplerLogits => RegionInputKind::SamplerLogits,
                         ScheduleInputKind::SampledTokens => RegionInputKind::SampledTokens,
                         ScheduleInputKind::StepId => RegionInputKind::StepId,
@@ -3639,9 +3629,10 @@ fn compile_impl(
         if options.allow_side_stream
             && region.effects.is_empty()
             && region.capture_safe
-            && region.input_bindings.iter().all(|binding| {
-                matches!(binding.kind, RegionInputKind::Materialized)
-            })
+            && region
+                .input_bindings
+                .iter()
+                .all(|binding| matches!(binding.kind, RegionInputKind::Materialized))
         {
             region.stream = Some(RegionStreamClass::SideForward);
         }
@@ -4862,8 +4853,8 @@ mod tests {
         normalize_runtime_specialization_options_wire, validate_runtime_specialization_facts,
         validate_schedule, workload_compilation_wire_cache_key, CompileOptions, Decision,
         ExecutionRegion, HiddenPhase, HiddenSite, RegionCaptureMode, RegionFallbackPolicy,
-        RegionInputBinding, RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleEffectKind,
-        ScheduleInput,
+        RegionInputBinding, RegionInputKind, RegionOutputKind, RegionStreamClass,
+        ScheduleEffectKind, ScheduleInput,
     };
     use isl_rs::{Context, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
 
@@ -4983,7 +4974,7 @@ mod tests {
         let options = serde_json::json!({
             "memory_budget_bytes": 64,
             "allow_serial_fallback": true,
-            "static_binding_manifest": r#"[{"workload_id":"recirculation","factory":"factory","config":[],"specialization_key":[],"backend_region_implementation_ids":[]}]"#,
+            "static_binding_manifest": r#"[{"workload_id":"fixture","factory":"factory","config":[],"specialization_key":[],"backend_region_implementation_ids":[]}]"#,
             "schema_version": 1,
         })
         .to_string();
@@ -5490,10 +5481,9 @@ mod tests {
         // Without capture safety the compiled callable may carry host-side
         // hazards the stream context could invalidate: default stream.
         let unsafe_graph = r#"{"workload_key":"side-stream-unsafe","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":false,"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[],"values":[{"value_id":"side:run:answer","version":1,"producer":"run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
-        let unsafe_decision: Decision = serde_json::from_str(
-            &compile_schedule(unsafe_graph, timeline, side_options).unwrap(),
-        )
-        .unwrap();
+        let unsafe_decision: Decision =
+            serde_json::from_str(&compile_schedule(unsafe_graph, timeline, side_options).unwrap())
+                .unwrap();
         assert_eq!(
             unsafe_decision.execution_regions[0].stream,
             Some(RegionStreamClass::Default)
@@ -6069,7 +6059,7 @@ mod tests {
     #[test]
     fn flow_dependences_keep_a_self_referential_recurrence() {
         pyo3::prepare_freethreaded_python();
-        // recirculation pattern: one task writes kv[t, l] and reads
+        // recurrence pattern: one task writes kv[t, l] and reads
         // kv[t - 1, l]; the must-source flow relates instance t-1 to t.
         let graph = r#"{"workload_key":"flow-recurrence","tasks":[{"task_id":"rw","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:rw@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"domain":{"name":"affine","indices":["t","l"],"bounds":[["t","0","T"],["l","0","L"]],"parameters":["T","L"]},"accesses":[{"value":"kv","indices":[{"coefficients":[["t",1]],"constant":0},{"coefficients":[["l",1]],"constant":0}],"mode":"write"},{"value":"kv","indices":[{"coefficients":[["t",1]],"constant":-1},{"coefficients":[["l",1]],"constant":0}],"mode":"read"}]}],"edges":[],"values":[],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
@@ -6092,5 +6082,4 @@ mod tests {
             "flow dependence must carry the t-1 -> t shift: {dependences}"
         );
     }
-
 }

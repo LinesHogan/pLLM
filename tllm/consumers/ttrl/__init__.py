@@ -18,12 +18,14 @@ from tllm.consumers.ttrl.rewards import (
     select_ttrl_training_indices,
 )
 from tllm.consumers.ttrl.verifier import BoxedNormalizedVerifier, TTRLVerifier
+from tllm.consumers.ttrl.workload import TTRLConfig, TTRLWorkload
 
 __all__ = [
     "BoxedNormalizedVerifier",
     "TTRLConsumer",
     "TTRLClosedLoopIntent",
     "TTRLConsumerConfig",
+    "TTRLConfig",
     "TTRLMajorityResult",
     "TTRLProgram",
     "TTRLRetryScheduleEntry",
@@ -32,6 +34,7 @@ __all__ = [
     "TTRLSampleReward",
     "TTRLStats",
     "TTRLVerifier",
+    "TTRLWorkload",
     "build_ttrl_closed_loop_intent",
     "build_ttrl_reward_outcome_batch",
     "build_ttrl_reward_result",

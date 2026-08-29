@@ -20,7 +20,7 @@ class OverRIDEConsumerConfig:
     consumer_id: str = "override"
     enabled: bool = True
     # "consumer" keeps the legacy Program oracle; "native" selects the
-    # native Region workload via build_override_workload (legacy remains
+    # native workload via build_override_workload (legacy remains
     # available during the migration transition).
     implementation: str = "consumer"
     hidden_size: int = 0

@@ -6,8 +6,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tllm.consumers.recirculation import RecirculationConfig, RecirculationConsumer
-from tllm.consumers.recirculation import run_serial_recirculation
+from tllm.consumers.recirculation.config import (
+    LegacyRecirculationConfig as RecirculationConfig,
+)
+from tllm.consumers.recirculation.consumer import RecirculationConsumer
+from tllm.consumers.recirculation.reference import run_serial_recirculation
 
 
 def test_mix_matches_norm_and_ramp() -> None:
@@ -84,7 +87,7 @@ def test_serial_oracle_returns_normal_logits_and_overwrites_upper_kv() -> None:
     consumer = RecirculationConsumer(
         RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
     )
-    result = run_serial_recirculation(decoder, consumer, (1, 2))
+    result = run_serial_recirculation(decoder, consumer.config, (1, 2))
 
     assert len(result.logits) == 2
     assert decoder.calls == [

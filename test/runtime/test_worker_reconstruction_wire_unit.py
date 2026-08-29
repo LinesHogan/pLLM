@@ -289,7 +289,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
         signed = [
             {
                 "workload_id": "recirculation.vllm-prefill",
-                "factory": "tllm.consumers.recirculation.vllm_region_workload:reconstruct_vllm_recirculation_region_workload",
+                "factory": "tllm.consumers.recirculation.workload:RecirculationWorkload.reconstruct",
                 "config": {
                     "source_layer": 3,
                     "destination_layer": 1,
@@ -391,7 +391,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
         signed = [
             {
                 "workload_id": "recirculation.vllm-prefill",
-                "factory": "tllm.consumers.recirculation.vllm_region_workload:reconstruct_vllm_recirculation_region_workload",
+                "factory": "tllm.consumers.recirculation.workload:RecirculationWorkload.reconstruct",
                 "config": {
                     "source_layer": 3,
                     "destination_layer": 1,

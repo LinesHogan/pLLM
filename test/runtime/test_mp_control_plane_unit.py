@@ -455,7 +455,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.specialization import RuntimeSpecializationSpec
 
-        from tllm.consumers.esamp.region_workload import (
+        from tllm.consumers.esamp.workload import (
             ESampConfig,
             ESampWorkload,
         )
@@ -707,17 +707,17 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.consumers.recirculation import (
             RecirculationConfig,
-            VllmRecirculationRegionWorkload,
+            RecirculationWorkload,
         )
-        from tllm.consumers.recirculation import vllm_region_workload
+        from tllm.consumers.recirculation import native_backend
         from tllm.runtime.graph_policy import GraphMode
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.state import ResidualRuntimeState
         from tllm.workgraph.anchors import BackendResolution
 
         driver = V027MRv2Driver()
-        workload = VllmRecirculationRegionWorkload(
-            RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2)
+        workload = RecirculationWorkload(
+            RecirculationConfig(source_layer=1, destination_layer=0, alpha=0.2, beta=0.8)
         )
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
@@ -753,7 +753,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         )
         compile_stage = _core.compile_typed_recurrence_stage_artifact_json
         compile_bundle = _core.compile_typed_recurrence_stage_artifact_bundle_json
-        build_graph = vllm_region_workload.build_recirculation_graph
+        build_definitions = native_backend.build_stage_definitions
 
         with (
             mock.patch.object(residual_runtime, "RUNTIME", state),
@@ -768,10 +768,10 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 wraps=compile_bundle,
             ) as bundle_compile,
             mock.patch.object(
-                vllm_region_workload,
-                "build_recirculation_graph",
-                wraps=build_graph,
-            ) as graph_compile,
+                native_backend,
+                "build_stage_definitions",
+                wraps=build_definitions,
+            ) as definition_compile,
         ):
             runtime._coordinate_worker_compilation(plane)
 
@@ -779,9 +779,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
         worker_spec = resources.worker_spec
         assert worker_spec is not None
         assert "typed_stage_artifact_bundle" in worker_spec.config
-        assert artifact_compile.call_count == 2
-        assert bundle_compile.call_count == 1
-        assert graph_compile.call_count == 2
+        assert definition_compile.call_count == 1
+        assert artifact_compile.call_count == 0
+        assert bundle_compile.call_count == 0
         self.assertEqual(
             llm.llm_engine.engine_core.calls[-4][0],
             "tllm_prepare_workload_decision",
@@ -1052,7 +1052,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
     def test_abort_restores_native_hidden_hook_topology_and_resources(self) -> None:
         from tllm.backends.timeline import export_main_workload_timeline
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
-        from tllm.consumers.esamp.region_workload import (
+        from tllm.consumers.esamp.workload import (
             ESampConfig,
             ESampWorkload,
         )
@@ -2125,7 +2125,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
     def test_failed_native_install_clears_pending_state_and_partial_bindings(self) -> None:
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.backends.timeline import export_main_workload_timeline
-        from tllm.consumers.esamp.region_workload import (
+        from tllm.consumers.esamp.workload import (
             ESampConfig,
             ESampWorkload,
         )
