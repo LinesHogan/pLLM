@@ -24,9 +24,17 @@ class OverlayScope(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class OverlayTarget:
+    layer: int
+    module: str
+    parameter: str
+
+
+@dataclass(frozen=True, slots=True)
 class OverlayChannel:
     namespace: str
     name: str
+    target: OverlayTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +115,38 @@ class OverlayVersion:
 
 
 @dataclass(frozen=True, slots=True)
-class OverlayLease:
+class OverlayLeaseKey:
     request: RequestIdentity
+    lineage: OverlayLineage
+
+    def __post_init__(self) -> None:
+        lineage_request = self.lineage.request
+        if lineage_request is not None and lineage_request != self.request:
+            raise ValueError(
+                "request-scoped overlay lineage must match its lease request"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayLease:
+    key: OverlayLeaseKey
     ref: OverlayVersionRef
+
+    def __post_init__(self) -> None:
+        if self.ref.lineage != self.key.lineage:
+            raise ValueError("overlay lease version belongs to another lineage")
+
+    @property
+    def request(self) -> RequestIdentity:
+        return self.key.request
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayRequestRetirement:
+    released_leases: int
+    retired_lineages: int
+    retired_versions: int
+    retired_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +172,7 @@ class OverlayVersionStore:
         self._versions: dict[OverlayVersionRef, _StoredVersion] = {}
         self._latest: dict[OverlayLineage, OverlayVersionRef] = {}
         self._next_versions: dict[OverlayLineage, int] = {}
-        self._leases: dict[RequestIdentity, OverlayLease] = {}
+        self._leases: dict[OverlayLeaseKey, OverlayLease] = {}
         self._bytes = 0
         self._lock = RLock()
 
@@ -210,41 +247,41 @@ class OverlayVersionStore:
         with self._lock:
             return self._versions[ref].payload.materialize()
 
-    def pin_latest(
-        self, request: RequestIdentity, lineage: OverlayLineage
-    ) -> OverlayLease | None:
+    def pin_latest(self, key: OverlayLeaseKey) -> OverlayLease | None:
         with self._lock:
-            existing = self._leases.get(request)
+            existing = self._leases.get(key)
             if existing is not None:
                 return existing
-            ref = self._latest.get(lineage)
+            ref = self._latest.get(key.lineage)
             if ref is None:
                 return None
-            return self._pin(request, ref)
+            return self._pin(key, ref)
 
     def pin_exact(
-        self, request: RequestIdentity, ref: OverlayVersionRef
+        self, key: OverlayLeaseKey, ref: OverlayVersionRef
     ) -> OverlayLease:
         with self._lock:
-            existing = self._leases.get(request)
+            if ref.lineage != key.lineage:
+                raise ValueError("overlay version belongs to another lease lineage")
+            existing = self._leases.get(key)
             if existing is not None:
                 if existing.ref != ref:
                     raise RuntimeError("request already pins another overlay version")
                 return existing
-            return self._pin(request, ref)
+            return self._pin(key, ref)
 
     def _pin(
-        self, request: RequestIdentity, ref: OverlayVersionRef
+        self, key: OverlayLeaseKey, ref: OverlayVersionRef
     ) -> OverlayLease:
         stored = self._versions[ref]
-        lease = OverlayLease(request, ref)
+        lease = OverlayLease(key, ref)
         stored.leases += 1
-        self._leases[request] = lease
+        self._leases[key] = lease
         return lease
 
-    def release(self, request: RequestIdentity) -> bool:
+    def release(self, key: OverlayLeaseKey) -> bool:
         with self._lock:
-            lease = self._leases.pop(request, None)
+            lease = self._leases.pop(key, None)
             if lease is None:
                 return False
             self._versions[lease.ref].leases -= 1
@@ -252,23 +289,79 @@ class OverlayVersionStore:
             return True
 
     def advance_request(
-        self, request: RequestIdentity, ref: OverlayVersionRef
+        self, key: OverlayLeaseKey, ref: OverlayVersionRef
     ) -> OverlayLease:
         """Move an explicit request lineage to a newly committed version."""
 
         with self._lock:
-            existing = self._leases.get(request)
+            if ref.lineage != key.lineage:
+                raise ValueError("overlay version belongs to another lease lineage")
+            existing = self._leases.get(key)
             if existing is not None:
                 self._versions[existing.ref].leases -= 1
-            lease = OverlayLease(request, ref)
+            lease = OverlayLease(key, ref)
             self._versions[ref].leases += 1
-            self._leases[request] = lease
+            self._leases[key] = lease
             self._collect_unleased()
             return lease
 
-    def pinned(self, request: RequestIdentity) -> OverlayLease | None:
+    def pinned(self, key: OverlayLeaseKey) -> OverlayLease | None:
         with self._lock:
-            return self._leases.get(request)
+            return self._leases.get(key)
+
+    def retire_request(
+        self, request: RequestIdentity
+    ) -> OverlayRequestRetirement:
+        """Release every request lease and retire its request-scoped lineages."""
+
+        with self._lock:
+            request_lineages = tuple(
+                lineage
+                for lineage in self._latest
+                if lineage.request == request
+            )
+            pending = tuple(
+                transaction
+                for transaction, entry in self._pending.items()
+                if entry.publication.lineage.request == request
+            )
+            if pending:
+                raise RuntimeError(
+                    "cannot retire request overlay lineages with pending publications"
+                )
+
+            lease_keys = tuple(
+                key for key in self._leases if key.request == request
+            )
+            for key in lease_keys:
+                lease = self._leases.pop(key)
+                self._versions[lease.ref].leases -= 1
+
+            lineage_set = frozenset(request_lineages)
+            refs = tuple(
+                ref for ref in self._versions if ref.lineage in lineage_set
+            )
+            if any(self._versions[ref].leases for ref in refs):
+                raise RuntimeError(
+                    "cannot retire request overlay lineages with active leases"
+                )
+
+            retired_bytes = sum(
+                self._versions[ref].version.byte_size for ref in refs
+            )
+            for lineage in request_lineages:
+                self._latest.pop(lineage)
+                self._next_versions.pop(lineage, None)
+            for ref in refs:
+                self._versions.pop(ref)
+            self._bytes -= retired_bytes
+            self._collect_unleased()
+            return OverlayRequestRetirement(
+                released_leases=len(lease_keys),
+                retired_lineages=len(request_lineages),
+                retired_versions=len(refs),
+                retired_bytes=retired_bytes,
+            )
 
     def versions(self, lineage: OverlayLineage) -> tuple[OverlayVersion, ...]:
         with self._lock:
@@ -305,15 +398,19 @@ class OverlayVersionStore:
             stored = self._versions.pop(ref)
             self._bytes -= stored.version.byte_size
 
+
 __all__ = [
     "OverlayChannel",
     "OverlayLease",
+    "OverlayLeaseKey",
     "OverlayLineage",
     "OverlayManifest",
     "OverlayPayload",
     "OverlayPublication",
     "OverlayRepresentation",
+    "OverlayRequestRetirement",
     "OverlayScope",
+    "OverlayTarget",
     "OverlayVersion",
     "OverlayVersionRef",
     "OverlayVersionStore",

@@ -41,6 +41,17 @@ class RuntimeTypingContractsUnitTest(unittest.TestCase):
                     current[key] = current.get(key, 0) + 1
 
         baseline: dict[str, int] = json.loads(Path("tools/getattr_probe_baseline.json").read_text(encoding="utf-8"))
+        stale = sorted(
+            key for key in baseline if not Path(key.partition("::")[0]).is_file()
+        )
+        self.assertEqual(
+            stale,
+            [],
+            msg=(
+                "getattr probe baseline contains entries for deleted files; "
+                "remove the obsolete exemptions:\n" + "\n".join(stale)
+            ),
+        )
         violations = sorted(
             f"{key}: {count} > baseline {baseline.get(key, 0)}" for key, count in current.items() if count > baseline.get(key, 0)
         )

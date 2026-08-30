@@ -104,10 +104,10 @@ def main() -> int:
                 f"requested {args.runner}, got runner module {type(runner).__module__}"
             )
         binding = getattr(runner, "_tllm_runner_binding", None)
-        handles = getattr(binding, "model_region_handles", {})
-        if tuple(handles) != ("typed-layer-replay",):
-            raise AssertionError(f"native model-region handle missing: {tuple(handles)}")
-        stats = handles["typed-layer-replay"].stats
+        handle = getattr(binding, "typed_layer_replay_handle", None)
+        if handle is None:
+            raise AssertionError("native model-region handle missing")
+        stats = handle.stats
         output_request_ids = {str(output.request_id) for output in outputs}
         replay_ids = set(stats.request_replays)
         if (

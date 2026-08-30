@@ -61,7 +61,12 @@ if TYPE_CHECKING:
     import torch
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
-    from tllm.runtime.mp.control import ControlPlane
+    from tllm.runtime.mp.control import (
+        ControlPlane,
+        WorkerPortCommitReply,
+        WorkerPortQuorum,
+    )
+    from tllm.runtime.mp.port_wire import EncodedPortPayload
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_plugins import (
@@ -335,17 +340,19 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         from tllm.runtime.mp.control import active_control_plane
 
         plane = active_control_plane()
-        encoded_payloads = ()
-        if plane is not None:
-            from tllm.runtime.mp.port_wire import encode_port_payload
-
-            encoded_payloads = (
-                encode_port_payload(first_value),
-                encode_port_payload(second_value),
-            )
+        encoded_payloads: list[EncodedPortPayload] = []
         prepared = 0
         remote_prepared = 0
+        sequence_mismatch = False
+        quorum: WorkerPortQuorum | None = None
+        first_remote: tuple[WorkerPortCommitReply, ...] = ()
+        second_remote: tuple[WorkerPortCommitReply, ...] = ()
         try:
+            if plane is not None:
+                from tllm.runtime.mp.port_wire import encode_port_payload
+
+                encoded_payloads.append(encode_port_payload(first_value))
+                encoded_payloads.append(encode_port_payload(second_value))
             for workload, key, value in entries:
                 workload.prepare_port(key, transaction, value)
                 prepared += 1
@@ -358,23 +365,59 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                         key, transaction, encoded.wire, quorum=quorum
                     )
                     remote_prepared += 1
-                for _workload, key, _value in entries:
-                    plane.commit_workload_port(key, transaction, quorum=quorum)
-            return (
-                first.commit_port(first_port.key, transaction),
-                second.commit_port(second_port.key, transaction),
-            )
-        except Exception:
+                first_remote = plane.commit_workload_port(
+                    first_port.key, transaction, quorum=quorum
+                )
+                second_remote = plane.commit_workload_port(
+                    second_port.key, transaction, quorum=quorum
+                )
+            first_sequence = first.commit_port(first_port.key, transaction)
+            second_sequence = second.commit_port(second_port.key, transaction)
+            if plane is not None and (
+                any(reply.sequence != first_sequence for reply in first_remote)
+                or any(reply.sequence != second_sequence for reply in second_remote)
+            ):
+                sequence_mismatch = True
+                raise RuntimeError(
+                    "workload port pair parent/worker sequence quorum mismatch"
+                )
+            return first_sequence, second_sequence
+        except Exception as exc:
+            rollback_failures: list[Exception] = []
             for workload, key, _value in entries[:prepared]:
-                workload.abort_port(key, transaction)
-            if plane is not None and remote_prepared:
-                quorum = plane.worker_quorum()
+                try:
+                    workload.abort_port(key, transaction)
+                except Exception as rollback_error:
+                    rollback_failures.append(rollback_error)
+            if plane is not None and remote_prepared and quorum is not None:
                 for _workload, key, _value in entries[:remote_prepared]:
-                    plane.abort_workload_port(key, transaction, quorum=quorum)
+                    try:
+                        plane.abort_workload_port(key, transaction, quorum=quorum)
+                    except Exception as rollback_error:
+                        rollback_failures.append(rollback_error)
+            if rollback_failures:
+                self._fail_stop_workloads(
+                    "workload port pair rollback did not reach its full quorum"
+                )
+                raise RuntimeError(
+                    "workload port pair publication failed and rollback quorum "
+                    "was not confirmed"
+                ) from exc
+            if sequence_mismatch:
+                self._fail_stop_workloads(
+                    "workload port pair transaction histories diverged"
+                )
             raise
         finally:
             for encoded in encoded_payloads:
-                encoded.release()
+                try:
+                    encoded.release()
+                except Exception as cleanup_error:
+                    warnings.warn(
+                        f"staged port pair cleanup failed: {cleanup_error}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
     def drain(self, port: "HostOutput[HostOutputT]") -> tuple[HostOutputT, ...]:
         """Drain typed outputs published by signed workload tasks."""

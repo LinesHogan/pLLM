@@ -89,13 +89,12 @@ def main() -> int:
             from tllm.backends.protocol import runner_binding_for
 
             binding = runner_binding_for(runner)
-            handles = {} if binding is None else binding.parameter_overlay_handles
-            controller = handles.get("tllm.versioned_parameter_overlay")
+            state = None if binding is None else binding.parameter_overlay_state
             raise AssertionError(
                 "generic TLM overlay was not installed in vLLM: "
                 f"lineages={local_workload.overlay_versions.store.lineages()!r} "
-                f"controller_lineages={None if controller is None else {channel: store.lineages() for channel, store in controller.stores.items()}!r} "
-                f"handles={handles!r}"
+                f"controller_lineages={None if state is None else {channel: store.lineages() for channel, store in state.stores.items()}!r} "
+                f"backend_state={state!r}"
             )
         print(
             json.dumps(

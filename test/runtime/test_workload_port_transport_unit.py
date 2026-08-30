@@ -100,6 +100,43 @@ class _LocalPortWorkload:
         self.store.abort(key, transaction)
 
 
+class _PortRuntime(TllmRuntime[_LocalPortWorkload]):
+    @classmethod
+    def create(cls, workload: _LocalPortWorkload) -> _PortRuntime:
+        runtime = cls.__new__(cls)
+        runtime._workloads_by_type = {
+            _PortOwner: workload,
+            _LocalPortWorkload: workload,
+        }
+        runtime._workload_fail_stop_reason = None
+        runtime._workload_compilation = None
+        runtime._port_transaction_owner = "test-runtime"
+        runtime._port_transaction_sequence = 0
+        return runtime
+
+    @property
+    def fail_stopped(self) -> bool:
+        return self._workload_fail_stop_reason is not None
+
+    def set_compilation_for_test(
+        self, compilation: WorkloadCompilation
+    ) -> None:
+        self._workload_compilation = compilation
+
+
+@dataclass(slots=True)
+class _ForeignExecution:
+    compilation: WorkloadCompilation
+    plan_epoch: int
+    workload: _LocalPortWorkload
+
+    def workload_instance(
+        self, workload_type: type[_LocalPortWorkload]
+    ) -> _LocalPortWorkload:
+        del workload_type
+        return self.workload
+
+
 class _PortWorker:
     def __init__(self, worker_id: str = "worker-0") -> None:
         self.worker_id = worker_id
@@ -223,18 +260,9 @@ class _CleanupFailingPayload:
         raise RuntimeError("cleanup failed")
 
 
-def _runtime_with_local_port() -> tuple[TllmRuntime, _LocalPortWorkload]:
+def _runtime_with_local_port() -> tuple[_PortRuntime, _LocalPortWorkload]:
     workload = _LocalPortWorkload()
-    runtime = TllmRuntime.__new__(TllmRuntime)
-    runtime._workloads_by_type = {
-        _PortOwner: workload,
-        _LocalPortWorkload: workload,
-    }
-    runtime._workload_fail_stop_reason = None
-    runtime._workload_compilation = None
-    runtime._port_transaction_owner = "test-runtime"
-    runtime._port_transaction_sequence = 0
-    return runtime, workload
+    return _PortRuntime.create(workload), workload
 
 
 class WorkloadPortTransportUnitTest(unittest.TestCase):
@@ -278,18 +306,150 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
             )
         self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
 
+    def test_stage_pair_releases_first_payload_when_second_encode_fails(self) -> None:
+        runtime, _local = _runtime_with_local_port()
+        first_payload = mock.Mock(wire={"kind": "first"})
+        plane = mock.Mock()
+        with (
+            mock.patch(
+                "tllm.runtime.mp.control.active_control_plane",
+                return_value=plane,
+            ),
+            mock.patch(
+                "tllm.runtime.mp.port_wire.encode_port_payload",
+                side_effect=(first_payload, RuntimeError("second encode failed")),
+            ),
+            self.assertRaisesRegex(RuntimeError, "second encode failed"),
+        ):
+            runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(1),
+                _PortOwner.metadata,
+                _Payload("metadata", 1),
+            )
+        first_payload.release.assert_called_once_with()
+
+    def test_stage_pair_sequence_divergence_rolls_back_and_fail_stops(self) -> None:
+        runtime, local = _runtime_with_local_port()
+        plane = mock.Mock()
+        plane.worker_quorum.return_value = SimpleNamespace(worker_ids=frozenset({"w"}))
+        plane.commit_workload_port.return_value = (
+            SimpleNamespace(sequence=9),
+        )
+        payloads = (
+            mock.Mock(wire={"kind": "first"}),
+            mock.Mock(wire={"kind": "second"}),
+        )
+        with (
+            mock.patch(
+                "tllm.runtime.mp.control.active_control_plane",
+                return_value=plane,
+            ),
+            mock.patch(
+                "tllm.runtime.mp.port_wire.encode_port_payload",
+                side_effect=payloads,
+            ),
+            self.assertRaisesRegex(RuntimeError, "sequence quorum mismatch"),
+        ):
+            runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(1),
+                _PortOwner.metadata,
+                _Payload("metadata", 1),
+            )
+        self.assertTrue(runtime.fail_stopped)
+        self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+        self.assertIs(local.store.take(_PortOwner.metadata.key), SKIPPED)
+
+    def test_stage_pair_commits_tensor_and_metadata_to_worker_quorum(self) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, local = _runtime_with_local_port()
+        tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        metadata = _Payload("pair", 2)
+
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            self.assertEqual(
+                runtime.stage_pair(
+                    _PortOwner.batch,
+                    tensor,
+                    _PortOwner.metadata,
+                    metadata,
+                ),
+                (1, 1),
+            )
+
+        self.assertTrue(
+            torch.equal(
+                cast(torch.Tensor, local.store.take(_PortOwner.batch.key)), tensor
+            )
+        )
+        self.assertEqual(local.store.take(_PortOwner.metadata.key), metadata)
+        for worker in core.workers:
+            self.assertTrue(
+                torch.equal(
+                    cast(
+                        torch.Tensor,
+                        worker.store.take(_PortOwner.batch.key),
+                    ),
+                    tensor,
+                )
+            )
+            self.assertEqual(
+                worker.store.take(_PortOwner.metadata.key), metadata
+            )
+
+    def test_stage_pair_unconfirmed_rollback_fail_stops_runtime(self) -> None:
+        core = _PortEngineCore()
+        core.failures.update(
+            {
+                ("tllm_commit_workload_port", 1),
+                ("tllm_abort_workload_port", 1),
+            }
+        )
+        plane = ControlPlane(_PortLLM(core))
+        runtime, _local = _runtime_with_local_port()
+
+        with (
+            mock.patch(
+                "tllm.runtime.mp.control.active_control_plane",
+                return_value=plane,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "rollback quorum was not confirmed"
+            ),
+        ):
+            runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2, 3),
+                _PortOwner.metadata,
+                _Payload("pair", 2),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
+            runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2, 3),
+                _PortOwner.metadata,
+                _Payload("pair", 2),
+            )
+
     def test_local_workload_never_borrows_a_foreign_active_runtime(self) -> None:
         runtime, local = _runtime_with_local_port()
         compilation = SimpleNamespace(
             decision=SimpleNamespace(signature="a" * 64),
             physical=SimpleNamespace(plan_epoch=2),
         )
-        runtime._workload_compilation = cast("WorkloadCompilation", compilation)
+        typed_compilation = cast("WorkloadCompilation", compilation)
+        runtime.set_compilation_for_test(typed_compilation)
         foreign = _LocalPortWorkload()
-        foreign_execution = SimpleNamespace(
-            compilation=compilation,
+        foreign_execution = _ForeignExecution(
+            compilation=typed_compilation,
             plan_epoch=2,
-            workload_instance=lambda _workload_type: foreign,
+            workload=foreign,
         )
         foreign_runtime, _ = _runtime_with_local_port()
         with (

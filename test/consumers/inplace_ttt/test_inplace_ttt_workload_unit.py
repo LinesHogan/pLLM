@@ -19,6 +19,7 @@ from tllm.consumers.inplace_ttt.workload import (
     InPlaceTTTWorkload,
 )
 from tllm.contracts.request_identity import RequestIdentity
+from tllm.runtime.parameter_overlay import OverlayLeaseKey
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -165,7 +166,10 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
             InPlaceTTTMetadata(InPlaceTTTKey(request, 0), InPlaceTTTPhase.PREFILL),
         )
         _drive(runtime, compilation, 1)
-        self.assertIsNotNone(workload.overlay_versions.store.pinned(request))
+        (publication,) = runtime.drain(InPlaceTTTWorkload.publications)
+        assert publication.version is not None
+        lease_key = OverlayLeaseKey(request, publication.version.lineage)
+        self.assertIsNotNone(workload.overlay_versions.store.pinned(lease_key))
         runtime.stage(
             InPlaceTTTWorkload.finished_requests,
             InPlaceTTTFinishBatch((request,)),
@@ -175,7 +179,52 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         receipt = runtime.drain(InPlaceTTTWorkload.cleanup)[0]
         self.assertEqual(receipt.cleared_slots, 1)
         self.assertEqual(receipt.released_versions, 1)
-        self.assertIsNone(workload.overlay_versions.store.pinned(request))
+        self.assertIsNone(workload.overlay_versions.store.pinned(lease_key))
+
+    def test_finished_request_retires_every_layer_lineage_and_payload(self) -> None:
+        workload, runtime, compilation = _build(
+            InPlaceTTTConfig(layers=(0, 1), chunk_size=2)
+        )
+        request = RequestIdentity("req-multi-layer", 0, 0)
+        lease_keys: list[OverlayLeaseKey] = []
+        for step_id, layer in enumerate((0, 1), start=1):
+            runtime.stage_pair(
+                InPlaceTTTWorkload.batch_tensors,
+                {
+                    "hidden": torch.ones((2, 3), dtype=torch.float64),
+                    "target": torch.ones((2, 2), dtype=torch.float64),
+                    "base_weight": torch.ones((2, 3), dtype=torch.float64),
+                },
+                InPlaceTTTWorkload.batch_metadata,
+                InPlaceTTTMetadata(
+                    InPlaceTTTKey(request, layer), InPlaceTTTPhase.PREFILL
+                ),
+            )
+            _drive(runtime, compilation, step_id)
+            (publication,) = runtime.drain(InPlaceTTTWorkload.publications)
+            assert publication.version is not None
+            lease_keys.append(
+                OverlayLeaseKey(request, publication.version.lineage)
+            )
+
+        for lease_key in lease_keys:
+            self.assertIsNotNone(workload.overlay_versions.store.pinned(lease_key))
+        self.assertEqual(len(workload.overlay_versions.store.lineages()), 2)
+        self.assertGreater(workload.overlay_versions.store.byte_size, 0)
+
+        runtime.stage(
+            InPlaceTTTWorkload.finished_requests,
+            InPlaceTTTFinishBatch((request,)),
+        )
+        _drive(runtime, compilation, 3)
+
+        receipt = runtime.drain(InPlaceTTTWorkload.cleanup)[0]
+        self.assertEqual(receipt.cleared_slots, 2)
+        self.assertEqual(receipt.released_versions, 2)
+        self.assertEqual(workload.overlay_versions.store.lineages(), ())
+        self.assertEqual(workload.overlay_versions.store.byte_size, 0)
+        for lease_key in lease_keys:
+            self.assertIsNone(workload.overlay_versions.store.pinned(lease_key))
 
     def test_config_contains_algorithm_semantics_not_scheduler_controls(self) -> None:
         self.assertEqual(

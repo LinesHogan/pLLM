@@ -14,10 +14,12 @@ from tllm.contracts.request_identity import RequestIdentity
 from tllm.kit.workload import Workload
 from tllm.runtime.parameter_overlay import (
     OverlayChannel,
+    OverlayLeaseKey,
     OverlayLineage,
     OverlayPayload,
     OverlayPublication,
     OverlayRepresentation,
+    OverlayTarget,
     OverlayVersionRef,
     OverlayVersionStore,
 )
@@ -242,7 +244,11 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
     ) -> MappingProxyType[OverlayChannel, OverlayVersionStore]:
         return MappingProxyType(
             {
-                OverlayChannel("inplace_ttt", f"layer-{layer}-down-proj"): self._overlay_store
+                OverlayChannel(
+                    "inplace_ttt",
+                    f"layer-{layer}-down-proj",
+                    OverlayTarget(layer, "mlp", "down_proj.weight"),
+                ): self._overlay_store
                 for layer in self.config.layers
             }
         )
@@ -297,7 +303,11 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         if not step.update_count:
             return InPlaceTTTPublication(step.key.request, None, 0)
         lineage = OverlayLineage(
-            OverlayChannel("inplace_ttt", f"layer-{step.key.layer}-down-proj"),
+            OverlayChannel(
+                "inplace_ttt",
+                f"layer-{step.key.layer}-down-proj",
+                OverlayTarget(step.key.layer, "mlp", "down_proj.weight"),
+            ),
             step.key.request,
         )
         publication = OverlayPublication(
@@ -314,7 +324,9 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         )
         store.stage(transaction, publication)
         version = store.commit(transaction)
-        store.advance_request(step.key.request, version.ref)
+        store.advance_request(
+            OverlayLeaseKey(step.key.request, lineage), version.ref
+        )
         self.advance_state(InPlaceTTTWorkload.overlay_versions)
         return InPlaceTTTPublication(
             step.key.request, version.ref, step.update_count
@@ -356,12 +368,13 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
     def finish_overlay(
         self, requests: tuple[RequestIdentity, ...], cleared: int
     ) -> InPlaceTTTCleanupReceipt:
-        released = sum(
-            self.overlay_versions.store.release(request) for request in requests
+        retired_versions = sum(
+            self.overlay_versions.store.retire_request(request).retired_versions
+            for request in requests
         )
-        if released:
+        if retired_versions:
             self.advance_state(InPlaceTTTWorkload.overlay_versions)
-        return InPlaceTTTCleanupReceipt(cleared, released)
+        return InPlaceTTTCleanupReceipt(cleared, retired_versions)
 
     def runtime_services(self) -> LocalRuntimeServices:
         return LocalRuntimeServices(

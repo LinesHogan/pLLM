@@ -13,16 +13,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.typed_replay import TypedLayerReplayHandle
 
 if TYPE_CHECKING:
     import torch
-    from tllm.runtime.parameter_overlay import OverlayLease, OverlayVersion
+    from tllm.runtime.parameter_overlay import (
+        OverlayChannel,
+        OverlayLease,
+        OverlayVersion,
+        OverlayVersionRef,
+        OverlayVersionStore,
+    )
     from tllm.schedule import MainWorkloadTimeline
 
 
@@ -44,6 +52,43 @@ class GraphSafety(Enum):
     EAGER_ONLY = auto()
     CAPTURE_SAFE = auto()
     REPLAY_STATEFUL = auto()
+
+
+@dataclass(slots=True, init=False)
+class OverlayBackendState:
+    """Runner-owned installation state shared across overlay store epochs."""
+
+    stores: Mapping[OverlayChannel, OverlayVersionStore]
+    version_handles: dict[OverlayVersionRef, int]
+    request_identities: dict[str, RequestIdentity]
+    attached_requests: set[str]
+    next_handle_ordinal: int
+
+    def __init__(self) -> None:
+        self.stores = {}
+        self.version_handles = {}
+        self.request_identities = {}
+        self.attached_requests = set()
+        self.next_handle_ordinal = 0
+
+    def owns_stores(
+        self, stores: Mapping[OverlayChannel, OverlayVersionStore]
+    ) -> bool:
+        return self.stores.keys() == stores.keys() and all(
+            self.stores[channel] is store for channel, store in stores.items()
+        )
+
+    def rebind(
+        self, stores: Mapping[OverlayChannel, OverlayVersionStore]
+    ) -> None:
+        self.stores = MappingProxyType(dict(stores))
+        self.version_handles.clear()
+        self.request_identities.clear()
+        self.attached_requests.clear()
+
+    def allocate_handle_ordinal(self) -> int:
+        self.next_handle_ordinal += 1
+        return self.next_handle_ordinal
 
 
 @dataclass(frozen=True)
@@ -140,37 +185,24 @@ class BackendCapabilities:
     extensions: frozenset[BackendCapability] = frozenset()
     hidden_locators: frozenset[HiddenLocatorCapability] = frozenset()
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.extensions, frozenset) or any(
-            not isinstance(capability, BackendCapability)
-            for capability in self.extensions
-        ):
-            raise TypeError(
-                "BackendCapabilities.extensions must be "
-                "frozenset[BackendCapability]"
-            )
-        if not isinstance(self.hidden_locators, frozenset) or any(
-            not isinstance(locator, HiddenLocatorCapability)
-            for locator in self.hidden_locators
-        ):
-            raise TypeError(
-                "BackendCapabilities.hidden_locators must be "
-                "frozenset[HiddenLocatorCapability]"
-            )
-
     def capability_names(self) -> frozenset[str]:
         parameter_overlay = self.parameter_overlay
         region = self.model_region
-        return (
-            (
-                frozenset()
-                if parameter_overlay is None
-                else parameter_overlay.capability_names()
-            )
-            | (frozenset() if region is None else region.capability_names())
-            | frozenset(capability.value for capability in self.extensions)
-            | frozenset(locator.value for locator in self.hidden_locators)
+        parameter_names: frozenset[str] = (
+            frozenset()
+            if parameter_overlay is None
+            else parameter_overlay.capability_names()
         )
+        region_names: frozenset[str] = (
+            frozenset() if region is None else region.capability_names()
+        )
+        extension_names = frozenset(
+            capability.value for capability in self.extensions
+        )
+        locator_names = frozenset(
+            locator.value for locator in self.hidden_locators
+        )
+        return parameter_names | region_names | extension_names | locator_names
 
 
 @dataclass
@@ -180,9 +212,10 @@ class RunnerBinding:
     driver: "BackendDriver"
     runner: Any
     capabilities: BackendCapabilities
-    orig_methods: dict[str, Any] = field(default_factory=dict)
-    parameter_overlay_handles: dict[str, Any] = field(default_factory=dict)
-    model_region_handles: dict[str, Any] = field(default_factory=dict)
+    parameter_overlay_state: OverlayBackendState = field(
+        default_factory=OverlayBackendState
+    )
+    typed_layer_replay_handle: TypedLayerReplayHandle | None = None
     active: bool = True
 
 

@@ -28,9 +28,6 @@ from tllm.contracts.typed_replay import (
     TypedLayerReplayStep,
 )
 
-_HANDLE_KEY = "typed-layer-replay"
-
-
 @dataclass(frozen=True, slots=True)
 class TypedLayerReplayStats:
     prepare_count: int
@@ -402,11 +399,11 @@ def install_typed_layer_replay(*, runtime: object, runner: object) -> VllmTypedL
     """Return the single restorable typed replay hook for an active runner."""
 
     binding = _require_binding(runtime=runtime, runner=runner)
-    existing = binding.model_region_handles.get(_HANDLE_KEY)
+    existing = binding.typed_layer_replay_handle
     if isinstance(existing, VllmTypedLayerReplayHandle) and not existing.restored:
         return existing
     handle = VllmTypedLayerReplayHandle(binding=binding)
-    binding.model_region_handles[_HANDLE_KEY] = handle
+    binding.typed_layer_replay_handle = handle
     setattr(runtime, "typed_layer_replay_binding", binding)
     return handle
 
@@ -445,7 +442,7 @@ def abort_typed_layer_replay(runtime: object) -> bool:
     binding = getattr(runtime, "typed_layer_replay_binding", None)
     if not isinstance(binding, RunnerBinding):
         return False
-    handle = binding.model_region_handles.get(_HANDLE_KEY)
+    handle = binding.typed_layer_replay_handle
     if not isinstance(handle, VllmTypedLayerReplayHandle):
         return False
     handle.abort()
@@ -456,10 +453,11 @@ def restore_typed_layer_replay(runtime: object) -> int:
     binding = getattr(runtime, "typed_layer_replay_binding", None)
     if not isinstance(binding, RunnerBinding):
         return 0
-    handle = binding.model_region_handles.pop(_HANDLE_KEY, None)
+    handle = binding.typed_layer_replay_handle
     if not isinstance(handle, VllmTypedLayerReplayHandle):
         return 0
     handle.restore()
+    binding.typed_layer_replay_handle = None
     setattr(runtime, "typed_layer_replay_binding", None)
     return 1
 

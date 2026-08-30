@@ -9,6 +9,8 @@
     "tllm/workload",
     "tllm/kit/backend.py",
     "tllm/kit/workload.py",
+    "tllm/backends/protocol.py",
+    "tllm/backends/vllm/versioned_parameter_overlay.py",
     "tllm/runtime/runtime.py",
     "tllm/runtime/backend_region_binders.py",
     "tllm/runtime/declaration_adapter.py",
@@ -32,7 +34,12 @@
     "tllm/consumers/recirculation/native_backend.py",
     "tllm/consumers/recirculation/stage_definition.py",
     "tllm/consumers/recirculation/stage_binding.py",
-    "test/typing/native_workload_api.py"
+    "test/typing/native_workload_api.py",
+    "test/runtime/test_parameter_overlay_unit.py",
+    "test/runtime/test_runtime_typing_contracts_unit.py",
+    "test/runtime/test_vllm_parameter_overlay_unit.py",
+    "test/runtime/test_workload_port_transport_unit.py",
+    "test/consumers/inplace_ttt/test_inplace_ttt_workload_unit.py"
   ],
   "exclude": ["**/__pycache__"],
   "reportMissingImports": true,

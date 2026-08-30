@@ -78,9 +78,11 @@ def _wrapped_prepare_inputs(
 ) -> Any:
     runtime = core.RUNTIME
     cold_compile_loaded_workloads(core=core, runner=runner)
+    binding = _runner_adapter.get_runner_binding(runner)
     overlay_controller = _parameter_overlay.maybe_bind_publisher(
         runtime=runtime,
         runner=runner,
+        state=None if binding is None else binding.parameter_overlay_state,
     )
     input_batch = orig(runner, *args, **kwargs)
     if overlay_controller is not None:
@@ -203,9 +205,11 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     # step. Otherwise prepare_inputs can stage a Region on an unprepared
     # execution and PREPARE_INPUTS_POST will silently skip it.
     cold_compile_loaded_workloads(core=core, runner=runner)
+    binding = _runner_adapter.get_runner_binding(runner)
     overlay_controller = _parameter_overlay.maybe_bind_publisher(
         runtime=runtime,
         runner=runner,
+        state=None if binding is None else binding.parameter_overlay_state,
     )
     if overlay_controller is not None:
         overlay_controller.sync_versions()
@@ -490,7 +494,9 @@ class V027MRv2Driver:
         orig_sample_tokens = cls.sample_tokens
 
         def _load_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            _runner_adapter.ensure_runner_binding(driver=self, runner=runner)
+            binding = _runner_adapter.ensure_runner_binding(
+                driver=self, runner=runner
+            )
             out = _wrapped_load_model(
                 core=core,
                 runner=runner,
@@ -501,6 +507,7 @@ class V027MRv2Driver:
             _parameter_overlay.maybe_bind_publisher(
                 runtime=core.RUNTIME,
                 runner=runner,
+                state=binding.parameter_overlay_state,
             )
             return out
 

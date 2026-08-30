@@ -195,9 +195,11 @@ def _wrapped_prepare_inputs(
             "the engine called it with a legacy single-argument shape. "
             "Refusing to guess: install a matching backend driver."
         )
+    binding = _runner_adapter.get_runner_binding(runner)
     _parameter_overlay.sync_mrv1_before_prepare(
         runtime=runtime,
         runner=runner,
+        state=None if binding is None else binding.parameter_overlay_state,
         scheduler_output=scheduler_output,
     )
     if not active_targets.runtime_has_active_targets(runtime):
@@ -513,11 +515,14 @@ class V027MRv1Driver:
         core._ORIG_SAMPLE_TOKENS = orig_sample_tokens
 
         def _load_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
-            _runner_adapter.ensure_runner_binding(driver=self, runner=runner)
+            binding = _runner_adapter.ensure_runner_binding(
+                driver=self, runner=runner
+            )
             out = _hooks.wrapped_load_model(core=core, runner=runner, args=args, kwargs=kwargs)
             _parameter_overlay.maybe_bind_publisher(
                 runtime=core.RUNTIME,
                 runner=runner,
+                state=binding.parameter_overlay_state,
             )
             from tllm.runtime.graph_policy import resolve_graph_mode
 
