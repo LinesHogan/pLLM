@@ -4,7 +4,7 @@
 //! neutral. Rust owns graph validation, deterministic grouping, and value
 //! liveness; Python binds the resulting typed operands to runtime resources.
 
-use crate::prefill_row_plan::{PackedPrefillRowPlan, SchedulerBatchPhase};
+use crate::prefill_row_plan::{PackedPrefillRowPlan, PrefillRowSpan, SchedulerBatchPhase};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -408,6 +408,7 @@ impl TypedDependency {
 enum MixedBatchPolicy {
     Reject,
     Noop,
+    SelectAllowed,
 }
 
 impl<'de> Deserialize<'de> for MixedBatchPolicy {
@@ -418,8 +419,9 @@ impl<'de> Deserialize<'de> for MixedBatchPolicy {
         match String::deserialize(deserializer)?.as_str() {
             "reject" => Ok(Self::Reject),
             "noop" => Ok(Self::Noop),
+            "select_allowed" => Ok(Self::SelectAllowed),
             _ => Err(serde::de::Error::custom(
-                "mixed_batch must be reject or noop",
+                "mixed_batch must be reject, noop, or select_allowed",
             )),
         }
     }
@@ -446,6 +448,16 @@ impl TypedStageAdmission {
             value: RowAdmission {
                 allowed_phases: vec!["prefill".into()],
                 mixed_batch: MixedBatchPolicy::Reject,
+            },
+        }
+    }
+
+    #[staticmethod]
+    fn prefill_select() -> Self {
+        Self {
+            value: RowAdmission {
+                allowed_phases: vec!["prefill".into()],
+                mixed_batch: MixedBatchPolicy::SelectAllowed,
             },
         }
     }
@@ -1932,6 +1944,30 @@ fn admit_typed_recurrence_stage_bundle_for_packed_plan(
     admit_stage_bundle_for_packed_plan(&bundle, &row_plan)
 }
 
+fn packed_span_phase(span: &PrefillRowSpan) -> PyResult<(SchedulerBatchPhase, &'static str)> {
+    let packed_row_count = span
+        .packed_row_end
+        .checked_sub(span.packed_row_start)
+        .ok_or_else(|| validation_error("typed recurrence packed span has invalid row bounds"))?;
+    if packed_row_count <= 0
+        || span.prefill_row_count < 0
+        || span.decode_row_count < 0
+        || span.prefill_row_count + span.decode_row_count != packed_row_count
+        || span.token_offset_end - span.token_offset_start != packed_row_count
+    {
+        return Err(validation_error(
+            "typed recurrence packed span has inconsistent observed row facts",
+        ));
+    }
+    match (span.prefill_row_count, span.decode_row_count) {
+        (prefill, 0) if prefill > 0 => Ok((SchedulerBatchPhase::Prefill, "prefill")),
+        (0, decode) if decode > 0 => Ok((SchedulerBatchPhase::Decode, "decode")),
+        _ => Err(validation_error(
+            "typed recurrence packed span contains mixed prefill/decode rows",
+        )),
+    }
+}
+
 fn admit_stage_bundle_for_packed_plan(
     bundle: &TypedRecurrenceStageArtifactBundle,
     row_plan: &PackedPrefillRowPlan,
@@ -1951,6 +1987,22 @@ fn admit_stage_bundle_for_packed_plan(
                 "typed recurrence stage row admission rejects mixed backend phases",
             )),
             MixedBatchPolicy::Noop => Ok(TypedStagePlanAdmission::Noop),
+            MixedBatchPolicy::SelectAllowed => {
+                for span in &row_plan.request_spans {
+                    let (_, phase_name) = packed_span_phase(span)?;
+                    if artifact
+                        .plan
+                        .spec
+                        .row_admission
+                        .allowed_phases
+                        .iter()
+                        .any(|allowed| allowed == phase_name)
+                    {
+                        return Ok(TypedStagePlanAdmission::Execute);
+                    }
+                }
+                Ok(TypedStagePlanAdmission::Noop)
+            }
         };
     }
     let phase = observed
@@ -1993,29 +2045,11 @@ fn bind_stage_bundle_for_packed_span(
                 "typed recurrence packed row plan has no request ordinal {request_ordinal}"
             ))
         })?;
+    let (phase, phase_name) = packed_span_phase(span)?;
     let packed_row_count = span
         .packed_row_end
         .checked_sub(span.packed_row_start)
         .ok_or_else(|| validation_error("typed recurrence packed span has invalid row bounds"))?;
-    if packed_row_count <= 0
-        || span.prefill_row_count < 0
-        || span.decode_row_count < 0
-        || span.prefill_row_count + span.decode_row_count != packed_row_count
-        || span.token_offset_end - span.token_offset_start != packed_row_count
-    {
-        return Err(validation_error(
-            "typed recurrence packed span has inconsistent observed row facts",
-        ));
-    }
-    let (phase, phase_name) = match (span.prefill_row_count, span.decode_row_count) {
-        (prefill, 0) if prefill > 0 => (SchedulerBatchPhase::Prefill, "prefill"),
-        (0, decode) if decode > 0 => (SchedulerBatchPhase::Decode, "decode"),
-        _ => {
-            return Err(validation_error(
-                "typed recurrence packed span contains mixed prefill/decode rows",
-            ));
-        }
-    };
     let row_count = u64::try_from(packed_row_count)
         .map_err(|_| validation_error("typed recurrence packed span row count is unsupported"))?;
     let artifact = bundle
@@ -2054,11 +2088,31 @@ fn bind_stage_bundle_for_packed_plan(
             requests: Vec::new(),
         });
     }
-    let requests = row_plan
-        .request_spans
-        .iter()
-        .map(|span| bind_stage_bundle_for_packed_span(bundle, row_plan, span.request_ordinal))
-        .collect::<PyResult<Vec<_>>>()?;
+    let allowed_phases = &bundle
+        .artifacts
+        .first()
+        .ok_or_else(|| validation_error("typed recurrence stage artifact bundle is empty"))?
+        .artifact
+        .plan
+        .spec
+        .row_admission
+        .allowed_phases;
+    let mut requests = Vec::new();
+    for span in &row_plan.request_spans {
+        let (_, phase_name) = packed_span_phase(span)?;
+        if allowed_phases.iter().any(|allowed| allowed == phase_name) {
+            requests.push(bind_stage_bundle_for_packed_span(
+                bundle,
+                row_plan,
+                span.request_ordinal,
+            )?);
+        }
+    }
+    let admission = if requests.is_empty() {
+        TypedStagePlanAdmission::Noop
+    } else {
+        admission
+    };
     Ok(TypedPackedRecurrenceStageBatch {
         admission,
         total_rows: row_plan.total_rows,

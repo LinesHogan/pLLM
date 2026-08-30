@@ -130,7 +130,7 @@ def _recurrence(
     return _core.TypedRecurrence(
         f"recirculation.vllm-prefill/rows-{row_count}",
         PREFILL_BINDER_IMPLEMENTATION_ID,
-        _core.TypedStageAdmission.prefill_reject(),
+        _core.TypedStageAdmission.prefill_select(),
         _core.TypedStageFusionPolicy.automatic(),
         operations,
         dependencies,

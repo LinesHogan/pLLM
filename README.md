@@ -26,10 +26,10 @@ legacy adapter fails before vLLM construction instead of being silently skipped.
 > **Recirculation/model-region support is ongoing experimental work.** The
 > compiler has finite CPU-request serial/wavefront Regions and a typed native
 > vLLM prefill row/model-Region binder. The eager MRv1/MRv2 correctness path is
-> verified, but it is not yet a general production prefill implementation. For
-> Recirculation, CUDA Graph,
-> EngineCore multiprocessing, decode recurrence, speculative decoding, PP/DP,
-> and general model-family support are not complete. Unsupported configurations
+> verified in-process and under EngineCore multiprocessing, but it is not yet a
+> general production prefill implementation. CUDA Graph capture, decode
+> recurrence, speculative decoding, PP/DP/TP, normal hook retirement, and
+> general model-family support are not complete. Unsupported configurations
 > fail closed instead of silently falling back. See the
 > [Recirculation implementation notes](tllm/consumers/Recirculation/introduce.md).
 
@@ -40,15 +40,17 @@ the same dependence/effect vocabulary only during migration.
 
 **Current GPU correctness evidence (not a throughput result):** with
 `torch==2.13.0+cu129` and `vllm==0.27.1`, native Dummy, native Recirculation,
-and native ESamp passed exact eager, in-process MRv1/MRv2 short smokes. The
-Recirculation path reported typed layer replay with zero fallback. ESamp reported
+and native ESamp passed exact eager, in-process MRv1/MRv2 short smokes.
+Recirculation also passed EngineCore MP on both runners, including a mixed
+prefill/decode packed step; each cell replayed two requests and seven prompt
+rows with zero fallback. ESamp reported
 `loss_count=6`, `update_count=6`, `state_version=6`, and `fallback_count=0`.
 The same native ESamp exact eager Region also passed EngineCore MP correctness
 on MRv1/MRv2: loss, update, state-version, and sampler-intervention counters
 were nonzero, with `fallback_count=0` and `replay_count=0`. This establishes
 non-capture execution correctness only. No throughput result is claimed; the
-model-backed native piecewise CUDA Graph path, Recirculation EngineCore MP and
-capture paths, and shape-miss epoch switching remain unverified or incomplete.
+model-backed native piecewise CUDA Graph path, Recirculation capture and hook
+retirement paths, and shape-miss epoch switching remain unverified or incomplete.
 
 The canonical declaration surface uses one node decorator:
 

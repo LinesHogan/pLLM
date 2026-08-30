@@ -10,11 +10,15 @@ driver meet only through that contract and the ``BackendDriver`` protocol.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
-import os
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+    from vllm.forward_context import ForwardContext
 
 from tllm.backends.protocol import (
     ORDERED_ROW_FUSION_POLICY_PREFIX,
@@ -28,6 +32,27 @@ from tllm.contracts.typed_replay import (
     TypedLayerReplayStep,
 )
 
+
+class _ForwardCall(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+class _ForwardModule(Protocol):
+    forward: _ForwardCall
+
+
+class _CallableModule(_ForwardModule, Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+class _LayerCollection(Protocol):
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: int) -> _CallableModule: ...
+
+    def __iter__(self) -> Iterator[_CallableModule]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class TypedLayerReplayStats:
     prepare_count: int
@@ -36,7 +61,9 @@ class TypedLayerReplayStats:
     request_replays: tuple[str, ...]
 
 
-def _resolve_qwen_like_model(runner: object) -> tuple[object, object, Any, object]:
+def _resolve_qwen_like_model(
+    runner: object,
+) -> tuple[_ForwardModule, _LayerCollection, _CallableModule]:
     outer = getattr(runner, "model", None)
     inner = getattr(outer, "model", None)
     layers = getattr(inner, "layers", None)
@@ -48,9 +75,11 @@ def _resolve_qwen_like_model(runner: object) -> tuple[object, object, Any, objec
         )
     if not hasattr(layers, "__len__") or not hasattr(layers, "__getitem__"):
         raise RuntimeError("vLLM typed layer replay layers must be indexable")
-    if len(layers) < 1 or not callable(getattr(norm, "forward", None)):
+    typed_layers = cast(_LayerCollection, layers)
+    typed_norm = cast(_CallableModule, norm)
+    if len(typed_layers) < 1 or not callable(getattr(norm, "forward", None)):
         raise RuntimeError("vLLM typed layer replay requires decoder layers and final norm")
-    for index, layer in enumerate(layers):
+    for index, layer in enumerate(typed_layers):
         if not callable(getattr(layer, "forward", None)):
             raise RuntimeError(f"vLLM typed layer replay layer {index} has no callable forward")
         attention = getattr(getattr(layer, "self_attn", None), "attn", None)
@@ -59,7 +88,7 @@ def _resolve_qwen_like_model(runner: object) -> tuple[object, object, Any, objec
                 "vLLM typed layer replay requires decoder layers exposing "
                 f"self_attn.attn; layer {index} does not"
             )
-    return outer, inner, layers, norm
+    return cast(_ForwardModule, inner), typed_layers, typed_norm
 
 
 def _metadata_replace_kwargs(
@@ -120,14 +149,26 @@ def _slice_forward_context(
     request_ordinal: int,
     packed_row: int,
     token_position: int,
-) -> object:
-    attention = getattr(context, "attn_metadata", None)
-    slots = getattr(context, "slot_mapping", None)
+) -> ForwardContext:
+    typed_context = cast("ForwardContext", context)
+    attention = typed_context.attn_metadata
+    slots = typed_context.slot_mapping
     if not isinstance(attention, dict) or not isinstance(slots, dict):
         raise RuntimeError("vLLM typed layer replay does not support DBO/list metadata")
+    typed_attention = cast(dict[str, object], attention)
+    if any(type(name) is not str or not name for name in typed_attention):
+        raise RuntimeError("vLLM typed layer replay attention names must be strings")
+    typed_slots = cast(dict[str, object], slots)
+    if any(
+        type(name) is not str
+        or not name
+        or not isinstance(value, torch.Tensor)
+        for name, value in typed_slots.items()
+    ):
+        raise RuntimeError("vLLM typed layer replay slot mappings must be tensors")
     sliced_attention = {
         name: replace(
-            metadata,
+            cast("DataclassInstance", metadata),
             **_metadata_replace_kwargs(
                 metadata,
                 request_ordinal=request_ordinal,
@@ -135,14 +176,17 @@ def _slice_forward_context(
                 token_position=token_position,
             ),
         )
-        for name, metadata in attention.items()
+        for name, metadata in typed_attention.items()
     }
-    sliced_slots = {name: value[[packed_row]] for name, value in slots.items()}
-    batch_descriptor = getattr(context, "batch_descriptor", None)
+    sliced_slots = {
+        name: cast(torch.Tensor, value)[[packed_row]]
+        for name, value in typed_slots.items()
+    }
+    batch_descriptor = typed_context.batch_descriptor
     if batch_descriptor is not None:
         batch_descriptor = replace(batch_descriptor, num_tokens=1)
     return replace(
-        context,
+        typed_context,
         attn_metadata=sliced_attention,
         slot_mapping=sliced_slots,
         batch_descriptor=batch_descriptor,
@@ -152,6 +196,15 @@ def _slice_forward_context(
 
 class VllmTypedLayerReplayHandle:
     """Restorable hook which exposes only exact typed vLLM resources."""
+
+    binding: RunnerBinding
+    runner: object
+    inner_model: _ForwardModule
+    layers: _LayerCollection
+    norm: _CallableModule
+    original_model_forward: _ForwardCall
+    original_first_layer_forward: _ForwardCall
+    forward_context: ForwardContext | None
 
     __slots__ = (
         "binding",
@@ -177,16 +230,14 @@ class VllmTypedLayerReplayHandle:
     def __init__(self, *, binding: RunnerBinding) -> None:
         self.binding = binding
         self.runner = binding.runner
-        _outer, self.inner_model, self.layers, self.norm = _resolve_qwen_like_model(
-            self.runner
-        )
+        self.inner_model, self.layers, self.norm = _resolve_qwen_like_model(self.runner)
         self.original_model_forward = self.inner_model.forward
         self.original_first_layer_forward = self.layers[0].forward
         self.prepared: TypedLayerReplayStep | None = None
         self.seed_hidden: torch.Tensor | None = None
         self.seed_residual: torch.Tensor | None = None
         self.seed_positions: torch.Tensor | None = None
-        self.forward_context: object | None = None
+        self.forward_context = None
         self.replaying = False
         self.restored = False
         self._prepare_count = 0
@@ -202,7 +253,9 @@ class VllmTypedLayerReplayHandle:
             raise
 
     @staticmethod
-    def _layer_arguments(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple:
+    def _layer_arguments(
+        args: tuple[object, ...], kwargs: Mapping[str, object]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         positions = args[0] if args else kwargs.get("positions")
         hidden = args[1] if len(args) > 1 else kwargs.get("hidden_states")
         residual = args[2] if len(args) > 2 else kwargs.get("residual")
@@ -214,7 +267,7 @@ class VllmTypedLayerReplayHandle:
             raise RuntimeError("vLLM typed layer replay residual must be tensor or None")
         return positions, hidden, residual
 
-    def _first_layer_forward(self, *args: Any, **kwargs: Any) -> Any:
+    def _first_layer_forward(self, *args: object, **kwargs: object) -> object:
         if self.prepared is not None and not self.replaying:
             positions, hidden, residual = self._layer_arguments(args, kwargs)
             if hidden.ndim < 2 or int(hidden.shape[0]) != self.prepared.total_rows:
@@ -242,7 +295,7 @@ class VllmTypedLayerReplayHandle:
         )
 
     def seed_state(self, packed_row: int) -> LayerReplayState:
-        if not isinstance(packed_row, int) or isinstance(packed_row, bool) or packed_row < 0:
+        if packed_row < 0:
             raise ValueError("typed layer replay packed row must be a non-negative int")
         if self.seed_hidden is None:
             raise RuntimeError("typed layer replay did not capture model input")
@@ -262,8 +315,6 @@ class VllmTypedLayerReplayHandle:
         packed_row: int,
         token_position: int,
     ) -> LayerReplayState:
-        if not isinstance(state, LayerReplayState):
-            raise TypeError("typed vLLM layer replay requires LayerReplayState")
         if layer < 0 or layer >= len(self.layers):
             raise RuntimeError("typed vLLM layer replay layer is outside the bound model")
         positions = self.seed_positions
@@ -284,22 +335,23 @@ class VllmTypedLayerReplayHandle:
                 state.hidden,
                 state.residual,
             )
-        if not isinstance(output, tuple) or len(output) != 2:
+        if not isinstance(output, tuple):
             raise RuntimeError("vLLM typed layer replay requires (hidden_states, residual)")
-        hidden, residual = output
+        typed_output = cast(tuple[object, ...], output)
+        if len(typed_output) != 2:
+            raise RuntimeError("vLLM typed layer replay requires (hidden_states, residual)")
+        hidden, residual = typed_output
         if not isinstance(hidden, torch.Tensor) or not isinstance(residual, torch.Tensor):
             raise RuntimeError("vLLM typed layer replay layer outputs must be tensors")
         return LayerReplayState(hidden, residual)
 
     def normalize(self, state: LayerReplayState) -> torch.Tensor:
-        if not isinstance(state, LayerReplayState):
-            raise TypeError("typed vLLM norm requires LayerReplayState")
         normalized = self.norm(state.hidden, state.residual)
         if not isinstance(normalized, tuple) or not isinstance(normalized[0], torch.Tensor):
             raise RuntimeError("vLLM typed layer replay final norm must return (hidden, residual)")
         return normalized[0]
 
-    def _model_forward(self, *args: Any, **kwargs: Any) -> Any:
+    def _model_forward(self, *args: object, **kwargs: object) -> object:
         prepared = self.prepared
         try:
             output = self.original_model_forward(*args, **kwargs)
@@ -323,7 +375,7 @@ class VllmTypedLayerReplayHandle:
                     raise RuntimeError("typed layer replay callback did not return every request row")
                 for token, packed_row in enumerate(request.packed_rows):
                     value = replacements[token]
-                    if not isinstance(value, torch.Tensor) or value.shape[0] != 1:
+                    if value.shape[0] != 1:
                         raise RuntimeError("typed layer replay callback must return one tensor row")
                     result[packed_row : packed_row + 1] = value
                 self._replay_count += 1
@@ -355,7 +407,7 @@ class VllmTypedLayerReplayHandle:
         self.restored = True
 
 
-def _require_binding(*, runtime: object, runner: object) -> RunnerBinding:
+def _admit_typed_layer_replay(*, runtime: object, runner: object) -> RunnerBinding:
     binding = _runner_adapter.get_runner_binding(runner)
     if not isinstance(binding, RunnerBinding) or not binding.active:
         raise RuntimeError("typed vLLM layer replay requires an active RunnerBinding")
@@ -369,23 +421,28 @@ def _require_binding(*, runtime: object, runner: object) -> RunnerBinding:
             raise RuntimeError("vLLM typed layer replay is eager-only")
     if bool(getattr(getattr(runner, "cache_config", None), "enable_prefix_caching", False)):
         raise RuntimeError("vLLM typed layer replay does not support prefix caching")
-    try:
-        from vllm import envs as vllm_envs
-
-        multiprocessing_enabled = bool(vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING)
-    except (AttributeError, ImportError):
-        multiprocessing_enabled = os.getenv(
-            "VLLM_ENABLE_V1_MULTIPROCESSING", "1"
-        ).strip().lower() not in {"0", "false", "no", "off"}
-    if multiprocessing_enabled:
-        raise RuntimeError("vLLM typed layer replay currently requires VLLM_ENABLE_V1_MULTIPROCESSING=0")
     parallel_config = getattr(runner, "parallel_config", None)
     if parallel_config is None:
         parallel_config = getattr(getattr(runner, "vllm_config", None), "parallel_config", None)
-    if int(getattr(parallel_config, "pipeline_parallel_size", 1)) != 1 or int(
-        getattr(parallel_config, "data_parallel_size", 1)
-    ) != 1:
-        raise RuntimeError("vLLM typed layer replay currently requires PP=1 and DP=1")
+    if parallel_config is None:
+        raise RuntimeError("vLLM typed layer replay requires explicit parallel topology")
+    tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", None)
+    pipeline_parallel_size = getattr(parallel_config, "pipeline_parallel_size", None)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", None)
+    if (
+        type(tensor_parallel_size) is not int
+        or type(pipeline_parallel_size) is not int
+        or type(data_parallel_size) is not int
+    ):
+        raise RuntimeError("vLLM typed layer replay parallel sizes must be exact integers")
+    if (
+        tensor_parallel_size != 1
+        or pipeline_parallel_size != 1
+        or data_parallel_size != 1
+    ):
+        raise RuntimeError(
+            "vLLM typed layer replay currently requires TP=1, PP=1, and DP=1"
+        )
     if (
         getattr(runner, "speculator", None) is not None
         or getattr(getattr(runner, "vllm_config", None), "speculative_config", None)
@@ -398,7 +455,8 @@ def _require_binding(*, runtime: object, runner: object) -> RunnerBinding:
 def install_typed_layer_replay(*, runtime: object, runner: object) -> VllmTypedLayerReplayHandle:
     """Return the single restorable typed replay hook for an active runner."""
 
-    binding = _require_binding(runtime=runtime, runner=runner)
+    binding = _admit_typed_layer_replay(runtime=runtime, runner=runner)
+    signed_ordered_row_fusion_policy(runtime=runtime, binding=binding)
     existing = binding.typed_layer_replay_handle
     if isinstance(existing, VllmTypedLayerReplayHandle) and not existing.restored:
         return existing
@@ -409,7 +467,7 @@ def install_typed_layer_replay(*, runtime: object, runner: object) -> VllmTypedL
 
 
 def signed_ordered_row_fusion_policy(
-    *, runtime: object, handle: VllmTypedLayerReplayHandle
+    *, runtime: object, binding: RunnerBinding
 ) -> str:
     """Check the worker replay capability against the signed Region epoch."""
 
@@ -426,7 +484,7 @@ def signed_ordered_row_fusion_policy(
             "signed typed layer replay Region must contain exactly one "
             "ordered-row fusion policy"
         )
-    model_region = handle.binding.capabilities.model_region
+    model_region = binding.capabilities.model_region
     local = ordered_row_fusion_policy_fingerprint(
         None if model_region is None else model_region.ordered_row_fusion
     )

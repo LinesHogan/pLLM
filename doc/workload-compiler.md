@@ -224,9 +224,10 @@ metadata; the Rust stage family owns canonicalization, signing, wire loading,
 packed-row admission, and exact artifact selection. Consumer-local Python only
 declares the Recirculation operations and binds signed coordinates to layer
 replay and mix resources. The eager MRv1/MRv2 GPU smokes exercise this native
-prefill path successfully. CUDA Graph, EngineCore MP, decode recurrence,
-speculative decoding, PP/DP, and general model-family support remain outside
-its verified boundary. The old standalone and vLLM-specific workload classes,
+prefill path in-process and under EngineCore MP, including mixed packed-row
+phase selection. CUDA Graph capture, decode recurrence, speculative decoding,
+TP/PP/DP, normal hook retirement, and general model-family support remain
+outside its verified boundary. The old standalone and vLLM-specific workload classes,
 legacy Rust planner, and model-region adapter have been removed.
 
 Dummy, FTTT, GTTA, In-Place-TTT, TLM, TTRL, ReFT, OverRIDE, Recirculation,
@@ -250,14 +251,16 @@ With `torch==2.13.0+cu129` and `vllm==0.27.1`, short GPU correctness smokes
 cover native Dummy, Recirculation, ESamp, and TLM. TLM's MRv2 eager smoke
 performs real HF/PEFT training and installs the published generic LoRA version;
 Recirculation
-reported typed layer replay with zero fallback. The latest ESamp run recorded `loss_count=6`,
+passed typed layer replay in-process and under EngineCore MP on MRv1/MRv2;
+each cell replayed two requests and seven prompt rows with zero fallback. The
+latest ESamp run recorded `loss_count=6`,
 `update_count=6`, `state_version=6`, and `fallback_count=0`. Native ESamp
 exact eager Regions also passed EngineCore MP correctness on both runners:
 loss, update, state-version, and intervention counters were nonzero, with
 `fallback_count=0` and `replay_count=0`. These establish execution and
 state/sampler activity, not performance. The model-backed native piecewise
-CUDA Graph path, Recirculation EngineCore MP/capture integration, and shape-miss
-specialization epoch switching remain unverified or incomplete.
+CUDA Graph path, Recirculation capture/hook-retirement integration, and
+shape-miss specialization epoch switching remain unverified or incomplete.
 Throughput experiments are not claimed here.
 
 Generic multi-task/value eager Region execution, signed internal task

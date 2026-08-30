@@ -37,15 +37,37 @@ from tllm.runtime.backend_region_binders import (
 )
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.kit.backend import BackendRuntimeBinding
-from tllm.runtime.workload_bindings import RuntimeInputBinding, RuntimePortRegistry
 from tllm.workload import WorkloadConfig
 
-_PLAN_INPUT = "typed_recurrence_stage"
 _STAGE_ARTIFACT_BUNDLE_WIRE_KEY = "typed_stage_artifact_bundle"
 # Core v1 intentionally compiles a small, exact static family. A prefill span
 # beyond this bound requests a new cold epoch instead of compiling in a model
 # hook or silently using a different shape.
 MAX_COLD_STAGE_ARTIFACT_ROWS = 16
+
+
+@dataclass(slots=True)
+class _RecirculationDiagnostics:
+    staged_step_count: int = 0
+    staged_request_count: int = 0
+    replay_request_count: int = 0
+    replay_row_count: int = 0
+    selected_row_count: int = 0
+    mixed_step_count: int = 0
+    mixed_passthrough_row_count: int = 0
+
+    def read(self) -> Mapping[str, int]:
+        return MappingProxyType(
+            {
+                "staged_step_count": self.staged_step_count,
+                "staged_request_count": self.staged_request_count,
+                "replay_request_count": self.replay_request_count,
+                "replay_row_count": self.replay_row_count,
+                "selected_row_count": self.selected_row_count,
+                "mixed_step_count": self.mixed_step_count,
+                "mixed_passthrough_row_count": self.mixed_passthrough_row_count,
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,15 +78,19 @@ class _TypedRecirculationRequest:
     token_positions: tuple[int, ...]
     bound_stage: _core.TypedBoundRecurrenceStage
     config: RecirculationSettings
+    diagnostics: _RecirculationDiagnostics
 
     def replay(self, handle: TypedLayerReplayHandle) -> Mapping[int, torch.Tensor]:
-        return RecirculationBindingProvider(
+        outputs = RecirculationBindingProvider(
             handle=handle,
             config=self.config,
             request_ordinal=self.request_ordinal,
             packed_rows=self.packed_rows,
             token_positions=self.token_positions,
         ).execute(self.bound_stage)
+        self.diagnostics.replay_request_count += 1
+        self.diagnostics.replay_row_count += len(self.packed_rows)
+        return outputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +125,7 @@ def _stage_typed_recirculation(
     context: BackendRegionStageContext,
     config: RecirculationSettings,
     artifacts: _core.TypedRecurrenceStageArtifactBundle,
+    diagnostics: _RecirculationDiagnostics,
 ) -> None:
     """Bind existing Rust artifacts to one exact vLLM row plan."""
 
@@ -133,6 +160,8 @@ def _stage_typed_recirculation(
             ) from exc
         if batch.admission == _core.TypedStagePlanAdmission.Noop:
             stage: _RecirculationStage = _NoopRecirculationStage()
+            staged_request_count = 0
+            selected_row_count = 0
         elif batch.admission == _core.TypedStagePlanAdmission.Execute:
             requests: list[_TypedRecirculationRequest] = []
             for packed_binding in batch.requests:
@@ -162,11 +191,16 @@ def _stage_typed_recirculation(
                         ),
                         bound_stage=bound_stage,
                         config=config,
+                        diagnostics=diagnostics,
                     )
                 )
             stage = _ExecuteRecirculationStage(
                 total_rows=batch.total_rows,
                 requests=tuple(requests),
+            )
+            staged_request_count = len(requests)
+            selected_row_count = sum(
+                len(request.packed_rows) for request in requests
             )
         else:
             raise RuntimeError("Rust typed recurrence returned an unknown stage admission")
@@ -178,9 +212,17 @@ def _stage_typed_recirculation(
         ) -> None:
             if staged is not stage:
                 raise RuntimeError("typed Recirculation binder received a different staged plan")
-            cast(_RecirculationStage, staged).prepare(handle)
+            stage.prepare(handle)
 
         context.slot.stage(stage, bind, context.step_id)
+        diagnostics.staged_step_count += 1
+        diagnostics.staged_request_count += staged_request_count
+        diagnostics.selected_row_count += selected_row_count
+        if staged_request_count and selected_row_count < batch.total_rows:
+            diagnostics.mixed_step_count += 1
+            diagnostics.mixed_passthrough_row_count += (
+                batch.total_rows - selected_row_count
+            )
     except Exception:
         driver.restore_typed_layer_replay(runtime=context.runtime)
         raise
@@ -202,6 +244,7 @@ class RecirculationBackend:
     def __init__(self, config: RecirculationSettings) -> None:
         self.config = config
         self._state: _ColdBackend | _ReadyBackend = _ColdBackend()
+        self._diagnostics = _RecirculationDiagnostics()
         self.binder = BackendRegionBinderSlot(
             PREFILL_BINDER_IMPLEMENTATION_ID,
             backend_stager=self._stage,
@@ -247,7 +290,15 @@ class RecirculationBackend:
                 )
 
     def _stage(self, context: BackendRegionStageContext) -> None:
-        _stage_typed_recirculation(context, self.config, self.artifacts)
+        _stage_typed_recirculation(
+            context,
+            self.config,
+            self.artifacts,
+            self._diagnostics,
+        )
+
+    def diagnostics(self) -> Mapping[str, int]:
+        return self._diagnostics.read()
 
     def specialize(self, spec: RuntimeSpecializationSpec) -> None:
         layer_count = spec.model_layer_count
@@ -299,14 +350,8 @@ class RecirculationBackend:
 
     def runtime_binding(self) -> BackendRuntimeBinding:
         return BackendRuntimeBinding(
-            ports=RuntimePortRegistry(
-                inputs={_PLAN_INPUT: RuntimeInputBinding(self.plan_for_step)}
-            ),
             binders={PREFILL_BINDER_IMPLEMENTATION_ID: self.binder},
         )
-
-    def plan_for_step(self, step_id: int) -> object:
-        return self.binder.plan_for_step(step_id)
 
     def invoke(self, step_id: int) -> None:
         self.binder.invoke(step_id)

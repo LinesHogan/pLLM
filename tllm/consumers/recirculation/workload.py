@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Protocol, cast
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import ClassVar, cast
 
 from tllm.kit.backend import WorkloadBackendAdapter
 from tllm.kit.workload import Workload
@@ -18,7 +20,6 @@ from tllm.workload import (
     WorkloadConfig,
     config_field,
     extern,
-    provided,
     step_id,
     task,
     workload,
@@ -30,14 +31,9 @@ from tllm.consumers.recirculation.native_backend import (
     RecirculationBackend,
 )
 
-_PLAN_INPUT = "typed_recurrence_stage"
 _TOKEN = Index("token")
 _LAYER = Index("layer")
 _RECIRCULATION_ENABLED = ConfigField.boolean(True)
-
-
-class RecirculationStage(Protocol):
-    pass
 
 
 class RecirculationConfig(WorkloadConfig):
@@ -73,7 +69,7 @@ class RecirculationWorkload(Workload[RecirculationConfig]):
     backend: RecirculationBackend
 
     @task(
-        inputs={"plan": provided(_PLAN_INPUT), "step_id": step_id()},
+        inputs={"step_id": step_id()},
         timing=Before("model.execute"),
         implementation=extern(
             PREFILL_BINDER_IMPLEMENTATION_ID,
@@ -94,9 +90,13 @@ class RecirculationWorkload(Workload[RecirculationConfig]):
             AffineAccess("vllm_kv", (_TOKEN - 1, _LAYER), "read"),
         ),
     )
-    def bind_prefill(self, plan: RecirculationStage, step_id: int) -> None:
-        del plan
+    def bind_prefill(self, step_id: int) -> None:
         self.backend.invoke(step_id)
+
+    def _diagnostics(self) -> Mapping[str, int]:
+        return MappingProxyType(
+            {**super()._diagnostics(), **self.backend.diagnostics()}
+        )
 
 
 workload(

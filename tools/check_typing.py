@@ -60,6 +60,7 @@ AUTHOR_SURFACE = (*WORKLOAD_SURFACE,
     Path("tllm/consumers/recirculation/workload.py"),
     Path("tllm/consumers/recirculation/stage_definition.py"),
     Path("tllm/consumers/recirculation/stage_binding.py"),
+    Path("tllm/backends/vllm/typed_layer_replay.py"),
     Path("tllm/runtime/declaration_adapter.py"),
     Path("tllm/runtime/backend_region_binders.py"),
     Path("tllm/runtime/mp/worker_extension.py"),
@@ -84,6 +85,56 @@ FORBIDDEN_COMPATIBILITY_NAMES = frozenset(
 # Exact foreign-object probes. Entries are (path, enclosing function, call).
 DYNAMIC_BOUNDARY_ALLOWLIST = frozenset(
     {
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "_resolve_qwen_like_model",
+            "getattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "_resolve_qwen_like_model",
+            "hasattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "_metadata_replace_kwargs",
+            "getattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "_metadata_replace_kwargs",
+            "hasattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "_admit_typed_layer_replay",
+            "getattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "install_typed_layer_replay",
+            "setattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "signed_ordered_row_fusion_policy",
+            "getattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "abort_typed_layer_replay",
+            "getattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "restore_typed_layer_replay",
+            "getattr",
+        ),
+        (
+            Path("tllm/backends/vllm/typed_layer_replay.py"),
+            "restore_typed_layer_replay",
+            "setattr",
+        ),
         (
             Path("tllm/runtime/mp/worker_extension.py"),
             "_runner_specialization_facts",
@@ -181,7 +232,11 @@ class _TypingRuleVisitor(ast.NodeVisitor):
             )
 
     def visit_Call(self, node: ast.Call) -> None:
-        if isinstance(node.func, ast.Name) and node.func.id in {"getattr", "setattr"}:
+        if isinstance(node.func, ast.Name) and node.func.id in {
+            "getattr",
+            "setattr",
+            "hasattr",
+        }:
             key = (self.relative, self.function, node.func.id)
             if key not in DYNAMIC_BOUNDARY_ALLOWLIST:
                 self.violations.append(

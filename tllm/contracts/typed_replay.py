@@ -89,7 +89,7 @@ class TypedLayerReplayRequest:
 
 @dataclass(frozen=True, slots=True)
 class TypedLayerReplayStep:
-    """All callbacks for one packed model forward."""
+    """Selected row callbacks for one packed model forward."""
 
     total_rows: int
     requests: tuple[TypedLayerReplayRequest, ...]
@@ -106,8 +106,13 @@ class TypedLayerReplayStep:
         ):
             raise TypeError("typed layer replay requests must be non-empty typed requests")
         rows = tuple(row for request in self.requests for row in request.packed_rows)
-        if len(rows) != self.total_rows or set(rows) != set(range(self.total_rows)):
-            raise ValueError("typed layer replay requests must cover packed rows exactly")
+        if (
+            len(rows) != len(set(rows))
+            or any(row >= self.total_rows for row in rows)
+        ):
+            raise ValueError(
+                "typed layer replay requests must select unique in-range packed rows"
+            )
 
 
 @dataclass(frozen=True, slots=True)

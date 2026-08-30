@@ -7,6 +7,11 @@ import json
 import pytest
 import tllm._core as _core
 
+from tllm.contracts.typed_replay import (
+    TypedLayerReplayRequest,
+    TypedLayerReplayStep,
+)
+
 
 def _wire(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -131,7 +136,9 @@ def _bundle_for_rows(row_count: int, *, phase: str = "prefill") -> object:
     return _core.load_typed_recurrence_stage_artifact_bundle(wire)
 
 
-def _typed_definition(row_count: int) -> _core.TypedRecurrenceStageDefinition:
+def _typed_definition(
+    row_count: int, *, select_prefill: bool = False
+) -> _core.TypedRecurrenceStageDefinition:
     first = _core.TypedOperation(
         "first",
         "test.backend:first@1",
@@ -155,7 +162,11 @@ def _typed_definition(row_count: int) -> _core.TypedRecurrenceStageDefinition:
     recurrence = _core.TypedRecurrence(
         f"test.typed-stage.rows-{row_count}",
         "test.backend:stage@1",
-        _core.TypedStageAdmission.prefill_reject(),
+        (
+            _core.TypedStageAdmission.prefill_select()
+            if select_prefill
+            else _core.TypedStageAdmission.prefill_reject()
+        ),
         _core.TypedStageFusionPolicy.serial(),
         (first, second),
         (_core.TypedDependency("first", "second", "data"),),
@@ -198,6 +209,48 @@ def test_typed_stage_family_owns_canonicalization_wire_and_packed_binding() -> N
     noop = loaded.bind_packed_plan(decode)
     assert noop.admission == _core.TypedStagePlanAdmission.Noop
     assert noop.requests == []
+
+
+def test_mixed_batch_selects_only_signed_prefill_request_rows() -> None:
+    family = _core.TypedRecurrenceStageArtifactBundle.compile(
+        tuple(
+            _typed_definition(rows, select_prefill=True)
+            for rows in range(1, 5)
+        )
+    )
+    mixed = _core.plan_packed_prefill_rows(
+        [1, 4],
+        [3, 4],
+        [3, 0],
+    )
+
+    batch = family.bind_packed_plan(mixed)
+
+    assert batch.admission == _core.TypedStagePlanAdmission.Execute
+    assert batch.total_rows == 5
+    assert len(batch.requests) == 1
+    selected = batch.requests[0].observed_span
+    assert selected.request_ordinal == 1
+    assert selected.packed_row_start == 1
+    assert selected.packed_row_end == 5
+    assert selected.phase == _core.SchedulerBatchPhase.Prefill
+
+
+def test_typed_layer_replay_step_accepts_a_strict_row_subset() -> None:
+    request = TypedLayerReplayRequest(
+        request_id="prefill",
+        packed_rows=(1, 2, 3, 4),
+        replay=lambda _handle: {},
+    )
+
+    step = TypedLayerReplayStep(total_rows=5, requests=(request,))
+
+    assert step.total_rows == 5
+    with pytest.raises(ValueError, match="unique in-range"):
+        TypedLayerReplayStep(
+            total_rows=4,
+            requests=(request,),
+        )
 
 
 def test_rust_compiles_loads_and_binds_an_immutable_typed_stage_artifact() -> None:

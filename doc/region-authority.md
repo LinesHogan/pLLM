@@ -133,6 +133,13 @@ nonzero loss/update/state/intervention evidence and zero fallback; Recirculation
 reported typed layer replay and zero fallback. Throughput benchmarks were
 intentionally not run for this freeze.
 
+A 2026-08-30 follow-up extended native Recirculation eager correctness to
+MRv1/MRv2 × in-process/EngineCore-MP. Every cell replayed two requests and
+seven prompt rows with `fallback_count=0`; the MRv1 MP cell also exercised a
+mixed prefill/decode packed step, where the Rust-signed admission selected
+only prefill request rows. CUDA Graph capture, hook retirement, speculative
+decode, and distributed TP/PP/DP support remain outside this evidence.
+
 ## Part II: Legacy Inventory
 
 | Surface | Permitted role until migrated |

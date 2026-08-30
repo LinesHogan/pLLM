@@ -32,13 +32,14 @@ silent fallback.
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, GPU correctness covers exact
 eager in-process native Dummy, native Recirculation, and native ESamp on
-MRv1/MRv2. Recirculation reported typed layer replay with zero fallback. The
+MRv1/MRv2. Recirculation also passed EngineCore MP on both runners, replaying
+two requests and seven prompt rows with zero fallback. The
 latest ESamp short smoke recorded six losses, six updates, state version six,
 and zero fallbacks. Native ESamp exact eager Regions also passed EngineCore MP
 correctness on both runners: loss, update, state-version, and intervention
 counters were nonzero, with zero fallbacks and zero replays. This is not a
 throughput claim. Model-backed native piecewise CUDA Graph execution,
-Recirculation EngineCore MP/capture integration, and shape-miss epoch switching
-are not yet claims.
+Recirculation capture/hook-retirement integration, and shape-miss epoch
+switching are not yet claims.
 
 中文文档见 [doc_zh/README.md](../doc_zh/README.md)。

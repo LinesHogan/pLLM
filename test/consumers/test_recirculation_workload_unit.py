@@ -11,9 +11,14 @@ import pytest
 import torch
 
 from tllm.backends.vllm import runner_adapter
-from tllm.backends.protocol import OrderedRowFusionCapabilities
+from tllm.backends.protocol import (
+    ORDERED_ROW_FUSION_POLICY_PREFIX,
+    OrderedRowFusionCapabilities,
+    RunnerBinding,
+)
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
+from tllm.backends.vllm import typed_layer_replay
 from tllm.consumers.recirculation import (
     PREFILL_BINDER_IMPLEMENTATION_ID,
     RecirculationConfig,
@@ -21,6 +26,7 @@ from tllm.consumers.recirculation import (
 )
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.runtime import residual_runtime
+from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime.backend_region_binders import (
     BackendRegionBinderSlot,
     BackendRegionStageContext,
@@ -99,6 +105,7 @@ def test_vllm_recirculation_is_one_signed_prepare_post_binder_region() -> None:
     assert runtime.workload_execution_bindings.backend_region_binders == {
         PREFILL_BINDER_IMPLEMENTATION_ID: workload.backend.binder
     }
+    assert workload.native_workload_resources().backend.ports.inputs == {}
     assert static_backend_binding_manifest_wire(
         runtime.workload_execution_bindings.static_binding_entries
     ) == compilation.options.static_binding_manifest
@@ -204,7 +211,7 @@ def test_signed_backend_binder_stage_rejects_tampering_before_execution() -> Non
         type(compilation.decision).from_json(json.dumps(tampered))
 
 
-def test_signed_region_consumes_staged_plan_and_invokes_backend_once() -> None:
+def test_signed_region_uses_step_identity_and_invokes_backend_once() -> None:
     runtime, workload = _runtime()
     compilation = runtime.compile_workloads(_timeline())
     state = ResidualRuntimeState()
@@ -291,6 +298,126 @@ def test_cold_artifact_native_stage_binds_without_graph_or_plan_compilation() ->
     prepared = handle.prepare.call_args.args[0]
     assert prepared.total_rows == 2
     assert tuple(request.request_id for request in prepared.requests) == ("request-0",)
+    assert services.diagnostics() == {
+        "loss_count": 0,
+        "update_count": 0,
+        "staged_step_count": 1,
+        "staged_request_count": 1,
+        "replay_request_count": 0,
+        "replay_row_count": 0,
+        "selected_row_count": 2,
+        "mixed_step_count": 0,
+        "mixed_passthrough_row_count": 0,
+    }
+
+    replay = prepared.requests[0].replay
+    with (
+        mock.patch.object(
+            native_backend.RecirculationBindingProvider,
+            "execute",
+            side_effect=RuntimeError("replay failed"),
+        ),
+        pytest.raises(RuntimeError, match="replay failed"),
+    ):
+        replay(handle)
+    assert services.diagnostics()["replay_request_count"] == 0
+    assert services.diagnostics()["replay_row_count"] == 0
+
+    outputs = {0: torch.ones(1), 1: torch.ones(1)}
+    with mock.patch.object(
+        native_backend.RecirculationBindingProvider,
+        "execute",
+        return_value=outputs,
+    ):
+        assert replay(handle) == outputs
+    assert services.diagnostics()["replay_request_count"] == 1
+    assert services.diagnostics()["replay_row_count"] == 2
+
+
+def test_signed_fusion_mismatch_fails_before_recurrence_stage() -> None:
+    driver = V027MRv2Driver()
+    runner = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        speculator=None,
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    binding = RunnerBinding(
+        driver=driver,
+        runner=runner,
+        capabilities=driver.capabilities(),
+    )
+    runtime = SimpleNamespace(
+        workload_compilation=SimpleNamespace(
+            timeline=SimpleNamespace(
+                capabilities=(
+                    ORDERED_ROW_FUSION_POLICY_PREFIX
+                    + "max_rows=99;internalized_edges=tampered",
+                )
+            )
+        ),
+    )
+
+    with (
+        mock.patch.object(
+            typed_layer_replay._runner_adapter,
+            "get_runner_binding",
+            return_value=binding,
+        ),
+        mock.patch(
+            "tllm.runtime.graph_policy.resolve_graph_mode",
+            return_value=GraphMode.EAGER,
+        ),
+        pytest.raises(RuntimeError, match="ordered-row fusion policy disagrees"),
+    ):
+        typed_layer_replay.install_typed_layer_replay(
+            runtime=runtime,
+            runner=runner,
+        )
+
+    assert binding.typed_layer_replay_handle is None
+
+
+def test_tensor_parallel_replay_admission_fails_closed_before_staging() -> None:
+    driver = V027MRv2Driver()
+    runner = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        speculator=None,
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    binding = RunnerBinding(
+        driver=driver,
+        runner=runner,
+        capabilities=driver.capabilities(),
+    )
+
+    with (
+        mock.patch.object(
+            typed_layer_replay._runner_adapter,
+            "get_runner_binding",
+            return_value=binding,
+        ),
+        mock.patch(
+            "tllm.runtime.graph_policy.resolve_graph_mode",
+            return_value=GraphMode.EAGER,
+        ),
+        pytest.raises(RuntimeError, match="requires TP=1, PP=1, and DP=1"),
+    ):
+        typed_layer_replay.install_typed_layer_replay(
+            runtime=object(),
+            runner=runner,
+        )
+
+    assert binding.typed_layer_replay_handle is None
 
 
 def test_worker_reconstruction_loads_signed_artifact_without_any_compile() -> None:

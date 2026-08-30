@@ -12,6 +12,7 @@
     "tllm/backends/protocol.py",
     "tllm/backends/vllm/dense_parameter_overlay.py",
     "tllm/backends/vllm/runner_adapter.py",
+    "tllm/backends/vllm/typed_layer_replay.py",
     "tllm/backends/vllm/versioned_parameter_overlay.py",
     "tllm/runtime/runtime.py",
     "tllm/runtime/backend_region_binders.py",
@@ -45,7 +46,8 @@
     "test/consumers/fttt/test_fttt_workload_unit.py",
     "test/consumers/inplace_ttt/test_inplace_ttt_workload_unit.py",
     "test/gpu/native_fttt_workload_smoke.py",
-    "test/gpu/native_inplace_ttt_workload_smoke.py"
+    "test/gpu/native_inplace_ttt_workload_smoke.py",
+    "test/gpu/native_recirculation_workload_smoke.py"
   ],
   "exclude": ["**/__pycache__"],
   "reportMissingImports": true,

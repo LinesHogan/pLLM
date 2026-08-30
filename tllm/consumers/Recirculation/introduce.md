@@ -571,8 +571,8 @@ Jacobi 是系统预制、用户显式选择的近似变换；wavefront 是编译
 - [x] 将 Jacobi 表达为上一轮版本的 snapshot/read 与双缓冲更新；将 wavefront 表达为同一图上的拓扑 schedule。由编译器选择或拒绝 schedule，而不是由 consumer 直接驱动 runner 私有循环。
 - [ ] 优先复用 `ResidualStream`、现有 locator、row metadata、bundle ownership、placement deadline 和 backend capability；只有现有 port 确实无法表达某个稳定的数据契约时才新增通用 port。
 - [x] Recirculation consumer 仅拥有算法配置和纯 tensor 数学：`source_layer`、`dest_layer`、mix/renorm、ramping、Jacobi 容差/轮数。vLLM 对象解析、生命周期和执行 materialization 继续归 backend。
-- [x] 首期支持 vLLM 0.27 MRv1/MRv2、TP=1、eager；不通过专用 CUDA kernel 绕开 IR。wavefront 首先用可验证的 eager executor 落地，再由通用 region/fusion 机制优化。
-- [ ] 将 model-region 迁移为 worker-side、静态 buffer、按 schedule/shape bucket 捕获的 CUDA Graph executor，并验证 EngineCore multiprocessing；eager executor 保留为 correctness oracle，不作为性能终点。
+- [x] 首期支持 vLLM 0.27 MRv1/MRv2、TP=1、eager，并验证 in-process/EngineCore MP 四格；不通过专用 CUDA kernel 绕开 IR。wavefront 首先用可验证的 eager executor 落地，再由通用 region/fusion 机制优化。
+- [ ] 将 model-region 迁移为 worker-side、静态 buffer、按 schedule/shape bucket 捕获的 CUDA Graph executor；已验证的 eager EngineCore MP 保留为 correctness oracle，不作为性能终点。
 - [x] 编译准入必须 fail closed：无法证明 KV 版本、carry ownership、row/request 隔离或 schedule 依赖正确时，在 model execution 前拒绝。
 - [ ] 测试覆盖串行 oracle、Jacobi 误差界、wavefront 拓扑等价、多请求 packed/chunked prefill、零 token、抢占/恢复和 MRv1/MRv2 对称性。
 - [x] 用至少第二种非 Recirculation 的时序 prefill 算法验证迭代域抽象，再稳定公开 API；避免只对一个 consumer 有效的“通用”设计。

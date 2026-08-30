@@ -168,8 +168,9 @@ Recirculation 现在只有一个生产 `RecirculationWorkload`。它通过通用
 `Before("model.execute")` 绑定 Rust 签名的 typed recurrence stage。Rust IR constructor 负责
 schema 与 shape metadata；Rust stage family 负责 canonicalization、签名、wire load、packed-row
 admission 与精确 artifact 选择。consumer-local Python 只声明 Recirculation operation，并把签名
-coordinate 绑定到 layer replay 与 mix resource。eager MRv1/MRv2 GPU smoke 已通过这条 native
-prefill 路径。CUDA Graph、EngineCore MP、decode recurrence、speculative decoding、PP/DP 与通用
+coordinate 绑定到 layer replay 与 mix resource。eager MRv1/MRv2 GPU smoke 已在 in-process 与
+EngineCore MP 覆盖这条 native prefill 路径，并验证 mixed packed-row phase selection。CUDA Graph
+capture、decode recurrence、speculative decoding、TP/PP/DP、正常 hook retirement 与通用
 model-family 支持仍在已验证边界之外。旧 standalone/vLLM 专用 workload class、legacy Rust
 planner 与 model-region adapter 已删除。
 
@@ -189,11 +190,12 @@ residual path、CPU-export service、specialization identity 和 worker reconstr
 
 在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，短 GPU 正确性 smoke 已覆盖通用 native Dummy、
 native Recirculation vLLM prefill 与 native ESamp 的 exact eager in-process MRv1/MRv2。
-Recirculation 观察到 typed layer replay 且 fallback 为零。最新 ESamp：`loss_count=6`、
+Recirculation 还通过了两种 runner 的 EngineCore MP；四格均 replay 两个请求、七个 prompt
+rows，fallback 为零。最新 ESamp：`loss_count=6`、
 `update_count=6`、`state_version=6`、`fallback_count=0`。native ESamp exact eager Region 还通过
 两种 runner 的 EngineCore MP 正确性：loss、update、state-version、intervention 均非零，
 `fallback_count=0`、`replay_count=0`。这些只证明 execution 与 state/sampler activity，不是性能
-结论。model-backed native piecewise CUDA Graph、Recirculation EngineCore MP/capture 集成，以及
+结论。model-backed native piecewise CUDA Graph、Recirculation capture/hook-retirement 集成，以及
 shape-miss specialization epoch switching 仍未验证或未完成。本文不作吞吐宣称。
 
 通用 multi-task/value eager Region 执行、签名过的内部 task invocation、typed
