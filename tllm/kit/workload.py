@@ -6,7 +6,7 @@ import ast
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import ClassVar, Generic, TypeVar, cast
+from typing import ClassVar, Generic, Protocol, TypeVar, cast
 
 import torch
 
@@ -54,6 +54,7 @@ from tllm.workload.frontend import (
     definition_for_workload_class,
 )
 from tllm.workload.ir import OptimizerSpec
+from tllm.workload.ir import StateStorage
 from tllm.workload.ir import EffectKind
 from tllm.workload.ir import ValueSourceKind
 from tllm.contracts.workload_ports import (
@@ -89,7 +90,7 @@ class _WorkloadAccounting:
         self._updates = 0
 
     def record(self, loss: torch.Tensor) -> None:
-        self._losses.append(loss.detach().float())
+        self._losses.append(loss.detach().float().clone())
         self._updates += 1
 
     def stats(self) -> Mapping[str, int]:
@@ -123,6 +124,28 @@ class _SamplerBinding:
 
 
 _SamplerState = _NoSampler | _SamplerBinding
+
+
+class _OptimizerTransitionOwner(Protocol):
+    def execute_optimizer_device_step(
+        self, state_name: str, loss: torch.Tensor
+    ) -> None: ...
+
+    def commit_optimizer_transition(
+        self, state_name: str, loss: torch.Tensor
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkloadOptimizerTransition:
+    owner: _OptimizerTransitionOwner
+    state_name: str
+
+    def device_step(self, loss: torch.Tensor) -> None:
+        self.owner.execute_optimizer_device_step(self.state_name, loss)
+
+    def commit(self, loss: torch.Tensor) -> None:
+        self.owner.commit_optimizer_transition(self.state_name, loss)
 
 
 class Workload(NativeWorkload, Generic[ConfigT]):
@@ -254,16 +277,30 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     def optimize_state(
         self, state: TrainableState[StateValueT], loss: torch.Tensor
     ) -> None:
+        self.execute_optimizer_device_step(state.name, loss)
+        self.commit_optimizer_transition(state.name, loss)
+
+    def execute_optimizer_device_step(
+        self, state_name: str, loss: torch.Tensor
+    ) -> None:
         match self._lifecycle:
-            case _Specialized(optimizers=optimizers, versions=versions):
-                optimizer = optimizers[state.name]
+            case _Specialized(optimizers=optimizers):
+                optimizer = optimizers[state_name]
             case _:
-                raise RuntimeError(f"State {state.name!r} is not specialized")
+                raise RuntimeError(f"State {state_name!r} is not specialized")
         with torch.inference_mode(False), torch.enable_grad():
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=False)
             torch.autograd.backward(loss)
             optimizer.step()
-        versions[state.name] += 1
+
+    def commit_optimizer_transition(
+        self, state_name: str, loss: torch.Tensor
+    ) -> None:
+        match self._lifecycle:
+            case _Specialized(versions=versions):
+                versions[state_name] += 1
+            case _:
+                raise RuntimeError(f"State {state_name!r} is not specialized")
         self._accounting.record(loss)
 
     def publish_module(
@@ -556,6 +593,11 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             ),
             backend=backend_binding,
             parameter_overlays=self.parameter_overlay_bindings(),
+            optimizer_transitions={
+                state.name: _WorkloadOptimizerTransition(self, state.name)
+                for state in type(self)._states()
+                if state.storage is StateStorage.OPTIMIZER_STABLE
+            },
         )
 
     def runtime_services(self) -> RuntimeServices:
@@ -589,34 +631,63 @@ def _build_optimizer(
     config: WorkloadConfig,
     device: torch.device,
 ) -> torch.optim.Optimizer:
-    parameters = list(value.parameters())
+    parameters = tuple(value.parameters())
     options = dict(spec.options)
     lr = _optimizer_float(options["lr"], config)
     eps = float.fromhex(options["eps"])
     betas = _optimizer_betas(options["betas"])
-    fused = True if device.type == "cuda" else None
     match spec.kind:
         case "adam":
-            return torch.optim.Adam(
-                parameters,
-                lr=lr,
-                betas=betas,
-                eps=eps,
-                foreach=False,
-                fused=fused,
+            optimizer: torch.optim.Optimizer = (
+                torch.optim.Adam(
+                    parameters,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    foreach=False,
+                    fused=True,
+                    capturable=True,
+                )
+                if device.type == "cuda"
+                else torch.optim.Adam(
+                    parameters,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    foreach=False,
+                    fused=None,
+                )
             )
         case "adamw":
-            return torch.optim.AdamW(
-                parameters,
-                lr=lr,
-                betas=betas,
-                eps=eps,
-                weight_decay=float.fromhex(options["weight_decay"]),
-                foreach=False,
-                fused=fused,
+            optimizer = (
+                torch.optim.AdamW(
+                    parameters,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=float.fromhex(options["weight_decay"]),
+                    foreach=False,
+                    fused=True,
+                    capturable=True,
+                )
+                if device.type == "cuda"
+                else torch.optim.AdamW(
+                    parameters,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=float.fromhex(options["weight_decay"]),
+                    foreach=False,
+                    fused=None,
+                )
             )
         case unsupported:
             raise ValueError(f"unsupported optimizer kind {unsupported!r}")
+    if device.type == "cuda":
+        from tllm.runtime.torch_adapter import initialize_adam_capture_storage
+
+        initialize_adam_capture_storage(optimizer, parameters)
+    return optimizer
 
 
 def _optimizer_float(encoded: str, config: WorkloadConfig) -> float:

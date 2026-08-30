@@ -359,6 +359,13 @@ class ScheduleOutputKind(StrEnum):
     SAMPLER = "sampler"
 
 
+class ScheduleStateStorage(StrEnum):
+    """Closed state-storage stability evidence crossing Python into Rust."""
+
+    DYNAMIC = "dynamic"
+    OPTIMIZER_STABLE = "optimizer_stable"
+
+
 class RegionInputKind(StrEnum):
     HIDDEN = "hidden"
     PROVIDED = "provided"
@@ -433,6 +440,13 @@ class HostCommandKind(StrEnum):
     WAIT_ASYNC = "wait_async"
     EXECUTE_INLINE = "execute_inline"
     SUBMIT_ASYNC = "submit_async"
+
+
+class AsyncBatchCaptureMode(StrEnum):
+    """Closed capture command for one Rust-signed async Region batch."""
+
+    DISABLED = "disabled"
+    OPTIMIZER_TRANSITION = "optimizer_transition"
 
 
 class RegionFallbackPolicy(StrEnum):
@@ -685,11 +699,11 @@ class ScheduleTask:
         if not isinstance(self.implementation_ids, tuple):
             raise TypeError("ScheduleTask.implementation_ids must be tuple[str, ...]")
         if not isinstance(self.implementation_kinds, tuple) or any(
-            value not in {"captured", "extern"}
+            value not in {"captured", "extern", "optimizer_transition"}
             for value in self.implementation_kinds
         ):
             raise TypeError(
-                "ScheduleTask.implementation_kinds must be tuple[captured | extern, ...]"
+                "ScheduleTask.implementation_kinds must be tuple[captured | extern | optimizer_transition, ...]"
             )
         if len(self.implementation_kinds) != len(self.implementation_ids):
             raise ValueError(
@@ -807,6 +821,7 @@ class ScheduleState:
     resource: str
     scope: str
     request_key: tuple[str, ...] = ()
+    storage: ScheduleStateStorage = ScheduleStateStorage.DYNAMIC
     transition: str = "optimizer"
 
     def __post_init__(self) -> None:
@@ -819,6 +834,7 @@ class ScheduleState:
             raise TypeError("ScheduleState.request_key must be tuple[str, ...]")
         if (self.scope == "request") != bool(self.request_key):
             raise ValueError("only request ScheduleState requires a request_key")
+        object.__setattr__(self, "storage", ScheduleStateStorage(self.storage))
         object.__setattr__(
             self, "transition", _name(self.transition, "ScheduleState.transition")
         )
@@ -875,14 +891,21 @@ class ScheduleGraph:
             if any(consumer not in known for consumer in value.consumers):
                 raise ValueError("ScheduleGraph value references an unknown consumer")
         object.__setattr__(self, "persistent_state_bytes", _bytes(self.persistent_state_bytes, "ScheduleGraph.persistent_state_bytes"))
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise ValueError("unsupported ScheduleGraph schema version")
-        if self.schema_version == 2 and any(
+        if self.schema_version >= 2 and any(
             len(task.implementation_capabilities) != len(task.implementation_ids)
             for task in self.tasks
         ):
             raise ValueError(
-                "ScheduleGraph schema v2 tasks require per-implementation capabilities"
+                "ScheduleGraph schema v2+ tasks require per-implementation capabilities"
+            )
+        if self.schema_version < 3 and any(
+            state.storage is not ScheduleStateStorage.DYNAMIC
+            for state in self.states
+        ):
+            raise ValueError(
+                "ScheduleGraph schema before v3 cannot carry stable state-storage evidence"
             )
         if not isinstance(self.workload_approximations, tuple) or any(
             not isinstance(entry, tuple)
@@ -916,6 +939,12 @@ class ScheduleGraph:
             for task in tasks:
                 assert isinstance(task, dict)
                 task.pop("implementation_capabilities")
+        if self.schema_version < 3:
+            states = payload["states"]
+            assert isinstance(states, list)
+            for state in states:
+                assert isinstance(state, dict)
+                state.pop("storage")
         if not self.workload_approximations:
             # Exact-only graphs keep a byte-identical wire form and identity.
             payload.pop("workload_approximations")
@@ -924,6 +953,14 @@ class ScheduleGraph:
     @classmethod
     def from_json(cls, payload: str) -> "ScheduleGraph":
         raw = json.loads(payload)
+        schema_version = raw.get("schema_version", 1)
+        if schema_version == 3:
+            for position, state in enumerate(raw.get("states", ())):
+                if "storage" not in state:
+                    raise ValueError(
+                        "ScheduleGraph schema v3 state is missing storage: "
+                        f"states[{position}]"
+                    )
         tasks = []
         for task in raw["tasks"]:
             domain_raw = task.get("domain", {})
@@ -1030,12 +1067,15 @@ class ScheduleGraph:
                     resource=state["resource"],
                     scope=state["scope"],
                     request_key=tuple(state.get("request_key", ())),
+                    storage=ScheduleStateStorage(
+                        state.get("storage", ScheduleStateStorage.DYNAMIC.value)
+                    ),
                     transition=state.get("transition", "optimizer"),
                 )
                 for state in raw.get("states", ())
             ),
             persistent_state_bytes=raw["persistent_state_bytes"],
-            schema_version=raw.get("schema_version", 1),
+            schema_version=schema_version,
             workload_approximations=tuple(
                 (str(entry[0]), str(entry[1]))
                 for entry in raw.get("workload_approximations", ())
@@ -1675,9 +1715,16 @@ class RuntimeHostCommand:
     kind: HostCommandKind
     submission_id: str
     region_ids: tuple[str, ...]
+    async_capture_mode: AsyncBatchCaptureMode = AsyncBatchCaptureMode.DISABLED
+    async_artifact_key: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", HostCommandKind(self.kind))
+        object.__setattr__(
+            self,
+            "async_capture_mode",
+            AsyncBatchCaptureMode(self.async_capture_mode),
+        )
         if not isinstance(self.submission_id, str):
             raise TypeError("RuntimeHostCommand.submission_id must be str")
         if not isinstance(self.region_ids, tuple) or any(
@@ -1696,10 +1743,22 @@ class RuntimeHostCommand:
                     raise ValueError(
                         "wait_async requires async-serial-0 and no regions"
                     )
+                if (
+                    self.async_capture_mode is not AsyncBatchCaptureMode.DISABLED
+                    or self.async_artifact_key
+                ):
+                    raise ValueError("wait_async cannot carry an async capture artifact")
             case HostCommandKind.EXECUTE_INLINE:
                 if self.submission_id or not self.region_ids:
                     raise ValueError(
                         "execute_inline requires no submission id and non-empty regions"
+                    )
+                if (
+                    self.async_capture_mode is not AsyncBatchCaptureMode.DISABLED
+                    or self.async_artifact_key
+                ):
+                    raise ValueError(
+                        "execute_inline cannot carry an async capture artifact"
                     )
             case HostCommandKind.SUBMIT_ASYNC:
                 if (
@@ -1708,6 +1767,21 @@ class RuntimeHostCommand:
                 ):
                     raise ValueError(
                         "submit_async requires async-serial-0 and non-empty regions"
+                    )
+                if self.async_capture_mode is AsyncBatchCaptureMode.DISABLED:
+                    if self.async_artifact_key:
+                        raise ValueError(
+                            "disabled submit_async cannot carry an async artifact key"
+                        )
+                elif (
+                    len(self.async_artifact_key) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in self.async_artifact_key
+                    )
+                ):
+                    raise ValueError(
+                        "captured submit_async requires a lowercase SHA-256 artifact key"
                     )
 
 
@@ -1817,10 +1891,10 @@ class ScheduleDecision:
     cost: CostBreakdown = CostBreakdown(0, 0, 0, 0)
     explanations: tuple[str, ...] = ()
     signature: str = ""
-    schema_version: int = 4
+    schema_version: int = 5
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 4}:
+        if self.schema_version not in {1, 4, 5}:
             raise ValueError("unsupported ScheduleDecision schema version")
         if not isinstance(self.execution_regions, tuple) or any(
             not isinstance(region, ExecutionRegion) for region in self.execution_regions
@@ -1939,7 +2013,7 @@ class ScheduleDecision:
                     binder_identities.add(identity)
             if self.capture_partitions:
                 raise ValueError(
-                    "ScheduleDecision schema v4 cannot contain capture_partitions"
+                    "ScheduleDecision schema v4+ cannot contain capture_partitions"
                 )
         if not isinstance(self.fences, tuple) or any(
             not isinstance(fence, ScheduleFence) for fence in self.fences
@@ -1971,6 +2045,17 @@ class ScheduleDecision:
                 "critical_path_extension",
             ):
                 cost.pop(key)
+        elif self.schema_version == 4:
+            advances = payload["runtime_advance_plan"]
+            assert isinstance(advances, list)
+            for advance in advances:
+                assert isinstance(advance, dict)
+                commands = advance["host_commands"]
+                assert isinstance(commands, list)
+                for command in commands:
+                    assert isinstance(command, dict)
+                    command.pop("async_capture_mode")
+                    command.pop("async_artifact_key")
         payload["signature"] = self.signature
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -1987,12 +2072,12 @@ class ScheduleDecision:
         if schema_version in {2, 3}:
             raise ValueError(
                 f"ScheduleDecision schema v{schema_version} is stale; "
-                "recompile with schema v4"
+                "recompile with schema v5"
             )
-        if schema_version not in {1, 4}:
+        if schema_version not in {1, 4, 5}:
             raise ValueError("unsupported ScheduleDecision schema version")
 
-        is_v4 = schema_version == 4
+        is_v4 = schema_version in {4, 5}
         if is_v4:
             _require_json_fields(
                 raw,
@@ -2080,7 +2165,17 @@ class ScheduleDecision:
         )
         effect_fields = ("kind", "resource")
         binder_stage_fields = ("backend_event", "region_id", "implementation_id")
-        host_command_fields = ("kind", "submission_id", "region_ids")
+        host_command_fields = (
+            ("kind", "submission_id", "region_ids")
+            if schema_version == 4
+            else (
+                "kind",
+                "submission_id",
+                "region_ids",
+                "async_capture_mode",
+                "async_artifact_key",
+            )
+        )
         runtime_advance_fields = (
             "backend_event",
             "anchor_id",
@@ -2554,6 +2649,27 @@ class ScheduleDecision:
                             )["region_ids"],
                             f"{label}.host_commands[{command_position}].region_ids",
                         ),
+                        async_capture_mode=AsyncBatchCaptureMode(
+                            _json_string(
+                                _require_json_fields(
+                                    command,
+                                    f"{label}.host_commands[{command_position}]",
+                                    host_command_fields,
+                                ).get(
+                                    "async_capture_mode",
+                                    AsyncBatchCaptureMode.DISABLED.value,
+                                ),
+                                f"{label}.host_commands[{command_position}].async_capture_mode",
+                            )
+                        ),
+                        async_artifact_key=_json_string(
+                            _require_json_fields(
+                                command,
+                                f"{label}.host_commands[{command_position}]",
+                                host_command_fields,
+                            ).get("async_artifact_key", ""),
+                            f"{label}.host_commands[{command_position}].async_artifact_key",
+                        ),
                     )
                     for command_position, command in enumerate(
                         _json_array(
@@ -2816,6 +2932,7 @@ class ScheduleDecision:
 
 __all__ = [
     "AffineRegionSchedule",
+    "AsyncBatchCaptureMode",
     "BackendObservableEvent",
     "BackendRegionBinderStage",
     "CompileOptions",
@@ -2862,6 +2979,7 @@ __all__ = [
     "ScheduleOutput",
     "ScheduleOutputKind",
     "ScheduleState",
+    "ScheduleStateStorage",
     "ScheduleFence",
     "ScheduleGraph",
     "ScheduleTask",

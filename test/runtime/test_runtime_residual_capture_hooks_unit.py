@@ -25,7 +25,7 @@ class _DecodeExecutor:
 
 
 class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
-    def test_capture_resident_tap_uses_module_buffers_and_salts_aot_identity(self) -> None:
+    def test_native_capture_tap_uses_module_buffers_and_salts_aot_identity(self) -> None:
         class _Layer(torch.nn.Module):
             def forward(self, x):
                 return x + 1
@@ -59,14 +59,19 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
         runtime.producer_executor = type(
             "Executor",
             (),
-            {"capture_resident_producer_ids": ("tllm.residual.decode",)},
+            {"capture_resident_producer_ids": ()},
         )()
         runtime.placement_stats = type(
             "Stats", (), {"capture_resident_stage_install_count": 0}
         )()
         core = type("Core", (), {"RUNTIME": runtime})()
         runner = type(
-            "Runner", (), {"device": torch.device("cpu"), "model": model}
+            "Runner",
+            (),
+            {
+                "device": torch.device("cpu"),
+                "get_model": lambda self: model,
+            },
         )()
 
         from tllm.runtime.graph_policy import GraphMode
@@ -80,6 +85,7 @@ class RuntimeResidualCaptureHooksUnitTest(unittest.TestCase):
                 core=core,
                 runner=runner,
                 resolved_layers={"layers.0": layer},
+                capture_native_hidden=True,
             )
 
         x = torch.arange(9, dtype=torch.float32).reshape(3, 3)

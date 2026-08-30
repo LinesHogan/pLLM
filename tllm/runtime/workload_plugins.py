@@ -15,6 +15,7 @@ from tllm.runtime.workload_bindings import (
     LocalRuntimeServices,
     NoRuntimeServices,
     NoSamplerBinding,
+    OptimizerTransitionService,
     RuntimeInputBinding,
     RuntimeOutputBinding,
     RuntimePortRegistry,
@@ -393,7 +394,8 @@ def reconstruct_worker_bindings(
     from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
 
     parameter_overlays: dict[OverlayChannel, OverlayVersionStore] = {}
-    for item in reconstructed:
+    optimizer_transitions: dict[str, OptimizerTransitionService] = {}
+    for declaration, item in zip(declarations, reconstructed, strict=True):
         overlap = set(backend_region_binders).intersection(item.backend.binders)
         if overlap:
             raise RuntimeError(
@@ -410,6 +412,18 @@ def reconstruct_worker_bindings(
                 "native worker reconstruction has duplicate parameter overlay channels"
             )
         parameter_overlays.update(item.parameter_overlays)
+        for local_name, transition_service in item.optimizer_transitions.items():
+            resource = (
+                f"{declaration.ir.workload_id}/{local_name}"
+                if multiple
+                else local_name
+            )
+            if resource in optimizer_transitions:
+                raise RuntimeError(
+                    "native worker reconstruction has duplicate optimizer "
+                    f"transition binding {resource!r}"
+                )
+            optimizer_transitions[resource] = transition_service
 
     diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
     for declaration, item in zip(declarations, reconstructed, strict=True):
@@ -444,6 +458,7 @@ def reconstruct_worker_bindings(
             outputs=merge_outputs(),
         ),
         state_versions=state_versions,
+        optimizer_transitions=optimizer_transitions,
         sampler=(NoSamplerBinding() if not sampler_bindings else sampler_bindings[0]),
         diagnostics_readers=diagnostics_readers,
         lifecycle=(

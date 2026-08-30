@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 from tllm.contracts.consumer_stats import TrainingStats
 from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
@@ -79,6 +79,18 @@ def _empty_residual_paths() -> Mapping["ResidualLocator", str]:
 
 
 def _empty_parameter_overlays() -> Mapping[OverlayChannel, OverlayVersionStore]:
+    return MappingProxyType({})
+
+
+class OptimizerTransitionService(Protocol):
+    """Typed split between capturable device work and one host commit."""
+
+    def device_step(self, loss: "torch.Tensor") -> None: ...
+
+    def commit(self, loss: "torch.Tensor") -> None: ...
+
+
+def _empty_optimizer_transitions() -> Mapping[str, OptimizerTransitionService]:
     return MappingProxyType({})
 
 
@@ -225,6 +237,9 @@ class WorkloadRuntimeBinding:
     parameter_overlays: Mapping[OverlayChannel, OverlayVersionStore] = field(
         default_factory=_empty_parameter_overlays
     )
+    optimizer_transitions: Mapping[str, OptimizerTransitionService] = field(
+        default_factory=_empty_optimizer_transitions
+    )
 
     def __post_init__(self) -> None:
         if any(not name or not value for name, value in self.specialization_key.items()):
@@ -240,6 +255,11 @@ class WorkloadRuntimeBinding:
             "parameter_overlays",
             MappingProxyType(dict(self.parameter_overlays)),
         )
+        object.__setattr__(
+            self,
+            "optimizer_transitions",
+            _frozen_bindings(self.optimizer_transitions),
+        )
 
 __all__ = [
     "BackendRuntimeBinding",
@@ -249,6 +269,7 @@ __all__ = [
     "NoRuntimeServices",
     "NoSamplerBinding",
     "NoWorkerBinding",
+    "OptimizerTransitionService",
     "PerRequestStats",
     "RuntimePortRegistry",
     "RuntimeInputBinding",

@@ -17,6 +17,7 @@ use std::fmt::Write;
 enum TaskImplementationKind {
     Captured,
     Extern,
+    OptimizerTransition,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -145,6 +146,13 @@ enum StateScope {
     Replica,
     Shard,
     Global,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ScheduleStateStorage {
+    Dynamic,
+    OptimizerStable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -280,12 +288,21 @@ enum HostCommandKind {
     SubmitAsync,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AsyncBatchCaptureMode {
+    Disabled,
+    OptimizerTransition,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RuntimeHostCommand {
     kind: HostCommandKind,
     submission_id: String,
     region_ids: Vec<String>,
+    async_capture_mode: AsyncBatchCaptureMode,
+    async_artifact_key: String,
 }
 
 /// The closed fallback command for a fully-bound ExecutionRegion.
@@ -462,6 +479,8 @@ struct ScheduleState {
     scope: StateScope,
     #[serde(default)]
     request_key: Vec<String>,
+    #[serde(default)]
+    storage: Option<ScheduleStateStorage>,
     transition: String,
 }
 
@@ -855,7 +874,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 fn workload_compilation_wire_cache_key(graph: &str, timeline: &str, options: &str) -> String {
     digest(&format!(
-        "workload-compilation-v4\0{graph}\0{timeline}\0{options}"
+        "workload-compilation-v5\0{graph}\0{timeline}\0{options}"
     ))
 }
 
@@ -1608,9 +1627,64 @@ fn capture_effects_have_stable_storage(graph: &ScheduleGraph, effects: &[Schedul
         effect.kind == ScheduleEffectKind::StateRead
             && graph.states.iter().any(|state| {
                 state.resource == effect.resource
+                    && state.storage == Some(ScheduleStateStorage::OptimizerStable)
                     && state.transition == CAPTURE_STABLE_STATE_TRANSITION
             })
     })
+}
+
+fn validate_optimizer_transition_task(graph: &ScheduleGraph, task: &ScheduleTask) -> PyResult<()> {
+    let optimizer_candidates = task
+        .implementation_kinds
+        .iter()
+        .filter(|kind| **kind == TaskImplementationKind::OptimizerTransition)
+        .count();
+    if optimizer_candidates == 0 {
+        return Ok(());
+    }
+    let stable_state = task.effects.first().and_then(|effect| {
+        graph
+            .states
+            .iter()
+            .find(|state| state.resource == effect.resource)
+    });
+    let capabilities_are_closed =
+        task.implementation_capabilities
+            .first()
+            .is_some_and(|capabilities| {
+                capabilities
+                    == &[
+                        ASYNC_HOST_SAFE_CAPABILITY.to_owned(),
+                        SIDE_STREAM_SAFE_CAPABILITY.to_owned(),
+                    ]
+            });
+    if graph.schema_version != 3
+        || optimizer_candidates != 1
+        || task.implementation_ids.len() != 1
+        || task.implementation_kinds.len() != 1
+        || !capabilities_are_closed
+        || task.capture_safe
+        || task.effects.len() != 1
+        || task.effects[0].kind != ScheduleEffectKind::StateTransition
+        || stable_state.is_none_or(|state| {
+            state.scope == StateScope::Request
+                || state.storage != Some(ScheduleStateStorage::OptimizerStable)
+                || state.transition != CAPTURE_STABLE_STATE_TRANSITION
+        })
+        || task.inputs.len() != 1
+        || task.inputs[0].kind != ScheduleInputKind::Result
+        || !task.outputs.is_empty()
+        || !task.domain.indices.is_empty()
+        || !task.domain.bounds.is_empty()
+        || !task.domain.parameters.is_empty()
+        || !task.accesses.is_empty()
+    {
+        return Err(schedule_error(format!(
+            "task {:?} optimizer_transition implementation requires one strict optimizer-stable state transition, one Tensor result input, no outputs, and the closed async/side capability evidence",
+            task.task_id
+        )));
+    }
+    Ok(())
 }
 
 fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
@@ -1688,7 +1762,7 @@ fn select_task_implementations(
                             .then(|| {
                                 let compile_safe = kind == TaskImplementationKind::Captured
                                     && (graph.schema_version == 1 || export_safe);
-                                let async_host_safe = graph.schema_version == 2
+                                let async_host_safe = graph.schema_version >= 2
                                     && capabilities
                                         .iter()
                                         .any(|capability| capability == ASYNC_HOST_SAFE_CAPABILITY);
@@ -1729,6 +1803,16 @@ fn select_task_implementations(
 /// signed, inspectable evidence; the scheduler refuses to use them unless
 /// they agree with this Rust-owned derivation.
 fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
+    if graph.schema_version == 3 && graph.states.iter().any(|state| state.storage.is_none()) {
+        return Err(schedule_error(
+            "ScheduleGraph schema v3 requires explicit state storage evidence",
+        ));
+    }
+    if graph.schema_version < 3 && graph.states.iter().any(|state| state.storage.is_some()) {
+        return Err(schedule_error(
+            "ScheduleGraph schema before v3 forbids state storage evidence",
+        ));
+    }
     if graph.schema_version == 1 {
         // Historical payloads did not carry per-implementation capabilities,
         // so re-derivation would be fabricated.  New lowering always emits
@@ -1741,10 +1825,11 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
     for task in &graph.tasks {
         if task.implementation_capabilities.len() != task.implementation_ids.len() {
             return Err(schedule_error(format!(
-                "task {:?} schema v2 requires per-implementation capabilities",
+                "task {:?} schema v2+ requires per-implementation capabilities",
                 task.task_id
             )));
         }
+        validate_optimizer_transition_task(graph, task)?;
         let mut required_by_all_candidates: Option<BTreeSet<String>> = None;
         for capabilities in &task.implementation_capabilities {
             let mut seen = BTreeSet::<&str>::new();
@@ -1911,7 +1996,7 @@ fn validate_inputs(
     timeline: &Timeline,
     options: &CompileOptions,
 ) -> PyResult<(HashMap<String, usize>, HashMap<String, usize>)> {
-    if !matches!(graph.schema_version, 1 | 2) || !matches!(timeline.schema_version, 1 | 2) {
+    if !matches!(graph.schema_version, 1 | 2 | 3) || !matches!(timeline.schema_version, 1 | 2) {
         return Err(value_error("unsupported schedule schema version"));
     }
     validate_derived_graph_semantics(graph)?;
@@ -1997,6 +2082,8 @@ fn validate_inputs(
         if state.resource.is_empty()
             || state.transition.is_empty()
             || (state.scope == StateScope::Request) != !state.request_key.is_empty()
+            || (graph.schema_version == 3 && state.storage.is_none())
+            || (graph.schema_version < 3 && state.storage.is_some())
             || !state_resources.insert(state.resource.as_str())
         {
             return Err(value_error("invalid or duplicate typed schedule state"));
@@ -2556,7 +2643,10 @@ fn drafts_can_merge(
         task_approximation_policy(graph, graph.tasks[*index].task_id.as_str()) != first_policy
     });
     if earliest >= before
-        || implementation_kind == TaskImplementationKind::Extern
+        || matches!(
+            implementation_kind,
+            TaskImplementationKind::Extern | TaskImplementationKind::OptimizerTransition
+        )
         || tasks
             .iter()
             .any(|index| selected[*index].kind != implementation_kind)
@@ -2988,7 +3078,7 @@ fn side_stream_eligible(graph_schema_version: i64, region: &ExecutionRegion) -> 
         && region.side_stream_safe
         && inputs_materialized
         && pure_outputs_safe;
-    let ordered_state_tail = graph_schema_version == 2
+    let ordered_state_tail = graph_schema_version >= 2
         && region.side_stream_safe
         && has_ordered_effect
         && ordered_effects
@@ -3020,7 +3110,7 @@ fn async_host_eligible(
                     | ScheduleEffectKind::StateTransitionMaybe
             )
         });
-    graph_schema_version == 2
+    graph_schema_version >= 2
         && region.stream == Some(RegionStreamClass::SideForward)
         && selected_async_host_safe
         && inputs_materialized
@@ -3036,11 +3126,15 @@ fn append_async_submission(commands: &mut Vec<RuntimeHostCommand>, region_ids: &
         kind: HostCommandKind::WaitAsync,
         submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
         region_ids: Vec::new(),
+        async_capture_mode: AsyncBatchCaptureMode::Disabled,
+        async_artifact_key: String::new(),
     });
     commands.push(RuntimeHostCommand {
         kind: HostCommandKind::SubmitAsync,
         submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
         region_ids: std::mem::take(region_ids),
+        async_capture_mode: AsyncBatchCaptureMode::Disabled,
+        async_artifact_key: String::new(),
     });
 }
 
@@ -3055,16 +3149,22 @@ fn validate_host_commands(
             HostCommandKind::WaitAsync => {
                 if command.submission_id != ASYNC_SERIAL_SUBMISSION_ID
                     || !command.region_ids.is_empty()
+                    || command.async_capture_mode != AsyncBatchCaptureMode::Disabled
+                    || !command.async_artifact_key.is_empty()
                 {
                     return Err(schedule_error(
-                        "wait_async requires the fixed async-serial-0 submission and no regions",
+                        "wait_async requires the fixed async-serial-0 submission, no regions, and disabled async capture",
                     ));
                 }
             }
             HostCommandKind::ExecuteInline => {
-                if !command.submission_id.is_empty() || command.region_ids.is_empty() {
+                if !command.submission_id.is_empty()
+                    || command.region_ids.is_empty()
+                    || command.async_capture_mode != AsyncBatchCaptureMode::Disabled
+                    || !command.async_artifact_key.is_empty()
+                {
                     return Err(schedule_error(
-                        "execute_inline requires an empty submission_id and non-empty regions",
+                        "execute_inline requires an empty submission_id, non-empty regions, and disabled async capture",
                     ));
                 }
                 for region_id in &command.region_ids {
@@ -3089,6 +3189,22 @@ fn validate_host_commands(
                     return Err(schedule_error(
                         "submit_async requires non-empty regions and an immediately preceding wait on async-serial-0",
                     ));
+                }
+                match command.async_capture_mode {
+                    AsyncBatchCaptureMode::Disabled if !command.async_artifact_key.is_empty() => {
+                        return Err(schedule_error(
+                            "disabled submit_async capture forbids an async artifact key",
+                        ));
+                    }
+                    AsyncBatchCaptureMode::OptimizerTransition
+                        if !is_lowercase_sha256(&command.async_artifact_key) =>
+                    {
+                        return Err(schedule_error(
+                            "optimizer_transition submit_async capture requires a lowercase SHA-256 artifact key",
+                        ));
+                    }
+                    AsyncBatchCaptureMode::Disabled
+                    | AsyncBatchCaptureMode::OptimizerTransition => {}
                 }
                 for region_id in &command.region_ids {
                     if regions_by_id.get(region_id.as_str()).is_none_or(|region| {
@@ -3224,6 +3340,8 @@ fn runtime_advance_plan(
                             kind: HostCommandKind::ExecuteInline,
                             submission_id: String::new(),
                             region_ids: std::mem::take(&mut inline_batch),
+                            async_capture_mode: AsyncBatchCaptureMode::Disabled,
+                            async_artifact_key: String::new(),
                         });
                     }
                     async_batch.push(region_id.clone());
@@ -3240,6 +3358,8 @@ fn runtime_advance_plan(
                         kind: HostCommandKind::WaitAsync,
                         submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
                         region_ids: Vec::new(),
+                        async_capture_mode: AsyncBatchCaptureMode::Disabled,
+                        async_artifact_key: String::new(),
                     });
                 }
                 let waits_for_async_dependency = region
@@ -3259,6 +3379,8 @@ fn runtime_advance_plan(
                             kind: HostCommandKind::ExecuteInline,
                             submission_id: String::new(),
                             region_ids: std::mem::take(&mut inline_batch),
+                            async_capture_mode: AsyncBatchCaptureMode::Disabled,
+                            async_artifact_key: String::new(),
                         });
                     }
                     if host_commands
@@ -3269,6 +3391,8 @@ fn runtime_advance_plan(
                             kind: HostCommandKind::WaitAsync,
                             submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
                             region_ids: Vec::new(),
+                            async_capture_mode: AsyncBatchCaptureMode::Disabled,
+                            async_artifact_key: String::new(),
                         });
                     }
                 }
@@ -3282,6 +3406,8 @@ fn runtime_advance_plan(
                     kind: HostCommandKind::ExecuteInline,
                     submission_id: String::new(),
                     region_ids: inline_batch,
+                    async_capture_mode: AsyncBatchCaptureMode::Disabled,
+                    async_artifact_key: String::new(),
                 });
             }
             validate_host_commands(&region_ids, &host_commands, &regions_by_id)?;
@@ -3337,6 +3463,271 @@ fn runtime_advance_plan(
         .map(|region| region.placement_anchor.clone())
         .unwrap_or_else(|| timeline.anchors.last().unwrap().anchor_id.clone());
     Ok((advances, completion_anchor))
+}
+
+fn async_optimizer_capture_eligible(
+    graph: &ScheduleGraph,
+    timeline: &Timeline,
+    options: &CompileOptions,
+    selected: &[SelectedTaskImplementation],
+    task_index: &HashMap<String, usize>,
+    execution_regions: &[ExecutionRegion],
+    materializations: &[Materialization],
+    region_ids: &[String],
+) -> bool {
+    if graph.schema_version != 3
+        || options.capture_policy == "disabled"
+        || timeline.graph_mode == "eager"
+        || region_ids.len() < 2
+    {
+        return false;
+    }
+    let region_position: HashMap<&str, usize> = execution_regions
+        .iter()
+        .enumerate()
+        .map(|(position, region)| (region.region_id.as_str(), position))
+        .collect();
+    let Some(regions) = region_ids
+        .iter()
+        .map(|region_id| {
+            region_position
+                .get(region_id.as_str())
+                .map(|position| &execution_regions[*position])
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if regions.windows(2).any(|pair| {
+        region_position[pair[1].region_id.as_str()]
+            != region_position[pair[0].region_id.as_str()] + 1
+    }) || regions.iter().any(|region| {
+        region.placement_anchor != regions[0].placement_anchor
+            || region.stream != Some(RegionStreamClass::SideForward)
+            || region.host_submission != RegionHostSubmission::AsyncSerial
+            || region.capture_mode != RegionCaptureMode::Disabled
+            || region.input_bindings.is_empty()
+            || region
+                .input_bindings
+                .iter()
+                .any(|binding| binding.kind != RegionInputKind::Materialized)
+            || region
+                .output_bindings
+                .iter()
+                .any(|binding| binding.kind != RegionOutputKind::Materialized)
+    }) {
+        return false;
+    }
+
+    let mut optimizer_task = None;
+    for (region_ordinal, region) in regions.iter().enumerate() {
+        for task_id in &region.tasks {
+            let implementation = &selected[task_index[task_id]];
+            if !implementation.async_host_safe || !implementation.side_stream_safe {
+                return false;
+            }
+            match implementation.kind {
+                TaskImplementationKind::Captured
+                    if optimizer_task.is_none() && implementation.compile_safe => {}
+                TaskImplementationKind::OptimizerTransition
+                    if optimizer_task.is_none()
+                        && region_ordinal + 1 == regions.len()
+                        && region.tasks.len() == 1 =>
+                {
+                    optimizer_task = Some(task_id.as_str());
+                }
+                TaskImplementationKind::Captured
+                | TaskImplementationKind::Extern
+                | TaskImplementationKind::OptimizerTransition => return false,
+            }
+        }
+    }
+    let Some(optimizer_task) = optimizer_task else {
+        return false;
+    };
+
+    let mut mutation_resource = None;
+    let mut read_resources = BTreeSet::new();
+    for region in &regions {
+        for effect in &region.effects {
+            match effect.kind {
+                ScheduleEffectKind::StateRead => {
+                    read_resources.insert(effect.resource.as_str());
+                }
+                ScheduleEffectKind::StateTransition
+                    if region.tasks == [optimizer_task] && mutation_resource.is_none() =>
+                {
+                    mutation_resource = Some(effect.resource.as_str());
+                }
+                ScheduleEffectKind::StateWrite
+                | ScheduleEffectKind::StateTransition
+                | ScheduleEffectKind::StateTransitionMaybe
+                | ScheduleEffectKind::VersionPublish
+                | ScheduleEffectKind::ExternIo => return false,
+            }
+        }
+    }
+    let Some(mutation_resource) = mutation_resource else {
+        return false;
+    };
+    if !read_resources.is_empty() && read_resources != BTreeSet::from([mutation_resource]) {
+        return false;
+    }
+    if graph
+        .states
+        .iter()
+        .find(|state| state.resource == mutation_resource)
+        .is_none_or(|state| {
+            state.scope == StateScope::Request
+                || state.storage != Some(ScheduleStateStorage::OptimizerStable)
+                || state.transition != CAPTURE_STABLE_STATE_TRANSITION
+        })
+    {
+        return false;
+    }
+
+    let members: BTreeSet<&str> = region_ids.iter().map(String::as_str).collect();
+    let materializations_by_id: HashMap<&str, &Materialization> = materializations
+        .iter()
+        .map(|value| (value.materialization_id.as_str(), value))
+        .collect();
+    let mut external_inputs = 0usize;
+    let mut adjacent_edges = BTreeSet::<(&str, &str)>::new();
+    for (region_ordinal, region) in regions.iter().enumerate() {
+        for binding in &region.input_bindings {
+            let Some(materialization) = materializations_by_id.get(binding.binding_id.as_str())
+            else {
+                return false;
+            };
+            if materialization.consumer_region != region.region_id {
+                return false;
+            }
+            if members.contains(materialization.producer_region.as_str()) {
+                let producer_position = region_position[materialization.producer_region.as_str()];
+                if producer_position >= region_position[region.region_id.as_str()] {
+                    return false;
+                }
+                adjacent_edges.insert((
+                    materialization.producer_region.as_str(),
+                    materialization.consumer_region.as_str(),
+                ));
+            } else {
+                if region_ordinal != 0
+                    || region_position
+                        .get(materialization.producer_region.as_str())
+                        .is_none_or(|position| {
+                            *position >= region_position[regions[0].region_id.as_str()]
+                                || execution_regions[*position].placement_anchor
+                                    == regions[0].placement_anchor
+                        })
+                {
+                    return false;
+                }
+                external_inputs += 1;
+            }
+        }
+        for binding in &region.output_bindings {
+            let Some(materialization) = materializations_by_id.get(binding.binding_id.as_str())
+            else {
+                return false;
+            };
+            if materialization.producer_region != region.region_id
+                || !members.contains(materialization.consumer_region.as_str())
+            {
+                return false;
+            }
+        }
+    }
+    external_inputs > 0
+        && regions.windows(2).all(|pair| {
+            adjacent_edges.contains(&(pair[0].region_id.as_str(), pair[1].region_id.as_str()))
+                && pair[1]
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == &pair[0].region_id)
+        })
+}
+
+fn async_capture_artifact_key(
+    graph_json: &str,
+    timeline_json: &str,
+    options_json: &str,
+    advance: &RuntimeAdvancePlan,
+    command: &RuntimeHostCommand,
+    execution_regions: &[ExecutionRegion],
+) -> PyResult<String> {
+    let regions_by_id: HashMap<&str, &ExecutionRegion> = execution_regions
+        .iter()
+        .map(|region| (region.region_id.as_str(), region))
+        .collect();
+    let members = command
+        .region_ids
+        .iter()
+        .map(|region_id| {
+            regions_by_id
+                .get(region_id.as_str())
+                .map(|region| (region_id.as_str(), region.artifact_key.as_str()))
+                .ok_or_else(|| schedule_error("async capture references an unknown Region"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let batch_json = serde_json::to_string(&(
+        advance.backend_event,
+        advance.anchor_id.as_str(),
+        AsyncBatchCaptureMode::OptimizerTransition,
+        members,
+    ))
+    .map_err(|error| schedule_error(format!("failed to serialize async capture batch: {error}")))?;
+    Ok(digest(&format!(
+        "async-optimizer-transition-v1\0{graph_json}\0{timeline_json}\0{options_json}\0{batch_json}"
+    )))
+}
+
+fn sign_async_capture_commands(
+    graph: &ScheduleGraph,
+    graph_json: &str,
+    timeline: &Timeline,
+    timeline_json: &str,
+    options: &CompileOptions,
+    options_json: &str,
+    selected: &[SelectedTaskImplementation],
+    task_index: &HashMap<String, usize>,
+    execution_regions: &[ExecutionRegion],
+    materializations: &[Materialization],
+    advances: &mut [RuntimeAdvancePlan],
+) -> PyResult<()> {
+    let regions_by_id: HashMap<&str, &ExecutionRegion> = execution_regions
+        .iter()
+        .map(|region| (region.region_id.as_str(), region))
+        .collect();
+    for advance in advances {
+        let advance_view = advance.clone();
+        for command in &mut advance.host_commands {
+            if command.kind == HostCommandKind::SubmitAsync
+                && async_optimizer_capture_eligible(
+                    graph,
+                    timeline,
+                    options,
+                    selected,
+                    task_index,
+                    execution_regions,
+                    materializations,
+                    &command.region_ids,
+                )
+            {
+                command.async_capture_mode = AsyncBatchCaptureMode::OptimizerTransition;
+                command.async_artifact_key = async_capture_artifact_key(
+                    graph_json,
+                    timeline_json,
+                    options_json,
+                    &advance_view,
+                    command,
+                    execution_regions,
+                )?;
+            }
+        }
+        validate_host_commands(&advance.region_ids, &advance.host_commands, &regions_by_id)?;
+    }
+    Ok(())
 }
 
 /// A capture Region must be able to inspect its complete Tensor contract
@@ -3610,8 +4001,10 @@ fn compile_impl(
             timeline.anchors[draft.before].anchor_id
         );
         let region_id = format!("region-{ordinal:04}-{}", &digest(&identity)[..16]);
-        let implementation_kind = if selected[draft.tasks[0]].kind == TaskImplementationKind::Extern
-        {
+        let implementation_kind = if matches!(
+            selected[draft.tasks[0]].kind,
+            TaskImplementationKind::Extern | TaskImplementationKind::OptimizerTransition
+        ) {
             RegionImplementationKind::Extern
         } else {
             RegionImplementationKind::Compiled
@@ -4081,16 +4474,36 @@ fn compile_impl(
         .iter()
         .map(|value| value.size_bytes)
         .fold(0u64, u64::saturating_add);
-    let capture_boundary_count = execution_regions
-        .iter()
-        .filter(|region| region.capture_mode == RegionCaptureMode::Require)
-        .count() as u64;
     let serial_fallback_count = execution_regions
         .iter()
         .filter(|region| region.serial_fallback)
         .count();
-    let (runtime_advance_plan, completion_anchor) =
+    let (mut runtime_advance_plan, completion_anchor) =
         runtime_advance_plan(timeline, &execution_regions)?;
+    sign_async_capture_commands(
+        graph,
+        graph_json,
+        timeline,
+        timeline_json,
+        options,
+        options_json,
+        &selected,
+        &task_index,
+        &execution_regions,
+        &materializations,
+        &mut runtime_advance_plan,
+    )?;
+    let capture_boundary_count = execution_regions
+        .iter()
+        .filter(|region| region.capture_mode == RegionCaptureMode::Require)
+        .count() as u64
+        + runtime_advance_plan
+            .iter()
+            .flat_map(|advance| advance.host_commands.iter())
+            .filter(|command| {
+                command.async_capture_mode == AsyncBatchCaptureMode::OptimizerTransition
+            })
+            .count() as u64;
     let mut decision = Decision {
         graph_key: digest(graph_json),
         timeline_key: digest(timeline_json),
@@ -4157,7 +4570,7 @@ fn compile_impl(
             explanations
         },
         signature: String::new(),
-        schema_version: 4,
+        schema_version: 5,
     };
     let unsigned = serde_json::to_string(&decision)
         .map_err(|error| schedule_error(format!("failed to serialize decision: {error}")))?;
@@ -4190,7 +4603,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     let supplied: Decision = decode(decision, "ScheduleDecision")?;
     let (anchor_index, task_index) = validate_inputs(&graph_desc, &timeline_desc, &options_desc)?;
     let selected = select_task_implementations(&graph_desc, &timeline_desc)?;
-    if supplied.schema_version != 4
+    if supplied.schema_version != 5
         || supplied.graph_key != digest(graph)
         || supplied.timeline_key != digest(timeline)
     {
@@ -4204,7 +4617,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         .any(|region| region.stream.is_none() || region.fallback_policy.is_none())
     {
         return Err(schedule_error(
-            "ScheduleDecision v4 ExecutionRegion requires explicit stream and fallback_policy",
+            "ScheduleDecision v5 ExecutionRegion requires explicit stream and fallback_policy",
         ));
     }
     if supplied.execution_regions.iter().any(|region| {
@@ -4212,7 +4625,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             != region.compile_command.is_some()
     }) {
         return Err(schedule_error(
-            "ScheduleDecision v4 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
+            "ScheduleDecision v5 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
         ));
     }
     let mut unsigned = supplied.clone();
@@ -4224,7 +4637,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
     if supplied.fallback != "explicit_regions" || !supplied.capture_partitions.is_empty() {
         return Err(schedule_error(
-            "ScheduleDecision v4 requires explicit regions and forbids capture_partitions",
+            "ScheduleDecision v5 requires explicit regions and forbids capture_partitions",
         ));
     }
     if supplied.execution_order.len() != graph_desc.tasks.len()
@@ -4511,10 +4924,10 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
 
     let supplied_runtime_plan = supplied.runtime_advance_plan.as_ref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v4 requires an explicit runtime_advance_plan")
+        schedule_error("ScheduleDecision v5 requires an explicit runtime_advance_plan")
     })?;
     let supplied_completion_anchor = supplied.completion_anchor.as_deref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v4 requires an explicit completion_anchor")
+        schedule_error("ScheduleDecision v5 requires an explicit completion_anchor")
     })?;
     let supplied_regions_by_id: HashMap<&str, &ExecutionRegion> = supplied
         .execution_regions
@@ -4533,8 +4946,21 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             "ScheduleDecision completion_anchor must be non-empty",
         ));
     }
-    let (canonical_runtime_plan, canonical_completion_anchor) =
+    let (mut canonical_runtime_plan, canonical_completion_anchor) =
         runtime_advance_plan(&timeline_desc, &supplied.execution_regions)?;
+    sign_async_capture_commands(
+        &graph_desc,
+        graph,
+        &timeline_desc,
+        timeline,
+        &options_desc,
+        options,
+        &selected,
+        &task_index,
+        &supplied.execution_regions,
+        &supplied.materializations,
+        &mut canonical_runtime_plan,
+    )?;
     if supplied_runtime_plan != &canonical_runtime_plan
         || supplied_completion_anchor != canonical_completion_anchor
     {
@@ -5265,12 +5691,12 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_region_shape_specializations_wire, compile_schedule, digest,
+        apply_region_shape_specializations_wire, compile_schedule, digest, is_lowercase_sha256,
         normalize_runtime_specialization_options_wire, validate_runtime_specialization_facts,
-        validate_schedule, workload_compilation_wire_cache_key, CompileOptions, Decision,
-        ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind, RegionCaptureMode,
-        RegionFallbackPolicy, RegionHostSubmission, RegionInputBinding, RegionInputKind,
-        RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleInput,
+        validate_schedule, workload_compilation_wire_cache_key, AsyncBatchCaptureMode,
+        CompileOptions, Decision, ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind,
+        RegionCaptureMode, RegionFallbackPolicy, RegionHostSubmission, RegionInputBinding,
+        RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleInput,
     };
     use isl_rs::{Context, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
 
@@ -5506,13 +5932,13 @@ mod tests {
     #[test]
     fn rust_signs_canonical_async_host_commands_without_name_policy() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"neutral-graph","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"neutral-graph","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
 
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
-        assert_eq!(decision.schema_version, 4);
+        assert_eq!(decision.schema_version, 5);
         let update_region = decision
             .execution_regions
             .iter()
@@ -5618,7 +6044,7 @@ mod tests {
     #[test]
     fn async_host_submission_requires_every_structural_proof() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"neutral-eligibility","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"neutral-eligibility","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
         let baseline: serde_json::Value = serde_json::from_str(graph).unwrap();
@@ -6146,7 +6572,7 @@ mod tests {
     #[test]
     fn read_only_sampler_tensor_capture_is_structural_and_tamper_evident() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"neutral-capture","tasks":[{"task_id":"observe","timing":{"after":"tick","before":"end"},"temporary_bytes":0,"implementation_ids":["test:observe@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"parameters"}],"inputs":[{"name":"sample_index","kind":"sampler_sample_idx_tensor","source":"sampler.sample_index_tensor"}]}],"edges":[],"values":[],"states":[{"resource":"parameters","scope":"replica","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"neutral-capture","tasks":[{"task_id":"observe","timing":{"after":"tick","before":"end"},"temporary_bytes":0,"implementation_ids":["test:observe@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"parameters"}],"inputs":[{"name":"sample_index","kind":"sampler_sample_idx_tensor","source":"sampler.sample_index_tensor"}]}],"edges":[],"values":[],"states":[{"resource":"parameters","scope":"replica","storage":"optimizer_stable","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":3}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"piecewise","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sampler.pre_draw"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
@@ -6312,6 +6738,295 @@ mod tests {
         );
         assert!(!async_region.capture_safe);
         assert_eq!(async_region.capture_mode, RegionCaptureMode::Disabled);
+    }
+
+    #[test]
+    fn rust_signs_structural_optimizer_transition_batches_without_name_policy() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"neutral-batch","tasks":[{"task_id":"seed","timing":{"after":"tick","before":"train"},"temporary_bytes":0,"implementation_ids":["test:seed@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"derive","timing":{"after":"train","before":"end"},"temporary_bytes":0,"implementation_ids":["test:derive@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"parameters"}],"inputs":[{"name":"value","kind":"result","source":"seed","output":"value"}],"outputs":[{"name":"delta","kind":"temporary","target":"delta"}]},{"task_id":"apply","timing":{"after":"train","before":"end"},"temporary_bytes":0,"implementation_ids":["test:apply@1"],"implementation_kinds":["optimizer_transition"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"parameters"}],"inputs":[{"name":"delta","kind":"result","source":"derive","output":"delta"}]}],"edges":[{"source":"seed","target":"derive","kind":"data"},{"source":"derive","target":"apply","kind":"data"},{"source":"derive","target":"apply","kind":"effect"}],"values":[{"value_id":"neutral:value","version":1,"producer":"seed","producer_output":"value","consumers":["derive"],"size_bytes":0,"alias_set":""},{"value_id":"neutral:delta","version":1,"producer":"derive","producer_output":"delta","consumers":["apply"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"parameters","scope":"replica","storage":"optimizer_stable","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":3}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"piecewise","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"train","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        validate_schedule(graph, timeline, options, &compiled).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.schema_version, 5);
+        let optimizer_region = decision
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks == ["apply"])
+            .unwrap();
+        assert_eq!(
+            optimizer_region.implementation_kind,
+            super::RegionImplementationKind::Extern
+        );
+        assert!(!optimizer_region.compile_safe);
+        assert_eq!(optimizer_region.capture_mode, RegionCaptureMode::Disabled);
+        let command = decision
+            .runtime_advance_plan
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|advance| advance.host_commands.iter())
+            .find(|command| {
+                command.async_capture_mode == AsyncBatchCaptureMode::OptimizerTransition
+            })
+            .unwrap();
+        assert_eq!(command.kind, HostCommandKind::SubmitAsync);
+        assert_eq!(command.region_ids.len(), 2);
+        assert!(is_lowercase_sha256(&command.async_artifact_key));
+        assert_eq!(decision.cost.capture_boundary_count, 1);
+
+        let repeated: Decision =
+            serde_json::from_str(&compile_schedule(graph, timeline, options).unwrap()).unwrap();
+        let repeated_key = repeated
+            .runtime_advance_plan
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|advance| advance.host_commands.iter())
+            .find(|command| {
+                command.async_capture_mode == AsyncBatchCaptureMode::OptimizerTransition
+            })
+            .unwrap()
+            .async_artifact_key
+            .as_str();
+        assert_eq!(repeated_key, command.async_artifact_key);
+
+        let renamed_graph = graph
+            .replace("neutral-batch", "renamed-batch")
+            .replace("seed", "alpha")
+            .replace("derive", "beta")
+            .replace("apply", "gamma")
+            .replace("parameters", "weights");
+        let renamed: Decision =
+            serde_json::from_str(&compile_schedule(&renamed_graph, timeline, options).unwrap())
+                .unwrap();
+        let renamed_command = renamed
+            .runtime_advance_plan
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|advance| advance.host_commands.iter())
+            .find(|command| command.kind == HostCommandKind::SubmitAsync)
+            .unwrap();
+        assert_eq!(
+            renamed_command.async_capture_mode,
+            AsyncBatchCaptureMode::OptimizerTransition
+        );
+        assert_eq!(renamed_command.region_ids.len(), command.region_ids.len());
+
+        let eager_timeline =
+            timeline.replace(r#""graph_mode":"piecewise""#, r#""graph_mode":"eager""#);
+        let eager: Decision =
+            serde_json::from_str(&compile_schedule(graph, &eager_timeline, options).unwrap())
+                .unwrap();
+        assert!(eager
+            .runtime_advance_plan
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|advance| advance.host_commands.iter())
+            .all(|command| {
+                command.async_capture_mode == AsyncBatchCaptureMode::Disabled
+                    && command.async_artifact_key.is_empty()
+            }));
+
+        let disabled_options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"capture_policy":"disabled","schema_version":1}"#;
+        let disabled: Decision =
+            serde_json::from_str(&compile_schedule(graph, timeline, disabled_options).unwrap())
+                .unwrap();
+        assert!(disabled
+            .runtime_advance_plan
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|advance| advance.host_commands.iter())
+            .all(|command| {
+                command.async_capture_mode == AsyncBatchCaptureMode::Disabled
+                    && command.async_artifact_key.is_empty()
+            }));
+    }
+
+    #[test]
+    fn optimizer_transition_batch_capture_is_fail_closed_and_tamper_evident() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"closed-batch","tasks":[{"task_id":"one","timing":{"after":"tick","before":"train"},"temporary_bytes":0,"implementation_ids":["test:one@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"two","timing":{"after":"train","before":"end"},"temporary_bytes":0,"implementation_ids":["test:two@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}],"inputs":[{"name":"value","kind":"result","source":"one","output":"value"}],"outputs":[{"name":"next","kind":"temporary","target":"next"}]},{"task_id":"three","timing":{"after":"train","before":"end"},"temporary_bytes":0,"implementation_ids":["test:three@1"],"implementation_kinds":["optimizer_transition"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}],"inputs":[{"name":"next","kind":"result","source":"two","output":"next"}]}],"edges":[{"source":"one","target":"two","kind":"data"},{"source":"two","target":"three","kind":"data"},{"source":"two","target":"three","kind":"effect"}],"values":[{"value_id":"closed:value","version":1,"producer":"one","producer_output":"value","consumers":["two"],"size_bytes":0,"alias_set":""},{"value_id":"closed:next","version":1,"producer":"two","producer_output":"next","consumers":["three"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"state","scope":"replica","storage":"optimizer_stable","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":3}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"piecewise","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"train","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let original: Decision = serde_json::from_str(&compiled).unwrap();
+
+        let mut bad_key = original.clone();
+        let command = bad_key
+            .runtime_advance_plan
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|advance| advance.host_commands.iter_mut())
+            .find(|command| {
+                command.async_capture_mode == AsyncBatchCaptureMode::OptimizerTransition
+            })
+            .unwrap();
+        command.async_artifact_key = "0".repeat(64);
+        bad_key.signature.clear();
+        bad_key.signature = digest(&serde_json::to_string(&bad_key).unwrap());
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&bad_key).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime advancement"));
+
+        let mut wait_tampered = original.clone();
+        let wait = wait_tampered
+            .runtime_advance_plan
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|advance| advance.host_commands.iter_mut())
+            .find(|command| command.kind == HostCommandKind::WaitAsync)
+            .unwrap();
+        wait.async_capture_mode = AsyncBatchCaptureMode::OptimizerTransition;
+        wait.async_artifact_key = "1".repeat(64);
+        wait_tampered.signature.clear();
+        wait_tampered.signature = digest(&serde_json::to_string(&wait_tampered).unwrap());
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&wait_tampered).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("wait_async"));
+
+        let mut reordered = original.clone();
+        let advance = reordered
+            .runtime_advance_plan
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|advance| {
+                advance.host_commands.iter().any(|command| {
+                    command.async_capture_mode == AsyncBatchCaptureMode::OptimizerTransition
+                })
+            })
+            .unwrap();
+        advance.region_ids.swap(0, 1);
+        let submit = advance
+            .host_commands
+            .iter_mut()
+            .find(|command| command.kind == HostCommandKind::SubmitAsync)
+            .unwrap();
+        submit.region_ids.swap(0, 1);
+        reordered.signature.clear();
+        reordered.signature = digest(&serde_json::to_string(&reordered).unwrap());
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&reordered).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime advancement"));
+
+        let mut missing_field: serde_json::Value = serde_json::from_str(&compiled).unwrap();
+        let commands = missing_field["runtime_advance_plan"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|advance| advance["host_commands"].as_array_mut().unwrap())
+            .collect::<Vec<_>>();
+        commands
+            .into_iter()
+            .find(|command| command["kind"] == "submit_async")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("async_capture_mode");
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&missing_field).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("async_capture_mode"));
+        assert!(serde_json::from_str::<AsyncBatchCaptureMode>(r#""prefer""#).is_err());
+
+        let baseline: serde_json::Value = serde_json::from_str(graph).unwrap();
+        let mut missing_storage = baseline.clone();
+        missing_storage["states"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("storage");
+        let error = compile_schedule(&missing_storage.to_string(), timeline, options).unwrap_err();
+        assert!(error.to_string().contains("state storage evidence"));
+
+        let mut unstable_optimizer_kind = baseline.clone();
+        unstable_optimizer_kind["states"][0]["storage"] = serde_json::json!("dynamic");
+        let error =
+            compile_schedule(&unstable_optimizer_kind.to_string(), timeline, options).unwrap_err();
+        assert!(error.to_string().contains("optimizer_transition"));
+
+        for (storage, transition, effect, kind) in [
+            ("dynamic", "optimizer", "state_transition", "extern"),
+            ("dynamic", "manual", "state_transition", "extern"),
+            (
+                "optimizer_stable",
+                "optimizer",
+                "state_transition_maybe",
+                "extern",
+            ),
+        ] {
+            let mut candidate = baseline.clone();
+            candidate["states"][0]["storage"] = serde_json::json!(storage);
+            candidate["states"][0]["transition"] = serde_json::json!(transition);
+            candidate["tasks"][2]["effects"][0]["kind"] = serde_json::json!(effect);
+            candidate["tasks"][2]["implementation_kinds"] = serde_json::json!([kind]);
+            let candidate = serde_json::to_string(&candidate).unwrap();
+            let rejected: Decision =
+                serde_json::from_str(&compile_schedule(&candidate, timeline, options).unwrap())
+                    .unwrap();
+            assert!(rejected
+                .runtime_advance_plan
+                .as_ref()
+                .unwrap()
+                .iter()
+                .flat_map(|advance| advance.host_commands.iter())
+                .all(|command| {
+                    command.async_capture_mode == AsyncBatchCaptureMode::Disabled
+                        && command.async_artifact_key.is_empty()
+                }));
+        }
+
+        for output_kind in ["host", "sampler"] {
+            let mut candidate = baseline.clone();
+            candidate["tasks"][1]["outputs"][0]["kind"] = serde_json::json!(output_kind);
+            let candidate = serde_json::to_string(&candidate).unwrap();
+            let rejected: Decision =
+                serde_json::from_str(&compile_schedule(&candidate, timeline, options).unwrap())
+                    .unwrap();
+            assert!(rejected
+                .runtime_advance_plan
+                .as_ref()
+                .unwrap()
+                .iter()
+                .flat_map(|advance| advance.host_commands.iter())
+                .all(|command| {
+                    command.async_capture_mode == AsyncBatchCaptureMode::Disabled
+                        && command.async_artifact_key.is_empty()
+                }));
+        }
+
+        let mut invalid_optimizer = baseline;
+        invalid_optimizer["tasks"][2]["effects"][0]["kind"] =
+            serde_json::json!("state_transition_maybe");
+        let error =
+            compile_schedule(&invalid_optimizer.to_string(), timeline, options).unwrap_err();
+        assert!(error.to_string().contains("optimizer_transition"));
     }
 
     #[test]
@@ -6698,7 +7413,7 @@ mod tests {
 
     #[test]
     fn graph_v2_rederives_task_capabilities_capture_and_effect_edges() {
-        let graph = r#"{"workload_key":"v2-derived","tasks":[{"task_id":"captured","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["backend/test","torch.export"]],"required_capabilities":["backend/test"],"capture_safe":true},{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"v2-derived","tasks":[{"task_id":"captured","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["backend/test","torch.export"]],"required_capabilities":["backend/test"],"capture_safe":true},{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":["backend/test"],"schema_version":1}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
@@ -6733,7 +7448,7 @@ mod tests {
         // A conditional transition orders against adjacent accesses exactly
         // like a strict transition: the signed graph cannot prove the update
         // will not fire, so the ordering contract is identical.
-        let graph = r#"{"workload_key":"v2-maybe","tasks":[{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"maybe","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition_maybe","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"maybe","kind":"effect"},{"source":"maybe","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"v2-maybe","tasks":[{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"maybe","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition_maybe","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"maybe","kind":"effect"},{"source":"maybe","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
@@ -6900,7 +7615,7 @@ mod tests {
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
-        let ordered = r#"{"workload_key":"ordered-effects","tasks":[{"task_id":"read","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:transition@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"publish","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:publish@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"version_publish","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"publish","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let ordered = r#"{"workload_key":"ordered-effects","tasks":[{"task_id":"read","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:transition@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"publish","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:publish@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"version_publish","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"publish","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let decision: Decision =
             serde_json::from_str(&compile_schedule(ordered, timeline, options).unwrap()).unwrap();
         assert_eq!(decision.execution_regions.len(), 1);

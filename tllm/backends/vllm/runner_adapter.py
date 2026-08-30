@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, SupportsInt
 
+import torch
+
 from tllm.backends.protocol import (
     RUNNER_BINDING_ATTR,
     RunnerBinding,
@@ -54,14 +56,30 @@ def _model_layers(model: object) -> Sequence[object]:
 
 
 def runner_model_identity(runner: object) -> int:
-    return id(getattr(runner, "model", None))
+    return id(runner_model_module(runner))
+
+
+def runner_device(runner: object) -> torch.device:
+    device = getattr(runner, "device", None)
+    if not isinstance(device, torch.device):
+        raise TypeError("vLLM runner must expose a torch.device")
+    return device
+
+
+def runner_model_module(runner: object) -> torch.nn.Module:
+    """Resolve vLLM's unwrapped model in the external-runner quarantine."""
+
+    get_model = getattr(runner, "get_model", None)
+    model = get_model() if callable(get_model) else None
+    if not isinstance(model, torch.nn.Module):
+        model = getattr(runner, "model", None)
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("vLLM runner must expose an unwrapped torch.nn.Module")
+    return model
 
 
 def runner_model_layer_count(runner: object) -> int:
-    model = getattr(runner, "model", None)
-    if model is None:
-        raise RuntimeError("vLLM runner adapter requires runner.model")
-    return len(_model_layers(model))
+    return len(_model_layers(runner_model_module(runner)))
 
 
 def runner_tensor_parallel_size(runner: object) -> int:
@@ -293,7 +311,9 @@ __all__ = [
     "mrv1_finished_request_ids",
     "mrv2_packed_row_plan_inputs",
     "runner_active_request_count",
+    "runner_device",
     "runner_model_identity",
+    "runner_model_module",
     "runner_model_layer_count",
     "runner_tensor_parallel_size",
     "unbind_runner",

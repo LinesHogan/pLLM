@@ -14,6 +14,8 @@ from typing import cast
 import unittest
 from unittest import mock
 
+import torch
+
 from tllm import _core
 from tllm.backends.vllm import v027_mrv1, v027_mrv2
 from tllm.runtime.step_session import StepSession, set_step_session
@@ -343,7 +345,7 @@ class Phase4DistributedBindingActivationAuditRedTest(unittest.TestCase):
         binding = _binding(self)
         state = ResidualRuntimeState()
         state.distributed_runtime_binding = binding
-        model = SimpleNamespace()
+        model = torch.nn.Module()
         runner = SimpleNamespace(model=model)
         core = SimpleNamespace(
             RUNTIME=state,

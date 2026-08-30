@@ -26,6 +26,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=3)
     parser.add_argument("--gpu-mem", type=float, default=0.35)
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="exercise the signed prediction and optimizer batch replay path",
+    )
     return parser.parse_args()
 
 
@@ -97,6 +102,10 @@ def main() -> int:
     from tllm.runtime.runtime import TllmRuntime
     from tllm.util.tools import shutdown_llm_instance
     from tllm.workgraph.physical import CapturePolicy
+    from tllm.schedule import (
+        AsyncBatchCaptureMode,
+        HostCommandKind,
+    )
 
     workload = ESampWorkload(
         ESampConfig(
@@ -120,7 +129,7 @@ def main() -> int:
         gpu_memory_utilization=float(args.gpu_mem),
         max_model_len=64,
         enable_prefix_caching=False,
-        enforce_eager=True,
+        enforce_eager=not bool(args.cuda_graph),
         seed=1234,
         max_num_seqs=int(args.batch_size),
         max_num_batched_tokens=16,
@@ -191,13 +200,43 @@ def main() -> int:
             if region.capture_safe
             for task_name in region.tasks
         }
-        if capture_safe_tasks != {"predict"} or any(
-            node.capture_policy is not CapturePolicy.DISABLED
-            for node in compilation.physical.nodes
+        captured_timeline = compilation.timeline.graph_mode != "eager"
+        capture_required_tasks = {
+            task_name
+            for region, node in zip(
+                regions, compilation.physical.nodes, strict=True
+            )
+            if node.capture_policy is CapturePolicy.REQUIRE
+            for task_name in region.tasks
+        }
+        if capture_safe_tasks != {"predict"} or capture_required_tasks != (
+            {"predict"} if captured_timeline else set()
         ):
             raise AssertionError(
-                "eager ESamp must disable capture while retaining only "
-                f"prediction capture eligibility: {capture_safe_tasks!r}"
+                "ESamp prediction capture differs from its signed timeline: "
+                f"eligible={capture_safe_tasks!r}, required={capture_required_tasks!r}"
+            )
+        tail_submit = next(
+            command
+            for advance in decision.runtime_advance_plan
+            for command in advance.host_commands
+            if command.kind is HostCommandKind.SUBMIT_ASYNC
+            and any(
+                "loss__optimize_distiller" in region.tasks
+                for region in regions
+                if region.region_id in command.region_ids
+            )
+        )
+        expected_batch_capture = (
+            AsyncBatchCaptureMode.OPTIMIZER_TRANSITION
+            if captured_timeline
+            else AsyncBatchCaptureMode.DISABLED
+        )
+        if tail_submit.async_capture_mode is not expected_batch_capture:
+            raise AssertionError(
+                "ESamp optimizer batch capture differs from its signed timeline: "
+                f"expected={expected_batch_capture.value!r}, "
+                f"actual={tail_submit.async_capture_mode.value!r}"
             )
 
         params = SamplingParams(
@@ -228,12 +267,15 @@ def main() -> int:
         if execution is None or execution.artifact_report != expected_artifacts:
             raise AssertionError("first ESamp request did not activate the signed Region epoch")
         first_versions = _active_distiller_version(execution)
+        second_sample_indices = [
+            index + 1 for index in range(int(args.batch_size))
+        ]
         second = runtime.generate_requests(
             llm,
             prompts,
             params,
             prompt_indices=prompt_indices,
-            sample_indices=sample_indices,
+            sample_indices=second_sample_indices,
         )
         execution = core.RUNTIME.workload_execution
         if execution is None or execution.artifact_report != expected_artifacts:
@@ -257,6 +299,17 @@ def main() -> int:
             raise AssertionError(
                 "native ESamp Region did not train: "
                 f"loss_count={training.loss_count} diagnostics={diagnostics!r}"
+            )
+        if not (
+            training.loss_count
+            == diagnostics["loss_count"]
+            == diagnostics["update_count"]
+            == final_versions
+        ):
+            raise AssertionError(
+                "native ESamp capture/replay did not commit exactly once per update: "
+                f"training={training.loss_count}, diagnostics={diagnostics!r}, "
+                f"state_version={final_versions}"
             )
         observed = execution.state_versions
         if observed is None or observed.observed_version("distiller", None) != final_versions:
@@ -286,12 +339,19 @@ def main() -> int:
             )
 
         stats = execution.executor.stats
-        if (
+        invalid_execution_evidence = (
             stats.execute_count <= 0
-            or stats.eager_count <= 0
             or stats.fallback_count != 0
-            or stats.replay_count != 0
-        ):
+            or (
+                captured_timeline
+                and (stats.replay_count <= 0 or stats.eager_count <= 0)
+            )
+            or (
+                not captured_timeline
+                and (stats.eager_count <= 0 or stats.replay_count != 0)
+            )
+        )
+        if invalid_execution_evidence:
             raise AssertionError(
                 "native ESamp execution violated Region fallback/capture contract: "
                 f"{stats!r}"
@@ -300,6 +360,8 @@ def main() -> int:
             json.dumps(
                 {
                     "runner": actual_runner,
+                    "graph_mode": compilation.timeline.graph_mode,
+                    "async_capture_mode": tail_submit.async_capture_mode.value,
                     "signature": decision.signature,
                     "artifacts": execution.artifact_report,
                     "loss_count": training.loss_count,
@@ -314,6 +376,7 @@ def main() -> int:
                     "fallback_count": stats.fallback_count,
                     "replay_count": stats.replay_count,
                     "mapping_sizes": mapping_sizes,
+                    "metadata_changed": True,
                 },
                 sort_keys=True,
             )

@@ -24,6 +24,13 @@ class StateScope(StrEnum):
     GLOBAL = "global"
 
 
+class StateStorage(StrEnum):
+    """Signed parameter-storage stability exposed to the Rust scheduler."""
+
+    DYNAMIC = "dynamic"
+    OPTIMIZER_STABLE = "optimizer_stable"
+
+
 class ApproximationPolicy(StrEnum):
     EXACT = "exact"
     JACOBI = "jacobi"
@@ -73,6 +80,7 @@ class WorkloadEdgeKind(StrEnum):
 class ImplementationKind(StrEnum):
     CAPTURED = "captured"
     EXTERN = "extern"
+    OPTIMIZER_TRANSITION = "optimizer_transition"
 
 
 class ValueSourceKind(StrEnum):
@@ -143,6 +151,7 @@ class StateIR:
     request_key: tuple[str, ...]
     parameters: tuple[str, ...]
     optimizer: OptimizerSpec | None
+    storage: StateStorage = StateStorage.DYNAMIC
     transition: str = "optimizer"
 
     def __post_init__(self) -> None:
@@ -150,6 +159,7 @@ class StateIR:
         object.__setattr__(self, "scope", StateScope(self.scope))
         object.__setattr__(self, "request_key", _str_tuple(self.request_key, "StateIR.request_key"))
         object.__setattr__(self, "parameters", _str_tuple(self.parameters, "StateIR.parameters"))
+        object.__setattr__(self, "storage", StateStorage(self.storage))
         if self.scope is StateScope.REQUEST and not self.request_key:
             raise ValueError("REQUEST StateIR requires a request_key")
         if self.scope is not StateScope.REQUEST and self.request_key:
@@ -350,13 +360,19 @@ class WorkloadIR:
     edges: tuple[WorkloadEdge, ...]
     schedule: tuple[str, ...]
     approximation: ApproximationPolicy = ApproximationPolicy.EXACT
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workload_id", _nonempty(self.workload_id, "WorkloadIR.workload_id"))
         object.__setattr__(self, "approximation", ApproximationPolicy(self.approximation))
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError(f"unsupported WorkloadIR.schema_version {self.schema_version}")
+        if self.schema_version == 1 and any(
+            state.storage is not StateStorage.DYNAMIC for state in self.states
+        ):
+            raise ValueError(
+                "WorkloadIR schema v1 cannot carry stable state-storage evidence"
+            )
         names = tuple(task.name for task in self.tasks)
         if len(names) != len(set(names)):
             raise ValueError("WorkloadIR contains duplicate task names")
@@ -385,6 +401,7 @@ __all__ = [
     "OptimizerSpec",
     "StateIR",
     "StateScope",
+    "StateStorage",
     "TaskIR",
     "TaskInputIR",
     "TaskOutputIR",

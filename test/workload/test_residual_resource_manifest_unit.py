@@ -122,7 +122,7 @@ class ResidualResourceManifestContractTest(unittest.TestCase):
         options = self._options("model.layers.0").to_json()
         decision = _core.compile_schedule(graph, timeline, options)
         cache_key = hashlib.sha256(
-            f"workload-compilation-v4\0{graph}\0{timeline}\0{options}".encode("ascii")
+            f"workload-compilation-v5\0{graph}\0{timeline}\0{options}".encode("ascii")
         ).hexdigest()
         local_manifest = self._json(
             [

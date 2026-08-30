@@ -9,12 +9,14 @@ from unittest import mock
 
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.schedule import (
+    AsyncBatchCaptureMode,
     BackendObservableEvent,
     CompileOptions,
     ExecutionRegion,
     HiddenPhase,
     HiddenLayerKind,
     HiddenSite,
+    HostCommandKind,
     MainWorkloadRegion,
     MainWorkloadTimeline,
     RegionCaptureMode,
@@ -35,11 +37,14 @@ from tllm.schedule import (
     ScheduleInputKind,
     ScheduleOutput,
     ScheduleOutputKind,
+    ScheduleDecision,
     ScheduleTask,
     ScheduleState,
+    ScheduleStateStorage,
     ScheduleValue,
     TaskTiming,
     TimelineAnchor,
+    RuntimeHostCommand,
     compile_schedule,
     install_workload_compilation,
     lower_physical_flow_plan,
@@ -86,6 +91,28 @@ def _timeline() -> MainWorkloadTimeline:
     )
 
 
+def _async_timeline(graph_mode: str) -> MainWorkloadTimeline:
+    backend_events = {
+        "model.execute": (BackendObservableEvent.EXECUTE_MODEL_POST,),
+        "sampler.pre_draw": (BackendObservableEvent.SAMPLE_TOKENS_POST,),
+        "step.end": (),
+        "next.prepare": (),
+    }
+    timeline = _timeline()
+    return replace(
+        timeline,
+        graph_mode=graph_mode,
+        anchors=tuple(
+            replace(
+                anchor,
+                backend_events=backend_events[anchor.anchor_id],
+            )
+            for anchor in timeline.anchors
+        ),
+        schema_version=2,
+    )
+
+
 def _indexed_hidden_manifest(
     layer: int,
     site: HiddenSite | str,
@@ -100,7 +127,385 @@ def _indexed_hidden_manifest(
     )
 
 
+def _async_optimizer_graph(
+    *,
+    optimizer_transition: bool = True,
+    conditional: bool = False,
+    storage: ScheduleStateStorage = ScheduleStateStorage.OPTIMIZER_STABLE,
+    auxiliary_output: ScheduleOutputKind | None = None,
+    tensor_input: bool = True,
+) -> ScheduleGraph:
+    state_read = ScheduleEffect(ScheduleEffectKind.STATE_READ, "weights")
+    state_transition = ScheduleEffect(
+        (
+            ScheduleEffectKind.STATE_TRANSITION_MAYBE
+            if conditional
+            else ScheduleEffectKind.STATE_TRANSITION
+        ),
+        "weights",
+    )
+    loss_inputs = (
+        (
+            ScheduleInput(
+                "batch",
+                ScheduleInputKind.RESULT,
+                "produce",
+                output="batch",
+            ),
+        )
+        if tensor_input
+        else (
+            ScheduleInput(
+                "current_step",
+                ScheduleInputKind.STEP_ID,
+                "step_id",
+            ),
+        )
+    )
+    loss_outputs = (
+        ScheduleOutput(
+            "loss",
+            ScheduleOutputKind.TEMPORARY,
+            "loss",
+        ),
+        *(
+            ()
+            if auxiliary_output is None
+            else (
+                ScheduleOutput(
+                    "auxiliary",
+                    auxiliary_output,
+                    "auxiliary",
+                ),
+            )
+        ),
+    )
+    update_kind = (
+        "optimizer_transition" if optimizer_transition else "extern"
+    )
+    return ScheduleGraph(
+        workload_key="async-optimizer-capture",
+        tasks=(
+            ScheduleTask(
+                "produce",
+                timing=TaskTiming(
+                    after="model.execute",
+                    before="sampler.pre_draw",
+                ),
+                implementation_capabilities=(("torch.export",),),
+                capture_safe=True,
+                outputs=(
+                    ScheduleOutput(
+                        "batch",
+                        ScheduleOutputKind.TEMPORARY,
+                        "batch",
+                    ),
+                ),
+            ),
+            ScheduleTask(
+                "loss",
+                timing=TaskTiming(
+                    after="sampler.pre_draw",
+                    before="step.end",
+                ),
+                implementation_ids=("python:loss@1",),
+                implementation_capabilities=(
+                    ("runtime.async_host_safe", "torch.export"),
+                ),
+                capture_safe=False,
+                effects=(state_read,),
+                inputs=loss_inputs,
+                outputs=loss_outputs,
+            ),
+            ScheduleTask(
+                "update",
+                timing=TaskTiming(
+                    after="sampler.pre_draw",
+                    before="step.end",
+                ),
+                implementation_ids=(
+                    "tllm.workload:optimizer_transition@2"
+                    if optimizer_transition
+                    else "test:manual_update@1",
+                ),
+                implementation_kinds=(update_kind,),
+                implementation_capabilities=(
+                    (
+                        "runtime.async_host_safe",
+                        "runtime.side_stream_safe",
+                    ),
+                ),
+                capture_safe=False,
+                effects=(state_transition,),
+                inputs=(
+                    ScheduleInput(
+                        "loss",
+                        ScheduleInputKind.RESULT,
+                        "loss",
+                        output="loss",
+                    ),
+                ),
+            ),
+        ),
+        edges=(
+            *(
+                (ScheduleEdge("produce", "loss", ScheduleEdgeKind.DATA),)
+                if tensor_input
+                else ()
+            ),
+            ScheduleEdge("loss", "update", ScheduleEdgeKind.DATA),
+            ScheduleEdge("loss", "update", ScheduleEdgeKind.EFFECT),
+        ),
+        values=(
+            ScheduleValue(
+                "batch",
+                producer="produce",
+                producer_output="batch",
+                consumers=("loss",) if tensor_input else (),
+            ),
+            ScheduleValue(
+                "loss",
+                producer="loss",
+                producer_output="loss",
+                consumers=("update",),
+            ),
+        ),
+        states=(
+            ScheduleState(
+                "weights",
+                "replica",
+                storage=storage,
+                transition="optimizer",
+            ),
+        ),
+        schema_version=3,
+    )
+
+
+def _submit_commands(
+    decision: ScheduleDecision,
+) -> tuple[RuntimeHostCommand, ...]:
+    return tuple(
+        command
+        for advance in decision.runtime_advance_plan
+        for command in advance.host_commands
+        if command.kind is HostCommandKind.SUBMIT_ASYNC
+    )
+
+
 class ScheduleContractUnitTest(unittest.TestCase):
+    def test_schedule_state_storage_is_closed_and_schema_v3_required(self) -> None:
+        dynamic = ScheduleState(
+            "ordinary",
+            "replica",
+            storage=ScheduleStateStorage.DYNAMIC,
+            transition="optimizer",
+        )
+        stable = ScheduleState(
+            "trainable",
+            "replica",
+            storage=ScheduleStateStorage.OPTIMIZER_STABLE,
+            transition="optimizer",
+        )
+        graph = ScheduleGraph(
+            workload_key="state-storage-wire",
+            tasks=(),
+            states=(dynamic, stable),
+            schema_version=3,
+        )
+        self.assertEqual(
+            ScheduleGraph.from_json(graph.to_json()).states,
+            (dynamic, stable),
+        )
+
+        missing = json.loads(graph.to_json())
+        del missing["states"][1]["storage"]
+        with self.assertRaisesRegex(ValueError, "missing storage"):
+            ScheduleGraph.from_json(json.dumps(missing))
+
+        invalid = json.loads(graph.to_json())
+        invalid["states"][1]["storage"] = "stable"
+        with self.assertRaisesRegex(ValueError, "ScheduleStateStorage"):
+            ScheduleGraph.from_json(json.dumps(invalid))
+
+        legacy = ScheduleGraph(
+            workload_key="legacy-state-storage-wire",
+            tasks=(),
+            states=(dynamic,),
+            schema_version=2,
+        )
+        legacy_payload = json.loads(legacy.to_json())
+        self.assertNotIn("storage", legacy_payload["states"][0])
+        self.assertIs(
+            ScheduleGraph.from_json(legacy.to_json()).states[0].storage,
+            ScheduleStateStorage.DYNAMIC,
+        )
+
+    def test_rust_signs_only_strict_optimizer_async_batch_capture(self) -> None:
+        graph = _async_optimizer_graph()
+        options = CompileOptions(memory_budget_bytes=64)
+        for graph_mode, expected in (
+            ("eager", AsyncBatchCaptureMode.DISABLED),
+            ("piecewise", AsyncBatchCaptureMode.OPTIMIZER_TRANSITION),
+            ("full", AsyncBatchCaptureMode.OPTIMIZER_TRANSITION),
+        ):
+            with self.subTest(graph_mode=graph_mode):
+                decision = compile_schedule(
+                    graph,
+                    _async_timeline(graph_mode),
+                    options,
+                )
+                commands = _submit_commands(decision)
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(
+                    tuple(
+                        task
+                        for region in decision.execution_regions
+                        if region.region_id in commands[0].region_ids
+                        for task in region.tasks
+                    ),
+                    ("loss", "update"),
+                )
+                self.assertIs(commands[0].async_capture_mode, expected)
+                self.assertEqual(
+                    len(commands[0].async_artifact_key),
+                    (
+                        0
+                        if expected is AsyncBatchCaptureMode.DISABLED
+                        else 64
+                    ),
+                )
+                self.assertTrue(
+                    all(
+                        command.async_capture_mode
+                        is AsyncBatchCaptureMode.DISABLED
+                        for advance in decision.runtime_advance_plan
+                        for command in advance.host_commands
+                        if command.kind is not HostCommandKind.SUBMIT_ASYNC
+                    )
+                )
+
+    def test_async_batch_capture_requires_every_structural_proof(self) -> None:
+        timeline = _async_timeline("piecewise")
+        for label, graph in (
+            (
+                "conditional",
+                _async_optimizer_graph(
+                    optimizer_transition=False,
+                    conditional=True,
+                ),
+            ),
+            (
+                "manual",
+                _async_optimizer_graph(optimizer_transition=False),
+            ),
+            (
+                "dynamic-storage",
+                _async_optimizer_graph(
+                    optimizer_transition=False,
+                    storage=ScheduleStateStorage.DYNAMIC,
+                ),
+            ),
+            (
+                "host-output",
+                _async_optimizer_graph(
+                    auxiliary_output=ScheduleOutputKind.HOST,
+                ),
+            ),
+            (
+                "sampler-output",
+                _async_optimizer_graph(
+                    auxiliary_output=ScheduleOutputKind.SAMPLER,
+                ),
+            ),
+            (
+                "non-tensor-input",
+                _async_optimizer_graph(tensor_input=False),
+            ),
+        ):
+            with self.subTest(case=label):
+                decision = compile_schedule(
+                    graph,
+                    timeline,
+                    CompileOptions(memory_budget_bytes=64),
+                )
+                commands = _submit_commands(decision)
+                self.assertTrue(commands)
+                self.assertTrue(
+                    all(
+                        command.async_capture_mode
+                        is AsyncBatchCaptureMode.DISABLED
+                        for command in commands
+                    )
+                )
+
+    def test_async_batch_capture_json_is_required_and_tamper_evident(self) -> None:
+        graph = _async_optimizer_graph()
+        timeline = _async_timeline("piecewise")
+        options = CompileOptions(memory_budget_bytes=64)
+        decision = compile_schedule(graph, timeline, options)
+        self.assertEqual(decision.schema_version, 5)
+        encoded = json.loads(decision.to_json())
+        submit = next(
+            command
+            for advance in encoded["runtime_advance_plan"]
+            for command in advance["host_commands"]
+            if command["kind"] == "submit_async"
+        )
+        self.assertEqual(
+            submit["async_capture_mode"],
+            AsyncBatchCaptureMode.OPTIMIZER_TRANSITION.value,
+        )
+
+        for field_name in ("async_capture_mode", "async_artifact_key"):
+            with self.subTest(missing=field_name):
+                missing = json.loads(decision.to_json())
+                missing_submit = next(
+                    command
+                    for advance in missing["runtime_advance_plan"]
+                    for command in advance["host_commands"]
+                    if command["kind"] == "submit_async"
+                )
+                del missing_submit[field_name]
+                with self.assertRaisesRegex(ValueError, field_name):
+                    type(decision).from_json(json.dumps(missing))
+
+        invalid = json.loads(decision.to_json())
+        invalid_submit = next(
+            command
+            for advance in invalid["runtime_advance_plan"]
+            for command in advance["host_commands"]
+            if command["kind"] == "submit_async"
+        )
+        invalid_submit["async_capture_mode"] = "optimizer"
+        with self.assertRaisesRegex(ValueError, "AsyncBatchCaptureMode"):
+            type(decision).from_json(json.dumps(invalid))
+
+        tampered = json.loads(decision.to_json())
+        tampered_submit = next(
+            command
+            for advance in tampered["runtime_advance_plan"]
+            for command in advance["host_commands"]
+            if command["kind"] == "submit_async"
+        )
+        tampered_submit["async_capture_mode"] = (
+            AsyncBatchCaptureMode.DISABLED.value
+        )
+        tampered_submit["async_artifact_key"] = ""
+        parsed = type(decision).from_json(json.dumps(tampered))
+        with self.assertRaisesRegex(RuntimeError, "signature is invalid"):
+            validate_schedule(graph, timeline, parsed, options)
+
+        with self.assertRaisesRegex(ValueError, "wait_async.*capture"):
+            RuntimeHostCommand(
+                HostCommandKind.WAIT_ASYNC,
+                "async-serial-0",
+                (),
+                async_capture_mode=(
+                    AsyncBatchCaptureMode.OPTIMIZER_TRANSITION
+                ),
+            )
+
     def test_rust_selects_implementation_candidate_from_timeline(self) -> None:
         timing = TaskTiming(after="model.execute", before="step.end")
         graph = ScheduleGraph(
@@ -164,7 +569,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
             compile_schedule(graph, unavailable, CompileOptions(memory_budget_bytes=64))
 
     def test_graph_v2_rust_cross_checks_python_derived_task_semantics(self) -> None:
-        """V2 keeps transition fields only as Rust-verified wire evidence."""
+        """V2 keeps task evidence but cannot claim stable state storage."""
 
         timing = TaskTiming(after="model.execute", before="step.end")
         graph = ScheduleGraph(
@@ -181,7 +586,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
                     "read",
                     timing=timing,
                     implementation_capabilities=(("torch.export",),),
-                    capture_safe=True,
+                    capture_safe=False,
                     effects=(ScheduleEffect(ScheduleEffectKind.STATE_READ, "state"),),
                 ),
                 ScheduleTask(
@@ -197,7 +602,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
                     "after",
                     timing=timing,
                     implementation_capabilities=(("torch.export",),),
-                    capture_safe=True,
+                    capture_safe=False,
                     effects=(ScheduleEffect(ScheduleEffectKind.STATE_READ, "state"),),
                 ),
             ),
@@ -601,12 +1006,12 @@ class ScheduleContractUnitTest(unittest.TestCase):
 
         stale_v2 = json.loads(decision.to_json())
         stale_v2["schema_version"] = 2
-        with self.assertRaisesRegex(ValueError, "schema v2 is stale.*v4"):
+        with self.assertRaisesRegex(ValueError, "schema v2 is stale.*v5"):
             type(decision).from_json(json.dumps(stale_v2))
 
         stale_v3 = json.loads(decision.to_json())
         stale_v3["schema_version"] = 3
-        with self.assertRaisesRegex(ValueError, "schema v3 is stale.*v4"):
+        with self.assertRaisesRegex(ValueError, "schema v3 is stale.*v5"):
             type(decision).from_json(json.dumps(stale_v3))
 
     def test_schema_v2_rejects_malformed_region_json_shapes(self) -> None:
@@ -780,7 +1185,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         second = compile_schedule(graph, _timeline(), options)
 
         self.assertEqual(first.to_json(), second.to_json())
-        self.assertEqual(first.schema_version, 4)
+        self.assertEqual(first.schema_version, 5)
         self.assertEqual(first.execution_order, ("predict", "update"))
         self.assertEqual(len(first.execution_regions), 1)
         self.assertEqual(first.execution_regions[0].tasks, ("predict", "update"))
@@ -1179,7 +1584,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "signature is invalid"):
             validate_schedule(graph, piecewise, tampered, auto)
 
-    def test_schema_v4_region_signature_golden(self) -> None:
+    def test_schema_v5_region_signature_golden(self) -> None:
         graph = ScheduleGraph(
             workload_key="golden",
             tasks=(
@@ -1224,7 +1629,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
             )
 
         golden = (
-            Path(__file__).with_name("golden") / "schedule_v4_region.json"
+            Path(__file__).with_name("golden") / "schedule_v5_region.json"
         )
         if os.environ.get("TLLM_REGEN_GOLDEN") == "1":
             golden.write_text(decision.to_json() + "\n", encoding="utf-8")
@@ -1243,14 +1648,14 @@ class ScheduleContractUnitTest(unittest.TestCase):
             ))
         self.assertEqual(
             decision.signature,
-            "1dab4aac72466610f36be1edba36db79bc8fa5838fbba878c5dd2b96fc0ecc35",
+            "4cdc5617fff610b3b773060aca4243e53b805cac5d47f8943f878417c991b4e4",
         )
         self.assertEqual(
             decision.execution_regions[0].artifact_key,
             "5db675cd0818d6f80ed38c455391508e8e9d6a3e3f741494f97805e6ffaea34b",
         )
 
-    def test_schema_v4_complex_region_signature_golden(self) -> None:
+    def test_schema_v5_complex_region_signature_golden(self) -> None:
         """Freeze Rust-owned binder, state, and cross-Region wire records."""
 
         graph = ScheduleGraph(
@@ -1398,7 +1803,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         )
 
         golden = (
-            Path(__file__).with_name("golden") / "schedule_v4_complex_region.json"
+            Path(__file__).with_name("golden") / "schedule_v5_complex_region.json"
         )
         if os.environ.get("TLLM_REGEN_GOLDEN") == "1":
             golden.write_text(decision.to_json() + "\n", encoding="utf-8")

@@ -26,6 +26,11 @@ from tllm.schedule.contracts import (
 from tllm.workload.frontend import WorkloadDeclaration
 
 
+TensorRegionCallable = Callable[
+    [tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]
+]
+
+
 class RegionParityError(RuntimeError):
     """Fail-closed numerical parity violation for a signed ExecutionRegion.
 
@@ -273,6 +278,7 @@ class RegionCallableArtifact:
     output_keys: tuple[str, ...]
     callable: Callable[..., tuple[object, ...]]
     compiled: bool
+    tensor_callable: TensorRegionCallable | None = None
     compile_command: RegionCompileCommand | None = None
     input_bindings: tuple[RegionInputBinding, ...] = ()
     output_bindings: tuple[RegionOutputBinding, ...] = ()
@@ -330,6 +336,27 @@ def _execute_with_grad(
     return dict(zip(output_keys, result, strict=True))
 
 
+def _tensor_region_callable(
+    callable_artifact: Callable[..., tuple[object, ...]],
+    output_count: int,
+) -> TensorRegionCallable:
+    """Narrow one raw Torch Region at its compiler-adapter boundary."""
+
+    def execute(
+        inputs: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        result = callable_artifact(*inputs)
+        if len(result) != output_count or any(
+            not isinstance(value, torch.Tensor) for value in result
+        ):
+            raise RuntimeError(
+                "captured optimizer batch requires Tensor-only Region outputs"
+            )
+        return cast(tuple[torch.Tensor, ...], result)
+
+    return execute
+
+
 class RegionArtifactRegistry:
     """Exact process-local artifact binding for one signed Region decision."""
 
@@ -340,8 +367,8 @@ class RegionArtifactRegistry:
         decision: ScheduleDecision,
         artifacts: tuple[RegionCallableArtifact, ...],
     ) -> None:
-        if decision.schema_version != 4:
-            raise ValueError("decision must use ScheduleDecision schema v4")
+        if decision.schema_version != 5:
+            raise ValueError("decision must use ScheduleDecision schema v5")
         by_region: dict[str, RegionCallableArtifact] = {}
         for artifact in artifacts:
             if artifact.region_id in by_region:
@@ -626,6 +653,9 @@ def materialize_region_callable(
         input_keys=tuple(input_keys),
         output_keys=tuple(output_keys),
         callable=executable,
+        tensor_callable=_tensor_region_callable(
+            combined, len(output_keys)
+        ),
         compiled=(
             command is not None
             and command.adapter is RegionCompilerAdapter.TORCH_COMPILE
@@ -648,8 +678,8 @@ def materialize_region_artifacts(
 ) -> tuple[RegionCallableArtifact, ...]:
     """Materialize every signed Region without changing its partition or order."""
 
-    if decision.schema_version != 4:
-        raise ValueError("decision must use ScheduleDecision schema v4")
+    if decision.schema_version != 5:
+        raise ValueError("decision must use ScheduleDecision schema v5")
     artifacts = tuple(
         materialize_region_callable(
             declarations,
@@ -670,6 +700,7 @@ __all__ = [
     "RegionArtifactRegistry",
     "RegionCallableArtifact",
     "RegionParityError",
+    "TensorRegionCallable",
     "compare_region_outputs",
     "materialize_region_artifacts",
     "materialize_region_callable",

@@ -19,16 +19,24 @@ from tllm.schedule.contracts import (
     ScheduleOutput,
     ScheduleOutputKind,
     ScheduleState,
+    ScheduleStateStorage,
     ScheduleTask,
     ScheduleValue,
     TaskTiming,
 )
-from tllm.workload.ir import EffectKind, ValueSourceKind, WorkloadEdgeKind, WorkloadIR
+from tllm.workload.ir import (
+    EffectKind,
+    StateStorage,
+    ValueSourceKind,
+    WorkloadEdgeKind,
+    WorkloadIR,
+)
 
 
 _IMPLEMENTATION_EVIDENCE = frozenset(
     {
         "runtime.async_host_safe",
+        "runtime.optimizer_transition",
         "runtime.side_stream_safe",
         "torch.export",
     }
@@ -88,6 +96,7 @@ def lower_schedule_graph(
                 resource=state_id(workload, state.name),
                 scope=state.scope.value,
                 request_key=state.request_key,
+                storage=ScheduleStateStorage(state.storage.value),
                 transition=state.transition,
             )
             for state in workload.states
@@ -134,6 +143,12 @@ def lower_schedule_graph(
                         and all(
                             effect.kind in (EffectKind.READ, EffectKind.CURRENT)
                             and state_transitions.get(effect.state) == "optimizer"
+                            and next(
+                                state.storage
+                                for state in workload.states
+                                if state.name == effect.state
+                            )
+                            is StateStorage.OPTIMIZER_STABLE
                             for effect in task.effects
                         )
                         and all(
@@ -249,7 +264,7 @@ def lower_schedule_graph(
         values=tuple(values),
         states=tuple(states),
         persistent_state_bytes=persistent_state_bytes,
-        schema_version=2,
+        schema_version=3,
         # Non-exact policies are signed into the graph so the Decision can
         # explain which Regions run under approximation parity.  Criteria
         # stay host-side (declaration-only) by design.

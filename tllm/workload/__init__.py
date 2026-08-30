@@ -71,6 +71,7 @@ from tllm.workload.ir import (
     EffectKind,
     OptimizerSpec,
     StateScope,
+    StateStorage,
     WorkloadEdgeKind,
     WorkloadIR,
 )
@@ -144,6 +145,7 @@ __all__ = [
     "TrainableState",
     "StateEffect",
     "StateScope",
+    "StateStorage",
     "StagedPort",
     "StagedLifecycle",
     "WorkloadDeclaration",

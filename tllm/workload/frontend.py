@@ -29,6 +29,7 @@ from tllm.workload.ir import (
     OptimizerSpec,
     StateIR,
     StateScope,
+    StateStorage,
     TaskIR,
     TaskInputIR,
     TaskOutputIR,
@@ -263,6 +264,8 @@ def configured(
 class State(Generic[StateValueT]):
     """A named state family declared on a workload class."""
 
+    storage = StateStorage.DYNAMIC
+
     def __init__(
         self,
         *,
@@ -382,12 +385,14 @@ class State(Generic[StateValueT]):
             request_key=() if self.key is None else self.key.fields,
             parameters=self.parameters,
             optimizer=self.optimizer,
+            storage=self.storage,
             transition=self.transition_kind,
         )
 
 
 class TrainableState(State[StateValueT]):
     optimizer: OptimizerSpec
+    storage = StateStorage.OPTIMIZER_STABLE
 
 
 class ServiceState(State[StateValueT]):
@@ -890,12 +895,14 @@ class ExternImplementation:
     # When set, task() fills input_types/output_types from the function's
     # annotations (the encoding rule is the type's __name__, None -> "None").
     derive_types: bool = False
+    kind: ImplementationKind = ImplementationKind.EXTERN
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "namespace", _name(self.namespace, "ExternImplementation.namespace")
         )
         object.__setattr__(self, "name", _name(self.name, "ExternImplementation.name"))
+        object.__setattr__(self, "kind", ImplementationKind(self.kind))
         object.__setattr__(self, "version", _name(self.version, "ExternImplementation.version"))
         for values, field_name in (
             (self.input_types, "input_types"),
@@ -918,7 +925,7 @@ class ExternImplementation:
         if self.derive_types:
             raise RuntimeError("extern() implementation escaped task() without type derivation")
         return ImplementationIR(
-            kind=ImplementationKind.EXTERN,
+            kind=self.kind,
             key=self.key,
             input_types=self.input_types,
             output_types=self.output_types,
@@ -1599,7 +1606,12 @@ def _optimized_task_definitions(
                     implementations=(ExternImplementation(
                         namespace="tllm.workload",
                         name="optimizer_transition",
-                        version="1",
+                        kind=(
+                            ImplementationKind.EXTERN
+                            if conditional
+                            else ImplementationKind.OPTIMIZER_TRANSITION
+                        ),
+                        version="1" if conditional else "2",
                         input_types=("Tensor",),
                         output_types=("None",),
                         capabilities=(

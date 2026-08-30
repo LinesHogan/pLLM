@@ -30,10 +30,14 @@ callables stay in the declaration's executor table and are never serialized.
 - `ScheduleGraph`: auxiliary tasks, typed input/output ports, values, versions,
   dependencies, effects, timing, implementation candidates, and static memory
   requirements.
-- `ScheduleDecision` schema v4: the fine-grained execution order and schedule
+- `ScheduleDecision` schema v5: the fine-grained execution order and schedule
   tree plus authoritative `ExecutionRegion` records, cross-Region
   materializations and lifetimes, memory plan, cross-Region fences, cost
   breakdown, explanations, artifact keys, and signature.
+- `RuntimeHostCommand`: closed inline/wait/submit actions plus an optional
+  Rust-derived optimizer-transition batch mode and artifact key. The mode
+  cannot be authored by a workload and does not create a lane, priority, or
+  execution-order policy.
 
 Rust derives each Region's typed input/output descriptors and ordered task
 invocations from the fine-grained task ports. Every invocation parameter and

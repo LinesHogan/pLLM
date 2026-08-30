@@ -76,10 +76,16 @@ Two principles:
       ▼
 ScheduleGraph ──► Rust legality + granularity + memory planning
       ▼
-signed ScheduleDecision v4 ──► ExecutionRegions + RegionCaptureMode + HostCommands
+signed ScheduleDecision v5 ──► ExecutionRegions + RegionCaptureMode + HostCommands
       ▼
 PhysicalFlowPlan ──► one artifact/callable per Region at signed anchors
 ```
+
+For a structurally complete optimizer tail, Rust may sign one
+`optimizer_transition` async-batch artifact over consecutive Regions. The
+runtime performs one eager device warmup, one capture, then replay; version
+and loss accounting commit exactly once after each device update. This is a
+generic effect/storage optimization, not a workload lane or ordering policy.
 
 The planner starts from the largest legal Region and splits only for an
 unintersectable anchor window, required effect/version or typed-extern

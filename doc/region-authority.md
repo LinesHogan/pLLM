@@ -23,7 +23,7 @@ artifact key, and decision signature, not capability evidence.
 
 | Interface | Required stable fields | Failure behavior |
 | --- | --- | --- |
-| `ScheduleDecision` v4 / `ExecutionRegion` | ids, anchors, dependencies, materializations, effects, capture/stream/fallback, signed side waits and host commands, artifact key, `compile_command` | unknown, missing, unsigned, stale-v2/v3, or noncanonical field rejects |
+| `ScheduleDecision` v5 / `ExecutionRegion` | ids, anchors, dependencies, materializations, effects, capture/stream/fallback, signed side waits and host commands, async-batch mode/key, artifact key, `compile_command` | unknown, missing, unsigned, stale-v2/v3/v4, or noncanonical field rejects |
 | `RegionCompileCommand` | adapter, fullgraph, dynamic, ordered shape specialization, autograd, fallback | unsupported adapter or compiler failure raises; no eager retry |
 | `RegionCallableArtifact` | Region id/key, ordered input/output keys, exact typed bindings/effects, local callable, compiled marker, command | missing/mismatched callable/key/binding rejects before execution |
 | `BackendRegionBinderSlot` | signed implementation id and event context; exact-once `stage` then `invoke`, `clear`, or `abort` | duplicate/stale/missing stage rejects; a failed callback is never retried |
@@ -106,11 +106,11 @@ PATH=.venv/bin:$PATH /workspace/pllm/.venv/bin/python tools/check_typing.py
 /workspace/pllm/.venv/bin/python tools/check_region_authority.py
 ```
 
-Results: Rust `46 passed`; Python `1067 passed, 1079 subtests passed`; strict
-typing `0 errors`; basic typing `163 errors` against a baseline of 176; and the
+Results: Rust `46 passed`; Python `1218 passed, 1075 subtests passed`; strict
+typing `0 errors`; basic typing `152 errors` against a baseline of 152; and the
 authority gate passed across 20 production files. The frozen schema examples
-are `test/workload/golden/schedule_v4_region.json` for a maximal compiled
-Region and `test/workload/golden/schedule_v4_complex_region.json` for typed
+are `test/workload/golden/schedule_v5_region.json` for a maximal compiled
+Region and `test/workload/golden/schedule_v5_complex_region.json` for typed
 extern staging, state effects, materialization, and a fence. Schedule,
 binder/state, recurrence, worker reconstruction, and authority-boundary
 regressions are in
@@ -119,6 +119,26 @@ regressions are in
 `test/runtime/test_native_workload_execution_unit.py`,
 `test/core/test_typed_recurrence_plan_unit.py`, and
 `test/runtime/test_execution_region_core_v1_boundary_unit.py`.
+
+Native optimizer tails now carry typed `optimizer_stable` storage evidence
+through ScheduleGraph v3. ScheduleDecision v5 can sign a closed
+`optimizer_transition` async batch only for a consecutive, Tensor-only,
+strict state-transition chain. Python executes the signed membership and
+order atomically, uses thread-local CUDA capture on the async host thread,
+and commits version/accounting once after the device update. Eager,
+conditional, dynamic-storage, host/sampler-output, or unsupported chains stay
+explicitly disabled; there is no runtime fallback or workload-specific
+scheduling policy.
+
+The 2026-08-31 ESamp follow-up passed MRv1/MRv2 × eager/CUDA-Graph
+correctness. Every cell reported `loss_count=update_count=state_version=4`,
+zero fallback, and empty finished-request mappings; captured cells signed an
+`optimizer_transition` batch and exercised eager warmup, one capture, and
+replay. A contention-constrained 0.4 diagnostic pair (0.5B, batch 8 × n16,
+128 tokens) measured raw `44,113 tok/s` and native `46,486 tok/s` with all
+127 expected updates and zero sampler fallback. This is diagnostic evidence,
+not the formal 0.5/five-pair retirement gate, so the ESamp legacy and Program
+baselines remain present.
 
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension

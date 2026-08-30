@@ -21,7 +21,11 @@ class RuntimeResidualRuntimeSetupUnitTest(unittest.TestCase):
         )
         raw_path = "model.layers.0"
         layer = torch.nn.Linear(4, 4)
-        model = type("Model", (), {})()
+
+        class Model(torch.nn.Module):
+            pass
+
+        model = Model()
         model.mapping = {raw_path: layer}
         model.config = type("Cfg", (), {"hidden_size": 4})()
         runtime = type("Runtime", (), {})()
@@ -59,6 +63,7 @@ class RuntimeResidualRuntimeSetupUnitTest(unittest.TestCase):
                 "model": model,
                 "device": torch.device("cpu"),
                 "max_num_reqs": 2,
+                "get_model": lambda self: model,
             },
         )()
 
@@ -109,7 +114,11 @@ class RuntimeResidualRuntimeSetupUnitTest(unittest.TestCase):
         )()
         layer0 = torch.nn.Linear(4, 4)
         layer1 = torch.nn.Linear(4, 4)
-        model = type("Model", (), {})()
+
+        class Model(torch.nn.Module):
+            pass
+
+        model = Model()
         model.mapping = {
             "model.model.layers[0].input_layernorm": layer0,
             "model.model.layers[-1].input_layernorm": layer1,
@@ -119,7 +128,16 @@ class RuntimeResidualRuntimeSetupUnitTest(unittest.TestCase):
             "model.model.layers[-1].input_layernorm": "layers.1",
         }
         model.config = type("Cfg", (), {"hidden_size": 4})()
-        runner = type("Runner", (), {"model": model, "device": torch.device("cpu"), "max_num_reqs": 8})()
+        runner = type(
+            "Runner",
+            (),
+            {
+                "model": model,
+                "device": torch.device("cpu"),
+                "max_num_reqs": 8,
+                "get_model": lambda self: model,
+            },
+        )()
         setup = residual_runtime_setup.resolve_runtime_setup(core=core, runner=runner)
 
         with mock.patch.object(residual_runtime_setup._residual_capture_hooks, "install_layer_forward_taps") as p_install:

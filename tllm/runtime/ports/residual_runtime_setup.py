@@ -22,6 +22,7 @@ from tllm.runtime.ports.tap_handle import TapHandle
 
 if TYPE_CHECKING:
     from tllm.schedule import ScheduleGraph
+    from tllm.runtime.torch_adapter import CudaLongHostStaging
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class ResidualRuntimeSetup:
     source_resolved: str
     target_resolved: str
     native_hidden_path_aliases: Dict[str, str]
+    capture_native_hidden: bool = False
 
 
 class ConfigLike(Protocol):
@@ -52,6 +54,9 @@ class RuntimeLike(Protocol):
     decode_valid_mask: torch.Tensor | None
     decode_prompt_idx_buf: torch.Tensor | None
     decode_sample_idx_buf: torch.Tensor | None
+    decode_identity_staging: "CudaLongHostStaging | None"
+    decode_logit_row_selector_buf: torch.Tensor | None
+    decode_logit_row_selector_staging: "CudaLongHostStaging | None"
     decode_compact_row_idx: torch.Tensor | None
     decode_compact_count: int
     decode_compact_row_ids: tuple[int, ...]
@@ -85,7 +90,9 @@ class CoreLike(Protocol):
 
 
 def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeSetup:
-    model = getattr(runner, "model")
+    from tllm.backends.vllm.runner_adapter import runner_model_module
+
+    model = runner_model_module(runner)
     cfg = core.RUNTIME.config
     plan = getattr(core.RUNTIME, "dispatch_plan", None)
     required = set(plan.required_residual_layers()) if plan is not None and hasattr(plan, "required_residual_layers") else set()
@@ -187,27 +194,42 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
         native_hidden_path_aliases={
             raw_path: resolve_alias[raw_path] for raw_path in native_paths
         },
+        capture_native_hidden=bool(native_paths),
     )
 
 
 def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntimeSetup) -> None:
-    core.RUNTIME.decode_row_idx = torch.zeros((setup.rows,), device=getattr(runner, "device"), dtype=torch.long)
-    core.RUNTIME.decode_valid_mask = torch.zeros((setup.rows, 1), device=getattr(runner, "device"), dtype=setup.hidden_dtype)
+    from tllm.backends.vllm.runner_adapter import runner_device
+
+    device = runner_device(runner)
+    core.RUNTIME.decode_row_idx = torch.zeros((setup.rows,), device=device, dtype=torch.long)
+    core.RUNTIME.decode_valid_mask = torch.zeros((setup.rows, 1), device=device, dtype=setup.hidden_dtype)
     core.RUNTIME.decode_prompt_idx_buf = torch.full(
         (setup.rows,),
         fill_value=-1,
-        device=getattr(runner, "device"),
+        device=device,
         dtype=torch.long,
     )
     core.RUNTIME.decode_sample_idx_buf = torch.full(
         (setup.rows,),
         fill_value=-1,
-        device=getattr(runner, "device"),
+        device=device,
         dtype=torch.long,
+    )
+    from tllm.runtime.torch_adapter import CudaLongHostStaging
+
+    core.RUNTIME.decode_identity_staging = CudaLongHostStaging(
+        setup.rows, device, channels=2
+    )
+    core.RUNTIME.decode_logit_row_selector_buf = torch.empty(
+        (setup.rows,), device=device, dtype=torch.long
+    )
+    core.RUNTIME.decode_logit_row_selector_staging = CudaLongHostStaging(
+        setup.rows, device
     )
     core.RUNTIME.decode_count = 0
     if int(setup.compact_rows) > 0:
-        core.RUNTIME.decode_compact_row_idx = torch.zeros((int(setup.compact_rows),), device=getattr(runner, "device"), dtype=torch.long)
+        core.RUNTIME.decode_compact_row_idx = torch.zeros((int(setup.compact_rows),), device=device, dtype=torch.long)
     else:
         core.RUNTIME.decode_compact_row_idx = None
     core.RUNTIME.decode_compact_count = 0
@@ -217,7 +239,7 @@ def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntim
     _residual_capture_buffers.initialize_runtime_tap_buffers(
         runtime=core.RUNTIME,
         resolved_layers=setup.resolved_layers,
-        device=getattr(runner, "device"),
+        device=device,
         rows=setup.rows,
         hidden_size=setup.hidden_size,
         hidden_dtype=setup.hidden_dtype,
@@ -235,6 +257,7 @@ def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntim
         core=cast(_residual_capture_hooks.ResidualCaptureCoreLike, core),
         runner=cast(RunnerLike, runner),
         resolved_layers=setup.resolved_layers,
+        capture_native_hidden=setup.capture_native_hidden,
     )
     core.RUNTIME.tap_handles = dict(handles)
 
@@ -259,7 +282,7 @@ def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntim
         resolve_path=lambda locator: _residual_bindings.resolved_path_for_locator(
             setup.runtime_bindings, locator
         ),
-        device=getattr(runner, "device"),
+        device=device,
         max_rows=int(setup.rows),
         hidden_size=int(setup.hidden_size),
         dtype=setup.hidden_dtype,

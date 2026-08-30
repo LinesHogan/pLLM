@@ -1104,7 +1104,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         store.execute(consumer, context)
         self.assertEqual(store.retained_value_count, 0)
 
-    def test_physical_region_binding_is_invariant_to_legal_node_reordering(self) -> None:
+    def test_physical_region_binding_rejects_unsigned_node_reordering(self) -> None:
         trace: list[str] = []
 
         @workload(id="runtime.unordered")
@@ -1169,44 +1169,19 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 },
             ),
         )
-        state = ResidualRuntimeState()
-
-        with mock.patch.object(residual_runtime, "RUNTIME", state):
+        with (
+            mock.patch.object(
+                residual_runtime, "RUNTIME", ResidualRuntimeState()
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "order differs from the signed decision"
+            ),
+        ):
             residual_runtime.publish_workload_compilation(
                 reordered_compilation,
                 bindings=bindings,
             )
-            execution = state.workload_execution
-            self.assertIsNotNone(execution)
-            assert execution is not None
-            self.assertEqual(
-                execution.completion_anchor,
-                compilation.decision.completion_anchor,
-            )
-
-            residual_runtime.prepare_physical_workgraph_step(1)
-            self.assertTrue(
-                execution.advance_backend_event(
-                    BackendObservableEvent.EXECUTE_MODEL_PRE
-                )
-            )
-            self.assertEqual(trace, ["left"])
-            self.assertTrue(
-                execution.advance_backend_event(
-                    BackendObservableEvent.SAMPLE_TOKENS_POST
-                )
-            )
-            self.assertFalse(
-                execution.advance_backend_event(
-                    BackendObservableEvent.SAMPLE_TOKENS_POST
-                )
-            )
-            execution._event_advances = {}
-            with self.assertRaisesRegex(RuntimeError, "not signed"):
-                execution.advance_backend_event(BackendObservableEvent.SAMPLER_PRE_DRAW)
-            self.assertFalse(execution.advance_anchor("unsigned.anchor"))
-
-        self.assertEqual(trace, ["left", "right"])
+        self.assertEqual(trace, [])
 
     def test_zero_node_sampler_consumer_still_joins_pending_side_work(self) -> None:
         """A sampler consumer must fence even when it advances zero Regions.

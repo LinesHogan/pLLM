@@ -19,6 +19,7 @@ from tllm.runtime.ports.assembler import BundleAssembler
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.scheduling.deferred import DeferredWorkQueue
 from tllm.runtime.stats import PlacementStats
+from tllm.runtime.torch_adapter import CudaLongHostStaging
 from tllm.runtime.vllm_patch import port_runtime_hooks
 
 
@@ -128,8 +129,12 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
             MODEL_HOOK_SPEC_ATTR="_tllm_hook_spec",
             _runner_uses_compilation_or_cudagraph=lambda _runner: False,
         )
-        model = SimpleNamespace(compute_logits=lambda *args, **kwargs: (args, kwargs))
-        runner = SimpleNamespace(model=model)
+        class Model(torch.nn.Module):
+            def compute_logits(self, *args, **kwargs):
+                return args, kwargs
+
+        model = Model()
+        runner = SimpleNamespace(model=model, get_model=lambda: model)
         setup = SimpleNamespace(
             resolved_layers=(),
             target_resolved="layers.1",
@@ -214,6 +219,10 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
         runtime.decode_valid_mask = torch.zeros((3, 1), dtype=torch.float32)
         runtime.decode_prompt_idx_buf = torch.full((3,), -1, dtype=torch.long)
         runtime.decode_sample_idx_buf = torch.full((3,), -1, dtype=torch.long)
+        runtime.decode_identity_staging = CudaLongHostStaging(
+            3, torch.device("cpu"), channels=2
+        )
+        runtime.decode_logit_row_selector_staging = None
         runtime.decode_count = 0
         runtime.decode_prompt_idxs = []
         runtime.decode_sample_idxs = []
@@ -253,7 +262,12 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
             },
         )()
 
-        port_runtime_hooks.prepare_decode_localization(core=core, runner=runner, out=(None, None), prepare_inputs_view=view)
+        port_runtime_hooks.prepare_decode_localization(
+            core=core,
+            runner=runner,
+            out=(None, None),
+            prepare_inputs_view=view,
+        )
 
         self.assertEqual(runtime.decode_count, 3)
         self.assertEqual(runtime.decode_request_ids, ["reqA", "reqB", "reqC"])
@@ -261,6 +275,12 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
         self.assertEqual(runtime.decode_sample_idxs, [0, 0, 0])
         self.assertEqual(tuple(runtime.decode_row_idx.tolist()), (4, 5, 6))
         self.assertEqual(tuple(runtime.decode_valid_mask[:, 0].tolist()), (1.0, 1.0, 1.0))
+        self.assertEqual(
+            tuple(runtime.decode_prompt_idx_tensor.tolist()), (10, 11, 12)
+        )
+        self.assertEqual(
+            tuple(runtime.decode_sample_idx_tensor.tolist()), (0, 0, 0)
+        )
         self.assertEqual(seen_max_rows, [0])
 
 

@@ -43,6 +43,7 @@ from tllm.runtime.workload_bindings import (
     NoRuntimeServices,
     NoSamplerBinding,
     NoWorkerBinding,
+    OptimizerTransitionService,
     RuntimePortRegistry,
     RuntimeInputBinding,
     RuntimeOutputBinding,
@@ -986,6 +987,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         provided_inputs: dict[str, RuntimeInputBinding[object]] = {}
         output_sinks: dict[str, RuntimeOutputBinding[object]] = {}
         snapshots: dict[str, Callable[[int], Mapping[Hashable, int]]] = {}
+        optimizer_transitions: dict[str, OptimizerTransitionService] = {}
         sampler_bindings: list[SamplerRuntimeBinding] = []
         diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
         residual_paths: dict["ResidualLocator", str] = {}
@@ -1028,6 +1030,17 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                         f"duplicate native workload state binding {resource!r}"
                     )
                 snapshots[resource] = snapshot
+            for local_name, transition_service in resources.optimizer_transitions.items():
+                resource = (
+                    f"{declaration.ir.workload_id}/{local_name}"
+                    if multiple
+                    else local_name
+                )
+                if resource in optimizer_transitions:
+                    raise RuntimeError(
+                        f"duplicate native optimizer transition binding {resource!r}"
+                    )
+                optimizer_transitions[resource] = transition_service
             match resources.sampler:
                 case SamplerRuntimeBinding() as sampler:
                     sampler_bindings.append(sampler)
@@ -1093,6 +1106,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 outputs=output_sinks,
             ),
             state_versions=state_versions,
+            optimizer_transitions=optimizer_transitions,
             sampler=(NoSamplerBinding() if not sampler_bindings else sampler_bindings[0]),
             diagnostics_readers=diagnostics_readers,
             lifecycle=(

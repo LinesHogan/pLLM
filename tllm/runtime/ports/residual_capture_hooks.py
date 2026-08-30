@@ -131,6 +131,7 @@ def install_layer_forward_taps(
     core: ResidualCaptureCoreLike,
     runner: RunnerLike,
     resolved_layers: dict[str, torch.nn.Module],
+    capture_native_hidden: bool = False,
 ) -> dict[str, TapHandle]:
     handles: dict[str, TapHandle] = {}
     from tllm.runtime.graph_policy import GraphMode, resolve_graph_mode
@@ -138,7 +139,10 @@ def install_layer_forward_taps(
     executor = core.RUNTIME.producer_executor
     capture_ids = () if executor is None else executor.capture_resident_producer_ids
     capture_resident = (
-        "tllm.residual.decode" in capture_ids
+        (
+            "tllm.residual.decode" in capture_ids
+            or capture_native_hidden
+        )
         and resolve_graph_mode(runner) != GraphMode.EAGER
     )
     capture_full = bool(core.RUNTIME.capture_full_residual_rows)
@@ -235,9 +239,9 @@ def install_layer_forward_taps(
             orig_forward=orig_forward,
         )
     if capture_resident:
-        model = runner.model
-        if model is None:
-            raise RuntimeError("capture-resident producer requires runner.model")
+        from tllm.backends.vllm.runner_adapter import runner_model_module
+
+        model = runner_model_module(runner)
         resolved_layer_items = tuple(resolved_layers.items())
         _compilation.install_capture_compile_identity(
             model=model,
@@ -285,4 +289,3 @@ def _capture_plan_fingerprint(
             )
         )
     return hashlib.sha256("\n".join(rows).encode("ascii")).hexdigest()[:16]
-

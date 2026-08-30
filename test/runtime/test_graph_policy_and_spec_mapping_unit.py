@@ -9,6 +9,8 @@ import unittest
 import numpy as np
 import torch
 
+from tllm.runtime.torch_adapter import CudaLongHostStaging
+
 
 class GraphPolicyUnitTest(unittest.TestCase):
     def test_plan_compatibility_enforcement(self) -> None:
@@ -58,6 +60,13 @@ class SpecRowMappingUnitTest(unittest.TestCase):
             decode_valid_mask=torch.zeros(rows, dtype=torch.bool),
             decode_prompt_idx_buf=torch.zeros(rows, dtype=torch.long),
             decode_sample_idx_buf=torch.zeros(rows, dtype=torch.long),
+            decode_identity_staging=CudaLongHostStaging(
+                rows, torch.device("cpu"), channels=2
+            ),
+            decode_logit_row_selector_buf=torch.empty(rows, dtype=torch.long),
+            decode_logit_row_selector_staging=CudaLongHostStaging(
+                rows, torch.device("cpu")
+            ),
             decode_count=0,
             event_step_id=1,
             workload_execution=None,

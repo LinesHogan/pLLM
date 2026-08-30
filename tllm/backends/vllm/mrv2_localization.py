@@ -25,6 +25,8 @@ from typing import Any
 
 import torch
 
+from tllm.runtime.torch_adapter import torch_regular_position_view
+
 from tllm.runtime.vllm_patch.port_runtime_hooks import (
     _clear_decode_localization,
     store_decode_localization,
@@ -113,8 +115,24 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
         _clear_decode_localization(core)
         return ()
 
-    row_selector = torch.as_tensor(logit_rows, dtype=torch.long, device=logits_indices.device)
-    row_idx = logits_indices.index_select(0, row_selector)
+    row_idx = torch_regular_position_view(logits_indices, logit_rows)
+    if row_idx is None:
+        selector = runtime.decode_logit_row_selector_buf
+        selector_staging = runtime.decode_logit_row_selector_staging
+        decode_row_idx = runtime.decode_row_idx
+        count = len(logit_rows)
+        if selector is None or selector_staging is None or decode_row_idx is None:
+            raise RuntimeError(
+                "MRv2 localization requires persistent row-selector buffers"
+            )
+        selector_staging.copy(logit_rows, selector)
+        torch.index_select(
+            logits_indices,
+            0,
+            selector[:count],
+            out=decode_row_idx[:count],
+        )
+        row_idx = decode_row_idx[:count]
     store_decode_localization(
         core=core,
         row_idx=row_idx,

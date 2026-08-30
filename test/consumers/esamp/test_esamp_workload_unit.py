@@ -33,6 +33,15 @@ from tllm.runtime.mp.worker_extension import (
     _decision_requires_hidden_taps,
 )
 from tllm.ports.residual_stream import ResidualLocator
+from tllm.schedule import (
+    AsyncBatchCaptureMode,
+    HostCommandKind,
+    MainWorkloadTimeline,
+    RegionCaptureMode,
+    RegionHostSubmission,
+    RegionStreamClass,
+    ScheduleStateStorage,
+)
 from tllm.workload import declare_workload
 
 
@@ -92,7 +101,7 @@ def _capabilities() -> BackendCapabilities:
     )
 
 
-def _timeline() -> object:
+def _timeline() -> MainWorkloadTimeline:
     return export_main_workload_timeline(
         _capabilities(), graph_mode="eager", static_headroom_bytes=1 << 20
     )
@@ -121,7 +130,7 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
 
 
 class ESampRegionUnitTest(unittest.TestCase):
-    def test_piecewise_capture_is_limited_to_read_only_prediction(self) -> None:
+    def test_graph_modes_sign_prediction_and_async_optimizer_capture(self) -> None:
         workload = ESampWorkload(_config())
         runtime = TllmRuntime(
             workloads=(workload,), workload_memory_budget_bytes=1 << 20
@@ -131,7 +140,23 @@ class ESampRegionUnitTest(unittest.TestCase):
                 2, 4, torch.float32, torch.device("cpu")
             )
         )
-        for graph_mode in ("piecewise", "full"):
+        for graph_mode, expected_prediction, expected_optimizer in (
+            (
+                "eager",
+                RegionCaptureMode.DISABLED,
+                AsyncBatchCaptureMode.DISABLED,
+            ),
+            (
+                "piecewise",
+                RegionCaptureMode.REQUIRE,
+                AsyncBatchCaptureMode.OPTIMIZER_TRANSITION,
+            ),
+            (
+                "full",
+                RegionCaptureMode.REQUIRE,
+                AsyncBatchCaptureMode.OPTIMIZER_TRANSITION,
+            ),
+        ):
             with self.subTest(graph_mode=graph_mode):
                 compilation = runtime.compile_workloads(
                     replace(_timeline(), graph_mode=graph_mode)
@@ -142,15 +167,72 @@ class ESampRegionUnitTest(unittest.TestCase):
                     for task_name in region.tasks
                 }
 
+                self.assertEqual(compilation.graph.schema_version, 3)
+                self.assertIs(
+                    compilation.graph.states[0].storage,
+                    ScheduleStateStorage.OPTIMIZER_STABLE,
+                )
                 self.assertTrue(regions["predict"].capture_safe)
-                self.assertEqual(
-                    regions["predict"].capture_mode.value, "require"
+                self.assertIs(
+                    regions["predict"].capture_mode,
+                    expected_prediction,
                 )
                 for task_name in ("loss", "loss__optimize_distiller"):
                     self.assertFalse(regions[task_name].capture_safe)
-                    self.assertEqual(
-                        regions[task_name].capture_mode.value, "disabled"
+                    self.assertIs(
+                        regions[task_name].capture_mode,
+                        RegionCaptureMode.DISABLED,
                     )
+                    self.assertIs(
+                        regions[task_name].stream,
+                        RegionStreamClass.SIDE_FORWARD,
+                    )
+                    self.assertIs(
+                        regions[task_name].host_submission,
+                        RegionHostSubmission.ASYNC_SERIAL,
+                    )
+
+                predict_advance = next(
+                    advance
+                    for advance in compilation.decision.runtime_advance_plan
+                    if regions["predict"].region_id in advance.region_ids
+                )
+                self.assertEqual(
+                    tuple(command.kind for command in predict_advance.host_commands),
+                    (
+                        HostCommandKind.WAIT_ASYNC,
+                        HostCommandKind.EXECUTE_INLINE,
+                    ),
+                )
+                self.assertTrue(
+                    all(
+                        command.async_capture_mode
+                        is AsyncBatchCaptureMode.DISABLED
+                        for command in predict_advance.host_commands
+                    )
+                )
+
+                tail_advance = next(
+                    advance
+                    for advance in compilation.decision.runtime_advance_plan
+                    if regions["loss"].region_id in advance.region_ids
+                )
+                self.assertEqual(
+                    tuple(command.kind for command in tail_advance.host_commands),
+                    (
+                        HostCommandKind.WAIT_ASYNC,
+                        HostCommandKind.SUBMIT_ASYNC,
+                    ),
+                )
+                submit = tail_advance.host_commands[1]
+                self.assertEqual(
+                    submit.region_ids,
+                    (
+                        regions["loss"].region_id,
+                        regions["loss__optimize_distiller"].region_id,
+                    ),
+                )
+                self.assertIs(submit.async_capture_mode, expected_optimizer)
 
     def test_native_dispatch_rejects_every_legacy_only_option(self) -> None:
         cases: tuple[tuple[dict[str, object], str], ...] = (

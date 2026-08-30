@@ -39,6 +39,7 @@ from tllm.workload import (
 from tllm.schedule import (
     CompileOptions,
     MainWorkloadTimeline,
+    ScheduleStateStorage,
     TimelineAnchor,
     WorkloadCompilerCoordinator,
     PlanEpochAllocator,
@@ -46,6 +47,40 @@ from tllm.schedule import (
 
 
 class WorkloadDslUnitTest(unittest.TestCase):
+    def test_only_trainable_state_lowers_stable_optimizer_storage(self) -> None:
+        @workload(id="state.storage-evidence")
+        class StorageEvidence:
+            ordinary = State(
+                scope=StateScope.REPLICA,
+                parameters="ordinary",
+                transition="optimizer",
+            )
+            trainable = State.replica(
+                optimizer=AdamWSpec.fixed(1e-3),
+            )
+
+        declaration = declare_workload(StorageEvidence())
+        storage_by_state = {
+            state.name: state.storage.value for state in declaration.ir.states
+        }
+        self.assertEqual(
+            storage_by_state,
+            {
+                "ordinary": "dynamic",
+                "trainable": "optimizer_stable",
+            },
+        )
+
+        graph = lower_schedule_graph((declaration.ir,))
+        self.assertEqual(graph.schema_version, 3)
+        self.assertEqual(
+            {state.resource: state.storage for state in graph.states},
+            {
+                "ordinary": ScheduleStateStorage.DYNAMIC,
+                "trainable": ScheduleStateStorage.OPTIMIZER_STABLE,
+            },
+        )
+
     def test_eager_region_artifact_owns_grad_context(self) -> None:
         import torch
 
@@ -116,7 +151,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
         self.assertEqual(ir.semantic_key, declare_workload(ESamp()).ir.semantic_key)
         self.assertNotIn("<object at", ir.to_json())
         graph = lower_schedule_graph((ir,))
-        self.assertEqual(graph.schema_version, 2)
+        self.assertEqual(graph.schema_version, 3)
         self.assertEqual(graph.states[0].resource, "distiller")
         self.assertEqual(graph.states[0].scope, "request")
         self.assertEqual(graph.states[0].request_key, ("request_id", "sample_idx"))

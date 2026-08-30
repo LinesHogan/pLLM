@@ -38,6 +38,7 @@ if TYPE_CHECKING:
         NativeWorkloadExecutionStore,
     )
     from tllm.runtime.producer_executor import ProducerExecutor
+    from tllm.runtime.torch_adapter import CudaLongHostStaging
     from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
     from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
     from tllm.runtime.scheduling.collective import (
@@ -87,6 +88,9 @@ class ResidualRuntimeState:
     decode_request_ids: list[str] = field(default_factory=list)
     decode_prompt_idx_buf: torch.Tensor | None = None
     decode_sample_idx_buf: torch.Tensor | None = None
+    decode_identity_staging: "CudaLongHostStaging | None" = None
+    decode_logit_row_selector_buf: torch.Tensor | None = None
+    decode_logit_row_selector_staging: "CudaLongHostStaging | None" = None
     decode_prompt_idx_tensor: torch.Tensor | None = None
     decode_sample_idx_tensor: torch.Tensor | None = None
     decode_compact_row_idx: Optional[torch.Tensor] = None

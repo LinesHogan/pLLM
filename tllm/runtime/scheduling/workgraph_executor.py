@@ -16,6 +16,7 @@ import torch
 
 from tllm.contracts.runtime_stats import WorkGraphRuntimeStats
 from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
+from tllm.runtime.torch_adapter import torch_cuda_stream
 
 from tllm.runtime.scheduling.physical import (
     BufferLease,
@@ -76,6 +77,22 @@ class PhysicalExecutionContext:
     stream: object
     tensors: tuple[torch.Tensor, ...]
     leases: tuple[BufferLease, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalBatchExecutionContext:
+    step_id: int
+    plan_epoch: int
+    nodes: tuple[PhysicalNodePlan, ...]
+    stream: torch.cuda.Stream
+
+
+class PhysicalNodeBatchGraph(Protocol):
+    def preflight_context(self, context: PhysicalBatchExecutionContext) -> None: ...
+
+    def replay_context(
+        self, context: PhysicalBatchExecutionContext
+    ) -> PhysicalExecutionKind: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +271,7 @@ class PhysicalExecutor:
         *,
         tensors: tuple[torch.Tensor, ...] = (),
         main_snapshot: torch.cuda.Event | None = None,
+        batch_graph: PhysicalNodeBatchGraph | None = None,
     ) -> PhysicalStepResult:
         """Execute an ordered Region subset from one prepared physical plan.
 
@@ -300,6 +318,12 @@ class PhysicalExecutor:
             ordered_nodes = tuple(
                 node for node in plan_nodes if node.node_key in selected
             )
+            if batch_graph is not None and tuple(
+                node.node_key for node in ordered_nodes
+            ) != node_keys:
+                raise PhysicalExecutionError(
+                    "captured physical batch order differs from its signed command"
+                )
             available = set(completed)
             for node in ordered_nodes:
                 missing = tuple(
@@ -321,7 +345,73 @@ class PhysicalExecutor:
         try:
             # A miss must abort an entire backend event group before a prior
             # Region can mutate state, publish a sink, or record a fence.
-            self._preflight_nodes(step, prepared, ordered_nodes, inputs)
+            if batch_graph is None:
+                self._preflight_nodes(step, prepared, ordered_nodes, inputs)
+            else:
+                batch_streams = {node.stream for node in ordered_nodes}
+                if len(batch_streams) != 1:
+                    raise PhysicalExecutionError(
+                        "captured physical batch requires one signed stream"
+                    )
+                if any(node.buffer_bucket is not None for node in ordered_nodes):
+                    raise PhysicalExecutionError(
+                        "captured physical batch cannot infer buffer-bucket ownership"
+                    )
+                batch_stream_class = next(iter(batch_streams))
+                batch_stream = cast(
+                    StreamLike, prepared.streams[batch_stream_class].stream
+                )
+                batch_cuda_stream = torch_cuda_stream(batch_stream)
+                batch_context = PhysicalBatchExecutionContext(
+                    step_id=step,
+                    plan_epoch=prepared.resources.plan.plan_epoch,
+                    nodes=ordered_nodes,
+                    stream=batch_cuda_stream,
+                )
+                batch_graph.preflight_context(batch_context)
+                if batch_stream_class is not StreamClass.DEFAULT:
+                    if main_snapshot is None:
+                        main_snapshot = torch.cuda.Event()
+                        main_snapshot.record()
+                    batch_cuda_stream.wait_event(main_snapshot)
+                selected_batch_nodes = {
+                    node.node_key for node in ordered_nodes
+                }
+                for node in ordered_nodes:
+                    for dependency in node.fences:
+                        if dependency.producer in selected_batch_nodes:
+                            continue
+                        event = prepared.events[dependency.fence]
+                        batch_stream.wait_event(event.event)
+                        self.stats.fence_wait_count += 1
+                with torch.cuda.stream(batch_cuda_stream):
+                    batch_kind = batch_graph.replay_context(batch_context)
+                for node in ordered_nodes:
+                    for fence_key in prepared.outgoing_fences.get(
+                        node.node_key, ()
+                    ):
+                        cast(EventLike, prepared.events[fence_key].event).record(
+                            batch_cuda_stream
+                        )
+                        self.stats.fence_record_count += 1
+                    with self._condition:
+                        self._completed[step].add(node.node_key)
+                if batch_kind is PhysicalExecutionKind.EAGER:
+                    eager_nodes.extend(
+                        str(node.node_key) for node in ordered_nodes
+                    )
+                    self.stats.eager_count += 1
+                else:
+                    replayed_nodes.extend(
+                        str(node.node_key) for node in ordered_nodes
+                    )
+                    self.stats.replay_count += 1
+                return PhysicalStepResult(
+                    step_id=step,
+                    plan_epoch=prepared.resources.plan.plan_epoch,
+                    eager_nodes=tuple(eager_nodes),
+                    replayed_nodes=tuple(replayed_nodes),
+                )
             for node in ordered_nodes:
                 stream_resource = prepared.streams[node.stream]
                 stream = cast(StreamLike, stream_resource.stream)
@@ -649,11 +739,13 @@ def _tensors(value: object) -> tuple[torch.Tensor, ...]:
 
 __all__ = [
     "PhysicalExecutionContext",
+    "PhysicalBatchExecutionContext",
     "PhysicalExecutionError",
     "PhysicalExecutionKind",
     "PhysicalExecutionStats",
     "PhysicalExecutor",
     "PhysicalNodeHandler",
+    "PhysicalNodeBatchGraph",
     "PhysicalStepResult",
     "SpecializationRequest",
     "SpecializationRequestFactory",

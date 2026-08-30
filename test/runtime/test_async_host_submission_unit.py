@@ -23,6 +23,7 @@ from tllm.runtime.workload_execution import (
     WorkloadExecutionBindings,
 )
 from tllm.schedule import (
+    AsyncBatchCaptureMode,
     BackendObservableEvent,
     CompileOptions,
     HostCommandKind,
@@ -287,7 +288,7 @@ class AsyncHostSubmissionUnitTest(unittest.TestCase):
         if async_started.is_set() and "main-cuda-wait" not in trace:
             trace.append("main-cuda-wait")
 
-    def test_rust_v4_signs_closed_host_commands_in_region_order(self) -> None:
+    def test_rust_v5_signs_closed_host_commands_in_region_order(self) -> None:
         _, compilation = self._compile(_TailControl())
         regions = {
             task_name: region.region_id
@@ -306,7 +307,7 @@ class AsyncHostSubmissionUnitTest(unittest.TestCase):
             if regions["update"] in advance.region_ids
         )
 
-        self.assertEqual(compilation.decision.schema_version, 4)
+        self.assertEqual(compilation.decision.schema_version, 5)
         self.assertEqual(execute_advance.region_ids, (regions["predict"],))
         self.assertEqual(
             execute_advance.host_commands,
@@ -340,6 +341,13 @@ class AsyncHostSubmissionUnitTest(unittest.TestCase):
             ),
         )
         for advance in compilation.decision.runtime_advance_plan:
+            self.assertTrue(
+                all(
+                    command.async_capture_mode
+                    is AsyncBatchCaptureMode.DISABLED
+                    for command in advance.host_commands
+                )
+            )
             flattened = tuple(
                 region_id
                 for command in advance.host_commands

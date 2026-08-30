@@ -28,6 +28,10 @@ from tllm.runtime.vllm_patch.adapters import (
 )
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
+from tllm.runtime.torch_adapter import (
+    CudaLongHostStaging,
+    torch_regular_position_view,
+)
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.stats import PlacementStats
@@ -120,11 +124,9 @@ def _snapshot_runtime_value(value: object) -> object:
 def _capture_runtime_hook_transaction(
     *, core: Any, runner: RunnerLike
 ) -> RuntimeHookTransaction:
-    model = runner.model
-    if model is None:
-        raise RuntimeError("runtime hook installation requires runner.model")
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError("runtime hook installation requires a torch.nn.Module model")
+    from tllm.backends.vllm.runner_adapter import runner_model_module
+
+    model = runner_model_module(runner)
     modules = tuple(
         _ModuleHookSnapshot(
             module=module,
@@ -220,6 +222,8 @@ class PortRuntimeStateLike(Protocol):
     decode_request_ids: list[str]
     decode_prompt_idx_buf: torch.Tensor | None
     decode_sample_idx_buf: torch.Tensor | None
+    decode_identity_staging: CudaLongHostStaging | None
+    decode_logit_row_selector_staging: CudaLongHostStaging | None
     tap_decode_hidden: dict[str, torch.Tensor]
     decode_compact_row_idx: torch.Tensor | None
     decode_compact_count: int
@@ -258,33 +262,6 @@ class PortDispatchCoreLike(Protocol):
     RUNTIME: PortRuntimeStateLike
 
 
-def _regular_position_view(tensor: torch.Tensor, positions: list[int]) -> torch.Tensor | None:
-    if not positions:
-        return tensor[:0]
-    if tensor.ndim != 1:
-        return None
-    if len(positions) == 1:
-        pos = int(positions[0])
-        if pos < 0 or pos >= int(tensor.numel()):
-            return None
-        return tensor[pos : pos + 1]
-    step = int(positions[1]) - int(positions[0])
-    if step <= 0:
-        return None
-    start = int(positions[0])
-    last = int(positions[-1])
-    if start < 0 or last >= int(tensor.numel()):
-        return None
-    for left, right in zip(positions, positions[1:]):
-        if int(right) - int(left) != step:
-            return None
-    return tensor.as_strided(
-        (len(positions),),
-        (int(tensor.stride(0)) * step,),
-        storage_offset=int(tensor.storage_offset()) + start * int(tensor.stride(0)),
-    )
-
-
 def _needs_device_decode_metadata(runtime: PortRuntimeStateLike) -> bool:
     plan = getattr(runtime, "dispatch_plan", None)
     if plan is None or not hasattr(plan, "requires_device_decode_metadata"):
@@ -311,7 +288,12 @@ def store_decode_localization(
     decode_valid_mask = core.RUNTIME.decode_valid_mask
     decode_prompt_idx_buf = getattr(core.RUNTIME, "decode_prompt_idx_buf", None)
     decode_sample_idx_buf = getattr(core.RUNTIME, "decode_sample_idx_buf", None)
-    if decode_row_idx is None or decode_valid_mask is None or decode_prompt_idx_buf is None or decode_sample_idx_buf is None:
+    if (
+        decode_row_idx is None
+        or decode_valid_mask is None
+        or decode_prompt_idx_buf is None
+        or decode_sample_idx_buf is None
+    ):
         raise RuntimeError(
             "Active runtime requires decode scratch buffers decode_row_idx/decode_valid_mask/decode_prompt_idx_buf/decode_sample_idx_buf"
         )
@@ -359,14 +341,21 @@ def store_decode_localization(
             decode_valid_mask[:k].fill_(1.0)
             if k < int(decode_valid_mask.shape[0]):
                 decode_valid_mask[k:].zero_()
-            decode_prompt_idx_buf[:k].copy_(torch.as_tensor(prompt_idxs, device=decode_row_idx.device, dtype=torch.long))
-            decode_sample_idx_buf[:k].copy_(torch.as_tensor(sample_idxs, device=decode_row_idx.device, dtype=torch.long))
 
     core.RUNTIME.decode_count = k
     core.RUNTIME.decode_prompt_idxs = [int(x) for x in prompt_idxs]
     core.RUNTIME.decode_sample_idxs = [int(x) for x in sample_idxs]
     core.RUNTIME.decode_request_ids = [str(x) for x in request_ids]
     if needs_device_metadata:
+        identity_staging = core.RUNTIME.decode_identity_staging
+        if identity_staging is None:
+            raise RuntimeError("decode identity requires typed host staging")
+        identity_staging.copy_channels(
+            (
+                (prompt_idxs[:k], decode_prompt_idx_buf),
+                (sample_idxs[:k], decode_sample_idx_buf),
+            )
+        )
         core.RUNTIME.decode_prompt_idx_tensor = decode_prompt_idx_buf[:k]
         core.RUNTIME.decode_sample_idx_tensor = decode_sample_idx_buf[:k]
     else:
@@ -399,7 +388,9 @@ def store_decode_localization(
                 "Increase the compact flow capacity or graph_scratch_rows."
             )
         if compact_count > 0:
-            compact_rows = _regular_position_view(row_idx, compact_positions)
+            compact_rows = torch_regular_position_view(
+                row_idx, compact_positions
+            )
             if compact_rows is None:
                 compact_pos_tensor = torch.as_tensor(compact_positions, device=row_idx.device, dtype=torch.long)
                 compact_rows = row_idx.index_select(0, compact_pos_tensor)
@@ -620,7 +611,9 @@ def maybe_launch_post_logits_decode_work(*, core: Any, runner: Any) -> None:
 
 
 def setup_runtime_hooks_if_active(*, core: Any, runner: Any) -> None:
-    model = runner.model
+    from tllm.backends.vllm.runner_adapter import runner_model_module
+
+    model = runner_model_module(runner)
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         core.RUNTIME.launch_consumer_from_hooks = False
         return

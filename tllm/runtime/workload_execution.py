@@ -60,7 +60,10 @@ from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationRequest,
 )
 from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
-from tllm.runtime.torch_adapter import torch_record_stream_owners
+from tllm.runtime.torch_adapter import (
+    torch_cuda_tensor_tuple,
+    torch_record_stream_owners,
+)
 from tllm.runtime.parameter_overlay import (
     DenseOperandCaptureBatch,
     OverlayChannel,
@@ -71,6 +74,7 @@ from tllm.runtime.workload_bindings import (
     NoSamplerBinding,
     PerRequestStats,
     PerRequestStatsService,
+    OptimizerTransitionService,
     RuntimePortRegistry,
     RuntimeInputBinding,
     RuntimeOutputBinding,
@@ -87,7 +91,10 @@ from tllm.runtime.scheduling.plan_store import (
 )
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
+    PhysicalBatchExecutionContext,
     PhysicalExecutor,
+    PhysicalExecutionKind,
+    PhysicalNodeBatchGraph,
     PhysicalStepResult,
     ShapeSpecializationMiss,
     runtime_stats_from_executor,
@@ -105,6 +112,7 @@ from tllm.contracts.physical_plan import (
 from tllm.workload.region_compiler import compare_region_outputs
 from tllm.schedule.contracts import (
     BackendObservableEvent,
+    AsyncBatchCaptureMode,
     BackendRegionBinderStage,
     ExecutionRegion,
     HostCommandKind,
@@ -115,6 +123,7 @@ from tllm.schedule.contracts import (
     RegionOutputKind,
     RegionHostSubmission,
     RuntimeAdvancePlan,
+    RuntimeHostCommand,
     ScheduleEffect,
     ScheduleEffectKind,
     ScheduleGraph,
@@ -135,6 +144,7 @@ if TYPE_CHECKING:
     from tllm.schedule import WorkloadCompilation
     from tllm.workload.frontend import WorkloadDeclaration
     from tllm.workload.region_compiler import RegionCallableArtifact
+    from tllm.workload.region_compiler import TensorRegionCallable
 
 
 
@@ -220,8 +230,8 @@ def lower_signed_materialization_bindings(
     lifetime, producer, or consumer count themselves.
     """
 
-    if decision.schema_version != 4:
-        raise TypeError("decision must be a ScheduleDecision schema v4")
+    if decision.schema_version != 5:
+        raise TypeError("decision must be a ScheduleDecision schema v5")
 
     regions_by_id = {region.region_id: region for region in decision.execution_regions}
     artifacts_by_id: dict[str, RegionCallableArtifact] = {}
@@ -723,6 +733,9 @@ class WorkloadExecutionBindings:
     state_versions: Mapping[str, StateVersionBinding] = field(
         default_factory=dict[str, StateVersionBinding]
     )
+    optimizer_transitions: Mapping[str, OptimizerTransitionService] = field(
+        default_factory=dict[str, OptimizerTransitionService]
+    )
     sampler: SamplerBinding = field(default_factory=NoSamplerBinding)
     diagnostics_readers: Mapping[
         str, Callable[[], Mapping[str, int | float]]
@@ -750,6 +763,13 @@ class WorkloadExecutionBindings:
             raise ValueError("state-version resource names must not be empty")
         object.__setattr__(
             self, "state_versions", MappingProxyType(dict(self.state_versions))
+        )
+        if any(not resource for resource in self.optimizer_transitions):
+            raise ValueError("optimizer-transition resource names must not be empty")
+        object.__setattr__(
+            self,
+            "optimizer_transitions",
+            MappingProxyType(dict(self.optimizer_transitions)),
         )
         if any(not workload_id for workload_id in self.diagnostics_readers):
             raise ValueError("diagnostic workload IDs must not be empty")
@@ -906,6 +926,9 @@ class NativeWorkloadExecution:
     _side_node_keys: frozenset[NodeKey] = frozenset()
     _side_work_pending: bool = False
     _async_host: AsyncHostLane = field(default_factory=_NoAsyncHostLane)
+    _async_batch_graphs: Mapping[
+        tuple[NodeKey, ...], PhysicalNodeBatchGraph
+    ] = field(default_factory=dict[tuple[NodeKey, ...], PhysicalNodeBatchGraph])
     _cost_probe: RegionCostProbe = field(default_factory=RegionCostProbe)
 
     def _join_side_streams_locked(self) -> None:
@@ -1162,8 +1185,7 @@ class NativeWorkloadExecution:
                 case HostCommandKind.SUBMIT_ASYNC:
                     advanced = (
                         self._submit_async_host_locked(
-                            command.submission_id,
-                            self._node_keys(command.region_ids),
+                            command,
                         )
                         or advanced
                     )
@@ -1192,9 +1214,10 @@ class NativeWorkloadExecution:
 
     def _submit_async_host_locked(
         self,
-        submission_id: str,
-        nodes: tuple[NodeKey, ...],
+        command: RuntimeHostCommand,
     ) -> bool:
+        submission_id = command.submission_id
+        nodes = self._node_keys(command.region_ids)
         if self._prepared_step < 0:
             return False
         pending = tuple(node for node in nodes if node not in self._executed_nodes)
@@ -1206,11 +1229,22 @@ class NativeWorkloadExecution:
                 if self._main_stream is not None and self._side_streams:
                     main_snapshot = torch.cuda.Event()
                     main_snapshot.record(self._main_stream)
+                match command.async_capture_mode:
+                    case AsyncBatchCaptureMode.DISABLED:
+                        batch_graph = None
+                    case AsyncBatchCaptureMode.OPTIMIZER_TRANSITION:
+                        try:
+                            batch_graph = self._async_batch_graphs[pending]
+                        except KeyError as exc:
+                            raise RuntimeError(
+                                "signed optimizer batch has no bound CUDA artifact"
+                            ) from exc
                 future = lane.executor.submit(
                     self.executor.execute_nodes,
                     self._prepared_step,
                     pending,
                     main_snapshot=main_snapshot,
+                    batch_graph=batch_graph,
                 )
                 lane.active = _AsyncHostSubmission(
                     submission_id=submission_id,
@@ -1837,6 +1871,385 @@ class _RegionValueStore:
                 # consumer Region. Release that explicit boundary after its
                 # consumer executes; Python does not derive a liveness count.
                 frame.values.pop(key, None)
+
+
+@dataclass(frozen=True, slots=True)
+class _TensorRegionArtifact:
+    region_id: str
+    input_keys: tuple[str, ...]
+    output_keys: tuple[str, ...]
+    callable: "TensorRegionCallable"
+
+    def execute(
+        self, inputs: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        if len(inputs) != len(self.input_keys):
+            raise RuntimeError(
+                f"Tensor Region {self.region_id!r} received the wrong input arity"
+            )
+        with torch.inference_mode(False), torch.enable_grad():
+            return self.callable(inputs)
+
+
+def _tensor_region_artifact(
+    artifact: "RegionCallableArtifact",
+) -> _TensorRegionArtifact:
+    tensor_callable = artifact.tensor_callable
+    if tensor_callable is None:
+        raise RuntimeError(
+            f"Region {artifact.region_id!r} has no Tensor batch artifact"
+        )
+    return _TensorRegionArtifact(
+        region_id=artifact.region_id,
+        input_keys=artifact.input_keys,
+        output_keys=artifact.output_keys,
+        callable=tensor_callable,
+    )
+
+
+class _OptimizerBatchCudaGraph(PhysicalNodeBatchGraph):
+    """One fail-closed CUDA graph for a Rust-signed optimizer batch."""
+
+    __slots__ = (
+        "_artifact_key",
+        "_artifacts",
+        "_tensor_regions",
+        "_transition",
+        "_transition_input",
+        "_store",
+        "_graph",
+        "_staging",
+        "_input_specs",
+        "_outputs",
+        "_loss",
+        "_shape_specialization_request",
+        "_preflight_identity",
+        "_preflight_inputs",
+        "_preflight_disabled",
+        "_preflight_miss",
+        "_poisoned",
+        "_warmed",
+        "_cost_probe",
+        "_stream_label",
+    )
+
+    def __init__(
+        self,
+        artifact_key: str,
+        artifacts: tuple["RegionCallableArtifact", ...],
+        transition: OptimizerTransitionService,
+        store: _RegionValueStore,
+        shape_specialization_request: Callable[
+            [PhysicalExecutionContext, Mapping[str, torch.Tensor]],
+            RegionShapeSpecializationRequest,
+        ],
+        cost_probe: RegionCostProbe,
+        stream_label: str,
+    ) -> None:
+        if len(artifacts) < 2:
+            raise RuntimeError(
+                "optimizer batch capture requires compute and transition Regions"
+            )
+        transition_artifact = artifacts[-1]
+        if (
+            len(transition_artifact.input_keys) != 1
+            or transition_artifact.output_keys
+            or len(transition_artifact.effects) != 1
+            or transition_artifact.effects[0].kind
+            is not ScheduleEffectKind.STATE_TRANSITION
+        ):
+            raise RuntimeError(
+                "optimizer batch transition artifact differs from its signed contract"
+            )
+        tensor_regions = tuple(
+            _tensor_region_artifact(artifact) for artifact in artifacts[:-1]
+        )
+        available = set(tensor_regions[0].input_keys)
+        for region in tensor_regions:
+            if any(key not in available for key in region.input_keys):
+                raise RuntimeError(
+                    "optimizer batch Tensor Regions do not form one closed value chain"
+                )
+            available.update(region.output_keys)
+        transition_input = transition_artifact.input_keys[0]
+        if transition_input not in available:
+            raise RuntimeError(
+                "optimizer batch transition input is not produced by its Tensor chain"
+            )
+        self._artifact_key = artifact_key
+        self._artifacts = artifacts
+        self._tensor_regions = tensor_regions
+        self._transition = transition
+        self._transition_input = transition_input
+        self._store = store
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._staging: tuple[torch.Tensor, ...] = ()
+        self._input_specs: tuple[
+            tuple[tuple[int, ...], torch.dtype, torch.device], ...
+        ] = ()
+        self._outputs: tuple[tuple[torch.Tensor, ...], ...] = ()
+        self._loss: torch.Tensor | None = None
+        self._shape_specialization_request = shape_specialization_request
+        self._preflight_identity: tuple[int, int] | None = None
+        self._preflight_inputs: tuple[torch.Tensor, ...] | None = None
+        self._preflight_disabled = False
+        self._preflight_miss: RegionShapeSpecializationRequest | None = None
+        self._poisoned = False
+        self._warmed = False
+        self._cost_probe = cost_probe
+        self._stream_label = stream_label
+
+    @staticmethod
+    def _context_identity(
+        context: PhysicalBatchExecutionContext,
+    ) -> tuple[int, int]:
+        return (context.plan_epoch, context.step_id)
+
+    def _clear_preflight(self) -> None:
+        self._preflight_identity = None
+        self._preflight_inputs = None
+        self._preflight_disabled = False
+        self._preflight_miss = None
+
+    def _device_step(
+        self, inputs: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[tuple[torch.Tensor, ...], ...], torch.Tensor]:
+        first = self._tensor_regions[0]
+        values = dict(zip(first.input_keys, inputs, strict=True))
+        region_outputs: list[tuple[torch.Tensor, ...]] = []
+        for region in self._tensor_regions:
+            outputs = region.execute(
+                tuple(values[key] for key in region.input_keys)
+            )
+            values.update(zip(region.output_keys, outputs, strict=True))
+            region_outputs.append(outputs)
+        loss = values[self._transition_input]
+        self._transition.device_step(loss)
+        return tuple(region_outputs), loss
+
+    def _capture(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        staging = tuple(torch.empty_like(value) for value in inputs)
+        for target, source in zip(staging, inputs, strict=True):
+            target.copy_(source)
+        graph = torch.cuda.CUDAGraph()
+        # The Rust-signed batch runs on the dedicated async host thread.
+        # Thread-local capture keeps unrelated main-thread CUDA submission
+        # legal while preserving fail-closed capture errors in this thread.
+        with torch.cuda.graph(
+            graph,
+            stream=stream,
+            capture_error_mode="thread_local",
+        ):
+            outputs, loss = self._device_step(staging)
+        self._graph = graph
+        self._staging = staging
+        self._input_specs = tuple(
+            (tuple(value.shape), value.dtype, value.device) for value in inputs
+        )
+        self._outputs = outputs
+        self._loss = loss
+
+    def preflight_context(self, context: PhysicalBatchExecutionContext) -> None:
+        identity = self._context_identity(context)
+        if self._preflight_identity == identity:
+            request = self._preflight_miss
+            if request is not None:
+                self._clear_preflight()
+                raise ShapeSpecializationMiss(request)
+            return
+        self._clear_preflight()
+        self._preflight_identity = identity
+        try:
+            if self._poisoned:
+                raise RuntimeError(
+                    f"optimizer batch CUDA artifact {self._artifact_key!r} is poisoned"
+                )
+            if not self._store.is_enabled():
+                self._preflight_disabled = True
+                return
+            first_artifact = self._artifacts[0]
+            physical_context = PhysicalExecutionContext(
+                step_id=context.step_id,
+                plan_epoch=context.plan_epoch,
+                node=context.nodes[0],
+                kind=PhysicalExecutionKind.REPLAY,
+                stream=context.stream,
+                tensors=(),
+                leases=(),
+            )
+            raw_inputs = self._store.resolve_inputs(
+                first_artifact, physical_context
+            )
+            values = tuple(raw_inputs[key] for key in first_artifact.input_keys)
+            if any(value is SKIPPED for value in values):
+                self._preflight_disabled = True
+                return
+            inputs = torch_cuda_tensor_tuple(values)
+            if self._graph is not None:
+                specs = tuple(
+                    (tuple(value.shape), value.dtype, value.device)
+                    for value in inputs
+                )
+                if specs != self._input_specs:
+                    mapping = dict(zip(first_artifact.input_keys, inputs, strict=True))
+                    physical_context = PhysicalExecutionContext(
+                        step_id=context.step_id,
+                        plan_epoch=context.plan_epoch,
+                        node=context.nodes[0],
+                        kind=PhysicalExecutionKind.REPLAY,
+                        stream=context.stream,
+                        tensors=(),
+                        leases=(),
+                    )
+                    request = self._shape_specialization_request(
+                        physical_context, mapping
+                    )
+                    self._preflight_miss = request
+                    raise ShapeSpecializationMiss(request)
+            self._preflight_inputs = inputs
+        except BaseException:
+            self._clear_preflight()
+            raise
+
+    def _commit_skipped(self, context: PhysicalBatchExecutionContext) -> None:
+        physical_context = PhysicalExecutionContext(
+            step_id=context.step_id,
+            plan_epoch=context.plan_epoch,
+            node=context.nodes[0],
+            kind=PhysicalExecutionKind.REPLAY,
+            stream=context.stream,
+            tensors=(),
+            leases=(),
+        )
+        for artifact in self._artifacts:
+            self._store.commit_outputs(
+                artifact,
+                physical_context,
+                {key: SKIPPED for key in artifact.output_keys},
+            )
+
+    def replay_context(
+        self, context: PhysicalBatchExecutionContext
+    ) -> PhysicalExecutionKind:
+        try:
+            self.preflight_context(context)
+            if self._preflight_disabled:
+                self._commit_skipped(context)
+                return PhysicalExecutionKind.EAGER
+            inputs = self._preflight_inputs
+            if inputs is None:
+                raise RuntimeError("optimizer batch replay was not preflighted")
+            stream = context.stream
+            physical_context = PhysicalExecutionContext(
+                step_id=context.step_id,
+                plan_epoch=context.plan_epoch,
+                node=context.nodes[0],
+                kind=PhysicalExecutionKind.REPLAY,
+                stream=stream,
+                tensors=(),
+                leases=(),
+            )
+            state_before = tuple(
+                self._store.begin_state_effects(artifact, physical_context)
+                for artifact in self._artifacts
+            )
+            torch_record_stream_owners(inputs, stream)
+            try:
+                graph = self._graph
+                if not self._warmed:
+                    with self._cost_probe.measure(
+                        self._artifact_key,
+                        "warmup",
+                        self._stream_label,
+                    ):
+                        outputs, loss = self._device_step(inputs)
+                    self._outputs = outputs
+                    self._loss = loss
+                    self._warmed = True
+                    execution_kind = PhysicalExecutionKind.EAGER
+                elif graph is None:
+                    with self._cost_probe.measure_host(
+                        self._artifact_key,
+                        "capture",
+                        self._stream_label,
+                    ):
+                        self._capture(inputs, stream)
+                    graph = self._graph
+                    if graph is None:
+                        raise RuntimeError(
+                            "optimizer batch capture produced no CUDA graph"
+                        )
+                    with self._cost_probe.measure(
+                        self._artifact_key,
+                        "replay",
+                        self._stream_label,
+                    ):
+                        graph.replay()
+                    execution_kind = PhysicalExecutionKind.REPLAY
+                else:
+                    for target, source in zip(
+                        self._staging, inputs, strict=True
+                    ):
+                        target.copy_(source)
+                    with self._cost_probe.measure(
+                        self._artifact_key,
+                        "replay",
+                        self._stream_label,
+                    ):
+                        graph.replay()
+                    execution_kind = PhysicalExecutionKind.REPLAY
+            except BaseException:
+                self._poisoned = True
+                for artifact, before in zip(
+                    self._artifacts[:-1], state_before[:-1], strict=True
+                ):
+                    self._store.finish_state_effects(
+                        artifact, physical_context, before
+                    )
+                raise
+            try:
+                loss = self._loss
+                if loss is None:
+                    raise RuntimeError(
+                        "optimizer batch capture produced no loss Tensor"
+                    )
+                for artifact, before in zip(
+                    self._artifacts[:-1], state_before[:-1], strict=True
+                ):
+                    self._store.finish_state_effects(
+                        artifact, physical_context, before
+                    )
+                self._transition.commit(loss)
+                self._store.finish_state_effects(
+                    self._artifacts[-1], physical_context, state_before[-1]
+                )
+                for artifact, outputs in zip(
+                    self._artifacts[:-1], self._outputs, strict=True
+                ):
+                    self._store.commit_outputs(
+                        artifact,
+                        physical_context,
+                        dict(
+                            zip(
+                                artifact.output_keys,
+                                outputs,
+                                strict=True,
+                            )
+                        ),
+                    )
+                self._store.commit_outputs(
+                    self._artifacts[-1], physical_context, {}
+                )
+                return execution_kind
+            except BaseException:
+                self._poisoned = True
+                raise
+        finally:
+            self._clear_preflight()
 
 
 class _RegionCudaGraph:
@@ -2469,6 +2882,13 @@ def _bind_physical_region_nodes(
             f"unexpected={[str(node) for node in unexpected]}"
         )
 
+    expected_node_order = tuple(expected_by_node)
+    physical_node_order = tuple(node.node_key for node in physical.nodes)
+    if physical_node_order != expected_node_order:
+        raise RuntimeError(
+            "physical Region order differs from the signed decision"
+        )
+
     placement_by_node: dict[NodeKey, str] = {}
     for placement in physical.anchor_placements:
         if placement.node_key in placement_by_node:
@@ -2663,6 +3083,70 @@ def _native_workload_execution(
         anchor_nodes.setdefault(anchor, []).append(node.node_key)
         node_by_region[region.region_id] = node.node_key
 
+    async_batch_graphs: dict[
+        tuple[NodeKey, ...], PhysicalNodeBatchGraph
+    ] = {}
+    signed_regions = {
+        region.region_id: region
+        for region in compilation.decision.execution_regions
+    }
+    for advance in compilation.decision.runtime_advance_plan:
+        for command in advance.host_commands:
+            if (
+                command.async_capture_mode
+                is not AsyncBatchCaptureMode.OPTIMIZER_TRANSITION
+            ):
+                continue
+            command_artifacts = tuple(
+                registry.resolve(region_id) for region_id in command.region_ids
+            )
+            transition_artifact = command_artifacts[-1]
+            if len(transition_artifact.effects) != 1:
+                raise RuntimeError(
+                    "signed optimizer batch has an invalid transition effect"
+                )
+            resource = transition_artifact.effects[0].resource
+            try:
+                transition_service = bindings.optimizer_transitions[resource]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "signed optimizer batch has no typed transition service for "
+                    f"state {resource!r}"
+                ) from exc
+            first_artifact = command_artifacts[0]
+
+            def request_batch_shape_specialization(
+                context: PhysicalExecutionContext,
+                inputs: Mapping[str, torch.Tensor],
+                *,
+                bound_artifact: "RegionCallableArtifact" = first_artifact,
+            ) -> RegionShapeSpecializationRequest:
+                request = _region_shape_specialization_request(
+                    compilation,
+                    bound_artifact,
+                    context,
+                    inputs,
+                )
+                shape_specializations.enqueue(request)
+                return request
+
+            batch_nodes = tuple(
+                node_by_region[region_id] for region_id in command.region_ids
+            )
+            if batch_nodes in async_batch_graphs:
+                raise RuntimeError(
+                    "signed optimizer batch membership is duplicated"
+                )
+            async_batch_graphs[batch_nodes] = _OptimizerBatchCudaGraph(
+                command.async_artifact_key,
+                command_artifacts,
+                transition_service,
+                value_store,
+                request_batch_shape_specialization,
+                cost_probe,
+                signed_regions[command.region_ids[0]].stream.value,
+            )
+
     event_nodes: dict[BackendObservableEvent, list[NodeKey]] = {}
     event_advances: dict[
         BackendObservableEvent, list[RuntimeAdvancePlan]
@@ -2793,6 +3277,7 @@ def _native_workload_execution(
         _side_streams=side_streams,
         _side_node_keys=side_node_keys,
         _async_host=async_host,
+        _async_batch_graphs=MappingProxyType(async_batch_graphs),
         _cost_probe=cost_probe,
     )
 
