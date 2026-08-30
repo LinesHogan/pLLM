@@ -91,6 +91,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--max-model-len", type=int, default=256)
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help="vLLM sequence capacity; 0 uses the effective expanded batch cap.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=4096,
+        help="Explicit vLLM scheduler/profile token capacity.",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--no-enforce-eager", dest="enforce_eager", action="store_false")
 
@@ -378,6 +390,10 @@ def _build_isolated_case_subprocess_cmd(
         str(args.model_bank_initializer_svd_max_wait_steps),
         "--benchmark-batch-size",
         str(args.benchmark_batch_size),
+        "--max-num-seqs",
+        str(args.max_num_seqs),
+        "--max-num-batched-tokens",
+        str(args.max_num_batched_tokens),
         "--benchmark-max-new-tokens",
         str(args.benchmark_max_new_tokens),
         "--benchmark-warmup-rounds",
@@ -865,6 +881,21 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
         bench_prompts, int(args.sampling_n)
     )
     effective_batch_cap = _resolve_effective_batch_cap(len(effective_prompts), int(args.effective_batch_cap))
+    configured_max_num_seqs = int(args.max_num_seqs)
+    if configured_max_num_seqs < 0:
+        raise ValueError("--max-num-seqs must be non-negative")
+    max_num_seqs = (
+        effective_batch_cap
+        if configured_max_num_seqs == 0
+        else configured_max_num_seqs
+    )
+    if max_num_seqs < effective_batch_cap:
+        raise ValueError(
+            "--max-num-seqs must cover the effective expanded batch cap"
+        )
+    max_num_batched_tokens = int(args.max_num_batched_tokens)
+    if max_num_batched_tokens <= 0:
+        raise ValueError("--max-num-batched-tokens must be positive")
     effective_sampling_n = 1
     print(
         "[compat] vLLM V1 n>1 is emulated via prompt expansion: "
@@ -947,6 +978,8 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
             dtype=args.dtype,
             gpu_memory_utilization=float(args.gpu_memory_utilization),
             max_model_len=int(args.max_model_len),
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=(not args.benchmark_disable_prefix_caching),
             enforce_eager=bool(args.enforce_eager),
         )

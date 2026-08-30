@@ -202,9 +202,17 @@ def main() -> int:
             for region in compilation.decision.execution_regions
         )
         expected_epoch = physical_plan.plan_epoch
-        if len(expected_artifacts) != 2:
+        signed_tasks = tuple(
+            task
+            for region in compilation.decision.execution_regions
+            for task in region.tasks
+        )
+        if set(signed_tasks) != {
+            "predict_and_loss",
+            "predict_and_loss__optimize_distiller",
+        } or len(signed_tasks) != 2:
             raise AssertionError(
-                f"unexpected native ESamp Region partition: {expected_artifacts!r}"
+                f"unexpected signed native ESamp tasks: {signed_tasks!r}"
             )
 
         plane = ControlPlane(llm)

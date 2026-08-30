@@ -96,6 +96,7 @@ def _run_one_implementation(args: argparse.Namespace, implementation: str) -> Di
         tap_paths = [args.source_layer_path, args.target_layer_path]
 
     esamp_workflow_support.configure_esamp_runtime(
+        implementation="legacy",
         graph_scratch_rows=graph_scratch_rows,
         tap_layer_paths=tap_paths,
         source_layer_path=args.source_layer_path,
@@ -183,9 +184,9 @@ def main() -> int:
             "Depending on model/backend this may fail under torch.compile."
         )
 
-    summary = _run_one_implementation(args, "esamp")
+    summary = _run_one_implementation(args, "legacy")
     if args.emit_json_summary:
-        print(JSON_SUMMARY_PREFIX + json.dumps({"implementation": "esamp", "summary": summary}, sort_keys=True))
+        print(JSON_SUMMARY_PREFIX + json.dumps({"implementation": "legacy", "summary": summary}, sort_keys=True))
 
     return 0
 

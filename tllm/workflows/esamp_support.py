@@ -79,6 +79,12 @@ def configure_esamp_runtime(
         distiller_sampler_backend=str(distiller_sampler_backend).strip() or "post_filter_exact",
         compact_capture_lane=bool(compact_capture_lane),
     )
+    if config.implementation == "native":
+        raise ValueError(
+            "configure_esamp_runtime cannot install a native workload; use "
+            "build_esamp_workload(config) with "
+            "TllmRuntime(workloads=(workload,))"
+        )
 
     current = runtime.RUNTIME.consumer
     if isinstance(current, ESampProgramConsumer) and config.implementation == "program":

@@ -146,11 +146,14 @@ def main() -> int:
         expected_artifacts = tuple(
             (region.region_id, region.artifact_key) for region in regions
         )
-        if len(regions) != 2 or tuple(region.tasks for region in regions) != (
-            ("predict_and_loss",),
-            ("predict_and_loss__optimize_distiller",),
-        ):
-            raise AssertionError(f"unexpected ESamp Region partition: {regions!r}")
+        signed_tasks = tuple(
+            task for region in regions for task in region.tasks
+        )
+        if set(signed_tasks) != {
+            "predict_and_loss",
+            "predict_and_loss__optimize_distiller",
+        } or len(signed_tasks) != 2:
+            raise AssertionError(f"unexpected signed ESamp tasks: {signed_tasks!r}")
         store = core.RUNTIME.workload_execution_store
         installed = [execution]
         if store is not None:

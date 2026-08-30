@@ -107,6 +107,7 @@ def _configure_esamp(
         prompt_count=int(prompt_count),
     )
     esamp_support.configure_esamp_runtime(
+        implementation="legacy",
         graph_scratch_rows=int(rows),
         tap_layer_paths=[args.source_layer_path, args.target_layer_path],
         source_layer_path=str(args.source_layer_path),
@@ -285,7 +286,7 @@ def main() -> int:
             float(result["out_tok_per_s"]) / base if base > 0 else 0.0
         )
 
-    payload = {"implementation": "esamp", "results": results}
+    payload = {"implementation": "legacy", "results": results}
     if args.emit_json_summary:
         print(JSON_SUMMARY_PREFIX + json.dumps(payload, sort_keys=True))
     return 0

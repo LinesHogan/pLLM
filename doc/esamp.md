@@ -51,9 +51,15 @@ python -m tllm.workflows.benchmarks.per_request_esamp_benchmark \
 ```
 
 The summary reports output tok/s **and** functional counters (`loss_count`, `distiller_intervention_state_count`, fallback counts). Treat any throughput number with zero training or zero interventions as a broken run, not a fast one.
+Use the exact alignment and memory preconditions in
+[`guides/benchmarking.md`](guides/benchmarking.md), and do not retire either
+baseline before the gate in [`guides/validation.md`](guides/validation.md).
 
 ## Measured numbers
 
 - Legacy pipeline vs optimized vLLM baseline (Qwen2.5-7B, min-p active path, RTX 4090): **0.9878 ratio** (5304.9 vs 5370.6 tok/s).
 - Program path host cost per train step (synthetic probe, 128×896 bf16): **0.082 ms vs 0.51 ms legacy eager**; whole-step CUDA graph replay ≈ 3–5 kernel launches vs ~70–90.
-- The 5-round paired in-engine benchmark (gate ≥ 0.98 program/legacy) is scripted at `docs/p5_paired_benchmark_report.json` and pending GPU availability at time of writing.
+- The recorded 5-round Program/legacy report at
+  `docs/p5_paired_benchmark_report.json` has median ratio **0.7968** and
+  `gate_pass=false`. It is not native throughput evidence and explicitly keeps
+  deletion blocked.

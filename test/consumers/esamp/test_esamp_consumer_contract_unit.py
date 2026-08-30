@@ -417,6 +417,10 @@ class ESampConsumerContractUnitTest(unittest.TestCase):
         self.assertTrue(targets)
         self.assertIs(targets[0].consumer, esamp_runtime.RUNTIME.consumer)
 
+    def test_configure_esamp_runtime_never_routes_native_to_legacy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot install a native"):
+            esamp_support.configure_esamp_runtime(implementation="native")
+
 
 if __name__ == "__main__":
     unittest.main()

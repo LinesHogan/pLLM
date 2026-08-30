@@ -7,6 +7,10 @@ import torch
 
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.config import ESampConsumerConfig
+from tllm.consumers.esamp.initializers.svd import (
+    SVDModelBankInitializerConfig,
+)
+from tllm.consumers.esamp.legacy_workload import build_esamp_workload
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
@@ -112,6 +116,46 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
 
 
 class ESampRegionUnitTest(unittest.TestCase):
+    def test_native_dispatch_rejects_every_legacy_only_option(self) -> None:
+        cases: tuple[tuple[dict[str, object], str], ...] = (
+            ({"consumer_id": "custom"}, "consumer_id"),
+            ({"graph_scratch_rows": 8}, "graph_scratch_rows"),
+            ({"enable_workgraph_execution": False}, "enable_workgraph_execution"),
+            ({"per_request_models": True}, "per_request_models"),
+            (
+                {
+                    "per_request_models": True,
+                    "per_request_model_bank": True,
+                },
+                "per_request_model_bank",
+            ),
+            ({"training_row_selection": "first_per_prompt"}, "training_row_selection"),
+            ({"model_bank_slots": 2}, "model_bank_slots"),
+            ({"model_bank_flush_interval": 2}, "model_bank_flush_interval"),
+            ({"model_bank_rank": 32}, "model_bank_rank"),
+            (
+                {"model_bank_initializer": SVDModelBankInitializerConfig()},
+                "model_bank_initializer",
+            ),
+            ({"model_bank_train_cudagraph": True}, "model_bank_train_cudagraph"),
+            ({"model_bank_forward_backend": "triton"}, "model_bank_forward_backend"),
+            ({"adaptation_pipeline_slots": 2}, "adaptation_pipeline_slots"),
+            ({"adaptation_stream_mode": "single"}, "adaptation_stream_mode"),
+            ({"adaptation_stream_priority": 1}, "adaptation_stream_priority"),
+            ({"trace_per_request_losses": True}, "trace_per_request_losses"),
+            ({"trace_interval": 2}, "trace_interval"),
+            ({"trace_max_points": 2}, "trace_max_points"),
+            ({"compact_capture_lane": True}, "compact_capture_lane"),
+            ({"distiller_sampler_backend": "pre_filter_dense"}, "distiller_sampler_backend"),
+        )
+        for overrides, option in cases:
+            with self.subTest(option=option):
+                config = ESampConsumerConfig(
+                    implementation="native", **overrides
+                )
+                with self.assertRaisesRegex(ValueError, option):
+                    build_esamp_workload(config)
+
     def test_native_region_rejects_a_coinstalled_legacy_consumer(self) -> None:
         native = ESampWorkload(_config())
         legacy = ESampConsumer(ESampConsumerConfig(implementation="legacy"))

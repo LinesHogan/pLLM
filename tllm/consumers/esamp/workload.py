@@ -58,7 +58,7 @@ class ESampConfig(WorkloadConfig):
 
 
 class ESampWorkload(Workload[ESampConfig]):
-    distiller: State[LowRankGatedResidualModel] = (
+    distiller: TrainableState[LowRankGatedResidualModel] = (
         State[LowRankGatedResidualModel].replica(
             optimizer=AdamWSpec.configured(_ESAMP_DISTILLER_LR)
         )
@@ -98,7 +98,7 @@ class ESampWorkload(Workload[ESampConfig]):
                 backend=ESampConfig.sampler_backend,
             ),
             "loss": optimize(
-                cast(TrainableState[object], distiller), at=Before("next.prepare")
+                distiller, at=Before("next.prepare")
             ),
         },
         timing=Between("model.execute", "sampler.pre_draw"),

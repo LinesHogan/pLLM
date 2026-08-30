@@ -5,6 +5,7 @@ from __future__ import annotations
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.register import build as build_legacy_consumer
 from tllm.ports.consumer import BaseConsumer
+from tllm.ports.base import RowSelection
 from tllm.workload import (
     AdamWSpec,
     Before,
@@ -34,10 +35,51 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             ESampWorkload,
         )
 
+        unsupported: list[str] = []
+        if resolved.consumer_id != "esamp":
+            unsupported.append("consumer_id")
+        if resolved.graph_scratch_rows != 0:
+            unsupported.append("graph_scratch_rows")
+        if not resolved.enable_workgraph_execution:
+            unsupported.append("enable_workgraph_execution")
+        if resolved.per_request_models:
+            unsupported.append("per_request_models")
+        if resolved.per_request_model_bank:
+            unsupported.append("per_request_model_bank")
+        if resolved.training_row_selection is not RowSelection.ALL:
+            unsupported.append("training_row_selection")
+        if resolved.model_bank_slots != 0:
+            unsupported.append("model_bank_slots")
+        if resolved.model_bank_flush_interval != 1:
+            unsupported.append("model_bank_flush_interval")
+        if resolved.model_bank_rank != 64:
+            unsupported.append("model_bank_rank")
+        if resolved.model_bank_initializer is not None:
+            unsupported.append("model_bank_initializer")
+        if resolved.model_bank_train_cudagraph:
+            unsupported.append("model_bank_train_cudagraph")
+        if resolved.model_bank_forward_backend != "torch":
+            unsupported.append("model_bank_forward_backend")
+        if resolved.adaptation_pipeline_slots != 4:
+            unsupported.append("adaptation_pipeline_slots")
+        if resolved.adaptation_stream_mode != "dual":
+            unsupported.append("adaptation_stream_mode")
+        if resolved.adaptation_stream_priority != 0:
+            unsupported.append("adaptation_stream_priority")
+        if resolved.trace_per_request_losses:
+            unsupported.append("trace_per_request_losses")
+        if resolved.trace_interval != 1:
+            unsupported.append("trace_interval")
+        if resolved.trace_max_points != 0:
+            unsupported.append("trace_max_points")
+        if resolved.compact_capture_lane:
+            unsupported.append("compact_capture_lane")
         if resolved.distiller_sampler_backend != "post_filter_exact":
+            unsupported.append("distiller_sampler_backend")
+        if unsupported:
             raise ValueError(
-                "implementation='native' supports only "
-                "distiller_sampler_backend='post_filter_exact'"
+                "implementation='native' does not support legacy-only "
+                f"option(s): {', '.join(unsupported)}"
             )
         return ESampWorkload(
             ESampConfig(
