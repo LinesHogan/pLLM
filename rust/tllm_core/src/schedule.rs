@@ -1597,6 +1597,21 @@ fn validate_affine_regions(
 const TORCH_EXPORT_CAPABILITY: &str = "torch.export";
 const SIDE_STREAM_SAFE_CAPABILITY: &str = "runtime.side_stream_safe";
 const ASYNC_HOST_SAFE_CAPABILITY: &str = "runtime.async_host_safe";
+const CAPTURE_STABLE_STATE_TRANSITION: &str = "optimizer";
+
+/// CUDA graph replay requires every captured state read to retain the same
+/// storage address.  The native optimizer contract updates parameters in
+/// place; replacement, publication, and custom transition contracts do not
+/// provide that guarantee.  Empty effect sets need no state-address proof.
+fn capture_effects_have_stable_storage(graph: &ScheduleGraph, effects: &[ScheduleEffect]) -> bool {
+    effects.iter().all(|effect| {
+        effect.kind == ScheduleEffectKind::StateRead
+            && graph.states.iter().any(|state| {
+                state.resource == effect.resource
+                    && state.transition == CAPTURE_STABLE_STATE_TRANSITION
+            })
+    })
+}
 
 fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
     capabilities
@@ -1673,22 +1688,28 @@ fn select_task_implementations(
                             .then(|| {
                                 let compile_safe = kind == TaskImplementationKind::Captured
                                     && (graph.schema_version == 1 || export_safe);
+                                let async_host_safe = graph.schema_version == 2
+                                    && capabilities
+                                        .iter()
+                                        .any(|capability| capability == ASYNC_HOST_SAFE_CAPABILITY);
                                 SelectedTaskImplementation {
                                     kind,
                                     implementation_id,
                                     required_capabilities: required_capabilities
                                         .into_iter()
                                         .collect(),
-                                    capture_safe: compile_safe && task.effects.is_empty(),
+                                    capture_safe: compile_safe
+                                        && !async_host_safe
+                                        && capture_effects_have_stable_storage(
+                                            graph,
+                                            &task.effects,
+                                        ),
                                     compile_safe,
                                     side_stream_safe: compile_safe
                                         || capabilities.iter().any(|capability| {
                                             capability == SIDE_STREAM_SAFE_CAPABILITY
                                         }),
-                                    async_host_safe: graph.schema_version == 2
-                                        && capabilities.iter().any(|capability| {
-                                            capability == ASYNC_HOST_SAFE_CAPABILITY
-                                        }),
+                                    async_host_safe,
                                 }
                             })
                     },
@@ -1764,14 +1785,19 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
                 task.task_id
             )));
         }
-        let expected_capture_safe = task.effects.is_empty()
+        let expected_capture_safe = capture_effects_have_stable_storage(graph, &task.effects)
             && task
                 .implementation_kinds
                 .iter()
-                .all(|kind| *kind == TaskImplementationKind::Captured);
+                .all(|kind| *kind == TaskImplementationKind::Captured)
+            && task.implementation_capabilities.iter().all(|capabilities| {
+                !capabilities
+                    .iter()
+                    .any(|capability| capability == ASYNC_HOST_SAFE_CAPABILITY)
+            });
         if task.capture_safe != expected_capture_safe {
             return Err(schedule_error(format!(
-                "task {:?} derived capture_safe disagrees with effects or implementation kinds",
+                "task {:?} derived capture_safe disagrees with implementation, effect, or stable-state evidence",
                 task.task_id
             )));
         }
@@ -2706,17 +2732,22 @@ fn make_region_drafts(
 
 /// Mirror the final Region capture eligibility before the executor bindings
 /// exist.  Result inputs from another draft become materialized bindings;
-/// hidden inputs remain hidden bindings.  Provided and step-id bindings make
-/// capture ineligible, and a Region with no external tensor contract is not
-/// capturable.  This keeps partition-search cost equal to the final signed
-/// `capture_mode` semantics instead of charging eager/disabled timelines.
+/// hidden inputs remain hidden bindings, and the sampler's device-side sample
+/// index remains a Tensor binding.  Provided, staged, host-tuple, and step-id
+/// bindings make capture ineligible, and a Region with no external Tensor
+/// contract is not capturable.  This keeps partition-search cost equal to the
+/// final signed `capture_mode` semantics instead of charging eager/disabled
+/// timelines.
 fn draft_capture_safe(
     graph: &ScheduleGraph,
     selected: &[SelectedTaskImplementation],
     task_index: &HashMap<String, usize>,
     draft: &RegionDraft,
 ) -> bool {
-    if !draft.tasks.iter().all(|task| selected[*task].capture_safe) {
+    if !draft.tasks.iter().all(|task| {
+        selected[*task].capture_safe
+            && capture_effects_have_stable_storage(graph, &graph.tasks[*task].effects)
+    }) {
         return false;
     }
     let members: BTreeSet<usize> = draft.tasks.iter().copied().collect();
@@ -2724,7 +2755,9 @@ fn draft_capture_safe(
     for task_index_in_draft in &draft.tasks {
         for input in &graph.tasks[*task_index_in_draft].inputs {
             match input.kind {
-                ScheduleInputKind::Hidden => external_inputs += 1,
+                ScheduleInputKind::Hidden | ScheduleInputKind::SamplerSampleIdxTensor => {
+                    external_inputs += 1
+                }
                 ScheduleInputKind::Result => {
                     let Some(source) = task_index.get(&input.source).copied() else {
                         return false;
@@ -2737,7 +2770,6 @@ fn draft_capture_safe(
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
                 | ScheduleInputKind::SamplerSampleIdxs
-                | ScheduleInputKind::SamplerSampleIdxTensor
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId => return false,
@@ -3970,11 +4002,14 @@ fn compile_impl(
         region.output_bindings = std::mem::take(&mut region_outputs[index]);
         region.task_invocations = std::mem::take(&mut region_invocations[index]);
         region.capture_safe = region.capture_safe
+            && capture_effects_have_stable_storage(graph, &region.effects)
             && !region.input_bindings.is_empty()
             && region.input_bindings.iter().all(|binding| {
                 matches!(
                     binding.kind,
-                    RegionInputKind::Hidden | RegionInputKind::Materialized
+                    RegionInputKind::Hidden
+                        | RegionInputKind::Materialized
+                        | RegionInputKind::SamplerSampleIdxTensor
                 )
             });
         // Side-stream placement only exposes legal parallelism to the GPU
@@ -5471,7 +5506,7 @@ mod tests {
     #[test]
     fn rust_signs_canonical_async_host_commands_without_name_policy() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"neutral-graph","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"neutral-graph","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
 
@@ -5583,7 +5618,7 @@ mod tests {
     #[test]
     fn async_host_submission_requires_every_structural_proof() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"neutral-eligibility","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"neutral-eligibility","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
         let baseline: serde_json::Value = serde_json::from_str(graph).unwrap();
@@ -6109,6 +6144,177 @@ mod tests {
     }
 
     #[test]
+    fn read_only_sampler_tensor_capture_is_structural_and_tamper_evident() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"neutral-capture","tasks":[{"task_id":"observe","timing":{"after":"tick","before":"end"},"temporary_bytes":0,"implementation_ids":["test:observe@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"parameters"}],"inputs":[{"name":"sample_index","kind":"sampler_sample_idx_tensor","source":"sampler.sample_index_tensor"}]}],"edges":[],"values":[],"states":[{"resource":"parameters","scope":"replica","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"piecewise","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sampler.pre_draw"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        validate_schedule(graph, timeline, options, &compiled).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.execution_regions.len(), 1);
+        let region = &decision.execution_regions[0];
+        assert!(region.compile_safe);
+        assert!(region.capture_safe);
+        assert_eq!(region.capture_mode, RegionCaptureMode::Require);
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+        assert_eq!(region.input_bindings.len(), 1);
+        assert_eq!(
+            region.input_bindings[0].kind,
+            RegionInputKind::SamplerSampleIdxTensor
+        );
+        assert_eq!(decision.cost.capture_boundary_count, 1);
+
+        let renamed_graph = graph
+            .replace("neutral-capture", "renamed-capture")
+            .replace("observe", "inspect")
+            .replace("parameters", "snapshot");
+        let renamed: Decision =
+            serde_json::from_str(&compile_schedule(&renamed_graph, timeline, options).unwrap())
+                .unwrap();
+        let renamed_region = &renamed.execution_regions[0];
+        assert_eq!(renamed_region.compile_safe, region.compile_safe);
+        assert_eq!(renamed_region.capture_safe, region.capture_safe);
+        assert_eq!(renamed_region.capture_mode, region.capture_mode);
+        assert_eq!(renamed_region.host_submission, region.host_submission);
+        assert_eq!(
+            renamed_region
+                .input_bindings
+                .iter()
+                .map(|binding| binding.kind)
+                .collect::<Vec<_>>(),
+            region
+                .input_bindings
+                .iter()
+                .map(|binding| binding.kind)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            renamed.cost.capture_boundary_count,
+            decision.cost.capture_boundary_count
+        );
+
+        let baseline: serde_json::Value = serde_json::from_str(graph).unwrap();
+        for effect_kind in ["state_transition", "state_write"] {
+            let mut candidate = baseline.clone();
+            candidate["tasks"][0]["effects"][0]["kind"] = serde_json::json!(effect_kind);
+            candidate["tasks"][0]["capture_safe"] = serde_json::json!(false);
+            let candidate = serde_json::to_string(&candidate).unwrap();
+            let rejected: Decision =
+                serde_json::from_str(&compile_schedule(&candidate, timeline, options).unwrap())
+                    .unwrap();
+            assert!(!rejected.execution_regions[0].capture_safe);
+            assert_eq!(
+                rejected.execution_regions[0].capture_mode,
+                RegionCaptureMode::Disabled
+            );
+            assert_eq!(rejected.cost.capture_boundary_count, 0);
+        }
+
+        let mut async_evidence = baseline.clone();
+        async_evidence["tasks"][0]["implementation_capabilities"] =
+            serde_json::json!([["runtime.async_host_safe", "torch.export"]]);
+        async_evidence["tasks"][0]["capture_safe"] = serde_json::json!(false);
+        let async_evidence = serde_json::to_string(&async_evidence).unwrap();
+        let async_rejected: Decision =
+            serde_json::from_str(&compile_schedule(&async_evidence, timeline, options).unwrap())
+                .unwrap();
+        assert!(!async_rejected.execution_regions[0].capture_safe);
+        assert_eq!(
+            async_rejected.execution_regions[0].capture_mode,
+            RegionCaptureMode::Disabled
+        );
+
+        for input_kind in [
+            "provided",
+            "staged",
+            "sampler_request_ids",
+            "sampler_sample_idxs",
+        ] {
+            let mut candidate = baseline.clone();
+            candidate["tasks"][0]["inputs"][0]["kind"] = serde_json::json!(input_kind);
+            let candidate = serde_json::to_string(&candidate).unwrap();
+            let rejected: Decision =
+                serde_json::from_str(&compile_schedule(&candidate, timeline, options).unwrap())
+                    .unwrap();
+            assert!(!rejected.execution_regions[0].capture_safe);
+            assert_eq!(
+                rejected.execution_regions[0].capture_mode,
+                RegionCaptureMode::Disabled
+            );
+        }
+
+        for transition in ["replace", "manual", "publish"] {
+            let mut candidate = baseline.clone();
+            candidate["states"][0]["transition"] = serde_json::json!(transition);
+            candidate["tasks"][0]["capture_safe"] = serde_json::json!(false);
+            let candidate = serde_json::to_string(&candidate).unwrap();
+            let rejected: Decision =
+                serde_json::from_str(&compile_schedule(&candidate, timeline, options).unwrap())
+                    .unwrap();
+            assert!(!rejected.execution_regions[0].capture_safe);
+            assert_eq!(
+                rejected.execution_regions[0].capture_mode,
+                RegionCaptureMode::Disabled
+            );
+        }
+
+        let mut graph_tampered = baseline.clone();
+        graph_tampered["tasks"][0]["capture_safe"] = serde_json::json!(false);
+        let error = compile_schedule(&graph_tampered.to_string(), timeline, options).unwrap_err();
+        assert!(error.to_string().contains("derived capture_safe"));
+
+        let mut transition_graph = baseline;
+        transition_graph["tasks"][0]["effects"][0]["kind"] = serde_json::json!("state_transition");
+        transition_graph["tasks"][0]["capture_safe"] = serde_json::json!(false);
+        let transition_graph = serde_json::to_string(&transition_graph).unwrap();
+        let transition_compiled = compile_schedule(&transition_graph, timeline, options).unwrap();
+        let mut decision_tampered: Decision = serde_json::from_str(&transition_compiled).unwrap();
+        decision_tampered.execution_regions[0].capture_safe = true;
+        decision_tampered.execution_regions[0].capture_mode = RegionCaptureMode::Require;
+        decision_tampered.signature.clear();
+        decision_tampered.signature = digest(&serde_json::to_string(&decision_tampered).unwrap());
+        let error = validate_schedule(
+            &transition_graph,
+            timeline,
+            options,
+            &serde_json::to_string(&decision_tampered).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("artifact metadata"));
+    }
+
+    #[test]
+    fn async_serial_compiled_region_remains_capture_disabled() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"neutral-async-capture","tasks":[{"task_id":"make","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:make@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"apply","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:apply@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe","torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"parameters"}],"inputs":[{"name":"value","kind":"result","source":"make","output":"value"}]}],"edges":[{"source":"make","target":"apply","kind":"data"}],"values":[{"value_id":"neutral:value","version":1,"producer":"make","producer_output":"value","consumers":["apply"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"parameters","scope":"replica","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"piecewise","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        validate_schedule(graph, timeline, options, &compiled).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        let async_region = decision
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks == ["apply"])
+            .unwrap();
+        assert_eq!(
+            async_region.implementation_kind,
+            super::RegionImplementationKind::Compiled
+        );
+        assert_eq!(async_region.stream, Some(RegionStreamClass::SideForward));
+        assert_eq!(
+            async_region.host_submission,
+            RegionHostSubmission::AsyncSerial
+        );
+        assert!(!async_region.capture_safe);
+        assert_eq!(async_region.capture_mode, RegionCaptureMode::Disabled);
+    }
+
+    #[test]
     fn side_stream_placement_is_signed_and_option_gated() {
         pyo3::prepare_freethreaded_python();
         // Side-eligible: pure, capture-safe, and every Region input a signed
@@ -6492,7 +6698,7 @@ mod tests {
 
     #[test]
     fn graph_v2_rederives_task_capabilities_capture_and_effect_edges() {
-        let graph = r#"{"workload_key":"v2-derived","tasks":[{"task_id":"captured","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["backend/test","torch.export"]],"required_capabilities":["backend/test"],"capture_safe":true},{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"v2-derived","tasks":[{"task_id":"captured","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["backend/test","torch.export"]],"required_capabilities":["backend/test"],"capture_safe":true},{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":["backend/test"],"schema_version":1}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
@@ -6527,7 +6733,7 @@ mod tests {
         // A conditional transition orders against adjacent accesses exactly
         // like a strict transition: the signed graph cannot prove the update
         // will not fire, so the ordering contract is identical.
-        let graph = r#"{"workload_key":"v2-maybe","tasks":[{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"maybe","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition_maybe","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"maybe","kind":"effect"},{"source":"maybe","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let graph = r#"{"workload_key":"v2-maybe","tasks":[{"task_id":"read","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"maybe","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition_maybe","resource":"state"}]},{"task_id":"after","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]}],"edges":[{"source":"read","target":"maybe","kind":"effect"},{"source":"maybe","target":"after","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
@@ -6694,7 +6900,7 @@ mod tests {
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
-        let ordered = r#"{"workload_key":"ordered-effects","tasks":[{"task_id":"read","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:transition@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"publish","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:publish@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"version_publish","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"publish","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let ordered = r#"{"workload_key":"ordered-effects","tasks":[{"task_id":"read","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"effects":[{"kind":"state_read","resource":"state"}]},{"task_id":"transition","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:transition@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"state"}]},{"task_id":"publish","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["python:publish@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"version_publish","resource":"state"}]}],"edges":[{"source":"read","target":"transition","kind":"effect"},{"source":"transition","target":"publish","kind":"effect"}],"values":[],"states":[{"resource":"state","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
         let decision: Decision =
             serde_json::from_str(&compile_schedule(ordered, timeline, options).unwrap()).unwrap();
         assert_eq!(decision.execution_regions.len(), 1);

@@ -462,7 +462,7 @@ class StateVersionBinding:
 class StateVersionRegistry:
     """Audits signed Region effects against concrete process-local versions."""
 
-    __slots__ = ("_bindings", "_observed")
+    __slots__ = ("_bindings", "_observed", "_lock")
 
     _MUTATING = frozenset(
         {
@@ -502,6 +502,7 @@ class StateVersionRegistry:
             normalized[resource] = binding
         self._bindings = MappingProxyType(normalized)
         self._observed: dict[tuple[str, Hashable], int] = {}
+        self._lock = Lock()
 
     @staticmethod
     def _snapshot(
@@ -533,10 +534,11 @@ class StateVersionRegistry:
                 binding = self._bindings[effect.resource]
                 snapshot = self._snapshot(binding, step_id)
                 snapshots[effect.resource] = MappingProxyType(snapshot)
-                self._observed.update(
-                    ((effect.resource, key), version)
-                    for key, version in snapshot.items()
-                )
+                with self._lock:
+                    self._observed.update(
+                        ((effect.resource, key), version)
+                        for key, version in snapshot.items()
+                    )
         return MappingProxyType(snapshots)
 
     def after(
@@ -583,30 +585,33 @@ class StateVersionRegistry:
                     f"state resource {resource!r} violated signed {action} version effect: "
                     f"{invalid!r}"
                 )
-            self._observed.update(
-                ((resource, key), version) for key, version in current.items()
-            )
+            with self._lock:
+                self._observed.update(
+                    ((resource, key), version) for key, version in current.items()
+                )
 
     def observed_version(self, resource: str, key: Hashable) -> int:
-        try:
-            return self._observed[(resource, key)]
-        except KeyError as exc:
-            raise KeyError((resource, key)) from exc
+        with self._lock:
+            try:
+                return self._observed[(resource, key)]
+            except KeyError as exc:
+                raise KeyError((resource, key)) from exc
 
     def observed_versions(self) -> tuple[tuple[str, Hashable, int], ...]:
         """Return a stable diagnostic snapshot without exposing mutable state."""
 
-        return tuple(
-            (resource, key, version)
-            for (resource, key), version in sorted(
-                self._observed.items(),
-                key=lambda item: (
-                    item[0][0],
-                    type(item[0][1]).__name__,
-                    repr(item[0][1]),
-                ),
+        with self._lock:
+            return tuple(
+                (resource, key, version)
+                for (resource, key), version in sorted(
+                    self._observed.items(),
+                    key=lambda item: (
+                        item[0][0],
+                        type(item[0][1]).__name__,
+                        repr(item[0][1]),
+                    ),
+                )
             )
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1707,9 +1712,7 @@ class _RegionValueStore:
             return
         inputs = self.resolve_inputs(artifact, context)
         torch_record_stream_owners(tuple(inputs.values()), context.stream)
-        state_before = self._state_versions.before(
-            artifact.effects, context.step_id
-        )
+        state_before = self.begin_state_effects(artifact, context)
         if any(value is SKIPPED for value in inputs.values()):
             outputs = {key: SKIPPED for key in artifact.output_keys}
         else:
@@ -1717,15 +1720,33 @@ class _RegionValueStore:
             torch_record_stream_owners(
                 tuple(outputs.values()), context.stream
             )
-            self._state_versions.after(
-                artifact.effects,
-                context.step_id,
-                state_before,
-            )
+            self.finish_state_effects(artifact, context, state_before)
         self.commit_outputs(artifact, context, outputs)
 
     def is_enabled(self) -> bool:
         return self._lifecycle.is_enabled()
+
+    def begin_state_effects(
+        self,
+        artifact: "RegionCallableArtifact",
+        context: PhysicalExecutionContext,
+    ) -> Mapping[str, Mapping[Hashable, int]]:
+        return self._state_versions.before(
+            artifact.effects,
+            context.step_id,
+        )
+
+    def finish_state_effects(
+        self,
+        artifact: "RegionCallableArtifact",
+        context: PhysicalExecutionContext,
+        before: Mapping[str, Mapping[Hashable, int]],
+    ) -> None:
+        self._state_versions.after(
+            artifact.effects,
+            context.step_id,
+            before,
+        )
 
     def resolve_inputs(
         self,
@@ -1851,9 +1872,12 @@ class _RegionCudaGraph:
         cost_probe: RegionCostProbe | None = None,
         stream_label: str = "default",
     ) -> None:
-        if artifact.effects:
+        if any(
+            effect.kind is not ScheduleEffectKind.STATE_READ
+            for effect in artifact.effects
+        ):
             raise RuntimeError(
-                f"capture-safe Region {artifact.region_id!r} cannot contain state effects"
+                f"capture-safe Region {artifact.region_id!r} may contain only state-read effects"
             )
         self._artifact = artifact
         self._store = store
@@ -1979,83 +2003,112 @@ class _RegionCudaGraph:
         if self._preflight_identity == identity:
             request = self._preflight_miss
             if request is not None:
+                self._clear_preflight()
                 raise ShapeSpecializationMiss(request)
             return
         self._clear_preflight()
         self._preflight_identity = identity
-        if not self._store.is_enabled():
-            self._preflight_disabled = True
-            return
-        inputs = self._store.resolve_inputs(self._artifact, context)
-        if any(value is SKIPPED for value in inputs.values()):
-            self._preflight_disabled = True
-            return
-        tensors = self._tensor_inputs(self._artifact, inputs)
-        if self._graph is not None:
-            for key, value in tensors.items():
-                spec = (tuple(value.shape), value.dtype, value.device)
-                if self._input_specs.get(key) != spec:
-                    request_shape_specialization = self._shape_specialization_request
-                    if request_shape_specialization is None:
-                        raise RuntimeError(
-                            "ExecutionRegion "
-                            f"{self._artifact.region_id!r} has a shape specialization "
-                            "miss without a signed request binding"
-                        )
-                    request = request_shape_specialization(context, tensors)
-                    self._preflight_miss = request
-                    raise ShapeSpecializationMiss(request)
-        self._preflight_inputs = tensors
+        try:
+            if not self._store.is_enabled():
+                self._preflight_disabled = True
+                return
+            inputs = self._store.resolve_inputs(self._artifact, context)
+            if any(value is SKIPPED for value in inputs.values()):
+                self._preflight_disabled = True
+                return
+            tensors = self._tensor_inputs(self._artifact, inputs)
+            if self._graph is not None:
+                for key, value in tensors.items():
+                    spec = (tuple(value.shape), value.dtype, value.device)
+                    if self._input_specs.get(key) != spec:
+                        request_shape_specialization = self._shape_specialization_request
+                        if request_shape_specialization is None:
+                            raise RuntimeError(
+                                "ExecutionRegion "
+                                f"{self._artifact.region_id!r} has a shape specialization "
+                                "miss without a signed request binding"
+                            )
+                        request = request_shape_specialization(context, tensors)
+                        self._preflight_miss = request
+                        raise ShapeSpecializationMiss(request)
+            self._preflight_inputs = tensors
+        except BaseException:
+            self._clear_preflight()
+            raise
 
     def replay_context(self, context: object) -> None:
         if not isinstance(context, PhysicalExecutionContext):
             raise TypeError("Region CUDA Graph requires PhysicalExecutionContext")
-        self.preflight_context(context)
-        if self._preflight_disabled:
-            self._store.commit_outputs(
-                self._artifact,
-                context,
-                {key: SKIPPED for key in self._artifact.output_keys},
+        try:
+            self.preflight_context(context)
+            if self._preflight_disabled:
+                self._store.commit_outputs(
+                    self._artifact,
+                    context,
+                    {key: SKIPPED for key in self._artifact.output_keys},
+                )
+                return
+            tensors = self._preflight_inputs
+            if tensors is None:
+                raise RuntimeError("Region CUDA Graph replay was not preflighted")
+            state_before = (
+                self._store.begin_state_effects(self._artifact, context)
+                if self._artifact.effects
+                else None
             )
-            self._clear_preflight()
-            return
-        tensors = self._preflight_inputs
-        if tensors is None:
-            raise RuntimeError("Region CUDA Graph replay was not preflighted")
-        probe = self._cost_probe
-        if self._graph is None:
-            # Capture is one-time and host-visible; measure its wall time.
-            timer = (
-                probe.measure_host(self._artifact.region_id, "capture", self._stream_label)
-                if probe is not None
-                else contextlib.nullcontext()
-            )
-            with timer:
-                self._capture(tensors)
-        else:
-            stream = self._stream
-            graph = self._graph
-            assert stream is not None and graph is not None
-            current = torch.cuda.current_stream(next(iter(tensors.values())).device)
-            stream.wait_stream(current)
-            with torch.cuda.stream(stream):
-                # Events recorded inside this block live on the capture stream,
-                # so the reading is the graph's own GPU span, not the fencing.
+            probe = self._cost_probe
+            if self._graph is None:
+                # Capture is one-time and host-visible; measure its wall time.
                 timer = (
-                    probe.measure(self._artifact.region_id, "replay", self._stream_label)
+                    probe.measure_host(
+                        self._artifact.region_id,
+                        "capture",
+                        self._stream_label,
+                    )
                     if probe is not None
                     else contextlib.nullcontext()
                 )
                 with timer:
-                    for key, value in tensors.items():
-                        self._staging[key].copy_(value)
-                    graph.replay()
-            current.wait_stream(stream)
-        outputs = dict(
-            zip(self._artifact.output_keys, self._outputs, strict=True)
-        )
-        self._store.commit_outputs(self._artifact, context, outputs)
-        self._clear_preflight()
+                    self._capture(tensors)
+            else:
+                stream = self._stream
+                graph = self._graph
+                assert stream is not None and graph is not None
+                current = torch.cuda.current_stream(
+                    next(iter(tensors.values())).device
+                )
+                torch_record_stream_owners(tuple(tensors.values()), stream)
+                stream.wait_stream(current)
+                with torch.cuda.stream(stream):
+                    # Events recorded inside this block live on the capture stream,
+                    # so the reading is the graph's own GPU span, not the fencing.
+                    timer = (
+                        probe.measure(
+                            self._artifact.region_id,
+                            "replay",
+                            self._stream_label,
+                        )
+                        if probe is not None
+                        else contextlib.nullcontext()
+                    )
+                    with timer:
+                        for key, value in tensors.items():
+                            self._staging[key].copy_(value)
+                        graph.replay()
+                current.wait_stream(stream)
+                torch_record_stream_owners(self._outputs, current)
+            outputs = dict(
+                zip(self._artifact.output_keys, self._outputs, strict=True)
+            )
+            if state_before is not None:
+                self._store.finish_state_effects(
+                    self._artifact,
+                    context,
+                    state_before,
+                )
+            self._store.commit_outputs(self._artifact, context, outputs)
+        finally:
+            self._clear_preflight()
 
 
 def _hidden_value(

@@ -48,7 +48,7 @@ def _scheduler_diagnostics() -> dict[str, object]:
 def _run_payload(*, mode: str, throughput: float, loss_count: int = 1) -> dict[str, object]:
     return {
         "mode": mode,
-        "workload": {"schema_version": 3, "model": "m", "batch_size": 8},
+        "workload": {"schema_version": 4, "model": "m", "batch_size": 8},
         "out_tok_per_s": float(throughput),
         "scheduler_diagnostics": _scheduler_diagnostics(),
         "training_enabled": mode in ("tllm", "native"),
@@ -76,7 +76,7 @@ def _run_payload(*, mode: str, throughput: float, loss_count: int = 1) -> dict[s
         "native_workgraph": {
             "execute_count": 1,
             "eager_count": 1,
-            "replay_count": 0,
+            "replay_count": 1,
             "fallback_count": 0,
         },
     }
@@ -199,10 +199,10 @@ class ESampRatioContractUnitTest(unittest.TestCase):
         native["native_workgraph"] = {
             "execute_count": 1,
             "eager_count": 1,
-            "replay_count": 0,
+            "replay_count": 1,
             "fallback_count": 1,
         }
-        with self.assertRaisesRegex(ValueError, "signed eager path"):
+        with self.assertRaisesRegex(ValueError, "signed mixed eager/replay path"):
             _validate_comparable(raw, native)
 
     def test_paired_acceptance_reports_ci_from_five_blocks(self) -> None:

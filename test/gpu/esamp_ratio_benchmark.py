@@ -317,11 +317,11 @@ def _validate_comparable(raw: Mapping[str, Any], tllm: Mapping[str, Any]) -> Non
         if (
             int(workgraph.get("execute_count", 0)) <= 0
             or int(workgraph.get("eager_count", 0)) <= 0
-            or int(workgraph.get("replay_count", 0)) != 0
+            or int(workgraph.get("replay_count", 0)) <= 0
             or int(workgraph.get("fallback_count", 0)) != 0
         ):
             raise ValueError(
-                "native benchmark did not remain on its signed eager path"
+                "native benchmark did not remain on its signed mixed eager/replay path"
             )
     else:
         placement = tllm.get("placement", {})

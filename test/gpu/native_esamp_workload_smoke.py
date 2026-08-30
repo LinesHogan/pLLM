@@ -185,11 +185,20 @@ def main() -> int:
             character in "0123456789abcdef" for character in decision.signature
         ):
             raise AssertionError("ESamp Region decision does not carry a SHA-256 signature")
-        if any(region.capture_safe for region in regions) or any(
+        capture_safe_tasks = {
+            task_name
+            for region in regions
+            if region.capture_safe
+            for task_name in region.tasks
+        }
+        if capture_safe_tasks != {"predict"} or any(
             node.capture_policy is not CapturePolicy.DISABLED
             for node in compilation.physical.nodes
         ):
-            raise AssertionError("stateful ESamp Regions must be explicitly non-capture")
+            raise AssertionError(
+                "eager ESamp must disable capture while retaining only "
+                f"prediction capture eligibility: {capture_safe_tasks!r}"
+            )
 
         params = SamplingParams(
             temperature=0.8,

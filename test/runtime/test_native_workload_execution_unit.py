@@ -463,11 +463,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         class Store:
             def __init__(self) -> None:
                 self.commits: list[dict[str, object]] = []
+                self.resolve_count = 0
 
             def is_enabled(self) -> bool:
                 return True
 
             def resolve_inputs(self, _artifact, _context) -> dict[str, object]:
+                self.resolve_count += 1
                 return {key: object() for key in artifact.input_keys}
 
             def commit_outputs(self, _artifact, _context, outputs) -> None:
@@ -511,6 +513,16 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             }
             graph._outputs = (inputs[input_keys[0]],)
 
+        with mock.patch.object(
+            _RegionCudaGraph,
+            "_tensor_inputs",
+            side_effect=RuntimeError("sampler tensor is not CUDA"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not CUDA"):
+                graph.preflight_context(context)
+        self.assertIsNone(graph._preflight_identity)
+        self.assertIsNone(graph._preflight_inputs)
+
         # The first capture fixes its observed Tensor contract. It is not a
         # specialization miss and must leave the cold-path queue empty.
         with mock.patch.object(
@@ -527,6 +539,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             side_effect=lambda payload: payload,
         ):
             graph.replay_context(context)
+            self.assertEqual(store.resolve_count, 2)
             self.assertEqual(queue.peek(), ())
             self.assertEqual(len(store.commits), 1)
 
@@ -561,8 +574,9 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             {item.binding_id: item.shape for item in request.inputs},
             {input_keys[0]: (2, 4), input_keys[1]: (1, 4)},
         )
-        self.assertIs(repeated.exception.request, request)
-        self.assertIs(replayed.exception.request, request)
+        self.assertEqual(repeated.exception.request, request)
+        self.assertEqual(replayed.exception.request, request)
+        self.assertEqual(queue.peek(), (request,))
         self.assertEqual(queue.peek(), (request,))
         self.assertEqual(store.commits, [])
 

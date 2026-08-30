@@ -181,7 +181,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
                     "read",
                     timing=timing,
                     implementation_capabilities=(("torch.export",),),
-                    capture_safe=False,
+                    capture_safe=True,
                     effects=(ScheduleEffect(ScheduleEffectKind.STATE_READ, "state"),),
                 ),
                 ScheduleTask(
@@ -197,7 +197,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
                     "after",
                     timing=timing,
                     implementation_capabilities=(("torch.export",),),
-                    capture_safe=False,
+                    capture_safe=True,
                     effects=(ScheduleEffect(ScheduleEffectKind.STATE_READ, "state"),),
                 ),
             ),

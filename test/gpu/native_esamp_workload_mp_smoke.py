@@ -289,7 +289,7 @@ def main() -> int:
             or physical.replay_count != 0
         ):
             raise AssertionError(
-                "native MP ESamp violated the signed non-capture execution contract: "
+                "native MP ESamp violated the signed eager execution contract: "
                 f"{physical!r}"
             )
         print(

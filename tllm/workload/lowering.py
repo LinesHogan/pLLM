@@ -72,6 +72,9 @@ def lower_schedule_graph(
         EffectKind.EXTERN_IO: ScheduleEffectKind.EXTERN_IO,
     }
     for workload in workloads:
+        state_transitions = {
+            state.name: state.transition for state in workload.states
+        }
         # extern_io names a process-global channel, not workload state: it is
         # never prefixed, so two workloads naming the same channel share it.
         extern_resources = {
@@ -124,9 +127,18 @@ def lower_schedule_graph(
                         sorted(common_capabilities)
                     ),
                     capture_safe=(
-                        not task.effects
-                        and all(
+                        all(
                             implementation.kind.value == "captured"
+                            for implementation in task.implementations
+                        )
+                        and all(
+                            effect.kind in (EffectKind.READ, EffectKind.CURRENT)
+                            and state_transitions.get(effect.state) == "optimizer"
+                            for effect in task.effects
+                        )
+                        and all(
+                            "runtime.async_host_safe"
+                            not in implementation.capabilities
                             for implementation in task.implementations
                         )
                     ),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import torch
@@ -120,6 +121,37 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
 
 
 class ESampRegionUnitTest(unittest.TestCase):
+    def test_piecewise_capture_is_limited_to_read_only_prediction(self) -> None:
+        workload = ESampWorkload(_config())
+        runtime = TllmRuntime(
+            workloads=(workload,), workload_memory_budget_bytes=1 << 20
+        )
+        runtime.cold_specialize_workloads(
+            RuntimeSpecializationSpec(
+                2, 4, torch.float32, torch.device("cpu")
+            )
+        )
+        for graph_mode in ("piecewise", "full"):
+            with self.subTest(graph_mode=graph_mode):
+                compilation = runtime.compile_workloads(
+                    replace(_timeline(), graph_mode=graph_mode)
+                )
+                regions = {
+                    task_name: region
+                    for region in compilation.decision.execution_regions
+                    for task_name in region.tasks
+                }
+
+                self.assertTrue(regions["predict"].capture_safe)
+                self.assertEqual(
+                    regions["predict"].capture_mode.value, "require"
+                )
+                for task_name in ("loss", "loss__optimize_distiller"):
+                    self.assertFalse(regions[task_name].capture_safe)
+                    self.assertEqual(
+                        regions[task_name].capture_mode.value, "disabled"
+                    )
+
     def test_native_dispatch_rejects_every_legacy_only_option(self) -> None:
         cases: tuple[tuple[dict[str, object], str], ...] = (
             ({"consumer_id": "custom"}, "consumer_id"),
