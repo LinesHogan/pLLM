@@ -6,6 +6,7 @@ from collections.abc import Mapping
 
 from tllm.program.decl import EdgeKind as ProgramEdgeKind
 from tllm.program.decl import StateSpec, declare_program
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.workgraph.frontend import (
     FlowProgramDecl,
     HiddenSource,
@@ -42,10 +43,11 @@ from tllm.workload.ir import (
 def _state_ir(name: str, spec: StateSpec) -> StateIR:
     old_scope = str(spec.scope)
     scope = StateScope(old_scope)
+    key: tuple[RequestKeyField, ...]
     if isinstance(spec.key, PromptIdxKey):
-        key = ("prompt_idx",)
+        key = (RequestKeyField.PROMPT_IDX,)
     elif isinstance(spec.key, RequestStateKey):
-        key = tuple(field.value for field in spec.key.fields)
+        key = spec.key.fields
     else:
         key = ()
     optimizer = spec.optimizer

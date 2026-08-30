@@ -124,7 +124,7 @@ def _snapshot_runtime_value(value: object) -> object:
 def _capture_runtime_hook_transaction(
     *, core: Any, runner: RunnerLike
 ) -> RuntimeHookTransaction:
-    from tllm.backends.vllm.runner_adapter import runner_model_module
+    from tllm.backends.protocol import runner_model_module
 
     model = runner_model_module(runner)
     modules = tuple(
@@ -611,7 +611,7 @@ def maybe_launch_post_logits_decode_work(*, core: Any, runner: Any) -> None:
 
 
 def setup_runtime_hooks_if_active(*, core: Any, runner: Any) -> None:
-    from tllm.backends.vllm.runner_adapter import runner_model_module
+    from tllm.backends.protocol import runner_model_module
 
     model = runner_model_module(runner)
     if not active_targets.runtime_has_active_targets(core.RUNTIME):

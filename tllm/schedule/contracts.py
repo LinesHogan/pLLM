@@ -9,6 +9,7 @@ from enum import Enum, StrEnum
 from typing import Mapping
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.request_identity import RequestKeyField
 
 
 def _name(value: object, label: str) -> str:
@@ -820,7 +821,7 @@ class ScheduleValue:
 class ScheduleState:
     resource: str
     scope: str
-    request_key: tuple[str, ...] = ()
+    request_key: tuple[RequestKeyField, ...] = ()
     storage: ScheduleStateStorage = ScheduleStateStorage.DYNAMIC
     transition: str = "optimizer"
 
@@ -828,10 +829,8 @@ class ScheduleState:
         object.__setattr__(self, "resource", _name(self.resource, "ScheduleState.resource"))
         if self.scope not in {"request", "replica", "shard", "global"}:
             raise ValueError("ScheduleState.scope is invalid")
-        if not isinstance(self.request_key, tuple) or any(
-            not isinstance(field, str) or not field for field in self.request_key
-        ):
-            raise TypeError("ScheduleState.request_key must be tuple[str, ...]")
+        if len(self.request_key) != len(set(self.request_key)):
+            raise ValueError("ScheduleState.request_key fields must be unique")
         if (self.scope == "request") != bool(self.request_key):
             raise ValueError("only request ScheduleState requires a request_key")
         object.__setattr__(self, "storage", ScheduleStateStorage(self.storage))
@@ -1066,7 +1065,21 @@ class ScheduleGraph:
                 ScheduleState(
                     resource=state["resource"],
                     scope=state["scope"],
-                    request_key=tuple(state.get("request_key", ())),
+                    request_key=tuple(
+                        RequestKeyField(
+                            _json_string(
+                                field,
+                                "ScheduleState.request_key"
+                                f"[{position}]",
+                            )
+                        )
+                        for position, field in enumerate(
+                            _json_array(
+                                state.get("request_key", ()),
+                                "ScheduleState.request_key",
+                            )
+                        )
+                    ),
                     storage=ScheduleStateStorage(
                         state.get("storage", ScheduleStateStorage.DYNAMIC.value)
                     ),

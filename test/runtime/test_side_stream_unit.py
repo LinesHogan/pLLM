@@ -18,6 +18,7 @@ from tllm.workload import (
     Between,
     State,
     StateScope,
+    RequestKeyField,
     declare_workload,
     provided,
     read,
@@ -97,7 +98,7 @@ def _stateful_declaration():
     class Stateful:
         bank = State(
             scope=StateScope.REQUEST,
-            key=request_key("request_id"),
+            key=request_key(RequestKeyField.REQUEST_ID),
             parameters="model",
             optimizer=AdamWSpec.fixed(1e-3),
         )

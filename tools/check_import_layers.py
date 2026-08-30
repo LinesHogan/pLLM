@@ -111,12 +111,17 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         # the signed schedule contract. Keep this narrower than a package-wide
         # dependency so neither layer can acquire general contract authority.
         ("tllm.schedule.contracts", "tllm.contracts.hidden_locator"),
+        ("tllm.schedule.contracts", "tllm.contracts.request_identity"),
         ("tllm.workload.frontend", "tllm.contracts.hidden_locator"),
+        ("tllm.workload.frontend", "tllm.contracts.request_identity"),
         ("tllm.workload.ir", "tllm.contracts.hidden_locator"),
+        ("tllm.workload.ir", "tllm.contracts.request_identity"),
         ("tllm.workload.staging", "tllm.contracts.workload_ports"),
         # Workload frontend adapters.
         ("tllm.workload.compat", "tllm.program.decl"),
+        ("tllm.workload.compat", "tllm.contracts.request_identity"),
         ("tllm.workload.compat", "tllm.workgraph.frontend"),
+        ("tllm.workload", "tllm.contracts.request_identity"),
         ("tllm.workload.lowering", "tllm.schedule.contracts"),
         ("tllm.workload.region_compiler", "tllm.schedule.contracts"),
         # Compiler composition and mechanical physical lowering.  The frozen

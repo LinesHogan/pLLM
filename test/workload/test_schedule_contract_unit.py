@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.schedule import (
     AsyncBatchCaptureMode,
     BackendObservableEvent,
@@ -294,6 +295,41 @@ def _submit_commands(
 
 
 class ScheduleContractUnitTest(unittest.TestCase):
+    def test_request_state_key_wire_is_closed_and_unique(self) -> None:
+        state = ScheduleState(
+            "request-weights",
+            "request",
+            request_key=(
+                RequestKeyField.REQUEST_ID,
+                RequestKeyField.SAMPLE_IDX,
+            ),
+        )
+        graph = ScheduleGraph(
+            workload_key="request-key-wire",
+            tasks=(),
+            states=(state,),
+            schema_version=3,
+        )
+        encoded = json.loads(graph.to_json())
+        self.assertEqual(
+            encoded["states"][0]["request_key"],
+            ["request_id", "sample_idx"],
+        )
+        self.assertEqual(ScheduleGraph.from_json(graph.to_json()).states, (state,))
+
+        unknown = json.loads(graph.to_json())
+        unknown["states"][0]["request_key"] = ["worker_slot"]
+        with self.assertRaisesRegex(ValueError, "worker_slot"):
+            ScheduleGraph.from_json(json.dumps(unknown))
+
+        duplicate = json.loads(graph.to_json())
+        duplicate["states"][0]["request_key"] = [
+            "request_id",
+            "request_id",
+        ]
+        with self.assertRaisesRegex(ValueError, "fields must be unique"):
+            ScheduleGraph.from_json(json.dumps(duplicate))
+
     def test_schedule_state_storage_is_closed_and_schema_v3_required(self) -> None:
         dynamic = ScheduleState(
             "ordinary",

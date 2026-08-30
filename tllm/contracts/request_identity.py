@@ -5,6 +5,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
+
+
+class RequestKeyField(StrEnum):
+    """Closed fields that can identify native request-scoped state."""
+
+    REQUEST_ID = "request_id"
+    PROMPT_IDX = "prompt_idx"
+    SAMPLE_IDX = "sample_idx"
 
 
 @dataclass(frozen=True, slots=True)

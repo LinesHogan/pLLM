@@ -8,10 +8,12 @@ import unittest
 from unittest import mock
 
 import torch
+import torch.nn.functional as F
 
 from tllm.consumers.esamp import engine as engine_module
 from tllm.consumers.esamp.config import AdaptationStreamMode, ESampConsumerConfig
 from tllm.consumers.esamp.engine import ESampTrainEngine, group_row_indices_by_prompt
+from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.runtime import residual_runtime as esamp_runtime
 
 
@@ -122,6 +124,137 @@ class ESampPerRequestUnitTest(unittest.TestCase):
         stats = consumer._require_stats()
         self.assertGreater(float(stats.loss_sum.item()), 0.0)
         self.assertEqual(int(stats.loss_count.item()), 2)
+
+    def test_legacy_per_request_prompt_key_oracle(self) -> None:
+        """Freeze the non-bank legacy key, update, and retention semantics.
+
+        The legacy engine receives only ``prompt_idxs``.  Consequently all
+        parallel sample rows for one prompt share a trainer and produce one
+        loss/optimizer update; a different prompt owns separate model and
+        optimizer state.  There is no request-finished input in this engine:
+        reading per-prompt metrics resets counters but retains those owners.
+        """
+        torch.manual_seed(17)
+        reference_a = LowRankGatedResidualModel(
+            hidden_size=4,
+            rank=2,
+            use_output_layernorm=True,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).train()
+        LowRankGatedResidualModel(
+            hidden_size=4,
+            rank=2,
+            use_output_layernorm=True,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).eval()
+        reference_b = LowRankGatedResidualModel(
+            hidden_size=4,
+            rank=2,
+            use_output_layernorm=True,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).train()
+        LowRankGatedResidualModel(
+            hidden_size=4,
+            rank=2,
+            use_output_layernorm=True,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).eval()
+
+        torch.manual_seed(17)
+        consumer = ESampTrainEngine(
+            hidden_dim=2,
+            lr=1e-2,
+            enabled=True,
+            per_request_models=True,
+            per_request_model_bank=False,
+        )
+        with mock.patch("torch.cuda.Stream"), mock.patch("torch.cuda.Event"), mock.patch(
+            "torch.cuda.stream", return_value=contextlib.nullcontext()
+        ), mock.patch("torch.cuda.current_stream", return_value=mock.Mock()):
+            consumer.ensure_resources(
+                device=torch.device("cpu"),
+                rows=4,
+                hidden_size=4,
+                hidden_dtype=torch.float32,
+            )
+
+        prompt_a = 71
+        prompt_b = 113
+        source_a = torch.tensor(
+            [
+                [0.1, -0.2, 0.3, -0.4],
+                [0.5, 0.6, -0.7, 0.8],
+                [-0.9, 1.0, 1.1, -1.2],
+            ],
+            dtype=torch.float32,
+        )
+        target_a = torch.tensor(
+            [
+                [-0.3, 0.2, 0.1, 0.4],
+                [0.8, -0.6, 0.5, -0.2],
+                [0.7, 0.9, -1.0, 1.1],
+            ],
+            dtype=torch.float32,
+        )
+        expected_a_loss = F.mse_loss(reference_a(source_a).float(), target_a.float())
+
+        with mock.patch("torch.cuda.current_stream", return_value=mock.Mock()), mock.patch(
+            "torch.cuda.stream", return_value=contextlib.nullcontext()
+        ):
+            consumer.launch_step(source_a, target_a)
+            consumer.launch_delayed_backward(3, (prompt_a, prompt_a, prompt_a))
+
+        self.assertEqual(set(consumer.state.per_request_trainers), {prompt_a})
+        trainer_a = consumer.state.per_request_trainers[prompt_a]
+        self.assertFalse(torch.equal(trainer_a.train_model.a, reference_a.a))
+        self.assertTrue(torch.equal(trainer_a.forward_model.a, trainer_a.train_model.a))
+
+        a_after_prompt_a = trainer_a.train_model.a.detach().clone()
+        source_b = torch.tensor(
+            [[1.0, -0.5, 0.25, -0.75], [-0.1, 0.2, -0.3, 0.4]],
+            dtype=torch.float32,
+        )
+        target_b = torch.tensor(
+            [[-0.4, 0.3, -0.2, 0.1], [0.9, -0.8, 0.7, -0.6]],
+            dtype=torch.float32,
+        )
+        expected_b_loss = F.mse_loss(reference_b(source_b).float(), target_b.float())
+
+        with mock.patch("torch.cuda.current_stream", return_value=mock.Mock()), mock.patch(
+            "torch.cuda.stream", return_value=contextlib.nullcontext()
+        ):
+            consumer.launch_step(source_b, target_b)
+            consumer.launch_delayed_backward(2, (prompt_b, prompt_b))
+
+        trainer_b = consumer.state.per_request_trainers[prompt_b]
+        self.assertIsNot(trainer_a.train_model, trainer_b.train_model)
+        self.assertIsNot(trainer_a.optimizer, trainer_b.optimizer)
+        self.assertTrue(torch.equal(trainer_a.train_model.a, a_after_prompt_a))
+        self.assertFalse(torch.equal(trainer_b.train_model.a, reference_b.a))
+        self.assertTrue(torch.equal(trainer_b.forward_model.a, trainer_b.train_model.a))
+        stats = consumer.read_and_reset_stats(sync=False)
+        self.assertEqual(stats.loss_count, 2)
+        self.assertAlmostEqual(
+            stats.loss_avg,
+            float(((expected_a_loss + expected_b_loss) / 2).item()),
+            places=6,
+        )
+
+        per_request = consumer.read_and_reset_per_request_stats(sync=False)
+        self.assertEqual(set(per_request), {prompt_a, prompt_b})
+        self.assertEqual(per_request[prompt_a].loss_count, 1)
+        self.assertEqual(per_request[prompt_b].loss_count, 1)
+        # Metric reset is not request cleanup: both prompt-keyed trainers persist.
+        self.assertIs(consumer.state.per_request_trainers[prompt_a], trainer_a)
+        self.assertIs(consumer.state.per_request_trainers[prompt_b], trainer_b)
+        retained = consumer.read_and_reset_per_request_stats(sync=False)
+        self.assertEqual(set(retained), {prompt_a, prompt_b})
+        self.assertEqual(retained[prompt_a].loss_count, 0)
+        self.assertEqual(retained[prompt_b].loss_count, 0)
 
     def test_shared_graph_replay_failure_disables_graph_and_falls_back(self) -> None:
         device = torch.device("cpu")

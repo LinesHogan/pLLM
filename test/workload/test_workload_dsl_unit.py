@@ -19,6 +19,7 @@ from tllm.workload import (
     RegionCallableArtifact,
     State,
     StateScope,
+    RequestKeyField,
     declare_workload,
     hidden,
     maybe_transition,
@@ -114,7 +115,10 @@ class WorkloadDslUnitTest(unittest.TestCase):
         class ESamp:
             distiller = State(
                 scope=StateScope.REQUEST,
-                key=request_key("request_id", "sample_idx"),
+                key=request_key(
+                    RequestKeyField.REQUEST_ID,
+                    RequestKeyField.SAMPLE_IDX,
+                ),
                 parameters="model",
                 optimizer=AdamWSpec.fixed(1e-3),
             )
@@ -144,7 +148,10 @@ class WorkloadDslUnitTest(unittest.TestCase):
         self.assertEqual(tuple(task.name for task in ir.tasks), ("predict_and_loss", "update"))
         self.assertEqual(ir.schedule, ("predict_and_loss", "update"))
         self.assertEqual(ir.states[0].name, "distiller")
-        self.assertEqual(ir.states[0].request_key, ("request_id", "sample_idx"))
+        self.assertEqual(
+            ir.states[0].request_key,
+            (RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX),
+        )
         self.assertEqual(ir.tasks[0].domain.name, "tokens")
         self.assertEqual(ir.edges[0].kind.value, "data")
         self.assertEqual(len(ir.semantic_key), 64)
@@ -154,7 +161,10 @@ class WorkloadDslUnitTest(unittest.TestCase):
         self.assertEqual(graph.schema_version, 3)
         self.assertEqual(graph.states[0].resource, "distiller")
         self.assertEqual(graph.states[0].scope, "request")
-        self.assertEqual(graph.states[0].request_key, ("request_id", "sample_idx"))
+        self.assertEqual(
+            graph.states[0].request_key,
+            (RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX),
+        )
         self.assertEqual(graph.tasks[0].effects[0].resource, "distiller")
         self.assertEqual(
             graph.tasks[0].implementation_capabilities,
@@ -318,7 +328,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
 
         state = State(
             scope=StateScope.REQUEST,
-            key=request_key("request_id"),
+            key=request_key(RequestKeyField.REQUEST_ID),
             parameters="model",
         )
         with self.assertRaisesRegex(ValueError, "transition.*optimizer"):
@@ -419,6 +429,21 @@ class WorkloadDslUnitTest(unittest.TestCase):
         esamp_ir = declare_workload(esamp).ir
         self.assertEqual(esamp_ir.workload_id, "esamp")
         self.assertEqual(esamp_ir.schedule, ("predict_and_loss", "update"))
+        self.assertEqual(
+            esamp_ir.states[0].request_key,
+            (),
+        )
+
+        per_request_esamp = build_esamp_workload(
+            ESampConsumerConfig(
+                implementation="legacy",
+                per_request_models=True,
+            )
+        )
+        self.assertEqual(
+            declare_workload(per_request_esamp).ir.states[0].request_key,
+            (RequestKeyField.PROMPT_IDX,),
+        )
 
     def test_step_id_is_a_typed_input_not_a_reserved_provider_name(self) -> None:
         @workload(id="typed.step")

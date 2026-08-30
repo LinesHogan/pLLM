@@ -15,6 +15,7 @@ from enum import Enum, StrEnum
 from typing import Mapping, cast
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.request_identity import RequestKeyField
 
 
 class StateScope(StrEnum):
@@ -148,7 +149,7 @@ class OptimizerSpec:
 class StateIR:
     name: str
     scope: StateScope
-    request_key: tuple[str, ...]
+    request_key: tuple[RequestKeyField, ...]
     parameters: tuple[str, ...]
     optimizer: OptimizerSpec | None
     storage: StateStorage = StateStorage.DYNAMIC
@@ -157,7 +158,8 @@ class StateIR:
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _nonempty(self.name, "StateIR.name"))
         object.__setattr__(self, "scope", StateScope(self.scope))
-        object.__setattr__(self, "request_key", _str_tuple(self.request_key, "StateIR.request_key"))
+        if len(self.request_key) != len(set(self.request_key)):
+            raise ValueError("StateIR.request_key fields must be unique")
         object.__setattr__(self, "parameters", _str_tuple(self.parameters, "StateIR.parameters"))
         object.__setattr__(self, "storage", StateStorage(self.storage))
         if self.scope is StateScope.REQUEST and not self.request_key:

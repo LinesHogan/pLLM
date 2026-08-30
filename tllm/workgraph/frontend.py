@@ -16,6 +16,7 @@ from tllm.contracts.physical_plan import (
     TensorDTypeDesc,
     TensorDeviceDesc,
 )
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.ports.address import PortAddressDesc
 from tllm.ports.base import TimingDeadline
 from tllm.ports.port_id import PortId
@@ -787,12 +788,6 @@ class ResultRef:
 @dataclass(frozen=True, slots=True)
 class PromptIdxKey:
     """State key source: prompt identity from bundle metadata."""
-
-
-class RequestKeyField(StrEnum):
-    REQUEST_ID = "request_id"
-    PROMPT_IDX = "prompt_idx"
-    SAMPLE_IDX = "sample_idx"
 
 
 @dataclass(frozen=True, slots=True)

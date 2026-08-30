@@ -66,6 +66,7 @@ from tllm.workload.config import (
 )
 from tllm.workload.staging import StagedLifecycle, StagedPort
 from tllm.workload.host import HostOutput
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.workload.ir import (
     ApproximationPolicy,
     EffectKind,
@@ -137,6 +138,7 @@ __all__ = [
     "OptimizerSpec",
     "NumericConstraint",
     "RequestKey",
+    "RequestKeyField",
     "PublishedModule",
     "ServiceState",
     "RegionArtifactRegistry",

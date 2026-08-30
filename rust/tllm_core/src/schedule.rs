@@ -148,6 +148,17 @@ enum StateScope {
     Global,
 }
 
+/// Closed request-identity projection for request-scoped native state.
+/// Python authoring exports the matching ``RequestKeyField`` enum; only its
+/// string wire representation crosses this JSON boundary.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum RequestKeyField {
+    RequestId,
+    PromptIdx,
+    SampleIdx,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ScheduleStateStorage {
@@ -478,7 +489,7 @@ struct ScheduleState {
     resource: String,
     scope: StateScope,
     #[serde(default)]
-    request_key: Vec<String>,
+    request_key: Vec<RequestKeyField>,
     #[serde(default)]
     storage: Option<ScheduleStateStorage>,
     transition: String,
@@ -2079,9 +2090,12 @@ fn validate_inputs(
     let capabilities: BTreeSet<&str> = timeline.capabilities.iter().map(String::as_str).collect();
     let mut state_resources = BTreeSet::new();
     for state in &graph.states {
+        let request_key_fields: BTreeSet<RequestKeyField> =
+            state.request_key.iter().copied().collect();
         if state.resource.is_empty()
             || state.transition.is_empty()
             || (state.scope == StateScope::Request) != !state.request_key.is_empty()
+            || request_key_fields.len() != state.request_key.len()
             || (graph.schema_version == 3 && state.storage.is_none())
             || (graph.schema_version < 3 && state.storage.is_some())
             || !state_resources.insert(state.resource.as_str())
@@ -5696,9 +5710,32 @@ mod tests {
         validate_schedule, workload_compilation_wire_cache_key, AsyncBatchCaptureMode,
         CompileOptions, Decision, ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind,
         RegionCaptureMode, RegionFallbackPolicy, RegionHostSubmission, RegionInputBinding,
-        RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleInput,
+        RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleGraph,
+        ScheduleInput,
     };
     use isl_rs::{Context, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
+
+    #[test]
+    fn request_state_key_fields_are_closed_and_unique() {
+        let graph = r#"{"workload_key":"request-key","tasks":[],"edges":[],"values":[],"states":[{"resource":"weights","scope":"request","request_key":["request_id","sample_idx"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":3}"#;
+        let parsed: ScheduleGraph = serde_json::from_str(graph).unwrap();
+        assert_eq!(parsed.states[0].request_key.len(), 2);
+
+        let unknown = graph.replace("sample_idx", "worker_slot");
+        assert!(serde_json::from_str::<ScheduleGraph>(&unknown).is_err());
+
+        let duplicate = graph.replace(
+            "[\"request_id\",\"sample_idx\"]",
+            "[\"request_id\",\"request_id\"]",
+        );
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+        let error = compile_schedule(&duplicate, timeline, options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid or duplicate typed schedule state"));
+    }
 
     #[test]
     fn worker_runtime_facts_are_closed_complete_and_exact() {

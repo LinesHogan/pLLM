@@ -239,7 +239,7 @@ def install_layer_forward_taps(
             orig_forward=orig_forward,
         )
     if capture_resident:
-        from tllm.backends.vllm.runner_adapter import runner_model_module
+        from tllm.backends.protocol import runner_model_module
 
         model = runner_model_module(runner)
         resolved_layer_items = tuple(resolved_layers.items())

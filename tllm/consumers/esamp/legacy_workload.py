@@ -11,6 +11,7 @@ from tllm.workload import (
     Between,
     State,
     StateScope,
+    RequestKeyField,
     WorkloadAuthority,
     hidden,
     read,
@@ -112,7 +113,11 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
     per_request = bool(resolved.per_request_models)
     distiller = State(
         scope=StateScope.REQUEST if per_request else StateScope.REPLICA,
-        key=request_key("request_id", "sample_idx") if per_request else None,
+        key=(
+            request_key(RequestKeyField.PROMPT_IDX)
+            if per_request
+            else None
+        ),
         parameters="distiller",
         optimizer=AdamWSpec.fixed(float(resolved.distiller_lr)),
     )

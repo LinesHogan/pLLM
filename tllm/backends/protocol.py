@@ -23,6 +23,31 @@ from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.typed_replay import TypedLayerReplayHandle
 
+
+def runner_model_module(runner: object) -> "torch.nn.Module":
+    """Resolve an unwrapped model at the external-runner protocol boundary."""
+
+    import torch
+
+    get_model = getattr(runner, "get_model", None)
+    model = get_model() if callable(get_model) else None
+    if not isinstance(model, torch.nn.Module):
+        model = getattr(runner, "model", None)
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("inference runner must expose an unwrapped torch.nn.Module")
+    return model
+
+
+def runner_device(runner: object) -> "torch.device":
+    """Resolve the runner device at the external protocol boundary."""
+
+    import torch
+
+    device = getattr(runner, "device", None)
+    if not isinstance(device, torch.device):
+        raise TypeError("inference runner must expose a torch.device")
+    return device
+
 if TYPE_CHECKING:
     import torch
     from tllm.runtime.parameter_overlay import (

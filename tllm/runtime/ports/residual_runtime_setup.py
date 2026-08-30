@@ -90,7 +90,7 @@ class CoreLike(Protocol):
 
 
 def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeSetup:
-    from tllm.backends.vllm.runner_adapter import runner_model_module
+    from tllm.backends.protocol import runner_model_module
 
     model = runner_model_module(runner)
     cfg = core.RUNTIME.config
@@ -199,7 +199,7 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
 
 
 def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntimeSetup) -> None:
-    from tllm.backends.vllm.runner_adapter import runner_device
+    from tllm.backends.protocol import runner_device
 
     device = runner_device(runner)
     core.RUNTIME.decode_row_idx = torch.zeros((setup.rows,), device=device, dtype=torch.long)

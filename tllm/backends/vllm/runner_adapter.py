@@ -7,13 +7,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, SupportsInt
 
-import torch
-
 from tllm.backends.protocol import (
     RUNNER_BINDING_ATTR,
     RunnerBinding,
     RunnerBindingDriver,
+    runner_device,
     runner_binding_for,
+    runner_model_module,
 )
 
 _BINDING_ATTR = RUNNER_BINDING_ATTR
@@ -57,25 +57,6 @@ def _model_layers(model: object) -> Sequence[object]:
 
 def runner_model_identity(runner: object) -> int:
     return id(runner_model_module(runner))
-
-
-def runner_device(runner: object) -> torch.device:
-    device = getattr(runner, "device", None)
-    if not isinstance(device, torch.device):
-        raise TypeError("vLLM runner must expose a torch.device")
-    return device
-
-
-def runner_model_module(runner: object) -> torch.nn.Module:
-    """Resolve vLLM's unwrapped model in the external-runner quarantine."""
-
-    get_model = getattr(runner, "get_model", None)
-    model = get_model() if callable(get_model) else None
-    if not isinstance(model, torch.nn.Module):
-        model = getattr(runner, "model", None)
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError("vLLM runner must expose an unwrapped torch.nn.Module")
-    return model
 
 
 def runner_model_layer_count(runner: object) -> int:

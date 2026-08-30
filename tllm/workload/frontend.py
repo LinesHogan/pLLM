@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Generic, Never, ParamSpec, Protocol, Self, Typ
 from weakref import WeakKeyDictionary
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.workload.config import ConfigAtom, ConfigField, WorkloadConfig
 from tllm.workload.staging import StagedPort
 from tllm.workload.host import HostOutput
@@ -49,9 +50,6 @@ if TYPE_CHECKING:
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 _T = TypeVar("_T")
-_REQUEST_KEY_FIELDS = frozenset({"request_id", "prompt_idx", "sample_idx"})
-
-
 def _name(value: str, label: str) -> str:
     if not value:
         raise ValueError(f"{label} must be non-empty")
@@ -60,21 +58,16 @@ def _name(value: str, label: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RequestKey:
-    fields: tuple[str, ...]
+    fields: tuple[RequestKeyField, ...]
 
     def __post_init__(self) -> None:
         if not self.fields:
             raise ValueError("request_key requires at least one field")
-        normalized = tuple(_name(field, "request_key field") for field in self.fields)
-        unknown = tuple(field for field in normalized if field not in _REQUEST_KEY_FIELDS)
-        if unknown:
-            raise ValueError(f"unsupported request_key fields: {', '.join(unknown)}")
-        if len(normalized) != len(set(normalized)):
+        if len(self.fields) != len(set(self.fields)):
             raise ValueError("request_key fields must be unique")
-        object.__setattr__(self, "fields", normalized)
 
 
-def request_key(*fields: str) -> RequestKey:
+def request_key(*fields: RequestKeyField) -> RequestKey:
     return RequestKey(tuple(fields))
 
 
