@@ -88,7 +88,13 @@ class DenseOperandCapture:
     rows: tuple[OverlayCaptureRows, ...]
     down_proj_input: torch.Tensor
     mlp_input: torch.Tensor
-    base_weight: torch.Tensor
+    base_weight: BaseWeightLease
+
+
+@dataclass(frozen=True, slots=True)
+class BaseWeightLease:
+    target: OverlayTarget
+    tensor: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +463,7 @@ class OverlayVersionStore:
 
 __all__ = [
     "OverlayChannel",
+    "BaseWeightLease",
     "OverlayCaptureRows",
     "DenseOperandCapture",
     "DenseOperandCaptureBatch",

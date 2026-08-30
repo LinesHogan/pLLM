@@ -19,13 +19,13 @@ from tllm.consumers.inplace_ttt.workload import (
     InPlaceTTTConfig,
     InPlaceTTTFastWeightState,
     InPlaceTTTKey,
-    InPlaceTTTMetadata,
     InPlaceTTTPhase,
     InPlaceTTTWorkload,
 )
 from test.core.oracles.inplace_ttt import oracle_exact_step
 from tllm.contracts.request_identity import RequestFinishedBatch, RequestIdentity
 from tllm.runtime.parameter_overlay import (
+    BaseWeightLease,
     DenseOperandCapture,
     DenseOperandCaptureBatch,
     OverlayCaptureRows,
@@ -108,6 +108,45 @@ def _drive(
             execution.state_versions.observed_version("fast_weights", None),
             execution.state_versions.observed_version("overlay_versions", None),
         )
+
+
+def _captured_batch(
+    request: RequestIdentity,
+    *,
+    layers: tuple[int, ...],
+    phase: OverlayRowPhase,
+    hidden: torch.Tensor,
+    target: torch.Tensor,
+    base_weight: torch.Tensor,
+    step_id: int,
+) -> DenseOperandCaptureBatch:
+    packed_rows = tuple(range(hidden.shape[0]))
+    return DenseOperandCaptureBatch(
+        tuple(
+            DenseOperandCapture(
+                step_id=step_id,
+                target=OverlayTarget(layer, "mlp", "down_proj.weight"),
+                rows=(
+                    OverlayCaptureRows(
+                        target=OverlayTarget(
+                            layer, "mlp", "down_proj.weight"
+                        ),
+                        request=request,
+                        phase=phase,
+                        packed_rows=packed_rows,
+                        token_offsets=packed_rows,
+                    ),
+                ),
+                down_proj_input=hidden,
+                mlp_input=target,
+                base_weight=BaseWeightLease(
+                    OverlayTarget(layer, "mlp", "down_proj.weight"),
+                    base_weight,
+                ),
+            )
+            for layer in layers
+        )
+    )
 
 
 class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
@@ -230,7 +269,9 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
                 ),
                 down_proj_input=hidden,
                 mlp_input=target,
-                base_weight=base,
+                base_weight=BaseWeightLease(
+                    OverlayTarget(layer, "mlp", "down_proj.weight"), base
+                ),
             )
             for layer in (0, 1)
         )
@@ -272,6 +313,82 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         self.assertEqual(workload.fast_weights.slots, {})
         self.assertEqual(workload.overlay_versions.store.lineages(), ())
 
+    def test_adjacent_mixed_phases_share_one_enabled_update_group(self) -> None:
+        workload, runtime, compilation = _build(
+            InPlaceTTTConfig(
+                chunk_size=2,
+                learning_rate=0.3,
+                update_prefill=True,
+                update_decode=True,
+            )
+        )
+        request = RequestIdentity("mixed", 0, 0)
+        target_spec = OverlayTarget(0, "mlp", "down_proj.weight")
+        hidden = torch.tensor(
+            [[1.0, -0.5, 0.25], [0.2, 0.4, -0.3]],
+            dtype=torch.float64,
+        )
+        target = torch.tensor(
+            [[0.5, -0.25], [0.1, 0.75]], dtype=torch.float64
+        )
+        base = torch.tensor(
+            [[0.2, -0.3, 0.5], [0.4, 0.1, -0.2]],
+            dtype=torch.float64,
+        )
+        capture = DenseOperandCapture(
+            step_id=1,
+            target=target_spec,
+            rows=(
+                OverlayCaptureRows(
+                    target_spec,
+                    request,
+                    OverlayRowPhase.PREFILL,
+                    (0,),
+                    (0,),
+                ),
+                OverlayCaptureRows(
+                    target_spec,
+                    request,
+                    OverlayRowPhase.DECODE,
+                    (1,),
+                    (1,),
+                ),
+            ),
+            down_proj_input=hidden,
+            mlp_input=target,
+            base_weight=BaseWeightLease(target_spec, base),
+        )
+
+        self.assertEqual(
+            _drive(
+                runtime,
+                compilation,
+                1,
+                captured=DenseOperandCaptureBatch((capture,)),
+            ),
+            (1, 1),
+        )
+        (step_bundle,) = runtime.drain(InPlaceTTTWorkload.captured_steps)
+        self.assertEqual(len(step_bundle.steps), 1)
+        self.assertEqual(step_bundle.steps[0].update_count, 1)
+        expected = oracle_exact_step(
+            hidden,
+            target,
+            base,
+            chunk_size=2,
+            learning_rate=0.3,
+        )
+        torch.testing.assert_close(step_bundle.steps[0].weight, expected.weight)
+        (publication_bundle,) = runtime.drain(
+            InPlaceTTTWorkload.captured_publications
+        )
+        self.assertEqual(len(publication_bundle.publications), 1)
+        lineage = publication_bundle.publications[0].version
+        assert lineage is not None
+        self.assertEqual(
+            len(workload.overlay_versions.store.versions(lineage.lineage)), 1
+        )
+
     def test_exact_chunk_output_precedes_update_and_publishes_owned_weight(self) -> None:
         config = InPlaceTTTConfig(
             layers=(0,), chunk_size=2, learning_rate=0.3
@@ -289,18 +406,29 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         )
         expected_output = hidden @ base.transpose(0, 1)
         expected_weight = base + 0.3 * (target.transpose(0, 1) @ hidden)
-        runtime.stage_pair(
-            InPlaceTTTWorkload.batch_tensors,
-            {"hidden": hidden, "target": target, "base_weight": base},
-            InPlaceTTTWorkload.batch_metadata,
-            InPlaceTTTMetadata(InPlaceTTTKey(request, 0), InPlaceTTTPhase.PREFILL),
+        self.assertEqual(
+            _drive(
+                runtime,
+                compilation,
+                1,
+                captured=_captured_batch(
+                    request,
+                    layers=(0,),
+                    phase=OverlayRowPhase.PREFILL,
+                    hidden=hidden,
+                    target=target,
+                    base_weight=base,
+                    step_id=1,
+                ),
+            ),
+            (1, 1),
         )
-
-        self.assertEqual(_drive(runtime, compilation, 1), (1, 1))
-        step = runtime.drain(InPlaceTTTWorkload.steps)[0]
+        step = runtime.drain(InPlaceTTTWorkload.captured_steps)[0].steps[0]
         torch.testing.assert_close(step.output, expected_output)
         torch.testing.assert_close(step.weight, expected_weight)
-        publication = runtime.drain(InPlaceTTTWorkload.publications)[0]
+        publication = runtime.drain(
+            InPlaceTTTWorkload.captured_publications
+        )[0].publications[0]
         assert publication.version is not None
         materialized = workload.overlay_versions.store.materialize(
             publication.version
@@ -320,27 +448,58 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         hidden = torch.ones((2, 3), dtype=torch.float64)
         target = torch.ones((2, 2), dtype=torch.float64)
         base = torch.ones((2, 3), dtype=torch.float64)
-        runtime.stage_pair(
-            InPlaceTTTWorkload.batch_tensors,
-            {"hidden": hidden, "target": target, "base_weight": base},
-            InPlaceTTTWorkload.batch_metadata,
-            InPlaceTTTMetadata(InPlaceTTTKey(request, 0), InPlaceTTTPhase.PREFILL),
+        self.assertEqual(
+            _drive(
+                runtime,
+                compilation,
+                1,
+                captured=_captured_batch(
+                    request,
+                    layers=(0,),
+                    phase=OverlayRowPhase.PREFILL,
+                    hidden=hidden,
+                    target=target,
+                    base_weight=base,
+                    step_id=1,
+                ),
+            ),
+            (1, 0),
         )
-        self.assertEqual(_drive(runtime, compilation, 1), (1, 0))
-        self.assertEqual(runtime.drain(InPlaceTTTWorkload.steps)[0].tail_rows, 2)
-        self.assertIsNone(runtime.drain(InPlaceTTTWorkload.publications)[0].version)
+        self.assertEqual(
+            runtime.drain(InPlaceTTTWorkload.captured_steps)[0]
+            .steps[0]
+            .tail_rows,
+            2,
+        )
+        self.assertIsNone(
+            runtime.drain(InPlaceTTTWorkload.captured_publications)[0]
+            .publications[0]
+            .version
+        )
 
         decode_request = RequestIdentity("req-decode", 2, 0)
-        runtime.stage_pair(
-            InPlaceTTTWorkload.batch_tensors,
-            {"hidden": hidden, "target": target, "base_weight": base},
-            InPlaceTTTWorkload.batch_metadata,
-            InPlaceTTTMetadata(
-                InPlaceTTTKey(decode_request, 0), InPlaceTTTPhase.DECODE
+        self.assertEqual(
+            _drive(
+                runtime,
+                compilation,
+                2,
+                captured=_captured_batch(
+                    decode_request,
+                    layers=(0,),
+                    phase=OverlayRowPhase.DECODE,
+                    hidden=hidden,
+                    target=target,
+                    base_weight=base,
+                    step_id=2,
+                ),
             ),
+            (1, 0),
         )
-        self.assertEqual(_drive(runtime, compilation, 2), (1, 0))
-        self.assertFalse(runtime.drain(InPlaceTTTWorkload.steps)[0].state_changed)
+        self.assertFalse(
+            runtime.drain(InPlaceTTTWorkload.captured_steps)[0]
+            .steps[0]
+            .state_changed
+        )
         self.assertEqual(workload.update_count, 0)
 
     def test_finished_request_releases_tail_and_overlay_lease(self) -> None:
@@ -348,18 +507,23 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
             InPlaceTTTConfig(chunk_size=2)
         )
         request = RequestIdentity("req-finish", 0, 0)
-        runtime.stage_pair(
-            InPlaceTTTWorkload.batch_tensors,
-            {
-                "hidden": torch.ones((2, 3), dtype=torch.float64),
-                "target": torch.ones((2, 2), dtype=torch.float64),
-                "base_weight": torch.ones((2, 3), dtype=torch.float64),
-            },
-            InPlaceTTTWorkload.batch_metadata,
-            InPlaceTTTMetadata(InPlaceTTTKey(request, 0), InPlaceTTTPhase.PREFILL),
+        _drive(
+            runtime,
+            compilation,
+            1,
+            captured=_captured_batch(
+                request,
+                layers=(0,),
+                phase=OverlayRowPhase.PREFILL,
+                hidden=torch.ones((2, 3), dtype=torch.float64),
+                target=torch.ones((2, 2), dtype=torch.float64),
+                base_weight=torch.ones((2, 3), dtype=torch.float64),
+                step_id=1,
+            ),
         )
-        _drive(runtime, compilation, 1)
-        (publication,) = runtime.drain(InPlaceTTTWorkload.publications)
+        publication = runtime.drain(
+            InPlaceTTTWorkload.captured_publications
+        )[0].publications[0]
         assert publication.version is not None
         lease_key = OverlayLeaseKey(request, publication.version.lineage)
         self.assertIsNotNone(workload.overlay_versions.store.pinned(lease_key))
@@ -384,20 +548,23 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         request = RequestIdentity("req-multi-layer", 0, 0)
         lease_keys: list[OverlayLeaseKey] = []
         for step_id, layer in enumerate((0, 1), start=1):
-            runtime.stage_pair(
-                InPlaceTTTWorkload.batch_tensors,
-                {
-                    "hidden": torch.ones((2, 3), dtype=torch.float64),
-                    "target": torch.ones((2, 2), dtype=torch.float64),
-                    "base_weight": torch.ones((2, 3), dtype=torch.float64),
-                },
-                InPlaceTTTWorkload.batch_metadata,
-                InPlaceTTTMetadata(
-                    InPlaceTTTKey(request, layer), InPlaceTTTPhase.PREFILL
+            _drive(
+                runtime,
+                compilation,
+                step_id,
+                captured=_captured_batch(
+                    request,
+                    layers=(layer,),
+                    phase=OverlayRowPhase.PREFILL,
+                    hidden=torch.ones((2, 3), dtype=torch.float64),
+                    target=torch.ones((2, 2), dtype=torch.float64),
+                    base_weight=torch.ones((2, 3), dtype=torch.float64),
+                    step_id=step_id,
                 ),
             )
-            _drive(runtime, compilation, step_id)
-            (publication,) = runtime.drain(InPlaceTTTWorkload.publications)
+            publication = runtime.drain(
+                InPlaceTTTWorkload.captured_publications
+            )[0].publications[0]
             assert publication.version is not None
             lease_keys.append(
                 OverlayLeaseKey(request, publication.version.lineage)

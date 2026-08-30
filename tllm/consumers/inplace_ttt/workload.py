@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -103,12 +102,6 @@ class InPlaceTTTBatch:
 
 
 @dataclass(frozen=True, slots=True)
-class InPlaceTTTMetadata:
-    key: InPlaceTTTKey
-    phase: InPlaceTTTPhase
-
-
-@dataclass(frozen=True, slots=True)
 class InPlaceTTTStep:
     key: InPlaceTTTKey
     output: torch.Tensor
@@ -134,6 +127,14 @@ class InPlaceTTTStepBundle:
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTPublicationBundle:
     publications: tuple[InPlaceTTTPublication, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedUpdateGroup:
+    request: RequestIdentity
+    phase: InPlaceTTTPhase
+    update_enabled: bool
+    packed_rows: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,16 +226,12 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
     overlay_versions: ServiceState[InPlaceTTTOverlayState] = State[
         InPlaceTTTOverlayState
     ].service(transition="overlay_publish")
-    batch_tensors: StagedPort[Mapping[str, torch.Tensor]] = StagedPort()
-    batch_metadata: StagedPort[InPlaceTTTMetadata] = StagedPort()
     captured_operands: StagedPort[DenseOperandCaptureBatch] = StagedPort(
         lifecycle=StagedLifecycle.DENSE_OPERAND_CAPTURED
     )
     finished_requests: StagedPort[RequestFinishedBatch] = StagedPort(
         lifecycle=StagedLifecycle.REQUEST_FINISHED
     )
-    steps: HostOutput[InPlaceTTTStep] = HostOutput()
-    publications: HostOutput[InPlaceTTTPublication] = HostOutput()
     captured_steps: HostOutput[InPlaceTTTStepBundle] = HostOutput()
     captured_publications: HostOutput[InPlaceTTTPublicationBundle] = HostOutput()
     cleanup: HostOutput[InPlaceTTTCleanupReceipt] = HostOutput()
@@ -274,46 +271,6 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         )
 
     @task(
-        inputs={
-            "tensors": staged(batch_tensors),
-            "metadata": staged(batch_metadata),
-        },
-        outputs={"step": host_output(steps)},
-        effects=(maybe_transition(fast_weights),),
-        timing=Between("model.execute", "step.end"),
-        implementation=extern("tllm.inplace_ttt:exact_fast_weight@1"),
-    )
-    def update(
-        self,
-        tensors: Mapping[str, torch.Tensor],
-        metadata: InPlaceTTTMetadata,
-    ) -> InPlaceTTTStep:
-        batch = InPlaceTTTBatch(
-            metadata.key,
-            metadata.phase,
-            tensors["hidden"],
-            tensors["target"],
-            tensors["base_weight"],
-        )
-        update_enabled = (
-            self.config.update_prefill
-            if batch.phase is InPlaceTTTPhase.PREFILL
-            else self.config.update_decode
-        )
-        step = self.fast_weights.execute(
-            batch,
-            chunk_size=self.config.chunk_size,
-            learning_rate=self.config.learning_rate,
-            update_enabled=update_enabled,
-        )
-        if step.state_changed:
-            self.advance_state(InPlaceTTTWorkload.fast_weights)
-        self.update_count += step.update_count
-        self.trained_rows += step.trained_rows
-        self.fast_weight_slot_count = len(self.fast_weights.slots)
-        return step
-
-    @task(
         inputs={"batch": staged(captured_operands)},
         outputs={"steps": host_output(captured_steps)},
         effects=(maybe_transition(fast_weights),),
@@ -333,12 +290,14 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         steps: list[InPlaceTTTStep] = []
         state_changed = False
         for capture in batch.captures:
-            for rows in capture.rows:
-                row_index = torch.tensor(
-                    rows.packed_rows,
-                    device=capture.down_proj_input.device,
-                    dtype=torch.long,
+            if capture.base_weight.target != capture.target or any(
+                rows.target != capture.target for rows in capture.rows
+            ):
+                raise RuntimeError(
+                    "captured operands do not match their declared target"
                 )
+            groups: list[_CapturedUpdateGroup] = []
+            for rows in capture.rows:
                 phase = (
                     InPlaceTTTPhase.PREFILL
                     if rows.phase is OverlayRowPhase.PREFILL
@@ -349,19 +308,52 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
                     if phase is InPlaceTTTPhase.PREFILL
                     else self.config.update_decode
                 )
+                if (
+                    groups
+                    and groups[-1].request == rows.request
+                    and groups[-1].update_enabled == update_enabled
+                    and groups[-1].packed_rows[-1] + 1
+                    == rows.packed_rows[0]
+                ):
+                    previous = groups[-1]
+                    groups[-1] = _CapturedUpdateGroup(
+                        request=previous.request,
+                        phase=previous.phase,
+                        update_enabled=previous.update_enabled,
+                        packed_rows=(
+                            previous.packed_rows + rows.packed_rows
+                        ),
+                    )
+                else:
+                    groups.append(
+                        _CapturedUpdateGroup(
+                            request=rows.request,
+                            phase=phase,
+                            update_enabled=update_enabled,
+                            packed_rows=rows.packed_rows,
+                        )
+                    )
+            for group in groups:
+                row_index = torch.tensor(
+                    group.packed_rows,
+                    device=capture.down_proj_input.device,
+                    dtype=torch.long,
+                )
                 step = self.fast_weights.execute(
                     InPlaceTTTBatch(
-                        key=InPlaceTTTKey(rows.request, capture.target.layer),
-                        phase=phase,
+                        key=InPlaceTTTKey(
+                            group.request, capture.target.layer
+                        ),
+                        phase=group.phase,
                         hidden=capture.down_proj_input.index_select(
                             0, row_index
                         ),
                         target=capture.mlp_input.index_select(0, row_index),
-                        base_weight=capture.base_weight,
+                        base_weight=capture.base_weight.tensor,
                     ),
                     chunk_size=self.config.chunk_size,
                     learning_rate=self.config.learning_rate,
-                    update_enabled=update_enabled,
+                    update_enabled=group.update_enabled,
                 )
                 steps.append(step)
                 state_changed = state_changed or step.state_changed
@@ -371,31 +363,6 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
             self.advance_state(InPlaceTTTWorkload.fast_weights)
         self.fast_weight_slot_count = len(self.fast_weights.slots)
         return InPlaceTTTStepBundle(tuple(steps))
-
-    @task(
-        inputs={"step": result("update", "step")},
-        outputs={"publication": host_output(publications)},
-        effects=(read(fast_weights), maybe_transition(overlay_versions)),
-        timing=Before("next.prepare"),
-        implementation=extern(
-            "tllm.parameter_overlay:publish_exact@1",
-            capabilities=(
-                "eager_only",
-                "parameter_overlay/representation/dense_replace",
-                "parameter_overlay/scope/request",
-                "parameter_overlay/phase/prefill",
-                "parameter_overlay/phase/decode",
-                "parameter_overlay/pinning/explicit_request_advance",
-                "parameter_overlay/mixed_versions/true",
-                "parameter_overlay/tensor_parallel_size/1",
-            ),
-        ),
-    )
-    def publish(self, step: InPlaceTTTStep) -> InPlaceTTTPublication:
-        publication = self._publish_step(step, ordinal=0)
-        if publication.version is not None:
-            self.advance_state(InPlaceTTTWorkload.overlay_versions)
-        return publication
 
     def _publish_step(
         self, step: InPlaceTTTStep, *, ordinal: int
@@ -541,7 +508,6 @@ __all__ = [
     "InPlaceTTTConfig",
     "InPlaceTTTFastWeightState",
     "InPlaceTTTKey",
-    "InPlaceTTTMetadata",
     "InPlaceTTTPhase",
     "InPlaceTTTPublication",
     "InPlaceTTTPublicationBundle",

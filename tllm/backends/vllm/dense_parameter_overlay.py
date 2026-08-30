@@ -10,6 +10,7 @@ import torch
 from torch.nn import Parameter
 from torch.nn import functional as F
 from tllm.runtime.parameter_overlay import (
+    BaseWeightLease,
     DenseOperandCapture,
     OverlayCaptureRows,
     OverlayStepPlan,
@@ -104,7 +105,7 @@ class VLLMDenseReplacementHandle:
         self.module = module
         self._original_mlp_forward: _MLPForward = mlp.forward
         self._original_forward: _LinearForward = module.forward
-        self._base_weight = module.weight.detach()
+        self._base_weight = BaseWeightLease(target, module.weight.detach())
         self._versions: dict[OverlayVersionRef, torch.Tensor] = {}
         self._prepared: tuple[_PreparedRows, ...] = ()
         self._capture_rows: tuple[OverlayCaptureRows, ...] = ()

@@ -404,6 +404,10 @@ class VLLMParameterOverlayController:
             for channel, store in self.stores.items()
             if channel.target is not None
         )
+        capture_enabled = any(
+            channel.capture_operands for channel, _store in dense_channels
+        )
+        capture_mapping_active = bool(self.runtime.reqid_to_promptidx)
         for request_ordinal, packed_row, token_offset, raw_phase in zip(
             row_plan.request_ordinals,
             row_plan.packed_row_indices,
@@ -417,6 +421,14 @@ class VLLMParameterOverlayController:
                 prompt_indices=self.runtime.reqid_to_promptidx,
                 sample_indices=self.runtime.reqid_to_sampleidx,
             )
+            if (
+                capture_enabled
+                and capture_mapping_active
+                and resolved_identity is None
+            ):
+                raise RuntimeError(
+                    "dense operand capture could not resolve request identity"
+                )
             identity = (
                 RequestIdentity(request_id, -1, 0)
                 if resolved_identity is None

@@ -542,6 +542,16 @@ def test_typed_capture_records_real_mlp_and_down_proj_operands_once() -> None:
     assert controller.sync_versions() == 0
     assert controller.requires_dense_step()
     assert not controller.has_dense_versions()
+    with pytest.raises(RuntimeError, match="resolve request identity"):
+        controller.prepare_dense_step(
+            step_id=8,
+            columns=PackedRowPlanInputs(
+                request_ids=("missing",),
+                scheduled_tokens=(1,),
+                prompt_tokens=(1,),
+                computed_tokens=(0,),
+            ),
+        )
     plan = controller.prepare_dense_step(
         step_id=9,
         columns=PackedRowPlanInputs(
@@ -577,7 +587,7 @@ def test_typed_capture_records_real_mlp_and_down_proj_operands_once() -> None:
     assert capture.rows == plan.captures
     torch.testing.assert_close(capture.mlp_input, mlp_input)
     torch.testing.assert_close(capture.down_proj_input, expected_down_input)
-    torch.testing.assert_close(capture.base_weight, base_weight)
+    torch.testing.assert_close(capture.base_weight.tensor, base_weight)
 
     controller.clear_dense_step()
     controller.finish_requests(("active",))

@@ -602,7 +602,11 @@ class V027MRv1Driver:
                     step_id=None if session is None else session.step_id,
                 )
 
+            capture_attempted = False
+
             def _stage_dense_capture() -> None:
+                nonlocal capture_attempted
+                capture_attempted = True
                 if overlay_controller is not None:
                     overlay_controller.stage_dense_operand_captured()
 
@@ -621,6 +625,22 @@ class V027MRv1Driver:
                     ),
                     after_model_forward=_stage_dense_capture,
                 )
+            except Exception as error:
+                session = get_step_session(runner)
+                if session is not None:
+                    session.fail(str(error))
+                _model_region.abort_model_region_step(
+                    core.RUNTIME, int(core.RUNTIME.event_step_id)
+                )
+                if capture_attempted:
+                    from tllm.runtime import residual_runtime as _residual_runtime
+                    from tllm.runtime.runtime import active_runtime
+
+                    if core is _residual_runtime:
+                        active_runtime().fail_stop_native_workloads(
+                            "MRv1 dense operand capture failed after forward"
+                        )
+                raise
             finally:
                 if overlay_controller is not None:
                     overlay_controller.clear_dense_step()

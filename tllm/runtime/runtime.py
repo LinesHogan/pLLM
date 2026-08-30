@@ -1068,6 +1068,11 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         if self._workload_fail_stop_reason is None:
             self._workload_fail_stop_reason = reason
 
+    def fail_stop_native_workloads(self, reason: str) -> None:
+        """Fail-stop native workload entry after an irreversible backend error."""
+
+        self._fail_stop_workloads(reason)
+
     def apply_region_shape_specializations(
         self,
         requests: Sequence[object],
