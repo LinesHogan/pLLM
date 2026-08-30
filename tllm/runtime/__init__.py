@@ -8,7 +8,12 @@ instance-scoped runtime API.
 
 from __future__ import annotations
 
-from tllm.runtime.runtime import TllmRuntime, default_runtime
+from tllm.runtime.runtime import (
+    StagedPortTransactionReceipt,
+    StagedPortTransactionResolution,
+    TllmRuntime,
+    default_runtime,
+)
 from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
 from tllm.runtime.workload_execution import StateVersionBinding
 from tllm.runtime.workload_plugins import (
@@ -21,6 +26,8 @@ __all__ = [
     "NativeWorkload",
     "BackendRegionBinderSlot",
     "StateVersionBinding",
+    "StagedPortTransactionReceipt",
+    "StagedPortTransactionResolution",
     "TllmRuntime",
     "WorkloadWorkerSpec",
     "WorkloadRuntimeBinding",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from enum import StrEnum
 from math import isfinite
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, TypedDict
 
@@ -101,6 +102,16 @@ _PORT_COMMIT_REPLY_FIELDS = frozenset(
 )
 _PORT_ABORT_REPLY_FIELDS = frozenset(
     {"worker_id", "key", "transaction", "aborted"}
+)
+_PORT_TRANSACTION_REPLY_FIELDS = frozenset(
+    {
+        "worker_id",
+        "keys",
+        "transaction",
+        "signature",
+        "plan_epoch",
+        "resolution",
+    }
 )
 
 
@@ -461,6 +472,61 @@ class WorkerPortAbortReply:
         return cls(worker_id, key, transaction)
 
 
+class WorkerPortTransactionResolution(StrEnum):
+    ABORTED = "aborted"
+    CONSUMED = "consumed"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPortTransactionReply:
+    worker_id: str
+    keys: tuple[str, ...]
+    transaction: str
+    signature: str
+    plan_epoch: int
+    resolution: WorkerPortTransactionResolution
+
+    @classmethod
+    def from_wire(cls, payload: object) -> WorkerPortTransactionReply:
+        fields = _exact_wire_object(
+            payload,
+            "port transaction reply",
+            _PORT_TRANSACTION_REPLY_FIELDS,
+        )
+        worker_id = fields["worker_id"]
+        raw_keys = fields["keys"]
+        transaction = fields["transaction"]
+        signature = _shape_digest(fields["signature"], "port transaction signature")
+        plan_epoch = _positive_wire_int(
+            fields["plan_epoch"], "port transaction plan_epoch"
+        )
+        resolution = fields["resolution"]
+        if type(worker_id) is not str or not worker_id:
+            raise TypeError("port transaction worker_id must be a non-empty string")
+        if type(raw_keys) is not list or not raw_keys or any(
+            type(key) is not str or not key for key in raw_keys
+        ):
+            raise TypeError("port transaction keys must be non-empty strings")
+        if len(raw_keys) != len(set(raw_keys)):
+            raise ValueError("port transaction keys must be unique")
+        if type(transaction) is not str or not transaction:
+            raise TypeError("port transaction identity must be a non-empty string")
+        if type(resolution) is not str:
+            raise TypeError("port transaction resolution must be a string")
+        try:
+            typed_resolution = WorkerPortTransactionResolution(resolution)
+        except ValueError as exc:
+            raise ValueError("port transaction resolution is not closed") from exc
+        return cls(
+            worker_id,
+            tuple(raw_keys),
+            transaction,
+            signature,
+            plan_epoch,
+            typed_resolution,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerStatsReply:
     esamp: TrainingStats
@@ -662,6 +728,85 @@ class ControlPlane:
         if any(reply.key != key or reply.transaction != transaction for reply in replies):
             raise RuntimeError("workload port abort reply identity mismatch")
         return replies
+
+    def abort_workload_port_transaction(
+        self,
+        keys: tuple[str, ...],
+        transaction: str,
+        *,
+        signature: str,
+        plan_epoch: int,
+        quorum: WorkerPortQuorum,
+        timeout: float | None = None,
+    ) -> bool:
+        replies = tuple(
+            WorkerPortTransactionReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_abort_workload_port_transaction",
+                list(keys),
+                transaction,
+                signature,
+                plan_epoch,
+                timeout=timeout,
+            )
+        )
+        if (
+            len(replies) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in replies) != quorum.worker_ids
+        ):
+            raise RuntimeError("workload port transaction reply count mismatch")
+        if any(
+            reply.keys != keys
+            or reply.transaction != transaction
+            or reply.signature != signature
+            or reply.plan_epoch != plan_epoch
+            for reply in replies
+        ):
+            raise RuntimeError("workload port transaction reply identity mismatch")
+        resolutions = frozenset(reply.resolution for reply in replies)
+        if len(resolutions) != 1:
+            raise RuntimeError("workload port transaction worker states diverged")
+        return next(iter(resolutions)) is WorkerPortTransactionResolution.ABORTED
+
+    def confirm_workload_port_transaction_consumed(
+        self,
+        keys: tuple[str, ...],
+        transaction: str,
+        *,
+        signature: str,
+        plan_epoch: int,
+        quorum: WorkerPortQuorum,
+        timeout: float | None = None,
+    ) -> None:
+        replies = tuple(
+            WorkerPortTransactionReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_confirm_workload_port_transaction_consumed",
+                list(keys),
+                transaction,
+                signature,
+                plan_epoch,
+                timeout=timeout,
+            )
+        )
+        if (
+            len(replies) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in replies) != quorum.worker_ids
+        ):
+            raise RuntimeError(
+                "workload port consumption confirmation reply count mismatch"
+            )
+        if any(
+            reply.keys != keys
+            or reply.transaction != transaction
+            or reply.signature != signature
+            or reply.plan_epoch != plan_epoch
+            or reply.resolution is not WorkerPortTransactionResolution.CONSUMED
+            for reply in replies
+        ):
+            raise RuntimeError(
+                "workload port consumption confirmation identity mismatch"
+            )
 
     def apply_enable_flags(self, flags: Mapping[str, bool], *, timeout: float | None = None) -> None:
         self.call("tllm_apply_enable_flags", {str(k): bool(v) for k, v in flags.items()}, timeout=timeout)

@@ -20,6 +20,8 @@ per-runner dispatch will land.
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from threading import RLock
 from typing import TYPE_CHECKING, Generic, Never, Protocol, Sequence, TypeVar, cast
 from typing_extensions import TypeVar as TypeVarWithDefault
@@ -55,6 +57,10 @@ from tllm.runtime.vllm_adapter import (
     install_generate_boundary,
 )
 from tllm.runtime.torch_adapter import runtime_torch_values
+from tllm.workload.staging import (
+    PortTransactionStatus,
+    StagedPortTransactionResolution,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -98,7 +104,19 @@ ConfiguredWorkloadT = TypeVarWithDefault(
 )
 
 
-class _StagedWorkload(Protocol[StagedT]):
+class _PortTransactionOwner(Protocol):
+    def abort_port(self, key: str, transaction: str) -> None: ...
+
+    def port_transaction_status(
+        self, key: str, transaction: str
+    ) -> PortTransactionStatus: ...
+
+    def acknowledge_remote_port_consumed(
+        self, key: str, transaction: str
+    ) -> None: ...
+
+
+class _StagedWorkload(_PortTransactionOwner, Protocol[StagedT]):
     def stage_port(
         self, port: "StagedPort[StagedT]", value: StagedT
     ) -> int: ...
@@ -107,7 +125,33 @@ class _StagedWorkload(Protocol[StagedT]):
 
     def commit_port(self, key: str, transaction: str) -> int: ...
 
-    def abort_port(self, key: str, transaction: str) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StagedPortTransactionReceipt(Generic[StagedT, SecondStagedT]):
+    runtime_owner: str
+    transaction: str
+    first_port: StagedPort[StagedT]
+    second_port: StagedPort[SecondStagedT]
+    first_sequence: int
+    second_sequence: int
+
+
+class _StagedPortTransactionPhase(StrEnum):
+    OPEN = "open"
+    CONSUMED = "consumed"
+
+
+@dataclass(slots=True)
+class _StagedPortTransaction:
+    owners: tuple[_PortTransactionOwner, ...]
+    keys: tuple[str, ...]
+    sequences: tuple[int, ...]
+    plane: ControlPlane | None
+    quorum: WorkerPortQuorum | None
+    signature: str
+    plan_epoch: int
+    phase: _StagedPortTransactionPhase = _StagedPortTransactionPhase.OPEN
 
 
 class _HostOutputWorkload(Protocol[HostOutputT]):
@@ -318,7 +362,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         first_value: StagedT,
         second_port: "StagedPort[SecondStagedT]",
         second_value: SecondStagedT,
-    ) -> tuple[int, int]:
+    ) -> StagedPortTransactionReceipt[StagedT, SecondStagedT]:
         """Atomically stage two typed ports under one transaction identity."""
 
         self._require_workload_live()
@@ -330,6 +374,18 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             "_StagedWorkload[SecondStagedT]",
             self._local_workload_by_type(second_port.owner),
         )
+        staged_keys = (first_port.key, second_port.key)
+        if staged_keys[0] == staged_keys[1]:
+            raise ValueError("staged port transaction keys must be distinct")
+        unresolved_keys = {
+            key
+            for staged in self._staged_port_transactions.values()
+            for key in staged.keys
+        }
+        if any(key in unresolved_keys for key in staged_keys):
+            raise RuntimeError(
+                "staged port already belongs to an unresolved transaction"
+            )
         self._port_transaction_sequence += 1
         transaction = (
             f"{self._port_transaction_owner}:{self._port_transaction_sequence}"
@@ -341,6 +397,16 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         from tllm.runtime.mp.control import active_control_plane
 
         plane = active_control_plane()
+        signature = ""
+        plan_epoch = 0
+        if plane is not None:
+            compilation = self._workload_compilation
+            if compilation is None or compilation.physical is None:
+                raise RuntimeError(
+                    "multiprocess port staging requires a signed physical epoch"
+                )
+            signature = compilation.decision.signature
+            plan_epoch = compilation.physical.plan_epoch
         encoded_payloads: list[EncodedPortPayload] = []
         prepared = 0
         remote_prepared = 0
@@ -382,7 +448,23 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 raise RuntimeError(
                     "workload port pair parent/worker sequence quorum mismatch"
                 )
-            return first_sequence, second_sequence
+            self._staged_port_transactions[transaction] = _StagedPortTransaction(
+                owners=(first, second),
+                keys=staged_keys,
+                sequences=(first_sequence, second_sequence),
+                plane=plane,
+                quorum=quorum,
+                signature=signature,
+                plan_epoch=plan_epoch,
+            )
+            return StagedPortTransactionReceipt(
+                runtime_owner=self._port_transaction_owner,
+                transaction=transaction,
+                first_port=first_port,
+                second_port=second_port,
+                first_sequence=first_sequence,
+                second_sequence=second_sequence,
+            )
         except Exception as exc:
             rollback_failures: list[Exception] = []
             for workload, key, _value in entries[:prepared]:
@@ -419,6 +501,172 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                         RuntimeWarning,
                         stacklevel=2,
                     )
+
+    def _staged_transaction_record(
+        self,
+        receipt: StagedPortTransactionReceipt[StagedT, SecondStagedT],
+    ) -> _StagedPortTransaction:
+        if receipt.runtime_owner != self._port_transaction_owner:
+            raise ValueError("staged port transaction belongs to another runtime")
+        staged = self._staged_port_transactions.get(receipt.transaction)
+        if staged is None:
+            raise RuntimeError("staged port transaction is already resolved")
+        if (
+            staged.keys
+            != (receipt.first_port.key, receipt.second_port.key)
+            or staged.sequences
+            != (receipt.first_sequence, receipt.second_sequence)
+        ):
+            raise ValueError("staged port transaction receipt does not match its journal")
+        return staged
+
+    def resolve_staged_transaction(
+        self,
+        receipt: StagedPortTransactionReceipt[StagedT, SecondStagedT],
+    ) -> StagedPortTransactionResolution:
+        """Cancel pending inputs or record irreversible signed consumption."""
+
+        staged = self._staged_transaction_record(receipt)
+        if staged.phase is _StagedPortTransactionPhase.CONSUMED:
+            return StagedPortTransactionResolution.CONSUMED
+        statuses = tuple(
+            owner.port_transaction_status(key, receipt.transaction)
+            for owner, key in zip(staged.owners, staged.keys, strict=True)
+        )
+        plane = staged.plane
+        if plane is None:
+            if all(
+                status is PortTransactionStatus.CONSUMED for status in statuses
+            ):
+                staged.phase = _StagedPortTransactionPhase.CONSUMED
+                return StagedPortTransactionResolution.CONSUMED
+            if not all(
+                status is PortTransactionStatus.PENDING for status in statuses
+            ):
+                self._fail_stop_workloads(
+                    "staged port transaction members diverged at resolution"
+                )
+                raise RuntimeError(
+                    "staged port transaction members diverged at resolution"
+                )
+            try:
+                for owner, key in zip(staged.owners, staged.keys, strict=True):
+                    owner.abort_port(key, receipt.transaction)
+            except Exception:
+                self._fail_stop_workloads(
+                    "staged port transaction cancellation was not atomic"
+                )
+                raise
+            self._staged_port_transactions.pop(receipt.transaction)
+            return StagedPortTransactionResolution.CANCELLED
+
+        quorum = staged.quorum
+        assert quorum is not None
+        try:
+            remote_aborted = plane.abort_workload_port_transaction(
+                staged.keys,
+                receipt.transaction,
+                signature=staged.signature,
+                plan_epoch=staged.plan_epoch,
+                quorum=quorum,
+            )
+        except Exception:
+            self._fail_stop_workloads(
+                "staged port transaction resolution did not reach its worker quorum"
+            )
+            raise
+        if not remote_aborted:
+            if not all(
+                status is PortTransactionStatus.PENDING for status in statuses
+            ):
+                self._fail_stop_workloads(
+                    "staged port transaction parent mirror diverged after consumption"
+                )
+                raise RuntimeError(
+                    "staged port transaction parent mirror diverged after consumption"
+                )
+            staged.phase = _StagedPortTransactionPhase.CONSUMED
+            return StagedPortTransactionResolution.CONSUMED
+        if not all(status is PortTransactionStatus.PENDING for status in statuses):
+            self._fail_stop_workloads(
+                "staged port transaction parent mirror diverged at cancellation"
+            )
+            raise RuntimeError(
+                "staged port transaction parent mirror diverged at cancellation"
+            )
+        try:
+            for owner, key in zip(staged.owners, staged.keys, strict=True):
+                owner.abort_port(key, receipt.transaction)
+        except Exception:
+            self._fail_stop_workloads(
+                "staged port transaction parent cancellation was not atomic"
+            )
+            raise
+        self._staged_port_transactions.pop(receipt.transaction)
+        return StagedPortTransactionResolution.CANCELLED
+
+    def settle_staged_transaction(
+        self,
+        receipt: StagedPortTransactionReceipt[StagedT, SecondStagedT],
+    ) -> None:
+        """Retire a consumed receipt after typed host-service settlement."""
+
+        staged = self._staged_transaction_record(receipt)
+        if staged.phase is not _StagedPortTransactionPhase.CONSUMED:
+            raise RuntimeError(
+                "staged port transaction must resolve consumed before settlement"
+            )
+        plane = staged.plane
+        if plane is not None:
+            quorum = staged.quorum
+            assert quorum is not None
+            try:
+                plane.confirm_workload_port_transaction_consumed(
+                    staged.keys,
+                    receipt.transaction,
+                    signature=staged.signature,
+                    plan_epoch=staged.plan_epoch,
+                    quorum=quorum,
+                )
+            except Exception:
+                self._fail_stop_workloads(
+                    "staged port consumption was not confirmed by its worker quorum"
+                )
+                raise
+        statuses = tuple(
+            owner.port_transaction_status(key, receipt.transaction)
+            for owner, key in zip(staged.owners, staged.keys, strict=True)
+        )
+        if plane is None:
+            if not all(
+                status is PortTransactionStatus.CONSUMED for status in statuses
+            ):
+                self._fail_stop_workloads(
+                    "staged port transaction changed before settlement"
+                )
+                raise RuntimeError(
+                    "staged port transaction changed before settlement"
+                )
+            self._staged_port_transactions.pop(receipt.transaction)
+            return
+        if not all(status is PortTransactionStatus.PENDING for status in statuses):
+            self._fail_stop_workloads(
+                "staged port transaction parent mirror diverged at settlement"
+            )
+            raise RuntimeError(
+                "staged port transaction parent mirror diverged at settlement"
+            )
+        try:
+            for owner, key in zip(staged.owners, staged.keys, strict=True):
+                owner.acknowledge_remote_port_consumed(
+                    key, receipt.transaction
+                )
+        except Exception:
+            self._fail_stop_workloads(
+                "staged port transaction parent mirror could not be retired"
+            )
+            raise
+        self._staged_port_transactions.pop(receipt.transaction)
 
     def drain(self, port: "HostOutput[HostOutputT]") -> tuple[HostOutputT, ...]:
         """Drain typed outputs published by signed workload tasks."""
@@ -500,6 +748,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._workload_fail_stop_reason: str | None = None
         self._port_transaction_owner = uuid4().hex
         self._port_transaction_sequence = 0
+        self._staged_port_transactions: dict[str, _StagedPortTransaction] = {}
         self._shape_specialization_poll_lock = RLock()
         native_workloads: list[
             tuple[ConfiguredWorkloadT, DeclarationDefinition]
@@ -857,6 +1106,11 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
     def cold_specialize_workloads(self, spec: "RuntimeSpecializationSpec") -> None:
         """Materialize native state before Region artifacts are compiled."""
 
+        self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot specialize a workload epoch with unresolved staged ports"
+            )
         import json
         from tllm import _core
         from tllm.schedule import CompileOptions
@@ -910,6 +1164,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         return self._workload_compiler is not None
 
     def _rebuild_workload_compiler(self) -> None:
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot rebuild a workload epoch with unresolved staged ports"
+            )
         from tllm.schedule import WorkloadCompilerCoordinator
         from tllm.workload import declare_workload
 
@@ -934,6 +1192,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self, timeline: "MainWorkloadTimeline"
     ) -> "WorkloadCompilation":
         self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot compile a workload epoch with unresolved staged ports"
+            )
         compiler = self._workload_compiler
         if compiler is None:
             raise RuntimeError("runtime has no @workload declarations to compile")
@@ -955,7 +1217,12 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
     ) -> bool:
         """Serialize an enable transition with all other cold epoch changes."""
 
+        self._require_workload_live()
         with self._shape_specialization_poll_lock:
+            if self._staged_port_transactions:
+                raise RuntimeError(
+                    "cannot change workload semantics with unresolved staged ports"
+                )
             if self._pending_workload_finalizations:
                 raise RuntimeError(
                     "cannot change native enable semantics while a prior workload "
@@ -1086,6 +1353,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         """
 
         self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot specialize a workload epoch with unresolved staged ports"
+            )
 
         from tllm.contracts.shape_specialization import (
             RegionShapeSpecializationRequest,
@@ -1170,6 +1441,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         """
 
         self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot poll workload specializations with unresolved staged ports"
+            )
         with self._shape_specialization_poll_lock:
             return self._apply_pending_worker_shape_specializations_locked(plane)
 
@@ -1280,6 +1555,11 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         A runtime with no consumers of its own leaves any consumers already
         registered through the legacy façade untouched (backward compat).
         """
+        self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot reactivate a runtime with unresolved staged ports"
+            )
         global _active_runtime
         _active_runtime = cast("TllmRuntime[object]", self)
         from tllm.runtime import residual_runtime
@@ -1322,8 +1602,8 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         # Resolve mixed-authority errors before constructing an engine. Pure
         # native declarations are bound on the backend cold-compilation path.
         _ = self.workload_execution_bindings
-        set_active_control_plane(None)
         self.activate()
+        set_active_control_plane(None)
         llm = create_llm(args, dict(kwargs))
         self._bind_engine_runners(llm)
         return llm
@@ -1392,6 +1672,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         """Compile once in the parent from worker-reported pure timeline facts."""
 
         self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot coordinate a workload epoch with unresolved staged ports"
+            )
         import json
 
         from tllm.schedule import MainWorkloadTimeline
@@ -1483,6 +1767,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         """Install an already compiled immutable epoch on every TP=1 worker."""
 
         self._require_workload_live()
+        if self._staged_port_transactions:
+            raise RuntimeError(
+                "cannot install a workload epoch with unresolved staged ports"
+            )
         from tllm.runtime import residual_runtime
 
         self.drain_pending_workload_finalizations()

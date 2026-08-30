@@ -24,10 +24,18 @@ from tllm.runtime.mp.port_wire import (
     encode_port_payload,
 )
 from tllm.runtime.mp.worker_extension import TllmWorkerExtension
-from tllm.runtime.runtime import TllmRuntime
+from tllm.runtime.runtime import (
+    StagedPortTransactionReceipt,
+    StagedPortTransactionResolution,
+    TllmRuntime,
+)
 from tllm.workload.host import HostOutput
 from tllm.workload.runtime_values import SKIPPED
-from tllm.workload.staging import RuntimePortStore, StagedPort
+from tllm.workload.staging import (
+    PortTransactionStatus,
+    RuntimePortStore,
+    StagedPort,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +107,16 @@ class _LocalPortWorkload:
     def abort_port(self, key: str, transaction: str) -> None:
         self.store.abort(key, transaction)
 
+    def port_transaction_status(
+        self, key: str, transaction: str
+    ) -> PortTransactionStatus:
+        return self.store.transaction_status(key, transaction)
+
+    def acknowledge_remote_port_consumed(
+        self, key: str, transaction: str
+    ) -> None:
+        self.store.acknowledge_remote_consumed(key, transaction)
+
 
 class _PortRuntime(TllmRuntime[_LocalPortWorkload]):
     @classmethod
@@ -109,9 +127,16 @@ class _PortRuntime(TllmRuntime[_LocalPortWorkload]):
             _LocalPortWorkload: workload,
         }
         runtime._workload_fail_stop_reason = None
-        runtime._workload_compilation = None
-        runtime._port_transaction_owner = "test-runtime"
+        runtime._workload_compilation = cast(
+            "WorkloadCompilation",
+            SimpleNamespace(
+                decision=SimpleNamespace(signature="a" * 64),
+                physical=SimpleNamespace(plan_epoch=1),
+            ),
+        )
+        runtime._port_transaction_owner = f"test-runtime-{id(runtime)}"
         runtime._port_transaction_sequence = 0
+        runtime._staged_port_transactions = {}
         return runtime
 
     @property
@@ -141,6 +166,8 @@ class _PortWorker:
     def __init__(self, worker_id: str = "worker-0") -> None:
         self.worker_id = worker_id
         self.store = RuntimePortStore()
+        self.signature = "a" * 64
+        self.plan_epoch = 1
 
     def tllm_ping(self) -> dict[str, object]:
         return {"pid": 1, "worker_id": self.worker_id}
@@ -176,6 +203,61 @@ class _PortWorker:
             "key": key,
             "transaction": transaction,
             "aborted": True,
+        }
+
+    def tllm_abort_workload_port_transaction(
+        self,
+        keys: list[str],
+        transaction: str,
+        signature: str,
+        plan_epoch: int,
+    ) -> dict[str, object]:
+        if signature != self.signature or plan_epoch != self.plan_epoch:
+            raise RuntimeError("worker port transaction epoch mismatch")
+        statuses = tuple(
+            self.store.transaction_status(key, transaction) for key in keys
+        )
+        if all(status is PortTransactionStatus.PENDING for status in statuses):
+            for key in keys:
+                self.store.abort(key, transaction)
+            resolution = "aborted"
+        elif all(
+            status is PortTransactionStatus.CONSUMED for status in statuses
+        ):
+            resolution = "consumed"
+        else:
+            raise RuntimeError("worker port transaction members diverged")
+        return {
+            "worker_id": self.worker_id,
+            "keys": keys,
+            "transaction": transaction,
+            "signature": signature,
+            "plan_epoch": plan_epoch,
+            "resolution": resolution,
+        }
+
+    def tllm_confirm_workload_port_transaction_consumed(
+        self,
+        keys: list[str],
+        transaction: str,
+        signature: str,
+        plan_epoch: int,
+    ) -> dict[str, object]:
+        if signature != self.signature or plan_epoch != self.plan_epoch:
+            raise RuntimeError("worker port transaction epoch mismatch")
+        if not all(
+            self.store.transaction_status(key, transaction)
+            is PortTransactionStatus.CONSUMED
+            for key in keys
+        ):
+            raise RuntimeError("worker port transaction was not consumed")
+        return {
+            "worker_id": self.worker_id,
+            "keys": keys,
+            "transaction": transaction,
+            "signature": signature,
+            "plan_epoch": plan_epoch,
+            "resolution": "consumed",
         }
 
 
@@ -284,17 +366,23 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
         tensor = torch.ones(2)
         metadata = _Payload("pair", 2)
 
+        receipt = runtime.stage_pair(
+            _PortOwner.batch,
+            tensor,
+            _PortOwner.metadata,
+            metadata,
+        )
         self.assertEqual(
-            runtime.stage_pair(
-                _PortOwner.batch,
-                tensor,
-                _PortOwner.metadata,
-                metadata,
-            ),
+            (receipt.first_sequence, receipt.second_sequence),
             (1, 1),
         )
         self.assertIs(local.store.take(_PortOwner.batch.key), tensor)
         self.assertEqual(local.store.take(_PortOwner.metadata.key), metadata)
+        self.assertIs(
+            runtime.resolve_staged_transaction(receipt),
+            StagedPortTransactionResolution.CONSUMED,
+        )
+        runtime.settle_staged_transaction(receipt)
 
         _PortOwner.metadata.stage(local.store, _Payload("occupied", 1))
         with self.assertRaisesRegex(RuntimeError, "pending value"):
@@ -305,6 +393,91 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
                 metadata,
             )
         self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+
+    def test_pending_stage_pair_receipt_aborts_and_can_be_replaced(self) -> None:
+        runtime, local = _runtime_with_local_port()
+        receipt = runtime.stage_pair(
+            _PortOwner.batch,
+            torch.ones(2),
+            _PortOwner.metadata,
+            _Payload("first", 2),
+        )
+
+        self.assertIs(
+            runtime.resolve_staged_transaction(receipt),
+            StagedPortTransactionResolution.CANCELLED,
+        )
+        self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+        self.assertIs(local.store.take(_PortOwner.metadata.key), SKIPPED)
+
+        replacement = runtime.stage_pair(
+            _PortOwner.batch,
+            torch.ones(2),
+            _PortOwner.metadata,
+            _Payload("replacement", 2),
+        )
+        self.assertEqual(
+            (replacement.first_sequence, replacement.second_sequence),
+            (1, 1),
+        )
+        self.assertIs(
+            runtime.resolve_staged_transaction(replacement),
+            StagedPortTransactionResolution.CANCELLED,
+        )
+
+    def test_stage_pair_receipt_identity_is_exact(self) -> None:
+        runtime, _local = _runtime_with_local_port()
+        foreign_runtime, _foreign = _runtime_with_local_port()
+        receipt = runtime.stage_pair(
+            _PortOwner.batch,
+            torch.ones(2),
+            _PortOwner.metadata,
+            _Payload("identity", 2),
+        )
+        forged = StagedPortTransactionReceipt(
+            runtime_owner=receipt.runtime_owner,
+            transaction=receipt.transaction,
+            first_port=receipt.first_port,
+            second_port=receipt.second_port,
+            first_sequence=receipt.first_sequence + 1,
+            second_sequence=receipt.second_sequence,
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not match its journal"):
+            runtime.resolve_staged_transaction(forged)
+        with self.assertRaisesRegex(ValueError, "another runtime"):
+            foreign_runtime.resolve_staged_transaction(receipt)
+        self.assertIs(
+            runtime.resolve_staged_transaction(receipt),
+            StagedPortTransactionResolution.CANCELLED,
+        )
+
+    def test_consumed_stage_pair_receipt_requires_explicit_settlement(
+        self,
+    ) -> None:
+        runtime, local = _runtime_with_local_port()
+        receipt = runtime.stage_pair(
+            _PortOwner.batch,
+            torch.ones(2),
+            _PortOwner.metadata,
+            _Payload("consumed", 2),
+        )
+        local.store.take(_PortOwner.batch.key)
+        local.store.take(_PortOwner.metadata.key)
+
+        with self.assertRaisesRegex(RuntimeError, "unresolved transaction"):
+            runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("too-early", 2),
+            )
+        self.assertIs(
+            runtime.resolve_staged_transaction(receipt),
+            StagedPortTransactionResolution.CONSUMED,
+        )
+        self.assertFalse(runtime.fail_stopped)
+        runtime.settle_staged_transaction(receipt)
 
     def test_stage_pair_releases_first_payload_when_second_encode_fails(self) -> None:
         runtime, _local = _runtime_with_local_port()
@@ -372,13 +545,14 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
             "tllm.runtime.mp.control.active_control_plane",
             return_value=plane,
         ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                tensor,
+                _PortOwner.metadata,
+                metadata,
+            )
             self.assertEqual(
-                runtime.stage_pair(
-                    _PortOwner.batch,
-                    tensor,
-                    _PortOwner.metadata,
-                    metadata,
-                ),
+                (receipt.first_sequence, receipt.second_sequence),
                 (1, 1),
             )
 
@@ -401,6 +575,169 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
             self.assertEqual(
                 worker.store.take(_PortOwner.metadata.key), metadata
             )
+
+    def test_mp_consumption_ack_retires_parent_mirror_and_preserves_sequence(
+        self,
+    ) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, local = _runtime_with_local_port()
+
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("first", 2),
+            )
+            for worker in core.workers:
+                worker.store.take(_PortOwner.batch.key)
+                worker.store.take(_PortOwner.metadata.key)
+            self.assertIs(
+                runtime.resolve_staged_transaction(receipt),
+                StagedPortTransactionResolution.CONSUMED,
+            )
+            runtime.settle_staged_transaction(receipt)
+
+            self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+            self.assertIs(local.store.take(_PortOwner.metadata.key), SKIPPED)
+            replacement = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("replacement", 2),
+            )
+            self.assertEqual(
+                (replacement.first_sequence, replacement.second_sequence),
+                (2, 2),
+            )
+            self.assertIs(
+                runtime.resolve_staged_transaction(replacement),
+                StagedPortTransactionResolution.CANCELLED,
+            )
+
+        self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+        self.assertIs(local.store.take(_PortOwner.metadata.key), SKIPPED)
+        for worker in core.workers:
+            self.assertIs(worker.store.take(_PortOwner.batch.key), SKIPPED)
+            self.assertIs(worker.store.take(_PortOwner.metadata.key), SKIPPED)
+
+    def test_mp_receipt_pins_the_original_control_plane(self) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, local = _runtime_with_local_port()
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("pending", 2),
+            )
+
+        self.assertIs(
+            runtime.resolve_staged_transaction(receipt),
+            StagedPortTransactionResolution.CANCELLED,
+        )
+        self.assertIs(local.store.take(_PortOwner.batch.key), SKIPPED)
+        self.assertIs(local.store.take(_PortOwner.metadata.key), SKIPPED)
+
+    def test_mp_worker_consumption_divergence_fail_stops_resolution(self) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, _local = _runtime_with_local_port()
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("diverged", 2),
+            )
+        core.workers[0].store.take(_PortOwner.batch.key)
+        core.workers[0].store.take(_PortOwner.metadata.key)
+
+        with self.assertRaisesRegex(RuntimeError, "worker states diverged"):
+            runtime.resolve_staged_transaction(receipt)
+        self.assertTrue(runtime.fail_stopped)
+
+    def test_mp_receipt_rejects_resolution_against_another_epoch(self) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, _local = _runtime_with_local_port()
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("epoch", 2),
+            )
+        for worker in core.workers:
+            worker.signature = "b" * 64
+            worker.plan_epoch = 2
+
+        with self.assertRaisesRegex(RuntimeError, "epoch mismatch"):
+            runtime.resolve_staged_transaction(receipt)
+        self.assertTrue(runtime.fail_stopped)
+
+    def test_mp_transaction_resolution_quorum_failure_fail_stops(self) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, _local = _runtime_with_local_port()
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("resolution-quorum", 2),
+            )
+        core.failures.add(("tllm_abort_workload_port_transaction", 1))
+
+        with self.assertRaisesRegex(RuntimeError, "worker 1 failed"):
+            runtime.resolve_staged_transaction(receipt)
+        self.assertTrue(runtime.fail_stopped)
+
+    def test_mp_transaction_settlement_quorum_failure_fail_stops(self) -> None:
+        core = _PortEngineCore()
+        plane = ControlPlane(_PortLLM(core))
+        runtime, _local = _runtime_with_local_port()
+        with mock.patch(
+            "tllm.runtime.mp.control.active_control_plane",
+            return_value=plane,
+        ):
+            receipt = runtime.stage_pair(
+                _PortOwner.batch,
+                torch.ones(2),
+                _PortOwner.metadata,
+                _Payload("settlement-quorum", 2),
+            )
+        for worker in core.workers:
+            worker.store.take(_PortOwner.batch.key)
+            worker.store.take(_PortOwner.metadata.key)
+        self.assertIs(
+            runtime.resolve_staged_transaction(receipt),
+            StagedPortTransactionResolution.CONSUMED,
+        )
+        core.failures.add(
+            ("tllm_confirm_workload_port_transaction_consumed", 1)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "worker 1 failed"):
+            runtime.settle_staged_transaction(receipt)
+        self.assertTrue(runtime.fail_stopped)
 
     def test_stage_pair_unconfirmed_rollback_fail_stops_runtime(self) -> None:
         core = _PortEngineCore()
@@ -580,6 +917,33 @@ class WorkloadPortTransportUnitTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(cast(torch.Tensor, execution.prepared[2]), torch.ones(2, 3))
         )
+
+    def test_worker_port_transaction_wire_is_exactly_typed(self) -> None:
+        extension = TllmWorkerExtension()
+        invalid = (
+            ("not-an-array", "tx-1", "a" * 64, 1),
+            ([1], "tx-1", "a" * 64, 1),
+            ([""], "tx-1", "a" * 64, 1),
+            (["input"], "", "a" * 64, 1),
+            (["input"], "tx-1", "not-a-signature", 1),
+            (["input"], "tx-1", "a" * 64, True),
+        )
+        for keys, transaction, signature, plan_epoch in invalid:
+            with (
+                self.subTest(
+                    keys=keys,
+                    transaction=transaction,
+                    signature=signature,
+                    plan_epoch=plan_epoch,
+                ),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                extension.tllm_abort_workload_port_transaction(
+                    keys,
+                    transaction,
+                    signature,
+                    plan_epoch,
+                )
 
     def test_worker_port_transaction_targets_activated_next_execution(self) -> None:
         current = _Execution()

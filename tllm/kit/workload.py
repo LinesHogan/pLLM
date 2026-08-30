@@ -57,6 +57,7 @@ from tllm.workload.ir import OptimizerSpec
 from tllm.workload.ir import EffectKind
 from tllm.workload.ir import ValueSourceKind
 from tllm.workload.staging import (
+    PortTransactionStatus,
     RuntimePortStore,
     StagedLifecycle,
     StagedPort,
@@ -380,6 +381,16 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     def abort_port(self, key: str, transaction: str) -> None:
         self._port_store.abort(key, transaction)
+
+    def port_transaction_status(
+        self, key: str, transaction: str
+    ) -> PortTransactionStatus:
+        return self._port_store.transaction_status(key, transaction)
+
+    def acknowledge_remote_port_consumed(
+        self, key: str, transaction: str
+    ) -> None:
+        self._port_store.acknowledge_remote_consumed(key, transaction)
 
     def drain_port(self, port: HostOutput[PortValueT]) -> tuple[PortValueT, ...]:
         if port not in type(self)._host_outputs():

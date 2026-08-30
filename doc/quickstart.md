@@ -94,9 +94,30 @@ That is the entire algorithm. Reading the declarations:
   compiler lowers your optimizer to a functional transition over bank slots
   and verifies the two agree at compile time (`PG145`). No silent fallback.
 
-The shipped version (`tllm/consumers/esamp/program.py`) is the same shape
-with a gated residual model and a separate `predict` flow; every built-in
-consumer (`tlm`, `ttrl`, `fttt`, `override`) follows this pattern.
+The shipped compatibility version (`tllm/consumers/esamp/program.py`) is the
+same shape with a gated residual model and a separate `predict` flow. This is
+an ESamp migration baseline, not a pattern followed by native FTTT.
+
+Native FTTT has a formal `WorkloadConfig` + `Workload` entry point:
+
+```python
+from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
+from tllm.runtime import TllmRuntime
+
+config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
+workload = FTTTWorkload(config)
+runtime = TllmRuntime(workloads=(workload,))
+feedback = FTTTFeedbackService(config)
+```
+
+The feedback service converts judging and queue state into a typed transaction
+and atomically stages the matching plan and hidden rows. Selection, feature
+construction, loss, Adam, edit prediction, and publication execute as native
+signed tasks; `commit()` acknowledges the exact published reward, retry,
+barrier, and adapter-version intent. FTTT declares only dependencies, effects,
+and semantic timing. The generic Rust scheduler chooses physical Region
+formation, placement, and overlap, with no FTTT-specific lane, priority, or
+fusion policy.
 
 ## Run it
 

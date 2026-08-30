@@ -76,7 +76,26 @@ class ESampProgram(torch.nn.Module):
 - `@extern(inputs={"loss": result("forward", "loss")}, ...)`——`backward` 消费 `forward` 的 loss **连同其 autograd 图**。这条边让编译器知道需要 grad 模式；`deadline=` 约束更新必须落定的时机。
 - `backward` 函数体是普通 PyTorch——它同时是 **oracle**：编译器把你的 optimizer 降级为 bank slot 上的函数式 transition，并在编译期校验两者一致（`PG145`）。没有静默 fallback。
 
-仓库内置版本（`tllm/consumers/esamp/program.py`）形状相同，只是换成 gated residual 模型并多一个 `predict` flow；所有内置 consumer（`tlm`、`ttrl`、`fttt`、`override`）都遵循这个模式。
+仓库内置的兼容版本（`tllm/consumers/esamp/program.py`）形状相同，只是换成 gated
+residual 模型并多一个 `predict` flow。这是 ESamp 迁移基线，不是 native FTTT 遵循的模式。
+
+Native FTTT 有正式的 `WorkloadConfig` + `Workload` 入口：
+
+```python
+from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
+from tllm.runtime import TllmRuntime
+
+config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
+workload = FTTTWorkload(config)
+runtime = TllmRuntime(workloads=(workload,))
+feedback = FTTTFeedbackService(config)
+```
+
+feedback service 将 judge 与队列状态转换成 typed transaction，并原子地 stage 配对的
+plan 与 hidden rows。选择、特征构造、loss、Adam、edit prediction 和 publication 都作为
+native signed tasks 执行；`commit()` 只确认该次签名执行发布的 reward、retry、barrier 与
+adapter-version intent。FTTT 只声明依赖、effect 和语义 timing；物理 Region 划分、放置与
+重叠由通用 Rust scheduler 自动选择，不存在 FTTT 专属 lane、priority 或 fusion 策略。
 
 ## 运行
 

@@ -260,6 +260,20 @@ def _wire_text(value: object, label: str) -> str:
     return value
 
 
+def _wire_nonempty_text_tuple(value: object, label: str) -> tuple[str, ...]:
+    if type(value) is not list or not value:
+        raise TypeError(f"{label} must be a non-empty string array")
+    raw_values = cast(list[object], value)
+    values = tuple(
+        _wire_text(item, f"{label} item") for item in raw_values
+    )
+    if any(not item for item in values):
+        raise ValueError(f"{label} items must be non-empty")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{label} items must be unique")
+    return values
+
+
 def _wire_positive_int(value: object, label: str) -> int:
     if type(value) is not int or value < 1:
         raise TypeError(f"{label} must be a positive integer")
@@ -428,6 +442,88 @@ class TllmWorkerExtension:
             "key": key,
             "transaction": transaction,
             "aborted": True,
+        }
+
+    def tllm_abort_workload_port_transaction(
+        self,
+        keys: object,
+        transaction: object,
+        signature: object,
+        plan_epoch: object,
+    ) -> dict[str, object]:
+        from tllm.runtime import residual_runtime as core
+
+        port_keys = _wire_nonempty_text_tuple(keys, "port transaction keys")
+        typed_transaction = _wire_text(transaction, "port transaction identity")
+        if not typed_transaction:
+            raise ValueError("port transaction identity must be non-empty")
+        typed_signature, typed_epoch = _workload_identity(signature, plan_epoch)
+        store = core.RUNTIME.workload_execution_store
+        execution = (
+            store.next_execution
+            if store is not None
+            else core.RUNTIME.workload_execution
+        )
+        if execution is None:
+            raise RuntimeError("worker has no active workload execution")
+        if (
+            execution.compilation.decision.signature != typed_signature
+            or execution.plan_epoch != typed_epoch
+        ):
+            raise RuntimeError(
+                "staged port transaction resolved against a different epoch"
+            )
+        aborted = execution.abort_port_transaction(
+            port_keys, typed_transaction
+        )
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "keys": list(port_keys),
+            "transaction": typed_transaction,
+            "signature": typed_signature,
+            "plan_epoch": typed_epoch,
+            "resolution": "aborted" if aborted else "consumed",
+        }
+
+    def tllm_confirm_workload_port_transaction_consumed(
+        self,
+        keys: object,
+        transaction: object,
+        signature: object,
+        plan_epoch: object,
+    ) -> dict[str, object]:
+        from tllm.runtime import residual_runtime as core
+
+        port_keys = _wire_nonempty_text_tuple(keys, "port transaction keys")
+        typed_transaction = _wire_text(transaction, "port transaction identity")
+        if not typed_transaction:
+            raise ValueError("port transaction identity must be non-empty")
+        typed_signature, typed_epoch = _workload_identity(signature, plan_epoch)
+        store = core.RUNTIME.workload_execution_store
+        execution = (
+            store.next_execution
+            if store is not None
+            else core.RUNTIME.workload_execution
+        )
+        if execution is None:
+            raise RuntimeError("worker has no active workload execution")
+        if (
+            execution.compilation.decision.signature != typed_signature
+            or execution.plan_epoch != typed_epoch
+        ):
+            raise RuntimeError(
+                "staged port transaction settled against a different epoch"
+            )
+        execution.confirm_port_transaction_consumed(
+            port_keys, typed_transaction
+        )
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "keys": list(port_keys),
+            "transaction": typed_transaction,
+            "signature": typed_signature,
+            "plan_epoch": typed_epoch,
+            "resolution": "consumed",
         }
 
     def tllm_drain_workload_output(self, key: str) -> dict[str, object]:

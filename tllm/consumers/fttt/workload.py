@@ -11,7 +11,8 @@ from collections import deque
 from dataclasses import dataclass, replace
 import hashlib
 import re
-from typing import cast
+from types import TracebackType
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar, cast
 
 import torch
 from torch.nn import functional as F
@@ -57,8 +58,16 @@ from tllm.workload import (
     temporary,
     workload,
 )
+from tllm.workload.staging import StagedPortTransactionResolution
+
+if TYPE_CHECKING:
+    from tllm.runtime.runtime import (
+        StagedPortTransactionReceipt,
+        TllmRuntime,
+    )
 
 
+_RuntimeWorkloadT = TypeVar("_RuntimeWorkloadT")
 _FTTT_ENABLED = ConfigField.boolean(True)
 _FTTT_LEARNING_RATE = ConfigField.floating(1e-3, NumericConstraint.POSITIVE)
 
@@ -342,7 +351,7 @@ class FTTTFeedbackService:
         self._queued_feedback += len(records)
         return bool(records)
 
-    def next_batch(self) -> FTTTTrainingBatch | None:
+    def _next_batch(self) -> FTTTTrainingBatch | None:
         if self._active is not None:
             raise RuntimeError("the active FTTT transaction must be committed or aborted")
         if not self._queue:
@@ -351,20 +360,59 @@ class FTTTFeedbackService:
         self._queued_feedback -= len(self._active.plan.intent.feedback_records)
         return self._active
 
-    def acknowledge(self, intent: FTTTClosedLoopIntent) -> None:
+    def stage_next(
+        self, runtime: TllmRuntime[_RuntimeWorkloadT]
+    ) -> FTTTFeedbackTransaction[_RuntimeWorkloadT] | None:
+        batch = self._next_batch()
+        if batch is None:
+            return None
+        try:
+            receipt = runtime.stage_pair(
+                FTTTWorkload.hidden_rows,
+                batch.hidden_rows,
+                FTTTWorkload.plans,
+                batch.plan,
+            )
+        except Exception:
+            self.rollback_transaction(batch.plan.intent.transaction_id)
+            raise
+        return FTTTFeedbackTransaction(
+            service=self,
+            runtime=runtime,
+            batch=batch,
+            staged=receipt,
+        )
+
+    def settle_transaction(self, intent: FTTTClosedLoopIntent) -> None:
         active = self._active
         if active is None or active.plan.intent.transaction_id != intent.transaction_id:
             raise RuntimeError("FTTT acknowledgement does not match the active transaction")
+        expected = replace(
+            active.plan.intent,
+            adapter_version=intent.adapter_version,
+        )
+        if intent != expected:
+            raise RuntimeError("FTTT acknowledgement rewrote the signed intent")
+        settled_instances = dict(self._instances)
         for transition in intent.transitions:
             key = _InstanceKey(transition.prompt_idx, transition.request_id)
-            current = self._instances.get(key, FTTTInstanceState())
-            if current != transition.previous:
+            current = settled_instances.get(key, FTTTInstanceState())
+            if (
+                current.retries != transition.previous.retries
+                or current.stopped != transition.previous.stopped
+            ):
                 raise RuntimeError("FTTT lifecycle transition is stale")
             version = intent.adapter_version if transition.trained else current.adapter_version
-            self._instances[key] = replace(transition.next, adapter_version=version)
+            settled_instances[key] = replace(
+                transition.next,
+                adapter_version=version,
+            )
+        self._instances = settled_instances
         self._active = None
+        if not self._queue:
+            self._projected_instances = dict(self._instances)
 
-    def abort(self, transaction_id: int) -> None:
+    def rollback_transaction(self, transaction_id: int) -> None:
         active = self._active
         if active is None or active.plan.intent.transaction_id != transaction_id:
             raise RuntimeError("FTTT abort does not match the active transaction")
@@ -372,6 +420,119 @@ class FTTTFeedbackService:
         self._queue.clear()
         self._queued_feedback = 0
         self._projected_instances = dict(self._instances)
+
+
+@dataclass(slots=True)
+class FTTTFeedbackTransaction(Generic[_RuntimeWorkloadT]):
+    service: FTTTFeedbackService
+    runtime: TllmRuntime[_RuntimeWorkloadT]
+    batch: FTTTTrainingBatch
+    staged: StagedPortTransactionReceipt[torch.Tensor, FTTTTrainingPlan]
+    _closed: bool = False
+
+    @property
+    def transaction_id(self) -> int:
+        return self.batch.plan.intent.transaction_id
+
+    def __enter__(self) -> FTTTFeedbackTransaction[_RuntimeWorkloadT]:
+        return self
+
+    def _drain_closed_loop(self) -> tuple[FTTTClosedLoopIntent, ...]:
+        try:
+            return self.runtime.drain(FTTTWorkload.closed_loop)
+        except Exception:
+            self._closed = True
+            self.runtime.fail_stop_native_workloads(
+                "FTTT closed-loop output quorum could not be resolved"
+            )
+            raise
+
+    def _settle_published(self, intent: FTTTClosedLoopIntent) -> None:
+        try:
+            resolution = self.runtime.resolve_staged_transaction(self.staged)
+            if resolution is not StagedPortTransactionResolution.CONSUMED:
+                raise RuntimeError(
+                    "FTTT published closed-loop state without consuming its inputs"
+                )
+            self.service.settle_transaction(intent)
+            self.runtime.settle_staged_transaction(self.staged)
+        except Exception:
+            self.runtime.fail_stop_native_workloads(
+                "FTTT host settlement failed after signed port consumption"
+            )
+            self._closed = True
+            raise
+        self._closed = True
+
+    def commit(self) -> FTTTClosedLoopIntent:
+        if self._closed:
+            raise RuntimeError("FTTT feedback transaction is already closed")
+        intents = self._drain_closed_loop()
+        if (
+            len(intents) != 1
+            or intents[0].transaction_id != self.transaction_id
+        ):
+            self._closed = True
+            resolution = self.runtime.resolve_staged_transaction(self.staged)
+            if not intents and resolution is StagedPortTransactionResolution.CANCELLED:
+                self.service.rollback_transaction(self.transaction_id)
+            else:
+                self.runtime.fail_stop_native_workloads(
+                    "FTTT signed execution and closed-loop publication diverged"
+                )
+            raise RuntimeError(
+                "FTTT signed execution did not publish the active transaction"
+            )
+        intent = intents[0]
+        self._settle_published(intent)
+        return intent
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        intents = self._drain_closed_loop()
+        if (
+            len(intents) == 1
+            and intents[0].transaction_id == self.transaction_id
+        ):
+            self._settle_published(intents[0])
+            return
+        self._closed = True
+        resolution = self.runtime.resolve_staged_transaction(self.staged)
+        if not intents and resolution is StagedPortTransactionResolution.CANCELLED:
+            self.service.rollback_transaction(self.transaction_id)
+            return
+        self.runtime.fail_stop_native_workloads(
+            "FTTT transaction consumed inputs without a matching publication"
+        )
+        if intents:
+            raise RuntimeError(
+                "FTTT signed execution published a different transaction"
+            )
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        del traceback
+        if not self._closed:
+            if exc_type is not None:
+                try:
+                    self.abort()
+                except Exception as settlement_error:
+                    if exc is not None:
+                        exc.add_note(
+                            "FTTT transaction resolution also failed: "
+                            f"{settlement_error}"
+                        )
+                return False
+            self.abort()
+            raise RuntimeError(
+                "FTTT feedback transaction exited without commit"
+            )
+        return False
 
 
 class FTTTWorkload(Workload[FTTTConfig]):
@@ -500,6 +661,7 @@ __all__ = [
     "FTTTClosedLoopIntent",
     "FTTTConfig",
     "FTTTFeedbackService",
+    "FTTTFeedbackTransaction",
     "FTTTLifecycleTransition",
     "FTTTTrainingBatch",
     "FTTTTrainingPlan",

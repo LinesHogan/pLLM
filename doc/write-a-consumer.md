@@ -10,6 +10,37 @@ placement. `RegionCaptureMode` is a Rust-signed closed enum, and only explicit
 cross-Region dependencies may create fences/events. See
 [the workload compiler guide](workload-compiler.md) for the contract.
 
+### FTTT: a typed host-service boundary
+
+FTTT illustrates how host work remains explicit without regaining workload
+authority:
+
+```python
+from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
+from tllm.runtime import TllmRuntime
+
+config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
+workload = FTTTWorkload(config)
+runtime = TllmRuntime(workloads=(workload,))
+feedback = FTTTFeedbackService(config)
+```
+
+The service judges completed trajectories, owns the bounded feedback queue,
+and produces an `FTTTFeedbackTransaction`. `stage_next(runtime)` atomically
+stages a typed plan with its hidden rows. Selection, feature construction,
+loss, Adam, edit prediction, state-version reads, and closed-loop publication
+are native signed tasks. `commit()` accepts only the intent published for that
+transaction and acknowledges lifecycle state exactly once; abort discards the
+dependent projection only while its staged inputs are still pending. Once the
+signed graph consumes those inputs, a matching published intent is settled
+even if user code raises. Consumption without a matching publication
+fail-stops the runtime; optimizer state is never presented as rolled back.
+
+None of those semantics select a physical schedule. FTTT declares dependencies,
+effects, and legal timing windows; the generic Rust scheduler automatically
+chooses Region formation, placement, and overlap. Workloads do not declare
+lanes, priorities, or fusion strategies.
+
 The rest of this page describes the retained Program/`BaseConsumer` API for
 legacy adapters. It is useful while a workload has not completed native
 takeover, but its lanes, streams, events, and capture behavior are not the
@@ -39,7 +70,8 @@ State names (`state="distiller"`) refer to **state banks**: versioned, per-scope
 
 The compiled `ProgramConsumer` is driven by a small wrapper: declare what
 the engine should feed you (`flows()`), compile lazily once real shapes
-arrive, and delegate. The pattern, as used by every built-in consumer:
+arrive, and delegate. This pattern applies only to retained compatibility
+implementations, not to native FTTT:
 
 ```python
 class MyConsumer(BaseConsumer[MyConfig]):
@@ -89,12 +121,10 @@ Rules of thumb:
   unsupported configuration raises at compile time, never silently falls
   back.
 
-Reference implementations, smallest first: `tllm/consumers/ttrl/`
-(reward model), `tllm/consumers/tlm/` (logits adaptation, online/offline
-buffering), `tllm/consumers/fttt/` (feedback-conditioned edits with a plain
-Python lifecycle), `tllm/consumers/override/` (multi-head reweighting driven
-from the sampler bridge), `tllm/consumers/esamp/` (engine-tapped `hidden()`
-inputs, sink publication, per-request state scope).
+The retained ESamp migration baseline in `tllm/consumers/esamp/` is the
+reference for this compatibility surface. Do not use native FTTT as a Program
+or `BaseConsumer` example: its host lifecycle is the typed service described
+above, and its schedulable computation belongs to the signed workload graph.
 
 
 ## A complete example

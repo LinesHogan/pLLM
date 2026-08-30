@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
 from unittest import mock
 
 import torch
@@ -13,7 +12,6 @@ from tllm.consumers.fttt import (
     FTTTConfig,
     FTTTFeedbackService,
     FTTTJudgeResult,
-    FTTTTrainingBatch,
     FTTTWorkload,
 )
 from tllm.consumers.gtta import (
@@ -71,30 +69,28 @@ def test_two_stateful_workloads_execute_and_account_independently() -> None:
         ),
         torch.randn(1, 4),
     )
-    batch = cast(FTTTTrainingBatch, feedback.next_batch())
+    transaction = feedback.stage_next(runtime)
+    assert transaction is not None
     environment = GTTAEnvironmentService(gtta.config)
     environment.enqueue_feedback(
         TrajectoryFeedback("task", "act", reward=1.0)
     )
-    runtime.stage_pair(
-        FTTTWorkload.hidden_rows,
-        batch.hidden_rows,
-        FTTTWorkload.plans,
-        batch.plan,
-    )
     runtime.stage(GTTAWorkload.trajectories, environment.drain())
     state = ResidualRuntimeState()
-    with mock.patch.object(residual_runtime, "RUNTIME", state):
-        residual_runtime.publish_workload_compilation(
-            compilation, bindings=runtime.workload_execution_bindings
-        )
-        residual_runtime.prepare_physical_workgraph_step(1)
-        for region in compilation.decision.execution_regions:
-            residual_runtime.advance_workload_anchor(region.placement_anchor)
-        execution = state.workload_execution
-        assert execution is not None
-        assert execution.state_versions.observed_version(
-            "fttt/edit_adapter", None
-        ) == 1
-        assert execution.state_versions.observed_version("gtta/dynamics", None) == 1
-        assert execution.read_and_reset_stats(sync=False).loss_count == 1
+    with transaction:
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.publish_workload_compilation(
+                compilation, bindings=runtime.workload_execution_bindings
+            )
+            residual_runtime.prepare_physical_workgraph_step(1)
+            for region in compilation.decision.execution_regions:
+                residual_runtime.advance_workload_anchor(region.placement_anchor)
+            execution = state.workload_execution
+            assert execution is not None
+            assert execution.state_versions.observed_version(
+                "fttt/edit_adapter", None
+            ) == 1
+            assert execution.state_versions.observed_version("gtta/dynamics", None) == 1
+            assert execution.read_and_reset_stats(sync=False).loss_count == 1
+        intent = transaction.commit()
+    assert intent.adapter_version == 1

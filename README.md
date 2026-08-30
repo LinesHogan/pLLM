@@ -219,13 +219,43 @@ The full paired in-engine benchmark (5 alternating rounds, gate: program/legacy 
 
 ## What You Can Build
 
-- Test-time training algorithms that learn during generation. `esamp`, `ttrl`, `fttt`, and `override` use `tllm.program`; TLM uses a full HF/PEFT side model because its official-family update trains internal `q_proj/v_proj` LoRA rather than a hidden-to-logits surrogate.
+- Test-time training algorithms that learn during generation. Native FTTT uses
+  `FTTTConfig` + `FTTTWorkload`; its typed feedback service stages one
+  transaction while selection, loss, Adam, edit prediction, and closed-loop
+  publication remain signed tasks. TLM uses a full HF/PEFT side model because
+  its official-family update trains internal `q_proj/v_proj` LoRA rather than
+  a hidden-to-logits surrogate.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
 - Native exact In-Place-TTT with request-scoped immutable overlays — see [Native In-Place TTT](doc/inplace-ttt.md).
 - Experimental prefill recurrences such as Recirculation through the eager
   model-region/KV materializer. This path is ongoing and is not yet covered by
   the CUDA Graph performance claims above.
 - Activation / hidden-state export and editing pipelines; runtime analysis of LLM internals.
+
+The public FTTT construction follows the same native workload entry point as
+the other migrated workloads:
+
+```python
+from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
+from tllm.runtime import TllmRuntime
+
+config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
+workload = FTTTWorkload(config)
+runtime = TllmRuntime(workloads=(workload,))
+feedback = FTTTFeedbackService(config)
+```
+
+After the service has received a typed generation trace and its matching
+hidden rows, `feedback.stage_next(runtime)` atomically stages the pair and
+returns an `FTTTFeedbackTransaction`. A successful `commit()` acknowledges
+exactly the closed-loop intent published by signed execution. Before signed
+consumption, an exception or uncommitted context cancels the staged receipt
+and rolls back dependent queue projections. After consumption, a matching
+published intent is settled even when user code raises; consumption without a
+matching publication fail-stops the runtime because tensor state is no longer
+reversible. FTTT declares dependencies, effects, and semantic timing windows
+only. The generic Rust scheduler chooses Region formation, placement, and
+overlap; there is no FTTT-specific lane, priority, or fusion policy.
 
 ## Installation
 
@@ -259,7 +289,15 @@ tLLM is a test-time intervention layer for vLLM. The name is a recursive-style a
 
 > I have a test-time training algorithm. How do I implement it with tLLM?
 
-Write it as a `torch.nn.Module` with `@flow` and `@extern` declarations — see [write a consumer](doc/write-a-consumer.md). If your algorithm needs something the program language rejects, the compiler fails loudly with a stable error code (`PG###`) instead of silently falling back, so you always know what is and isn't supported.
+Define a `WorkloadConfig` and `Workload` with typed ports, state, effects, and
+semantic timing windows, then install it with
+`TllmRuntime(workloads=(workload,))` — see
+[write a consumer](doc/write-a-consumer.md). Keep judging, environment I/O,
+and similar host work behind explicit typed services, while schedulable tensor
+work stays in signed tasks. The generic Rust scheduler derives physical
+placement and overlap; a workload must not choose its own lanes, priorities,
+or fusion policy. The Program material above is retained compatibility
+documentation, not the authoring model for a new workload.
 
 ## License
 

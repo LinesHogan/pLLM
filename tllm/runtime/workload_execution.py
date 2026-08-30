@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 import torch
 
 from tllm.contracts.request_identity import RequestFinishedBatch
+from tllm.workload.staging import PortTransactionStatus
 
 WorkloadInstanceT = TypeVar("WorkloadInstanceT")
 
@@ -32,6 +33,14 @@ class WorkloadPortOwner(Protocol):
     def commit_port(self, key: str, transaction: str) -> int: ...
 
     def abort_port(self, key: str, transaction: str) -> None: ...
+
+    def port_transaction_status(
+        self, key: str, transaction: str
+    ) -> PortTransactionStatus: ...
+
+    def acknowledge_remote_port_consumed(
+        self, key: str, transaction: str
+    ) -> None: ...
 
     def owns_output(self, key: str) -> bool: ...
 
@@ -891,6 +900,52 @@ class NativeWorkloadExecution:
                 workload.abort_port(key, transaction)
                 return
         raise KeyError(key)
+
+    def port_transaction_status(
+        self, key: str, transaction: str
+    ) -> PortTransactionStatus:
+        for workload in self._workload_instances:
+            if workload.owns_port(key):
+                return workload.port_transaction_status(key, transaction)
+        raise KeyError(key)
+
+    def acknowledge_remote_port_consumed(
+        self, key: str, transaction: str
+    ) -> None:
+        for workload in self._workload_instances:
+            if workload.owns_port(key):
+                workload.acknowledge_remote_port_consumed(key, transaction)
+                return
+        raise KeyError(key)
+
+    def abort_port_transaction(
+        self, keys: tuple[str, ...], transaction: str
+    ) -> bool:
+        if not keys:
+            raise ValueError("staged port transaction must contain at least one port")
+        statuses = tuple(
+            self.port_transaction_status(key, transaction) for key in keys
+        )
+        if all(status is PortTransactionStatus.PENDING for status in statuses):
+            for key in keys:
+                self.abort_port(key, transaction)
+            return True
+        if all(status is PortTransactionStatus.CONSUMED for status in statuses):
+            return False
+        raise RuntimeError("staged port transaction members have diverged")
+
+    def confirm_port_transaction_consumed(
+        self, keys: tuple[str, ...], transaction: str
+    ) -> None:
+        if not keys:
+            raise ValueError("staged port transaction must contain at least one port")
+        statuses = tuple(
+            self.port_transaction_status(key, transaction) for key in keys
+        )
+        if not all(
+            status is PortTransactionStatus.CONSUMED for status in statuses
+        ):
+            raise RuntimeError("staged port transaction was not fully consumed")
 
     def drain_output(self, key: str) -> tuple[object, ...]:
         for workload in self._workload_instances:

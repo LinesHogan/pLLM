@@ -8,6 +8,33 @@
 签名的闭合 enum，只有显式跨 Region 依赖才会生成 fence/event。完整契约见
 [附加载荷编译器](workload-compiler.md)。
 
+### FTTT：typed host-service 边界
+
+FTTT 展示了 host work 如何保持显式，同时不重新取得 workload authority：
+
+```python
+from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
+from tllm.runtime import TllmRuntime
+
+config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
+workload = FTTTWorkload(config)
+runtime = TllmRuntime(workloads=(workload,))
+feedback = FTTTFeedbackService(config)
+```
+
+service 负责 judge 已完成的 trajectory、持有有界 feedback queue，并产出
+`FTTTFeedbackTransaction`。`stage_next(runtime)` 原子地 stage typed plan 与对应 hidden
+rows。选择、特征构造、loss、Adam、edit prediction、state-version 读取和 closed-loop
+publication 都是 native signed tasks。`commit()` 只接受该 transaction 对应的 published
+intent，并且只确认一次 lifecycle state。只有 staged inputs 尚未消费时，abort 才会取消
+receipt 并回滚依赖它的 projected state。
+一旦 signed graph 已消费 inputs，即使用户代码抛出异常，也会结算匹配的 published intent；
+若已经消费却没有匹配 publication，runtime 会 fail-stop，绝不伪装 optimizer state 已回滚。
+
+这些语义都不选择物理调度。FTTT 只声明依赖、effect 和合法 timing window；通用 Rust
+scheduler 自动选择 Region 划分、放置与重叠。workload 不声明 lane、priority 或 fusion
+策略。
+
 本页余下部分介绍为 legacy adapter 保留的 Program/`BaseConsumer` API。当 workload 尚未完成
 native takeover 时它仍然有用，但其中的 lane、stream、event 与 capture 行为不是当前优化模型。
 
@@ -33,7 +60,8 @@ from tllm.workgraph.frontend import extern, flow, hidden, local, provided, resul
 
 ## 薄 consumer 外壳
 
-编译出的 `ProgramConsumer` 由一个小封装驱动：声明引擎该喂什么（`flows()`）、拿到真实形状后懒编译、然后委托。所有内置 consumer 都用这个模式：
+编译出的 `ProgramConsumer` 由一个小封装驱动：声明引擎该喂什么（`flows()`）、拿到真实形状后
+懒编译、然后委托。这个模式只适用于保留的兼容实现，不适用于 native FTTT：
 
 ```python
 class MyConsumer(BaseConsumer[MyConfig]):
@@ -74,7 +102,9 @@ class MyConsumer(BaseConsumer[MyConfig]):
 - **统计从编译出的 consumer 读**（`update_count`、`loss_count`、`loss_sum` 增量）；不要自己重造计数器。
 - 程序在首个真实输入处懒编译并**fail closed**：不支持的配置在编译期显式报错，绝不静默 fallback。
 
-参考实现（从小到大）：`tllm/consumers/ttrl/`（reward 模型）、`tllm/consumers/tlm/`（logits 适配，online/offline 缓冲）、`tllm/consumers/fttt/`（带纯 Python 生命周期的反馈编辑）、`tllm/consumers/override/`（sampler bridge 驱动的多头 reweighting）、`tllm/consumers/esamp/`（引擎 tap 的 `hidden()` 输入、sink 发布、per-request state scope）。
+这个兼容 surface 的参考是 `tllm/consumers/esamp/` 中保留的 ESamp 迁移基线。不要把 native
+FTTT 当作 Program 或 `BaseConsumer` 示例：它的 host lifecycle 属于上文的 typed service，
+可调度计算属于 signed workload graph。
 
 ## 完整示例
 

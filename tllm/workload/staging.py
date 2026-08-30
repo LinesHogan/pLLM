@@ -16,6 +16,17 @@ class StagedLifecycle(StrEnum):
     REQUEST_FINISHED = "request.finished"
 
 
+class PortTransactionStatus(StrEnum):
+    PENDING = "pending"
+    CONSUMED = "consumed"
+    ABORTED = "aborted"
+
+
+class StagedPortTransactionResolution(StrEnum):
+    CANCELLED = "cancelled"
+    CONSUMED = "consumed"
+
+
 @dataclass(frozen=True, slots=True)
 class _Empty:
     pass
@@ -122,6 +133,51 @@ class RuntimePortStore:
             case _:
                 raise RuntimeError("cannot abort a different staged transaction")
 
+    def transaction_status(
+        self, key: str, transaction: str
+    ) -> PortTransactionStatus:
+        match self._states.get(key, _Empty()):
+            case _Prepared(transaction=observed) | _Ready(transaction=observed):
+                if observed != transaction:
+                    raise RuntimeError("staged input contains a different transaction")
+                return PortTransactionStatus.PENDING
+            case _Empty():
+                ordered = _ordered_transaction(transaction)
+                if ordered is None:
+                    raise ValueError(
+                        "staged transaction must be owner:positive_ordinal"
+                    )
+                owner, ordinal = ordered
+                finalized = self._finalized.get((key, owner))
+                if finalized is None or finalized.ordinal < ordinal:
+                    raise RuntimeError("staged input transaction is unknown")
+                if finalized.ordinal > ordinal:
+                    raise RuntimeError(
+                        "staged input transaction was superseded"
+                    )
+                if finalized.consumed:
+                    return PortTransactionStatus.CONSUMED
+                return PortTransactionStatus.ABORTED
+
+    def acknowledge_remote_consumed(self, key: str, transaction: str) -> None:
+        """Retire a parent mirror after worker-quorum consumption evidence."""
+
+        match self._states.get(key, _Empty()):
+            case _Ready(transaction=observed) if observed == transaction:
+                self._states.pop(key)
+                self._record_finalized(key, transaction, consumed=True)
+            case _Empty():
+                if self.transaction_status(key, transaction) is not PortTransactionStatus.CONSUMED:
+                    raise RuntimeError(
+                        "cannot acknowledge an aborted staged transaction"
+                    )
+            case _Prepared(transaction=observed) if observed == transaction:
+                raise RuntimeError("cannot acknowledge an uncommitted staged transaction")
+            case _:
+                raise RuntimeError(
+                    "cannot acknowledge a different staged transaction"
+                )
+
     def take(self, key: str) -> object | RuntimeValueMarker:
         match self._states.pop(key, _Empty()):
             case _Empty():
@@ -166,4 +222,10 @@ class StagedPort(Generic[T]):
         return cast(T, value)
 
 
-__all__ = ["RuntimePortStore", "StagedLifecycle", "StagedPort"]
+__all__ = [
+    "PortTransactionStatus",
+    "RuntimePortStore",
+    "StagedPortTransactionResolution",
+    "StagedLifecycle",
+    "StagedPort",
+]
