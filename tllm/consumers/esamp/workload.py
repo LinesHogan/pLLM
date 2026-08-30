@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.runtime.torch_adapter import torch_assert_async
 from tllm.kit.workload import Workload
 from tllm.workload import (
     AdamWSpec,
@@ -23,8 +24,11 @@ from tllm.workload import (
     config_field,
     hidden,
     optimize,
+    read,
+    result,
     sampler,
     task,
+    temporary,
     workload,
 )
 
@@ -54,6 +58,9 @@ class ESampConfig(WorkloadConfig):
     )
     sampler_backend: Literal["post_filter_exact"] = config_field(
         default="post_filter_exact", kind=ConfigKind.STR
+    )
+    training_row_selection: Literal["none", "first_per_prompt"] = config_field(
+        default="none", kind=ConfigKind.STR
     )
 
 
@@ -90,6 +97,7 @@ class ESampWorkload(Workload[ESampConfig]):
                 "decode",
                 path=ESampConfig.target_layer_path,
             ),
+            "sample_index_tensor": sampler.sample_index_tensor(),
         },
         outputs={
             "guidance": sampler.hidden_reweight(
@@ -97,17 +105,62 @@ class ESampWorkload(Workload[ESampConfig]):
                 enabled=ESampConfig.intervention,
                 backend=ESampConfig.sampler_backend,
             ),
+            "prediction": temporary(),
+            "target": temporary(),
+            "sample_index_tensor": temporary(),
+        },
+        effects=(read(distiller),),
+        timing=Between("model.execute", "sampler.pre_draw"),
+    )
+    def predict(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        sample_index_tensor: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        prediction = self.distiller(source)
+        return prediction, prediction, target, sample_index_tensor
+
+    @task(
+        inputs={
+            "prediction": result("predict", "prediction"),
+            "target": result("predict", "target"),
+            "sample_index_tensor": result(
+                "predict", "sample_index_tensor"
+            ),
+        },
+        outputs={
             "loss": optimize(
                 distiller, at=Before("next.prepare")
             ),
         },
-        timing=Between("model.execute", "sampler.pre_draw"),
+        timing=Between("token.commit", "next.prepare"),
     )
-    def predict_and_loss(
-        self, source: torch.Tensor, target: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        prediction = self.distiller(source)
-        return prediction, F.mse_loss(prediction.float(), target.float())
+    def loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        sample_index_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.config.training_row_selection == "first_per_prompt":
+            per_row_loss = (prediction.float() - target.float()).square().mean(
+                dim=1
+            )
+            selected = (sample_index_tensor == 0).to(per_row_loss)
+            selected_count = selected.sum()
+            torch_assert_async(
+                selected_count > 0,
+                "first_per_prompt requires at least one sample_idx=0 row",
+            )
+            loss = (per_row_loss * selected).sum() / selected_count
+        else:
+            loss = F.mse_loss(prediction.float(), target.float())
+        return loss
 
 
 workload(ESampWorkload, id="esamp", config=ESampConfig, enabled=_ESAMP_ENABLED)

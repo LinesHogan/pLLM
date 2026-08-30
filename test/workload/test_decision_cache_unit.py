@@ -133,6 +133,22 @@ class DecisionCacheUnitTest(unittest.TestCase):
             with self.assertRaises(WorkloadDecisionCacheError):
                 _coordinator(directory).compile(_timeline())
 
+    def test_stale_persisted_schema_requires_a_fresh_cache_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = _coordinator(directory).compile(_timeline())
+            path = Path(directory) / f"{first.cache_key}.json"
+            payload = json.loads(path.read_text(encoding="ascii"))
+            payload["schema_version"] = 1
+            path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(
+                WorkloadDecisionCacheError,
+                "unsupported workload decision cache schema",
+            ):
+                _coordinator(directory).compile(_timeline())
+
     def test_malformed_entry_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             coordinator = _coordinator(directory)

@@ -26,6 +26,7 @@ from tllm.workload import (
     sink,
     task,
     temporary,
+    transition,
     workload,
 )
 
@@ -39,7 +40,8 @@ def _timeline() -> MainWorkloadTimeline:
         anchors=(
             TimelineAnchor("model.execute", 0),
             TimelineAnchor("sampler.pre_draw", 1),
-            TimelineAnchor("step.end", 2),
+            TimelineAnchor("token.commit", 2),
+            TimelineAnchor("step.end", 3),
         ),
         regions=(),
         static_headroom_bytes=64,
@@ -64,12 +66,11 @@ def _materialized_declaration():
 
         @task(
             inputs={"value": result("produce", "value")},
-            outputs={"result_value": sink("result")},
             timing=Between("sampler.pre_draw", "step.end"),
         )
-        def consume(self, value: object) -> object:
+        def consume(self, value: object) -> None:
             assert isinstance(value, torch.Tensor)
-            return value * 2
+            _ = value * 2
 
     return declare_workload(Pure())
 
@@ -123,8 +124,10 @@ class SideStreamDecisionUnitTest(unittest.TestCase):
             _timeline()
         )
 
-    def test_effect_free_region_stays_on_default_stream_by_default(self) -> None:
-        compilation = self._compile(_materialized_declaration())
+    def test_effect_free_region_stays_default_when_side_search_is_disabled(self) -> None:
+        compilation = self._compile(
+            _materialized_declaration(), allow_side_stream=False
+        )
         for region in compilation.decision.execution_regions:
             self.assertEqual(region.stream.value, "default")
 
@@ -170,6 +173,58 @@ class SideStreamDecisionUnitTest(unittest.TestCase):
         for node in compilation.physical.nodes:
             self.assertIs(node.stream, StreamClass.DEFAULT)
 
+    def test_fully_materialized_ordered_state_tail_is_automatically_side_placed(
+        self,
+    ) -> None:
+        @workload(id="side.ordered-state-tail")
+        class OrderedStateTail:
+            bank = State(
+                scope=StateScope.REPLICA,
+                parameters="model",
+                transition="manual",
+            )
+
+            @task(
+                outputs={"prediction": temporary()},
+                effects=(read(bank),),
+                timing=Between("model.execute", "sampler.pre_draw"),
+            )
+            def predict(self) -> torch.Tensor:
+                return torch.ones(2, requires_grad=True)
+
+            @task(
+                inputs={"prediction": result("predict", "prediction")},
+                outputs={"loss": temporary()},
+                timing=Between("sampler.pre_draw", "token.commit"),
+            )
+            def loss(self, prediction: torch.Tensor) -> torch.Tensor:
+                return prediction.square().mean()
+
+            @task(
+                inputs={"loss": result("loss", "loss")},
+                effects=(transition(bank),),
+                timing=Between("token.commit", "step.end"),
+            )
+            def update(self, loss: torch.Tensor) -> None:
+                loss.backward()
+
+        compilation = self._compile(
+            declare_workload(OrderedStateTail()), allow_side_stream=True
+        )
+        streams = {
+            task: region.stream.value
+            for region in compilation.decision.execution_regions
+            for task in region.tasks
+        }
+
+        self.assertEqual(
+            streams,
+            {
+                "predict": "default",
+                "loss": "side_forward",
+                "update": "side_forward",
+            },
+        )
     def test_plan_resources_binds_side_stream_without_cuda(self) -> None:
         compilation = self._compile(
             _materialized_declaration(), allow_side_stream=True
@@ -178,8 +233,15 @@ class SideStreamDecisionUnitTest(unittest.TestCase):
         stream_keys = tuple(resource.key for resource in resources.streams)
         self.assertIn(StreamClass.SIDE_FORWARD, stream_keys)
         if not torch.cuda.is_available():
-            # CPU-only hosts keep serial tokens; signed order is unchanged.
-            self.assertEqual(len(resources.streams), 1)
+            # CPU-only hosts bind one serial token per signed stream class;
+            # execution stays synchronous while node-to-resource lookup stays
+            # identical to the CUDA plan.
+            self.assertEqual(
+                frozenset(stream_keys),
+                frozenset(
+                    {StreamClass.DEFAULT, StreamClass.SIDE_FORWARD}
+                ),
+            )
 
 
 if __name__ == "__main__":

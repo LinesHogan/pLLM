@@ -9,6 +9,7 @@ before the first model forward.
 from __future__ import annotations
 
 import contextlib
+from _thread import LockType
 from collections import Counter, deque
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -58,6 +59,7 @@ from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationRequest,
 )
 from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
+from tllm.runtime.torch_adapter import torch_record_stream_owners
 from tllm.runtime.parameter_overlay import (
     DenseOperandCaptureBatch,
     OverlayChannel,
@@ -213,8 +215,8 @@ def lower_signed_materialization_bindings(
     lifetime, producer, or consumer count themselves.
     """
 
-    if decision.schema_version != 2:
-        raise TypeError("decision must be a ScheduleDecision schema v2")
+    if decision.schema_version != 3:
+        raise TypeError("decision must be a ScheduleDecision schema v3")
 
     regions_by_id = {region.region_id: region for region in decision.execution_regions}
     artifacts_by_id: dict[str, RegionCallableArtifact] = {}
@@ -816,6 +818,10 @@ class NativeWorkloadExecution:
     _event_nodes: Mapping[BackendObservableEvent, tuple[NodeKey, ...]] = field(
         default_factory=dict[BackendObservableEvent, tuple[NodeKey, ...]]
     )
+    _event_wait_before: frozenset[BackendObservableEvent] = frozenset()
+    _event_wait_after: frozenset[BackendObservableEvent] = frozenset()
+    _anchor_wait_before: frozenset[str] = frozenset()
+    _anchor_wait_after: frozenset[str] = frozenset()
     _value_store: "_RegionValueStore | _NoRegionValueStore" = field(
         default_factory=_NoRegionValueStore
     )
@@ -844,23 +850,31 @@ class NativeWorkloadExecution:
     )
     _prepared_step: int = -1
     _executed_nodes: set[NodeKey] = field(default_factory=set[NodeKey])
-    _side_streams: tuple[object, ...] = ()
+    _execution_lock: LockType = field(default_factory=Lock)
+    _main_stream: torch.cuda.Stream | None = None
+    _side_streams: tuple[torch.cuda.Stream, ...] = ()
+    _side_node_keys: frozenset[NodeKey] = frozenset()
+    _side_work_pending: bool = False
     _cost_probe: RegionCostProbe = field(default_factory=RegionCostProbe)
 
-    def _join_side_streams(self) -> None:
+    def _join_side_streams_locked(self) -> None:
         """Order the main stream after all side-stream work enqueued so far.
 
-        Called at every signed advance and at step retirement: side Regions
-        overlap with the main workload between two signed events, and any
-        main-path consumption at the next event (sinks, backend binders)
-        observes their results.  This is an async event wait, not a host
-        synchronization.
+        Called only for Rust-signed before/after wait obligations and explicit
+        synchronization. Side Regions may cross ordinary lifecycle events and
+        step retirement; Python does not infer a consumer or scheduling edge.
+        This is an async event wait, not a host synchronization.
         """
-        if not self._side_streams or not torch.cuda.is_available():
+        if not self._side_work_pending:
             return
-        current = torch.cuda.current_stream()
-        for stream in self._side_streams:
-            current.wait_stream(cast(torch.cuda.Stream, stream))
+        if self._side_streams:
+            if self._main_stream is None:
+                raise RuntimeError(
+                    "side-stream execution has no bound main CUDA stream"
+                )
+            for stream in self._side_streams:
+                self._main_stream.wait_stream(stream)
+        self._side_work_pending = False
 
     def owns_consumer(self, consumer: object) -> bool:
         return any(owner is consumer for owner in self._owned_consumers)
@@ -980,10 +994,11 @@ class NativeWorkloadExecution:
         measurement feeds back into the compiler.
         """
 
-        signed = self.compilation.decision.cost.main_path_extension_ns
-        return self._cost_probe.report(
-            signed_main_path_extension_ns=signed, block=block
-        )
+        with self._execution_lock:
+            signed = self.compilation.decision.cost.main_path_extension_ns
+            return self._cost_probe.report(
+                signed_main_path_extension_ns=signed, block=block
+            )
 
     def backend_region_binder_stages(
         self, backend_event: BackendObservableEvent
@@ -1001,24 +1016,28 @@ class NativeWorkloadExecution:
         step = int(step_id)
         if step < 0:
             raise ValueError("native workload step id must be non-negative")
-        if self._prepared_step == step:
-            return
-        if self._prepared_step >= 0:
-            self.finish_step(self._prepared_step)
-        self.executor.prepare_step(step)
-        self._value_store.prepare_step(step)
-        self._prepared_step = step
-        self._executed_nodes.clear()
+        with self._execution_lock:
+            if self._prepared_step == step:
+                return
+            if self._prepared_step >= 0:
+                self._finish_step_locked(self._prepared_step)
+            self.executor.prepare_step(step)
+            self._value_store.prepare_step(step)
+            self._prepared_step = step
+            self._executed_nodes.clear()
 
     def finish_step(self, step_id: int) -> None:
         """Retire one prepared step without releasing epoch-owned artifacts."""
 
         step = int(step_id)
+        with self._execution_lock:
+            self._finish_step_locked(step)
+
+    def _finish_step_locked(self, step: int) -> None:
         if self._prepared_step < 0:
             return
         if self._prepared_step != step:
             raise RuntimeError("cannot retire a native workload step from another epoch")
-        self._join_side_streams()
         self.executor.finish_step(step)
         self._value_store.finish_step(step)
         self._cost_probe.harvest()
@@ -1032,7 +1051,13 @@ class NativeWorkloadExecution:
         nodes = self._anchor_nodes.get(anchor)
         if nodes is None:
             return False
-        return self._advance_nodes(nodes)
+        with self._execution_lock:
+            if anchor in self._anchor_wait_before:
+                self._join_side_streams_locked()
+            advanced = self._advance_nodes_locked(nodes)
+            if anchor in self._anchor_wait_after:
+                self._join_side_streams_locked()
+            return advanced
 
     def advance_backend_event(self, backend_event: BackendObservableEvent) -> bool:
         """Advance only the Region nodes signed for one backend event."""
@@ -1043,39 +1068,45 @@ class NativeWorkloadExecution:
                 "backend event "
                 f"{backend_event.value!r} is not signed for this native workload"
             )
-        # A signed timeline may expose an observable event that advances no
-        # Region. It is an intentional lifecycle no-op, not an unsigned hook.
-        # The side-stream join is still owed here: main-path consumers at
-        # this point in the timeline (e.g. the sampler provider reached via
-        # dispatch_sampler_pre_draw) must observe completed side work even
-        # when the event itself advances zero Region nodes.
-        if not nodes:
-            self._join_side_streams()
-            return False
-        return self._advance_nodes(nodes)
+        with self._execution_lock:
+            if backend_event in self._event_wait_before:
+                self._join_side_streams_locked()
+            # A signed timeline may expose an observable event that advances no
+            # Region. It is an intentional lifecycle no-op, not an unsigned hook.
+            if not nodes:
+                advanced = False
+            else:
+                advanced = self._advance_nodes_locked(nodes)
+            if backend_event in self._event_wait_after:
+                self._join_side_streams_locked()
+            return advanced
 
-    def _advance_nodes(self, nodes: tuple[NodeKey, ...]) -> bool:
+    def _advance_nodes_locked(self, nodes: tuple[NodeKey, ...]) -> bool:
         if self._prepared_step < 0:
             # vLLM kernel warmup calls sampler methods without opening a
             # logical engine step. It has no workload values to execute.
             return False
-        # Join side-stream work from earlier signed events before this
-        # event's nodes or main-path consumers observe their outputs.
-        self._join_side_streams()
         pending = tuple(node for node in nodes if node not in self._executed_nodes)
         if not pending:
             return False
+        if any(node in self._side_node_keys for node in pending):
+            self._side_work_pending = True
         self.executor.execute_nodes(self._prepared_step, pending)
         self._executed_nodes.update(pending)
         return True
 
     def close(self) -> None:
-        if self._prepared_step >= 0:
-            self.finish_step(self._prepared_step)
+        with self._execution_lock:
+            self._join_side_streams_locked()
+            if self._main_stream is not None:
+                self._main_stream.synchronize()
+            if self._prepared_step >= 0:
+                self._finish_step_locked(self._prepared_step)
 
     @property
     def retained_value_count(self) -> int:
-        return self._value_store.retained_value_count
+        with self._execution_lock:
+            return self._value_store.retained_value_count
 
     @property
     def state_versions(self) -> StateVersionRegistry:
@@ -1084,16 +1115,17 @@ class NativeWorkloadExecution:
     def state_version_report(self) -> tuple[tuple[str, object, int], ...]:
         """Project observed versions onto the closed JSON control-plane key set."""
 
-        report: list[tuple[str, object, int]] = []
-        for resource, key, version in self._state_versions.observed_versions():
-            if key is not None and (
-                isinstance(key, bool) or not isinstance(key, (str, int))
-            ):
-                raise TypeError(
-                    "state version report keys must be None, str, or non-bool int"
-                )
-            report.append((resource, key, version))
-        return tuple(report)
+        with self._execution_lock:
+            report: list[tuple[str, object, int]] = []
+            for resource, key, version in self._state_versions.observed_versions():
+                if key is not None and (
+                    isinstance(key, bool) or not isinstance(key, (str, int))
+                ):
+                    raise TypeError(
+                        "state version report keys must be None, str, or non-bool int"
+                    )
+                report.append((resource, key, version))
+            return tuple(report)
 
     @property
     def artifact_report(self) -> tuple[tuple[str, str], ...]:
@@ -1124,10 +1156,16 @@ class NativeWorkloadExecution:
         step_id: int,
         request_ids: tuple[str, ...],
         sample_indices: tuple[int, ...],
+        sample_index_tensor: torch.Tensor | None,
     ) -> None:
         match self._sampler:
             case SamplerRuntimeBinding(stage_identity=stage_identity):
-                stage_identity(step_id, request_ids, sample_indices)
+                stage_identity(
+                    step_id,
+                    request_ids,
+                    sample_indices,
+                    sample_index_tensor,
+                )
             case NoSamplerBinding():
                 pass
 
@@ -1139,32 +1177,55 @@ class NativeWorkloadExecution:
         scheduling, artifact identity, or cache selection.
         """
 
-        result: dict[str, Mapping[str, int | float]] = {}
-        for workload_id, reader in self._diagnostics_readers.items():
-            raw = reader()
-            normalized: dict[str, int | float] = {}
-            for name, value in raw.items():
-                if not name:
-                    raise TypeError(
-                        "native diagnostic names must be non-empty strings"
-                    )
-                if type(value) not in (int, float):
-                    raise TypeError(
-                        "native diagnostic values must be int or float"
-                    )
-                if type(value) is float and not isfinite(value):
-                    raise ValueError("native diagnostic float values must be finite")
-                normalized[name] = value
-            result[workload_id] = MappingProxyType(dict(sorted(normalized.items())))
-        return MappingProxyType(dict(sorted(result.items())))
+        with self._execution_lock:
+            result: dict[str, Mapping[str, int | float]] = {}
+            for workload_id, reader in self._diagnostics_readers.items():
+                raw = reader()
+                normalized: dict[str, int | float] = {}
+                for name, value in raw.items():
+                    if not name:
+                        raise TypeError(
+                            "native diagnostic names must be non-empty strings"
+                        )
+                    if type(value) not in (int, float):
+                        raise TypeError(
+                            "native diagnostic values must be int or float"
+                        )
+                    if type(value) is float and not isfinite(value):
+                        raise ValueError(
+                            "native diagnostic float values must be finite"
+                        )
+                    normalized[name] = value
+                result[workload_id] = MappingProxyType(
+                    dict(sorted(normalized.items()))
+                )
+            return MappingProxyType(dict(sorted(result.items())))
 
     def read_and_reset_stats(self, *, sync: bool = True) -> "TrainingStats":
-        return self._lifecycle.read_and_reset_stats(bool(sync))
+        with self._execution_lock:
+            self._join_side_streams_locked()
+            execution_stream = (
+                contextlib.nullcontext()
+                if self._main_stream is None
+                else torch.cuda.stream(self._main_stream)
+            )
+            with execution_stream:
+                return self._lifecycle.read_and_reset_stats(bool(sync))
 
     def read_and_reset_per_request_stats(
         self, *, sync: bool = True
     ) -> Mapping[int, "TrainingStats"]:
-        return self._lifecycle.read_and_reset_per_request_stats(bool(sync))
+        with self._execution_lock:
+            self._join_side_streams_locked()
+            execution_stream = (
+                contextlib.nullcontext()
+                if self._main_stream is None
+                else torch.cuda.stream(self._main_stream)
+            )
+            with execution_stream:
+                return self._lifecycle.read_and_reset_per_request_stats(
+                    bool(sync)
+                )
 
     def set_enabled(self, enabled: bool) -> None:
         _ = enabled
@@ -1174,10 +1235,21 @@ class NativeWorkloadExecution:
         )
 
     def synchronize(self) -> None:
-        self._lifecycle.synchronize()
+        with self._execution_lock:
+            self._join_side_streams_locked()
+            execution_stream = (
+                contextlib.nullcontext()
+                if self._main_stream is None
+                else torch.cuda.stream(self._main_stream)
+            )
+            with execution_stream:
+                self._lifecycle.synchronize()
+            if self._main_stream is not None:
+                self._main_stream.synchronize()
 
     def read_workgraph_runtime_stats(self) -> "WorkGraphRuntimeStats":
-        return runtime_stats_from_executor(self.executor.stats)
+        with self._execution_lock:
+            return runtime_stats_from_executor(self.executor.stats)
 
     def peek_shape_specialization_requests(
         self,
@@ -1432,6 +1504,7 @@ class _RegionValueStore:
             )
             return
         inputs = self.resolve_inputs(artifact, context)
+        torch_record_stream_owners(tuple(inputs.values()), context.stream)
         state_before = self._state_versions.before(
             artifact.effects, context.step_id
         )
@@ -1439,6 +1512,9 @@ class _RegionValueStore:
             outputs = {key: SKIPPED for key in artifact.output_keys}
         else:
             outputs = artifact.execute(inputs)
+            torch_record_stream_owners(
+                tuple(outputs.values()), context.stream
+            )
             self._state_versions.after(
                 artifact.effects,
                 context.step_id,
@@ -1474,6 +1550,7 @@ class _RegionValueStore:
                 RegionInputKind.STAGED,
                 RegionInputKind.SAMPLER_REQUEST_IDS,
                 RegionInputKind.SAMPLER_SAMPLE_IDXS,
+                RegionInputKind.SAMPLER_SAMPLE_IDX_TENSOR,
                 RegionInputKind.SAMPLER_LOGITS,
                 RegionInputKind.SAMPLED_TOKENS,
             ):
@@ -1947,6 +2024,7 @@ def _local_binding_requirements(
             RegionInputKind.STAGED,
             RegionInputKind.SAMPLER_REQUEST_IDS,
             RegionInputKind.SAMPLER_SAMPLE_IDXS,
+            RegionInputKind.SAMPLER_SAMPLE_IDX_TENSOR,
             RegionInputKind.SAMPLER_LOGITS,
             RegionInputKind.SAMPLED_TOKENS,
         )
@@ -2329,6 +2407,26 @@ def _native_workload_execution(
         event_nodes.setdefault(advance.backend_event, []).extend(
             node_by_region[region_id] for region_id in advance.region_ids
         )
+    event_wait_before = frozenset(
+        advance.backend_event
+        for advance in compilation.decision.runtime_advance_plan
+        if advance.wait_for_prior_side_work
+    )
+    event_wait_after = frozenset(
+        advance.backend_event
+        for advance in compilation.decision.runtime_advance_plan
+        if advance.wait_for_side_outputs
+    )
+    anchor_wait_before = frozenset(
+        advance.anchor_id
+        for advance in compilation.decision.runtime_advance_plan
+        if advance.wait_for_prior_side_work
+    )
+    anchor_wait_after = frozenset(
+        advance.anchor_id
+        for advance in compilation.decision.runtime_advance_plan
+        if advance.wait_for_side_outputs
+    )
     known_anchors = set(anchor_nodes)
     if compilation.decision.completion_anchor not in known_anchors:
         raise RuntimeError("signed Region completion anchor has no Region binding")
@@ -2353,6 +2451,20 @@ def _native_workload_execution(
         if resource.key is not StreamClass.DEFAULT
         and isinstance(resource.stream, torch.cuda.Stream)
     )
+    main_stream = next(
+        (
+            resource.stream
+            for resource in resources.streams
+            if resource.key is StreamClass.DEFAULT
+            and isinstance(resource.stream, torch.cuda.Stream)
+        ),
+        None,
+    )
+    side_node_keys = frozenset(
+        node.node_key
+        for node in resources.plan.nodes
+        if node.stream is not StreamClass.DEFAULT
+    )
     frozen_anchor_nodes = MappingProxyType(
         {anchor: tuple(nodes) for anchor, nodes in anchor_nodes.items()}
     )
@@ -2370,6 +2482,10 @@ def _native_workload_execution(
         ),
         _anchor_nodes=frozen_anchor_nodes,
         _event_nodes=frozen_event_nodes,
+        _event_wait_before=event_wait_before,
+        _event_wait_after=event_wait_after,
+        _anchor_wait_before=anchor_wait_before,
+        _anchor_wait_after=anchor_wait_after,
         _value_store=value_store,
         _state_versions=state_versions,
         _artifact_report=tuple(
@@ -2383,7 +2499,9 @@ def _native_workload_execution(
         parameter_overlays=bindings.parameter_overlays,
         _requires_decode_hidden=bool(hidden_bindings),
         _shape_specializations=shape_specializations,
+        _main_stream=main_stream,
         _side_streams=side_streams,
+        _side_node_keys=side_node_keys,
         _cost_probe=cost_probe,
     )
 

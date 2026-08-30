@@ -41,6 +41,7 @@ def make_plain_llm(
     worker_extension_cls: str | None = None,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
+    max_cudagraph_capture_size: int | None = None,
     enable_lora: bool = False,
     max_lora_rank: int | None = None,
     max_loras: int | None = None,
@@ -63,6 +64,10 @@ def make_plain_llm(
         kwargs["max_num_seqs"] = int(max_num_seqs)
     if max_num_batched_tokens is not None:
         kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    if max_cudagraph_capture_size is not None:
+        kwargs["max_cudagraph_capture_size"] = int(
+            max_cudagraph_capture_size
+        )
     if enable_lora:
         kwargs["enable_lora"] = True
     if max_lora_rank is not None:

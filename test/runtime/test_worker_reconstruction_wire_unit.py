@@ -76,7 +76,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
         )
         decision = _core.compile_schedule(graph, timeline, options)
         cache_key = hashlib.sha256(
-            f"workload-compilation-v2\0{graph}\0{timeline}\0{options}".encode("ascii")
+            f"workload-compilation-v3\0{graph}\0{timeline}\0{options}".encode("ascii")
         ).hexdigest()
         return cache_key, graph, timeline, options, decision
 

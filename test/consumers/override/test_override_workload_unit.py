@@ -273,7 +273,12 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
             assert isinstance(sampler, SamplerRuntimeBinding)
             assert isinstance(sampler.provider, DeclaredSamplerOutput)
             view = _view(hidden)
-            sampler.stage_identity(7, view.request_ids, view.sample_idxs)
+            sampler.stage_identity(
+                7,
+                view.request_ids,
+                view.sample_idxs,
+                torch.tensor(view.sample_idxs),
+            )
             residual_runtime.advance_workload_anchor(pre_draw)
             modifier = sampler.provider.prepare_step(view)
             self.assertIsNotNone(modifier)
@@ -397,7 +402,10 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
                     runner=object(),
                 )
                 sampler.stage_identity(
-                    step_id, view.request_ids, view.sample_idxs
+                    step_id,
+                    view.request_ids,
+                    view.sample_idxs,
+                    torch.tensor(view.sample_idxs),
                 )
                 residual_runtime.advance_workload_anchor(pre_draw)
                 self.assertIsNotNone(sampler.provider.prepare_step(view))
@@ -466,7 +474,12 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
             assert isinstance(sampler, SamplerRuntimeBinding)
             assert isinstance(sampler.provider, DeclaredSamplerOutput)
             view = _view(hidden, sample_idxs=(3, 3), engine_step_id=8)
-            sampler.stage_identity(8, view.request_ids, view.sample_idxs)
+            sampler.stage_identity(
+                8,
+                view.request_ids,
+                view.sample_idxs,
+                torch.tensor(view.sample_idxs),
+            )
             residual_runtime.advance_workload_anchor(pre_draw)
             modifier = sampler.provider.prepare_step(view)
             self.assertIsNotNone(modifier)

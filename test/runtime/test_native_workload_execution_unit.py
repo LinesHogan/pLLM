@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import unittest
 from unittest import mock
 from collections.abc import Hashable, Mapping
 from dataclasses import replace
+from threading import Event, Thread
 from typing import Any, cast
 
 import torch
@@ -95,6 +97,7 @@ from tllm.workload import (
     provided,
     read,
     result,
+    sampler,
     sink,
     step_id,
     task,
@@ -1065,7 +1068,11 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         context = PhysicalExecutionContext(
             step_id=9,
             plan_epoch=1,
-            node=cast(Any, object()),
+            node=PhysicalNodePlan(
+                node_key=NodeKey("test", "versioned-materializations"),
+                executor=ExecutorKey("test", "versioned-materializations"),
+                stream=StreamClass.DEFAULT,
+            ),
             kind=PhysicalExecutionKind.EAGER,
             stream=object(),
             tensors=(),
@@ -1182,8 +1189,8 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
 
         self.assertEqual(trace, ["left", "right"])
 
-    def test_zero_node_signed_event_still_joins_side_streams(self) -> None:
-        """A signed event advancing zero Regions must still fence side work.
+    def test_zero_node_sampler_consumer_still_joins_pending_side_work(self) -> None:
+        """A sampler consumer must fence even when it advances zero Regions.
 
         The sampler provider reached via dispatch_sampler_pre_draw consumes
         side-Region outputs at an anchor that typically advances no Region;
@@ -1193,11 +1200,21 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         @workload(id="runtime.zero-node-join")
         class ZeroNode:
             @task(
-                outputs={"output": sink("answer")},
+                outputs={"value": temporary()},
                 timing=Between("model.execute", "logits.post"),
             )
             def produce(self) -> torch.Tensor:
                 return torch.ones(4)
+
+            @task(
+                inputs={"value": result("produce", "value")},
+                outputs={
+                    "guidance": sampler.hidden_reweight(beta=1.0),
+                },
+                timing=Between("logits.post", "sampler.pre_draw"),
+            )
+            def publish(self, value: torch.Tensor) -> torch.Tensor:
+                return value
 
         declaration = declare_workload(ZeroNode())
         compilation = WorkloadCompilerCoordinator(
@@ -1211,7 +1228,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             declarations=(declaration,),
             ports=RuntimePortRegistry(
                 outputs={
-                    "answer": RuntimeOutputBinding(
+                    "guidance": RuntimeOutputBinding(
                         lambda _value, _step_id: None
                     )
                 }
@@ -1225,16 +1242,462 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
             self.assertIsNotNone(execution)
             assert execution is not None
             residual_runtime.prepare_physical_workgraph_step(1)
-            with mock.patch.object(
-                NativeWorkloadExecution, "_join_side_streams", autospec=True
-            ) as join:
-                self.assertFalse(
-                    execution.advance_backend_event(
-                        BackendObservableEvent.SAMPLER_PRE_DRAW
-                    )
+
+            class SideStream:
+                pass
+
+            waited: list[SideStream] = []
+
+            class MainStream:
+                def wait_stream(self, stream: SideStream) -> None:
+                    waited.append(stream)
+
+            side_stream = SideStream()
+            execution._side_streams = (side_stream,)
+            execution._main_stream = MainStream()
+            execution._side_work_pending = True
+            self.assertIn(
+                BackendObservableEvent.SAMPLER_PRE_DRAW,
+                execution._event_wait_after,
+            )
+            self.assertFalse(
+                execution.advance_backend_event(
+                    BackendObservableEvent.SAMPLER_PRE_DRAW
                 )
-                join.assert_called_once()
+            )
+            self.assertEqual(waited, [side_stream])
+            self.assertFalse(execution._side_work_pending)
             execution.finish_step(1)
+
+    def test_side_work_crosses_retirement_and_empty_events_before_next_state_reader(
+        self,
+    ) -> None:
+        trace: list[str] = []
+        versions: dict[Hashable, int] = {None: 0}
+
+        @workload(id="runtime.side-lifecycle")
+        class SideLifecycle:
+            state = State(
+                scope=StateScope.REPLICA,
+                parameters="model",
+                transition="manual",
+            )
+
+            def __init__(self) -> None:
+                self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+            @task(
+                inputs={"current_step": step_id()},
+                outputs={"prediction": temporary()},
+                effects=(read(state),),
+                timing=Between("model.execute", "sampler.pre_draw"),
+            )
+            def predict(self, current_step: int) -> torch.Tensor:
+                trace.append(f"read:{current_step}")
+                return self.weight * (current_step + 1)
+
+            @task(
+                inputs={"prediction": result("predict", "prediction")},
+                effects=(transition(state),),
+                timing=Between("token.commit", "next.prepare"),
+            )
+            def update(self, prediction: torch.Tensor) -> None:
+                trace.append("update")
+                prediction.square().backward()
+                versions[None] += 1
+
+        declaration = declare_workload(SideLifecycle())
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+                allow_side_stream=True,
+            ),
+        ).compile(_timeline())
+        streams = {
+            task_name: region.stream.value
+            for region in compilation.decision.execution_regions
+            for task_name in region.tasks
+        }
+        self.assertEqual(
+            streams,
+            {"predict": "default", "update": "side_forward"},
+        )
+        schedule_state = compilation.graph.states[0]
+        bindings = WorkloadExecutionBindings(
+            declarations=(declaration,),
+            state_versions={
+                schedule_state.resource: StateVersionBinding(
+                    schedule_state,
+                    lambda _step_id: dict(versions),
+                )
+            },
+        )
+        state = ResidualRuntimeState()
+
+        def join_pending_side_work(execution: NativeWorkloadExecution) -> None:
+            if execution._side_work_pending:
+                trace.append("join")
+                execution._side_work_pending = False
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch.object(
+                NativeWorkloadExecution,
+                "_join_side_streams_locked",
+                autospec=True,
+                side_effect=join_pending_side_work,
+            ),
+        ):
+            residual_runtime.publish_workload_compilation(
+                compilation,
+                bindings=bindings,
+            )
+            execution = state.workload_execution
+            self.assertIsNotNone(execution)
+            assert execution is not None
+            self.assertEqual(
+                execution._event_nodes[
+                    BackendObservableEvent.PREPARE_INPUTS_POST
+                ],
+                (),
+            )
+            self.assertIn(
+                BackendObservableEvent.EXECUTE_MODEL_POST,
+                execution._event_wait_before,
+            )
+            self.assertNotIn(
+                BackendObservableEvent.PREPARE_INPUTS_POST,
+                execution._event_wait_before,
+            )
+
+            execution.prepare_step(1)
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.EXECUTE_MODEL_POST
+                )
+            )
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.SAMPLE_TOKENS_POST
+                )
+            )
+            self.assertTrue(execution._side_work_pending)
+
+            execution.finish_step(1)
+            self.assertTrue(execution._side_work_pending)
+            self.assertEqual(trace, ["read:1", "update"])
+
+            execution.prepare_step(2)
+            self.assertFalse(
+                execution.advance_backend_event(
+                    BackendObservableEvent.PREPARE_INPUTS_POST
+                )
+            )
+            self.assertTrue(execution._side_work_pending)
+            self.assertEqual(trace, ["read:1", "update"])
+
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.EXECUTE_MODEL_POST
+                )
+            )
+            self.assertFalse(execution._side_work_pending)
+            self.assertEqual(
+                trace,
+                ["read:1", "update", "join", "read:2"],
+            )
+
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.SAMPLE_TOKENS_POST
+                )
+            )
+            self.assertTrue(execution._side_work_pending)
+            execution.synchronize()
+            self.assertFalse(execution._side_work_pending)
+
+            execution.finish_step(2)
+            execution.prepare_step(3)
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.EXECUTE_MODEL_POST
+                )
+            )
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.SAMPLE_TOKENS_POST
+                )
+            )
+            self.assertTrue(execution._side_work_pending)
+            execution.close()
+            self.assertFalse(execution._side_work_pending)
+
+        self.assertEqual(trace.count("join"), 3)
+        self.assertEqual(versions, {None: 3})
+
+    def test_side_autograd_materialization_records_stream_ownership_before_launch(
+        self,
+    ) -> None:
+        trace: list[str] = []
+        recorded: list[torch.Tensor] = []
+        producer_streams: list[torch.cuda.Stream] = []
+
+        @workload(id="runtime.side-autograd-ownership")
+        class SideAutogradOwnership:
+            def __init__(self) -> None:
+                self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+            @task(
+                inputs={"current_step": step_id()},
+                outputs={"prediction": temporary()},
+                timing=Between("model.execute", "sampler.pre_draw"),
+            )
+            def predict(self, current_step: int) -> torch.Tensor:
+                trace.append("predict")
+                prediction = self.weight * (current_step + 1)
+                return prediction
+
+            @task(
+                inputs={"prediction": result("predict", "prediction")},
+                timing=Between("token.commit", "next.prepare"),
+            )
+            def train(self, prediction: torch.Tensor) -> None:
+                trace.append("train")
+                prediction.square().backward()
+
+        declaration = declare_workload(SideAutogradOwnership())
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+                allow_side_stream=True,
+            ),
+        ).compile(_timeline())
+        self.assertEqual(
+            {
+                task_name: region.stream.value
+                for region in compilation.decision.execution_regions
+                for task_name in region.tasks
+            },
+            {"predict": "default", "train": "side_forward"},
+        )
+
+        state = ResidualRuntimeState()
+        def record_owners(
+            values: tuple[torch.Tensor, ...],
+            _stream: torch.cuda.Stream,
+        ) -> None:
+            if not producer_streams:
+                producer_streams.append(_stream)
+            elif values and _stream is not producer_streams[0]:
+                trace.append("record")
+                recorded.extend(values)
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch(
+                "tllm.runtime.workload_execution.torch_record_stream_owners",
+                side_effect=record_owners,
+            ),
+        ):
+            residual_runtime.publish_workload_compilation(
+                compilation,
+                bindings=WorkloadExecutionBindings(
+                    declarations=(declaration,)
+                ),
+            )
+            execution = state.workload_execution
+            self.assertIsNotNone(execution)
+            assert execution is not None
+            execution.prepare_step(1)
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.EXECUTE_MODEL_POST
+                )
+            )
+            self.assertTrue(
+                execution.advance_backend_event(
+                    BackendObservableEvent.SAMPLE_TOKENS_POST
+                )
+            )
+            self.assertTrue(execution._side_work_pending)
+            execution.finish_step(1)
+            execution.synchronize()
+        self.assertEqual(trace, ["predict", "record", "train"])
+        self.assertEqual(len(recorded), 1)
+        self.assertTrue(recorded[0].requires_grad)
+
+    def test_default_state_mutation_waits_for_prior_side_read(self) -> None:
+        @workload(id="runtime.side-read-default-write")
+        class SideReadDefaultWrite:
+            state = State(
+                scope=StateScope.REPLICA,
+                parameters="model",
+                transition="manual",
+            )
+
+            @task(
+                outputs={"value": temporary()},
+                timing=Between("model.execute", "sampler.pre_draw"),
+            )
+            def produce(self) -> torch.Tensor:
+                return torch.ones(1)
+
+            @task(
+                inputs={"value": result("produce", "value")},
+                effects=(read(state),),
+                timing=Between("sampler.pre_draw", "token.commit"),
+            )
+            def observe(self, value: torch.Tensor) -> None:
+                _ = value.square()
+
+            @task(
+                inputs={"trigger": provided("trigger")},
+                effects=(transition(state),),
+                timing=Between("token.commit", "next.prepare"),
+            )
+            def mutate(self, trigger: torch.Tensor) -> None:
+                _ = trigger
+
+        compilation = WorkloadCompilerCoordinator(
+            (declare_workload(SideReadDefaultWrite()),),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+            ),
+        ).compile(_timeline())
+        regions = {
+            task_name: region
+            for region in compilation.decision.execution_regions
+            for task_name in region.tasks
+        }
+        self.assertEqual(regions["observe"].stream.value, "side_forward")
+        self.assertEqual(regions["mutate"].stream.value, "default")
+        mutate_advance = next(
+            advance
+            for advance in compilation.decision.runtime_advance_plan
+            if regions["mutate"].region_id in advance.region_ids
+        )
+        self.assertTrue(mutate_advance.wait_for_prior_side_work)
+
+    def test_join_waits_until_side_host_submission_has_enqueued_work(self) -> None:
+        @workload(id="runtime.side-submission-lock")
+        class SideSubmissionLock:
+            @task(
+                outputs={"value": temporary()},
+                timing=Between("model.execute", "sampler.pre_draw"),
+            )
+            def produce(self) -> torch.Tensor:
+                return torch.ones(1)
+
+            @task(
+                inputs={"value": result("produce", "value")},
+                timing=Between("token.commit", "next.prepare"),
+            )
+            def consume(self, value: torch.Tensor) -> None:
+                _ = value.square()
+
+        declaration = declare_workload(SideSubmissionLock())
+        compilation = WorkloadCompilerCoordinator(
+            (declaration,),
+            options=CompileOptions(
+                memory_budget_bytes=1 << 20,
+                compile_policy="eager",
+            ),
+        ).compile(_timeline())
+        side_region = next(
+            region
+            for region in compilation.decision.execution_regions
+            if region.stream.value == "side_forward"
+        )
+        side_advance = next(
+            advance
+            for advance in compilation.decision.runtime_advance_plan
+            if side_region.region_id in advance.region_ids
+        )
+        state = ResidualRuntimeState()
+        entered = Event()
+        release = Event()
+        enqueued = Event()
+        synchronized = Event()
+        wait_observations: list[bool] = []
+
+        class SideStream:
+            pass
+
+        class MainStream:
+            def wait_stream(self, _stream: SideStream) -> None:
+                wait_observations.append(enqueued.is_set())
+
+            def synchronize(self) -> None:
+                pass
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            residual_runtime.publish_workload_compilation(
+                compilation,
+                bindings=WorkloadExecutionBindings(
+                    declarations=(declaration,)
+                ),
+            )
+            execution = state.workload_execution
+            self.assertIsNotNone(execution)
+            assert execution is not None
+            execution.prepare_step(1)
+            execution._side_streams = (SideStream(),)
+            execution._main_stream = MainStream()
+
+            def submit_nodes(
+                _executor: object,
+                _step_id: int,
+                _nodes: tuple[NodeKey, ...],
+                *,
+                tensors: tuple[torch.Tensor, ...] = (),
+            ) -> object:
+                _ = tensors
+                entered.set()
+                release.wait()
+                enqueued.set()
+                return object()
+
+            def synchronize_execution() -> None:
+                execution.synchronize()
+                synchronized.set()
+
+            with mock.patch(
+                "tllm.runtime.scheduling.workgraph_executor."
+                "PhysicalExecutor.execute_nodes",
+                autospec=True,
+                side_effect=submit_nodes,
+            ), mock.patch.object(
+                torch.cuda,
+                "stream",
+                return_value=contextlib.nullcontext(),
+            ):
+                submitter = Thread(
+                    target=execution.advance_backend_event,
+                    args=(side_advance.backend_event,),
+                )
+                waiter = Thread(
+                    target=synchronize_execution
+                )
+                submitter.start()
+                self.assertTrue(entered.wait(1.0))
+                waiter.start()
+                self.assertFalse(synchronized.wait(0.05))
+                release.set()
+                submitter.join(1.0)
+                waiter.join(1.0)
+
+        self.assertFalse(submitter.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(synchronized.is_set())
+        self.assertEqual(wait_observations, [True])
+        self.assertFalse(execution._side_work_pending)
 
     def test_physical_region_identity_coverage_fails_closed(self) -> None:
         @workload(id="runtime.identity")

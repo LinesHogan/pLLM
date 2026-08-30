@@ -36,6 +36,7 @@ class _PreparedIdentity:
     step_id: int
     request_ids: tuple[str, ...]
     sample_indices: tuple[int, ...]
+    sample_index_tensor: torch.Tensor | None
 
 
 class SamplerStepContext:
@@ -57,13 +58,22 @@ class SamplerStepContext:
         step_id: int,
         request_ids: tuple[str, ...],
         sample_indices: tuple[int, ...],
+        sample_index_tensor: torch.Tensor | None,
     ) -> None:
         if len(request_ids) != len(sample_indices):
             raise ValueError(
                 "sampler request and sample identity rows must match"
             )
+        owned_sample_index_tensor = (
+            None
+            if sample_index_tensor is None
+            else sample_index_tensor.clone()
+        )
         self._identity = _PreparedIdentity(
-            step_id, request_ids, sample_indices
+            step_id,
+            request_ids,
+            sample_indices,
+            owned_sample_index_tensor,
         )
 
     def prepare(self, view: SamplerStepView) -> None:
@@ -111,6 +121,18 @@ class SamplerStepContext:
                 sample_indices=sample_indices,
             ) if prepared_step == step_id and sample_indices:
                 return sample_indices
+            case _:
+                return SKIPPED
+
+    def sample_index_tensor(
+        self, step_id: int
+    ) -> torch.Tensor | RuntimeValueMarker:
+        match self._identity:
+            case _PreparedIdentity(
+                step_id=prepared_step,
+                sample_index_tensor=sample_index_tensor,
+            ) if prepared_step == step_id and sample_index_tensor is not None:
+                return sample_index_tensor
             case _:
                 return SKIPPED
 

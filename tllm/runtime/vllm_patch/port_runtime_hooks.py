@@ -334,7 +334,7 @@ def store_decode_localization(
         execution = core.RUNTIME.workload_execution
         if execution is not None:
             execution.stage_sampler_identity(
-                core.RUNTIME.event_step_id, (), ()
+                core.RUNTIME.event_step_id, (), (), None
             )
         return
 
@@ -366,19 +366,20 @@ def store_decode_localization(
     core.RUNTIME.decode_prompt_idxs = [int(x) for x in prompt_idxs]
     core.RUNTIME.decode_sample_idxs = [int(x) for x in sample_idxs]
     core.RUNTIME.decode_request_ids = [str(x) for x in request_ids]
-    execution = core.RUNTIME.workload_execution
-    if execution is not None:
-        execution.stage_sampler_identity(
-            core.RUNTIME.event_step_id,
-            tuple(core.RUNTIME.decode_request_ids),
-            tuple(core.RUNTIME.decode_sample_idxs),
-        )
     if needs_device_metadata:
         core.RUNTIME.decode_prompt_idx_tensor = decode_prompt_idx_buf[:k]
         core.RUNTIME.decode_sample_idx_tensor = decode_sample_idx_buf[:k]
     else:
         core.RUNTIME.decode_prompt_idx_tensor = None
         core.RUNTIME.decode_sample_idx_tensor = None
+    execution = core.RUNTIME.workload_execution
+    if execution is not None:
+        execution.stage_sampler_identity(
+            core.RUNTIME.event_step_id,
+            tuple(core.RUNTIME.decode_request_ids),
+            tuple(core.RUNTIME.decode_sample_idxs),
+            core.RUNTIME.decode_sample_idx_tensor,
+        )
 
     compact_row_idx = getattr(core.RUNTIME, "decode_compact_row_idx", None)
     if isinstance(compact_row_idx, torch.Tensor):
@@ -430,7 +431,7 @@ def _clear_decode_localization(core: DecodeHookCoreLike) -> None:
     execution = core.RUNTIME.workload_execution
     if execution is not None:
         execution.stage_sampler_identity(
-            core.RUNTIME.event_step_id, (), ()
+            core.RUNTIME.event_step_id, (), (), None
         )
 
 

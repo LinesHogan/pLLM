@@ -223,11 +223,15 @@ class TllmRuntimeUnitTest(unittest.TestCase):
                 enable_prefix_caching=False,
                 max_num_seqs=128,
                 max_num_batched_tokens=128,
+                max_cudagraph_capture_size=128,
             )
 
         self.assertIs(result, llm)
         self.assertEqual(llm_cls.call_args.kwargs["max_num_seqs"], 128)
         self.assertEqual(llm_cls.call_args.kwargs["max_num_batched_tokens"], 128)
+        self.assertEqual(
+            llm_cls.call_args.kwargs["max_cudagraph_capture_size"], 128
+        )
 
     def test_plain_llm_preserves_vllm_scheduler_defaults(self) -> None:
         from tllm.util.tools import make_plain_llm
@@ -243,6 +247,9 @@ class TllmRuntimeUnitTest(unittest.TestCase):
 
         self.assertNotIn("max_num_seqs", llm_cls.call_args.kwargs)
         self.assertNotIn("max_num_batched_tokens", llm_cls.call_args.kwargs)
+        self.assertNotIn(
+            "max_cudagraph_capture_size", llm_cls.call_args.kwargs
+        )
 
 
 if __name__ == "__main__":

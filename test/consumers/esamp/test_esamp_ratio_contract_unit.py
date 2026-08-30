@@ -51,8 +51,8 @@ def _run_payload(*, mode: str, throughput: float, loss_count: int = 1) -> dict[s
         "workload": {"schema_version": 3, "model": "m", "batch_size": 8},
         "out_tok_per_s": float(throughput),
         "scheduler_diagnostics": _scheduler_diagnostics(),
-        "training_enabled": mode == "tllm",
-        "intervention_enabled": mode == "tllm",
+        "training_enabled": mode in ("tllm", "native"),
+        "intervention_enabled": mode in ("tllm", "native"),
         "esamp_loss_count": int(loss_count),
         "expected_esamp_loss_count": 1,
         "minimum_esamp_loss_count": 1,
@@ -72,6 +72,12 @@ def _run_payload(*, mode: str, throughput: float, loss_count: int = 1) -> dict[s
             "capture_resident_stage_count": 1,
             "capture_resident_stage_install_count": 1,
             "step_lease_retire_count": 1,
+        },
+        "native_workgraph": {
+            "execute_count": 1,
+            "eager_count": 1,
+            "replay_count": 0,
+            "fallback_count": 0,
         },
     }
 
@@ -183,6 +189,21 @@ class ESampRatioContractUnitTest(unittest.TestCase):
             payload.pop("scheduler_diagnostics")
 
         _validate_comparable(raw, tllm)
+
+    def test_native_ratio_requires_signed_eager_execution(self) -> None:
+        raw = _run_payload(mode="raw", throughput=100.0)
+        native = _run_payload(mode="native", throughput=99.0)
+
+        _validate_comparable(raw, native)
+
+        native["native_workgraph"] = {
+            "execute_count": 1,
+            "eager_count": 1,
+            "replay_count": 0,
+            "fallback_count": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "signed eager path"):
+            _validate_comparable(raw, native)
 
     def test_paired_acceptance_reports_ci_from_five_blocks(self) -> None:
         raw = [_run_payload(mode="raw", throughput=100.0) for _ in range(5)]

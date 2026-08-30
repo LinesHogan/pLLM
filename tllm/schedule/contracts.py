@@ -67,13 +67,13 @@ def _require_json_fields(
     missing = tuple(field_name for field_name in required if field_name not in raw)
     if missing:
         raise ValueError(
-            f"{label} schema v2 is missing required fields: {', '.join(missing)}"
+            f"{label} wire schema is missing required fields: {', '.join(missing)}"
         )
     if allowed is not None:
         unknown = tuple(sorted(set(raw).difference(allowed)))
         if unknown:
             raise ValueError(
-                f"{label} schema v2 has unknown fields: {', '.join(unknown)}"
+                f"{label} wire schema has unknown fields: {', '.join(unknown)}"
             )
     return raw
 
@@ -347,6 +347,7 @@ class ScheduleInputKind(StrEnum):
     STAGED = "staged"
     SAMPLER_REQUEST_IDS = "sampler_request_ids"
     SAMPLER_SAMPLE_IDXS = "sampler_sample_idxs"
+    SAMPLER_SAMPLE_IDX_TENSOR = "sampler_sample_idx_tensor"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
 
@@ -366,6 +367,7 @@ class RegionInputKind(StrEnum):
     STAGED = "staged"
     SAMPLER_REQUEST_IDS = "sampler_request_ids"
     SAMPLER_SAMPLE_IDXS = "sampler_sample_idxs"
+    SAMPLER_SAMPLE_IDX_TENSOR = "sampler_sample_idx_tensor"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
 
@@ -1065,10 +1067,10 @@ class CompileOptions:
     compiler_fingerprint: str = ""
     compile_policy: str = "torch_compile"
     capture_policy: str = "auto"
-    # Permit the Rust planner to sign effect-free Regions onto a side stream
-    # for overlap with the main workload.  Cross-stream ordering stays on
-    # explicit signed fences; this never relaxes correctness.
-    allow_side_stream: bool = False
+    # Internal search-space gate, enabled by default. Rust alone selects
+    # stream-safe pure or ordered-transition Regions and signs every wait;
+    # workload declarations never choose a lane or placement.
+    allow_side_stream: bool = True
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -1456,6 +1458,7 @@ class ExecutionRegion:
     effects: tuple[ScheduleEffect, ...] = ()
     compile_safe: bool = True
     capture_safe: bool = False
+    side_stream_safe: bool = False
     capture_mode: RegionCaptureMode = RegionCaptureMode.DISABLED
     stream: RegionStreamClass = RegionStreamClass.DEFAULT
     fallback_policy: RegionFallbackPolicy = RegionFallbackPolicy.REJECT
@@ -1563,7 +1566,12 @@ class ExecutionRegion:
             raise ValueError("ExecutionRegion binding ids must be unique")
         if tuple(sorted(self.required_capabilities)) != self.required_capabilities:
             raise ValueError("ExecutionRegion.required_capabilities must be sorted")
-        for field_name in ("compile_safe", "capture_safe", "serial_fallback"):
+        for field_name in (
+            "compile_safe",
+            "capture_safe",
+            "side_stream_safe",
+            "serial_fallback",
+        ):
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"ExecutionRegion.{field_name} must be bool")
         if (
@@ -1642,6 +1650,8 @@ class RuntimeAdvancePlan:
     anchor_id: str
     region_ids: tuple[str, ...]
     backend_region_binder_stages: tuple[BackendRegionBinderStage, ...] = ()
+    wait_for_prior_side_work: bool = False
+    wait_for_side_outputs: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1679,6 +1689,14 @@ class RuntimeAdvancePlan:
         )
         if len(stage_ids) != len(set(stage_ids)):
             raise ValueError("RuntimeAdvancePlan backend binder stages must be unique")
+        if not isinstance(self.wait_for_prior_side_work, bool):
+            raise TypeError(
+                "RuntimeAdvancePlan.wait_for_prior_side_work must be bool"
+            )
+        if not isinstance(self.wait_for_side_outputs, bool):
+            raise TypeError(
+                "RuntimeAdvancePlan.wait_for_side_outputs must be bool"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1700,10 +1718,10 @@ class ScheduleDecision:
     cost: CostBreakdown = CostBreakdown(0, 0, 0, 0)
     explanations: tuple[str, ...] = ()
     signature: str = ""
-    schema_version: int = 2
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 3}:
             raise ValueError("unsupported ScheduleDecision schema version")
         if not isinstance(self.execution_regions, tuple) or any(
             not isinstance(region, ExecutionRegion) for region in self.execution_regions
@@ -1806,7 +1824,7 @@ class ScheduleDecision:
                     binder_identities.add(identity)
             if self.capture_partitions:
                 raise ValueError(
-                    "ScheduleDecision schema v2 cannot contain capture_partitions"
+                    "ScheduleDecision schema v3 cannot contain capture_partitions"
                 )
         if not isinstance(self.fences, tuple) or any(
             not isinstance(fence, ScheduleFence) for fence in self.fences
@@ -1851,9 +1869,15 @@ class ScheduleDecision:
         schema_version = raw["schema_version"]
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise TypeError("ScheduleDecision.schema_version must be int")
+        if schema_version == 2:
+            raise ValueError(
+                "ScheduleDecision schema v2 is stale; recompile with schema v3"
+            )
+        if schema_version not in {1, 3}:
+            raise ValueError("unsupported ScheduleDecision schema version")
 
-        is_v2 = schema_version == 2
-        if is_v2:
+        is_v3 = schema_version == 3
+        if is_v3:
             _require_json_fields(
                 raw,
                 "ScheduleDecision",
@@ -1866,17 +1890,17 @@ class ScheduleDecision:
             )
         region_payloads = _json_array(
             raw["execution_regions"]
-            if is_v2
+            if is_v3
             else raw.get("execution_regions", []),
             "ScheduleDecision.execution_regions",
         )
         materialization_payloads = _json_array(
-            raw["materializations"] if is_v2 else raw.get("materializations", []),
+            raw["materializations"] if is_v3 else raw.get("materializations", []),
             "ScheduleDecision.materializations",
         )
         runtime_advance_payloads = _json_array(
             raw["runtime_advance_plan"]
-            if is_v2
+            if is_v3
             else raw.get("runtime_advance_plan", []),
             "ScheduleDecision.runtime_advance_plan",
         )
@@ -1900,6 +1924,7 @@ class ScheduleDecision:
             "effects",
             "compile_safe",
             "capture_safe",
+            "side_stream_safe",
             "capture_mode",
             "stream",
             "fallback_policy",
@@ -1943,6 +1968,8 @@ class ScheduleDecision:
             "anchor_id",
             "region_ids",
             "backend_region_binder_stages",
+            "wait_for_prior_side_work",
+            "wait_for_side_outputs",
         )
         decision_fields = (
             "graph_key",
@@ -2002,7 +2029,7 @@ class ScheduleDecision:
             "live_end",
         )
 
-        def require_v2_object(
+        def require_exact_object(
             raw_value: object, label: str, field_names: tuple[str, ...]
         ) -> Mapping[str, object]:
             return _require_json_fields(
@@ -2012,34 +2039,34 @@ class ScheduleDecision:
                 allowed=field_names,
             )
 
-        if is_v2:
-            require_v2_object(raw, "ScheduleDecision", decision_fields)
+        if is_v3:
+            require_exact_object(raw, "ScheduleDecision", decision_fields)
             for position, placement in enumerate(
                 _json_array(raw["placements"], "ScheduleDecision.placements")
             ):
-                require_v2_object(
+                require_exact_object(
                     placement,
                     f"TaskPlacement[{position}]",
                     placement_fields,
                 )
-            tree_raw = require_v2_object(
+            tree_raw = require_exact_object(
                 raw["schedule_tree"], "ScheduleTree", schedule_tree_fields
             )
             for position, affine_region in enumerate(
                 _json_array(tree_raw["affine_regions"], "ScheduleTree.affine_regions")
             ):
-                require_v2_object(
+                require_exact_object(
                     affine_region,
                     f"AffineRegionSchedule[{position}]",
                     affine_region_fields,
                 )
-            memory_raw = require_v2_object(
+            memory_raw = require_exact_object(
                 raw["memory_plan"], "MemoryPlan", memory_plan_fields
             )
             for position, allocation in enumerate(
                 _json_array(memory_raw["allocations"], "MemoryPlan.allocations")
             ):
-                require_v2_object(
+                require_exact_object(
                     allocation,
                     f"MemoryAllocation[{position}]",
                     allocation_fields,
@@ -2047,34 +2074,34 @@ class ScheduleDecision:
             for position, fence in enumerate(
                 _json_array(raw["fences"], "ScheduleDecision.fences")
             ):
-                require_v2_object(fence, f"ScheduleFence[{position}]", fence_fields)
-            require_v2_object(raw["cost"], "CostBreakdown", cost_fields)
+                require_exact_object(fence, f"ScheduleFence[{position}]", fence_fields)
+            require_exact_object(raw["cost"], "CostBreakdown", cost_fields)
             for position, materialization in enumerate(materialization_payloads):
-                require_v2_object(
+                require_exact_object(
                     materialization,
                     f"MaterializedValue[{position}]",
                     materialization_fields,
                 )
 
         regions = tuple(
-            require_v2_object(region, f"ExecutionRegion[{position}]", region_fields)
-            if is_v2
+            require_exact_object(region, f"ExecutionRegion[{position}]", region_fields)
+            if is_v3
             else _require_json_fields(region, f"ExecutionRegion[{position}]", ())
             for position, region in enumerate(region_payloads)
         )
 
         runtime_advances = tuple(
-            require_v2_object(
+            require_exact_object(
                 advance,
                 f"RuntimeAdvancePlan[{position}]",
                 runtime_advance_fields,
             )
-            if is_v2
+            if is_v3
             else _require_json_fields(advance, f"RuntimeAdvancePlan[{position}]", ())
             for position, advance in enumerate(runtime_advance_payloads)
         )
 
-        if is_v2:
+        if is_v3:
             for position, advance in enumerate(runtime_advances):
                 for stage_position, stage in enumerate(
                     _json_array(
@@ -2083,7 +2110,7 @@ class ScheduleDecision:
                         f"[{position}].backend_region_binder_stages",
                     )
                 ):
-                    require_v2_object(
+                    require_exact_object(
                         stage,
                         "RuntimeAdvancePlan"
                         f"[{position}].backend_region_binder_stages[{stage_position}]",
@@ -2096,7 +2123,7 @@ class ScheduleDecision:
                         f"ExecutionRegion[{position}].input_bindings",
                     )
                 ):
-                    binding = require_v2_object(
+                    binding = require_exact_object(
                         binding_raw,
                         f"ExecutionRegion[{position}].input_bindings[{binding_position}]",
                         input_binding_fields,
@@ -2108,7 +2135,7 @@ class ScheduleDecision:
                             f"[{position}].input_bindings[{binding_position}].consumers",
                         )
                     ):
-                        require_v2_object(
+                        require_exact_object(
                             port,
                             "ExecutionRegion"
                             f"[{position}].input_bindings[{binding_position}]"
@@ -2121,12 +2148,12 @@ class ScheduleDecision:
                         f"ExecutionRegion[{position}].output_bindings",
                     )
                 ):
-                    binding = require_v2_object(
+                    binding = require_exact_object(
                         binding_raw,
                         f"ExecutionRegion[{position}].output_bindings[{binding_position}]",
                         output_binding_fields,
                     )
-                    require_v2_object(
+                    require_exact_object(
                         binding["producer"],
                         "ExecutionRegion"
                         f"[{position}].output_bindings[{binding_position}].producer",
@@ -2138,7 +2165,7 @@ class ScheduleDecision:
                         f"ExecutionRegion[{position}].task_invocations",
                     )
                 ):
-                    invocation = require_v2_object(
+                    invocation = require_exact_object(
                         invocation_raw,
                         "ExecutionRegion"
                         f"[{position}].task_invocations[{invocation_position}]",
@@ -2153,7 +2180,7 @@ class ScheduleDecision:
                                 f".{direction}",
                             )
                         ):
-                            require_v2_object(
+                            require_exact_object(
                                 binding,
                                 "ExecutionRegion"
                                 f"[{position}].task_invocations[{invocation_position}]"
@@ -2165,7 +2192,7 @@ class ScheduleDecision:
                         region["effects"], f"ExecutionRegion[{position}].effects"
                     )
                 ):
-                    require_v2_object(
+                    require_exact_object(
                         effect,
                         f"ExecutionRegion[{position}].effects[{effect_position}]",
                         effect_fields,
@@ -2174,12 +2201,12 @@ class ScheduleDecision:
         def region_value(
             region: Mapping[str, object], field_name: str, legacy_default: object
         ) -> object:
-            return region[field_name] if is_v2 else region.get(field_name, legacy_default)
+            return region[field_name] if is_v3 else region.get(field_name, legacy_default)
 
         def nested_value(
             raw_value: Mapping[str, object], field_name: str, legacy_default: object
         ) -> object:
-            return raw_value[field_name] if is_v2 else raw_value.get(field_name, legacy_default)
+            return raw_value[field_name] if is_v3 else raw_value.get(field_name, legacy_default)
 
         def region_array(
             region: Mapping[str, object], field_name: str
@@ -2404,6 +2431,14 @@ class ScheduleDecision:
                         )
                     )
                 ),
+                wait_for_prior_side_work=_json_bool(
+                    raw_value["wait_for_prior_side_work"],
+                    f"{label}.wait_for_prior_side_work",
+                ),
+                wait_for_side_outputs=_json_bool(
+                    raw_value["wait_for_side_outputs"],
+                    f"{label}.wait_for_side_outputs",
+                ),
             )
 
         def execution_region(
@@ -2476,6 +2511,10 @@ class ScheduleDecision:
                 ),
                 capture_safe=_json_bool(
                     region_value(region, "capture_safe", False), f"{label}.capture_safe"
+                ),
+                side_stream_safe=_json_bool(
+                    region_value(region, "side_stream_safe", False),
+                    f"{label}.side_stream_safe",
                 ),
                 capture_mode=region_capture_mode(
                     region_value(
@@ -2580,7 +2619,7 @@ class ScheduleDecision:
             ),
             completion_anchor=(
                 _json_string(raw["completion_anchor"], "ScheduleDecision.completion_anchor")
-                if is_v2
+                if is_v3
                 else _json_string(raw.get("completion_anchor", ""), "ScheduleDecision.completion_anchor")
             ),
             materializations=tuple(

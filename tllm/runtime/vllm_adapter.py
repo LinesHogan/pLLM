@@ -8,7 +8,7 @@ import weakref
 
 if TYPE_CHECKING:
     from vllm import LLM, SamplingParams
-    from vllm.inputs import TokensPrompt
+    from vllm.inputs import PromptType
     from vllm.outputs import RequestOutput
 
 _runner_owners: "weakref.WeakKeyDictionary[Any, object]" = weakref.WeakKeyDictionary()
@@ -26,7 +26,7 @@ def create_llm(args: tuple[object, ...], kwargs: dict[str, object]) -> LLM:
 
 def generate_requests(
     llm: LLM,
-    prompts: Sequence[TokensPrompt],
+    prompts: Sequence[PromptType],
     sampling_params: SamplingParams,
 ) -> list[RequestOutput]:
     return llm.generate(prompts, sampling_params, use_tqdm=False)

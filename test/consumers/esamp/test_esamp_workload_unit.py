@@ -107,7 +107,11 @@ def _specialized_workload(**overrides: object) -> ESampWorkload:
 
 def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
     """Drive the real signed sink path: task output -> auto-bound store."""
-    prediction, _loss = workload.predict_and_loss(torch.randn(2, 4), torch.randn(2, 4))
+    prediction, _materialized, _target, _sample_indices = workload.predict(
+        torch.randn(2, 4),
+        torch.randn(2, 4),
+        torch.zeros(2, dtype=torch.long),
+    )
     with mock.patch.object(residual_runtime, "RUNTIME", _decode_state(2)):
         workload.native_workload_resources().ports.outputs["guidance"].publish(
             prediction, step_id
@@ -129,7 +133,6 @@ class ESampRegionUnitTest(unittest.TestCase):
                 },
                 "per_request_model_bank",
             ),
-            ({"training_row_selection": "first_per_prompt"}, "training_row_selection"),
             ({"model_bank_slots": 2}, "model_bank_slots"),
             ({"model_bank_flush_interval": 2}, "model_bank_flush_interval"),
             ({"model_bank_rank": 32}, "model_bank_rank"),
@@ -155,6 +158,49 @@ class ESampRegionUnitTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ValueError, option):
                     build_esamp_workload(config)
+
+    def test_native_dispatch_preserves_explicit_training_row_selection(self) -> None:
+        workload = build_esamp_workload(
+            ESampConsumerConfig(
+                implementation="native",
+                training_row_selection="first_per_prompt",
+            )
+        )
+        self.assertIsInstance(workload, ESampWorkload)
+        assert isinstance(workload, ESampWorkload)
+        self.assertEqual(
+            workload.config.training_row_selection,
+            "first_per_prompt",
+        )
+
+    def test_first_per_prompt_selection_uses_typed_sample_identity(self) -> None:
+        workload = _specialized_workload(
+            training_row_selection="first_per_prompt"
+        )
+        source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        target = -source
+
+        prediction, _materialized, loss_target, sample_index_tensor = workload.predict(
+            source,
+            target,
+            torch.tensor((0, 1, 0, 2)),
+        )
+        loss = workload.loss(
+            prediction, loss_target, sample_index_tensor
+        )
+
+        expected_prediction = workload.distiller(source)
+        torch.testing.assert_close(
+            prediction, expected_prediction
+        )
+        assert loss is not None
+        torch.testing.assert_close(
+            loss,
+            torch.nn.functional.mse_loss(
+                expected_prediction.index_select(0, torch.tensor((0, 2))).float(),
+                target.index_select(0, torch.tensor((0, 2))).float(),
+            ),
+        )
 
     def test_native_region_rejects_a_coinstalled_legacy_consumer(self) -> None:
         native = ESampWorkload(_config())
@@ -374,18 +420,20 @@ class ESampRegionUnitTest(unittest.TestCase):
             RuntimeSpecializationSpec(2, 4, torch.float32, torch.device("cpu"))
         )
         compilation = runtime.compile_workloads(_timeline())
-        self.assertEqual(
-            tuple(region.tasks for region in compilation.decision.execution_regions),
-            (("predict_and_loss",), ("predict_and_loss__optimize_distiller",)),
+        signed_tasks = tuple(
+            task
+            for region in compilation.decision.execution_regions
+            for task in region.tasks
         )
         self.assertEqual(
-            tuple(
-                region.implementation_kind
-                for region in compilation.decision.execution_regions
-            ),
-            ("compiled", "extern"),
+            set(signed_tasks),
+            {
+                "predict",
+                "loss",
+                "loss__optimize_distiller",
+            },
         )
-        self.assertEqual(len(compilation.decision.materializations), 1)
+        self.assertEqual(len(signed_tasks), 3)
 
         state = _decode_state(2)
         source_locator = ResidualLocator(0, "block_output", "decode")
@@ -408,6 +456,14 @@ class ESampRegionUnitTest(unittest.TestCase):
                 bindings=runtime.workload_execution_bindings,
             )
             residual_runtime.prepare_physical_workgraph_step(7)
+            sampler_binding = workload.native_workload_resources().sampler
+            assert isinstance(sampler_binding, SamplerRuntimeBinding)
+            sampler_binding.stage_identity(
+                7,
+                tuple(state.decode_request_ids),
+                tuple(state.decode_sample_idxs),
+                torch.tensor(state.decode_sample_idxs),
+            )
             for region in compilation.decision.execution_regions:
                 residual_runtime.advance_workload_anchor(region.placement_anchor)
 
@@ -439,7 +495,11 @@ class ESampRegionUnitTest(unittest.TestCase):
         self.assertEqual(declaration.ir.states[0].scope.value, "replica")
         self.assertEqual(
             tuple(task.name for task in declaration.ir.tasks),
-            ("predict_and_loss", "predict_and_loss__optimize_distiller"),
+            (
+                "predict",
+                "loss",
+                "loss__optimize_distiller",
+            ),
         )
         self.assertEqual(declaration.ir.tasks[0].outputs[0].target, "guidance")
         self.assertEqual(declaration.ir.tasks[0].outputs[1].kind.value, "temporary")
@@ -477,7 +537,7 @@ class ESampRegionUnitTest(unittest.TestCase):
             workload.distiller(torch.randn(2, 4)), torch.randn(2, 4)
         )
         executors = dict(workload.declaration().executors)
-        executors["predict_and_loss__optimize_distiller"](loss)
+        executors["loss__optimize_distiller"](loss)
 
         after = tuple(parameter.detach() for parameter in workload.distiller.parameters())
         self.assertTrue(any(not torch.equal(old, new) for old, new in zip(before, after, strict=True)))

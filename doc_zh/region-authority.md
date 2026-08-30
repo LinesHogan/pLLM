@@ -21,7 +21,7 @@
 
 | 接口 | 必须稳定的字段 | 失败行为 |
 | --- | --- | --- |
-| `ScheduleDecision` v2 / `ExecutionRegion` | id、anchor、依赖、materialization、effect、capture/stream/fallback、artifact key、`compile_command` | 未知、缺失、未签名或非规范字段拒绝 |
+| `ScheduleDecision` v3 / `ExecutionRegion` | id、anchor、依赖、materialization、effect、capture/stream/fallback、已签名 side wait、artifact key、`compile_command` | 未知、缺失、未签名、过期 v2 或非规范字段拒绝 |
 | `RegionCompileCommand` | adapter、fullgraph、dynamic、有序 shape specialization、autograd、fallback | 不支持或编译失败直接报错，不重试 eager |
 | `RegionCallableArtifact` | Region id/key、有序输入输出 key、精确 typed binding/effect、本地 callable、compiled marker、command | callable/key/binding 缺失或不一致时在执行前拒绝 |
 | `BackendRegionBinderSlot` | 签名 implementation id/event context；一次 `stage` 后必须执行一次 `invoke`、`clear` 或 `abort` | 重复、过期或缺失 stage 拒绝；callback 失败后不重试 |
@@ -95,8 +95,8 @@ PATH=.venv/bin:$PATH /workspace/pllm/.venv/bin/python tools/check_typing.py
 
 结果：Rust `46 passed`；Python `1067 passed, 1079 subtests passed`；strict typing `0 errors`；
 basic typing 相对 baseline 176 为 `163 errors`；authority gate 覆盖 20 个生产文件并通过。冻结 schema
-示例包括：`test/workload/golden/schedule_v2_region.json` 冻结最大 compiled Region，
-`test/workload/golden/schedule_v2_complex_region.json` 冻结 typed extern staging、state effect、
+示例包括：`test/workload/golden/schedule_v3_region.json` 冻结最大 compiled Region，
+`test/workload/golden/schedule_v3_complex_region.json` 冻结 typed extern staging、state effect、
 materialization 与 fence。schedule、binder/state、recurrence、worker reconstruction 与 authority
 boundary 回归分别位于
 `test/workload/test_schedule_contract_unit.py`、`test/runtime/test_backend_region_binders_unit.py`、

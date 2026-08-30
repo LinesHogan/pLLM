@@ -8,14 +8,13 @@ signed ``side_forward``), then proves on hardware:
 - its kernels complete while the main stream is still busy with a large
   matmul chain enqueued *after* the consumer's advance (legal overlap: the
   side stream only waits the main snapshot recorded at its advance);
-- the join at step retirement orders the main stream after side work, so the
+- the explicit execution synchronization orders the main stream after side work, so the
   published sink is numerically correct after host synchronization.
 """
 
 from __future__ import annotations
 
 import time
-from typing import cast
 from unittest import mock
 
 import torch
@@ -23,7 +22,6 @@ import torch
 from tllm.runtime import residual_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import WorkloadExecutionBindings
-from tllm.runtime.workload_bindings import RuntimeOutputBinding, RuntimePortRegistry
 from tllm.schedule import (
     CompileOptions,
     MainWorkloadTimeline,
@@ -34,7 +32,6 @@ from tllm.workload import (
     Between,
     declare_workload,
     result,
-    sink,
     task,
     temporary,
     workload,
@@ -89,10 +86,9 @@ def main() -> None:
 
         @task(
             inputs={"value": result("produce", "value")},
-            outputs={"output": sink("answer")},
             timing=Between("sampler.pre_draw", "step.end"),
         )
-        def consume(self, value: torch.Tensor) -> torch.Tensor:
+        def consume(self, value: torch.Tensor) -> None:
             observer.consumer_on_side = (
                 torch.cuda.current_stream().cuda_stream
                 != torch.cuda.default_stream().cuda_stream
@@ -101,7 +97,7 @@ def main() -> None:
             done = torch.cuda.Event()
             done.record()
             observer.side_done = done
-            return output
+            observer.outputs.append((5, output))
 
     declaration = declare_workload(SideChain())
     compilation = WorkloadCompilerCoordinator(
@@ -122,18 +118,7 @@ def main() -> None:
     )
 
     state = ResidualRuntimeState()
-    bindings = WorkloadExecutionBindings(
-        declarations=(declaration,),
-        ports=RuntimePortRegistry(
-            outputs={
-                "answer": RuntimeOutputBinding(
-                    lambda value, step_id: observer.outputs.append(
-                        (step_id, cast(torch.Tensor, value))
-                    )
-                )
-            }
-        ),
-    )
+    bindings = WorkloadExecutionBindings(declarations=(declaration,))
 
     with mock.patch.object(residual_runtime, "RUNTIME", state):
         residual_runtime.publish_workload_compilation(compilation, bindings=bindings)
@@ -162,6 +147,7 @@ def main() -> None:
 
         execution = state.workload_execution
         assert execution is not None
+        execution.synchronize()
         execution.finish_step(5)
 
     torch.cuda.synchronize()

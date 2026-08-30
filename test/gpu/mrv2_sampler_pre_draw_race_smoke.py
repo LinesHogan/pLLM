@@ -41,7 +41,7 @@ from tllm.schedule import (
     TimelineAnchor,
     WorkloadCompilerCoordinator,
 )
-from tllm.workload import Between, declare_workload, result, sink, task, temporary, workload
+from tllm.workload import Between, declare_workload, result, sampler, task, temporary, workload
 
 _VOCAB = 8
 _ROWS = 2
@@ -197,7 +197,7 @@ def main() -> None:
 
         @task(
             inputs={"value": result("produce", "value")},
-            outputs={"output": sink("answer")},
+            outputs={"guidance": sampler.hidden_reweight(beta=1.0)},
             timing=Between("logits.post", "sampler.pre_draw"),
         )
         def consume(self, value: torch.Tensor) -> torch.Tensor:
@@ -246,7 +246,7 @@ def main() -> None:
         declarations=(declaration,),
         ports=RuntimePortRegistry(
             outputs={
-                "answer": RuntimeOutputBinding(
+                "guidance": RuntimeOutputBinding(
                     lambda value, step_id: observer.outputs.append(
                         (step_id, value)
                     )

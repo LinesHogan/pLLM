@@ -26,6 +26,11 @@ from tllm.schedule.contracts import (
 from tllm.workload.ir import EffectKind, ValueSourceKind, WorkloadEdgeKind, WorkloadIR
 
 
+_IMPLEMENTATION_EVIDENCE = frozenset(
+    {"runtime.side_stream_safe", "torch.export"}
+)
+
+
 def lower_schedule_graph(
     workloads: tuple[WorkloadIR, ...],
     *,
@@ -84,13 +89,13 @@ def lower_schedule_graph(
             common_capabilities: set[str] = {
                 capability
                 for capability in task.implementations[0].capabilities
-                if capability != "torch.export"
+                if capability not in _IMPLEMENTATION_EVIDENCE
             }
             for implementation in task.implementations[1:]:
                 common_capabilities.intersection_update(
                     capability
                     for capability in implementation.capabilities
-                    if capability != "torch.export"
+                    if capability not in _IMPLEMENTATION_EVIDENCE
                 )
             tasks.append(
                 ScheduleTask(

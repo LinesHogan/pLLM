@@ -29,6 +29,7 @@ enum ScheduleInputKind {
     Staged,
     SamplerRequestIds,
     SamplerSampleIdxs,
+    SamplerSampleIdxTensor,
     SamplerLogits,
     SampledTokens,
 }
@@ -156,6 +157,7 @@ enum RegionInputKind {
     Staged,
     SamplerRequestIds,
     SamplerSampleIdxs,
+    SamplerSampleIdxTensor,
     SamplerLogits,
     SampledTokens,
 }
@@ -170,6 +172,7 @@ impl RegionInputKind {
             Self::Staged => "staged",
             Self::SamplerRequestIds => "sampler_request_ids",
             Self::SamplerSampleIdxs => "sampler_sample_idxs",
+            Self::SamplerSampleIdxTensor => "sampler_sample_idx_tensor",
             Self::SamplerLogits => "sampler_logits",
             Self::SampledTokens => "sampled_tokens",
         }
@@ -356,6 +359,7 @@ struct SelectedTaskImplementation {
     required_capabilities: Vec<String>,
     compile_safe: bool,
     capture_safe: bool,
+    side_stream_safe: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -526,10 +530,10 @@ struct CompileOptions {
     compile_policy: String,
     #[serde(default = "default_capture_policy")]
     capture_policy: String,
-    /// Permit the planner to place effect-free Regions on a side stream so
-    /// they overlap with the main workload.  Cross-stream ordering stays on
-    /// explicit fences; the planner never predicts GPU timing.
-    #[serde(default)]
+    /// Internal search-space gate, enabled by default. The planner alone
+    /// selects stream-safe pure or ordered-transition Regions and signs
+    /// every wait; workload declarations never choose a lane or placement.
+    #[serde(default = "default_allow_side_stream")]
     allow_side_stream: bool,
     schema_version: i64,
 }
@@ -569,6 +573,10 @@ fn default_compile_policy() -> String {
 
 fn default_capture_policy() -> String {
     "auto".to_owned()
+}
+
+fn default_allow_side_stream() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -726,6 +734,7 @@ struct ExecutionRegion {
     effects: Vec<ScheduleEffect>,
     compile_safe: bool,
     capture_safe: bool,
+    side_stream_safe: bool,
     capture_mode: RegionCaptureMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<RegionStreamClass>,
@@ -745,6 +754,8 @@ struct RuntimeAdvancePlan {
     anchor_id: String,
     region_ids: Vec<String>,
     backend_region_binder_stages: Vec<BackendRegionBinderStage>,
+    wait_for_prior_side_work: bool,
+    wait_for_side_outputs: bool,
 }
 
 /// A backend-owned extern binding selected by the signed physical plan.
@@ -811,7 +822,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 fn workload_compilation_wire_cache_key(graph: &str, timeline: &str, options: &str) -> String {
     digest(&format!(
-        "workload-compilation-v2\0{graph}\0{timeline}\0{options}"
+        "workload-compilation-v3\0{graph}\0{timeline}\0{options}"
     ))
 }
 
@@ -1551,11 +1562,17 @@ fn validate_affine_regions(
 }
 
 const TORCH_EXPORT_CAPABILITY: &str = "torch.export";
+const SIDE_STREAM_SAFE_CAPABILITY: &str = "runtime.side_stream_safe";
 
 fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
     capabilities
         .iter()
-        .filter(|capability| capability.as_str() != TORCH_EXPORT_CAPABILITY)
+        .filter(|capability| {
+            !matches!(
+                capability.as_str(),
+                TORCH_EXPORT_CAPABILITY | SIDE_STREAM_SAFE_CAPABILITY
+            )
+        })
         .cloned()
         .collect()
 }
@@ -1630,6 +1647,10 @@ fn select_task_implementations(
                                         .collect(),
                                     capture_safe: compile_safe && task.effects.is_empty(),
                                     compile_safe,
+                                    side_stream_safe: compile_safe
+                                        || capabilities.iter().any(|capability| {
+                                            capability == SIDE_STREAM_SAFE_CAPABILITY
+                                        }),
                                 }
                             })
                     },
@@ -1969,6 +1990,7 @@ fn validate_inputs(
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
                 | ScheduleInputKind::SamplerSampleIdxs
+                | ScheduleInputKind::SamplerSampleIdxTensor
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId
@@ -1987,6 +2009,7 @@ fn validate_inputs(
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
                 | ScheduleInputKind::SamplerSampleIdxs
+                | ScheduleInputKind::SamplerSampleIdxTensor
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId
@@ -2676,6 +2699,7 @@ fn draft_capture_safe(
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
                 | ScheduleInputKind::SamplerSampleIdxs
+                | ScheduleInputKind::SamplerSampleIdxTensor
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId => return false,
@@ -2864,6 +2888,45 @@ fn capture_mode_for_region(
     }
 }
 
+fn side_stream_eligible(graph_schema_version: i64, region: &ExecutionRegion) -> bool {
+    let inputs_materialized = !region.input_bindings.is_empty()
+        && region
+            .input_bindings
+            .iter()
+            .all(|binding| matches!(binding.kind, RegionInputKind::Materialized));
+    let pure_outputs_safe = region.output_bindings.iter().all(|binding| {
+        matches!(
+            binding.kind,
+            RegionOutputKind::Materialized | RegionOutputKind::Sampler
+        )
+    });
+    let transition_outputs_safe = region
+        .output_bindings
+        .iter()
+        .all(|binding| matches!(binding.kind, RegionOutputKind::Materialized));
+    let ordered_effects = region.effects.iter().all(|effect| {
+        matches!(
+            effect.kind,
+            ScheduleEffectKind::StateRead
+                | ScheduleEffectKind::StateTransition
+                | ScheduleEffectKind::StateTransitionMaybe
+        )
+    });
+    let has_ordered_effect = !region.effects.is_empty();
+    let pure = region.effects.is_empty()
+        && region.capture_safe
+        && region.side_stream_safe
+        && inputs_materialized
+        && pure_outputs_safe;
+    let ordered_state_tail = graph_schema_version == 2
+        && region.side_stream_safe
+        && has_ordered_effect
+        && ordered_effects
+        && inputs_materialized
+        && transition_outputs_safe;
+    pure || ordered_state_tail
+}
+
 fn runtime_advance_plan(
     timeline: &Timeline,
     execution_regions: &[ExecutionRegion],
@@ -2902,6 +2965,28 @@ fn runtime_advance_plan(
         .iter()
         .map(|region| (region.region_id.as_str(), region))
         .collect();
+    let mut side_access_resources = BTreeMap::<&str, bool>::new();
+    for effect in execution_regions
+        .iter()
+        .filter(|region| region.stream == Some(RegionStreamClass::SideForward))
+        .flat_map(|region| region.effects.iter())
+    {
+        let mutates = matches!(
+            effect.kind,
+            ScheduleEffectKind::StateTransition | ScheduleEffectKind::StateTransitionMaybe
+        );
+        side_access_resources
+            .entry(effect.resource.as_str())
+            .and_modify(|existing| *existing |= mutates)
+            .or_insert(mutates);
+    }
+    let has_side_sampler_output = execution_regions.iter().any(|region| {
+        region.stream == Some(RegionStreamClass::SideForward)
+            && region
+                .output_bindings
+                .iter()
+                .any(|binding| binding.kind == RegionOutputKind::Sampler)
+    });
     let mut staged_binder_identities = BTreeSet::<(BackendObservableEvent, String)>::new();
     let mut advances = Vec::new();
     for anchor in &timeline.anchors {
@@ -2910,6 +2995,18 @@ fn runtime_advance_plan(
                 .get(anchor.anchor_id.as_str())
                 .cloned()
                 .unwrap_or_default();
+            let wait_for_prior_side_work = region_ids.iter().any(|region_id| {
+                regions_by_id.get(region_id.as_str()).is_some_and(|region| {
+                    region.stream != Some(RegionStreamClass::SideForward)
+                        && region.effects.iter().any(|effect| {
+                            side_access_resources
+                                .get(effect.resource.as_str())
+                                .is_some_and(|side_mutates| {
+                                    *side_mutates || effect.kind != ScheduleEffectKind::StateRead
+                                })
+                        })
+                })
+            });
             let mut backend_region_binder_stages = Vec::new();
             for region_id in &region_ids {
                 let region = regions_by_id.get(region_id.as_str()).ok_or_else(|| {
@@ -2943,6 +3040,9 @@ fn runtime_advance_plan(
                 anchor_id: anchor.anchor_id.clone(),
                 region_ids,
                 backend_region_binder_stages,
+                wait_for_prior_side_work,
+                wait_for_side_outputs: *backend_event == BackendObservableEvent::SamplerPreDraw
+                    && has_side_sampler_output,
             });
         }
     }
@@ -3266,6 +3366,10 @@ fn compile_impl(
                 .tasks
                 .iter()
                 .all(|index| selected[*index].capture_safe);
+        let side_stream_safe = draft
+            .tasks
+            .iter()
+            .all(|index| selected[*index].side_stream_safe);
         let effects: Vec<ScheduleEffect> = draft
             .tasks
             .iter()
@@ -3298,6 +3402,7 @@ fn compile_impl(
             effects,
             compile_safe,
             capture_safe,
+            side_stream_safe,
             capture_mode: RegionCaptureMode::Disabled,
             stream: Some(stream),
             fallback_policy: Some(RegionFallbackPolicy::Reject),
@@ -3470,6 +3575,9 @@ fn compile_impl(
                         ScheduleInputKind::Staged => RegionInputKind::Staged,
                         ScheduleInputKind::SamplerRequestIds => RegionInputKind::SamplerRequestIds,
                         ScheduleInputKind::SamplerSampleIdxs => RegionInputKind::SamplerSampleIdxs,
+                        ScheduleInputKind::SamplerSampleIdxTensor => {
+                            RegionInputKind::SamplerSampleIdxTensor
+                        }
                         ScheduleInputKind::SamplerLogits => RegionInputKind::SamplerLogits,
                         ScheduleInputKind::SampledTokens => RegionInputKind::SampledTokens,
                         ScheduleInputKind::StepId => RegionInputKind::StepId,
@@ -3623,24 +3731,13 @@ fn compile_impl(
             });
         // Side-stream placement only exposes legal parallelism to the GPU
         // hardware scheduler; every cross-stream dependency remains an
-        // explicit fence.  A Region may leave the default stream only when
-        // the signed graph proves the placement safe:
-        // - zero state effects, so version ordering never depends on
-        //   hardware timing;
-        // - the final signed capture_safe, so the compiled callable has no
-        //   host-side hazard the stream context could invalidate;
-        // - every input a signed materialization (fence-covered cross-region
-        //   value).  Hidden taps and provided/step-id values are excluded:
-        //   the model cannot prove the main snapshot event covers their
-        //   production.
-        if options.allow_side_stream
-            && region.effects.is_empty()
-            && region.capture_safe
-            && region
-                .input_bindings
-                .iter()
-                .all(|binding| matches!(binding.kind, RegionInputKind::Materialized))
-        {
+        // explicit fence. Hidden/provided inputs and host/sink outputs stay on
+        // the default stream; sampler outputs carry a signed after-wait.
+        // Fully materialized training tails may carry only ordered state
+        // effects: the runtime joins them before the next signed state reader,
+        // allowing overlap with intervening main model work without a
+        // workload-owned lane policy.
+        if options.allow_side_stream && side_stream_eligible(graph.schema_version, region) {
             region.stream = Some(RegionStreamClass::SideForward);
         }
         region.capture_mode = capture_mode_for_region(timeline, options, region)?;
@@ -3770,7 +3867,7 @@ fn compile_impl(
             explanations
         },
         signature: String::new(),
-        schema_version: 2,
+        schema_version: 3,
     };
     let unsigned = serde_json::to_string(&decision)
         .map_err(|error| schedule_error(format!("failed to serialize decision: {error}")))?;
@@ -3802,7 +3899,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     let options_desc: CompileOptions = decode(options, "CompileOptions")?;
     let supplied: Decision = decode(decision, "ScheduleDecision")?;
     let (anchor_index, task_index) = validate_inputs(&graph_desc, &timeline_desc, &options_desc)?;
-    if supplied.schema_version != 2
+    if supplied.schema_version != 3
         || supplied.graph_key != digest(graph)
         || supplied.timeline_key != digest(timeline)
     {
@@ -3816,7 +3913,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         .any(|region| region.stream.is_none() || region.fallback_policy.is_none())
     {
         return Err(schedule_error(
-            "ScheduleDecision v2 ExecutionRegion requires explicit stream and fallback_policy",
+            "ScheduleDecision v3 ExecutionRegion requires explicit stream and fallback_policy",
         ));
     }
     if supplied.execution_regions.iter().any(|region| {
@@ -3824,7 +3921,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             != region.compile_command.is_some()
     }) {
         return Err(schedule_error(
-            "ScheduleDecision v2 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
+            "ScheduleDecision v3 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
         ));
     }
     let mut unsigned = supplied.clone();
@@ -3836,7 +3933,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
     if supplied.fallback != "explicit_regions" || !supplied.capture_partitions.is_empty() {
         return Err(schedule_error(
-            "ScheduleDecision v2 requires explicit regions and forbids capture_partitions",
+            "ScheduleDecision v3 requires explicit regions and forbids capture_partitions",
         ));
     }
     if supplied.execution_order.len() != graph_desc.tasks.len()
@@ -3933,17 +4030,11 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             ));
         }
         if region.stream == Some(RegionStreamClass::SideForward) {
-            let inputs_materialized = region
-                .input_bindings
-                .iter()
-                .all(|binding| matches!(binding.kind, RegionInputKind::Materialized));
             if !options_desc.allow_side_stream
-                || !region.effects.is_empty()
-                || !region.capture_safe
-                || !inputs_materialized
+                || !side_stream_eligible(graph_desc.schema_version, region)
             {
                 return Err(schedule_error(
-                    "side-stream ExecutionRegion requires allow_side_stream, zero state effects, capture safety, and fully materialized inputs",
+                    "side-stream ExecutionRegion requires scheduler enablement, stream-safe implementation evidence, typed materializations, and ordered effects",
                 ));
             }
         }
@@ -4114,10 +4205,10 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
 
     let supplied_runtime_plan = supplied.runtime_advance_plan.as_ref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v2 requires an explicit runtime_advance_plan")
+        schedule_error("ScheduleDecision v3 requires an explicit runtime_advance_plan")
     })?;
     let supplied_completion_anchor = supplied.completion_anchor.as_deref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v2 requires an explicit completion_anchor")
+        schedule_error("ScheduleDecision v3 requires an explicit completion_anchor")
     })?;
     if supplied_completion_anchor.is_empty() {
         return Err(schedule_error(
@@ -5183,6 +5274,7 @@ mod tests {
             "effects":[],
             "compile_safe":true,
             "capture_safe":false,
+            "side_stream_safe":true,
             "capture_mode":"disabled",
             "stream":"default",
             "fallback_policy":"reject",
@@ -5422,10 +5514,9 @@ mod tests {
         // materialization.  The two tasks sit in disjoint windows so the
         // planner cannot merge them: `consume` reads `produce` through a
         // fence-covered cross-region value.
-        let graph = r#"{"workload_key":"side-stream","tasks":[{"task_id":"produce","timing":{"after":"model.execute","before":"sampler.pre_draw"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"consume","timing":{"after":"sampler.pre_draw","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"inputs":[{"name":"value","kind":"result","source":"produce","output":"value"}],"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[{"source":"produce","target":"consume","kind":"data"}],"values":[{"value_id":"side:produce:value","version":1,"producer":"produce","producer_output":"value","consumers":["consume"],"size_bytes":0,"alias_set":""},{"value_id":"side:consume:answer","version":1,"producer":"consume","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
+        let graph = r#"{"workload_key":"side-stream","tasks":[{"task_id":"produce","timing":{"after":"model.execute","before":"sampler.pre_draw"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"consume","timing":{"after":"sampler.pre_draw","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":true,"inputs":[{"name":"value","kind":"result","source":"produce","output":"value"}]}],"edges":[{"source":"produce","target":"consume","kind":"data"}],"values":[{"value_id":"side:produce:value","version":1,"producer":"produce","producer_output":"value","consumers":["consume"],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
         let timeline = r#"{"backend_id":"vllm","backend_version":"0.27.1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"sampler.pre_draw","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[]},{"anchor_id":"step.end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":1}"#;
-        let serial_options =
-            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+        let serial_options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":false,"schema_version":1}"#;
         let side_options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
 
         let serial: Decision =
@@ -5485,16 +5576,36 @@ mod tests {
             Some(RegionStreamClass::Default)
         );
 
-        // Without capture safety the compiled callable may carry host-side
-        // hazards the stream context could invalidate: default stream.
-        let unsafe_graph = r#"{"workload_key":"side-stream-unsafe","tasks":[{"task_id":"run","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"required_capabilities":[],"capture_safe":false,"outputs":[{"name":"answer","kind":"sink","target":"answer"}]}],"edges":[],"values":[{"value_id":"side:run:answer","version":1,"producer":"run","producer_output":"answer","consumers":[],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":1}"#;
+        // A fully materialized input is not sufficient evidence. Without
+        // capture safety the compiled callable stays on the default stream.
+        let unsafe_graph = r#"{"workload_key":"side-stream-unsafe","tasks":[{"task_id":"produce","timing":{"after":"model.execute","before":"sampler.pre_draw"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[[]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"consume","timing":{"after":"sampler.pre_draw","before":"step.end"},"temporary_bytes":0,"implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[[]],"required_capabilities":[],"capture_safe":true,"inputs":[{"name":"value","kind":"result","source":"produce","output":"value"}]}],"edges":[{"source":"produce","target":"consume","kind":"data"}],"values":[{"value_id":"unsafe:value","version":1,"producer":"produce","producer_output":"value","consumers":["consume"],"size_bytes":0,"alias_set":""}],"persistent_state_bytes":0,"schema_version":2}"#;
         let unsafe_decision: Decision =
             serde_json::from_str(&compile_schedule(unsafe_graph, timeline, side_options).unwrap())
                 .unwrap();
-        assert_eq!(
-            unsafe_decision.execution_regions[0].stream,
-            Some(RegionStreamClass::Default)
-        );
+        let unsafe_consume = unsafe_decision
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks.iter().any(|task| task == "consume"))
+            .unwrap();
+        assert_eq!(unsafe_consume.stream, Some(RegionStreamClass::Default));
+
+        // Extern materialization consumers are also default unless their
+        // selected implementation carries explicit stream-safety evidence.
+        let extern_graph = unsafe_graph
+            .replace("side-stream-unsafe", "side-stream-extern")
+            .replace(
+                r#""implementation_ids":["python:capture@1"],"implementation_kinds":["captured"],"implementation_capabilities":[[]],"required_capabilities":[],"capture_safe":true,"inputs""#,
+                r#""implementation_ids":["python:extern@1"],"implementation_kinds":["extern"],"implementation_capabilities":[[]],"required_capabilities":[],"capture_safe":false,"inputs""#,
+            );
+        let extern_decision: Decision =
+            serde_json::from_str(&compile_schedule(&extern_graph, timeline, side_options).unwrap())
+                .unwrap();
+        let extern_consume = extern_decision
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks.iter().any(|task| task == "consume"))
+            .unwrap();
+        assert_eq!(extern_consume.stream, Some(RegionStreamClass::Default));
     }
 
     #[test]

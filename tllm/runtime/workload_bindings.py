@@ -18,6 +18,7 @@ from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
 
 if TYPE_CHECKING:
+    import torch
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.workload_plugins import NativeWorkload, WorkloadWorkerSpec
@@ -174,7 +175,13 @@ class NoSamplerBinding:
 class SamplerRuntimeBinding:
     provider: "SamplerModifierProvider"
     stage_identity: Callable[
-        [int, tuple[str, ...], tuple[int, ...]], None
+        [
+            int,
+            tuple[str, ...],
+            tuple[int, ...],
+            "torch.Tensor | None",
+        ],
+        None,
     ]
 
 

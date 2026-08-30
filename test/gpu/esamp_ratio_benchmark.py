@@ -68,6 +68,7 @@ def _workload_fingerprint(args: argparse.Namespace, prompts: Sequence[str]) -> d
         "max_model_len": 1024,
         "max_num_seqs": BATCH * N_SAMPLES,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_cudagraph_capture_size": ACTIVE_SEQUENCES,
         "enable_prefix_caching": False,
         "enforce_eager": False,
         "engine_seed": 1234,
@@ -268,8 +269,9 @@ def _validate_scheduler_comparable(
 
 
 def _validate_comparable(raw: Mapping[str, Any], tllm: Mapping[str, Any]) -> None:
-    if raw.get("mode") != "raw" or tllm.get("mode") != "tllm":
-        raise ValueError("ratio inputs must be ordered as raw then tllm")
+    candidate_mode = tllm.get("mode")
+    if raw.get("mode") != "raw" or candidate_mode not in ("tllm", "native"):
+        raise ValueError("ratio inputs must be ordered as raw then tllm/native")
     if raw.get("workload") != tllm.get("workload"):
         raise ValueError("raw and tllm workload fingerprints differ")
     _validate_scheduler_comparable(raw, tllm)
@@ -310,33 +312,53 @@ def _validate_comparable(raw: Mapping[str, Any], tllm: Mapping[str, Any]) -> Non
         raise ValueError("tllm benchmark did not exercise the Triton candidate kernel")
     if int(tllm.get("candidate_kernel_fallback_count", 0)) > 0:
         raise ValueError("tllm benchmark used a candidate-kernel fallback")
-    placement = tllm.get("placement", {})
-    required_positive = (
-        "moved_dispatch_count",
-        "bubble_drain_count",
-        "fusion_execution_count",
-        "fusion_replay_count",
-        "capture_resident_stage_count",
-        "capture_resident_stage_install_count",
-        "step_lease_retire_count",
-    )
-    missing = [name for name in required_positive if int(placement.get(name, 0)) <= 0]
-    if missing:
-        raise ValueError(
-            "tllm benchmark did not exercise compiled DAG/fusion placement: "
-            + ", ".join(missing)
+    if candidate_mode == "native":
+        workgraph = tllm.get("native_workgraph", {})
+        if (
+            int(workgraph.get("execute_count", 0)) <= 0
+            or int(workgraph.get("eager_count", 0)) <= 0
+            or int(workgraph.get("replay_count", 0)) != 0
+            or int(workgraph.get("fallback_count", 0)) != 0
+        ):
+            raise ValueError(
+                "native benchmark did not remain on its signed eager path"
+            )
+    else:
+        placement = tllm.get("placement", {})
+        required_positive = (
+            "moved_dispatch_count",
+            "bubble_drain_count",
+            "fusion_execution_count",
+            "fusion_replay_count",
+            "capture_resident_stage_count",
+            "capture_resident_stage_install_count",
+            "step_lease_retire_count",
         )
-    forbidden_positive = (
-        "deadline_flush_count",
-        "fusion_fallback_count",
-        "fusion_eager_fallback_count",
-    )
-    fallback = [name for name in forbidden_positive if int(placement.get(name, 0)) > 0]
-    if fallback:
-        raise ValueError(
-            "tllm benchmark used a compiler/fusion fallback during measured rounds: "
-            + ", ".join(fallback)
+        missing = [
+            name
+            for name in required_positive
+            if int(placement.get(name, 0)) <= 0
+        ]
+        if missing:
+            raise ValueError(
+                "tllm benchmark did not exercise compiled DAG/fusion placement: "
+                + ", ".join(missing)
+            )
+        forbidden_positive = (
+            "deadline_flush_count",
+            "fusion_fallback_count",
+            "fusion_eager_fallback_count",
         )
+        fallback = [
+            name
+            for name in forbidden_positive
+            if int(placement.get(name, 0)) > 0
+        ]
+        if fallback:
+            raise ValueError(
+                "tllm benchmark used a compiler/fusion fallback during measured rounds: "
+                + ", ".join(fallback)
+            )
 
 
 def _capture_overhead(
@@ -458,7 +480,50 @@ def run(args: argparse.Namespace) -> None:
     )
     prompts = PROMPTS[:BATCH]
 
-    if args.mode != "raw":
+    native_runtime = None
+    if args.mode == "native":
+        os.environ["TLLM_ENABLE_EXACT_CANDIDATE_SAMPLING"] = "1"
+        os.environ["TLLM_ENABLE_TRITON_MINP_KEEP_MASK"] = "1"
+        from tllm.consumers.esamp import ESampConfig, ESampWorkload
+        from tllm.runtime import residual_runtime as core
+        from tllm.runtime.runtime import TllmRuntime
+
+        workload = ESampWorkload(
+            ESampConfig(
+                enabled=True,
+                intervention=not args.no_intervention,
+                distiller_hidden_dim=128,
+                distiller_lr=1e-3,
+                distiller_beta=0.5,
+                training_row_selection="first_per_prompt",
+            )
+        )
+        native_runtime = TllmRuntime(
+            workloads=(workload,),
+            workload_memory_budget_bytes=256 << 20,
+        )
+        llm = native_runtime.make_llm(
+            model_name=args.model,
+            dtype="bfloat16",
+            gpu_memory_utilization=float(args.gpu_mem),
+            max_model_len=1024,
+            max_num_seqs=BATCH * N_SAMPLES,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_cudagraph_capture_size=ACTIVE_SEQUENCES,
+            enable_prefix_caching=False,
+            enforce_eager=False,
+            seed=1234,
+        )
+
+        def generate_once():
+            return native_runtime.generate_requests(
+                llm,
+                prompts,
+                params,
+                prompt_indices=tuple(range(len(prompts))),
+            )
+
+    elif args.mode != "raw":
         # Optimized ESamp path: exact candidate sampling + triton min-p
         # keep-mask kernel (README's "triton kernel" arm).
         os.environ["TLLM_ENABLE_EXACT_CANDIDATE_SAMPLING"] = "1"
@@ -488,6 +553,7 @@ def run(args: argparse.Namespace) -> None:
             max_model_len=1024,
             max_num_seqs=BATCH * N_SAMPLES,
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_cudagraph_capture_size=ACTIVE_SEQUENCES,
             enable_prefix_caching=False,
             enforce_eager=False,
             seed=1234,
@@ -519,6 +585,7 @@ def run(args: argparse.Namespace) -> None:
             max_model_len=1024,
             max_num_seqs=BATCH * N_SAMPLES,
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_cudagraph_capture_size=ACTIVE_SEQUENCES,
             enable_prefix_caching=False,
             enforce_eager=False,
             seed=1234,
@@ -563,9 +630,13 @@ def run(args: argparse.Namespace) -> None:
                 placement.capture_resident_stage_install_count += int(
                     warmup_placement.capture_resident_stage_install_count
                 )
-            graph = core.read_graph_debug_stats(mode="shared")
+            graph = (
+                None
+                if args.mode == "native"
+                else core.read_graph_debug_stats(mode="shared")
+            )
             loss_count = int(getattr(stats, "loss_count", 0))
-            training_enabled = args.mode == "tllm"
+            training_enabled = args.mode in ("tllm", "native")
             if training_enabled and loss_count <= 0:
                 raise RuntimeError(
                     "ESamp benchmark completed without observed training; "
@@ -577,7 +648,11 @@ def run(args: argparse.Namespace) -> None:
                     training_enabled and not args.no_intervention
                 ),
                 "esamp_loss_count": loss_count,
-                "expected_esamp_loss_count": int(placement.moved_dispatch_count),
+                "expected_esamp_loss_count": (
+                    max(1, int(args.rounds)) * max(0, MAX_NEW_TOKENS - 1)
+                    if args.mode == "native"
+                    else int(placement.moved_dispatch_count)
+                ),
                 "minimum_esamp_loss_count": (
                     max(1, int(args.rounds)) * max(0, MAX_NEW_TOKENS - 1)
                     if training_enabled
@@ -595,12 +670,16 @@ def run(args: argparse.Namespace) -> None:
                 "candidate_kernel_fallback_count": int(
                     timing.candidate_kernel_fallback_count
                 ),
-                "training_graph": {
-                    "capture_state": str(graph.capture_state),
-                    "replay_attempt_count": int(graph.replay_attempt_count),
-                    "replay_hit_count": int(graph.replay_hit_count),
-                    "kernel_fallback_count": int(graph.kernel_fallback_count),
-                },
+                "training_graph": (
+                    {}
+                    if graph is None
+                    else {
+                        "capture_state": str(graph.capture_state),
+                        "replay_attempt_count": int(graph.replay_attempt_count),
+                        "replay_hit_count": int(graph.replay_hit_count),
+                        "kernel_fallback_count": int(graph.kernel_fallback_count),
+                    }
+                ),
                 "distiller_timing": {
                     key: getattr(timing, key)
                     for key in (
@@ -637,10 +716,39 @@ def run(args: argparse.Namespace) -> None:
                     )
                 },
             }
+            if args.mode == "native":
+                from tllm.runtime.mp.control import ControlPlane
+
+                (native_stats,) = ControlPlane(llm).pull_stats(
+                    "workgraph", sync=False, timeout=60.0
+                )
+                workgraph = native_stats.workgraph
+                tllm_metrics["native_workgraph"] = {
+                    "execute_count": workgraph.execute_count,
+                    "eager_count": workgraph.eager_count,
+                    "replay_count": workgraph.replay_count,
+                    "fallback_count": workgraph.fallback_count,
+                }
+                execution = core.RUNTIME.workload_execution
+                if execution is not None:
+                    cost_report = execution.region_cost_report(block=True)
+                    tllm_metrics["native_region_costs"] = {
+                        key: {
+                            "region_id": reading.region_id,
+                            "phase": reading.phase,
+                            "stream": reading.stream,
+                            "samples": reading.samples,
+                            "ewma_ns": reading.ewma_ns,
+                            "last_ns": reading.last_ns,
+                        }
+                        for key, reading in cost_report.readings.items()
+                    }
     finally:
         from tllm.util.tools import shutdown_llm_instance
 
         try:
+            if native_runtime is not None:
+                native_runtime.clear_consumers()
             shutdown_llm_instance(llm, cooldown_s=1.0)
         finally:
             if scheduler_trace is not None:
@@ -720,7 +828,7 @@ def main() -> None:
     p_run = sub.add_parser("run")
     p_run.add_argument(
         "--mode",
-        choices=["raw", "capture_only", "tllm"],
+        choices=["raw", "capture_only", "tllm", "native"],
         required=True,
     )
     p_run.add_argument("--runner", choices=["mrv1", "mrv2"], default="mrv2")

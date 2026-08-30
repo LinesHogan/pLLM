@@ -83,6 +83,7 @@ class ValueSourceKind(StrEnum):
     STAGED = "staged"
     SAMPLER_REQUEST_IDS = "sampler_request_ids"
     SAMPLER_SAMPLE_IDXS = "sampler_sample_idxs"
+    SAMPLER_SAMPLE_IDX_TENSOR = "sampler_sample_idx_tensor"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
 

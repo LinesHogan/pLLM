@@ -171,7 +171,12 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
                 model=object(),
                 runner=object(),
             )
-            sampler.stage_identity(7, view.request_ids, view.sample_idxs)
+            sampler.stage_identity(
+                7,
+                view.request_ids,
+                view.sample_idxs,
+                torch.tensor(view.sample_idxs),
+            )
             residual_runtime.advance_workload_anchor(regions[0].placement_anchor)
             modifier = sampler.provider.prepare_step(view)
             assert modifier is not None

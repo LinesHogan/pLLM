@@ -36,7 +36,11 @@ class SamplerStepContextUnitTest(unittest.TestCase):
 
         self.assertIs(context.request_ids(7), SKIPPED)
         self.assertIs(context.sample_indices(7), SKIPPED)
-        context.prepare_identity(7, view.request_ids, view.sample_idxs)
+        self.assertIs(context.sample_index_tensor(7), SKIPPED)
+        sample_tensor = torch.tensor(view.sample_idxs)
+        context.prepare_identity(
+            7, view.request_ids, view.sample_idxs, sample_tensor
+        )
         context.prepare(view)
 
         self.assertIs(context.logits(6), SKIPPED)
@@ -47,6 +51,15 @@ class SamplerStepContextUnitTest(unittest.TestCase):
         self.assertIs(context.tokens(7), SKIPPED)
         self.assertEqual(context.request_ids(7), view.request_ids)
         self.assertEqual(context.sample_indices(7), view.sample_idxs)
+        staged_sample_tensor = context.sample_index_tensor(7)
+        self.assertIsInstance(staged_sample_tensor, torch.Tensor)
+        assert isinstance(staged_sample_tensor, torch.Tensor)
+        self.assertIsNot(staged_sample_tensor, sample_tensor)
+        sample_tensor.fill_(9)
+        torch.testing.assert_close(
+            staged_sample_tensor,
+            torch.tensor(view.sample_idxs),
+        )
 
     def test_sampled_tokens_do_not_leak_into_the_next_step(self) -> None:
         context = SamplerStepContext()
@@ -61,7 +74,10 @@ class SamplerStepContextUnitTest(unittest.TestCase):
 
         next_view = _view(8)
         context.prepare_identity(
-            8, next_view.request_ids, next_view.sample_idxs
+            8,
+            next_view.request_ids,
+            next_view.sample_idxs,
+            torch.tensor(next_view.sample_idxs),
         )
         context.prepare(next_view)
 
@@ -69,6 +85,7 @@ class SamplerStepContextUnitTest(unittest.TestCase):
         self.assertIs(context.tokens(7), SKIPPED)
         self.assertIs(context.request_ids(7), SKIPPED)
         self.assertIs(context.sample_indices(7), SKIPPED)
+        self.assertIs(context.sample_index_tensor(7), SKIPPED)
 
 
 if __name__ == "__main__":

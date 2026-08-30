@@ -66,7 +66,7 @@ from tllm.contracts.workload_ports import (
 if TYPE_CHECKING:
     import torch
     from vllm import LLM, SamplingParams
-    from vllm.inputs import TokensPrompt
+    from vllm.inputs import PromptType
     from vllm.outputs import RequestOutput
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
@@ -721,7 +721,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         workloads: Sequence[ConfiguredWorkloadT] = (),
         workload_memory_budget_bytes: int = 0,
         workload_allow_serial_fallback: bool = True,
-        workload_allow_side_stream: bool = False,
         workload_persistent_state_bytes: int = 0,
         workload_decision_cache_directory: str | None = None,
         workload_worker_specs: Sequence["WorkloadWorkerSpec"] = (),
@@ -744,7 +743,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._workload_compile_options = CompileOptions(
             memory_budget_bytes=workload_memory_budget_bytes,
             allow_serial_fallback=workload_allow_serial_fallback,
-            allow_side_stream=workload_allow_side_stream,
         )
         if workload_persistent_state_bytes < 0:
             raise ValueError("workload_persistent_state_bytes must be a non-negative int")
@@ -1635,7 +1633,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
     def generate_requests(
         self,
         llm: LLM,
-        prompts: Sequence[TokensPrompt],
+        prompts: Sequence[PromptType],
         sampling_params: SamplingParams,
         *,
         prompt_indices: Sequence[int] | None = None,

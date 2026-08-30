@@ -690,6 +690,11 @@ class _SamplerOutputs:
     def sample_indices(self) -> SamplerRuntimeInput:
         return SamplerRuntimeInput(ValueSourceKind.SAMPLER_SAMPLE_IDXS)
 
+    def sample_index_tensor(self) -> SamplerRuntimeInput:
+        return SamplerRuntimeInput(
+            ValueSourceKind.SAMPLER_SAMPLE_IDX_TENSOR
+        )
+
     def logits(self) -> SamplerRuntimeInput:
         return SamplerRuntimeInput(ValueSourceKind.SAMPLER_LOGITS)
 
@@ -1597,6 +1602,7 @@ def _optimized_task_definitions(
                         version="1",
                         input_types=("Tensor",),
                         output_types=("None",),
+                        capabilities=("runtime.side_stream_safe",),
                     ),),
                     domain=Domain("scalar"),
                     accesses=(),

@@ -153,15 +153,12 @@ def main() -> int:
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
 
     from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
-    from tllm.contracts.request_identity import resolve_request_identity
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane
     from tllm.runtime.runtime import TllmRuntime
-    from tllm.runtime.vllm_patch.capture_runner import (
-        run_generate_with_request_mapping,
-    )
     from tllm.util.tools import shutdown_llm_instance
 
     workload = ESampWorkload(
@@ -208,9 +205,10 @@ def main() -> int:
             for task in region.tasks
         )
         if set(signed_tasks) != {
-            "predict_and_loss",
-            "predict_and_loss__optimize_distiller",
-        } or len(signed_tasks) != 2:
+            "predict",
+            "loss",
+            "loss__optimize_distiller",
+        } or len(signed_tasks) != 3:
             raise AssertionError(
                 f"unexpected signed native ESamp tasks: {signed_tasks!r}"
             )
@@ -225,48 +223,42 @@ def main() -> int:
             max_tokens=int(args.max_new_tokens),
             ignore_eos=True,
         )
-        prompts = [
-            {"prompt_token_ids": [10 + index, 20 + index, 30 + index]}
+        prompts = tuple(
+            TokensPrompt(
+                prompt_token_ids=[10 + index, 20 + index, 30 + index]
+            )
             for index in range(int(args.batch_size))
-        ]
+        )
         prompt_indices = list(range(int(args.batch_size)))
         sample_indices = [0] * int(args.batch_size)
         _ = core.read_and_reset_distiller_timing_stats()
-        first = run_generate_with_request_mapping(
-            runtime=core.RUNTIME,
-            llm=llm,
-            prompts=prompts,
-            params=params,
-            request_prompt_indices=prompt_indices,
-            request_sample_indices=sample_indices,
-            use_tqdm=False,
-            dispatch_post_generate=False,
+        first = runtime.generate_requests(
+            llm,
+            prompts,
+            params,
+            prompt_indices=prompt_indices,
+            sample_indices=sample_indices,
         )
-        second = run_generate_with_request_mapping(
-            runtime=core.RUNTIME,
-            llm=llm,
-            prompts=prompts,
-            params=params,
-            request_prompt_indices=prompt_indices,
-            request_sample_indices=sample_indices,
-            use_tqdm=False,
-            dispatch_post_generate=False,
+        second = runtime.generate_requests(
+            llm,
+            prompts,
+            params,
+            prompt_indices=prompt_indices,
+            sample_indices=sample_indices,
         )
         expected_counts = [int(args.max_new_tokens)] * int(args.batch_size)
         if _token_counts(first) != expected_counts or _token_counts(second) != expected_counts:
             raise AssertionError("native MP ESamp generation did not complete")
 
-        for output in second:
-            identity = resolve_request_identity(
-                str(output.request_id),
-                prompt_indices=core.RUNTIME.reqid_to_promptidx,
-                sample_indices=core.RUNTIME.reqid_to_sampleidx,
+        mapping_sizes = [
+            int(reply["mapping_size"])
+            for reply in plane.ping(timeout=60.0)
+        ]
+        if any(mapping_sizes):
+            raise AssertionError(
+                "native MP ESamp retained finished request mappings: "
+                f"{mapping_sizes!r}"
             )
-            if identity is None or identity.sample_idx != 0 or identity.prompt_idx not in prompt_indices:
-                raise AssertionError(
-                    "parent request/sample identity mapping is missing after MP generation: "
-                    f"request_id={output.request_id!r} identity={identity!r}"
-                )
 
         # State versions advance during the two generate calls, so inspect the
         # worker only after execution rather than only at cold installation.
@@ -300,10 +292,6 @@ def main() -> int:
                 "native MP ESamp violated the signed non-capture execution contract: "
                 f"{physical!r}"
             )
-        pings = plane.ping(timeout=60.0)
-        if any(int(reply.get("mapping_size", 0)) < int(args.batch_size) for reply in pings):
-            raise AssertionError(f"worker did not receive request identity mappings: {pings!r}")
-
         print(
             json.dumps(
                 {
@@ -321,6 +309,7 @@ def main() -> int:
                     "eager_count": physical.eager_count,
                     "fallback_count": physical.fallback_count,
                     "replay_count": physical.replay_count,
+                    "mapping_sizes": mapping_sizes,
                 },
                 sort_keys=True,
             )

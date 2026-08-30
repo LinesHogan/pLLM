@@ -463,6 +463,9 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             ValueSourceKind.SAMPLER_SAMPLE_IDXS: RuntimeInputBinding(
                 self._sampler_context.sample_indices
             ),
+            ValueSourceKind.SAMPLER_SAMPLE_IDX_TENSOR: RuntimeInputBinding(
+                self._sampler_context.sample_index_tensor
+            ),
             ValueSourceKind.SAMPLER_LOGITS: RuntimeInputBinding(
                 self._sampler_context.logits
             ),
