@@ -199,7 +199,7 @@ class WorkloadAuthorApiUnitTest(unittest.TestCase):
         provider = next(
             iter(workload_instance.native_workload_resources().ports.inputs.values())
         )
-        from tllm.workload.runtime_values import SKIPPED
+        from tllm.contracts.workload_ports import SKIPPED
 
         self.assertIs(provider.read(1), SKIPPED)
         payload = torch.ones(2, 3)

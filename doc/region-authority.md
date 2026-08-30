@@ -180,6 +180,14 @@ the emitted retry request, but uses a deterministic test verifier and staged
 hidden rows; it is correctness evidence for the native closed-loop contract,
 not a claim that this side reward head is an official policy-GRPO trainer.
 
+Staged-port lifecycle/status/resolution enums and the closed `SKIPPED` marker
+now live in `tllm.contracts.workload_ports`; workload storage, runtime
+execution, kit services, and FTTT all import the same canonical objects from
+the neutral layer. The obsolete workload-owned marker module was removed.
+The import-layer gate is back to module/local `0/0`, snapshots its exact and
+sanctioned edges, rejects unreviewed rule drift during ordinary checks, and
+refuses a rebase that would increase violations.
+
 ## Part II: Legacy Inventory
 
 | Surface | Permitted role until migrated |

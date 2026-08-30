@@ -58,7 +58,7 @@ from tllm.runtime.vllm_adapter import (
     install_generate_boundary,
 )
 from tllm.runtime.torch_adapter import runtime_torch_values
-from tllm.workload.staging import (
+from tllm.contracts.workload_ports import (
     PortTransactionStatus,
     StagedPortTransactionResolution,
 )

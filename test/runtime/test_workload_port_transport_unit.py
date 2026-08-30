@@ -26,13 +26,15 @@ from tllm.runtime.mp.port_wire import (
 from tllm.runtime.mp.worker_extension import TllmWorkerExtension
 from tllm.runtime.runtime import (
     StagedPortTransactionReceipt,
-    StagedPortTransactionResolution,
     TllmRuntime,
 )
-from tllm.workload.host import HostOutput
-from tllm.workload.runtime_values import SKIPPED
-from tllm.workload.staging import (
+from tllm.contracts.workload_ports import (
     PortTransactionStatus,
+    SKIPPED,
+    StagedPortTransactionResolution,
+)
+from tllm.workload.host import HostOutput
+from tllm.workload.staging import (
     RuntimePortStore,
     StagedPort,
 )

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from tllm.runtime.sampler_bridge.types import SamplerStepView
-from tllm.workload.runtime_values import SKIPPED, RuntimeValueMarker
+from tllm.contracts.workload_ports import SKIPPED, RuntimeValueMarker
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,7 +15,7 @@ from tllm.contracts.hidden_locator import HiddenLocatorCapability, HiddenPhase, 
 from tllm.contracts.consumer_stats import TrainingStats
 from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 from tllm.contracts.runtime_context import CompilationConfigLike
-from tllm.workload.runtime_values import SKIPPED
+from tllm.contracts.workload_ports import SKIPPED
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding

@@ -8,9 +8,9 @@ instance-scoped runtime API.
 
 from __future__ import annotations
 
+from tllm.contracts.workload_ports import StagedPortTransactionResolution
 from tllm.runtime.runtime import (
     StagedPortTransactionReceipt,
-    StagedPortTransactionResolution,
     TllmRuntime,
     default_runtime,
 )

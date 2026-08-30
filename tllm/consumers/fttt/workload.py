@@ -58,7 +58,7 @@ from tllm.workload import (
     temporary,
     workload,
 )
-from tllm.workload.staging import StagedPortTransactionResolution
+from tllm.contracts.workload_ports import StagedPortTransactionResolution
 
 if TYPE_CHECKING:
     from tllm.runtime.runtime import (

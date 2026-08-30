@@ -113,6 +113,7 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.schedule.contracts", "tllm.contracts.hidden_locator"),
         ("tllm.workload.frontend", "tllm.contracts.hidden_locator"),
         ("tllm.workload.ir", "tllm.contracts.hidden_locator"),
+        ("tllm.workload.staging", "tllm.contracts.workload_ports"),
         # Workload frontend adapters.
         ("tllm.workload.compat", "tllm.program.decl"),
         ("tllm.workload.compat", "tllm.workgraph.frontend"),
@@ -143,7 +144,6 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.runtime.workload_execution", "tllm.workload.frontend"),
         ("tllm.runtime.workload_execution", "tllm.workload.lowering"),
         ("tllm.runtime.workload_execution", "tllm.workload.region_compiler"),
-        ("tllm.runtime.workload_execution", "tllm.workload.runtime_values"),
         # Authority enum check at native execution bind time (function-local).
         ("tllm.runtime.workload_execution", "tllm.workload"),
         ("tllm.runtime.workload_plugins", "tllm.schedule"),
@@ -316,6 +316,10 @@ def _rules_snapshot() -> dict[str, list[str] | str]:
         f"{source} -> {target}"
         for source, target in sorted(EXACT_MODULE_EDGES)
     ]
+    snapshot["sanctioned_edges"] = [
+        f"{source} -> {target}"
+        for source, target in sorted(SANCTIONED_EDGES)
+    ]
     return snapshot
 
 
@@ -342,6 +346,21 @@ def main() -> int:
         return 0
 
     if args.rebase:
+        if BASELINE_PATH.exists():
+            previous = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+            for current, old in (
+                (module_buckets, previous["module_level"]),
+                (local_buckets, previous["local_level"]),
+            ):
+                if any(
+                    count > old.get(bucket, 0)
+                    for bucket, count in current.items()
+                ):
+                    print(
+                        "error: --rebase cannot increase import violations",
+                        file=sys.stderr,
+                    )
+                    return 1
         baseline = {
             "comment": "Cross-package import baseline (only-decrease). Regenerate with `python tools/check_import_layers.py --rebase`.",
             "rules": _rules_snapshot(),
@@ -356,6 +375,16 @@ def main() -> int:
         return 0
 
     baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    live_rules = _rules_snapshot()
+    if baseline.get("rules") != live_rules:
+        print(
+            "FAIL import-layer rule snapshot differs from the reviewed baseline"
+        )
+        print(
+            "audit the rule change, then run "
+            "`python tools/check_import_layers.py --rebase`"
+        )
+        return 1
     failed = False
     for label, current, base in (
         ("module-level", module_buckets, baseline["module_level"]),

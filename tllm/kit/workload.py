@@ -56,12 +56,11 @@ from tllm.workload.frontend import (
 from tllm.workload.ir import OptimizerSpec
 from tllm.workload.ir import EffectKind
 from tllm.workload.ir import ValueSourceKind
-from tllm.workload.staging import (
+from tllm.contracts.workload_ports import (
     PortTransactionStatus,
-    RuntimePortStore,
     StagedLifecycle,
-    StagedPort,
 )
+from tllm.workload.staging import RuntimePortStore, StagedPort
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.runtime.parameter_overlay import DenseOperandCaptureBatch
 from tllm.workload.host import HostOutput, RuntimeHostOutputStore

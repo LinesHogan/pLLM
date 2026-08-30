@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 import torch
 
 from tllm.contracts.request_identity import RequestFinishedBatch
-from tllm.workload.staging import PortTransactionStatus
+from tllm.contracts.workload_ports import PortTransactionStatus, SKIPPED
 
 WorkloadInstanceT = TypeVar("WorkloadInstanceT")
 
@@ -99,7 +99,6 @@ from tllm.contracts.physical_plan import (
     StreamClass,
 )
 from tllm.workload.region_compiler import compare_region_outputs
-from tllm.workload.runtime_values import SKIPPED
 from tllm.schedule.contracts import (
     BackendObservableEvent,
     BackendRegionBinderStage,

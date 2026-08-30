@@ -3,28 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Generic, TypeVar, cast
 
-from tllm.workload.runtime_values import SKIPPED, RuntimeValueMarker
+from tllm.contracts.workload_ports import (
+    PortTransactionStatus,
+    RuntimeValueMarker,
+    SKIPPED,
+    StagedLifecycle,
+)
 
 T = TypeVar("T")
-
-
-class StagedLifecycle(StrEnum):
-    DENSE_OPERAND_CAPTURED = "dense_operand.captured"
-    REQUEST_FINISHED = "request.finished"
-
-
-class PortTransactionStatus(StrEnum):
-    PENDING = "pending"
-    CONSUMED = "consumed"
-    ABORTED = "aborted"
-
-
-class StagedPortTransactionResolution(StrEnum):
-    CANCELLED = "cancelled"
-    CONSUMED = "consumed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,9 +211,7 @@ class StagedPort(Generic[T]):
 
 
 __all__ = [
-    "PortTransactionStatus",
     "RuntimePortStore",
-    "StagedPortTransactionResolution",
     "StagedLifecycle",
     "StagedPort",
 ]

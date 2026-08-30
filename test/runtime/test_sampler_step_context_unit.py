@@ -6,7 +6,7 @@ import torch
 
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
 from tllm.runtime.sampler_bridge.types import SamplerStepView
-from tllm.workload.runtime_values import SKIPPED
+from tllm.contracts.workload_ports import SKIPPED
 
 
 def _view(step_id: int) -> SamplerStepView:
