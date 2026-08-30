@@ -27,7 +27,11 @@ from tllm.workload.ir import EffectKind, ValueSourceKind, WorkloadEdgeKind, Work
 
 
 _IMPLEMENTATION_EVIDENCE = frozenset(
-    {"runtime.side_stream_safe", "torch.export"}
+    {
+        "runtime.async_host_safe",
+        "runtime.side_stream_safe",
+        "torch.export",
+    }
 )
 
 

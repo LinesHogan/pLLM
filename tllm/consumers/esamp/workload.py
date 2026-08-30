@@ -105,7 +105,7 @@ class ESampWorkload(Workload[ESampConfig]):
                 enabled=ESampConfig.intervention,
                 backend=ESampConfig.sampler_backend,
             ),
-            "prediction": temporary(),
+            "training_source": temporary(),
             "target": temporary(),
             "sample_index_tensor": temporary(),
         },
@@ -124,11 +124,11 @@ class ESampWorkload(Workload[ESampConfig]):
         torch.Tensor,
     ]:
         prediction = self.distiller(source)
-        return prediction, prediction, target, sample_index_tensor
+        return prediction, source, target, sample_index_tensor
 
     @task(
         inputs={
-            "prediction": result("predict", "prediction"),
+            "source": result("predict", "training_source"),
             "target": result("predict", "target"),
             "sample_index_tensor": result(
                 "predict", "sample_index_tensor"
@@ -143,10 +143,11 @@ class ESampWorkload(Workload[ESampConfig]):
     )
     def loss(
         self,
-        prediction: torch.Tensor,
+        source: torch.Tensor,
         target: torch.Tensor,
         sample_index_tensor: torch.Tensor,
     ) -> torch.Tensor:
+        prediction = self.distiller(source)
         if self.config.training_row_selection == "first_per_prompt":
             per_row_loss = (prediction.float() - target.float()).square().mean(
                 dim=1

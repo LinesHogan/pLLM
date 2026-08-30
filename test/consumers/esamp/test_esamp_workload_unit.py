@@ -180,13 +180,13 @@ class ESampRegionUnitTest(unittest.TestCase):
         source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
         target = -source
 
-        prediction, _materialized, loss_target, sample_index_tensor = workload.predict(
+        prediction, training_source, loss_target, sample_index_tensor = workload.predict(
             source,
             target,
             torch.tensor((0, 1, 0, 2)),
         )
         loss = workload.loss(
-            prediction, loss_target, sample_index_tensor
+            training_source, loss_target, sample_index_tensor
         )
 
         expected_prediction = workload.distiller(source)

@@ -253,6 +253,7 @@ class PhysicalExecutor:
         node_keys: tuple[NodeKey, ...],
         *,
         tensors: tuple[torch.Tensor, ...] = (),
+        main_snapshot: torch.cuda.Event | None = None,
     ) -> PhysicalStepResult:
         """Execute an ordered Region subset from one prepared physical plan.
 
@@ -317,7 +318,6 @@ class PhysicalExecutor:
 
         eager_nodes: list[str] = []
         replayed_nodes: list[str] = []
-        main_snapshot: torch.cuda.Event | None = None
         try:
             # A miss must abort an entire backend event group before a prior
             # Region can mutate state, publish a sink, or record a fence.

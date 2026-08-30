@@ -601,8 +601,13 @@ class ScheduleContractUnitTest(unittest.TestCase):
 
         stale_v2 = json.loads(decision.to_json())
         stale_v2["schema_version"] = 2
-        with self.assertRaisesRegex(ValueError, "schema v2 is stale.*recompile"):
+        with self.assertRaisesRegex(ValueError, "schema v2 is stale.*v4"):
             type(decision).from_json(json.dumps(stale_v2))
+
+        stale_v3 = json.loads(decision.to_json())
+        stale_v3["schema_version"] = 3
+        with self.assertRaisesRegex(ValueError, "schema v3 is stale.*v4"):
+            type(decision).from_json(json.dumps(stale_v3))
 
     def test_schema_v2_rejects_malformed_region_json_shapes(self) -> None:
         graph = ScheduleGraph(
@@ -775,7 +780,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         second = compile_schedule(graph, _timeline(), options)
 
         self.assertEqual(first.to_json(), second.to_json())
-        self.assertEqual(first.schema_version, 3)
+        self.assertEqual(first.schema_version, 4)
         self.assertEqual(first.execution_order, ("predict", "update"))
         self.assertEqual(len(first.execution_regions), 1)
         self.assertEqual(first.execution_regions[0].tasks, ("predict", "update"))
@@ -1174,7 +1179,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "signature is invalid"):
             validate_schedule(graph, piecewise, tampered, auto)
 
-    def test_schema_v3_region_signature_golden(self) -> None:
+    def test_schema_v4_region_signature_golden(self) -> None:
         graph = ScheduleGraph(
             workload_key="golden",
             tasks=(
@@ -1219,7 +1224,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
             )
 
         golden = (
-            Path(__file__).with_name("golden") / "schedule_v3_region.json"
+            Path(__file__).with_name("golden") / "schedule_v4_region.json"
         )
         if os.environ.get("TLLM_REGEN_GOLDEN") == "1":
             golden.write_text(decision.to_json() + "\n", encoding="utf-8")
@@ -1238,14 +1243,14 @@ class ScheduleContractUnitTest(unittest.TestCase):
             ))
         self.assertEqual(
             decision.signature,
-            "bb5a377306f518e4970ade2cf6554c7837dffb3aea2b71a3ba5e11a786d6f744",
+            "1dab4aac72466610f36be1edba36db79bc8fa5838fbba878c5dd2b96fc0ecc35",
         )
         self.assertEqual(
             decision.execution_regions[0].artifact_key,
-            "de6234b02e0b6c932500e562095cae8bbf9b2c75ed2ba77c2043f4d3552cafc1",
+            "5db675cd0818d6f80ed38c455391508e8e9d6a3e3f741494f97805e6ffaea34b",
         )
 
-    def test_schema_v3_complex_region_signature_golden(self) -> None:
+    def test_schema_v4_complex_region_signature_golden(self) -> None:
         """Freeze Rust-owned binder, state, and cross-Region wire records."""
 
         graph = ScheduleGraph(
@@ -1393,7 +1398,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
         )
 
         golden = (
-            Path(__file__).with_name("golden") / "schedule_v3_complex_region.json"
+            Path(__file__).with_name("golden") / "schedule_v4_complex_region.json"
         )
         if os.environ.get("TLLM_REGEN_GOLDEN") == "1":
             golden.write_text(decision.to_json() + "\n", encoding="utf-8")

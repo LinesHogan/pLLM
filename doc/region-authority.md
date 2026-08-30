@@ -23,7 +23,7 @@ artifact key, and decision signature, not capability evidence.
 
 | Interface | Required stable fields | Failure behavior |
 | --- | --- | --- |
-| `ScheduleDecision` v3 / `ExecutionRegion` | ids, anchors, dependencies, materializations, effects, capture/stream/fallback, signed side waits, artifact key, `compile_command` | unknown, missing, unsigned, stale-v2, or noncanonical field rejects |
+| `ScheduleDecision` v4 / `ExecutionRegion` | ids, anchors, dependencies, materializations, effects, capture/stream/fallback, signed side waits and host commands, artifact key, `compile_command` | unknown, missing, unsigned, stale-v2/v3, or noncanonical field rejects |
 | `RegionCompileCommand` | adapter, fullgraph, dynamic, ordered shape specialization, autograd, fallback | unsupported adapter or compiler failure raises; no eager retry |
 | `RegionCallableArtifact` | Region id/key, ordered input/output keys, exact typed bindings/effects, local callable, compiled marker, command | missing/mismatched callable/key/binding rejects before execution |
 | `BackendRegionBinderSlot` | signed implementation id and event context; exact-once `stage` then `invoke`, `clear`, or `abort` | duplicate/stale/missing stage rejects; a failed callback is never retried |
@@ -109,8 +109,8 @@ PATH=.venv/bin:$PATH /workspace/pllm/.venv/bin/python tools/check_typing.py
 Results: Rust `46 passed`; Python `1067 passed, 1079 subtests passed`; strict
 typing `0 errors`; basic typing `163 errors` against a baseline of 176; and the
 authority gate passed across 20 production files. The frozen schema examples
-are `test/workload/golden/schedule_v3_region.json` for a maximal compiled
-Region and `test/workload/golden/schedule_v3_complex_region.json` for typed
+are `test/workload/golden/schedule_v4_region.json` for a maximal compiled
+Region and `test/workload/golden/schedule_v4_complex_region.json` for typed
 extern staging, state effects, materialization, and a fence. Schedule,
 binder/state, recurrence, worker reconstruction, and authority-boundary
 regressions are in

@@ -258,6 +258,36 @@ enum RegionStreamClass {
     SideForward,
 }
 
+/// The closed host-side submission command for a fully-bound Region.
+///
+/// This is distinct from the GPU stream class. `AsyncSerial` permits the
+/// runtime to submit an explicitly safe extern Region to the one Rust-owned
+/// serial host lane; it does not let Python or a workload create a lane or
+/// choose its capacity.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RegionHostSubmission {
+    Inline,
+    AsyncSerial,
+}
+
+/// A closed runtime command over the fixed-capacity async host lane.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HostCommandKind {
+    WaitAsync,
+    ExecuteInline,
+    SubmitAsync,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RuntimeHostCommand {
+    kind: HostCommandKind,
+    submission_id: String,
+    region_ids: Vec<String>,
+}
+
 /// The closed fallback command for a fully-bound ExecutionRegion.
 ///
 /// An unsupported Region must reject before execution instead of silently
@@ -360,6 +390,7 @@ struct SelectedTaskImplementation {
     compile_safe: bool,
     capture_safe: bool,
     side_stream_safe: bool,
+    async_host_safe: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -738,6 +769,7 @@ struct ExecutionRegion {
     capture_mode: RegionCaptureMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<RegionStreamClass>,
+    host_submission: RegionHostSubmission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fallback_policy: Option<RegionFallbackPolicy>,
     artifact_key: String,
@@ -753,6 +785,7 @@ struct RuntimeAdvancePlan {
     backend_event: BackendObservableEvent,
     anchor_id: String,
     region_ids: Vec<String>,
+    host_commands: Vec<RuntimeHostCommand>,
     backend_region_binder_stages: Vec<BackendRegionBinderStage>,
     wait_for_prior_side_work: bool,
     wait_for_side_outputs: bool,
@@ -822,7 +855,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 fn workload_compilation_wire_cache_key(graph: &str, timeline: &str, options: &str) -> String {
     digest(&format!(
-        "workload-compilation-v3\0{graph}\0{timeline}\0{options}"
+        "workload-compilation-v4\0{graph}\0{timeline}\0{options}"
     ))
 }
 
@@ -1563,6 +1596,7 @@ fn validate_affine_regions(
 
 const TORCH_EXPORT_CAPABILITY: &str = "torch.export";
 const SIDE_STREAM_SAFE_CAPABILITY: &str = "runtime.side_stream_safe";
+const ASYNC_HOST_SAFE_CAPABILITY: &str = "runtime.async_host_safe";
 
 fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
     capabilities
@@ -1570,7 +1604,7 @@ fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
         .filter(|capability| {
             !matches!(
                 capability.as_str(),
-                TORCH_EXPORT_CAPABILITY | SIDE_STREAM_SAFE_CAPABILITY
+                TORCH_EXPORT_CAPABILITY | SIDE_STREAM_SAFE_CAPABILITY | ASYNC_HOST_SAFE_CAPABILITY
             )
         })
         .cloned()
@@ -1650,6 +1684,10 @@ fn select_task_implementations(
                                     side_stream_safe: compile_safe
                                         || capabilities.iter().any(|capability| {
                                             capability == SIDE_STREAM_SAFE_CAPABILITY
+                                        }),
+                                    async_host_safe: graph.schema_version == 2
+                                        && capabilities.iter().any(|capability| {
+                                            capability == ASYNC_HOST_SAFE_CAPABILITY
                                         }),
                                 }
                             })
@@ -2927,6 +2965,120 @@ fn side_stream_eligible(graph_schema_version: i64, region: &ExecutionRegion) -> 
     pure || ordered_state_tail
 }
 
+fn async_host_eligible(
+    graph_schema_version: i64,
+    region: &ExecutionRegion,
+    selected_async_host_safe: bool,
+) -> bool {
+    let inputs_materialized = !region.input_bindings.is_empty()
+        && region
+            .input_bindings
+            .iter()
+            .all(|binding| binding.kind == RegionInputKind::Materialized);
+    let outputs_materialized = region
+        .output_bindings
+        .iter()
+        .all(|binding| binding.kind == RegionOutputKind::Materialized);
+    let effects_safe = !region.effects.is_empty()
+        && region.effects.iter().all(|effect| {
+            matches!(
+                effect.kind,
+                ScheduleEffectKind::StateRead
+                    | ScheduleEffectKind::StateTransition
+                    | ScheduleEffectKind::StateTransitionMaybe
+            )
+        });
+    graph_schema_version == 2
+        && region.stream == Some(RegionStreamClass::SideForward)
+        && selected_async_host_safe
+        && inputs_materialized
+        && outputs_materialized
+        && effects_safe
+}
+
+const ASYNC_SERIAL_SUBMISSION_ID: &str = "async-serial-0";
+
+fn append_async_submission(commands: &mut Vec<RuntimeHostCommand>, region_ids: &mut Vec<String>) {
+    debug_assert!(!region_ids.is_empty());
+    commands.push(RuntimeHostCommand {
+        kind: HostCommandKind::WaitAsync,
+        submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
+        region_ids: Vec::new(),
+    });
+    commands.push(RuntimeHostCommand {
+        kind: HostCommandKind::SubmitAsync,
+        submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
+        region_ids: std::mem::take(region_ids),
+    });
+}
+
+fn validate_host_commands(
+    region_ids: &[String],
+    commands: &[RuntimeHostCommand],
+    regions_by_id: &HashMap<&str, &ExecutionRegion>,
+) -> PyResult<()> {
+    let mut flattened = Vec::new();
+    for (index, command) in commands.iter().enumerate() {
+        match command.kind {
+            HostCommandKind::WaitAsync => {
+                if command.submission_id != ASYNC_SERIAL_SUBMISSION_ID
+                    || !command.region_ids.is_empty()
+                {
+                    return Err(schedule_error(
+                        "wait_async requires the fixed async-serial-0 submission and no regions",
+                    ));
+                }
+            }
+            HostCommandKind::ExecuteInline => {
+                if !command.submission_id.is_empty() || command.region_ids.is_empty() {
+                    return Err(schedule_error(
+                        "execute_inline requires an empty submission_id and non-empty regions",
+                    ));
+                }
+                for region_id in &command.region_ids {
+                    if regions_by_id
+                        .get(region_id.as_str())
+                        .is_none_or(|region| region.host_submission != RegionHostSubmission::Inline)
+                    {
+                        return Err(schedule_error(
+                            "execute_inline references a non-inline ExecutionRegion",
+                        ));
+                    }
+                }
+                flattened.extend(command.region_ids.iter().cloned());
+            }
+            HostCommandKind::SubmitAsync => {
+                if command.submission_id != ASYNC_SERIAL_SUBMISSION_ID
+                    || command.region_ids.is_empty()
+                    || index == 0
+                    || commands[index - 1].kind != HostCommandKind::WaitAsync
+                    || commands[index - 1].submission_id != command.submission_id
+                {
+                    return Err(schedule_error(
+                        "submit_async requires non-empty regions and an immediately preceding wait on async-serial-0",
+                    ));
+                }
+                for region_id in &command.region_ids {
+                    if regions_by_id.get(region_id.as_str()).is_none_or(|region| {
+                        region.host_submission != RegionHostSubmission::AsyncSerial
+                    }) {
+                        return Err(schedule_error(
+                            "submit_async references a non-async ExecutionRegion",
+                        ));
+                    }
+                }
+                flattened.extend(command.region_ids.iter().cloned());
+            }
+        }
+    }
+    if flattened != region_ids {
+        return Err(schedule_error(
+            "runtime host commands must flatten execute_inline and submit_async to region_ids exactly",
+        ));
+    }
+    Ok(())
+}
+
 fn runtime_advance_plan(
     timeline: &Timeline,
     execution_regions: &[ExecutionRegion],
@@ -2987,6 +3139,26 @@ fn runtime_advance_plan(
                 .iter()
                 .any(|binding| binding.kind == RegionOutputKind::Sampler)
     });
+    let async_region_ids: BTreeSet<&str> = execution_regions
+        .iter()
+        .filter(|region| region.host_submission == RegionHostSubmission::AsyncSerial)
+        .map(|region| region.region_id.as_str())
+        .collect();
+    let mut async_access_resources = BTreeMap::<&str, bool>::new();
+    for effect in execution_regions
+        .iter()
+        .filter(|region| region.host_submission == RegionHostSubmission::AsyncSerial)
+        .flat_map(|region| region.effects.iter())
+    {
+        let mutates = matches!(
+            effect.kind,
+            ScheduleEffectKind::StateTransition | ScheduleEffectKind::StateTransitionMaybe
+        );
+        async_access_resources
+            .entry(effect.resource.as_str())
+            .and_modify(|existing| *existing |= mutates)
+            .or_insert(mutates);
+    }
     let mut staged_binder_identities = BTreeSet::<(BackendObservableEvent, String)>::new();
     let mut advances = Vec::new();
     for anchor in &timeline.anchors {
@@ -3007,6 +3179,80 @@ fn runtime_advance_plan(
                         })
                 })
             });
+            let mut host_commands = Vec::new();
+            let mut inline_batch = Vec::new();
+            let mut async_batch = Vec::new();
+            for region_id in &region_ids {
+                let region = regions_by_id.get(region_id.as_str()).ok_or_else(|| {
+                    schedule_error("runtime advance references an unknown ExecutionRegion")
+                })?;
+                if region.host_submission == RegionHostSubmission::AsyncSerial {
+                    if !inline_batch.is_empty() {
+                        host_commands.push(RuntimeHostCommand {
+                            kind: HostCommandKind::ExecuteInline,
+                            submission_id: String::new(),
+                            region_ids: std::mem::take(&mut inline_batch),
+                        });
+                    }
+                    async_batch.push(region_id.clone());
+                    continue;
+                }
+
+                if !async_batch.is_empty() {
+                    append_async_submission(&mut host_commands, &mut async_batch);
+                    // PhysicalExecutor currently reserves one host submission
+                    // per logical step.  A later inline Region in that same
+                    // step therefore receives an explicit Rust-owned wait;
+                    // Python never infers this capacity edge.
+                    host_commands.push(RuntimeHostCommand {
+                        kind: HostCommandKind::WaitAsync,
+                        submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
+                        region_ids: Vec::new(),
+                    });
+                }
+                let waits_for_async_dependency = region
+                    .dependencies
+                    .iter()
+                    .any(|dependency| async_region_ids.contains(dependency.as_str()));
+                let waits_for_async_state = region.effects.iter().any(|effect| {
+                    async_access_resources
+                        .get(effect.resource.as_str())
+                        .is_some_and(|async_mutates| {
+                            *async_mutates || effect.kind != ScheduleEffectKind::StateRead
+                        })
+                });
+                if waits_for_async_dependency || waits_for_async_state {
+                    if !inline_batch.is_empty() {
+                        host_commands.push(RuntimeHostCommand {
+                            kind: HostCommandKind::ExecuteInline,
+                            submission_id: String::new(),
+                            region_ids: std::mem::take(&mut inline_batch),
+                        });
+                    }
+                    if host_commands
+                        .last()
+                        .is_none_or(|command| command.kind != HostCommandKind::WaitAsync)
+                    {
+                        host_commands.push(RuntimeHostCommand {
+                            kind: HostCommandKind::WaitAsync,
+                            submission_id: ASYNC_SERIAL_SUBMISSION_ID.to_owned(),
+                            region_ids: Vec::new(),
+                        });
+                    }
+                }
+                inline_batch.push(region_id.clone());
+            }
+            if !async_batch.is_empty() {
+                append_async_submission(&mut host_commands, &mut async_batch);
+            }
+            if !inline_batch.is_empty() {
+                host_commands.push(RuntimeHostCommand {
+                    kind: HostCommandKind::ExecuteInline,
+                    submission_id: String::new(),
+                    region_ids: inline_batch,
+                });
+            }
+            validate_host_commands(&region_ids, &host_commands, &regions_by_id)?;
             let mut backend_region_binder_stages = Vec::new();
             for region_id in &region_ids {
                 let region = regions_by_id.get(region_id.as_str()).ok_or_else(|| {
@@ -3039,6 +3285,7 @@ fn runtime_advance_plan(
                 backend_event: *backend_event,
                 anchor_id: anchor.anchor_id.clone(),
                 region_ids,
+                host_commands,
                 backend_region_binder_stages,
                 wait_for_prior_side_work,
                 wait_for_side_outputs: *backend_event == BackendObservableEvent::SamplerPreDraw
@@ -3405,6 +3652,7 @@ fn compile_impl(
             side_stream_safe,
             capture_mode: RegionCaptureMode::Disabled,
             stream: Some(stream),
+            host_submission: RegionHostSubmission::Inline,
             fallback_policy: Some(RegionFallbackPolicy::Reject),
             artifact_key: String::new(),
             serial_fallback: draft.serial_fallback,
@@ -3740,6 +3988,13 @@ fn compile_impl(
         if options.allow_side_stream && side_stream_eligible(graph.schema_version, region) {
             region.stream = Some(RegionStreamClass::SideForward);
         }
+        let selected_async_host_safe = region
+            .tasks
+            .iter()
+            .all(|task_id| selected[task_index[task_id]].async_host_safe);
+        if async_host_eligible(graph.schema_version, region, selected_async_host_safe) {
+            region.host_submission = RegionHostSubmission::AsyncSerial;
+        }
         region.capture_mode = capture_mode_for_region(timeline, options, region)?;
         region.compile_command = compile_command_for_region(options, region);
         region.artifact_key = region_artifact_key(graph_json, timeline_json, options_json, region)?;
@@ -3867,7 +4122,7 @@ fn compile_impl(
             explanations
         },
         signature: String::new(),
-        schema_version: 3,
+        schema_version: 4,
     };
     let unsigned = serde_json::to_string(&decision)
         .map_err(|error| schedule_error(format!("failed to serialize decision: {error}")))?;
@@ -3899,7 +4154,8 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     let options_desc: CompileOptions = decode(options, "CompileOptions")?;
     let supplied: Decision = decode(decision, "ScheduleDecision")?;
     let (anchor_index, task_index) = validate_inputs(&graph_desc, &timeline_desc, &options_desc)?;
-    if supplied.schema_version != 3
+    let selected = select_task_implementations(&graph_desc, &timeline_desc)?;
+    if supplied.schema_version != 4
         || supplied.graph_key != digest(graph)
         || supplied.timeline_key != digest(timeline)
     {
@@ -3913,7 +4169,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         .any(|region| region.stream.is_none() || region.fallback_policy.is_none())
     {
         return Err(schedule_error(
-            "ScheduleDecision v3 ExecutionRegion requires explicit stream and fallback_policy",
+            "ScheduleDecision v4 ExecutionRegion requires explicit stream and fallback_policy",
         ));
     }
     if supplied.execution_regions.iter().any(|region| {
@@ -3921,7 +4177,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             != region.compile_command.is_some()
     }) {
         return Err(schedule_error(
-            "ScheduleDecision v3 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
+            "ScheduleDecision v4 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
         ));
     }
     let mut unsigned = supplied.clone();
@@ -3933,7 +4189,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
     if supplied.fallback != "explicit_regions" || !supplied.capture_partitions.is_empty() {
         return Err(schedule_error(
-            "ScheduleDecision v3 requires explicit regions and forbids capture_partitions",
+            "ScheduleDecision v4 requires explicit regions and forbids capture_partitions",
         ));
     }
     if supplied.execution_order.len() != graph_desc.tasks.len()
@@ -4037,6 +4293,21 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                     "side-stream ExecutionRegion requires scheduler enablement, stream-safe implementation evidence, typed materializations, and ordered effects",
                 ));
             }
+        }
+        let selected_async_host_safe = region
+            .tasks
+            .iter()
+            .all(|task_id| selected[task_index[task_id]].async_host_safe);
+        let expected_host_submission =
+            if async_host_eligible(graph_desc.schema_version, region, selected_async_host_safe) {
+                RegionHostSubmission::AsyncSerial
+            } else {
+                RegionHostSubmission::Inline
+            };
+        if region.host_submission != expected_host_submission {
+            return Err(schedule_error(
+                "ExecutionRegion host_submission is inconsistent with selected async-host evidence and typed Region contracts",
+            ));
         }
         if let Some(command) = &region.compile_command {
             let expected_adapter =
@@ -4205,11 +4476,23 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
 
     let supplied_runtime_plan = supplied.runtime_advance_plan.as_ref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v3 requires an explicit runtime_advance_plan")
+        schedule_error("ScheduleDecision v4 requires an explicit runtime_advance_plan")
     })?;
     let supplied_completion_anchor = supplied.completion_anchor.as_deref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v3 requires an explicit completion_anchor")
+        schedule_error("ScheduleDecision v4 requires an explicit completion_anchor")
     })?;
+    let supplied_regions_by_id: HashMap<&str, &ExecutionRegion> = supplied
+        .execution_regions
+        .iter()
+        .map(|region| (region.region_id.as_str(), region))
+        .collect();
+    for advance in supplied_runtime_plan {
+        validate_host_commands(
+            &advance.region_ids,
+            &advance.host_commands,
+            &supplied_regions_by_id,
+        )?;
+    }
     if supplied_completion_anchor.is_empty() {
         return Err(schedule_error(
             "ScheduleDecision completion_anchor must be non-empty",
@@ -4950,9 +5233,9 @@ mod tests {
         apply_region_shape_specializations_wire, compile_schedule, digest,
         normalize_runtime_specialization_options_wire, validate_runtime_specialization_facts,
         validate_schedule, workload_compilation_wire_cache_key, CompileOptions, Decision,
-        ExecutionRegion, HiddenPhase, HiddenSite, RegionCaptureMode, RegionFallbackPolicy,
-        RegionInputBinding, RegionInputKind, RegionOutputKind, RegionStreamClass,
-        ScheduleEffectKind, ScheduleInput,
+        ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind, RegionCaptureMode,
+        RegionFallbackPolicy, RegionHostSubmission, RegionInputBinding, RegionInputKind,
+        RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleInput,
     };
     use isl_rs::{Context, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
 
@@ -5186,6 +5469,311 @@ mod tests {
     }
 
     #[test]
+    fn rust_signs_canonical_async_host_commands_without_name_policy() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"neutral-graph","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.schema_version, 4);
+        let update_region = decision
+            .execution_regions
+            .iter()
+            .find(|region| region.tasks == ["beta"])
+            .unwrap();
+        assert_eq!(update_region.stream, Some(RegionStreamClass::SideForward));
+        assert_eq!(
+            update_region.host_submission,
+            RegionHostSubmission::AsyncSerial
+        );
+        assert!(update_region.required_capabilities.is_empty());
+        assert!(decision
+            .execution_regions
+            .iter()
+            .filter(|region| region.region_id != update_region.region_id)
+            .all(|region| region.host_submission == RegionHostSubmission::Inline));
+
+        let advances = decision.runtime_advance_plan.as_ref().unwrap();
+        let tick = advances
+            .iter()
+            .find(|advance| advance.anchor_id == "tick")
+            .unwrap();
+        assert_eq!(
+            tick.host_commands
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                HostCommandKind::ExecuteInline,
+                HostCommandKind::WaitAsync,
+                HostCommandKind::SubmitAsync,
+            ]
+        );
+        assert_eq!(tick.host_commands[0].submission_id, "");
+        assert_eq!(tick.host_commands[1].submission_id, "async-serial-0");
+        assert!(tick.host_commands[1].region_ids.is_empty());
+        assert_eq!(tick.host_commands[2].submission_id, "async-serial-0");
+        assert_eq!(
+            tick.host_commands[2].region_ids,
+            vec![update_region.region_id.clone()]
+        );
+
+        let next = advances
+            .iter()
+            .find(|advance| advance.anchor_id == "next")
+            .unwrap();
+        assert_eq!(
+            next.host_commands
+                .iter()
+                .map(|command| command.kind)
+                .collect::<Vec<_>>(),
+            vec![HostCommandKind::WaitAsync, HostCommandKind::ExecuteInline]
+        );
+        validate_schedule(graph, timeline, options, &compiled).unwrap();
+
+        let renamed_graph = graph
+            .replace("neutral-graph", "renamed-graph")
+            .replace(r#""alpha""#, r#""first""#)
+            .replace(r#""beta""#, r#""second""#)
+            .replace(r#""gamma""#, r#""third""#);
+        let renamed: Decision =
+            serde_json::from_str(&compile_schedule(&renamed_graph, timeline, options).unwrap())
+                .unwrap();
+        assert_eq!(
+            renamed
+                .execution_regions
+                .iter()
+                .map(|region| region.host_submission)
+                .collect::<Vec<_>>(),
+            decision
+                .execution_regions
+                .iter()
+                .map(|region| region.host_submission)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            renamed
+                .runtime_advance_plan
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|advance| {
+                    advance
+                        .host_commands
+                        .iter()
+                        .map(|command| command.kind)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            advances
+                .iter()
+                .map(|advance| {
+                    advance
+                        .host_commands
+                        .iter()
+                        .map(|command| command.kind)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_host_submission_requires_every_structural_proof() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"neutral-eligibility","tasks":[{"task_id":"alpha","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:loss@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"loss","kind":"temporary","target":"loss"}]},{"task_id":"beta","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:update@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition","resource":"weights"}],"inputs":[{"name":"loss","kind":"result","source":"alpha","output":"loss"}]},{"task_id":"gamma","timing":{"after":"next","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights"}]}],"edges":[{"source":"alpha","target":"beta","kind":"data"},{"source":"beta","target":"gamma","kind":"effect"}],"values":[{"value_id":"neutral:loss","version":1,"producer":"alpha","producer_output":"loss","consumers":["beta"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"weights","scope":"global","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+        let baseline: serde_json::Value = serde_json::from_str(graph).unwrap();
+
+        let compile_update = |candidate: serde_json::Value| {
+            let candidate = serde_json::to_string(&candidate).unwrap();
+            let decision: Decision =
+                serde_json::from_str(&compile_schedule(&candidate, timeline, options).unwrap())
+                    .unwrap();
+            decision
+                .execution_regions
+                .into_iter()
+                .find(|region| region.tasks.iter().any(|task| task == "beta"))
+                .unwrap()
+        };
+
+        let mut no_async_evidence = baseline.clone();
+        no_async_evidence["tasks"][1]["implementation_capabilities"] =
+            serde_json::json!([["runtime.side_stream_safe"]]);
+        let region = compile_update(no_async_evidence);
+        assert_eq!(region.stream, Some(RegionStreamClass::SideForward));
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+
+        let mut compiled = baseline.clone();
+        compiled["tasks"][1]["implementation_kinds"] = serde_json::json!(["captured"]);
+        compiled["tasks"][1]["implementation_capabilities"] = serde_json::json!([[
+            "runtime.async_host_safe",
+            "runtime.side_stream_safe",
+            "torch.export"
+        ]]);
+        let region = compile_update(compiled);
+        assert_eq!(
+            region.implementation_kind,
+            super::RegionImplementationKind::Compiled
+        );
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+
+        let mut provided = baseline.clone();
+        provided["tasks"][1]["inputs"] =
+            serde_json::json!([{"name":"loss","kind":"provided","source":"batch"}]);
+        provided["edges"] = serde_json::json!([
+            {"source":"beta","target":"gamma","kind":"effect"}
+        ]);
+        provided["values"][0]["consumers"] = serde_json::json!([]);
+        let region = compile_update(provided);
+        assert_eq!(region.input_bindings[0].kind, RegionInputKind::Provided);
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+
+        let mut host_output = baseline.clone();
+        host_output["tasks"][1]["outputs"] =
+            serde_json::json!([{"name":"receipt","kind":"host","target":"receipt"}]);
+        host_output["values"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "value_id":"neutral:receipt",
+                "version":1,
+                "producer":"beta",
+                "producer_output":"receipt",
+                "consumers":[],
+                "size_bytes":0,
+                "alias_set":""
+            }));
+        let region = compile_update(host_output);
+        assert_eq!(region.output_bindings[0].kind, RegionOutputKind::Host);
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+
+        let mut unsafe_effect = baseline;
+        unsafe_effect["tasks"][1]["effects"] =
+            serde_json::json!([{"kind":"version_publish","resource":"weights"}]);
+        unsafe_effect["edges"] = serde_json::json!([
+            {"source":"alpha","target":"beta","kind":"data"}
+        ]);
+        let region = compile_update(unsafe_effect);
+        assert_eq!(region.effects[0].kind, ScheduleEffectKind::VersionPublish);
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+    }
+
+    #[test]
+    fn validator_rejects_async_host_region_and_command_tampering() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"tamper-neutral","tasks":[{"task_id":"one","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:produce@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":true,"outputs":[{"name":"value","kind":"temporary","target":"value"}]},{"task_id":"two","timing":{"after":"tick","before":"next"},"temporary_bytes":0,"implementation_ids":["test:transition@1"],"implementation_kinds":["extern"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_transition_maybe","resource":"state"}],"inputs":[{"name":"value","kind":"result","source":"one","output":"value"}]}],"edges":[{"source":"one","target":"two","kind":"data"}],"values":[{"value_id":"tamper:value","version":1,"producer":"one","producer_output":"value","consumers":["two"],"size_bytes":0,"alias_set":""}],"states":[{"resource":"state","scope":"global","transition":"maybe"}],"persistent_state_bytes":0,"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"tick","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]},{"anchor_id":"next","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let original: Decision = serde_json::from_str(&compiled).unwrap();
+
+        let mut region_tampered = original.clone();
+        let async_region = region_tampered
+            .execution_regions
+            .iter_mut()
+            .find(|region| region.host_submission == RegionHostSubmission::AsyncSerial)
+            .unwrap();
+        async_region.host_submission = RegionHostSubmission::Inline;
+        region_tampered.signature.clear();
+        region_tampered.signature = digest(&serde_json::to_string(&region_tampered).unwrap());
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&region_tampered).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("host_submission"));
+
+        let mut command_tampered = original.clone();
+        let advance = command_tampered
+            .runtime_advance_plan
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|advance| {
+                advance
+                    .host_commands
+                    .iter()
+                    .any(|command| command.kind == HostCommandKind::SubmitAsync)
+            })
+            .unwrap();
+        let submit = advance
+            .host_commands
+            .iter_mut()
+            .find(|command| command.kind == HostCommandKind::SubmitAsync)
+            .unwrap();
+        submit.submission_id = "workload-lane".to_owned();
+        command_tampered.signature.clear();
+        command_tampered.signature = digest(&serde_json::to_string(&command_tampered).unwrap());
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&command_tampered).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("submit_async"));
+
+        let mut flatten_tampered = original.clone();
+        let advance = flatten_tampered
+            .runtime_advance_plan
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|advance| advance.region_ids.len() == 2)
+            .unwrap();
+        let inline = advance
+            .host_commands
+            .iter_mut()
+            .find(|command| command.kind == HostCommandKind::ExecuteInline)
+            .unwrap();
+        inline.region_ids.push(inline.region_ids[0].clone());
+        flatten_tampered.signature.clear();
+        flatten_tampered.signature = digest(&serde_json::to_string(&flatten_tampered).unwrap());
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&flatten_tampered).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("flatten"));
+
+        let mut missing_commands: serde_json::Value = serde_json::from_str(&compiled).unwrap();
+        missing_commands["runtime_advance_plan"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("host_commands");
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&missing_commands).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing field `host_commands`"));
+
+        let mut unknown_command: serde_json::Value = serde_json::from_str(&compiled).unwrap();
+        let commands = unknown_command["runtime_advance_plan"][0]["host_commands"]
+            .as_array_mut()
+            .unwrap();
+        commands[0]["kind"] = serde_json::json!("enqueue");
+        let error = validate_schedule(
+            graph,
+            timeline,
+            options,
+            &serde_json::to_string(&unknown_command).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant `enqueue`"));
+    }
+
+    #[test]
     fn schema_v2_selects_first_timeline_supported_implementation() {
         pyo3::prepare_freethreaded_python();
         let graph = r#"{"workload_key":"candidate-selection","tasks":[{"task_id":"select","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["backend:extern@1","python:compiled@1"],"implementation_kinds":["extern","captured"],"implementation_capabilities":[["backend/alternate"],["backend/default","torch.export"]],"required_capabilities":[],"capture_safe":false}],"edges":[],"values":[],"states":[],"persistent_state_bytes":0,"schema_version":2}"#;
@@ -5277,6 +5865,7 @@ mod tests {
             "side_stream_safe":true,
             "capture_mode":"disabled",
             "stream":"default",
+            "host_submission":"inline",
             "fallback_policy":"reject",
             "artifact_key":"0000000000000000000000000000000000000000000000000000000000000000",
             "serial_fallback":false,
@@ -5309,6 +5898,18 @@ mod tests {
         assert!(error
             .to_string()
             .contains("missing field `compile_command`"));
+
+        let mut missing_host_submission: serde_json::Value =
+            serde_json::from_str(unknown_region).unwrap();
+        let missing_host_fields = missing_host_submission.as_object_mut().unwrap();
+        missing_host_fields.remove("host_submission");
+        missing_host_fields.remove("unexpected");
+        let error = serde_json::from_value::<ExecutionRegion>(missing_host_submission).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing field `host_submission`"));
+        let error = serde_json::from_str::<RegionHostSubmission>(r#""thread_pool""#).unwrap_err();
+        assert!(error.to_string().contains("unknown variant `thread_pool`"));
 
         let mut legacy_region: serde_json::Value = serde_json::from_str(unknown_region).unwrap();
         let legacy_fields = legacy_region.as_object_mut().unwrap();

@@ -26,7 +26,7 @@ transition 会被拒绝。recurrence 默认为 exact；Jacobi 必须显式选择
   capability、reservation 和启动期静态 headroom。
 - `ScheduleGraph`：task、typed input/output port、value/version、依赖、effect、
   timing、实现候选和静态内存。
-- `ScheduleDecision` schema v3：细粒度执行顺序和 schedule tree，加上权威的
+- `ScheduleDecision` schema v4：细粒度执行顺序和 schedule tree，加上权威的
   `ExecutionRegion`、跨 Region materialization 及 lifetime、MemoryPlan、跨 Region
   fence、成本分解、解释、artifact key 和签名。
 

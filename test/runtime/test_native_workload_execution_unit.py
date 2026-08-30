@@ -309,7 +309,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "explicit backend alias"):
             _hidden_value(runtime, binding)
 
-    def test_path_hidden_binding_uses_the_explicit_backend_alias(self) -> None:
+    def test_path_hidden_binding_owns_an_immutable_backend_snapshot(self) -> None:
         binding = RegionInputBinding(
             binding_id="hidden",
             kind=RegionInputKind.HIDDEN,
@@ -331,8 +331,13 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         self.assertIsInstance(staged, torch.Tensor)
         assert isinstance(staged, torch.Tensor)
         self.assertTrue(torch.equal(staged, hidden))
-        self.assertEqual(
+        self.assertNotEqual(
             staged.untyped_storage().data_ptr(), hidden.untyped_storage().data_ptr()
+        )
+        hidden.add_(1)
+        torch.testing.assert_close(
+            staged,
+            torch.arange(4, dtype=torch.float32).reshape(1, 4),
         )
 
     def test_hidden_binding_stages_inference_tensor_for_region_autograd(self) -> None:
@@ -1081,7 +1086,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         store.prepare_step(9)
         store.execute(producer, context)
         self.assertEqual(store.retained_value_count, 2)
-        self.assertEqual(set(store._values.values()), {"v1", "v2"})
+        self.assertEqual(set(store._frames[9].values.values()), {"v1", "v2"})
         store.execute(consumer, context)
         self.assertEqual(store.retained_value_count, 0)
 
@@ -1182,7 +1187,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                     BackendObservableEvent.SAMPLE_TOKENS_POST
                 )
             )
-            execution._event_nodes = {}
+            execution._event_advances = {}
             with self.assertRaisesRegex(RuntimeError, "not signed"):
                 execution.advance_backend_event(BackendObservableEvent.SAMPLER_PRE_DRAW)
             self.assertFalse(execution.advance_anchor("unsigned.anchor"))

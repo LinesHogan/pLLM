@@ -420,6 +420,21 @@ class RegionStreamClass(StrEnum):
     SIDE_FORWARD = "side_forward"
 
 
+class RegionHostSubmission(StrEnum):
+    """Closed Rust-selected host submission mode for one Region."""
+
+    INLINE = "inline"
+    ASYNC_SERIAL = "async_serial"
+
+
+class HostCommandKind(StrEnum):
+    """Closed runtime command over the fixed-capacity async host lane."""
+
+    WAIT_ASYNC = "wait_async"
+    EXECUTE_INLINE = "execute_inline"
+    SUBMIT_ASYNC = "submit_async"
+
+
 class RegionFallbackPolicy(StrEnum):
     """Closed fallback command emitted and signed by the Rust planner."""
 
@@ -1461,6 +1476,7 @@ class ExecutionRegion:
     side_stream_safe: bool = False
     capture_mode: RegionCaptureMode = RegionCaptureMode.DISABLED
     stream: RegionStreamClass = RegionStreamClass.DEFAULT
+    host_submission: RegionHostSubmission = RegionHostSubmission.INLINE
     fallback_policy: RegionFallbackPolicy = RegionFallbackPolicy.REJECT
     artifact_key: str = ""
     serial_fallback: bool = False
@@ -1598,6 +1614,13 @@ class ExecutionRegion:
             ) from exc
         object.__setattr__(self, "stream", stream)
         try:
+            host_submission = RegionHostSubmission(self.host_submission)
+        except ValueError as exc:
+            raise ValueError(
+                "ExecutionRegion.host_submission must be inline or async_serial"
+            ) from exc
+        object.__setattr__(self, "host_submission", host_submission)
+        try:
             fallback_policy = RegionFallbackPolicy(self.fallback_policy)
         except ValueError as exc:
             raise ValueError("ExecutionRegion.fallback_policy must be reject") from exc
@@ -1642,6 +1665,52 @@ class BackendRegionBinderStage:
         )
 
 
+_ASYNC_SERIAL_SUBMISSION_ID = "async-serial-0"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeHostCommand:
+    """One Rust-signed host action in an observable backend advance."""
+
+    kind: HostCommandKind
+    submission_id: str
+    region_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", HostCommandKind(self.kind))
+        if not isinstance(self.submission_id, str):
+            raise TypeError("RuntimeHostCommand.submission_id must be str")
+        if not isinstance(self.region_ids, tuple) or any(
+            not isinstance(region_id, str) or not region_id
+            for region_id in self.region_ids
+        ):
+            raise TypeError("RuntimeHostCommand.region_ids must be tuple[str, ...]")
+        if len(self.region_ids) != len(set(self.region_ids)):
+            raise ValueError("RuntimeHostCommand.region_ids must be unique")
+        match self.kind:
+            case HostCommandKind.WAIT_ASYNC:
+                if (
+                    self.submission_id != _ASYNC_SERIAL_SUBMISSION_ID
+                    or self.region_ids
+                ):
+                    raise ValueError(
+                        "wait_async requires async-serial-0 and no regions"
+                    )
+            case HostCommandKind.EXECUTE_INLINE:
+                if self.submission_id or not self.region_ids:
+                    raise ValueError(
+                        "execute_inline requires no submission id and non-empty regions"
+                    )
+            case HostCommandKind.SUBMIT_ASYNC:
+                if (
+                    self.submission_id != _ASYNC_SERIAL_SUBMISSION_ID
+                    or not self.region_ids
+                ):
+                    raise ValueError(
+                        "submit_async requires async-serial-0 and non-empty regions"
+                    )
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeAdvancePlan:
     """Signed backend-event advancement for one observable timeline anchor."""
@@ -1649,6 +1718,7 @@ class RuntimeAdvancePlan:
     backend_event: BackendObservableEvent
     anchor_id: str
     region_ids: tuple[str, ...]
+    host_commands: tuple[RuntimeHostCommand, ...] = ()
     backend_region_binder_stages: tuple[BackendRegionBinderStage, ...] = ()
     wait_for_prior_side_work: bool = False
     wait_for_side_outputs: bool = False
@@ -1667,6 +1737,35 @@ class RuntimeAdvancePlan:
             raise TypeError("RuntimeAdvancePlan.region_ids must be tuple[str, ...]")
         if len(self.region_ids) != len(set(self.region_ids)):
             raise ValueError("RuntimeAdvancePlan.region_ids must be unique")
+        if not isinstance(self.host_commands, tuple) or any(
+            not isinstance(command, RuntimeHostCommand)
+            for command in self.host_commands
+        ):
+            raise TypeError(
+                "RuntimeAdvancePlan.host_commands must be tuple[RuntimeHostCommand, ...]"
+            )
+        flattened = tuple(
+            region_id
+            for command in self.host_commands
+            if command.kind
+            in (HostCommandKind.EXECUTE_INLINE, HostCommandKind.SUBMIT_ASYNC)
+            for region_id in command.region_ids
+        )
+        if flattened != self.region_ids:
+            raise ValueError(
+                "RuntimeAdvancePlan host commands must cover region_ids in order"
+            )
+        for position, command in enumerate(self.host_commands):
+            if command.kind is HostCommandKind.SUBMIT_ASYNC and (
+                position == 0
+                or self.host_commands[position - 1].kind
+                is not HostCommandKind.WAIT_ASYNC
+                or self.host_commands[position - 1].submission_id
+                != command.submission_id
+            ):
+                raise ValueError(
+                    "submit_async requires an immediately preceding matching wait_async"
+                )
         if not isinstance(self.backend_region_binder_stages, tuple) or any(
             not isinstance(stage, BackendRegionBinderStage)
             for stage in self.backend_region_binder_stages
@@ -1718,10 +1817,10 @@ class ScheduleDecision:
     cost: CostBreakdown = CostBreakdown(0, 0, 0, 0)
     explanations: tuple[str, ...] = ()
     signature: str = ""
-    schema_version: int = 3
+    schema_version: int = 4
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 3}:
+        if self.schema_version not in {1, 4}:
             raise ValueError("unsupported ScheduleDecision schema version")
         if not isinstance(self.execution_regions, tuple) or any(
             not isinstance(region, ExecutionRegion) for region in self.execution_regions
@@ -1805,6 +1904,22 @@ class ScheduleDecision:
                     raise ValueError(
                         "RuntimeAdvancePlan references an unknown ExecutionRegion"
                     )
+                for command in advance.host_commands:
+                    expected_submission = (
+                        RegionHostSubmission.ASYNC_SERIAL
+                        if command.kind is HostCommandKind.SUBMIT_ASYNC
+                        else RegionHostSubmission.INLINE
+                    )
+                    if command.kind is HostCommandKind.WAIT_ASYNC:
+                        continue
+                    if any(
+                        self.execution_regions[positions[region_id]].host_submission
+                        is not expected_submission
+                        for region_id in command.region_ids
+                    ):
+                        raise ValueError(
+                            "RuntimeHostCommand differs from its Region host submission"
+                        )
                 for stage in advance.backend_region_binder_stages:
                     region = self.execution_regions[positions[stage.region_id]]
                     if (
@@ -1824,7 +1939,7 @@ class ScheduleDecision:
                     binder_identities.add(identity)
             if self.capture_partitions:
                 raise ValueError(
-                    "ScheduleDecision schema v3 cannot contain capture_partitions"
+                    "ScheduleDecision schema v4 cannot contain capture_partitions"
                 )
         if not isinstance(self.fences, tuple) or any(
             not isinstance(fence, ScheduleFence) for fence in self.fences
@@ -1869,15 +1984,16 @@ class ScheduleDecision:
         schema_version = raw["schema_version"]
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise TypeError("ScheduleDecision.schema_version must be int")
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             raise ValueError(
-                "ScheduleDecision schema v2 is stale; recompile with schema v3"
+                f"ScheduleDecision schema v{schema_version} is stale; "
+                "recompile with schema v4"
             )
-        if schema_version not in {1, 3}:
+        if schema_version not in {1, 4}:
             raise ValueError("unsupported ScheduleDecision schema version")
 
-        is_v3 = schema_version == 3
-        if is_v3:
+        is_v4 = schema_version == 4
+        if is_v4:
             _require_json_fields(
                 raw,
                 "ScheduleDecision",
@@ -1890,17 +2006,17 @@ class ScheduleDecision:
             )
         region_payloads = _json_array(
             raw["execution_regions"]
-            if is_v3
+            if is_v4
             else raw.get("execution_regions", []),
             "ScheduleDecision.execution_regions",
         )
         materialization_payloads = _json_array(
-            raw["materializations"] if is_v3 else raw.get("materializations", []),
+            raw["materializations"] if is_v4 else raw.get("materializations", []),
             "ScheduleDecision.materializations",
         )
         runtime_advance_payloads = _json_array(
             raw["runtime_advance_plan"]
-            if is_v3
+            if is_v4
             else raw.get("runtime_advance_plan", []),
             "ScheduleDecision.runtime_advance_plan",
         )
@@ -1927,6 +2043,7 @@ class ScheduleDecision:
             "side_stream_safe",
             "capture_mode",
             "stream",
+            "host_submission",
             "fallback_policy",
             "artifact_key",
             "serial_fallback",
@@ -1963,10 +2080,12 @@ class ScheduleDecision:
         )
         effect_fields = ("kind", "resource")
         binder_stage_fields = ("backend_event", "region_id", "implementation_id")
+        host_command_fields = ("kind", "submission_id", "region_ids")
         runtime_advance_fields = (
             "backend_event",
             "anchor_id",
             "region_ids",
+            "host_commands",
             "backend_region_binder_stages",
             "wait_for_prior_side_work",
             "wait_for_side_outputs",
@@ -2039,7 +2158,7 @@ class ScheduleDecision:
                 allowed=field_names,
             )
 
-        if is_v3:
+        if is_v4:
             require_exact_object(raw, "ScheduleDecision", decision_fields)
             for position, placement in enumerate(
                 _json_array(raw["placements"], "ScheduleDecision.placements")
@@ -2085,7 +2204,7 @@ class ScheduleDecision:
 
         regions = tuple(
             require_exact_object(region, f"ExecutionRegion[{position}]", region_fields)
-            if is_v3
+            if is_v4
             else _require_json_fields(region, f"ExecutionRegion[{position}]", ())
             for position, region in enumerate(region_payloads)
         )
@@ -2096,13 +2215,25 @@ class ScheduleDecision:
                 f"RuntimeAdvancePlan[{position}]",
                 runtime_advance_fields,
             )
-            if is_v3
+            if is_v4
             else _require_json_fields(advance, f"RuntimeAdvancePlan[{position}]", ())
             for position, advance in enumerate(runtime_advance_payloads)
         )
 
-        if is_v3:
+        if is_v4:
             for position, advance in enumerate(runtime_advances):
+                for command_position, command in enumerate(
+                    _json_array(
+                        advance["host_commands"],
+                        f"RuntimeAdvancePlan[{position}].host_commands",
+                    )
+                ):
+                    require_exact_object(
+                        command,
+                        "RuntimeAdvancePlan"
+                        f"[{position}].host_commands[{command_position}]",
+                        host_command_fields,
+                    )
                 for stage_position, stage in enumerate(
                     _json_array(
                         advance["backend_region_binder_stages"],
@@ -2201,12 +2332,12 @@ class ScheduleDecision:
         def region_value(
             region: Mapping[str, object], field_name: str, legacy_default: object
         ) -> object:
-            return region[field_name] if is_v3 else region.get(field_name, legacy_default)
+            return region[field_name] if is_v4 else region.get(field_name, legacy_default)
 
         def nested_value(
             raw_value: Mapping[str, object], field_name: str, legacy_default: object
         ) -> object:
-            return raw_value[field_name] if is_v3 else raw_value.get(field_name, legacy_default)
+            return raw_value[field_name] if is_v4 else raw_value.get(field_name, legacy_default)
 
         def region_array(
             region: Mapping[str, object], field_name: str
@@ -2395,6 +2526,42 @@ class ScheduleDecision:
                 ),
                 anchor_id=_json_string(raw_value["anchor_id"], f"{label}.anchor_id"),
                 region_ids=_json_strings(raw_value["region_ids"], f"{label}.region_ids"),
+                host_commands=tuple(
+                    RuntimeHostCommand(
+                        kind=HostCommandKind(
+                            _json_string(
+                                _require_json_fields(
+                                    command,
+                                    f"{label}.host_commands[{command_position}]",
+                                    host_command_fields,
+                                )["kind"],
+                                f"{label}.host_commands[{command_position}].kind",
+                            )
+                        ),
+                        submission_id=_json_string(
+                            _require_json_fields(
+                                command,
+                                f"{label}.host_commands[{command_position}]",
+                                host_command_fields,
+                            )["submission_id"],
+                            f"{label}.host_commands[{command_position}].submission_id",
+                        ),
+                        region_ids=_json_strings(
+                            _require_json_fields(
+                                command,
+                                f"{label}.host_commands[{command_position}]",
+                                host_command_fields,
+                            )["region_ids"],
+                            f"{label}.host_commands[{command_position}].region_ids",
+                        ),
+                    )
+                    for command_position, command in enumerate(
+                        _json_array(
+                            raw_value["host_commands"],
+                            f"{label}.host_commands",
+                        )
+                    )
+                ),
                 backend_region_binder_stages=tuple(
                     BackendRegionBinderStage(
                         backend_event=BackendObservableEvent(
@@ -2526,6 +2693,16 @@ class ScheduleDecision:
                     region_value(region, "stream", RegionStreamClass.DEFAULT.value),
                     f"{label}.stream",
                 ),
+                host_submission=RegionHostSubmission(
+                    _json_string(
+                        region_value(
+                            region,
+                            "host_submission",
+                            RegionHostSubmission.INLINE.value,
+                        ),
+                        f"{label}.host_submission",
+                    )
+                ),
                 fallback_policy=region_fallback_policy(
                     region_value(
                         region,
@@ -2619,7 +2796,7 @@ class ScheduleDecision:
             ),
             completion_anchor=(
                 _json_string(raw["completion_anchor"], "ScheduleDecision.completion_anchor")
-                if is_v3
+                if is_v4
                 else _json_string(raw.get("completion_anchor", ""), "ScheduleDecision.completion_anchor")
             ),
             materializations=tuple(
@@ -2644,6 +2821,7 @@ __all__ = [
     "CompileOptions",
     "CostBreakdown",
     "ExecutionRegion",
+    "HostCommandKind",
     "HiddenPhase",
     "HiddenLayerKind",
     "HiddenSite",
@@ -2661,6 +2839,7 @@ __all__ = [
     "RegionCaptureMode",
     "RegionStreamClass",
     "RegionFallbackPolicy",
+    "RegionHostSubmission",
     "RegionOutputBinding",
     "RegionOutputKind",
     "RegionPort",
@@ -2669,6 +2848,7 @@ __all__ = [
     "ResidualResourceBinding",
     "ResourceReservation",
     "RuntimeAdvancePlan",
+    "RuntimeHostCommand",
     "ScheduleAffineAccess",
     "ScheduleAffineExpr",
     "ScheduleDecision",

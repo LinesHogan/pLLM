@@ -26,7 +26,7 @@ from tllm.contracts.physical_plan import PhysicalFlowPlan
 from tllm.workload.frontend import WorkloadDeclaration
 from tllm.workload.lowering import lower_schedule_graph
 
-_PERSISTED_COMPILATION_SCHEMA_VERSION = 2
+_PERSISTED_COMPILATION_SCHEMA_VERSION = 3
 
 
 class WorkloadDecisionCacheError(RuntimeError):
@@ -234,7 +234,7 @@ def workload_compilation_cache_key(
     options = effective_compile_options(options)
     payload = "\0".join(
         (
-            "workload-compilation-v3",
+            "workload-compilation-v4",
             graph.to_json(),
             timeline.to_json(),
             options.to_json(),

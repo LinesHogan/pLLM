@@ -67,7 +67,7 @@ CUDA Graph、Recirculation capture/hook-retirement 集成和 shape-miss epoch sw
       ▼
 ScheduleGraph ──► Rust 合法性 + 粒度 + memory planning
       ▼
-已签名 ScheduleDecision v3 ──► ExecutionRegion + RegionCaptureMode
+已签名 ScheduleDecision v4 ──► ExecutionRegion + RegionCaptureMode + HostCommand
       ▼
 PhysicalFlowPlan ──► 每个 Region 一个 artifact/callable，在签名 anchor 提交
 ```

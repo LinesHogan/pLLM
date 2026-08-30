@@ -1602,7 +1602,10 @@ def _optimized_task_definitions(
                         version="1",
                         input_types=("Tensor",),
                         output_types=("None",),
-                        capabilities=("runtime.side_stream_safe",),
+                        capabilities=(
+                            "runtime.async_host_safe",
+                            "runtime.side_stream_safe",
+                        ),
                     ),),
                     domain=Domain("scalar"),
                     accesses=(),
@@ -1725,7 +1728,11 @@ def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
                 ImplementationIR(
                     ImplementationKind.CAPTURED,
                     f"{function.__module__}:{function.__qualname__}@1",
-                    capabilities=("torch.export",),
+                    capabilities=(
+                        ("runtime.async_host_safe", "torch.export")
+                        if entry.is_gradient_task
+                        else ("torch.export",)
+                    ),
                 ),
             )
         task_irs.append(

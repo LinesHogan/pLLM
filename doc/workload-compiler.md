@@ -30,7 +30,7 @@ callables stay in the declaration's executor table and are never serialized.
 - `ScheduleGraph`: auxiliary tasks, typed input/output ports, values, versions,
   dependencies, effects, timing, implementation candidates, and static memory
   requirements.
-- `ScheduleDecision` schema v3: the fine-grained execution order and schedule
+- `ScheduleDecision` schema v4: the fine-grained execution order and schedule
   tree plus authoritative `ExecutionRegion` records, cross-Region
   materializations and lifetimes, memory plan, cross-Region fences, cost
   breakdown, explanations, artifact keys, and signature.

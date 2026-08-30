@@ -12,6 +12,7 @@ import contextlib
 from _thread import LockType
 from collections import Counter, deque
 from collections.abc import Callable, Hashable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from math import isfinite
 from threading import Lock
@@ -87,6 +88,7 @@ from tllm.runtime.scheduling.plan_store import (
 from tllm.runtime.scheduling.workgraph_executor import (
     PhysicalExecutionContext,
     PhysicalExecutor,
+    PhysicalStepResult,
     ShapeSpecializationMiss,
     runtime_stats_from_executor,
 )
@@ -105,11 +107,14 @@ from tllm.schedule.contracts import (
     BackendObservableEvent,
     BackendRegionBinderStage,
     ExecutionRegion,
+    HostCommandKind,
     HiddenLayerKind,
     RegionInputBinding,
     RegionInputKind,
     RegionOutputBinding,
     RegionOutputKind,
+    RegionHostSubmission,
+    RuntimeAdvancePlan,
     ScheduleEffect,
     ScheduleEffectKind,
     ScheduleGraph,
@@ -215,8 +220,8 @@ def lower_signed_materialization_bindings(
     lifetime, producer, or consumer count themselves.
     """
 
-    if decision.schema_version != 3:
-        raise TypeError("decision must be a ScheduleDecision schema v3")
+    if decision.schema_version != 4:
+        raise TypeError("decision must be a ScheduleDecision schema v4")
 
     regions_by_id = {region.region_id: region for region in decision.execution_regions}
     artifacts_by_id: dict[str, RegionCallableArtifact] = {}
@@ -803,6 +808,33 @@ class _NoRegionValueStore:
         return 0
 
 
+@dataclass(frozen=True, slots=True)
+class _NoAsyncHostLane:
+    pass
+
+
+@dataclass(slots=True)
+class _AsyncHostSubmission:
+    submission_id: str
+    step_id: int
+    future: Future[PhysicalStepResult]
+    retire_requested: bool = False
+
+
+class _AsyncHostLane:
+    __slots__ = ("executor", "active")
+
+    def __init__(self) -> None:
+        self.executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="tllm-async-host",
+        )
+        self.active: _AsyncHostSubmission | None = None
+
+
+AsyncHostLane = _NoAsyncHostLane | _AsyncHostLane
+
+
 @dataclass(slots=True)
 class NativeWorkloadExecution:
     """One complete, immutable workload plan bound to process-local handles."""
@@ -822,6 +854,19 @@ class NativeWorkloadExecution:
     _event_wait_after: frozenset[BackendObservableEvent] = frozenset()
     _anchor_wait_before: frozenset[str] = frozenset()
     _anchor_wait_after: frozenset[str] = frozenset()
+    _event_advances: Mapping[
+        BackendObservableEvent, tuple[RuntimeAdvancePlan, ...]
+    ] = field(
+        default_factory=dict[
+            BackendObservableEvent, tuple[RuntimeAdvancePlan, ...]
+        ]
+    )
+    _anchor_advances: Mapping[str, tuple[RuntimeAdvancePlan, ...]] = field(
+        default_factory=dict[str, tuple[RuntimeAdvancePlan, ...]]
+    )
+    _region_nodes: Mapping[str, NodeKey] = field(
+        default_factory=dict[str, NodeKey]
+    )
     _value_store: "_RegionValueStore | _NoRegionValueStore" = field(
         default_factory=_NoRegionValueStore
     )
@@ -855,6 +900,7 @@ class NativeWorkloadExecution:
     _side_streams: tuple[torch.cuda.Stream, ...] = ()
     _side_node_keys: frozenset[NodeKey] = frozenset()
     _side_work_pending: bool = False
+    _async_host: AsyncHostLane = field(default_factory=_NoAsyncHostLane)
     _cost_probe: RegionCostProbe = field(default_factory=RegionCostProbe)
 
     def _join_side_streams_locked(self) -> None:
@@ -995,6 +1041,7 @@ class NativeWorkloadExecution:
         """
 
         with self._execution_lock:
+            self._drain_async_host_locked()
             signed = self.compilation.decision.cost.main_path_extension_ns
             return self._cost_probe.report(
                 signed_main_path_extension_ns=signed, block=block
@@ -1038,16 +1085,32 @@ class NativeWorkloadExecution:
             return
         if self._prepared_step != step:
             raise RuntimeError("cannot retire a native workload step from another epoch")
+        match self._async_host:
+            case _AsyncHostLane(active=submission) if (
+                submission is not None and submission.step_id == step
+            ):
+                submission.retire_requested = True
+            case _AsyncHostLane() | _NoAsyncHostLane():
+                self._retire_step_resources_locked(step)
+        self._prepared_step = -1
+        self._executed_nodes.clear()
+
+    def _retire_step_resources_locked(self, step: int) -> None:
         self.executor.finish_step(step)
         self._value_store.finish_step(step)
         self._cost_probe.harvest()
-        self._prepared_step = -1
-        self._executed_nodes.clear()
 
     def advance_anchor(self, anchor: str) -> bool:
         """Compatibility entry point for an already-signed timeline anchor."""
 
         anchor = str(anchor)
+        advances = self._anchor_advances.get(anchor)
+        if advances is not None:
+            with self._execution_lock:
+                advanced = False
+                for advance in advances:
+                    advanced = self._execute_advance_locked(advance) or advanced
+                return advanced
         nodes = self._anchor_nodes.get(anchor)
         if nodes is None:
             return False
@@ -1062,24 +1125,51 @@ class NativeWorkloadExecution:
     def advance_backend_event(self, backend_event: BackendObservableEvent) -> bool:
         """Advance only the Region nodes signed for one backend event."""
 
-        nodes = self._event_nodes.get(backend_event)
-        if nodes is None:
+        advances = self._event_advances.get(backend_event)
+        if advances is None:
             raise RuntimeError(
                 "backend event "
                 f"{backend_event.value!r} is not signed for this native workload"
             )
         with self._execution_lock:
-            if backend_event in self._event_wait_before:
-                self._join_side_streams_locked()
-            # A signed timeline may expose an observable event that advances no
-            # Region. It is an intentional lifecycle no-op, not an unsigned hook.
-            if not nodes:
-                advanced = False
-            else:
-                advanced = self._advance_nodes_locked(nodes)
-            if backend_event in self._event_wait_after:
-                self._join_side_streams_locked()
+            advanced = False
+            for advance in advances:
+                advanced = self._execute_advance_locked(advance) or advanced
             return advanced
+
+    def _execute_advance_locked(self, advance: RuntimeAdvancePlan) -> bool:
+        advanced = False
+        side_wait_owed = advance.wait_for_prior_side_work
+        for command in advance.host_commands:
+            match command.kind:
+                case HostCommandKind.WAIT_ASYNC:
+                    self._wait_async_host_locked(command.submission_id)
+                case HostCommandKind.EXECUTE_INLINE:
+                    if side_wait_owed:
+                        self._join_side_streams_locked()
+                        side_wait_owed = False
+                    advanced = (
+                        self._advance_nodes_locked(
+                            self._node_keys(command.region_ids)
+                        )
+                        or advanced
+                    )
+                case HostCommandKind.SUBMIT_ASYNC:
+                    advanced = (
+                        self._submit_async_host_locked(
+                            command.submission_id,
+                            self._node_keys(command.region_ids),
+                        )
+                        or advanced
+                    )
+        if side_wait_owed:
+            self._join_side_streams_locked()
+        if advance.wait_for_side_outputs:
+            self._join_side_streams_locked()
+        return advanced
+
+    def _node_keys(self, region_ids: tuple[str, ...]) -> tuple[NodeKey, ...]:
+        return tuple(self._region_nodes[region_id] for region_id in region_ids)
 
     def _advance_nodes_locked(self, nodes: tuple[NodeKey, ...]) -> bool:
         if self._prepared_step < 0:
@@ -1095,13 +1185,96 @@ class NativeWorkloadExecution:
         self._executed_nodes.update(pending)
         return True
 
+    def _submit_async_host_locked(
+        self,
+        submission_id: str,
+        nodes: tuple[NodeKey, ...],
+    ) -> bool:
+        if self._prepared_step < 0:
+            return False
+        pending = tuple(node for node in nodes if node not in self._executed_nodes)
+        if not pending:
+            return False
+        match self._async_host:
+            case _AsyncHostLane(active=None) as lane:
+                main_snapshot: torch.cuda.Event | None = None
+                if self._main_stream is not None and self._side_streams:
+                    main_snapshot = torch.cuda.Event()
+                    main_snapshot.record(self._main_stream)
+                future = lane.executor.submit(
+                    self.executor.execute_nodes,
+                    self._prepared_step,
+                    pending,
+                    main_snapshot=main_snapshot,
+                )
+                lane.active = _AsyncHostSubmission(
+                    submission_id=submission_id,
+                    step_id=self._prepared_step,
+                    future=future,
+                )
+            case _AsyncHostLane():
+                raise RuntimeError(
+                    "async host lane capacity was not released by signed wait_async"
+                )
+            case _NoAsyncHostLane():
+                raise RuntimeError(
+                    "signed submit_async has no bound async host lane"
+                )
+        if any(node in self._side_node_keys for node in pending):
+            self._side_work_pending = True
+        self._executed_nodes.update(pending)
+        return True
+
+    def _wait_async_host_locked(self, submission_id: str) -> None:
+        match self._async_host:
+            case _AsyncHostLane(active=None):
+                return
+            case _AsyncHostLane(active=submission) as lane if (
+                submission is not None
+                and submission.submission_id == submission_id
+            ):
+                try:
+                    submission.future.result()
+                except Exception:
+                    lane.active = None
+                    if submission.retire_requested:
+                        self._retire_step_resources_locked(submission.step_id)
+                    raise
+                lane.active = None
+                self._join_side_streams_locked()
+                if submission.retire_requested:
+                    self._retire_step_resources_locked(submission.step_id)
+            case _AsyncHostLane():
+                raise RuntimeError(
+                    "signed wait_async does not match the active submission"
+                )
+            case _NoAsyncHostLane():
+                raise RuntimeError(
+                    "signed wait_async has no bound async host lane"
+                )
+
+    def _drain_async_host_locked(self) -> None:
+        match self._async_host:
+            case _AsyncHostLane(active=submission) if submission is not None:
+                self._wait_async_host_locked(submission.submission_id)
+            case _AsyncHostLane() | _NoAsyncHostLane():
+                pass
+
     def close(self) -> None:
         with self._execution_lock:
-            self._join_side_streams_locked()
-            if self._main_stream is not None:
-                self._main_stream.synchronize()
-            if self._prepared_step >= 0:
-                self._finish_step_locked(self._prepared_step)
+            try:
+                self._drain_async_host_locked()
+            finally:
+                self._join_side_streams_locked()
+                if self._main_stream is not None:
+                    self._main_stream.synchronize()
+                if self._prepared_step >= 0:
+                    self._finish_step_locked(self._prepared_step)
+                match self._async_host:
+                    case _AsyncHostLane() as lane:
+                        lane.executor.shutdown(wait=True)
+                    case _NoAsyncHostLane():
+                        pass
 
     @property
     def retained_value_count(self) -> int:
@@ -1110,12 +1283,15 @@ class NativeWorkloadExecution:
 
     @property
     def state_versions(self) -> StateVersionRegistry:
-        return self._state_versions
+        with self._execution_lock:
+            self._drain_async_host_locked()
+            return self._state_versions
 
     def state_version_report(self) -> tuple[tuple[str, object, int], ...]:
         """Project observed versions onto the closed JSON control-plane key set."""
 
         with self._execution_lock:
+            self._drain_async_host_locked()
             report: list[tuple[str, object, int]] = []
             for resource, key, version in self._state_versions.observed_versions():
                 if key is not None and (
@@ -1178,6 +1354,7 @@ class NativeWorkloadExecution:
         """
 
         with self._execution_lock:
+            self._drain_async_host_locked()
             result: dict[str, Mapping[str, int | float]] = {}
             for workload_id, reader in self._diagnostics_readers.items():
                 raw = reader()
@@ -1203,6 +1380,7 @@ class NativeWorkloadExecution:
 
     def read_and_reset_stats(self, *, sync: bool = True) -> "TrainingStats":
         with self._execution_lock:
+            self._drain_async_host_locked()
             self._join_side_streams_locked()
             execution_stream = (
                 contextlib.nullcontext()
@@ -1216,6 +1394,7 @@ class NativeWorkloadExecution:
         self, *, sync: bool = True
     ) -> Mapping[int, "TrainingStats"]:
         with self._execution_lock:
+            self._drain_async_host_locked()
             self._join_side_streams_locked()
             execution_stream = (
                 contextlib.nullcontext()
@@ -1236,6 +1415,7 @@ class NativeWorkloadExecution:
 
     def synchronize(self) -> None:
         with self._execution_lock:
+            self._drain_async_host_locked()
             self._join_side_streams_locked()
             execution_stream = (
                 contextlib.nullcontext()
@@ -1249,6 +1429,7 @@ class NativeWorkloadExecution:
 
     def read_workgraph_runtime_stats(self) -> "WorkGraphRuntimeStats":
         with self._execution_lock:
+            self._drain_async_host_locked()
             return runtime_stats_from_executor(self.executor.stats)
 
     def peek_shape_specialization_requests(
@@ -1432,6 +1613,12 @@ class NativeWorkloadExecutionStore:
             seen.add(identity)
             execution.close()
 
+@dataclass(slots=True)
+class _RegionStepFrame:
+    values: dict[str, object] = field(default_factory=dict[str, object])
+    lock: LockType = field(default_factory=Lock)
+
+
 class _RegionValueStore:
     """Step-scoped binding and lifetime owner for Region boundary values."""
 
@@ -1443,8 +1630,8 @@ class _RegionValueStore:
         "_materializations",
         "_state_versions",
         "_lifecycle",
-        "_values",
-        "_step_id",
+        "_frames",
+        "_frames_lock",
     )
 
     def __init__(
@@ -1472,24 +1659,39 @@ class _RegionValueStore:
                 if binding.kind is RegionInputKind.HIDDEN
             }
         )
-        self._values: dict[str, object] = {}
-        self._step_id = -1
+        self._frames: dict[int, _RegionStepFrame] = {}
+        self._frames_lock = Lock()
 
     @property
     def retained_value_count(self) -> int:
-        return sum(value is not SKIPPED for value in self._values.values())
+        with self._frames_lock:
+            frames = tuple(self._frames.values())
+        retained = 0
+        for frame in frames:
+            with frame.lock:
+                retained += sum(
+                    value is not SKIPPED for value in frame.values.values()
+                )
+        return retained
 
     def prepare_step(self, step_id: int) -> None:
-        if self._step_id >= 0 and self._step_id != step_id:
-            raise RuntimeError("Region values from the prior step were not retired")
-        self._step_id = step_id
-        self._values.clear()
+        with self._frames_lock:
+            if step_id in self._frames:
+                raise RuntimeError("Region value frame is already prepared")
+            self._frames[step_id] = _RegionStepFrame()
 
     def finish_step(self, step_id: int) -> None:
-        if self._step_id not in {-1, step_id}:
-            raise RuntimeError("cannot retire Region values for another step")
-        self._values.clear()
-        self._step_id = -1
+        with self._frames_lock:
+            self._frames.pop(step_id, None)
+
+    def _frame(self, step_id: int) -> _RegionStepFrame:
+        with self._frames_lock:
+            try:
+                return self._frames[step_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Region value frame for step {step_id} is not prepared"
+                ) from exc
 
     def execute(
         self,
@@ -1530,41 +1732,45 @@ class _RegionValueStore:
         artifact: "RegionCallableArtifact",
         context: PhysicalExecutionContext,
     ) -> Mapping[str, object]:
-        if self._step_id != context.step_id:
-            raise RuntimeError("Region value store is not prepared for this step")
-        inputs: dict[str, object] = {}
-        for binding in artifact.input_bindings:
-            if binding.kind is RegionInputKind.MATERIALIZED:
-                self._materializations.input_binding_for(
-                    artifact.region_id, binding.binding_id
-                )
-                if binding.binding_id not in self._values:
-                    raise RuntimeError(
-                        f"ExecutionRegion {artifact.region_id!r} has no materialized input {binding.binding_id!r}"
+        frame = self._frame(context.step_id)
+        with frame.lock:
+            inputs: dict[str, object] = {}
+            for binding in artifact.input_bindings:
+                if binding.kind is RegionInputKind.MATERIALIZED:
+                    self._materializations.input_binding_for(
+                        artifact.region_id, binding.binding_id
                     )
-                inputs[binding.binding_id] = self._values[binding.binding_id]
-            elif binding.kind is RegionInputKind.STEP_ID:
-                inputs[binding.binding_id] = context.step_id
-            elif binding.kind in (
-                RegionInputKind.PROVIDED,
-                RegionInputKind.STAGED,
-                RegionInputKind.SAMPLER_REQUEST_IDS,
-                RegionInputKind.SAMPLER_SAMPLE_IDXS,
-                RegionInputKind.SAMPLER_SAMPLE_IDX_TENSOR,
-                RegionInputKind.SAMPLER_LOGITS,
-                RegionInputKind.SAMPLED_TOKENS,
-            ):
-                inputs[binding.binding_id] = self._providers[
-                    binding.source
-                ].read(context.step_id)
-            elif binding.kind is RegionInputKind.HIDDEN:
-                inputs[binding.binding_id] = _hidden_value(
-                    self._runtime,
-                    self._hidden_inputs[binding.binding_id],
-                )
-            else:
-                raise AssertionError(f"unhandled signed Region input kind {binding.kind!r}")
-        return inputs
+                    if binding.binding_id not in frame.values:
+                        raise RuntimeError(
+                            f"ExecutionRegion {artifact.region_id!r} has no materialized input {binding.binding_id!r}"
+                        )
+                    inputs[binding.binding_id] = frame.values[
+                        binding.binding_id
+                    ]
+                elif binding.kind is RegionInputKind.STEP_ID:
+                    inputs[binding.binding_id] = context.step_id
+                elif binding.kind in (
+                    RegionInputKind.PROVIDED,
+                    RegionInputKind.STAGED,
+                    RegionInputKind.SAMPLER_REQUEST_IDS,
+                    RegionInputKind.SAMPLER_SAMPLE_IDXS,
+                    RegionInputKind.SAMPLER_SAMPLE_IDX_TENSOR,
+                    RegionInputKind.SAMPLER_LOGITS,
+                    RegionInputKind.SAMPLED_TOKENS,
+                ):
+                    inputs[binding.binding_id] = self._providers[
+                        binding.source
+                    ].read(context.step_id)
+                elif binding.kind is RegionInputKind.HIDDEN:
+                    inputs[binding.binding_id] = _hidden_value(
+                        self._runtime,
+                        self._hidden_inputs[binding.binding_id],
+                    )
+                else:
+                    raise AssertionError(
+                        f"unhandled signed Region input kind {binding.kind!r}"
+                    )
+            return inputs
 
     def commit_outputs(
         self,
@@ -1572,40 +1778,44 @@ class _RegionValueStore:
         context: PhysicalExecutionContext,
         outputs: Mapping[str, object],
     ) -> None:
-        if self._step_id != context.step_id:
-            raise RuntimeError("Region value store is not prepared for this step")
+        frame = self._frame(context.step_id)
         if set(outputs) != set(artifact.output_keys):
             raise RuntimeError(
                 f"ExecutionRegion {artifact.region_id!r} produced invalid output bindings"
             )
-        for binding in artifact.output_bindings:
-            value = outputs[binding.binding_id]
-            if binding.kind in (
-                RegionOutputKind.SINK,
-                RegionOutputKind.HOST,
-                RegionOutputKind.SAMPLER,
-            ):
-                if value is not SKIPPED:
-                    self._sinks[binding.target].publish(value, context.step_id)
-            elif binding.kind is RegionOutputKind.MATERIALIZED:
-                self._materializations.output_binding_for(
+        with frame.lock:
+            for binding in artifact.output_bindings:
+                value = outputs[binding.binding_id]
+                if binding.kind in (
+                    RegionOutputKind.SINK,
+                    RegionOutputKind.HOST,
+                    RegionOutputKind.SAMPLER,
+                ):
+                    if value is not SKIPPED:
+                        self._sinks[binding.target].publish(
+                            value, context.step_id
+                        )
+                elif binding.kind is RegionOutputKind.MATERIALIZED:
+                    self._materializations.output_binding_for(
+                        artifact.region_id, binding.binding_id
+                    )
+                    frame.values[binding.binding_id] = value
+                else:
+                    raise AssertionError(
+                        f"unhandled signed Region output kind {binding.kind!r}"
+                    )
+
+            for binding in artifact.input_bindings:
+                if binding.kind is not RegionInputKind.MATERIALIZED:
+                    continue
+                self._materializations.input_binding_for(
                     artifact.region_id, binding.binding_id
                 )
-                self._values[binding.binding_id] = value
-            else:
-                raise AssertionError(f"unhandled signed Region output kind {binding.kind!r}")
-
-        for binding in artifact.input_bindings:
-            if binding.kind is not RegionInputKind.MATERIALIZED:
-                continue
-            self._materializations.input_binding_for(
-                artifact.region_id, binding.binding_id
-            )
-            key = binding.binding_id
-            # Each materialization record names exactly one Rust-signed
-            # consumer Region. Release that explicit boundary after its
-            # consumer executes; Python does not derive a liveness count.
-            self._values.pop(key, None)
+                key = binding.binding_id
+                # Each materialization record names exactly one Rust-signed
+                # consumer Region. Release that explicit boundary after its
+                # consumer executes; Python does not derive a liveness count.
+                frame.values.pop(key, None)
 
 
 class _RegionCudaGraph:
@@ -1901,14 +2111,12 @@ def _hidden_value(
     if active > int(hidden.shape[0]):
         raise RuntimeError("native Region decode row count exceeds hidden storage")
     selected = hidden[:active]
-    if torch.is_inference(selected):
-        # vLLM executes the model under inference_mode. A compiled Region that
-        # owns autograd must receive an ordinary tensor at this explicit
-        # backend boundary; cloning inside the compiled callable is too late
-        # because AOTAutograd saves its external inputs first.
-        with torch.inference_mode(False):
-            return selected.clone()
-    return selected
+    # vLLM capture buffers are overwritten in place on the next engine step,
+    # regardless of whether Torch marks their storage as an inference tensor.
+    # Native autograd therefore owns an immutable ordinary-tensor snapshot at
+    # this explicit backend boundary.
+    with torch.inference_mode(False):
+        return selected.clone()
 
 
 def _validate_hidden_resource_bindings(
@@ -2403,10 +2611,16 @@ def _native_workload_execution(
         node_by_region[region.region_id] = node.node_key
 
     event_nodes: dict[BackendObservableEvent, list[NodeKey]] = {}
+    event_advances: dict[
+        BackendObservableEvent, list[RuntimeAdvancePlan]
+    ] = {}
+    anchor_advances: dict[str, list[RuntimeAdvancePlan]] = {}
     for advance in compilation.decision.runtime_advance_plan:
         event_nodes.setdefault(advance.backend_event, []).extend(
             node_by_region[region_id] for region_id in advance.region_ids
         )
+        event_advances.setdefault(advance.backend_event, []).append(advance)
+        anchor_advances.setdefault(advance.anchor_id, []).append(advance)
     event_wait_before = frozenset(
         advance.backend_event
         for advance in compilation.decision.runtime_advance_plan
@@ -2471,6 +2685,26 @@ def _native_workload_execution(
     frozen_event_nodes = MappingProxyType(
         {event: tuple(nodes) for event, nodes in event_nodes.items()}
     )
+    frozen_event_advances = MappingProxyType(
+        {
+            event: tuple(advances)
+            for event, advances in event_advances.items()
+        }
+    )
+    frozen_anchor_advances = MappingProxyType(
+        {
+            anchor: tuple(advances)
+            for anchor, advances in anchor_advances.items()
+        }
+    )
+    async_host: AsyncHostLane = (
+        _AsyncHostLane()
+        if any(
+            region.host_submission is RegionHostSubmission.ASYNC_SERIAL
+            for region in compilation.decision.execution_regions
+        )
+        else _NoAsyncHostLane()
+    )
     return NativeWorkloadExecution(
         compilation=compilation,
         executor=executor,
@@ -2486,6 +2720,9 @@ def _native_workload_execution(
         _event_wait_after=event_wait_after,
         _anchor_wait_before=anchor_wait_before,
         _anchor_wait_after=anchor_wait_after,
+        _event_advances=frozen_event_advances,
+        _anchor_advances=frozen_anchor_advances,
+        _region_nodes=MappingProxyType(dict(node_by_region)),
         _value_store=value_store,
         _state_versions=state_versions,
         _artifact_report=tuple(
@@ -2502,6 +2739,7 @@ def _native_workload_execution(
         _main_stream=main_stream,
         _side_streams=side_streams,
         _side_node_keys=side_node_keys,
+        _async_host=async_host,
         _cost_probe=cost_probe,
     )
 
