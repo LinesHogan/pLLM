@@ -1881,6 +1881,30 @@ class ControlPlaneUnitTest(unittest.TestCase):
             ("request-0",), expected_finished=None
         )
 
+    def test_generate_keeps_active_epoch_while_port_transaction_is_open(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+        runtime._staged_port_transactions["open"] = mock.Mock()
+        plane = mock.Mock()
+        output = (SimpleNamespace(request_id="request-0"),)
+        llm = SimpleNamespace(
+            generate=mock.Mock(return_value=output),
+            llm_engine=SimpleNamespace(add_request=mock.Mock()),
+        )
+        with mock.patch.object(
+            runtime,
+            "apply_pending_worker_shape_specializations",
+            return_value=False,
+        ) as apply_pending:
+            runtime._install_generate_boundary(llm, plane)
+            self.assertEqual(llm.generate("next"), output)
+
+        apply_pending.assert_not_called()
+        plane.finish_workload_requests.assert_called_once_with(
+            ("request-0",), expected_finished=None
+        )
+
     def test_runtime_generate_publishes_exact_prompt_and_sample_indices(self) -> None:
         from tllm.runtime.runtime import TllmRuntime
         from tllm.runtime.state import ResidualRuntimeState

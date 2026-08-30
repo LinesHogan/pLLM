@@ -163,6 +163,23 @@ sample identities when no explicit map is supplied, while parent completion
 retires every child alias and overlay lease. An explicit one-to-one sample map
 is rejected when `SamplingParams.n > 1` instead of being silently reinterpreted.
 
+Native TTRL now closes one host transaction as an atomic staged pair: full
+trace-aligned hidden rows plus a typed majority-reward intent. A signed extern
+prepare task performs explicit row selection and reward-tensor construction;
+the compiled train task receives tensors only, and its conditional optimizer
+does not advance state for an empty trainable set. The post-transition publish
+task emits independent typed reward, retry, update-barrier, and aggregate
+control outputs. Host settlement requires the pair to be consumed and all four
+outputs to agree before acknowledgement. This adds no TTRL lane, priority,
+fusion, partition, or execution-order policy.
+
+The MRv1/MRv2 × in-process/EngineCore-MP eager matrix passed with one loss,
+one update, state version 1, reward oracle `[1, 1, 0]`, one version-pinned
+retry, complete typed-output quorum, and `fallback_count=0`. The smoke executes
+the emitted retry request, but uses a deterministic test verifier and staged
+hidden rows; it is correctness evidence for the native closed-loop contract,
+not a claim that this side reward head is an official policy-GRPO trainer.
+
 ## Part II: Legacy Inventory
 
 | Surface | Permitted role until migrated |
@@ -186,6 +203,16 @@ descriptors. The authoring surface should provide IDE completion, static
 validation, and rename-safe references while lowering to the same stable
 symbol names used by Rust signatures. This ergonomics work must not introduce
 Python-side scheduling choices or weaken deterministic declaration lowering.
+
+## Deferred Typed Port Transport TODO
+
+Replace the MP port wire's dynamic dataclass type-path import and reflective
+reconstruction with a closed, registered typed codec whose schema is fixed at
+the Python–Rust interaction boundary. Workload and runtime Python must receive
+the declared payload type directly; they must not infer classes from strings,
+walk attributes with reflection, or add workload-specific codecs. Preserve
+shared-memory tensor transport, exact transaction identity, and worker-quorum
+validation while making unsupported payload schemas fail at declaration time.
 
 ## Deferred Profiling Support TODO
 

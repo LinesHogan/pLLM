@@ -31,6 +31,8 @@
     "tllm/consumers/inplace_ttt/workload.py",
     "tllm/consumers/override/workload.py",
     "tllm/consumers/reft/workload.py",
+    "tllm/consumers/ttrl/rewards.py",
+    "tllm/consumers/ttrl/verifier.py",
     "tllm/consumers/ttrl/workload.py",
     "tllm/consumers/tlm/workload.py",
     "tllm/consumers/recirculation/workload.py",
@@ -48,10 +50,12 @@
     "test/consumers/fttt/test_fttt_workload_unit.py",
     "test/consumers/override/test_override_workload_unit.py",
     "test/consumers/inplace_ttt/test_inplace_ttt_workload_unit.py",
+    "test/consumers/ttrl/test_ttrl_workload_unit.py",
     "test/gpu/native_fttt_workload_smoke.py",
     "test/gpu/native_inplace_ttt_workload_smoke.py",
     "test/gpu/native_override_workload_smoke.py",
-    "test/gpu/native_recirculation_workload_smoke.py"
+    "test/gpu/native_recirculation_workload_smoke.py",
+    "test/gpu/native_ttrl_workload_smoke.py"
   ],
   "exclude": ["**/__pycache__"],
   "reportMissingImports": true,

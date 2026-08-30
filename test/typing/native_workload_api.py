@@ -13,8 +13,17 @@ from tllm.consumers.recirculation.workload import (
 )
 from tllm.consumers.reft.workload import ReftConfig, ReftParameters, ReftWorkload
 from tllm.consumers.ttrl.rewards import TTRLClosedLoopIntent
-from tllm.consumers.ttrl.workload import TTRLConfig, TTRLWorkload
+from tllm.consumers.ttrl.workload import (
+    TTRLConfig,
+    TTRLTrainingBatch,
+    TTRLTrainingTransaction,
+    TTRLWorkload,
+    stage_ttrl_training,
+)
+from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
+from tllm.runtime.retry_control_runtime import RetryControlBatch
 from tllm.runtime.runtime import TllmRuntime
+from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch
 
 NativeWorkloadSet = (
     DummyWorkload
@@ -59,13 +68,22 @@ def typed_ports(
     intent: TTRLClosedLoopIntent,
 ) -> None:
     hidden = torch.zeros(2, 8)
-    rewards = torch.zeros(2)
-    hidden_sequence: int = runtime.stage(TTRLWorkload.train_hidden, hidden)
-    reward_sequence: int = runtime.stage(TTRLWorkload.train_rewards, rewards)
-    intent_sequence: int = runtime.stage(TTRLWorkload.pending_intent, intent)
+    transaction: TTRLTrainingTransaction[TTRLWorkload] = stage_ttrl_training(
+        runtime,
+        TTRLTrainingBatch(hidden, intent),
+    )
     controls: tuple[TTRLClosedLoopIntent, ...] = runtime.drain(TTRLWorkload.control)
+    rewards: tuple[RewardOutcomeBatch, ...] = runtime.drain(
+        TTRLWorkload.reward_outcomes
+    )
+    retries: tuple[RetryControlBatch, ...] = runtime.drain(
+        TTRLWorkload.retry_controls
+    )
+    barriers: tuple[UpdateBarrierBatch, ...] = runtime.drain(
+        TTRLWorkload.update_barriers
+    )
     active: TTRLWorkload = runtime.local_workload(workload)
-    del hidden_sequence, reward_sequence, intent_sequence, controls, active
+    del transaction, controls, rewards, retries, barriers, active
 
 
 def typed_publication(

@@ -614,6 +614,12 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         """Retire a consumed receipt after typed host-service settlement."""
 
         staged = self._staged_transaction_record(receipt)
+        if staged.phase is _StagedPortTransactionPhase.OPEN:
+            resolution = self.resolve_staged_transaction(receipt)
+            if resolution is not StagedPortTransactionResolution.CONSUMED:
+                raise RuntimeError(
+                    "staged port transaction was not consumed"
+                )
         if staged.phase is not _StagedPortTransactionPhase.CONSUMED:
             raise RuntimeError(
                 "staged port transaction must resolve consumed before settlement"
@@ -669,6 +675,18 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             )
             raise
         self._staged_port_transactions.pop(receipt.transaction)
+
+    def cancel_staged_transaction(
+        self,
+        receipt: StagedPortTransactionReceipt[StagedT, SecondStagedT],
+    ) -> None:
+        """Cancel one still-pending typed staged transaction."""
+
+        resolution = self.resolve_staged_transaction(receipt)
+        if resolution is not StagedPortTransactionResolution.CANCELLED:
+            raise RuntimeError(
+                "staged port transaction was consumed before cancellation"
+            )
 
     def drain(self, port: "HostOutput[HostOutputT]") -> tuple[HostOutputT, ...]:
         """Drain typed outputs published by signed workload tasks."""
@@ -1702,7 +1720,8 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             # before another caller observes the parent-only next epoch.
             with self._shape_specialization_poll_lock:
                 self._require_workload_live()
-                self.apply_pending_worker_shape_specializations(plane)
+                if not self._staged_port_transactions:
+                    self.apply_pending_worker_shape_specializations(plane)
                 self._require_workload_live()
 
         def after_generate(outputs: Sequence[RequestOutput]) -> None:

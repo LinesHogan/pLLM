@@ -9,8 +9,8 @@ from typing import Protocol
 from tllm.consumers._common.alignment import normalize_answer_text
 
 
-_MISSING_BOXED_ANSWER = "missing-boxed-answer"
-_TTRL_DEFAULT_VERIFIER_JUDGE = "boxed_normalized_exact"
+MISSING_BOXED_ANSWER = "missing-boxed-answer"
+TTRL_DEFAULT_VERIFIER_JUDGE = "boxed_normalized_exact"
 
 
 class TTRLVerifier(Protocol):
@@ -29,8 +29,8 @@ class TTRLVerifier(Protocol):
 class BoxedNormalizedVerifier:
     """Dependency-light verifier for exact matches on normalized boxed answers."""
 
-    judge_name: str = _TTRL_DEFAULT_VERIFIER_JUDGE
-    missing_reason: str = _MISSING_BOXED_ANSWER
+    judge_name: str = TTRL_DEFAULT_VERIFIER_JUDGE
+    missing_reason: str = MISSING_BOXED_ANSWER
 
     def label_for_completion(self, completion: str) -> str:
         return _extract_boxed_answer_label(completion)
@@ -63,10 +63,6 @@ def _extract_boxed_answer_label(text: str) -> str:
     if not answer:
         return ""
     return normalize_answer_text(answer)
-
-
-def _default_ttrl_verifier() -> TTRLVerifier:
-    return BoxedNormalizedVerifier()
 
 
 DEFAULT_TTRL_VERIFIER: TTRLVerifier = BoxedNormalizedVerifier()
