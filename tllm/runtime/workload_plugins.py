@@ -233,7 +233,7 @@ def reconstruct_worker_bindings(
         StateVersionBinding,
         WorkloadExecutionBindings,
     )
-    from tllm.workload import declare_workload
+    from tllm.workload import StateScope, declare_workload
     from tllm.workload.lowering import lower_schedule_graph
 
     if not specs:
@@ -261,19 +261,32 @@ def reconstruct_worker_bindings(
     reconstructed: list[WorkloadRuntimeBinding] = []
     for spec in specs:
         reconstructed.append(_resolve_factory(spec.factory)(spec.config))
+    declarations = tuple(
+        declare_workload(item.owner) for item in reconstructed
+    )
+    # Replica state advertises a snapshot before specialization, but a pure
+    # request-state workload cannot: its typed service (and therefore its
+    # snapshots) is created by cold specialization itself.  Use the already
+    # reconstructed declaration to recognize that generic capability rather
+    # than teaching this worker path about any individual workload.
     cold_specializers = tuple(
         services.cold_specialize
-        for item in reconstructed
+        for declaration, item in zip(declarations, reconstructed, strict=True)
         if isinstance(services := item.services, LocalRuntimeServices)
-        and (item.states.snapshots or item.backend.binders)
+        and (
+            item.states.snapshots
+            or item.request_state_services
+            or item.backend.binders
+            or any(
+                state.scope is StateScope.REQUEST
+                for state in declaration.ir.states
+            )
+        )
     )
     if cold_specializers and specialization is None:
         raise RuntimeError(
             "native worker reconstruction requires cold specialization facts"
         )
-    declarations = tuple(
-        declare_workload(item.owner) for item in reconstructed
-    )
     expected_graph = lower_schedule_graph(
         tuple(declaration.ir for declaration in declarations),
         persistent_state_bytes=compilation.graph.persistent_state_bytes,
@@ -332,6 +345,14 @@ def reconstruct_worker_bindings(
     if specialization is not None:
         for specialize in cold_specializers:
             specialize(specialization)
+        # A request-state service is allocated by cold specialization, so its
+        # pre-specialization binding cannot carry the service itself. Refresh
+        # every owner binding only after the signed graph/facts gates above
+        # have accepted the reconstruction; this is still local resource
+        # binding, never a compiler decision.
+        reconstructed = [
+            item.owner.native_workload_resources() for item in reconstructed
+        ]
 
     def merge_inputs() -> dict[str, RuntimeInputBinding[object]]:
         merged: dict[str, RuntimeInputBinding[object]] = {}

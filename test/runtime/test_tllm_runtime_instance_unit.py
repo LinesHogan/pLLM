@@ -52,6 +52,7 @@ class TllmRuntimeUnitTest(unittest.TestCase):
             TllmRuntime(workloads=(_Consumer("workload"),))
 
     def test_declared_pure_workload_is_admitted_for_native_region_binding(self) -> None:
+        from tllm.runtime.vllm_adapter import EngineCoreTopology
         from tllm.workload import Before, task, workload
 
         @workload(id="no.adapter")
@@ -66,6 +67,9 @@ class TllmRuntimeUnitTest(unittest.TestCase):
             "tllm.runtime.residual_runtime.make_llm", return_value=llm
         ) as make_llm, mock.patch(
             "tllm.runtime.mp.control.ControlPlane.try_bind", return_value=None
+        ), mock.patch(
+            "tllm.runtime.runtime.engine_core_topology",
+            return_value=EngineCoreTopology.INPROCESS,
         ):
             result = runtime.make_llm(model_name="model")
         self.assertIs(result, llm)
@@ -175,23 +179,36 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         self.assertEqual(refresh.call_count, 2)
 
     def test_bind_engine_runners_installs_active_control_plane(self) -> None:
+        from tllm.runtime.vllm_adapter import EngineCoreTopology
+
         runtime = TllmRuntime()
         plane = mock.Mock()
-        with mock.patch("tllm.runtime.mp.control.ControlPlane.try_bind", return_value=plane), mock.patch(
-            "tllm.runtime.mp.control.set_active_control_plane"
-        ) as set_active:
+        with (
+            mock.patch(
+                "tllm.runtime.runtime.engine_core_topology",
+                return_value=EngineCoreTopology.MULTIPROCESS,
+            ),
+            mock.patch(
+                "tllm.runtime.mp.control.ControlPlane.try_bind", return_value=plane
+            ),
+            mock.patch("tllm.runtime.mp.control.set_active_control_plane") as set_active,
+        ):
             runtime._bind_engine_runners(object())
         plane.call.assert_called_once_with("tllm_bind_runner_runtime")
         set_active.assert_called_once_with(plane)
 
     def test_bind_engine_runners_installs_inprocess_generate_boundary(self) -> None:
-        from tllm.runtime.vllm_adapter import InprocessRunner
+        from tllm.runtime.vllm_adapter import EngineCoreTopology, InprocessRunner
 
         runtime = TllmRuntime()
         llm = object()
         with (
             mock.patch(
                 "tllm.runtime.mp.control.ControlPlane.try_bind", return_value=None
+            ),
+            mock.patch(
+                "tllm.runtime.runtime.engine_core_topology",
+                return_value=EngineCoreTopology.INPROCESS,
             ),
             mock.patch(
                 "tllm.runtime.runtime.bind_inprocess_runner",

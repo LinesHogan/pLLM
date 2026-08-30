@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import re
 from types import TracebackType
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
 import torch
 from torch.nn import functional as F
@@ -47,6 +47,7 @@ from tllm.workload import (
     TrainableState,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     extern_io,
     host_output,
@@ -73,14 +74,14 @@ _FTTT_LEARNING_RATE = ConfigField.floating(1e-3, NumericConstraint.POSITIVE)
 
 
 class FTTTConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _FTTT_ENABLED)
+    enabled: bool = declared_config_field(_FTTT_ENABLED)
     hidden_size: int = config_field(
         default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     rank: int = config_field(
         default=16, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
-    learning_rate: float = cast(float, _FTTT_LEARNING_RATE)
+    learning_rate: float = declared_config_field(_FTTT_LEARNING_RATE)
     max_queue_size: int = config_field(
         default=128, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )

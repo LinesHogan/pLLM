@@ -26,11 +26,22 @@ workload = build_esamp_workload(ESampConsumerConfig(implementation="native"))
 runtime = TllmRuntime(workloads=(workload,))
 ```
 
-`"native"` rejects legacy-only per-request/model-bank modes, compact capture
-lanes, row selection, and non-`post_filter_exact` samplers. The model-backed
-native piecewise CUDA Graph path remains unverified and incomplete; the native
-ESamp verification is eager correctness only. Program and legacy remain
-migration/benchmark paths, not evidence of native workload throughput.
+`"native"` supports both replica state and eager request-scoped state through
+`per_request_models=True`. Request state is keyed by the stable parent request
+ID, so parallel `SamplingParams(n=...)` children share one slot, loss,
+optimizer update, and version transition. The first request-state tranche does
+not yet support sampler intervention, `first_per_prompt` row selection, model
+bank state, or disabling the output layer norm; those combinations fail at
+construction. Compact capture lanes and non-`post_filter_exact` samplers also
+remain legacy-only.
+
+The request-scoped path passed MRv1/MRv2 × in-process/EngineCore-MP eager GPU
+correctness with two parents, two children per parent, and two decode updates:
+every cell reported four losses and four updates, retired two parent slots at
+version 2, cleared live slots and request mappings, and kept fallback/replay at
+zero. Its signed request-state Regions are explicitly capture-ineligible, so
+this is not CUDA Graph or throughput evidence. Program and legacy remain
+migration/benchmark paths until the complete deletion gate passes.
 
 ## Key config knobs (`ESampConsumerConfig`)
 

@@ -19,7 +19,7 @@ from tllm.consumers.dummy.workload import DummyWorkload
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.contracts.consumer_stats import TrainingStats, merge_training_stats_maps
-from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.mp.control import (
@@ -35,6 +35,7 @@ from tllm.runtime.mp.worker_extension import (
     _runner_specialization_facts,
     _to_plain,
 )
+from tllm.runtime.request_trainable_state import RequestStateKey, StateSlotRef
 from tllm.runtime.workload_plugins import (
     NativeWorkload,
     NoWorkloadRuntimeBinding,
@@ -187,7 +188,13 @@ class _RequestFinishWorker:
         self.finished = finished
 
     def tllm_ping(self) -> dict[str, object]:
-        return {"worker_id": self.worker_id}
+        return {
+            "pid": 1,
+            "worker_id": self.worker_id,
+            "patch_installed": True,
+            "consumer": None,
+            "mapping_size": 0,
+        }
 
     def _identities(self) -> tuple[RequestIdentity, ...]:
         return tuple(
@@ -862,6 +869,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(statuses[0]["state_versions"], [])
+            self.assertEqual(statuses[0]["request_state_versions"], [])
         finally:
             current = residual_runtime.RUNTIME.workload_execution
             if current is not None and current is not saved_execution:
@@ -2636,10 +2644,87 @@ class ControlPlaneUnitTest(unittest.TestCase):
             "plan_epoch": 1,
             "artifacts": [],
             "state_versions": [],
+            "request_state_versions": [],
+            "request_state_retirements": [],
             "diagnostics": {"dummy": {"count": float("nan")}},
         }
         with self.assertRaisesRegex(ValueError, "finite"):
             ControlPlane(llm).workload_status()
+
+    def test_workload_status_decodes_typed_request_state_versions(self) -> None:
+        llm = _FakeLLM()
+        llm.llm_engine.engine_core.handler.tllm_workload_status = lambda: {
+            "pid": os.getpid(),
+            "signature": "a" * 64,
+            "plan_epoch": 1,
+            "artifacts": [],
+            "state_versions": [],
+            "request_state_versions": [
+                {
+                    "resource": "weights",
+                    "key": {
+                        "fields": ["request_id", "prompt_idx", "sample_idx"],
+                        "request_id": "request-a",
+                        "prompt_idx": 2,
+                        "sample_idx": 3,
+                    },
+                    "slot": {"slot_id": 4, "generation": 5},
+                    "version": 6,
+                }
+            ],
+            "request_state_retirements": [
+                {
+                    "resource": "weights",
+                    "key": {
+                        "fields": ["request_id", "prompt_idx", "sample_idx"],
+                        "request_id": "request-a",
+                        "prompt_idx": 2,
+                        "sample_idx": 3,
+                    },
+                    "slot": {"slot_id": 4, "generation": 5},
+                    "before_version": 6,
+                    "after_version": 6,
+                }
+            ],
+            "diagnostics": {},
+        }
+
+        (status,) = ControlPlane(llm).workload_status()
+
+        self.assertEqual(
+            status["request_state_versions"][0].key,
+            RequestStateKey(
+                fields=(
+                    RequestKeyField.REQUEST_ID,
+                    RequestKeyField.PROMPT_IDX,
+                    RequestKeyField.SAMPLE_IDX,
+                ),
+                request_id="request-a",
+                prompt_idx=2,
+                sample_idx=3,
+            ),
+        )
+        self.assertEqual(
+            status["request_state_versions"][0].slot,
+            StateSlotRef(slot_id=4, generation=5),
+        )
+        self.assertEqual(status["request_state_versions"][0].resource, "weights")
+        self.assertEqual(status["request_state_versions"][0].version, 6)
+        self.assertEqual(
+            status["request_state_retirements"][0].key,
+            status["request_state_versions"][0].key,
+        )
+        self.assertEqual(
+            status["request_state_retirements"][0].slot,
+            status["request_state_versions"][0].slot,
+        )
+        self.assertEqual(
+            (
+                status["request_state_retirements"][0].before_version,
+                status["request_state_retirements"][0].after_version,
+            ),
+            (6, 6),
+        )
 
     def test_failed_native_install_clears_pending_state_and_partial_bindings(self) -> None:
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver

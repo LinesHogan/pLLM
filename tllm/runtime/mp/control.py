@@ -22,7 +22,11 @@ from tllm.contracts.consumer_stats import (
     TrainingStats,
     training_stats_map_from_wire,
 )
-from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.request_identity import (
+    RequestIdentity,
+    RequestKeyField,
+)
+from tllm.runtime.request_trainable_state import RequestStateKey, StateSlotRef
 from tllm.runtime.stats import DistillerTimingStats, PathHotspotStats, PlacementStats
 from tllm.runtime.request_lifecycle import new_request_finish_id
 from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
@@ -44,12 +48,43 @@ class WorkerStateVersionStatus(TypedDict):
     version: int
 
 
+class WorkerPingStatus(TypedDict):
+    """Closed provenance reply shared by in-process and MP workers."""
+
+    pid: int
+    worker_id: str
+    patch_installed: bool
+    consumer: str | None
+    mapping_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRequestStateVersionStatus:
+    resource: str
+    key: RequestStateKey
+    slot: StateSlotRef
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRequestStateRetirementStatus:
+    """One immutable request-slot receipt retained after lifecycle cleanup."""
+
+    resource: str
+    key: RequestStateKey
+    slot: StateSlotRef
+    before_version: int
+    after_version: int
+
+
 class WorkerWorkloadStatus(TypedDict):
     pid: int
     signature: str
     plan_epoch: int
     artifacts: list[WorkerArtifactStatus]
     state_versions: list[WorkerStateVersionStatus]
+    request_state_versions: list[WorkerRequestStateVersionStatus]
+    request_state_retirements: list[WorkerRequestStateRetirementStatus]
     diagnostics: dict[str, dict[str, int | float]]
 
 
@@ -192,11 +227,23 @@ _SHAPE_SPECIALIZATION_REPLY_FIELDS = frozenset(
 _SHAPE_SPECIALIZATION_ACK_REPLY_FIELDS = frozenset(
     {"signature", "plan_epoch", "acknowledged"}
 )
+_PING_REPLY_FIELDS = frozenset(
+    {"pid", "worker_id", "patch_installed", "consumer", "mapping_size"}
+)
 _WORKLOAD_ACTIVATION_REPLY_FIELDS = frozenset(
     {"signature", "plan_epoch", "activated"}
 )
 _WORKLOAD_STATUS_REPLY_FIELDS = frozenset(
-    {"pid", "signature", "plan_epoch", "artifacts", "state_versions", "diagnostics"}
+    {
+        "pid",
+        "signature",
+        "plan_epoch",
+        "artifacts",
+        "state_versions",
+        "request_state_versions",
+        "request_state_retirements",
+        "diagnostics",
+    }
 )
 _WORKLOAD_INSTALL_REPLY_FIELDS = frozenset(
     {"signature", "plan_epoch", "artifacts", "native", "committed"}
@@ -262,6 +309,83 @@ def _exact_wire_object(
     return wire
 
 
+def _request_state_resource_from_wire(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{label} resource must be a non-empty string")
+    return value
+
+
+def _request_state_key_from_wire(value: object, label: str) -> RequestStateKey:
+    fields = _exact_wire_object(
+        value,
+        f"{label} key",
+        frozenset({"fields", "request_id", "prompt_idx", "sample_idx"}),
+    )
+    raw_key_fields = fields["fields"]
+    if type(raw_key_fields) is not list or not raw_key_fields:
+        raise TypeError(f"{label} key fields must be a non-empty JSON array")
+    projected_fields: list[RequestKeyField] = []
+    for raw_field in raw_key_fields:
+        if type(raw_field) is not str:
+            raise TypeError(f"{label} key fields must be strings")
+        try:
+            projected_fields.append(RequestKeyField(raw_field))
+        except ValueError as error:
+            raise ValueError(f"{label} key field is not recognized") from error
+    if len(projected_fields) != len(set(projected_fields)):
+        raise ValueError(f"{label} key fields contain duplicates")
+    request_id = fields["request_id"]
+    prompt_idx = fields["prompt_idx"]
+    sample_idx = fields["sample_idx"]
+    if type(request_id) is not str:
+        raise TypeError(f"{label} request_id must be a string")
+    if type(prompt_idx) is not int or type(sample_idx) is not int:
+        raise TypeError(f"{label} prompt/sample indexes must be integers")
+    key = RequestStateKey.project(
+        RequestIdentity(request_id, prompt_idx, sample_idx),
+        tuple(projected_fields),
+    )
+    if (
+        key.request_id != request_id
+        or key.prompt_idx != prompt_idx
+        or key.sample_idx != sample_idx
+    ):
+        raise ValueError(f"{label} key projection is not canonical")
+    return key
+
+
+def _request_state_slot_from_wire(value: object, label: str) -> StateSlotRef:
+    fields = _exact_wire_object(
+        value, f"{label} slot", frozenset({"slot_id", "generation"})
+    )
+    return StateSlotRef(
+        slot_id=_nonnegative_wire_int(fields["slot_id"], f"{label} slot_id"),
+        generation=_positive_wire_int(fields["generation"], f"{label} generation"),
+    )
+
+
+def _worker_ping_from_wire(payload: object) -> WorkerPingStatus:
+    fields = _exact_wire_object(payload, "worker ping reply", _PING_REPLY_FIELDS)
+    worker_id = fields["worker_id"]
+    patch_installed = fields["patch_installed"]
+    consumer = fields["consumer"]
+    if type(worker_id) is not str or not worker_id:
+        raise TypeError("worker ping reply.worker_id must be a non-empty string")
+    if type(patch_installed) is not bool:
+        raise TypeError("worker ping reply.patch_installed must be a boolean")
+    if consumer is not None and type(consumer) is not str:
+        raise TypeError("worker ping reply.consumer must be a string or null")
+    return {
+        "pid": _positive_wire_int(fields["pid"], "worker ping reply.pid"),
+        "worker_id": worker_id,
+        "patch_installed": patch_installed,
+        "consumer": consumer,
+        "mapping_size": _nonnegative_wire_int(
+            fields["mapping_size"], "worker ping reply.mapping_size"
+        ),
+    }
+
+
 def _workload_status_from_wire(payload: object) -> WorkerWorkloadStatus:
     """Validate the closed, observational worker-status wire contract."""
 
@@ -317,6 +441,78 @@ def _workload_status_from_wire(payload: object) -> WorkerWorkloadStatus:
         version = _nonnegative_wire_int(entry["version"], "status state-version version")
         state_versions.append({"resource": resource, "key": key, "version": version})
 
+    raw_request_versions = fields["request_state_versions"]
+    if type(raw_request_versions) is not list:
+        raise TypeError("status.request_state_versions must be a JSON array")
+    request_state_versions: list[WorkerRequestStateVersionStatus] = []
+    for raw in raw_request_versions:
+        entry = _exact_wire_object(
+            raw,
+            "status request-state version",
+            frozenset({"resource", "key", "slot", "version"}),
+        )
+        resource = _request_state_resource_from_wire(
+            entry["resource"], "status request-state version"
+        )
+        key = _request_state_key_from_wire(entry["key"], "status request-state version")
+        slot = _request_state_slot_from_wire(
+            entry["slot"], "status request-state version"
+        )
+        version = _nonnegative_wire_int(
+            entry["version"], "status request-state version"
+        )
+        request_state_versions.append(
+            WorkerRequestStateVersionStatus(resource, key, slot, version)
+        )
+
+    raw_request_retirements = fields["request_state_retirements"]
+    if type(raw_request_retirements) is not list:
+        raise TypeError("status.request_state_retirements must be a JSON array")
+    request_state_retirements: list[WorkerRequestStateRetirementStatus] = []
+    seen_retirements: set[tuple[str, RequestStateKey, StateSlotRef]] = set()
+    for raw in raw_request_retirements:
+        entry = _exact_wire_object(
+            raw,
+            "status request-state retirement",
+            frozenset(
+                {
+                    "resource",
+                    "key",
+                    "slot",
+                    "before_version",
+                    "after_version",
+                }
+            ),
+        )
+        resource = _request_state_resource_from_wire(
+            entry["resource"], "status request-state retirement"
+        )
+        key = _request_state_key_from_wire(
+            entry["key"], "status request-state retirement"
+        )
+        slot = _request_state_slot_from_wire(
+            entry["slot"], "status request-state retirement"
+        )
+        before_version = _nonnegative_wire_int(
+            entry["before_version"], "status request-state retirement before_version"
+        )
+        after_version = _nonnegative_wire_int(
+            entry["after_version"], "status request-state retirement after_version"
+        )
+        if before_version != after_version:
+            raise ValueError(
+                "request-state retirement must preserve the final slot version"
+            )
+        identity = (resource, key, slot)
+        if identity in seen_retirements:
+            raise ValueError("status.request_state_retirements contains duplicates")
+        seen_retirements.add(identity)
+        request_state_retirements.append(
+            WorkerRequestStateRetirementStatus(
+                resource, key, slot, before_version, after_version
+            )
+        )
+
     raw_diagnostics = fields["diagnostics"]
     if type(raw_diagnostics) is not dict:
         raise TypeError("status.diagnostics must be a JSON object")
@@ -342,6 +538,8 @@ def _workload_status_from_wire(payload: object) -> WorkerWorkloadStatus:
         "plan_epoch": plan_epoch,
         "artifacts": artifacts,
         "state_versions": state_versions,
+        "request_state_versions": request_state_versions,
+        "request_state_retirements": request_state_retirements,
         "diagnostics": diagnostics,
     }
 
@@ -697,8 +895,11 @@ class ControlPlane:
             raise ValueError("control plane requires an LLM with llm_engine") from exc
         return list(core_client.collective_rpc(str(method), timeout=timeout, args=tuple(args)))
 
-    def ping(self, *, timeout: float | None = None) -> list[dict[str, Any]]:
-        return [dict(entry) for entry in self.call("tllm_ping", timeout=timeout)]
+    def ping(self, *, timeout: float | None = None) -> list[WorkerPingStatus]:
+        return [
+            _worker_ping_from_wire(entry)
+            for entry in self.call("tllm_ping", timeout=timeout)
+        ]
 
     def push_request_mapping(
         self,
@@ -739,10 +940,7 @@ class ControlPlane:
             raise RuntimeError("control plane has no live worker quorum")
         worker_ids: list[str] = []
         for reply in replies:
-            worker_id = reply.get("worker_id")
-            if type(worker_id) is not str or not worker_id:
-                raise TypeError("worker ping reply has no stable worker_id")
-            worker_ids.append(worker_id)
+            worker_ids.append(reply["worker_id"])
         if len(worker_ids) != len(set(worker_ids)):
             raise RuntimeError("worker ping quorum contains duplicate worker identities")
         return WorkerPortQuorum(frozenset(worker_ids))

@@ -15,6 +15,7 @@ from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.request_trainable_state import (
+    RequestStateLossBatch,
     RequestStateRuntimeService,
     RequestTrainableStateStore,
 )
@@ -222,11 +223,28 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
     @property
     def state_version(self) -> int:
-        states = type(self)._states()
-        match states:
-            case (State() as state,):
-                return self.state_version_for(state)
-            case _:
+        match self._lifecycle:
+            case _Specialized(versions=versions) if len(versions) == 1:
+                return next(iter(versions.values()))
+            case _Specialized():
+                raise RuntimeError(f"{type(self).__name__} has no single State")
+            case _Unspecialized():
+                active_state_names = {
+                    effect.state
+                    for task in declare_workload(self).ir.tasks
+                    for effect in task.effects
+                    if effect.kind is not EffectKind.EXTERN_IO
+                }
+                active_replica_states = tuple(
+                    state
+                    for state in type(self)._states()
+                    if (
+                        state.scope is not StateScope.REQUEST
+                        and state.name in active_state_names
+                    )
+                )
+                if len(active_replica_states) == 1:
+                    return 0
                 raise RuntimeError(f"{type(self).__name__} has no single State")
 
     def state_version_for(self, state: State[StateValueT]) -> int:
@@ -271,7 +289,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         request_state_services: dict[
             str, RequestStateRuntimeService[torch.nn.Module]
         ] = {}
-        active_request_states = {
+        active_state_names = {
             effect.state
             for task in declare_workload(self).ir.tasks
             for effect in task.effects
@@ -279,11 +297,10 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         }
         with torch.inference_mode(False), torch.enable_grad():
             for state in type(self)._states():
+                if state.name not in active_state_names:
+                    continue
                 match state:
                     case RequestTrainableState(optimizer=optimizer, key=key):
-                        if state.name not in active_request_states:
-                            continue
-
                         def module_factory() -> torch.nn.Module:
                             return state.initializer(self, spec)
 
@@ -333,7 +350,10 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             versions={
                 state.name: 0
                 for state in type(self)._states()
-                if state.scope is not StateScope.REQUEST
+                if (
+                    state.scope is not StateScope.REQUEST
+                    and state.name in active_state_names
+                )
             },
             request_state_services=request_state_services,
         )
@@ -344,6 +364,20 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     ) -> None:
         self.execute_optimizer_device_step(state.name, loss)
         self.commit_optimizer_transition(state.name, loss)
+
+    def optimize_request_state(
+        self,
+        state: RequestTrainableState[StateValueT],
+        batch: RequestStateLossBatch,
+    ) -> None:
+        """Apply a closed per-lease loss batch through its declared service."""
+
+        service = self.request_state_value(state)
+        if batch.selection.resource != service.resource:
+            raise ValueError("request state loss batch belongs to another state")
+        service.optimize(batch.selection, batch.losses)
+        for loss in batch.losses:
+            self._accounting.record(loss)
 
     def execute_optimizer_device_step(
         self, state_name: str, loss: torch.Tensor

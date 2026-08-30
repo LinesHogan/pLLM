@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 from torch.nn import functional as F
@@ -33,6 +33,7 @@ from tllm.workload import (
     StagedPort,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     extern_io,
     host_output,
@@ -61,12 +62,12 @@ _RuntimeWorkloadT = TypeVar("_RuntimeWorkloadT")
 
 class TTRLConfig(WorkloadConfig):
     consumer_id: str = config_field(default="ttrl", kind=ConfigKind.STR)
-    enabled: bool = cast(bool, _TTRL_ENABLED)
+    enabled: bool = declared_config_field(_TTRL_ENABLED)
     hidden_size: int = config_field(
         default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
     rank: int = config_field(default=16, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE)
-    learning_rate: float = cast(float, _TTRL_LEARNING_RATE)
+    learning_rate: float = declared_config_field(_TTRL_LEARNING_RATE)
 
 
 class TTRLRewardHead(torch.nn.Module):

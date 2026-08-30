@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import torch
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.kit.workload import Workload
@@ -15,6 +13,7 @@ from tllm.workload import (
     State,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     workload,
 )
 
@@ -23,7 +22,7 @@ _REFT_ENABLED = ConfigField.boolean(True)
 
 
 class ReftConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _REFT_ENABLED)
+    enabled: bool = declared_config_field(_REFT_ENABLED)
     layers: tuple[int, ...] = config_field(default=(15,), kind=ConfigKind.INT_TUPLE)
     rank: int = config_field(default=4, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE)
     first_tokens: int = config_field(

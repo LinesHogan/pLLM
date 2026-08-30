@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import unittest
-from typing import cast
 
 import torch
 
+from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
 from tllm.kit.workload import Workload
 from tllm.runtime.request_trainable_state import (
     RequestStateRuntimeService,
     RequestStateSelectionBatch,
 )
+from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
-from tllm.runtime.workload_bindings import LocalRuntimeServices
+from tllm.runtime.workload_bindings import (
+    LocalRuntimeServices,
+    NoWorkerBinding,
+    WorkerRuntimeBinding,
+)
+from tllm.runtime.workload_plugins import reconstruct_worker_bindings
 from tllm.workload import (
     AdamWSpec,
     ConfigField,
@@ -21,6 +27,7 @@ from tllm.workload import (
     RequestTrainableState,
     State,
     WorkloadConfig,
+    declared_config_field,
     read,
     request_key,
     task,
@@ -32,7 +39,7 @@ _REQUEST_ENABLED = ConfigField.boolean(True)
 
 
 class _RequestConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _REQUEST_ENABLED)
+    enabled: bool = declared_config_field(_REQUEST_ENABLED)
 
 
 @workload(
@@ -117,6 +124,42 @@ class RequestTrainableStateAuthorUnitTest(unittest.TestCase):
 
         self.assertEqual(state.request_key, (RequestKeyField.REQUEST_ID,))
         self.assertEqual(state.storage.value, "dynamic")
+
+    def test_worker_reconstruction_cold_specializes_request_only_service(self) -> None:
+        """A request-only workload has no pre-specialization State snapshot."""
+
+        workload_instance = _RequestTrainableWorkload(_RequestConfig())
+        runtime = TllmRuntime(
+            workloads=(workload_instance,), workload_memory_budget_bytes=1 << 20
+        )
+        specialization = RuntimeSpecializationSpec(
+            rows=2,
+            hidden_size=4,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        runtime.cold_specialize_workloads(specialization)
+        compilation = runtime.compile_workloads(
+            V027MRv2Driver().export_main_workload_timeline(
+                graph_mode="eager", static_headroom_bytes=1 << 20
+            )
+        )
+        worker = workload_instance.native_workload_resources().worker
+        match worker:
+            case WorkerRuntimeBinding(spec=worker_spec):
+                pass
+            case NoWorkerBinding():
+                self.fail("request-only workload omitted its worker spec")
+
+        bindings = reconstruct_worker_bindings(
+            compilation, (worker_spec,), specialization=specialization
+        )
+
+        self.assertEqual(bindings.state_versions, {})
+        self.assertEqual(set(bindings.request_state_services), {"distiller"})
+        service = bindings.request_state_services["distiller"]
+        self.assertEqual(service.capacity, 2)
+        self.assertEqual(service.epoch, 1)
 
 
 if __name__ == "__main__":

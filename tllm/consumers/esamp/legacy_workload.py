@@ -43,8 +43,6 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             unsupported.append("graph_scratch_rows")
         if not resolved.enable_workgraph_execution:
             unsupported.append("enable_workgraph_execution")
-        if resolved.per_request_models:
-            unsupported.append("per_request_models")
         if resolved.per_request_model_bank:
             unsupported.append("per_request_model_bank")
         if resolved.model_bank_slots != 0:
@@ -75,6 +73,21 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             unsupported.append("compact_capture_lane")
         if resolved.distiller_sampler_backend != "post_filter_exact":
             unsupported.append("distiller_sampler_backend")
+        if (
+            resolved.per_request_models
+            and resolved.enable_distiller_intervention
+        ):
+            unsupported.append("enable_distiller_intervention")
+        if (
+            resolved.per_request_models
+            and resolved.training_row_selection.value != "none"
+        ):
+            unsupported.append("training_row_selection")
+        if (
+            resolved.per_request_models
+            and not resolved.model_bank_use_output_layernorm
+        ):
+            unsupported.append("model_bank_use_output_layernorm")
         if unsupported:
             raise ValueError(
                 "implementation='native' does not support legacy-only "
@@ -92,6 +105,7 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
                 distiller_beta=float(resolved.distiller_beta),
                 sampler_backend="post_filter_exact",
                 training_row_selection=resolved.training_row_selection.value,
+                per_request_models=bool(resolved.per_request_models),
             )
         )
     identifier = str(resolved.consumer_id)

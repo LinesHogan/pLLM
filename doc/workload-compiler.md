@@ -193,19 +193,27 @@ re-declares and compares the complete schedule graph, then materializes and
 reports its ordered Region artifact set. A specialization, graph, binding, or
 artifact mismatch rejects the epoch.
 
-`ESampConsumerConfig(implementation="native")` is a distinct native,
-CPU-covered ESamp declaration, not a wrapper around the legacy consumer. It
-owns replica state and its optimizer, cold-specializes the distiller, and has
-two signed Regions: `predict_and_loss` reads signed hidden inputs and publishes
-guidance, while the explicit `update` extern Region consumes their single
-cross-Region materialized differentiable loss and advances the state version.
-The sampler bridge consumes only same-step, metadata-matching guidance; it
-does not recompute Region output. Source and target bindings use signed numeric
-layer indices, including `-1` for the target layer, and are resolved through
-the explicit residual-path contract. This mode rejects legacy-only features
-such as per-request/model-bank state, compact capture lanes, row selection,
-and non-`post_filter_exact` sampler backends. A native ESamp Region cannot be
-co-installed with a legacy ESamp authority. During the current migration this
+`ESampConsumerConfig(implementation="native")` is a distinct native
+declaration, not a wrapper around the legacy consumer. Replica mode owns one
+distiller and optimizer; request mode owns a generic fixed-capacity
+`RequestTrainableState` keyed by stable parent request ID. Parallel child
+samples therefore resolve to one signed selection and one loss/update/version
+transition per parent. Fresh logical admission reinitializes fixed-address
+slot parameters and optimizer state, while typed generation/slot receipts
+prevent ABA reuse and retain bounded cleanup evidence. Source and target
+bindings use signed numeric layer indices, including `-1` for the target
+layer, and are resolved through the explicit residual-path contract.
+
+The initial request-state mode is eager-only and rejects per-request sampler
+intervention, model-bank state, `first_per_prompt` row selection, and disabled
+output layer normalization. Compact capture lanes and non-`post_filter_exact`
+sampler backends remain legacy-only. It passed MRv1/MRv2 ×
+in-process/EngineCore-MP with four real updates, two parent slots retired at
+version 2, empty live mappings, and zero fallback/replay in every cell. These
+are correctness and lifecycle results, not throughput or CUDA Graph claims.
+
+A native ESamp Region cannot be co-installed with a legacy ESamp authority.
+During the current migration this
 isolation is runtime-wide: a runtime with any native Region declaration also
 rejects every legacy dispatch consumer, including an apparently unrelated
 GTTA/TTRL sidecar. Legacy consumers do not yet declare signed ownership of
@@ -215,11 +223,11 @@ be narrowed only after an explicit, decision-signed authority/ownership key is
 implemented on both native and legacy contracts.
 
 Region CUDA Graph materialization and replay infrastructure exists for
-address-stable CUDA Tensor Regions with a static specialization. It explicitly
-rejects Regions with state effects, so the stateful ESamp `predict_and_loss` /
-`update` sequence is exact eager and non-capture today. In particular, the
-model-backed native piecewise CUDA Graph path remains unverified and
-incomplete. These are capability boundaries, not throughput claims.
+address-stable CUDA Tensor Regions with a static specialization. Request-state
+read/transition Regions are explicitly signed capture-disabled; graph
+ineligibility is not counted as a runtime fallback. Model-backed request-state
+capture remains unverified and incomplete. These are capability boundaries,
+not throughput claims.
 
 Recirculation now has one production `RecirculationWorkload`. It binds a
 Rust-signed typed recurrence stage at `Before("model.execute")` through the

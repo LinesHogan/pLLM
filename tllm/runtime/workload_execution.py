@@ -93,6 +93,7 @@ from tllm.runtime.request_trainable_state import (
     RequestIdentityBatch,
     RequestStateEffectAudit,
     RequestStateSelectionBatch,
+    RequestStateVersion,
     StateEffectReceipt,
     StateEffectOperation,
 )
@@ -883,6 +884,11 @@ class _NoRegionValueStore:
     def requires_request_identities(self) -> bool:
         return False
 
+    def request_state_version_report(
+        self,
+    ) -> tuple[tuple[str, RequestStateVersion], ...]:
+        return ()
+
     @property
     def retained_value_count(self) -> int:
         return 0
@@ -976,6 +982,7 @@ class NativeWorkloadExecution:
     _prepared_step: int = -1
     _executed_nodes: set[NodeKey] = field(default_factory=set[NodeKey])
     _pending_request_finished_sources: tuple[str, ...] = ()
+    _last_request_state_retirements: tuple[StateEffectReceipt, ...] = ()
     _execution_lock: LockType = field(default_factory=Lock)
     _main_stream: torch.cuda.Stream | None = None
     _side_streams: tuple[torch.cuda.Stream, ...] = ()
@@ -1253,6 +1260,10 @@ class NativeWorkloadExecution:
                 return
             if self._prepared_step >= 0:
                 self._finish_step_locked(self._prepared_step)
+            # Retirements are a bounded observational receipt for the most
+            # recently completed request batch. A new logical step starts a
+            # new lifetime and must not surface stale completion evidence.
+            self._last_request_state_retirements = ()
             self.executor.prepare_step(step)
             self._value_store.prepare_step(step)
             self._prepared_step = step
@@ -1499,6 +1510,27 @@ class NativeWorkloadExecution:
                 report.append((resource, key, version))
             return tuple(report)
 
+    def request_state_version_report(
+        self,
+    ) -> tuple[tuple[str, RequestStateVersion], ...]:
+        """Read request-scoped versions without weakening their typed identity."""
+
+        with self._execution_lock:
+            self._drain_async_host_locked()
+            return self._value_store.request_state_version_report()
+
+    def request_state_retirement_report(self) -> tuple[StateEffectReceipt, ...]:
+        """Return the latest immutable request-state cleanup receipt tuple.
+
+        This is observational evidence only. It is populated at the verified
+        native request-finish safe point and cleared when the next logical
+        step starts, so it cannot accumulate historical request identities.
+        """
+
+        with self._execution_lock:
+            self._drain_async_host_locked()
+            return self._last_request_state_retirements
+
     @property
     def artifact_report(self) -> tuple[tuple[str, str], ...]:
         return self._artifact_report
@@ -1576,7 +1608,16 @@ class NativeWorkloadExecution:
                 raise RuntimeError(
                     "request-state retirement requires the prepared native step to retire"
                 )
-            return self._value_store.retire_request_states(batch)
+            receipts = self._value_store.retire_request_states(batch)
+            if any(
+                receipt.operation is not StateEffectOperation.RETIRE
+                for receipt in receipts
+            ):
+                raise RuntimeError(
+                    "request-state retirement returned a non-retirement receipt"
+                )
+            self._last_request_state_retirements = receipts
+            return receipts
 
     def read_resource_diagnostics(self) -> Mapping[str, Mapping[str, int | float]]:
         """Return a validated, JSON-safe snapshot of local workload resources.
@@ -1942,6 +1983,15 @@ class _RegionValueStore:
     @property
     def requires_request_identities(self) -> bool:
         return bool(self._request_state_services)
+
+    def request_state_version_report(
+        self,
+    ) -> tuple[tuple[str, RequestStateVersion], ...]:
+        return tuple(
+            (resource, version)
+            for resource, service in self._request_state_services.items()
+            for version in service.versions()
+        )
 
     def prepare_step(self, step_id: int) -> None:
         with self._frames_lock:

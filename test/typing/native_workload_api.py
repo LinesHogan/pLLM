@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import torch
-from typing import cast
 
 from tllm.kit.workload import Workload
 from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
 from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
+from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.consumers.override.workload import OverRIDEConfig, OverRIDEWorkload
 from tllm.consumers.recirculation.workload import (
     RecirculationConfig,
@@ -26,7 +26,11 @@ from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch
 from tllm.runtime.retry_control_runtime import RetryControlBatch
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch
-from tllm.runtime.request_trainable_state import RequestStateRuntimeService
+from tllm.runtime.request_trainable_state import (
+    RequestStateLossBatch,
+    RequestStateRuntimeService,
+    RequestStateSelectionBatch,
+)
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
     AdamWSpec,
@@ -35,6 +39,7 @@ from tllm.workload import (
     RequestTrainableState,
     State,
     WorkloadConfig,
+    declared_config_field,
     request_key,
     workload,
 )
@@ -114,7 +119,7 @@ _REQUEST_STATE_TYPING_ENABLED = ConfigField.boolean(True)
 
 
 class _RequestStateTypingConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _REQUEST_STATE_TYPING_ENABLED)
+    enabled: bool = declared_config_field(_REQUEST_STATE_TYPING_ENABLED)
 
 
 class _RequestStateTypingWorkload(Workload[_RequestStateTypingConfig]):
@@ -142,4 +147,19 @@ def typed_request_state_service(
     workload_instance: _RequestStateTypingWorkload,
 ) -> RequestStateRuntimeService[torch.nn.Linear]:
     service: RequestStateRuntimeService[torch.nn.Linear] = workload_instance.state
+    return service
+
+
+def typed_esamp_request_loss_transition(
+    workload_instance: ESampWorkload,
+    selection: RequestStateSelectionBatch,
+    losses: tuple[torch.Tensor, ...],
+) -> RequestStateRuntimeService[LowRankGatedResidualModel]:
+    batch = RequestStateLossBatch(selection, losses)
+    workload_instance.optimize_request_state(
+        ESampWorkload.request_distiller, batch
+    )
+    service: RequestStateRuntimeService[LowRankGatedResidualModel] = (
+        workload_instance.request_distiller
+    )
     return service

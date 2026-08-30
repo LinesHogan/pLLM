@@ -172,7 +172,13 @@ class _PortWorker:
         self.plan_epoch = 1
 
     def tllm_ping(self) -> dict[str, object]:
-        return {"pid": 1, "worker_id": self.worker_id}
+        return {
+            "pid": 1,
+            "worker_id": self.worker_id,
+            "patch_installed": True,
+            "consumer": None,
+            "mapping_size": 0,
+        }
 
     def tllm_prepare_workload_port(
         self, key: str, transaction: str, wire: dict[str, object]

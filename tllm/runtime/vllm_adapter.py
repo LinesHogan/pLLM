@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, cast
 import weakref
 
@@ -23,8 +24,42 @@ class InprocessRunner:
     binding: "RunnerBinding | None"
 
 
+class EngineCoreTopology(StrEnum):
+    """Closed topology fact decoded at the quarantined vLLM boundary."""
+
+    INPROCESS = "inprocess"
+    MULTIPROCESS = "multiprocess"
+
+
 def bind_runner_owner(runner: object, owner: object) -> None:
     _runner_owners[cast(Any, runner)] = owner
+
+
+def engine_core_topology(llm: object) -> EngineCoreTopology | None:
+    """Classify the concrete vLLM EngineCore client without policy inference.
+
+    A uniprocess EngineCore still exposes ``collective_rpc``.  That transport
+    capability is intentionally not evidence that request finish must use the
+    distributed parent/worker protocol; only the concrete client topology is.
+    ``None`` is reserved for non-vLLM test doubles that do not expose an
+    EngineCore at all.
+    """
+
+    dynamic = cast(Any, llm)
+    try:
+        core_client = dynamic.llm_engine.engine_core
+    except AttributeError:
+        return None
+    from vllm.v1.engine.core_client import InprocClient, MPClient
+
+    if isinstance(core_client, InprocClient):
+        return EngineCoreTopology.INPROCESS
+    if isinstance(core_client, MPClient):
+        return EngineCoreTopology.MULTIPROCESS
+    raise RuntimeError(
+        "unsupported vLLM EngineCore client topology: "
+        f"{type(core_client).__module__}.{type(core_client).__qualname__}"
+    )
 
 
 def create_llm(args: tuple[object, ...], kwargs: dict[str, object]) -> LLM:
@@ -44,7 +79,11 @@ def generate_requests(
 def bind_inprocess_runner(llm: object, owner: object) -> InprocessRunner | None:
     dynamic = cast(Any, llm)
     try:
-        driver = dynamic.llm_engine.engine_core.model_executor.driver_worker
+        core_client = dynamic.llm_engine.engine_core
+        # vLLM's InprocClient wraps the real EngineCore one level deeper;
+        # MP clients deliberately do not expose that local executor.
+        engine_core = getattr(core_client, "engine_core", core_client)
+        driver = engine_core.model_executor.driver_worker
         runner = driver.model_runner
     except AttributeError:
         return None
@@ -86,6 +125,9 @@ def install_generate_boundary(
         )
 
         engine = dynamic.llm_engine
+        # Mapping publication uses the same typed RPC in both topologies. An
+        # InprocClient executes it locally; the runtime's separate topology
+        # fact controls only whether request *finish* uses the MP protocol.
         plane = ControlPlane.try_bind(dynamic)
         prompt_indices = request_prompt_indices()
         sample_indices = request_sample_indices()
@@ -102,6 +144,17 @@ def install_generate_boundary(
             original_request_counter = dynamic.request_counter
             original_run_engine = dynamic._run_engine
         try:
+            # The wrapper clears the local mapping before admission. Install
+            # it before publishing IDs: an InprocClient shares this runtime
+            # object, unlike an EngineCore child.
+            engine.add_request = make_mapping_add_request(
+                runtime=residual_runtime.RUNTIME,
+                plane=None if mapping_prepublished else plane,
+                orig_add_request=original_add_request,
+                request_prompt_indices=prompt_indices,
+                request_sample_indices=sample_indices,
+                admitted_request_ids=admitted_request_ids,
+            )
             if mapping_prepublished:
                 engine.sleep(level=0, mode="keep")
                 if prompt_indices is not None:
@@ -144,14 +197,6 @@ def install_generate_boundary(
                     return original_run_engine(*run_args, **run_kwargs)
 
                 dynamic._run_engine = run_after_bulk_admission
-            engine.add_request = make_mapping_add_request(
-                runtime=residual_runtime.RUNTIME,
-                plane=None if mapping_prepublished else plane,
-                orig_add_request=original_add_request,
-                request_prompt_indices=prompt_indices,
-                request_sample_indices=sample_indices,
-                admitted_request_ids=admitted_request_ids,
-            )
             outputs = generate(*args, **kwargs)
         except Exception:
             aborted_request_ids = tuple(
@@ -189,6 +234,8 @@ def legacy_runner_graph_enabled(runner: object) -> bool:
 
 __all__ = [
     "bind_inprocess_runner",
+    "EngineCoreTopology",
+    "engine_core_topology",
     "InprocessRunner",
     "bind_runner_owner",
     "create_llm",

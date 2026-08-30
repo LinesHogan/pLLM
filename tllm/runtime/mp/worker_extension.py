@@ -620,6 +620,42 @@ class TllmWorkerExtension:
                 {"resource": resource, "key": key, "version": version}
                 for resource, key, version in execution.state_version_report()
             ],
+            "request_state_versions": [
+                {
+                    "resource": resource,
+                    "key": {
+                        "fields": [field.value for field in state.key.fields],
+                        "request_id": state.key.request_id,
+                        "prompt_idx": state.key.prompt_idx,
+                        "sample_idx": state.key.sample_idx,
+                    },
+                    "slot": {
+                        "slot_id": state.slot.slot_id,
+                        "generation": state.slot.generation,
+                    },
+                    "version": state.version,
+                }
+                for resource, state in execution.request_state_version_report()
+            ],
+            "request_state_retirements": [
+                {
+                    "resource": receipt.resource,
+                    "key": {
+                        "fields": [field.value for field in effect.key.fields],
+                        "request_id": effect.key.request_id,
+                        "prompt_idx": effect.key.prompt_idx,
+                        "sample_idx": effect.key.sample_idx,
+                    },
+                    "slot": {
+                        "slot_id": effect.slot.slot_id,
+                        "generation": effect.slot.generation,
+                    },
+                    "before_version": effect.before_version,
+                    "after_version": effect.after_version,
+                }
+                for receipt in execution.request_state_retirement_report()
+                for effect in receipt.slots
+            ],
             "diagnostics": {
                 workload_id: dict(metrics)
                 for workload_id, metrics in execution.read_resource_diagnostics().items()

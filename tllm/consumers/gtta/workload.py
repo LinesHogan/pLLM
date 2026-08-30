@@ -10,8 +10,6 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 import json
-from typing import cast
-
 import torch
 
 from tllm.kit.workload import Workload
@@ -28,6 +26,7 @@ from tllm.workload import (
     StagedPort,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     host_output,
     maybe_transition,
@@ -102,7 +101,7 @@ _GTTA_ENABLED = ConfigField.boolean(True)
 
 
 class GTTAConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _GTTA_ENABLED)
+    enabled: bool = declared_config_field(_GTTA_ENABLED)
     max_queue_size: int = config_field(
         default=128, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )

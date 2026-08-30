@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Literal
 
 import pytest
 import torch
@@ -194,6 +195,261 @@ def test_shared_alias_retires_only_after_last_identity_and_reuse_resets_paramete
     reset = store.groups(replacement.selection)[0].module.weight.detach()
     torch.testing.assert_close(reset, torch.tensor([[1.0]]))
     store.release_selection(replacement.selection)
+
+
+def test_cold_slots_preserve_rng_and_each_new_key_runs_logical_initialization() -> None:
+    class _RandomScalarModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.rand((1, 1)))
+
+    def random_model() -> _RandomScalarModel:
+        return _RandomScalarModel()
+
+    def random_optimizer(
+        module: _RandomScalarModel,
+    ) -> torch.optim.Optimizer:
+        return torch.optim.SGD(module.parameters(), lr=0.1)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(20260831)
+    initial_rng_state = generator.get_state()
+    expected_first = torch.rand((1, 1), generator=generator)
+    expected_second = torch.rand((1, 1), generator=generator)
+    torch.set_rng_state(initial_rng_state)
+    store = RequestTrainableStateStore(
+        resource="randomized",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        capacity=1,
+        epoch=1,
+        device=torch.device("cpu"),
+        module_factory=random_model,
+        optimizer_factory=random_optimizer,
+    )
+
+    first_identity = RequestIdentity("first", 0, 0)
+    first = store.acquire((first_identity,))
+    store.consume_receipt(first.admission)
+    first_module = store.groups(first.selection)[0].module
+    first_address = first_module.weight.data_ptr()
+    torch.testing.assert_close(first_module.weight, expected_first)
+    store.release_selection(first.selection)
+    store.consume_receipt(store.retire(RequestFinishedBatch((first_identity,))))
+
+    second_identity = RequestIdentity("second", 1, 0)
+    second = store.acquire((second_identity,))
+    store.consume_receipt(second.admission)
+    second_module = store.groups(second.selection)[0].module
+    assert second_module.weight.data_ptr() == first_address
+    torch.testing.assert_close(second_module.weight, expected_second)
+    assert not torch.equal(expected_first, expected_second)
+    store.release_selection(second.selection)
+
+
+def test_admission_builds_initial_state_outside_backend_inference_mode() -> None:
+    initializer_modes: list[bool] = []
+    optimizer_modes: list[bool] = []
+
+    def observed_model() -> _ScalarModel:
+        initializer_modes.append(torch.is_inference_mode_enabled())
+        return _ScalarModel()
+
+    def observed_optimizer(
+        module: _ScalarModel,
+    ) -> torch.optim.Optimizer:
+        optimizer_modes.append(torch.is_inference_mode_enabled())
+        return _optimizer(module)
+
+    store = RequestTrainableStateStore(
+        resource="observed",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        capacity=1,
+        epoch=1,
+        device=torch.device("cpu"),
+        module_factory=observed_model,
+        optimizer_factory=observed_optimizer,
+    )
+    initializer_modes.clear()
+    optimizer_modes.clear()
+
+    with torch.inference_mode():
+        acquired = store.acquire((RequestIdentity("request", 0, 0),))
+
+    assert initializer_modes == [False]
+    assert optimizer_modes == [False]
+    store.consume_receipt(acquired.admission)
+    module = store.groups(acquired.selection)[0].module
+    assert not any(parameter.is_inference() for parameter in module.parameters())
+    store.release_selection(acquired.selection)
+
+
+def test_cold_optimizer_allocation_does_not_advance_logical_rng() -> None:
+    def consuming_optimizer(
+        module: _ScalarModel,
+    ) -> torch.optim.Optimizer:
+        torch.rand(())
+        return _optimizer(module)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(404)
+    initial_rng_state = generator.get_state()
+    expected_next = torch.rand((), generator=generator)
+    torch.set_rng_state(initial_rng_state)
+
+    RequestTrainableStateStore(
+        resource="rng-preserving",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        capacity=2,
+        epoch=1,
+        device=torch.device("cpu"),
+        module_factory=_model,
+        optimizer_factory=consuming_optimizer,
+    )
+
+    torch.testing.assert_close(torch.rand(()), expected_next)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA RNG preservation requires CUDA"
+)
+def test_cold_slot_allocation_preserves_cpu_and_cuda_rng() -> None:
+    device = torch.device("cuda:0")
+
+    class _CudaRandomModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.rand((1, 1), device=device)
+            )
+
+    def cuda_random_model() -> _CudaRandomModel:
+        return _CudaRandomModel()
+
+    def consuming_optimizer(
+        module: _CudaRandomModel,
+    ) -> torch.optim.Optimizer:
+        torch.rand(())
+        torch.rand((), device=device)
+        return torch.optim.SGD(module.parameters(), lr=0.1)
+
+    cpu_generator = torch.Generator(device="cpu")
+    cpu_generator.manual_seed(505)
+    initial_cpu_state = cpu_generator.get_state()
+    expected_cpu = torch.rand((), generator=cpu_generator)
+    cuda_generator = torch.Generator(device=device)
+    cuda_generator.manual_seed(606)
+    initial_cuda_state = cuda_generator.get_state()
+    expected_cuda = torch.rand((), device=device, generator=cuda_generator)
+    torch.set_rng_state(initial_cpu_state)
+    torch.cuda.set_rng_state(initial_cuda_state, device)
+
+    RequestTrainableStateStore(
+        resource="cuda-rng-preserving",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        capacity=2,
+        epoch=1,
+        device=device,
+        module_factory=cuda_random_model,
+        optimizer_factory=consuming_optimizer,
+    )
+
+    torch.testing.assert_close(torch.rand(()), expected_cpu)
+    torch.testing.assert_close(
+        torch.rand((), device=device), expected_cuda
+    )
+
+
+def test_admission_initializer_cannot_alias_slot_storage_through_a_view() -> None:
+    class _ViewModel(torch.nn.Module):
+        def __init__(self, weight: torch.Tensor) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight)
+
+    backing = torch.tensor((1.0, 2.0))
+    factory_calls = 0
+
+    def view_model() -> _ViewModel:
+        nonlocal factory_calls
+        offset = factory_calls
+        factory_calls += 1
+        return _ViewModel(backing[offset : offset + 1])
+
+    def view_optimizer(module: _ViewModel) -> torch.optim.Optimizer:
+        return torch.optim.SGD(module.parameters(), lr=0.1)
+
+    store = RequestTrainableStateStore(
+        resource="aliased-view",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        capacity=1,
+        epoch=1,
+        device=torch.device("cpu"),
+        module_factory=view_model,
+        optimizer_factory=view_optimizer,
+    )
+
+    with pytest.raises(RuntimeError, match="aliases slot storage"):
+        store.acquire((RequestIdentity("request", 0, 0),))
+
+
+@pytest.mark.parametrize("failure_stage", ("initializer", "optimizer"))
+def test_multi_key_admission_factory_failure_is_atomic(
+    failure_stage: Literal["initializer", "optimizer"],
+) -> None:
+    initializer_calls = 0
+    optimizer_calls = 0
+    failures_enabled = False
+
+    def fallible_model() -> _ScalarModel:
+        nonlocal initializer_calls
+        initializer_calls += 1
+        if (
+            failures_enabled
+            and failure_stage == "initializer"
+            and initializer_calls == 2
+        ):
+            raise RuntimeError("second initializer failed")
+        return _ScalarModel()
+
+    def fallible_optimizer(
+        module: _ScalarModel,
+    ) -> torch.optim.Optimizer:
+        nonlocal optimizer_calls
+        optimizer_calls += 1
+        if (
+            failures_enabled
+            and failure_stage == "optimizer"
+            and optimizer_calls == 2
+        ):
+            raise RuntimeError("second optimizer failed")
+        return _optimizer(module)
+
+    store = RequestTrainableStateStore(
+        resource="atomic-admission",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        capacity=2,
+        epoch=1,
+        device=torch.device("cpu"),
+        module_factory=fallible_model,
+        optimizer_factory=fallible_optimizer,
+    )
+    initializer_calls = 0
+    optimizer_calls = 0
+    failures_enabled = True
+    identities = (
+        RequestIdentity("first", 0, 0),
+        RequestIdentity("second", 1, 0),
+    )
+
+    with pytest.raises(RuntimeError, match=f"second {failure_stage} failed"):
+        store.acquire(identities)
+
+    assert store.versions() == ()
+    failures_enabled = False
+    acquired = store.acquire(identities)
+    store.consume_receipt(acquired.admission)
+    assert len(acquired.selection.leases) == 2
+    assert tuple(version.version for version in store.versions()) == (0, 0)
+    store.release_selection(acquired.selection)
 
 
 def test_epoch_replacement_requires_empty_lifecycle() -> None:

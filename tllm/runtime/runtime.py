@@ -56,6 +56,8 @@ from tllm.runtime.vllm_adapter import (
     bind_inprocess_runner,
     bind_runner_owner,
     create_llm,
+    EngineCoreTopology,
+    engine_core_topology,
     generate_requests as generate_vllm_requests,
     install_generate_boundary,
 )
@@ -1723,8 +1725,13 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         """Record runner -> runtime routing for every live worker runner."""
         from tllm.runtime.mp.control import ControlPlane, set_active_control_plane
 
-        plane = ControlPlane.try_bind(llm)
-        if plane is not None:
+        topology = engine_core_topology(llm)
+        if topology is EngineCoreTopology.MULTIPROCESS:
+            plane = ControlPlane.try_bind(llm)
+            if plane is None:
+                raise RuntimeError(
+                    "multiprocess EngineCore has no tLLM control-plane transport"
+                )
             try:
                 plane.call("tllm_bind_runner_runtime")
             except Exception:
@@ -1735,6 +1742,8 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 set_active_control_plane(plane)
                 self._install_generate_boundary(llm, plane)
                 return
+        elif topology is not EngineCoreTopology.INPROCESS:
+            raise RuntimeError("LLM has no typed EngineCore topology")
         inprocess_runner = bind_inprocess_runner(llm, self)
         if inprocess_runner is not None:
             self._inprocess_request_finish_binding = inprocess_runner.binding

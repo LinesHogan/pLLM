@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from typing import Literal, cast
+from typing import Literal
 
 import torch
 from tllm.kit.workload import Workload
@@ -21,6 +21,7 @@ from tllm.workload import (
     StagedPort,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     declare_workload,
     hidden,
     optimize,
@@ -35,20 +36,20 @@ _LEARNING_RATE = ConfigField.floating(3e-4)
 
 class _Config(WorkloadConfig):
     enabled: bool = config_field(default=True, kind=ConfigKind.BOOL)
-    learning_rate: float = cast(float, _LEARNING_RATE)
+    learning_rate: float = declared_config_field(_LEARNING_RATE)
     layer_path: str = config_field(
         default="model.layers.0", kind=ConfigKind.STR
     )
 
 
-_MODE = ConfigField.choice("online", ("online", "offline"))
+_MODE: ConfigField[Literal["online", "offline"]] = ConfigField.choice(
+    "online", ("online", "offline")
+)
 
 
 class _ModeConfig(WorkloadConfig):
     enabled: bool = config_field(default=True, kind=ConfigKind.BOOL)
-    mode: Literal["online", "offline"] = cast(
-        Literal["online", "offline"], _MODE
-    )
+    mode: Literal["online", "offline"] = declared_config_field(_MODE)
 
 
 @workload(id="author.mode", config=_ModeConfig, enabled=_ModeConfig.enabled)

@@ -65,6 +65,7 @@ from tllm.workload.config import (
     NumericConstraint,
     WorkloadConfig,
     config_field,
+    declared_config_field,
 )
 from tllm.workload.staging import StagedLifecycle, StagedPort
 from tllm.workload.host import HostOutput
@@ -168,6 +169,7 @@ __all__ = [
     "extern_io",
     "WorkloadConfig",
     "config_field",
+    "declared_config_field",
     "hidden",
     "host_output",
     "lower_program",

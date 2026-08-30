@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import torch
 from torch.nn import functional as F
 
@@ -20,6 +18,7 @@ from tllm.workload import (
     TrainableState,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     hidden,
     maybe_optimize,
@@ -39,7 +38,7 @@ _OVERRIDE_LEARNING_RATE = ConfigField.floating(
 
 
 class OverRIDEConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _OVERRIDE_ENABLED)
+    enabled: bool = declared_config_field(_OVERRIDE_ENABLED)
     hidden_size: int = config_field(
         default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
@@ -51,7 +50,7 @@ class OverRIDEConfig(WorkloadConfig):
         default=10, kind=ConfigKind.INT, constraint=NumericConstraint.POSITIVE
     )
     lambd: float = config_field(default=0.8, kind=ConfigKind.FLOAT)
-    learning_rate: float = cast(float, _OVERRIDE_LEARNING_RATE)
+    learning_rate: float = declared_config_field(_OVERRIDE_LEARNING_RATE)
     source_layer_path: str = config_field(default="model.model.norm", kind=ConfigKind.STR)
 
 

@@ -140,6 +140,17 @@ replay. A contention-constrained 0.4 diagnostic pair (0.5B, batch 8 × n16,
 not the formal 0.5/five-pair retirement gate, so the ESamp legacy and Program
 baselines remain present.
 
+A later 2026-08-31 tranche added generic eager request-scoped trainable state
+to native ESamp without adding workload scheduling policy. Stable parent
+request IDs own fixed-address generational slots; parallel samples share one
+selection, optimizer transition, and version. MRv1/MRv2 ×
+in-process/EngineCore-MP each ran two parents with `n=2` through two decode
+updates, reported four losses and four updates, retired both slots at version
+2, cleared live state and request mappings, and recorded zero fallback/replay.
+The signed request Regions remain explicitly capture-disabled. This is
+request-state correctness and lifecycle evidence, not model-bank,
+sampler-intervention, CUDA Graph, distributed, or throughput evidence.
+
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension
 had only libc, libgcc, and loader dependencies; it did not dynamically link

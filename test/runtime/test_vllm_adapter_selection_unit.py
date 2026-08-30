@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 
@@ -21,6 +22,57 @@ class _Runner:
 
 
 class VllmAdapterSelectionUnitTest(unittest.TestCase):
+    def test_inprocess_runner_binding_unwraps_engine_core_client(self) -> None:
+        from tllm.runtime.vllm_adapter import bind_inprocess_runner
+
+        class Runner:
+            pass
+
+        runner = Runner()
+        llm = SimpleNamespace(
+            llm_engine=SimpleNamespace(
+                engine_core=SimpleNamespace(
+                    engine_core=SimpleNamespace(
+                        model_executor=SimpleNamespace(
+                            driver_worker=SimpleNamespace(model_runner=runner)
+                        )
+                    )
+                )
+            )
+        )
+        binding = object()
+        with mock.patch(
+            "tllm.backends.protocol.runner_binding_for", return_value=binding
+        ):
+            result = bind_inprocess_runner(llm, object())
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIs(result.binding, binding)
+
+    def test_engine_core_topology_distinguishes_uniproc_from_mp_transport(self) -> None:
+        """collective_rpc exists in both topologies; client type is decisive."""
+
+        from vllm.v1.engine.core_client import InprocClient, SyncMPClient
+
+        from tllm.runtime.vllm_adapter import (
+            EngineCoreTopology,
+            engine_core_topology,
+        )
+
+        def llm_for(client: object) -> SimpleNamespace:
+            return SimpleNamespace(llm_engine=SimpleNamespace(engine_core=client))
+
+        self.assertIs(
+            engine_core_topology(llm_for(object.__new__(InprocClient))),
+            EngineCoreTopology.INPROCESS,
+        )
+        self.assertIs(
+            engine_core_topology(llm_for(object.__new__(SyncMPClient))),
+            EngineCoreTopology.MULTIPROCESS,
+        )
+        self.assertIsNone(engine_core_topology(object()))
+
     def test_unknown_major_fails_fast(self) -> None:
         from tllm.runtime.vllm_patch.adapters import select_prepare_inputs_adapter
 

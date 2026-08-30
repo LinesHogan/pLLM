@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import ClassVar, cast
+from typing import ClassVar
 
 from tllm.kit.backend import WorkloadBackendAdapter
 from tllm.kit.workload import Workload
@@ -19,6 +19,7 @@ from tllm.workload import (
     NumericConstraint,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     step_id,
     task,
@@ -48,7 +49,7 @@ class RecirculationConfig(WorkloadConfig):
     ramp_tokens: int = config_field(
         default=0, kind=ConfigKind.INT, constraint=NumericConstraint.NONNEGATIVE
     )
-    enabled: bool = cast(bool, _RECIRCULATION_ENABLED)
+    enabled: bool = declared_config_field(_RECIRCULATION_ENABLED)
 
     def resolved_layers(self, layer_count: int) -> tuple[int, int]:
         source = self.source_layer if self.source_layer >= 0 else layer_count + self.source_layer

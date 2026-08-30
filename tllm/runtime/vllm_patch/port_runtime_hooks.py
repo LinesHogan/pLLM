@@ -459,6 +459,11 @@ def _clear_decode_localization(core: DecodeHookCoreLike) -> None:
         execution.stage_sampler_identity(
             core.RUNTIME.event_step_id, (), (), None
         )
+        if execution.requires_request_identities:
+            execution.stage_request_identities(
+                core.RUNTIME.event_step_id,
+                RequestIdentityBatch(()),
+            )
 
 
 def prepare_decode_localization(

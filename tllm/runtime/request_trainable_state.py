@@ -69,20 +69,6 @@ class RequestStateKey:
             ),
         )
 
-    def wire_key(self) -> str:
-        """Closed control-plane representation; no runtime type inspection."""
-
-        parts: list[str] = []
-        for field in self.fields:
-            match field:
-                case RequestKeyField.REQUEST_ID:
-                    parts.append(f"request_id={self.request_id}")
-                case RequestKeyField.PROMPT_IDX:
-                    parts.append(f"prompt_idx={self.prompt_idx}")
-                case RequestKeyField.SAMPLE_IDX:
-                    parts.append(f"sample_idx={self.sample_idx}")
-        return "|".join(parts)
-
 
 @dataclass(frozen=True, slots=True, order=True)
 class StateSlotRef:
@@ -94,10 +80,6 @@ class StateSlotRef:
             raise ValueError("request state slot id must be non-negative")
         if self.generation < 1:
             raise ValueError("request state slot generation must be positive")
-
-    def wire_key(self) -> str:
-        return f"{self.slot_id}:{self.generation}"
-
 
 @dataclass(frozen=True, slots=True)
 class RequestStateLease:
@@ -121,6 +103,22 @@ class RequestStateSelectionBatch:
     leases: tuple[RequestStateLease, ...]
     device_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class RequestStateLossBatch:
+    """One closed optimizer payload aligned to a request-state selection."""
+
+    selection: RequestStateSelectionBatch
+    losses: tuple[torch.Tensor, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.losses) != len(self.selection.leases):
+            raise ValueError(
+                "request-state loss batch must align with unique selection leases"
+            )
+        if any(loss.numel() != 1 for loss in self.losses):
+            raise ValueError("request-state loss batch entries must be scalar")
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,9 +241,12 @@ class RequestTrainableStateStore(Generic[ModuleT]):
     """A fixed slot bank with generation-safe request ownership.
 
     Modules are allocated during cold specialization and keep their parameter
-    addresses for the store lifetime.  Optimizers are intentionally eager in
-    this first capability: slot reuse reconstructs optimizer state, so Rust
-    must not classify request-scoped transitions as capture-compatible yet.
+    addresses for the store lifetime.  Physical allocation does not advance
+    the logical initializer RNG; each newly admitted key invokes the declared
+    module factory and copies that fresh state into its fixed slot. Optimizers
+    are intentionally eager in this first capability: slot reuse reconstructs
+    optimizer state, so Rust must not classify request-scoped transitions as
+    capture-compatible yet.
     """
 
     def __init__(
@@ -268,7 +269,18 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         if epoch < 1:
             raise ValueError("request trainable state epoch must be positive")
 
-        modules = tuple(module_factory() for _slot_id in range(capacity))
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else None
+        )
+        try:
+            modules = tuple(module_factory() for _slot_id in range(capacity))
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device)
         if len({id(module) for module in modules}) != capacity:
             raise RuntimeError("request state module slots must be distinct")
         canonical_parameters = tuple(
@@ -283,6 +295,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         parameter_addresses: set[int] = set()
         buffer_ids: set[int] = set()
         buffer_addresses: set[int] = set()
+        storage_addresses: set[int] = set()
         for module in modules:
             parameters = tuple(module.parameters())
             buffers = tuple(module.buffers())
@@ -318,11 +331,17 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             module_buffer_addresses = {
                 buffer.data_ptr() for buffer in buffers if buffer.numel()
             }
+            module_storage_addresses = {
+                tensor.untyped_storage().data_ptr()
+                for tensor in (*parameters, *buffers)
+                if tensor.numel()
+            }
             if (
                 parameter_ids.intersection(module_parameter_ids)
                 or parameter_addresses.intersection(module_parameter_addresses)
                 or buffer_ids.intersection(module_buffer_ids)
                 or buffer_addresses.intersection(module_buffer_addresses)
+                or storage_addresses.intersection(module_storage_addresses)
             ):
                 raise RuntimeError(
                     "request state module slots must not share tensor storage"
@@ -331,28 +350,36 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             parameter_addresses.update(module_parameter_addresses)
             buffer_ids.update(module_buffer_ids)
             buffer_addresses.update(module_buffer_addresses)
-            with torch.no_grad():
-                for parameter, initial in zip(
-                    parameters, canonical_parameters, strict=True
-                ):
-                    parameter.copy_(initial)
-                for buffer, initial in zip(
-                    buffers, canonical_buffers, strict=True
-                ):
-                    buffer.copy_(initial)
-
+            storage_addresses.update(module_storage_addresses)
         self._resource = resource
         self._key_fields = key_fields
         self._capacity = capacity
         self._epoch = epoch
         self._device = device
+        self._module_factory = module_factory
         self._optimizer_factory = optimizer_factory
         self._initial_parameters = canonical_parameters
         self._initial_buffers = canonical_buffers
-        self._slots = [
-            _RequestStateSlot(module, optimizer_factory(module))
-            for module in modules
-        ]
+        self._physical_parameter_ids = parameter_ids
+        self._physical_parameter_addresses = parameter_addresses
+        self._physical_buffer_ids = buffer_ids
+        self._physical_buffer_addresses = buffer_addresses
+        self._physical_storage_addresses = storage_addresses
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda"
+            else None
+        )
+        try:
+            self._slots = [
+                _RequestStateSlot(module, optimizer_factory(module))
+                for module in modules
+            ]
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device)
         self._slot_by_key: dict[RequestStateKey, int] = {}
         self._key_by_identity: dict[RequestIdentity, RequestStateKey] = {}
         self._active_selections: dict[int, _ActiveSelection] = {}
@@ -473,6 +500,8 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         slot_id: int,
         key: RequestStateKey,
         optimizer: torch.optim.Optimizer,
+        initial_parameters: tuple[torch.nn.Parameter, ...],
+        initial_buffers: tuple[torch.Tensor, ...],
     ) -> StateSlotRef:
         slot = self._slots[slot_id]
         if (
@@ -486,12 +515,12 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         buffers = tuple(slot.module.buffers())
         with torch.no_grad():
             for parameter, initial in zip(
-                parameters, self._initial_parameters, strict=True
+                parameters, initial_parameters, strict=True
             ):
                 parameter.copy_(initial)
                 parameter.grad = None
             for buffer, initial in zip(
-                buffers, self._initial_buffers, strict=True
+                buffers, initial_buffers, strict=True
             ):
                 buffer.copy_(initial)
         slot.optimizer = optimizer
@@ -588,12 +617,80 @@ class RequestTrainableStateStore(Generic[ModuleT]):
 
             planned_slots = dict(self._slot_by_key)
             planned_optimizers: dict[int, torch.optim.Optimizer] = {}
+            planned_initializations: dict[
+                int,
+                tuple[
+                    tuple[torch.nn.Parameter, ...],
+                    tuple[torch.Tensor, ...],
+                ],
+            ] = {}
             for key, slot_id in zip(new_keys, free_slots, strict=False):
                 self._validate_slot_layout(slot_id)
+                with torch.inference_mode(False), torch.enable_grad():
+                    initial_module = self._module_factory()
+                    initial_parameters = tuple(initial_module.parameters())
+                    initial_buffers = tuple(initial_module.buffers())
+                if len(initial_parameters) != len(self._initial_parameters) or any(
+                    tuple(parameter.shape) != tuple(canonical.shape)
+                    or parameter.dtype is not canonical.dtype
+                    or parameter.device != canonical.device
+                    for parameter, canonical in zip(
+                        initial_parameters,
+                        self._initial_parameters,
+                        strict=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "request state admission parameter layouts differ"
+                    )
+                if len(initial_buffers) != len(self._initial_buffers) or any(
+                    tuple(buffer.shape) != tuple(canonical.shape)
+                    or buffer.dtype is not canonical.dtype
+                    or buffer.device != canonical.device
+                    for buffer, canonical in zip(
+                        initial_buffers,
+                        self._initial_buffers,
+                        strict=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "request state admission buffer layouts differ"
+                    )
+                if (
+                    any(
+                        id(parameter) in self._physical_parameter_ids
+                        or parameter.data_ptr()
+                        in self._physical_parameter_addresses
+                        for parameter in initial_parameters
+                    )
+                    or any(
+                        id(buffer) in self._physical_buffer_ids
+                        or (
+                            buffer.numel() > 0
+                            and buffer.data_ptr()
+                            in self._physical_buffer_addresses
+                        )
+                        for buffer in initial_buffers
+                    )
+                    or any(
+                        tensor.numel() > 0
+                        and tensor.untyped_storage().data_ptr()
+                        in self._physical_storage_addresses
+                        for tensor in (*initial_parameters, *initial_buffers)
+                    )
+                ):
+                    raise RuntimeError(
+                        "request state admission initializer aliases slot storage"
+                    )
                 planned_slots[key] = slot_id
-                planned_optimizers[slot_id] = self._optimizer_factory(
-                    self._slots[slot_id].module
+                planned_initializations[slot_id] = (
+                    initial_parameters,
+                    initial_buffers,
                 )
+                with torch.inference_mode(False), torch.enable_grad():
+                    planned_optimizers[slot_id] = self._optimizer_factory(
+                        self._slots[slot_id].module
+                    )
             planned_slot_ids = tuple(planned_slots[key] for key in keys)
             slot_ids = torch.tensor(
                 planned_slot_ids,
@@ -607,8 +704,15 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             admitted: list[StateSlotEffect] = []
             try:
                 for key, slot_id in zip(new_keys, free_slots, strict=False):
+                    initial_parameters, initial_buffers = (
+                        planned_initializations[slot_id]
+                    )
                     slot_ref = self._reset_slot(
-                        slot_id, key, planned_optimizers[slot_id]
+                        slot_id,
+                        key,
+                        planned_optimizers[slot_id],
+                        initial_parameters,
+                        initial_buffers,
                     )
                     self._slot_by_key[key] = slot_id
                     admitted.append(StateSlotEffect(key, slot_ref, 0, 0))
@@ -1495,6 +1599,7 @@ __all__ = [
     "RequestIdentityBatch",
     "RequestStateKey",
     "RequestStateLease",
+    "RequestStateLossBatch",
     "RequestStateModuleGroup",
     "RequestStateSelectionBatch",
     "RequestStateSelectionRow",

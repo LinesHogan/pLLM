@@ -15,7 +15,11 @@ from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
 from tllm.contracts.hidden_locator import HiddenLocatorCapability, HiddenPhase, HiddenSite
 from tllm.contracts.consumer_stats import TrainingStats
-from tllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from tllm.contracts.request_identity import (
+    RequestFinishedBatch,
+    RequestIdentity,
+    RequestKeyField,
+)
 from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 from tllm.contracts.runtime_context import CompilationConfigLike
 from tllm.contracts.workload_ports import SKIPPED
@@ -1192,6 +1196,10 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         self.assertIs(
             store._frames[17].request_selections["weights"], selection
         )
+        self.assertEqual(
+            store.request_state_version_report(),
+            (("weights", service.versions()[0]),),
+        )
         store.finish_step(17)
 
         store.prepare_step(18)
@@ -1203,6 +1211,58 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         self.assertIs(empty_inputs["selection-b"], SKIPPED)
         store.execute(artifact, replace(context, step_id=18))
         store.finish_step(18)
+
+    def test_request_state_retirement_report_is_bounded_completion_evidence(self) -> None:
+        service = RequestStateRuntimeService(
+            RequestTrainableStateStore(
+                resource="weights",
+                key_fields=(RequestKeyField.REQUEST_ID,),
+                capacity=1,
+                epoch=1,
+                device=torch.device("cpu"),
+                module_factory=lambda: torch.nn.Linear(1, 1, bias=False),
+                optimizer_factory=lambda module: torch.optim.SGD(
+                    module.parameters(), lr=0.1
+                ),
+            )
+        )
+        store = _RegionValueStore(
+            runtime=ResidualRuntimeState(),
+            providers={},
+            sinks={},
+            artifacts=(),
+            materializations=_SignedMaterializationBindings(()),
+            state_versions=StateVersionRegistry((), {}, ()),
+            lifecycle=NoExecutionLifecycle(),
+            request_state_services={"weights": service},
+        )
+        identity = RequestIdentity("finished", 0, 0)
+        store.prepare_step(1)
+        store.stage_request_identities(1, RequestIdentityBatch((identity,)))
+        _ = service.selection_for_step(1)
+        store.finish_step(1)
+        executor = mock.Mock()
+        execution = NativeWorkloadExecution(
+            compilation=cast(Any, object()),
+            executor=executor,
+            completion_anchor="step.end",
+            _owned_consumers=(),
+            _value_store=store,
+        )
+
+        receipts = execution.retire_request_states(
+            RequestFinishedBatch((identity,))
+        )
+
+        self.assertEqual(execution.request_state_retirement_report(), receipts)
+        self.assertEqual(len(receipts), 1)
+        (effect,) = receipts[0].slots
+        self.assertEqual((effect.before_version, effect.after_version), (0, 0))
+        self.assertEqual(service.versions(), ())
+
+        execution.prepare_step(2)
+        self.assertEqual(execution.request_state_retirement_report(), ())
+        execution.finish_step(2)
 
     def test_physical_region_binding_rejects_unsigned_node_reordering(self) -> None:
         trace: list[str] = []

@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import cast
-
 import torch
 
 from tllm.contracts.request_identity import (
@@ -42,6 +40,7 @@ from tllm.workload import (
     StagedPort,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     host_output,
     maybe_transition,
@@ -63,7 +62,7 @@ _INPLACE_ENABLED = ConfigField.boolean(True)
 
 
 class InPlaceTTTConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _INPLACE_ENABLED)
+    enabled: bool = declared_config_field(_INPLACE_ENABLED)
     layers: tuple[int, ...] = config_field(
         default=(0,), kind=ConfigKind.INT_TUPLE
     )

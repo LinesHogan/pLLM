@@ -220,6 +220,18 @@ def config_field(
     )
 
 
+def declared_config_field(field: ConfigField[T]) -> T:
+    """Install one reusable declaration field with its instance value type.
+
+    A ``ConfigField`` is intentionally dual-faced: declarations consume the
+    class-level descriptor while configured workload instances expose ``T``.
+    Keep that static bridge here beside Rust-owned config normalization so
+    workload authoring code never needs local casts.
+    """
+
+    return cast(T, field)
+
+
 @dataclass_transform(field_specifiers=(config_field,), frozen_default=True)
 class WorkloadConfig:
     """Immutable config base whose subclasses receive IDE-visible constructors."""
@@ -351,4 +363,5 @@ __all__ = [
     "NumericConstraint",
     "WorkloadConfig",
     "config_field",
+    "declared_config_field",
 ]

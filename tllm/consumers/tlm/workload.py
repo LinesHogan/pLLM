@@ -35,6 +35,7 @@ from tllm.workload import (
     TrainableState,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     host_output,
     maybe_transition,
@@ -68,13 +69,15 @@ class _CausalLMFactory(Protocol):
 
 TLMMode = Literal["online", "offline"]
 _TLM_ENABLED = ConfigField.boolean(True)
-_TLM_MODE = ConfigField.choice("online", ("online", "offline"))
+_TLM_MODE: ConfigField[TLMMode] = ConfigField.choice(
+    "online", ("online", "offline")
+)
 _TLM_LEARNING_RATE = ConfigField.floating(5e-5, NumericConstraint.POSITIVE)
 
 
 class TLMConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _TLM_ENABLED)
-    mode: TLMMode = cast(TLMMode, _TLM_MODE)
+    enabled: bool = declared_config_field(_TLM_ENABLED)
+    mode: TLMMode = declared_config_field(_TLM_MODE)
     model_id: str = config_field(
         default="Qwen/Qwen2.5-0.5B-Instruct", kind=ConfigKind.STR
     )
@@ -92,7 +95,7 @@ class TLMConfig(WorkloadConfig):
         kind=ConfigKind.FLOAT,
         constraint=NumericConstraint.UNIT_INTERVAL,
     )
-    learning_rate: float = cast(float, _TLM_LEARNING_RATE)
+    learning_rate: float = declared_config_field(_TLM_LEARNING_RATE)
     threshold: float = config_field(default=3.0, kind=ConfigKind.FLOAT)
     lamb: float = config_field(
         default=0.1,

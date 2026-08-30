@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import cast
-
 import torch
 
 from tllm.consumers.dummy.stream_runtime import DummyStreamRuntime
@@ -20,6 +18,7 @@ from tllm.workload import (
     NumericConstraint,
     WorkloadConfig,
     config_field,
+    declared_config_field,
     extern,
     hidden,
     step_id,
@@ -32,7 +31,7 @@ _DUMMY_ENABLED = ConfigField.boolean(True)
 
 
 class DummyConfig(WorkloadConfig):
-    enabled: bool = cast(bool, _DUMMY_ENABLED)
+    enabled: bool = declared_config_field(_DUMMY_ENABLED)
     enable_async: bool = config_field(default=True, kind=ConfigKind.BOOL)
     export_to_cpu: bool = config_field(default=True, kind=ConfigKind.BOOL)
     max_queue_size: int = config_field(

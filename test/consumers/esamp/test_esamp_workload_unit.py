@@ -8,14 +8,28 @@ import torch
 
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.config import ESampConsumerConfig
+from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.consumers.esamp.initializers.svd import (
     SVDModelBankInitializerConfig,
 )
 from tllm.consumers.esamp.legacy_workload import build_esamp_workload
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
+from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
+from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
+from tllm.contracts.request_identity import (
+    RequestFinishedBatch,
+    RequestIdentity,
+    RequestKeyField,
+)
+from tllm.runtime.request_trainable_state import (
+    RequestIdentityBatch,
+    RequestStateSelectionBatch,
+    RequestStateRuntimeService,
+    StateEffectOperation,
+)
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime import residual_runtime
@@ -43,6 +57,7 @@ from tllm.schedule import (
     ScheduleStateStorage,
 )
 from tllm.workload import declare_workload
+from tllm.workgraph.physical import CapturePolicy
 
 
 def _config(**overrides: object) -> ESampConfig:
@@ -115,6 +130,61 @@ def _specialized_workload(**overrides: object) -> ESampWorkload:
     return workload
 
 
+def _request_workload(*, rows: int = 4) -> ESampWorkload:
+    workload = ESampWorkload(
+        ESampConfig(
+            per_request_models=True,
+            distiller_hidden_dim=2,
+            distiller_lr=1e-2,
+        )
+    )
+    workload.cold_specialize(
+        RuntimeSpecializationSpec(
+            rows, 4, torch.float32, torch.device("cpu")
+        )
+    )
+    return workload
+
+
+def _run_request_step(
+    workload: ESampWorkload,
+    service: RequestStateRuntimeService[LowRankGatedResidualModel],
+    *,
+    step_id: int,
+    identities: tuple[RequestIdentity, ...],
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    tuple[torch.Tensor, ...],
+    RequestStateSelectionBatch,
+]:
+    service.stage_identities(step_id, RequestIdentityBatch(identities))
+    selection = service.selection_for_step(step_id)
+
+    prediction_read = service.before(
+        StateEffectOperation.READ, selection, step_id
+    )
+    prediction, training_source, training_target = workload.request_predict(
+        source, target, selection
+    )
+    service.after(prediction_read)
+
+    loss_read = service.before(StateEffectOperation.READ, selection, step_id)
+    loss_batch = workload.request_loss(
+        training_source, training_target, selection
+    )
+    service.after(loss_read)
+
+    transition = service.before(
+        StateEffectOperation.TRANSITION, selection, step_id
+    )
+    workload.request_train(loss_batch, selection)
+    service.after(transition)
+    service.finish_step(step_id)
+    return prediction, loss_batch.losses, selection
+
+
 def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
     """Drive the real signed sink path: task output -> auto-bound store."""
     prediction, _materialized, _target, _sample_indices = workload.predict(
@@ -127,6 +197,277 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
             prediction, step_id
         )
     return prediction
+
+
+class ESampRequestWorkloadUnitTest(unittest.TestCase):
+    def _legacy_reference(self) -> LowRankGatedResidualModel:
+        train_model = LowRankGatedResidualModel(
+            hidden_size=4,
+            rank=2,
+            use_output_layernorm=True,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        LowRankGatedResidualModel(
+            hidden_size=4,
+            rank=2,
+            use_output_layernorm=True,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        return train_model
+
+    def _reference_optimizer(
+        self, model: LowRankGatedResidualModel
+    ) -> torch.optim.AdamW:
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-2,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01,
+            foreach=False,
+            fused=None,
+        )
+
+    def test_request_parent_shares_one_lease_update_and_version_with_exact_oracle(
+        self,
+    ) -> None:
+        torch.manual_seed(41)
+        reference = self._legacy_reference()
+        reference_optimizer = self._reference_optimizer(reference)
+        torch.manual_seed(41)
+        workload = _request_workload()
+        service = workload.request_distiller
+
+        identities = (
+            RequestIdentity("parent-a", 7, 0),
+            RequestIdentity("parent-a", 7, 1),
+        )
+        source = torch.tensor(
+            [[0.2, -0.3, 0.4, -0.5], [0.6, 0.7, -0.8, 0.9]],
+            dtype=torch.float32,
+        )
+        target = torch.tensor(
+            [[-0.1, 0.5, 0.3, -0.7], [0.8, -0.6, 0.2, 0.4]],
+            dtype=torch.float32,
+        )
+
+        expected_prediction = reference(source)
+        expected_loss = torch.nn.functional.mse_loss(
+            reference(source).float(), target.float()
+        )
+        reference_optimizer.zero_grad(set_to_none=True)
+        expected_loss.backward()
+        reference_optimizer.step()
+
+        prediction, losses, selection = _run_request_step(
+            workload,
+            service,
+            step_id=3,
+            identities=identities,
+            source=source,
+            target=target,
+        )
+
+        torch.testing.assert_close(prediction, expected_prediction)
+        self.assertFalse(prediction.requires_grad)
+        self.assertIsNone(prediction.grad_fn)
+        self.assertEqual(len(selection.leases), 1)
+        self.assertEqual(
+            tuple(row.lease.slot for row in selection.rows),
+            (selection.leases[0].slot, selection.leases[0].slot),
+        )
+        self.assertEqual(len(losses), 1)
+        torch.testing.assert_close(losses[0], expected_loss)
+        selection_versions = service.versions()
+        self.assertEqual(len(selection_versions), 1)
+        self.assertEqual(selection_versions[0].key.request_id, "parent-a")
+        self.assertEqual(selection_versions[0].version, 1)
+        service.stage_identities(4, RequestIdentityBatch((identities[0],)))
+        inspection = service.selection_for_step(4)
+        trained_module = service.groups(inspection)[0].module
+        for actual, expected in zip(
+            trained_module.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(actual, expected)
+        service.finish_step(4)
+        self.assertEqual(
+            workload.native_workload_resources().services.diagnostics(),
+            {"loss_count": 1, "update_count": 1, "guidance_rows": 0},
+        )
+
+        service.retire_requests(RequestFinishedBatch(identities))
+        self.assertEqual(service.versions(), ())
+
+    def test_request_parents_remain_isolated_and_cleanup_releases_all_slots(self) -> None:
+        torch.manual_seed(83)
+        reference_a = self._legacy_reference()
+        reference_b = self._legacy_reference()
+        optimizer_a = self._reference_optimizer(reference_a)
+        optimizer_b = self._reference_optimizer(reference_b)
+        torch.manual_seed(83)
+        workload = _request_workload(rows=3)
+        service = workload.request_distiller
+
+        parent_a_rows = (
+            RequestIdentity("parent-a", 11, 0),
+            RequestIdentity("parent-a", 11, 1),
+        )
+        parent_b = RequestIdentity("parent-b", 13, 0)
+        identities = (parent_a_rows[0], parent_b, parent_a_rows[1])
+        source = torch.tensor(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [-0.5, 0.6, 0.7, -0.8],
+                [0.9, -1.0, 1.1, 1.2],
+            ],
+            dtype=torch.float32,
+        )
+        target = -source
+
+        expected_prediction = torch.empty_like(source)
+        parent_a_indices = torch.tensor((0, 2), dtype=torch.long)
+        parent_b_indices = torch.tensor((1,), dtype=torch.long)
+        expected_prediction.index_copy_(
+            0,
+            parent_a_indices,
+            reference_a(source.index_select(0, parent_a_indices)),
+        )
+        expected_prediction.index_copy_(
+            0,
+            parent_b_indices,
+            reference_b(source.index_select(0, parent_b_indices)),
+        )
+        expected_loss_a = torch.nn.functional.mse_loss(
+            reference_a(source.index_select(0, parent_a_indices)).float(),
+            target.index_select(0, parent_a_indices).float(),
+        )
+        expected_loss_b = torch.nn.functional.mse_loss(
+            reference_b(source.index_select(0, parent_b_indices)).float(),
+            target.index_select(0, parent_b_indices).float(),
+        )
+        optimizer_a.zero_grad(set_to_none=True)
+        expected_loss_a.backward()
+        optimizer_a.step()
+        optimizer_b.zero_grad(set_to_none=True)
+        expected_loss_b.backward()
+        optimizer_b.step()
+
+        prediction, losses, selection = _run_request_step(
+            workload,
+            service,
+            step_id=5,
+            identities=identities,
+            source=source,
+            target=target,
+        )
+
+        torch.testing.assert_close(prediction, expected_prediction)
+        self.assertEqual(len(selection.leases), 2)
+        self.assertEqual(len(losses), 2)
+        torch.testing.assert_close(losses[0], expected_loss_a)
+        torch.testing.assert_close(losses[1], expected_loss_b)
+        versions = {version.key.request_id: version.version for version in service.versions()}
+        self.assertEqual(versions, {"parent-a": 1, "parent-b": 1})
+
+        service.stage_identities(
+            7, RequestIdentityBatch((parent_a_rows[0], parent_b))
+        )
+        inspection = service.selection_for_step(7)
+        modules = {
+            group.lease.key.request_id: group.module
+            for group in service.groups(inspection)
+        }
+        for actual, expected in zip(
+            modules["parent-a"].parameters(),
+            reference_a.parameters(),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        for actual, expected in zip(
+            modules["parent-b"].parameters(),
+            reference_b.parameters(),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        service.finish_step(7)
+
+        _run_request_step(
+            workload,
+            service,
+            step_id=6,
+            identities=(parent_a_rows[0],),
+            source=source[:1],
+            target=target[:1],
+        )
+        versions = {version.key.request_id: version.version for version in service.versions()}
+        self.assertEqual(versions, {"parent-a": 2, "parent-b": 1})
+
+        service.stage_identities(8, RequestIdentityBatch((parent_b,)))
+        b_selection = service.selection_for_step(8)
+        b_read = service.before(StateEffectOperation.READ, b_selection, 8)
+        b_prediction, _, _ = workload.request_predict(
+            source[1:2], target[1:2], b_selection
+        )
+        service.after(b_read)
+        torch.testing.assert_close(b_prediction, reference_b(source[1:2]))
+        for actual, expected in zip(
+            service.groups(b_selection)[0].module.parameters(),
+            reference_b.parameters(),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        service.finish_step(8)
+        service.retire_requests(RequestFinishedBatch(identities))
+        self.assertEqual(service.versions(), ())
+
+    def test_reused_slot_matches_the_next_legacy_owner_initialization(self) -> None:
+        torch.manual_seed(117)
+        first_reference = self._legacy_reference()
+        second_reference = self._legacy_reference()
+        torch.manual_seed(117)
+        workload = _request_workload(rows=1)
+        service = workload.request_distiller
+
+        first_identity = RequestIdentity("first-parent", 21, 0)
+        service.stage_identities(
+            9, RequestIdentityBatch((first_identity,))
+        )
+        first_selection = service.selection_for_step(9)
+        first_module = service.groups(first_selection)[0].module
+        first_address = next(first_module.parameters()).data_ptr()
+        for actual, expected in zip(
+            first_module.parameters(),
+            first_reference.parameters(),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        service.finish_step(9)
+        service.retire_requests(RequestFinishedBatch((first_identity,)))
+
+        second_identity = RequestIdentity("second-parent", 22, 0)
+        service.stage_identities(
+            10, RequestIdentityBatch((second_identity,))
+        )
+        second_selection = service.selection_for_step(10)
+        second_module = service.groups(second_selection)[0].module
+        self.assertEqual(
+            next(second_module.parameters()).data_ptr(), first_address
+        )
+        for actual, expected in zip(
+            second_module.parameters(),
+            second_reference.parameters(),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        self.assertFalse(
+            torch.equal(
+                next(first_reference.parameters()),
+                next(second_reference.parameters()),
+            )
+        )
+        service.finish_step(10)
 
 
 class ESampRegionUnitTest(unittest.TestCase):
@@ -239,7 +580,6 @@ class ESampRegionUnitTest(unittest.TestCase):
             ({"consumer_id": "custom"}, "consumer_id"),
             ({"graph_scratch_rows": 8}, "graph_scratch_rows"),
             ({"enable_workgraph_execution": False}, "enable_workgraph_execution"),
-            ({"per_request_models": True}, "per_request_models"),
             (
                 {
                     "per_request_models": True,
@@ -264,6 +604,27 @@ class ESampRegionUnitTest(unittest.TestCase):
             ({"trace_max_points": 2}, "trace_max_points"),
             ({"compact_capture_lane": True}, "compact_capture_lane"),
             ({"distiller_sampler_backend": "pre_filter_dense"}, "distiller_sampler_backend"),
+            (
+                {
+                    "per_request_models": True,
+                    "enable_distiller_intervention": True,
+                },
+                "enable_distiller_intervention",
+            ),
+            (
+                {
+                    "per_request_models": True,
+                    "training_row_selection": "first_per_prompt",
+                },
+                "training_row_selection",
+            ),
+            (
+                {
+                    "per_request_models": True,
+                    "model_bank_use_output_layernorm": False,
+                },
+                "model_bank_use_output_layernorm",
+            ),
         )
         for overrides, option in cases:
             with self.subTest(option=option):
@@ -286,6 +647,103 @@ class ESampRegionUnitTest(unittest.TestCase):
             workload.config.training_row_selection,
             "first_per_prompt",
         )
+
+    def test_native_dispatch_selects_eager_request_state_mode(self) -> None:
+        dispatched = build_esamp_workload(
+            ESampConsumerConfig(
+                implementation="native",
+                per_request_models=True,
+            )
+        )
+        self.assertIs(type(dispatched), ESampWorkload)
+        workload = ESampWorkload(ESampConfig(per_request_models=True))
+        self.assertTrue(workload.config.per_request_models)
+        declaration = declare_workload(workload)
+        self.assertEqual(
+            tuple(task.name for task in declaration.ir.tasks),
+            ("request_predict", "request_loss", "request_train"),
+        )
+        request_state = declaration.ir.states[1]
+        self.assertEqual(request_state.scope.value, "request")
+        self.assertEqual(request_state.request_key, (RequestKeyField.REQUEST_ID,))
+
+    def test_request_state_regions_remain_scheduler_selected_eager_work(self) -> None:
+        for driver in (V027MRv1Driver(), V027MRv2Driver()):
+            for graph_mode in ("eager", "piecewise"):
+                with self.subTest(
+                    runner=driver.capabilities().runner_family,
+                    graph_mode=graph_mode,
+                ):
+                    workload = ESampWorkload(
+                        ESampConfig(
+                            per_request_models=True,
+                            distiller_hidden_dim=2,
+                        )
+                    )
+                    runtime = TllmRuntime(
+                        workloads=(workload,),
+                        workload_memory_budget_bytes=1 << 20,
+                    )
+                    runtime.cold_specialize_workloads(
+                        RuntimeSpecializationSpec(
+                            4,
+                            4,
+                            torch.float32,
+                            torch.device("cpu"),
+                        )
+                    )
+                    compilation = runtime.compile_workloads(
+                        driver.export_main_workload_timeline(
+                            graph_mode=graph_mode,
+                            static_headroom_bytes=1 << 20,
+                        )
+                    )
+                    regions = compilation.decision.execution_regions
+                    self.assertEqual(
+                        tuple(task for region in regions for task in region.tasks),
+                        (
+                            "request_predict",
+                            "request_loss",
+                            "request_train",
+                        ),
+                    )
+                    for region in regions:
+                        self.assertIs(
+                            region.stream, RegionStreamClass.DEFAULT
+                        )
+                        self.assertIs(
+                            region.host_submission,
+                            RegionHostSubmission.INLINE,
+                        )
+                        self.assertFalse(region.compile_safe)
+                        self.assertFalse(region.capture_safe)
+                        self.assertIs(
+                            region.capture_mode,
+                            RegionCaptureMode.DISABLED,
+                        )
+                    physical = compilation.physical
+                    assert physical is not None
+                    self.assertTrue(
+                        all(
+                            node.capture_policy is CapturePolicy.DISABLED
+                            for node in physical.nodes
+                        )
+                    )
+
+    def test_direct_request_workload_rejects_unsupported_first_phase_options(self) -> None:
+        for overrides, message in (
+            ({"intervention": True}, "sampler intervention"),
+            (
+                {"training_row_selection": "first_per_prompt"},
+                "training_row_selection",
+            ),
+            ({"output_layernorm": False}, "output_layernorm"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    ESampWorkload(
+                        ESampConfig(per_request_models=True, **overrides)
+                    )
 
     def test_first_per_prompt_selection_uses_typed_sample_identity(self) -> None:
         workload = _specialized_workload(

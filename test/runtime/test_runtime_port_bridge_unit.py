@@ -66,6 +66,32 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
 
         localize.assert_called_once_with()
 
+    def test_empty_decode_stages_an_explicit_empty_request_identity_batch(self) -> None:
+        execution = mock.Mock(requires_request_identities=True)
+        runtime = SimpleNamespace(
+            decode_row_idx=None,
+            decode_valid_mask=None,
+            decode_count=1,
+            decode_prompt_idxs=[0],
+            decode_sample_idxs=[0],
+            decode_request_ids=["request"],
+            decode_prompt_idx_tensor=None,
+            decode_sample_idx_tensor=None,
+            decode_compact_count=1,
+            decode_compact_row_ids=(0,),
+            event_step_id=7,
+            workload_execution=execution,
+        )
+
+        port_runtime_hooks._clear_decode_localization(
+            SimpleNamespace(RUNTIME=runtime)
+        )
+
+        execution.stage_request_identities.assert_called_once()
+        step_id, batch = execution.stage_request_identities.call_args.args
+        self.assertEqual(step_id, 7)
+        self.assertEqual(batch.identities, ())
+
     class _StepFlowConsumer(BaseConsumer):
         @property
         def consumer_id(self) -> str:
