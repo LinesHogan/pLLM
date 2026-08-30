@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Real HF/PEFT train -> generic overlay -> vLLM LoRA admission smoke."""
+"""Real HF/PEFT train -> generic overlay -> in-process vLLM LoRA smoke."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import cast
+
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import torch
 from vllm import SamplingParams
