@@ -167,7 +167,7 @@ class ESampRegionUnitTest(unittest.TestCase):
                     for task_name in region.tasks
                 }
 
-                self.assertEqual(compilation.graph.schema_version, 3)
+                self.assertEqual(compilation.graph.schema_version, 4)
                 self.assertIs(
                     compilation.graph.states[0].storage,
                     ScheduleStateStorage.OPTIMIZER_STABLE,

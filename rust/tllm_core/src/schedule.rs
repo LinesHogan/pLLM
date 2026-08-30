@@ -25,6 +25,7 @@ enum TaskImplementationKind {
 enum ScheduleInputKind {
     Hidden,
     Result,
+    StateSelection,
     Provided,
     StepId,
     Staged,
@@ -172,6 +173,7 @@ enum RegionInputKind {
     Hidden,
     Provided,
     Materialized,
+    StateSelection,
     StepId,
     Staged,
     SamplerRequestIds,
@@ -187,6 +189,7 @@ impl RegionInputKind {
             Self::Hidden => "hidden",
             Self::Provided => "provided",
             Self::Materialized => "materialized",
+            Self::StateSelection => "state_selection",
             Self::StepId => "step_id",
             Self::Staged => "staged",
             Self::SamplerRequestIds => "sampler_request_ids",
@@ -460,6 +463,22 @@ fn default_layer_kind() -> HiddenLayerKind {
 struct ScheduleEffect {
     kind: ScheduleEffectKind,
     resource: String,
+    /// Schema v4 binds request-scoped effects to a closed StateSelection
+    /// input of the owning task.  Earlier schema versions did not carry a
+    /// selection and therefore retain the empty wire value.
+    selection_port: Option<String>,
+}
+
+/// An effect emitted on a signed ExecutionRegion.  Request-scoped effects
+/// retain the canonical Region input binding selected by their task port;
+/// this prevents a worker from substituting an unrelated request slot after
+/// Rust has signed the region.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RegionEffect {
+    kind: ScheduleEffectKind,
+    resource: String,
+    selection_binding_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -792,7 +811,7 @@ struct ExecutionRegion {
     input_bindings: Vec<RegionInputBinding>,
     output_bindings: Vec<RegionOutputBinding>,
     task_invocations: Vec<RegionTaskInvocation>,
-    effects: Vec<ScheduleEffect>,
+    effects: Vec<RegionEffect>,
     compile_safe: bool,
     capture_safe: bool,
     side_stream_safe: bool,
@@ -885,7 +904,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 fn workload_compilation_wire_cache_key(graph: &str, timeline: &str, options: &str) -> String {
     digest(&format!(
-        "workload-compilation-v5\0{graph}\0{timeline}\0{options}"
+        "workload-compilation-v6\0{graph}\0{timeline}\0{options}"
     ))
 }
 
@@ -1632,15 +1651,21 @@ const CAPTURE_STABLE_STATE_TRANSITION: &str = "optimizer";
 /// CUDA graph replay requires every captured state read to retain the same
 /// storage address.  The native optimizer contract updates parameters in
 /// place; replacement, publication, and custom transition contracts do not
-/// provide that guarantee.  Empty effect sets need no state-address proof.
+/// provide that guarantee.  Request slots are selected per invocation, so
+/// their binding is deliberately never capture-stable.
+fn state_has_capture_stable_storage(graph: &ScheduleGraph, resource: &str) -> bool {
+    graph.states.iter().any(|state| {
+        state.resource == resource
+            && state.scope != StateScope::Request
+            && state.storage == Some(ScheduleStateStorage::OptimizerStable)
+            && state.transition == CAPTURE_STABLE_STATE_TRANSITION
+    })
+}
+
 fn capture_effects_have_stable_storage(graph: &ScheduleGraph, effects: &[ScheduleEffect]) -> bool {
     effects.iter().all(|effect| {
         effect.kind == ScheduleEffectKind::StateRead
-            && graph.states.iter().any(|state| {
-                state.resource == effect.resource
-                    && state.storage == Some(ScheduleStateStorage::OptimizerStable)
-                    && state.transition == CAPTURE_STABLE_STATE_TRANSITION
-            })
+            && state_has_capture_stable_storage(graph, &effect.resource)
     })
 }
 
@@ -1669,7 +1694,7 @@ fn validate_optimizer_transition_task(graph: &ScheduleGraph, task: &ScheduleTask
                         SIDE_STREAM_SAFE_CAPABILITY.to_owned(),
                     ]
             });
-    if graph.schema_version != 3
+    if !matches!(graph.schema_version, 3 | 4)
         || optimizer_candidates != 1
         || task.implementation_ids.len() != 1
         || task.implementation_kinds.len() != 1
@@ -1814,9 +1839,11 @@ fn select_task_implementations(
 /// signed, inspectable evidence; the scheduler refuses to use them unless
 /// they agree with this Rust-owned derivation.
 fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
-    if graph.schema_version == 3 && graph.states.iter().any(|state| state.storage.is_none()) {
+    if matches!(graph.schema_version, 3 | 4)
+        && graph.states.iter().any(|state| state.storage.is_none())
+    {
         return Err(schedule_error(
-            "ScheduleGraph schema v3 requires explicit state storage evidence",
+            "ScheduleGraph schema v3+ requires explicit state storage evidence",
         ));
     }
     if graph.schema_version < 3 && graph.states.iter().any(|state| state.storage.is_some()) {
@@ -2007,7 +2034,7 @@ fn validate_inputs(
     timeline: &Timeline,
     options: &CompileOptions,
 ) -> PyResult<(HashMap<String, usize>, HashMap<String, usize>)> {
-    if !matches!(graph.schema_version, 1 | 2 | 3) || !matches!(timeline.schema_version, 1 | 2) {
+    if !matches!(graph.schema_version, 1 | 2 | 3 | 4) || !matches!(timeline.schema_version, 1 | 2) {
         return Err(value_error("unsupported schedule schema version"));
     }
     validate_derived_graph_semantics(graph)?;
@@ -2096,7 +2123,7 @@ fn validate_inputs(
             || state.transition.is_empty()
             || (state.scope == StateScope::Request) != !state.request_key.is_empty()
             || request_key_fields.len() != state.request_key.len()
-            || (graph.schema_version == 3 && state.storage.is_none())
+            || (matches!(graph.schema_version, 3 | 4) && state.storage.is_none())
             || (graph.schema_version < 3 && state.storage.is_some())
             || !state_resources.insert(state.resource.as_str())
         {
@@ -2151,6 +2178,7 @@ fn validate_inputs(
                     ));
                 }
                 ScheduleInputKind::Result
+                | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Provided
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
@@ -2171,6 +2199,7 @@ fn validate_inputs(
                     return Err(value_error("result schedule input requires an output name"));
                 }
                 ScheduleInputKind::Provided
+                | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
                 | ScheduleInputKind::SamplerSampleIdxs
@@ -2201,6 +2230,93 @@ fn validate_inputs(
                     )));
                 }
             }
+        }
+        if graph.schema_version == 4 {
+            for effect in &task.effects {
+                let selection_port = effect.selection_port.as_deref().ok_or_else(|| {
+                    value_error(
+                        "schema v4 schedule effects require an explicit selection_port field",
+                    )
+                })?;
+                if effect.kind == ScheduleEffectKind::ExternIo {
+                    if !selection_port.is_empty() {
+                        return Err(value_error(
+                            "extern_io schedule effects forbid a state selection port",
+                        ));
+                    }
+                    continue;
+                }
+                let state = graph
+                    .states
+                    .iter()
+                    .find(|state| state.resource == effect.resource)
+                    .ok_or_else(|| {
+                        value_error("schema v4 state effect references an unknown typed state")
+                    })?;
+                if state.scope == StateScope::Request {
+                    let selection = task
+                        .inputs
+                        .iter()
+                        .find(|input| input.name == selection_port);
+                    if selection.is_none_or(|input| {
+                        input.kind != ScheduleInputKind::StateSelection
+                            || input.source != effect.resource
+                    }) {
+                        return Err(value_error(
+                            "request-scoped schedule effect requires its exact state_selection task input",
+                        ));
+                    }
+                } else if !selection_port.is_empty() {
+                    return Err(value_error(
+                        "non-request schedule effects forbid a state selection port",
+                    ));
+                }
+            }
+            for input in task
+                .inputs
+                .iter()
+                .filter(|input| input.kind == ScheduleInputKind::StateSelection)
+            {
+                let state = graph
+                    .states
+                    .iter()
+                    .find(|state| state.resource == input.source)
+                    .ok_or_else(|| {
+                        value_error("state_selection input references an unknown typed state")
+                    })?;
+                if state.scope != StateScope::Request
+                    || task
+                        .effects
+                        .iter()
+                        .filter(|effect| {
+                            effect.kind != ScheduleEffectKind::ExternIo
+                                && effect.resource == input.source
+                                && effect.selection_port.as_deref() == Some(input.name.as_str())
+                        })
+                        .count()
+                        != 1
+                {
+                    return Err(value_error(
+                        "state_selection input must bind exactly one request-scoped schedule effect",
+                    ));
+                }
+            }
+        } else if task
+            .effects
+            .iter()
+            .any(|effect| effect.selection_port.is_some())
+        {
+            return Err(value_error(
+                "schedule schemas before v4 forbid state selection ports",
+            ));
+        } else if task
+            .inputs
+            .iter()
+            .any(|input| input.kind == ScheduleInputKind::StateSelection)
+        {
+            return Err(value_error(
+                "schedule schemas before v4 forbid state_selection inputs",
+            ));
         }
         let mut output_names = BTreeSet::new();
         for output in &task.outputs {
@@ -2871,6 +2987,7 @@ fn draft_capture_safe(
                     }
                 }
                 ScheduleInputKind::Provided
+                | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
                 | ScheduleInputKind::SamplerSampleIdxs
@@ -3489,7 +3606,7 @@ fn async_optimizer_capture_eligible(
     materializations: &[Materialization],
     region_ids: &[String],
 ) -> bool {
-    if graph.schema_version != 3
+    if !matches!(graph.schema_version, 3 | 4)
         || options.capture_policy == "disabled"
         || timeline.graph_mode == "eager"
         || region_ids.len() < 2
@@ -4056,11 +4173,6 @@ fn compile_impl(
             .tasks
             .iter()
             .all(|index| selected[*index].side_stream_safe);
-        let effects: Vec<ScheduleEffect> = draft
-            .tasks
-            .iter()
-            .flat_map(|index| graph.tasks[*index].effects.iter().cloned())
-            .collect();
         // The stream class is assigned after input bindings refine
         // capture safety (see below): side placement requires the final
         // signed capture_safe, not the draft-time value.
@@ -4085,7 +4197,7 @@ fn compile_impl(
             input_bindings: Vec::new(),
             output_bindings: Vec::new(),
             task_invocations: Vec::new(),
-            effects,
+            effects: Vec::new(),
             compile_safe,
             capture_safe,
             side_stream_safe,
@@ -4258,6 +4370,7 @@ fn compile_impl(
                 } else {
                     let region_kind = match input.kind {
                         ScheduleInputKind::Hidden => RegionInputKind::Hidden,
+                        ScheduleInputKind::StateSelection => RegionInputKind::StateSelection,
                         ScheduleInputKind::Provided => RegionInputKind::Provided,
                         ScheduleInputKind::Staged => RegionInputKind::Staged,
                         ScheduleInputKind::SamplerRequestIds => RegionInputKind::SamplerRequestIds,
@@ -4408,8 +4521,45 @@ fn compile_impl(
         region.input_bindings = std::mem::take(&mut region_inputs[index]);
         region.output_bindings = std::mem::take(&mut region_outputs[index]);
         region.task_invocations = std::mem::take(&mut region_invocations[index]);
+        let mut effects = Vec::new();
+        for task_id in &region.tasks {
+            let task = &graph.tasks[task_index[task_id]];
+            for effect in &task.effects {
+                let selection_port = effect.selection_port.as_deref().unwrap_or("");
+                let selection_binding_id = if selection_port.is_empty() {
+                    String::new()
+                } else {
+                    region
+                        .input_bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.kind == RegionInputKind::StateSelection
+                                && binding.source == effect.resource
+                                && binding.consumers.iter().any(|port| {
+                                    port.task_id == *task_id
+                                        && port.port_name == selection_port
+                                })
+                        })
+                        .map(|binding| binding.binding_id.clone())
+                        .ok_or_else(|| {
+                            schedule_error(
+                                "request-scoped effect has no canonical Region state selection binding",
+                            )
+                        })?
+                };
+                effects.push(RegionEffect {
+                    kind: effect.kind,
+                    resource: effect.resource.clone(),
+                    selection_binding_id,
+                });
+            }
+        }
+        region.effects = effects;
         region.capture_safe = region.capture_safe
-            && capture_effects_have_stable_storage(graph, &region.effects)
+            && region.effects.iter().all(|effect| {
+                effect.kind == ScheduleEffectKind::StateRead
+                    && state_has_capture_stable_storage(graph, &effect.resource)
+            })
             && !region.input_bindings.is_empty()
             && region.input_bindings.iter().all(|binding| {
                 matches!(
@@ -4584,7 +4734,7 @@ fn compile_impl(
             explanations
         },
         signature: String::new(),
-        schema_version: 5,
+        schema_version: 6,
     };
     let unsigned = serde_json::to_string(&decision)
         .map_err(|error| schedule_error(format!("failed to serialize decision: {error}")))?;
@@ -4617,7 +4767,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     let supplied: Decision = decode(decision, "ScheduleDecision")?;
     let (anchor_index, task_index) = validate_inputs(&graph_desc, &timeline_desc, &options_desc)?;
     let selected = select_task_implementations(&graph_desc, &timeline_desc)?;
-    if supplied.schema_version != 5
+    if supplied.schema_version != 6
         || supplied.graph_key != digest(graph)
         || supplied.timeline_key != digest(timeline)
     {
@@ -4631,7 +4781,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         .any(|region| region.stream.is_none() || region.fallback_policy.is_none())
     {
         return Err(schedule_error(
-            "ScheduleDecision v5 ExecutionRegion requires explicit stream and fallback_policy",
+            "ScheduleDecision v6 ExecutionRegion requires explicit stream and fallback_policy",
         ));
     }
     if supplied.execution_regions.iter().any(|region| {
@@ -4639,7 +4789,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             != region.compile_command.is_some()
     }) {
         return Err(schedule_error(
-            "ScheduleDecision v5 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
+            "ScheduleDecision v6 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
         ));
     }
     let mut unsigned = supplied.clone();
@@ -4651,7 +4801,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
     if supplied.fallback != "explicit_regions" || !supplied.capture_partitions.is_empty() {
         return Err(schedule_error(
-            "ScheduleDecision v5 requires explicit regions and forbids capture_partitions",
+            "ScheduleDecision v6 requires explicit regions and forbids capture_partitions",
         ));
     }
     if supplied.execution_order.len() != graph_desc.tasks.len()
@@ -4804,6 +4954,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             .collect();
         let mut binding_ids = BTreeSet::new();
         let mut covered_inputs = BTreeSet::new();
+        let mut input_binding_by_port = BTreeMap::new();
         for binding in &region.input_bindings {
             if binding.binding_id.is_empty()
                 || binding.source.is_empty()
@@ -4835,12 +4986,63 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                     ));
                 }
                 let task = &graph_desc.tasks[task_index[&port.task_id]];
-                if !task.inputs.iter().any(|input| input.name == port.port_name) {
+                let input = task
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == port.port_name);
+                let Some(input) = input else {
                     return Err(schedule_error(
                         "ExecutionRegion typed input references an undeclared task port",
                     ));
+                };
+                if (input.kind == ScheduleInputKind::StateSelection)
+                    != (binding.kind == RegionInputKind::StateSelection)
+                    || (input.kind == ScheduleInputKind::StateSelection
+                        && input.source != binding.source)
+                {
+                    return Err(schedule_error(
+                        "ExecutionRegion state selection binding disagrees with its task input",
+                    ));
                 }
+                input_binding_by_port
+                    .insert((port.task_id.as_str(), port.port_name.as_str()), binding);
             }
+        }
+        let mut expected_effects = Vec::new();
+        for task_id in &region.tasks {
+            let task = &graph_desc.tasks[task_index[task_id]];
+            for effect in &task.effects {
+                let selection_port = effect.selection_port.as_deref().unwrap_or("");
+                let selection_binding_id = if selection_port.is_empty() {
+                    String::new()
+                } else {
+                    let binding = input_binding_by_port
+                        .get(&(task_id.as_str(), selection_port))
+                        .ok_or_else(|| {
+                            schedule_error(
+                                "ExecutionRegion request effect selection port is not bound",
+                            )
+                        })?;
+                    if binding.kind != RegionInputKind::StateSelection
+                        || binding.source != effect.resource
+                    {
+                        return Err(schedule_error(
+                            "ExecutionRegion request effect selection binding has the wrong source or kind",
+                        ));
+                    }
+                    binding.binding_id.clone()
+                };
+                expected_effects.push(RegionEffect {
+                    kind: effect.kind,
+                    resource: effect.resource.clone(),
+                    selection_binding_id,
+                });
+            }
+        }
+        if region.effects != expected_effects {
+            return Err(schedule_error(
+                "ExecutionRegion effects disagree with typed task effects and state selection bindings",
+            ));
         }
         if region.task_invocations.len() != region.tasks.len() {
             return Err(schedule_error(
@@ -4938,10 +5140,10 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
 
     let supplied_runtime_plan = supplied.runtime_advance_plan.as_ref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v5 requires an explicit runtime_advance_plan")
+        schedule_error("ScheduleDecision v6 requires an explicit runtime_advance_plan")
     })?;
     let supplied_completion_anchor = supplied.completion_anchor.as_deref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v5 requires an explicit completion_anchor")
+        schedule_error("ScheduleDecision v6 requires an explicit completion_anchor")
     })?;
     let supplied_regions_by_id: HashMap<&str, &ExecutionRegion> = supplied
         .execution_regions
@@ -5738,6 +5940,108 @@ mod tests {
     }
 
     #[test]
+    fn schema_v4_request_effects_bind_selection_ports_into_signed_regions() {
+        let graph = r#"{"workload_key":"request-selection","tasks":[{"task_id":"read","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"fast_weights","selection_port":"selection"}],"inputs":[{"name":"selection","kind":"state_selection","source":"fast_weights"}]}],"edges":[],"values":[],"states":[{"resource":"fast_weights","scope":"request","request_key":["request_id","sample_idx"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":4}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"full","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.pre"]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let options =
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.schema_version, 6);
+        let region = &decision.execution_regions[0];
+        let selection = region
+            .input_bindings
+            .iter()
+            .find(|binding| binding.kind == RegionInputKind::StateSelection)
+            .unwrap();
+        assert_eq!(selection.source, "fast_weights");
+        assert_eq!(selection.consumers.len(), 1);
+        assert_eq!(selection.consumers[0].task_id, "read");
+        assert_eq!(selection.consumers[0].port_name, "selection");
+        assert_eq!(
+            region.task_invocations[0].inputs[0].value_binding_id,
+            selection.binding_id
+        );
+        assert_eq!(region.effects.len(), 1);
+        assert_eq!(region.effects[0].resource, "fast_weights");
+        assert_eq!(region.effects[0].selection_binding_id, selection.binding_id);
+        assert!(!region.capture_safe);
+        assert_eq!(region.capture_mode, RegionCaptureMode::Disabled);
+        validate_schedule(graph, timeline, options, &compiled).unwrap();
+
+        let mut missing_selection_port: serde_json::Value = serde_json::from_str(graph).unwrap();
+        missing_selection_port["tasks"][0]["effects"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("selection_port");
+        let error =
+            compile_schedule(&missing_selection_port.to_string(), timeline, options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("require an explicit selection_port field"));
+
+        let malformed = graph.replace(
+            "\"selection_port\":\"selection\"",
+            "\"selection_port\":\"wrong\"",
+        );
+        let error = compile_schedule(&malformed, timeline, options).unwrap_err();
+        assert!(error.to_string().contains(
+            "request-scoped schedule effect requires its exact state_selection task input"
+        ));
+
+        let mut non_request: serde_json::Value = serde_json::from_str(graph).unwrap();
+        non_request["states"][0]["scope"] = serde_json::json!("replica");
+        non_request["states"][0]["request_key"] = serde_json::json!([]);
+        let error = compile_schedule(&non_request.to_string(), timeline, options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-request schedule effects forbid a state selection port"));
+
+        let mut extern_effect: serde_json::Value = serde_json::from_str(graph).unwrap();
+        extern_effect["tasks"][0]["effects"][0]["kind"] = serde_json::json!("extern_io");
+        let error = compile_schedule(&extern_effect.to_string(), timeline, options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("extern_io schedule effects forbid a state selection port"));
+
+        let mut tampered = decision.clone();
+        tampered.execution_regions[0].effects[0]
+            .selection_binding_id
+            .clear();
+        tampered.signature.clear();
+        let unsigned = serde_json::to_string(&tampered).unwrap();
+        tampered.signature = digest(&unsigned);
+        let resigned = serde_json::to_string(&tampered).unwrap();
+        let error = validate_schedule(graph, timeline, options, &resigned).unwrap_err();
+        assert!(error.to_string().contains(
+            "ExecutionRegion effects disagree with typed task effects and state selection bindings"
+        ));
+
+        let mut missing_selection: serde_json::Value = serde_json::from_str(&compiled).unwrap();
+        missing_selection["execution_regions"][0]["effects"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("selection_binding_id");
+        let error = validate_schedule(graph, timeline, options, &missing_selection.to_string())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing field `selection_binding_id`"));
+
+        let mut stale = decision;
+        stale.schema_version = 5;
+        stale.signature.clear();
+        let unsigned = serde_json::to_string(&stale).unwrap();
+        stale.signature = digest(&unsigned);
+        let stale_json = serde_json::to_string(&stale).unwrap();
+        let error = validate_schedule(graph, timeline, options, &stale_json).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("ScheduleDecision identity or schema does not match its inputs"));
+    }
+
+    #[test]
     fn worker_runtime_facts_are_closed_complete_and_exact() {
         let signed: CompileOptions = serde_json::from_str(
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"shape_specialization":[["runtime/device","cpu"],["runtime/dtype","torch.float32"],["runtime/hidden_size","4"],["runtime/rows","2"]],"schema_version":1}"#,
@@ -5975,7 +6279,7 @@ mod tests {
 
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
-        assert_eq!(decision.schema_version, 5);
+        assert_eq!(decision.schema_version, 6);
         let update_region = decision
             .execution_regions
             .iter()
@@ -6787,7 +7091,7 @@ mod tests {
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         validate_schedule(graph, timeline, options, &compiled).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
-        assert_eq!(decision.schema_version, 5);
+        assert_eq!(decision.schema_version, 6);
         let optimizer_region = decision
             .execution_regions
             .iter()

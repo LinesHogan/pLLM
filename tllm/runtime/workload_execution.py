@@ -119,12 +119,12 @@ from tllm.schedule.contracts import (
     HiddenLayerKind,
     RegionInputBinding,
     RegionInputKind,
+    RegionEffect,
     RegionOutputBinding,
     RegionOutputKind,
     RegionHostSubmission,
     RuntimeAdvancePlan,
     RuntimeHostCommand,
-    ScheduleEffect,
     ScheduleEffectKind,
     ScheduleGraph,
     ScheduleDecision,
@@ -230,8 +230,8 @@ def lower_signed_materialization_bindings(
     lifetime, producer, or consumer count themselves.
     """
 
-    if decision.schema_version != 5:
-        raise TypeError("decision must be a ScheduleDecision schema v5")
+    if decision.schema_version != 6:
+        raise TypeError("decision must be a ScheduleDecision schema v6")
 
     regions_by_id = {region.region_id: region for region in decision.execution_regions}
     artifacts_by_id: dict[str, RegionCallableArtifact] = {}
@@ -486,8 +486,12 @@ class StateVersionRegistry:
         self,
         states: tuple[ScheduleState, ...] = (),
         bindings: Mapping[str, StateVersionBinding] = MappingProxyType({}),
-        effects: tuple[ScheduleEffect, ...] = (),
+        effects: tuple[RegionEffect, ...] = (),
     ) -> None:
+        if any(effect.selection_binding_id for effect in effects):
+            raise RuntimeError(
+                "request-state selection requires the typed request-state audit service"
+            )
         state_by_resource = {state.resource: state for state in states}
         required = {
             effect.resource
@@ -533,7 +537,7 @@ class StateVersionRegistry:
 
     def before(
         self,
-        effects: tuple[ScheduleEffect, ...],
+        effects: tuple[RegionEffect, ...],
         step_id: int,
     ) -> Mapping[str, Mapping[Hashable, int]]:
         snapshots: dict[str, Mapping[Hashable, int]] = {}
@@ -553,7 +557,7 @@ class StateVersionRegistry:
 
     def after(
         self,
-        effects: tuple[ScheduleEffect, ...],
+        effects: tuple[RegionEffect, ...],
         step_id: int,
         before: Mapping[str, Mapping[Hashable, int]],
     ) -> None:

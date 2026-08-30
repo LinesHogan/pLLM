@@ -185,6 +185,9 @@ def lower_program(
         edges=tuple(inferred_edges),
         schedule=declaration.schedule,
         approximation=ApproximationPolicy.EXACT,
+        # Program declarations have no typed request-state selection input.
+        # Keep their legacy wire contract outside native WorkloadIR v3.
+        schema_version=2,
     )
 
 

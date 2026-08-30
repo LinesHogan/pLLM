@@ -12,10 +12,13 @@ import json
 import math
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, StrEnum
-from typing import Mapping, cast
+from typing import Mapping, TypeVar, cast
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.request_identity import RequestKeyField
+
+
+WireValueT = TypeVar("WireValueT")
 
 
 class StateScope(StrEnum):
@@ -95,6 +98,7 @@ class ValueSourceKind(StrEnum):
     SAMPLER_SAMPLE_IDX_TENSOR = "sampler_sample_idx_tensor"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
+    STATE_SELECTION = "state_selection"
 
 
 class HiddenLayerKind(StrEnum):
@@ -128,6 +132,16 @@ def _str_tuple(value: tuple[str, ...], label: str) -> tuple[str, ...]:
     if any(not item for item in value):
         raise TypeError(f"{label} must be tuple[non-empty str, ...]")
     return value
+
+
+def _wire_fields(items: list[tuple[str, WireValueT]]) -> dict[str, WireValueT]:
+    """Preserve pre-v3 EffectIR wire records when no selection is present."""
+
+    return {
+        name: value
+        for name, value in items
+        if name != "selection_port" or value != ""
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,10 +230,19 @@ class TaskOutputIR:
 class EffectIR:
     kind: EffectKind
     state: str
+    selection_port: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", EffectKind(self.kind))
         object.__setattr__(self, "state", _nonempty(self.state, "EffectIR.state"))
+        if self.selection_port:
+            object.__setattr__(
+                self,
+                "selection_port",
+                _nonempty(self.selection_port, "EffectIR.selection_port"),
+            )
+        if self.kind is EffectKind.EXTERN_IO and self.selection_port:
+            raise ValueError("extern_io EffectIR cannot declare a selection_port")
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,7 +368,7 @@ def canonical_value(value: object) -> object:
             for key, item in sorted(mapping.items(), key=lambda pair: str(pair[0]))
         }
     if is_dataclass(value) and not isinstance(value, type):
-        return canonical_value(asdict(value))
+        return canonical_value(asdict(value, dict_factory=_wire_fields))
     raise TypeError(f"workload IR cannot serialize {type(value).__module__}.{type(value).__qualname__}")
 
 
@@ -362,12 +385,12 @@ class WorkloadIR:
     edges: tuple[WorkloadEdge, ...]
     schedule: tuple[str, ...]
     approximation: ApproximationPolicy = ApproximationPolicy.EXACT
-    schema_version: int = 2
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workload_id", _nonempty(self.workload_id, "WorkloadIR.workload_id"))
         object.__setattr__(self, "approximation", ApproximationPolicy(self.approximation))
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise ValueError(f"unsupported WorkloadIR.schema_version {self.schema_version}")
         if self.schema_version == 1 and any(
             state.storage is not StateStorage.DYNAMIC for state in self.states
@@ -375,6 +398,75 @@ class WorkloadIR:
             raise ValueError(
                 "WorkloadIR schema v1 cannot carry stable state-storage evidence"
             )
+        selection_inputs = tuple(
+            task_input
+            for task in self.tasks
+            for task_input in task.inputs
+            if task_input.kind is ValueSourceKind.STATE_SELECTION
+        )
+        selection_effects = tuple(
+            effect
+            for task in self.tasks
+            for effect in task.effects
+            if effect.selection_port
+        )
+        if self.schema_version < 3 and (selection_inputs or selection_effects):
+            raise ValueError(
+                f"WorkloadIR schema v{self.schema_version} cannot carry request-state selection evidence"
+            )
+        if self.schema_version == 3:
+            state_by_name = {state.name: state for state in self.states}
+            for task in self.tasks:
+                inputs_by_name = {task_input.name: task_input for task_input in task.inputs}
+                for task_input in task.inputs:
+                    if task_input.kind is not ValueSourceKind.STATE_SELECTION:
+                        continue
+                    selected_state = state_by_name.get(task_input.source)
+                    if selected_state is None:
+                        raise ValueError(
+                            f"task {task.name!r} selection input references unknown state {task_input.source!r}"
+                        )
+                    if selected_state.scope is not StateScope.REQUEST:
+                        raise ValueError(
+                            f"task {task.name!r} selection input requires REQUEST state {task_input.source!r}"
+                        )
+                    matching_effects = tuple(
+                        effect
+                        for effect in task.effects
+                        if effect.kind is not EffectKind.EXTERN_IO
+                        and effect.state == task_input.source
+                        and effect.selection_port == task_input.name
+                    )
+                    if len(matching_effects) != 1:
+                        raise ValueError(
+                            f"task {task.name!r} state selection input must bind exactly one effect"
+                        )
+                for effect in task.effects:
+                    if effect.kind is EffectKind.EXTERN_IO:
+                        continue
+                    affected_state = state_by_name.get(effect.state)
+                    if affected_state is None:
+                        raise ValueError(
+                            f"task {task.name!r} effect references unknown state {effect.state!r}"
+                        )
+                    if affected_state.scope is StateScope.REQUEST:
+                        if not effect.selection_port:
+                            raise ValueError(
+                                f"task {task.name!r} request-state effect requires selection_port"
+                            )
+                        selection_input = inputs_by_name.get(effect.selection_port)
+                        if (
+                            selection_input is None
+                            or selection_input.kind is not ValueSourceKind.STATE_SELECTION
+                            or selection_input.source != effect.state
+                        ):
+                            raise ValueError(
+                                f"task {task.name!r} request-state effect selection_port must bind {effect.state!r}"
+                            )
+                    elif effect.selection_port:
+                        raise ValueError(
+                            f"task {task.name!r} non-request state effect cannot declare selection_port"
+                        )
         names = tuple(task.name for task in self.tasks)
         if len(names) != len(set(names)):
             raise ValueError("WorkloadIR contains duplicate task names")

@@ -17,6 +17,12 @@ from tllm.runtime.request_trainable_state import (
     RequestTrainableStateStore,
     StateEffectOperation,
 )
+from tllm.runtime.workload_execution import StateVersionRegistry
+from tllm.schedule.contracts import (
+    RegionEffect,
+    ScheduleEffectKind,
+    ScheduleState,
+)
 
 
 class _ScalarModel(torch.nn.Module):
@@ -294,3 +300,19 @@ def test_retirement_receipt_pins_generation_until_audit_consumes_it() -> None:
         replacement.selection.leases[0].slot.generation
         == retirement.slots[0].slot.generation + 1
     )
+
+
+def test_request_effect_cannot_fall_back_to_legacy_snapshot_audit() -> None:
+    state = ScheduleState(
+        resource="distiller",
+        scope="request",
+        request_key=(RequestKeyField.REQUEST_ID,),
+    )
+    effect = RegionEffect(
+        kind=ScheduleEffectKind.STATE_READ,
+        resource="distiller",
+        selection_binding_id="selection:distiller",
+    )
+
+    with pytest.raises(RuntimeError, match="typed request-state audit service"):
+        StateVersionRegistry((state,), {}, (effect,))

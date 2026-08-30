@@ -73,7 +73,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
         )
 
         graph = lower_schedule_graph((declaration.ir,))
-        self.assertEqual(graph.schema_version, 3)
+        self.assertEqual(graph.schema_version, 4)
         self.assertEqual(
             {state.resource: state.storage for state in graph.states},
             {
@@ -122,24 +122,34 @@ class WorkloadDslUnitTest(unittest.TestCase):
                 parameters="model",
                 optimizer=AdamWSpec.fixed(1e-3),
             )
+            selection = distiller.selection()
 
             @task(
-                inputs={"source": hidden(2, "post", "decode")},
+                inputs={
+                    "source": hidden(2, "post", "decode"),
+                    "selection": selection,
+                },
                 outputs={"prediction": sink("guidance"), "loss": temporary()},
-                effects=(read(distiller),),
+                effects=(read(selection),),
                 timing=Between("model.execute", "sampler.pre_draw"),
                 domain=Domain("tokens", indices=(token,), bounds=(("token", 0, "T"),)),
             )
-            def predict_and_loss(self, source: object) -> tuple[object, object]:
+            def predict_and_loss(
+                self, source: object, selection: object
+            ) -> tuple[object, object]:
+                _ = selection
                 return source, source
 
             @task(
-                inputs={"loss": result("predict_and_loss", "loss")},
-                effects=(transition(distiller),),
+                inputs={
+                    "loss": result("predict_and_loss", "loss"),
+                    "selection": selection,
+                },
+                effects=(transition(selection),),
                 timing=Before("next.prepare"),
             )
-            def update(self, loss: object) -> None:
-                _ = loss
+            def update(self, loss: object, selection: object) -> None:
+                _ = loss, selection
 
         declaration = declare_workload(ESamp())
         ir = declaration.ir
@@ -153,12 +163,26 @@ class WorkloadDslUnitTest(unittest.TestCase):
             (RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX),
         )
         self.assertEqual(ir.tasks[0].domain.name, "tokens")
+        self.assertEqual(ir.schema_version, 3)
+        self.assertEqual(ir.tasks[0].inputs[1].kind.value, "state_selection")
+        self.assertEqual(ir.tasks[0].inputs[1].source, "distiller")
+        self.assertEqual(ir.tasks[0].effects[0].selection_port, "selection")
+        self.assertEqual(ir.tasks[1].effects[0].selection_port, "selection")
         self.assertEqual(ir.edges[0].kind.value, "data")
         self.assertEqual(len(ir.semantic_key), 64)
         self.assertEqual(ir.semantic_key, declare_workload(ESamp()).ir.semantic_key)
         self.assertNotIn("<object at", ir.to_json())
+        self.assertIn('"selection_port":"selection"', ir.to_json())
+        with self.assertRaisesRegex(ValueError, "schema v2 cannot carry"):
+            replace(ir, schema_version=2)
+        tampered_predict = replace(
+            ir.tasks[0],
+            effects=(replace(ir.tasks[0].effects[0], selection_port="other"),),
+        )
+        with self.assertRaisesRegex(ValueError, "bind exactly one effect"):
+            replace(ir, tasks=(tampered_predict, *ir.tasks[1:]))
         graph = lower_schedule_graph((ir,))
-        self.assertEqual(graph.schema_version, 3)
+        self.assertEqual(graph.schema_version, 4)
         self.assertEqual(graph.states[0].resource, "distiller")
         self.assertEqual(graph.states[0].scope, "request")
         self.assertEqual(
@@ -166,10 +190,43 @@ class WorkloadDslUnitTest(unittest.TestCase):
             (RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX),
         )
         self.assertEqual(graph.tasks[0].effects[0].resource, "distiller")
+        self.assertEqual(graph.tasks[0].effects[0].selection_port, "selection")
+        self.assertEqual(
+            tuple(task_input.kind.value for task_input in graph.tasks[0].inputs),
+            ("hidden", "state_selection"),
+        )
         self.assertEqual(
             graph.tasks[0].implementation_capabilities,
             (("torch.export",),),
         )
+
+    def test_request_selection_requires_the_exact_task_input(self) -> None:
+        state = State(
+            scope=StateScope.REQUEST,
+            key=request_key(RequestKeyField.REQUEST_ID),
+            parameters="model",
+            optimizer=AdamWSpec.fixed(1e-3),
+        )
+        selection = state.selection()
+
+        with self.assertRaisesRegex(ValueError, "exact selection input"):
+
+            @task(effects=(read(selection),))
+            def missing_selection(self) -> None:
+                return None
+
+        other_selection = state.selection()
+        with self.assertRaisesRegex(ValueError, "exact selection input"):
+
+            @task(
+                inputs={"selection": other_selection},
+                effects=(transition(selection),),
+            )
+            def different_selection(self, selection: object) -> None:
+                _ = selection
+
+        with self.assertRaisesRegex(ValueError, "State.selection requires a REQUEST"):
+            State.replica(optimizer=AdamWSpec.fixed(1e-3)).selection()
 
     def test_jacobi_is_explicit_and_changes_semantic_key(self) -> None:
         def build(policy: ApproximationPolicy) -> str:
@@ -251,8 +308,8 @@ class WorkloadDslUnitTest(unittest.TestCase):
 
         exact_graph = lower_schedule_graph((declare_workload(Plain()).ir,))
         self.assertEqual(exact_graph.workload_approximations, ())
-        # Exact-only graphs keep a byte-identical wire form (golden identity).
-        self.assertNotIn("workload_approximations", exact_graph.to_json())
+        # Schema v4 has a strict closed wire shape, including exact evidence.
+        self.assertIn("workload_approximations", exact_graph.to_json())
 
         timeline = MainWorkloadTimeline(
             backend_id="vllm",

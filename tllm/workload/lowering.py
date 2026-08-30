@@ -52,6 +52,14 @@ def lower_schedule_graph(
 
     if persistent_state_bytes < 0:
         raise ValueError("persistent_state_bytes must be non-negative")
+    has_native_v3 = any(workload.schema_version == 3 for workload in workloads)
+    if has_native_v3 and any(
+        workload.schema_version < 3 for workload in workloads
+    ):
+        raise ValueError(
+            "cannot combine native WorkloadIR v3 with legacy WorkloadIR"
+        )
+    graph_schema_version = 4 if has_native_v3 else 3
     semantic_keys = tuple(workload.semantic_key for workload in workloads)
     combined_key = hashlib.sha256("\n".join(semantic_keys).encode("ascii")).hexdigest()
     multiple = len(workloads) > 1
@@ -163,6 +171,7 @@ def lower_schedule_graph(
                             effect.state
                             if effect.kind is EffectKind.EXTERN_IO
                             else state_id(workload, effect.state),
+                            selection_port=effect.selection_port,
                         )
                         for effect in task.effects
                     ),
@@ -193,6 +202,9 @@ def lower_schedule_graph(
                             source=(
                                 task_id(workload, task_input.source)
                                 if task_input.kind is ValueSourceKind.RESULT
+                                else state_id(workload, task_input.source)
+                                if task_input.kind
+                                is ValueSourceKind.STATE_SELECTION
                                 else task_input.source
                             ),
                             output=task_input.output,
@@ -264,7 +276,7 @@ def lower_schedule_graph(
         values=tuple(values),
         states=tuple(states),
         persistent_state_bytes=persistent_state_bytes,
-        schema_version=3,
+        schema_version=graph_schema_version,
         # Non-exact policies are signed into the graph so the Decision can
         # explain which Regions run under approximation parity.  Criteria
         # stay host-side (declaration-only) by design.

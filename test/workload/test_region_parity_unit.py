@@ -12,7 +12,7 @@ from tllm.schedule import (
     TimelineAnchor,
     WorkloadCompilerCoordinator,
 )
-from tllm.schedule.contracts import ScheduleEffect, ScheduleEffectKind
+from tllm.schedule.contracts import RegionEffect, ScheduleEffectKind
 from tllm.workload import (
     ApproximationCriteria,
     ApproximationPolicy,
@@ -171,7 +171,7 @@ class RegionParityGateUnitTest(unittest.TestCase):
         effectful = replace(
             region,
             effects=(
-                ScheduleEffect(kind=ScheduleEffectKind.STATE_WRITE, resource="bank"),
+                RegionEffect(kind=ScheduleEffectKind.STATE_WRITE, resource="bank"),
             ),
         )
         with mock.patch("torch.compile", side_effect=_eager_backend_compile):

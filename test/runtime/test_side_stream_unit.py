@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from tllm.runtime.workload_execution import _plan_resources
+from tllm.runtime.request_trainable_state import RequestStateSelectionBatch
 from tllm.schedule import (
     CompileOptions,
     MainWorkloadTimeline,
@@ -102,14 +103,23 @@ def _stateful_declaration():
             parameters="model",
             optimizer=AdamWSpec.fixed(1e-3),
         )
+        selected_bank = bank.selection()
 
         @task(
-            inputs={"value": provided("value")},
+            inputs={
+                "selection": selected_bank,
+                "value": provided("value"),
+            },
             outputs={"result_value": sink("result")},
-            effects=(read(bank),),
+            effects=(read(selected_bank),),
             timing=Between("model.execute", "step.end"),
         )
-        def run(self, value: object) -> object:
+        def run(
+            self,
+            selection: RequestStateSelectionBatch,
+            value: object,
+        ) -> object:
+            _ = selection
             assert isinstance(value, torch.Tensor)
             return value * 2
 

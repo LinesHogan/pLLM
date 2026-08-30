@@ -15,12 +15,12 @@ from tllm.schedule.contracts import (
     RegionAutogradPolicy,
     RegionCompileCommand,
     RegionCompilerAdapter,
+    RegionEffect,
     RegionInputBinding,
     RegionImplementationKind,
     RegionOutputBinding,
     RegionTaskInvocation,
     ScheduleDecision,
-    ScheduleEffect,
     ScheduleEffectKind,
 )
 from tllm.workload.frontend import WorkloadDeclaration
@@ -134,7 +134,7 @@ _MUTATING_EFFECT_KINDS = frozenset(
 )
 
 
-def _effects_are_replayable(effects: tuple[ScheduleEffect, ...]) -> bool:
+def _effects_are_replayable(effects: tuple[RegionEffect, ...]) -> bool:
     """A Region may be executed twice for parity only when it cannot mutate."""
     return all(effect.kind not in _MUTATING_EFFECT_KINDS for effect in effects)
 
@@ -282,7 +282,7 @@ class RegionCallableArtifact:
     compile_command: RegionCompileCommand | None = None
     input_bindings: tuple[RegionInputBinding, ...] = ()
     output_bindings: tuple[RegionOutputBinding, ...] = ()
-    effects: tuple[ScheduleEffect, ...] = ()
+    effects: tuple[RegionEffect, ...] = ()
     # Declared (rtol, atol) when an approximation workload covers this Region;
     # None means the exact-policy dtype-aware defaults.
     parity_tolerance: tuple[float, float] | None = None
@@ -367,8 +367,8 @@ class RegionArtifactRegistry:
         decision: ScheduleDecision,
         artifacts: tuple[RegionCallableArtifact, ...],
     ) -> None:
-        if decision.schema_version != 5:
-            raise ValueError("decision must use ScheduleDecision schema v5")
+        if decision.schema_version != 6:
+            raise ValueError("decision must use ScheduleDecision schema v6")
         by_region: dict[str, RegionCallableArtifact] = {}
         for artifact in artifacts:
             if artifact.region_id in by_region:
@@ -678,8 +678,8 @@ def materialize_region_artifacts(
 ) -> tuple[RegionCallableArtifact, ...]:
     """Materialize every signed Region without changing its partition or order."""
 
-    if decision.schema_version != 5:
-        raise ValueError("decision must use ScheduleDecision schema v5")
+    if decision.schema_version != 6:
+        raise ValueError("decision must use ScheduleDecision schema v6")
     artifacts = tuple(
         materialize_region_callable(
             declarations,

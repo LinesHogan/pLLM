@@ -351,6 +351,7 @@ class ScheduleInputKind(StrEnum):
     SAMPLER_SAMPLE_IDX_TENSOR = "sampler_sample_idx_tensor"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
+    STATE_SELECTION = "state_selection"
 
 
 class ScheduleOutputKind(StrEnum):
@@ -378,6 +379,7 @@ class RegionInputKind(StrEnum):
     SAMPLER_SAMPLE_IDX_TENSOR = "sampler_sample_idx_tensor"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
+    STATE_SELECTION = "state_selection"
 
 
 class HiddenLayerKind(StrEnum):
@@ -512,12 +514,23 @@ class RegionCompileCommand:
 class ScheduleEffect:
     kind: ScheduleEffectKind
     resource: str
+    # The declaration-local State selection port is signed on graph effects.
+    # Rust lowers it to the Region input binding id selected for this task.
+    selection_port: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", ScheduleEffectKind(self.kind))
         object.__setattr__(
             self, "resource", _name(self.resource, "ScheduleEffect.resource")
         )
+        if not isinstance(self.selection_port, str):
+            raise TypeError("ScheduleEffect.selection_port must be str")
+        if self.selection_port:
+            object.__setattr__(
+                self,
+                "selection_port",
+                _name(self.selection_port, "ScheduleEffect.selection_port"),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -890,7 +903,7 @@ class ScheduleGraph:
             if any(consumer not in known for consumer in value.consumers):
                 raise ValueError("ScheduleGraph value references an unknown consumer")
         object.__setattr__(self, "persistent_state_bytes", _bytes(self.persistent_state_bytes, "ScheduleGraph.persistent_state_bytes"))
-        if self.schema_version not in {1, 2, 3}:
+        if self.schema_version not in {1, 2, 3, 4}:
             raise ValueError("unsupported ScheduleGraph schema version")
         if self.schema_version >= 2 and any(
             len(task.implementation_capabilities) != len(task.implementation_ids)
@@ -906,6 +919,74 @@ class ScheduleGraph:
             raise ValueError(
                 "ScheduleGraph schema before v3 cannot carry stable state-storage evidence"
             )
+        state_by_resource = {state.resource: state for state in self.states}
+        for task in self.tasks:
+            selection_inputs = {
+                task_input.name: task_input
+                for task_input in task.inputs
+                if task_input.kind is ScheduleInputKind.STATE_SELECTION
+            }
+            if self.schema_version < 4 and selection_inputs:
+                raise ValueError(
+                    "ScheduleGraph schema before v4 cannot carry state selections"
+                )
+            for task_input in selection_inputs.values():
+                state = state_by_resource.get(task_input.source)
+                if state is None or state.scope != "request":
+                    raise ValueError(
+                        "state_selection ScheduleInput must source a request state resource"
+                    )
+            for effect in task.effects:
+                if self.schema_version < 4 and effect.selection_port:
+                    raise ValueError(
+                        "ScheduleGraph schema before v4 cannot carry effect selections"
+                    )
+                if effect.kind is ScheduleEffectKind.EXTERN_IO:
+                    if effect.selection_port:
+                        raise ValueError(
+                            "extern_io ScheduleEffect cannot carry a selection_port"
+                        )
+                    continue
+                state = state_by_resource.get(effect.resource)
+                if state is None:
+                    raise ValueError(
+                        "ScheduleEffect references an unknown state resource"
+                    )
+                if state.scope != "request":
+                    if effect.selection_port:
+                        raise ValueError(
+                            "only request-state ScheduleEffect may carry a selection_port"
+                        )
+                    continue
+                if self.schema_version < 4:
+                    continue
+                if not effect.selection_port:
+                    raise ValueError(
+                        "request-state ScheduleEffect requires a selection_port"
+                    )
+                selection = selection_inputs.get(effect.selection_port)
+                if selection is None:
+                    raise ValueError(
+                        "request-state ScheduleEffect.selection_port must name a "
+                        "same-task state_selection input"
+                    )
+                if selection.source != effect.resource:
+                    raise ValueError(
+                        "request-state ScheduleEffect selection source must equal resource"
+                    )
+            if self.schema_version >= 4:
+                for selection_name, selection in selection_inputs.items():
+                    matching_effects = sum(
+                        effect.kind is not ScheduleEffectKind.EXTERN_IO
+                        and effect.resource == selection.source
+                        and effect.selection_port == selection_name
+                        for effect in task.effects
+                    )
+                    if matching_effects != 1:
+                        raise ValueError(
+                            "state_selection ScheduleInput must bind exactly one "
+                            "same-task request-state ScheduleEffect"
+                        )
         if not isinstance(self.workload_approximations, tuple) or any(
             not isinstance(entry, tuple)
             or len(entry) != 2
@@ -944,7 +1025,17 @@ class ScheduleGraph:
             for state in states:
                 assert isinstance(state, dict)
                 state.pop("storage")
-        if not self.workload_approximations:
+        if self.schema_version < 4:
+            tasks = payload["tasks"]
+            assert isinstance(tasks, list)
+            for task in tasks:
+                assert isinstance(task, dict)
+                effects = task["effects"]
+                assert isinstance(effects, list)
+                for effect in effects:
+                    assert isinstance(effect, dict)
+                    effect.pop("selection_port")
+        if self.schema_version < 4 and not self.workload_approximations:
             # Exact-only graphs keep a byte-identical wire form and identity.
             payload.pop("workload_approximations")
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -952,7 +1043,184 @@ class ScheduleGraph:
     @classmethod
     def from_json(cls, payload: str) -> "ScheduleGraph":
         raw = json.loads(payload)
+        if not isinstance(raw, Mapping):
+            raise TypeError("ScheduleGraph must be a JSON object")
         schema_version = raw.get("schema_version", 1)
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise TypeError("ScheduleGraph.schema_version must be int")
+        if schema_version == 4:
+            graph_fields = (
+                "workload_key",
+                "tasks",
+                "edges",
+                "values",
+                "states",
+                "persistent_state_bytes",
+                "schema_version",
+                "workload_approximations",
+            )
+            task_fields = (
+                "task_id",
+                "timing",
+                "temporary_bytes",
+                "implementation_ids",
+                "implementation_kinds",
+                "implementation_capabilities",
+                "required_capabilities",
+                "capture_safe",
+                "effects",
+                "domain",
+                "accesses",
+                "inputs",
+                "outputs",
+            )
+            timing_fields = ("after", "before")
+            effect_fields = ("kind", "resource", "selection_port")
+            domain_fields = ("name", "indices", "bounds", "parameters")
+            access_fields = ("value", "indices", "mode")
+            affine_expr_fields = ("coefficients", "constant")
+            input_fields = (
+                "name",
+                "kind",
+                "source",
+                "output",
+                "layer",
+                "layer_kind",
+                "site",
+                "phase",
+            )
+            output_fields = ("name", "kind", "target")
+            edge_fields = ("source", "target", "kind")
+            value_fields = (
+                "value_id",
+                "version",
+                "producer",
+                "producer_output",
+                "consumers",
+                "size_bytes",
+                "alias_set",
+            )
+            state_fields = ("resource", "scope", "request_key", "storage", "transition")
+
+            def strict_object(
+                value: object,
+                label: str,
+                fields_: tuple[str, ...],
+            ) -> Mapping[str, object]:
+                return _require_json_fields(value, label, fields_, allowed=fields_)
+
+            strict_object(raw, "ScheduleGraph", graph_fields)
+            for task_position, task_raw in enumerate(
+                _json_array(raw["tasks"], "ScheduleGraph.tasks")
+            ):
+                task = strict_object(
+                    task_raw, f"ScheduleTask[{task_position}]", task_fields
+                )
+                strict_object(
+                    task["timing"],
+                    f"ScheduleTask[{task_position}].timing",
+                    timing_fields,
+                )
+                strict_object(
+                    task["domain"],
+                    f"ScheduleTask[{task_position}].domain",
+                    domain_fields,
+                )
+                for effect_position, effect_raw in enumerate(
+                    _json_array(
+                        task["effects"],
+                        f"ScheduleTask[{task_position}].effects",
+                    )
+                ):
+                    strict_object(
+                        effect_raw,
+                        f"ScheduleTask[{task_position}].effects[{effect_position}]",
+                        effect_fields,
+                    )
+                for access_position, access_raw in enumerate(
+                    _json_array(
+                        task["accesses"],
+                        f"ScheduleTask[{task_position}].accesses",
+                    )
+                ):
+                    access = strict_object(
+                        access_raw,
+                        f"ScheduleTask[{task_position}].accesses[{access_position}]",
+                        access_fields,
+                    )
+                    for expression_position, expression_raw in enumerate(
+                        _json_array(
+                            access["indices"],
+                            "ScheduleTask"
+                            f"[{task_position}].accesses[{access_position}].indices",
+                        )
+                    ):
+                        strict_object(
+                            expression_raw,
+                            "ScheduleTask"
+                            f"[{task_position}].accesses[{access_position}]"
+                            f".indices[{expression_position}]",
+                            affine_expr_fields,
+                        )
+                for input_position, input_raw in enumerate(
+                    _json_array(
+                        task["inputs"],
+                        f"ScheduleTask[{task_position}].inputs",
+                    )
+                ):
+                    strict_object(
+                        input_raw,
+                        f"ScheduleTask[{task_position}].inputs[{input_position}]",
+                        input_fields,
+                    )
+                for output_position, output_raw in enumerate(
+                    _json_array(
+                        task["outputs"],
+                        f"ScheduleTask[{task_position}].outputs",
+                    )
+                ):
+                    strict_object(
+                        output_raw,
+                        f"ScheduleTask[{task_position}].outputs[{output_position}]",
+                        output_fields,
+                    )
+            for edge_position, edge_raw in enumerate(
+                _json_array(raw["edges"], "ScheduleGraph.edges")
+            ):
+                strict_object(edge_raw, f"ScheduleEdge[{edge_position}]", edge_fields)
+            for value_position, value_raw in enumerate(
+                _json_array(raw["values"], "ScheduleGraph.values")
+            ):
+                strict_object(value_raw, f"ScheduleValue[{value_position}]", value_fields)
+            for state_position, state_raw in enumerate(
+                _json_array(raw["states"], "ScheduleGraph.states")
+            ):
+                strict_object(state_raw, f"ScheduleState[{state_position}]", state_fields)
+        elif schema_version < 4:
+            for task_position, task_raw in enumerate(
+                _json_array(raw.get("tasks", []), "ScheduleGraph.tasks")
+            ):
+                task = _require_json_fields(
+                    task_raw,
+                    f"ScheduleTask[{task_position}]",
+                    ("effects",),
+                )
+                for effect_position, effect_raw in enumerate(
+                    _json_array(
+                        task["effects"],
+                        f"ScheduleTask[{task_position}].effects",
+                    )
+                ):
+                    effect = _require_json_fields(
+                        effect_raw,
+                        f"ScheduleTask[{task_position}].effects[{effect_position}]",
+                        ("kind", "resource"),
+                    )
+                    if "selection_port" in effect:
+                        raise ValueError(
+                            "ScheduleGraph schema before v4 cannot carry "
+                            "selection_port wire fields"
+                        )
         if schema_version == 3:
             for position, state in enumerate(raw.get("states", ())):
                 if "storage" not in state:
@@ -1002,6 +1270,7 @@ class ScheduleGraph:
                         ScheduleEffect(
                             kind=ScheduleEffectKind(effect["kind"]),
                             resource=effect["resource"],
+                            selection_port=effect.get("selection_port", ""),
                         )
                         for effect in task.get("effects", ())
                     ),
@@ -1507,6 +1776,40 @@ class RegionTaskInvocation:
 
 
 @dataclass(frozen=True, slots=True)
+class RegionEffect:
+    """A scheduled effect bound to its concrete Region selection input.
+
+    ``selection_binding_id`` is empty for replica/shard/global state and
+    extern I/O.  Request-state effects instead name the signed
+    ``RegionInputBinding`` that carries their fixed slot selection.
+    """
+
+    kind: ScheduleEffectKind
+    resource: str
+    selection_binding_id: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", ScheduleEffectKind(self.kind))
+        object.__setattr__(self, "resource", _name(self.resource, "RegionEffect.resource"))
+        if not isinstance(self.selection_binding_id, str):
+            raise TypeError("RegionEffect.selection_binding_id must be str")
+        if self.selection_binding_id:
+            object.__setattr__(
+                self,
+                "selection_binding_id",
+                _name(
+                    self.selection_binding_id,
+                    "RegionEffect.selection_binding_id",
+                ),
+            )
+        if (
+            self.kind is ScheduleEffectKind.EXTERN_IO
+            and self.selection_binding_id
+        ):
+            raise ValueError("extern_io RegionEffect cannot carry a selection binding")
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionRegion:
     region_id: str
     tasks: tuple[str, ...]
@@ -1523,7 +1826,7 @@ class ExecutionRegion:
     input_bindings: tuple[RegionInputBinding, ...] = ()
     output_bindings: tuple[RegionOutputBinding, ...] = ()
     task_invocations: tuple[RegionTaskInvocation, ...] = ()
-    effects: tuple[ScheduleEffect, ...] = ()
+    effects: tuple[RegionEffect, ...] = ()
     compile_safe: bool = True
     capture_safe: bool = False
     side_stream_safe: bool = False
@@ -1624,15 +1927,33 @@ class ExecutionRegion:
                 "ExecutionRegion.task_invocations must cover Region tasks in order"
             )
         if not isinstance(self.effects, tuple) or any(
-            not isinstance(effect, ScheduleEffect) for effect in self.effects
+            not isinstance(effect, RegionEffect) for effect in self.effects
         ):
-            raise TypeError("ExecutionRegion.effects must be tuple[ScheduleEffect, ...]")
+            raise TypeError("ExecutionRegion.effects must be tuple[RegionEffect, ...]")
         binding_ids = tuple(
             binding.binding_id
             for binding in (*self.input_bindings, *self.output_bindings)
         )
         if len(binding_ids) != len(set(binding_ids)):
             raise ValueError("ExecutionRegion binding ids must be unique")
+        selection_bindings = {
+            binding.binding_id: binding
+            for binding in self.input_bindings
+            if binding.kind is RegionInputKind.STATE_SELECTION
+        }
+        for effect in self.effects:
+            if not effect.selection_binding_id:
+                continue
+            selection = selection_bindings.get(effect.selection_binding_id)
+            if selection is None:
+                raise ValueError(
+                    "RegionEffect selection_binding_id must name a state_selection "
+                    "RegionInputBinding"
+                )
+            if selection.source != effect.resource:
+                raise ValueError(
+                    "RegionEffect selection binding source must equal resource"
+                )
         if tuple(sorted(self.required_capabilities)) != self.required_capabilities:
             raise ValueError("ExecutionRegion.required_capabilities must be sorted")
         for field_name in (
@@ -1904,10 +2225,10 @@ class ScheduleDecision:
     cost: CostBreakdown = CostBreakdown(0, 0, 0, 0)
     explanations: tuple[str, ...] = ()
     signature: str = ""
-    schema_version: int = 5
+    schema_version: int = 6
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 4, 5}:
+        if self.schema_version not in {1, 4, 6}:
             raise ValueError("unsupported ScheduleDecision schema version")
         if not isinstance(self.execution_regions, tuple) or any(
             not isinstance(region, ExecutionRegion) for region in self.execution_regions
@@ -1930,6 +2251,14 @@ class ScheduleDecision:
             ):
                 raise ValueError("legacy ScheduleDecision cannot contain ExecutionRegion data")
         else:
+            if self.schema_version == 4 and any(
+                effect.selection_binding_id
+                for region in self.execution_regions
+                for effect in region.effects
+            ):
+                raise ValueError(
+                    "ScheduleDecision schema v4 cannot carry request-state selection evidence"
+                )
             if not isinstance(self.runtime_advance_plan, tuple) or any(
                 not isinstance(advance, RuntimeAdvancePlan)
                 for advance in self.runtime_advance_plan
@@ -2069,6 +2398,16 @@ class ScheduleDecision:
                     assert isinstance(command, dict)
                     command.pop("async_capture_mode")
                     command.pop("async_artifact_key")
+        if self.schema_version == 4:
+            regions = payload["execution_regions"]
+            assert isinstance(regions, list)
+            for region in regions:
+                assert isinstance(region, dict)
+                effects = region["effects"]
+                assert isinstance(effects, list)
+                for effect in effects:
+                    assert isinstance(effect, dict)
+                    effect.pop("selection_binding_id")
         payload["signature"] = self.signature
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -2082,16 +2421,17 @@ class ScheduleDecision:
         schema_version = raw["schema_version"]
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise TypeError("ScheduleDecision.schema_version must be int")
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 5}:
             raise ValueError(
                 f"ScheduleDecision schema v{schema_version} is stale; "
-                "recompile with schema v5"
+                "recompile with schema v6"
             )
-        if schema_version not in {1, 4, 5}:
+        if schema_version not in {1, 4, 6}:
             raise ValueError("unsupported ScheduleDecision schema version")
 
-        is_v4 = schema_version in {4, 5}
-        if is_v4:
+        has_region_data = schema_version in {4, 6}
+        is_v6 = schema_version == 6
+        if has_region_data:
             _require_json_fields(
                 raw,
                 "ScheduleDecision",
@@ -2104,17 +2444,19 @@ class ScheduleDecision:
             )
         region_payloads = _json_array(
             raw["execution_regions"]
-            if is_v4
+            if has_region_data
             else raw.get("execution_regions", []),
             "ScheduleDecision.execution_regions",
         )
         materialization_payloads = _json_array(
-            raw["materializations"] if is_v4 else raw.get("materializations", []),
+            raw["materializations"]
+            if has_region_data
+            else raw.get("materializations", []),
             "ScheduleDecision.materializations",
         )
         runtime_advance_payloads = _json_array(
             raw["runtime_advance_plan"]
-            if is_v4
+            if has_region_data
             else raw.get("runtime_advance_plan", []),
             "ScheduleDecision.runtime_advance_plan",
         )
@@ -2176,7 +2518,11 @@ class ScheduleDecision:
             "autograd_policy",
             "fallback_policy",
         )
-        effect_fields = ("kind", "resource")
+        effect_fields = (
+            ("kind", "resource", "selection_binding_id")
+            if is_v6
+            else ("kind", "resource")
+        )
         binder_stage_fields = ("backend_event", "region_id", "implementation_id")
         host_command_fields = (
             ("kind", "submission_id", "region_ids")
@@ -2266,7 +2612,7 @@ class ScheduleDecision:
                 allowed=field_names,
             )
 
-        if is_v4:
+        if has_region_data:
             require_exact_object(raw, "ScheduleDecision", decision_fields)
             for position, placement in enumerate(
                 _json_array(raw["placements"], "ScheduleDecision.placements")
@@ -2312,7 +2658,7 @@ class ScheduleDecision:
 
         regions = tuple(
             require_exact_object(region, f"ExecutionRegion[{position}]", region_fields)
-            if is_v4
+            if has_region_data
             else _require_json_fields(region, f"ExecutionRegion[{position}]", ())
             for position, region in enumerate(region_payloads)
         )
@@ -2323,12 +2669,12 @@ class ScheduleDecision:
                 f"RuntimeAdvancePlan[{position}]",
                 runtime_advance_fields,
             )
-            if is_v4
+            if has_region_data
             else _require_json_fields(advance, f"RuntimeAdvancePlan[{position}]", ())
             for position, advance in enumerate(runtime_advance_payloads)
         )
 
-        if is_v4:
+        if has_region_data:
             for position, advance in enumerate(runtime_advances):
                 for command_position, command in enumerate(
                     _json_array(
@@ -2440,12 +2786,20 @@ class ScheduleDecision:
         def region_value(
             region: Mapping[str, object], field_name: str, legacy_default: object
         ) -> object:
-            return region[field_name] if is_v4 else region.get(field_name, legacy_default)
+            return (
+                region[field_name]
+                if has_region_data
+                else region.get(field_name, legacy_default)
+            )
 
         def nested_value(
             raw_value: Mapping[str, object], field_name: str, legacy_default: object
         ) -> object:
-            return raw_value[field_name] if is_v4 else raw_value.get(field_name, legacy_default)
+            return (
+                raw_value[field_name]
+                if has_region_data
+                else raw_value.get(field_name, legacy_default)
+            )
 
         def region_array(
             region: Mapping[str, object], field_name: str
@@ -2548,11 +2902,15 @@ class ScheduleDecision:
                 ),
             )
 
-        def schedule_effect(raw_value: object, label: str) -> ScheduleEffect:
+        def region_effect(raw_value: object, label: str) -> RegionEffect:
             effect = _require_json_fields(raw_value, label, effect_fields)
-            return ScheduleEffect(
+            return RegionEffect(
                 kind=ScheduleEffectKind(_json_string(effect["kind"], f"{label}.kind")),
                 resource=_json_string(effect["resource"], f"{label}.resource"),
+                selection_binding_id=_json_string(
+                    effect.get("selection_binding_id", ""),
+                    f"{label}.selection_binding_id",
+                ),
             )
 
         def region_capture_mode(raw_value: object, label: str) -> RegionCaptureMode:
@@ -2799,7 +3157,7 @@ class ScheduleDecision:
                     )
                 ),
                 effects=tuple(
-                    schedule_effect(effect, f"{label}.effects[{effect_position}]")
+                    region_effect(effect, f"{label}.effects[{effect_position}]")
                     for effect_position, effect in enumerate(region_array(region, "effects"))
                 ),
                 compile_safe=_json_bool(
@@ -2925,7 +3283,7 @@ class ScheduleDecision:
             ),
             completion_anchor=(
                 _json_string(raw["completion_anchor"], "ScheduleDecision.completion_anchor")
-                if is_v4
+                if has_region_data
                 else _json_string(raw.get("completion_anchor", ""), "ScheduleDecision.completion_anchor")
             ),
             materializations=tuple(
@@ -2967,6 +3325,7 @@ __all__ = [
     "RegionAutogradPolicy",
     "RegionCompileCommand",
     "RegionCaptureMode",
+    "RegionEffect",
     "RegionStreamClass",
     "RegionFallbackPolicy",
     "RegionHostSubmission",

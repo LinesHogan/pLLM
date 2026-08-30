@@ -201,6 +201,32 @@ class _StateOwner(Protocol[StateValueT]):
     def state_value(self, state: "State[StateValueT]") -> StateValueT: ...
 
 
+class _StateReference(Protocol):
+    @property
+    def scope(self) -> StateScope: ...
+
+    @property
+    def optimizer(self) -> OptimizerSpec | None: ...
+
+    @property
+    def transition_kind(self) -> str: ...
+
+    @property
+    def name(self) -> str: ...
+
+
+class _StateEffectTarget(Protocol):
+    @property
+    def effect_state(self) -> _StateReference: ...
+
+    def make_effect(self, kind: EffectKind) -> "StateEffect": ...
+
+
+class _StateSelection(Protocol):
+    @property
+    def selected_state(self) -> _StateReference: ...
+
+
 class ConfiguredValue(Protocol[ConfiguredT_co]):
     def resolve(self, config: WorkloadConfig) -> ConfiguredT_co: ...
 
@@ -382,6 +408,20 @@ class State(Generic[StateValueT]):
             transition=self.transition_kind,
         )
 
+    @property
+    def effect_state(self) -> Self:
+        return self
+
+    def make_effect(self, kind: EffectKind) -> "StateEffect":
+        return StateEffect(kind, self)
+
+    def selection(self) -> "StateSelectionInput[StateValueT]":
+        """Bind a task-local input to this request-owned state family."""
+
+        if self.scope is not StateScope.REQUEST:
+            raise ValueError("State.selection requires a REQUEST State")
+        return StateSelectionInput(self)
+
 
 class TrainableState(State[StateValueT]):
     optimizer: OptimizerSpec
@@ -416,29 +456,44 @@ class PublishedModule(State[StateValueT]):
         self.port.__set_name__(owner, f"{name}__publish")
 
 
-class _EffectState(Protocol):
-    @property
-    def optimizer(self) -> OptimizerSpec | None: ...
+def _state_id(state: _StateReference) -> str:
+    return state.name
+
+
+@dataclass(frozen=True, slots=True)
+class StateSelectionInput(Generic[StateValueT]):
+    """The exact request-state lease consumed by one task declaration."""
+
+    selected_state: _StateReference
+
+    def __post_init__(self) -> None:
+        if self.selected_state.scope is not StateScope.REQUEST:
+            raise ValueError("StateSelectionInput requires a REQUEST State")
 
     @property
-    def transition_kind(self) -> str: ...
+    def effect_state(self) -> _StateReference:
+        return self.selected_state
 
-    def to_ir(self) -> StateIR: ...
-
-
-def _state_id(state: _EffectState) -> str:
-    return state.to_ir().name
+    def make_effect(self, kind: EffectKind) -> "StateEffect":
+        return StateEffect(kind, self.selected_state, self)
 
 
 @dataclass(frozen=True, slots=True)
 class StateEffect:
     kind: EffectKind
-    state: _EffectState
+    state: _StateReference
+    selection: _StateSelection | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", EffectKind(self.kind))
         if self.kind is EffectKind.EXTERN_IO:
             raise ValueError("extern_io uses ExternalEffect, not StateEffect")
+        if self.state.scope is StateScope.REQUEST and self.selection is None:
+            raise ValueError("request-state effects require State.selection()")
+        if self.state.scope is not StateScope.REQUEST and self.selection is not None:
+            raise ValueError("only request-state effects may declare a selection")
+        if self.selection is not None and self.selection.selected_state is not self.state:
+            raise ValueError("StateEffect selection must belong to its state")
 
     @property
     def resource_name(self) -> str:
@@ -461,21 +516,24 @@ class ExternalEffect:
 WorkloadEffect = StateEffect | ExternalEffect
 
 
-def read(state: State[StateValueT]) -> StateEffect:
-    return _effect(EffectKind.READ, state)
+def read(target: _StateEffectTarget) -> StateEffect:
+    return _effect(EffectKind.READ, target)
 
 
-def current(state: State[StateValueT]) -> StateEffect:
-    return _effect(EffectKind.CURRENT, state)
+def current(target: _StateEffectTarget) -> StateEffect:
+    return _effect(EffectKind.CURRENT, target)
 
 
-def transition(state: State[StateValueT]) -> StateEffect:
+def transition(target: _StateEffectTarget) -> StateEffect:
+    state = target.effect_state
     if state.optimizer is None and state.transition_kind == "optimizer":
         raise ValueError("transition requires a State optimizer or explicit version conversion")
-    return StateEffect(EffectKind.TRANSITION, state)
+    return _effect(EffectKind.TRANSITION, target)
 
 
-def maybe_transition(state: State[StateValueT]) -> StateEffect:
+def maybe_transition(
+    target: _StateEffectTarget,
+) -> StateEffect:
     """Declare a *conditional* transition: the version may or may not advance.
 
     Use this when whether the update fires is data-dependent and cannot be
@@ -487,15 +545,16 @@ def maybe_transition(state: State[StateValueT]) -> StateEffect:
     conditional transition therefore never weakens the signed ordering
     contract; it only widens the audited version delta.
     """
+    state = target.effect_state
     if state.optimizer is None and state.transition_kind == "optimizer":
         raise ValueError(
             "maybe_transition requires a State optimizer or explicit version conversion"
         )
-    return StateEffect(EffectKind.TRANSITION_MAYBE, state)
+    return _effect(EffectKind.TRANSITION_MAYBE, target)
 
 
-def next(state: State[StateValueT]) -> StateEffect:
-    return _effect(EffectKind.NEXT, state)
+def next(target: _StateEffectTarget) -> StateEffect:
+    return _effect(EffectKind.NEXT, target)
 
 
 def extern_io(resource: str) -> ExternalEffect:
@@ -513,8 +572,11 @@ def extern_io(resource: str) -> ExternalEffect:
     return ExternalEffect(resource)
 
 
-def _effect(kind: EffectKind, state: _EffectState) -> StateEffect:
-    return StateEffect(kind, state)
+def _effect(
+    kind: EffectKind,
+    target: _StateEffectTarget,
+) -> StateEffect:
+    return target.make_effect(kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -607,6 +669,7 @@ InputSpec = (
     | StepIdInput
     | StagedInput[object]
     | SamplerRuntimeInput
+    | _StateSelection
 )
 OutputSpec = (
     SinkOutput | TemporaryOutput | OptimizeOutput | SamplerOutput | HostOutputSpec[object]
@@ -1110,6 +1173,18 @@ def task(
         unknown = tuple(name for name, _ in task_inputs if name not in parameters)
         if unknown:
             raise ValueError(f"task inputs are not function parameters: {', '.join(unknown)}")
+        for effect in effects:
+            match effect:
+                case StateEffect(selection=selection) if selection is not None:
+                    ports = tuple(
+                        name for name, source in task_inputs if source is selection
+                    )
+                    if len(ports) != 1:
+                        raise ValueError(
+                            "request-state effect requires its exact selection input exactly once"
+                        )
+                case _:
+                    pass
         if implementations:
             try:
                 hints = get_type_hints(target)
@@ -1636,6 +1711,11 @@ def _timing_ir(value: Timing) -> TimingIR:
 
 
 def _input_ir(name: str, value: InputSpec) -> TaskInputIR:
+    match value:
+        case StateSelectionInput(selected_state=state):
+            return TaskInputIR(name, ValueSourceKind.STATE_SELECTION, _state_id(state))
+        case _:
+            pass
     if isinstance(value, HiddenInput):
         return TaskInputIR(
             name,
@@ -1740,13 +1820,35 @@ def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
                     ),
                 ),
             )
+        effect_irs: list[EffectIR] = []
+        for effect in declaration.effects:
+            match effect:
+                case StateEffect(selection=selection) if selection is not None:
+                    ports = tuple(
+                        parameter
+                        for parameter, input_spec in declaration.inputs
+                        if input_spec is selection
+                    )
+                    if len(ports) != 1:
+                        raise ValueError(
+                            f"task {name!r} request-state effect must bind its exact selection input exactly once"
+                        )
+                    effect_irs.append(
+                        EffectIR(
+                            effect.kind,
+                            effect.resource_name,
+                            selection_port=ports[0],
+                        )
+                    )
+                case StateEffect() | ExternalEffect():
+                    effect_irs.append(EffectIR(effect.kind, effect.resource_name))
         task_irs.append(
             TaskIR(
                 name=name,
                 ordinal=ordinal,
                 inputs=tuple(_input_ir(param, value) for param, value in declaration.inputs),
                 outputs=tuple(_output_ir(output, value) for output, value in declaration.outputs),
-                effects=tuple(EffectIR(effect.kind, effect.resource_name) for effect in declaration.effects),
+                effects=tuple(effect_irs),
                 timing=_timing_ir(declaration.timing),
                 implementations=implementations,
                 domain=declaration.domain.to_ir(),
@@ -1950,6 +2052,7 @@ __all__ = [
     "RequestKey",
     "State",
     "StateEffect",
+    "StateSelectionInput",
     "WorkloadEffect",
     "WorkloadDeclaration",
     "WorkloadAuthority",

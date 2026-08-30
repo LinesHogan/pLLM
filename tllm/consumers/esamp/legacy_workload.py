@@ -5,6 +5,7 @@ from __future__ import annotations
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.register import build as build_legacy_consumer
 from tllm.ports.consumer import BaseConsumer
+from tllm.runtime.request_trainable_state import RequestStateSelectionBatch
 from tllm.workload import (
     AdamWSpec,
     Before,
@@ -121,6 +122,27 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
         parameters="distiller",
         optimizer=AdamWSpec.fixed(float(resolved.distiller_lr)),
     )
+    if per_request:
+        selection = distiller.selection()
+        prediction_inputs = {
+            "source": hidden(resolved.source_layer_path, "block_output", "decode"),
+            "target": hidden(resolved.target_layer_path, "block_output", "decode"),
+            "selection": selection,
+        }
+        prediction_effect = read(selection)
+        update_inputs = {
+            "loss": result("predict_and_loss", "loss"),
+            "selection": selection,
+        }
+        update_effect = transition(selection)
+    else:
+        prediction_inputs = {
+            "source": hidden(resolved.source_layer_path, "block_output", "decode"),
+            "target": hidden(resolved.target_layer_path, "block_output", "decode"),
+        }
+        prediction_effect = read(distiller)
+        update_inputs = {"loss": result("predict_and_loss", "loss")}
+        update_effect = transition(distiller)
 
     @workload(
         id=identifier,
@@ -131,25 +153,31 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
         state = distiller
 
         @task(
-            inputs={
-                "source": hidden(resolved.source_layer_path, "block_output", "decode"),
-                "target": hidden(resolved.target_layer_path, "block_output", "decode"),
-            },
+            inputs=prediction_inputs,
             outputs={"prediction": sink("guidance"), "loss": temporary()},
-            effects=(read(state),),
+            effects=(prediction_effect,),
             timing=Between("model.execute", "sampler.pre_draw"),
         )
         def predict_and_loss(
-            self, source: object, target: object
+            self,
+            source: object,
+            target: object,
+            selection: RequestStateSelectionBatch | None = None,
         ) -> tuple[object, object]:
+            _ = selection
             raise RuntimeError("ESamp workload is declaration-only during legacy takeover")
 
         @task(
-            inputs={"loss": result("predict_and_loss", "loss")},
-            effects=(transition(state),),
+            inputs=update_inputs,
+            effects=(update_effect,),
             timing=Before("next.prepare"),
         )
-        def update(self, loss: object) -> None:
+        def update(
+            self,
+            loss: object,
+            selection: RequestStateSelectionBatch | None = None,
+        ) -> None:
+            _ = selection
             raise RuntimeError("ESamp workload is declaration-only during legacy takeover")
 
     return ESampWorkloadDeclaration()
