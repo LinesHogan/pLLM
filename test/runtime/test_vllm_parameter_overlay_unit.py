@@ -329,6 +329,30 @@ def test_controller_materializes_and_keeps_request_version_stable() -> None:
     )
 
 
+def test_parent_finish_releases_all_parallel_child_aliases_and_leases() -> None:
+    channel, store = _store(1.0)
+    harness = _OverlayHarness.create({channel: store})
+    harness.runtime.reqid_to_promptidx = {"parent": 9}
+    harness.runtime.reqid_to_sampleidx = {}
+    controller = harness.bind()
+
+    assert controller.sync_versions() == 1
+    assert controller.pin_request("0_parent") is not None
+    assert controller.pin_request("1_parent") is not None
+    first = RequestIdentity("parent", 9, 0)
+    second = RequestIdentity("parent", 9, 1)
+    lineage = OverlayLineage(channel)
+    assert store.pinned(OverlayLeaseKey(first, lineage)) is not None
+    assert store.pinned(OverlayLeaseKey(second, lineage)) is not None
+
+    batch = controller.finish_requests(("parent",))
+
+    assert batch.requests == (first, second)
+    assert harness.state.request_identities == {}
+    assert store.pinned(OverlayLeaseKey(first, lineage)) is None
+    assert store.pinned(OverlayLeaseKey(second, lineage)) is None
+
+
 def test_epoch_rebind_releases_old_leases_removes_adapters_and_allocates_new_ids() -> None:
     channel, first_store = _store(1.0)
     _, second_store = _store(2.0)

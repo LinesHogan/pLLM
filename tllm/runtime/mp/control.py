@@ -594,9 +594,19 @@ class ControlPlane:
         return [dict(entry) for entry in self.call("tllm_ping", timeout=timeout)]
 
     def push_request_mapping(
-        self, mappings: Iterable[tuple[str, int, int]], *, timeout: float | None = None
+        self,
+        mappings: Iterable[tuple[str, int, int | None]],
+        *,
+        timeout: float | None = None,
     ) -> None:
-        rows = [[str(req_id), int(prompt_idx), int(sample_idx)] for req_id, prompt_idx, sample_idx in mappings]
+        rows = [
+            [
+                str(req_id),
+                int(prompt_idx),
+                None if sample_idx is None else int(sample_idx),
+            ]
+            for req_id, prompt_idx, sample_idx in mappings
+        ]
         if not rows:
             return
         self.call("tllm_push_request_mapping", rows, timeout=timeout)

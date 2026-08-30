@@ -1120,6 +1120,18 @@ class NativeWorkloadExecution:
             case NoSamplerBinding():
                 return None
 
+    def stage_sampler_identity(
+        self,
+        step_id: int,
+        request_ids: tuple[str, ...],
+        sample_indices: tuple[int, ...],
+    ) -> None:
+        match self._sampler:
+            case SamplerRuntimeBinding(stage_identity=stage_identity):
+                stage_identity(step_id, request_ids, sample_indices)
+            case NoSamplerBinding():
+                pass
+
     def read_resource_diagnostics(self) -> Mapping[str, Mapping[str, int | float]]:
         """Return a validated, JSON-safe snapshot of local workload resources.
 

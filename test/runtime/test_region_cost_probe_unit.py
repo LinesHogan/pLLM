@@ -137,6 +137,7 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
         signed_before = compilation.decision.cost
 
         state = ResidualRuntimeState()
+        state.event_step_id = 7
         locator = ResidualLocator(0, "block_output", "decode")
         state.residual_bindings = {"source": ResidualPathBinding(locator, "source")}
         state.tap_decode_hidden = {"source": torch.randn(2, 4)}
@@ -152,9 +153,6 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
             )
             residual_runtime.prepare_physical_workgraph_step(7)
             regions = compilation.decision.execution_regions
-            residual_runtime.advance_workload_anchor(regions[0].placement_anchor)
-            # Stage the sampler-boundary training rows exactly as the bridge
-            # does between the reweight and train region advances.
             sampler = workload.native_workload_resources().sampler
             assert isinstance(sampler, SamplerRuntimeBinding)
             view = SamplerStepView(
@@ -173,6 +171,8 @@ class RegionCostBackfillIntegrationTest(unittest.TestCase):
                 model=object(),
                 runner=object(),
             )
+            sampler.stage_identity(7, view.request_ids, view.sample_idxs)
+            residual_runtime.advance_workload_anchor(regions[0].placement_anchor)
             modifier = sampler.provider.prepare_step(view)
             assert modifier is not None
             sampler.provider.after_sample(view, torch.tensor([2, 4], dtype=torch.long))

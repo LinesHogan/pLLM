@@ -50,10 +50,11 @@ def make_mapping_add_request(
         if request_sample_indices is not None and req_i < len(request_sample_indices):
             sample_idx = int(request_sample_indices[req_i])
         else:
-            sample_idx = 0
+            sample_idx = None
         counter["i"] += 1
         runtime.reqid_to_promptidx[str(request_id)] = prompt_idx
-        runtime.reqid_to_sampleidx[str(request_id)] = sample_idx
+        if sample_idx is not None:
+            runtime.reqid_to_sampleidx[str(request_id)] = sample_idx
         if plane is not None:
             plane.push_request_mapping([(str(request_id), prompt_idx, sample_idx)])
         return orig_add_request(request_id, prompt, p, *args, **kwargs)

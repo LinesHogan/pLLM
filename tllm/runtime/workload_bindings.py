@@ -173,6 +173,9 @@ class NoSamplerBinding:
 @dataclass(frozen=True, slots=True)
 class SamplerRuntimeBinding:
     provider: "SamplerModifierProvider"
+    stage_identity: Callable[
+        [int, tuple[str, ...], tuple[int, ...]], None
+    ]
 
 
 SamplerBinding = NoSamplerBinding | SamplerRuntimeBinding

@@ -331,9 +331,13 @@ class TllmWorkerExtension:
         for entry in mappings:
             request_id = _wire_text(entry[0], "request_id")
             prompt_idx = _wire_nonnegative_int(entry[1], "prompt_idx")
-            sample_idx = _wire_nonnegative_int(entry[2], "sample_idx")
             core.RUNTIME.reqid_to_promptidx[request_id] = prompt_idx
-            core.RUNTIME.reqid_to_sampleidx[request_id] = sample_idx
+            if entry[2] is None:
+                core.RUNTIME.reqid_to_sampleidx.pop(request_id, None)
+            else:
+                core.RUNTIME.reqid_to_sampleidx[request_id] = (
+                    _wire_nonnegative_int(entry[2], "sample_idx")
+                )
             count += 1
         return count
 
@@ -659,6 +663,9 @@ class TllmWorkerExtension:
                     runner=runner,
                     state=binding.parameter_overlay_state,
                 )
+        for request_id in request_ids:
+            core.RUNTIME.reqid_to_promptidx.pop(request_id, None)
+            core.RUNTIME.reqid_to_sampleidx.pop(request_id, None)
         return {
             "worker_id": self._tllm_worker_id(),
             "request_ids": list(request_ids),

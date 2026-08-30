@@ -59,6 +59,8 @@ class SpecRowMappingUnitTest(unittest.TestCase):
             decode_prompt_idx_buf=torch.zeros(rows, dtype=torch.long),
             decode_sample_idx_buf=torch.zeros(rows, dtype=torch.long),
             decode_count=0,
+            event_step_id=1,
+            workload_execution=None,
         )
 
     def test_multi_row_request_yields_strict_mapping(self) -> None:

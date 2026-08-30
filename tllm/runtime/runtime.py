@@ -54,6 +54,7 @@ from tllm.runtime.vllm_adapter import (
     bind_inprocess_runner,
     bind_runner_owner,
     create_llm,
+    generate_requests as generate_vllm_requests,
     install_generate_boundary,
 )
 from tllm.runtime.torch_adapter import runtime_torch_values
@@ -64,7 +65,8 @@ from tllm.workload.staging import (
 
 if TYPE_CHECKING:
     import torch
-    from vllm import LLM
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
     from vllm.outputs import RequestOutput
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
@@ -750,6 +752,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._port_transaction_sequence = 0
         self._staged_port_transactions: dict[str, _StagedPortTransaction] = {}
         self._shape_specialization_poll_lock = RLock()
+        self._generate_request_lock = RLock()
+        self._generate_request_mapping_active = False
+        self._generate_request_prompt_indices: tuple[int, ...] | None = None
+        self._generate_request_sample_indices: tuple[int, ...] | None = None
         native_workloads: list[
             tuple[ConfiguredWorkloadT, DeclarationDefinition]
         ] = []
@@ -1608,6 +1614,57 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._bind_engine_runners(llm)
         return llm
 
+    def generate_requests(
+        self,
+        llm: LLM,
+        prompts: Sequence[TokensPrompt],
+        sampling_params: SamplingParams,
+        *,
+        prompt_indices: Sequence[int] | None = None,
+        sample_indices: Sequence[int] | None = None,
+    ) -> list[RequestOutput]:
+        """Generate with exact request metadata for typed workload inputs."""
+
+        prompt_count = len(prompts)
+        resolved_prompt_indices = (
+            tuple(range(prompt_count))
+            if prompt_indices is None
+            else tuple(prompt_indices)
+        )
+        resolved_sample_indices = (
+            None if sample_indices is None else tuple(sample_indices)
+        )
+        for label, values in (
+            ("prompt_indices", resolved_prompt_indices),
+            ("sample_indices", resolved_sample_indices),
+        ):
+            if values is not None and (
+                len(values) != prompt_count or any(value < 0 for value in values)
+            ):
+                raise ValueError(
+                    f"{label} must contain one non-negative integer per prompt"
+                )
+        if resolved_sample_indices is not None and sampling_params.n != 1:
+            raise ValueError(
+                "explicit sample_indices require SamplingParams.n == 1"
+            )
+        with self._generate_request_lock:
+            if self._generate_request_mapping_active:
+                raise RuntimeError("a mapped generate call is already active")
+            self._generate_request_mapping_active = True
+            self._generate_request_prompt_indices = resolved_prompt_indices
+            self._generate_request_sample_indices = resolved_sample_indices
+            try:
+                return generate_vllm_requests(
+                    llm,
+                    prompts,
+                    sampling_params,
+                )
+            finally:
+                self._generate_request_prompt_indices = None
+                self._generate_request_sample_indices = None
+                self._generate_request_mapping_active = False
+
     def _bind_engine_runners(self, llm: object) -> None:
         """Record runner -> runtime routing for every live worker runner."""
         from tllm.runtime.mp.control import ControlPlane, set_active_control_plane
@@ -1652,7 +1709,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             request_ids = tuple(output.request_id for output in outputs)
             bindings = self.workload_execution_bindings
             expected_finished = (
-                len(request_ids)
+                sum(len(output.outputs) for output in outputs)
                 if bindings is not None and bindings.parameter_overlays
                 else None
             )
@@ -1666,7 +1723,24 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 )
                 raise
 
-        install_generate_boundary(llm, self, before_generate, after_generate)
+        def abort_generate(request_ids: tuple[str, ...]) -> None:
+            try:
+                plane.finish_workload_requests(request_ids)
+            except Exception:
+                self._fail_stop_workloads(
+                    "request-abort worker quorum diverged"
+                )
+                raise
+
+        install_generate_boundary(
+            llm,
+            self,
+            before_generate,
+            after_generate,
+            abort_generate,
+            lambda: self._generate_request_prompt_indices,
+            lambda: self._generate_request_sample_indices,
+        )
 
     def _coordinate_worker_compilation(self, plane: "ControlPlane") -> None:
         """Compile once in the parent from worker-reported pure timeline facts."""

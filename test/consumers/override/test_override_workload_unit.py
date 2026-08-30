@@ -252,6 +252,7 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
         compilation = runtime.compile_workloads(_timeline())
         hidden = torch.randn(2, _HIDDEN)
         state = ResidualRuntimeState()
+        state.event_step_id = 7
         state.decode_count = 2
         state.decode_request_ids = ["0_req", "1_req"]
         state.decode_prompt_idxs = [0, 0]
@@ -268,11 +269,12 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
             residual_runtime.prepare_physical_workgraph_step(7)
             regions = compilation.decision.execution_regions
             pre_draw = regions[0].placement_anchor
-            residual_runtime.advance_workload_anchor(pre_draw)
             sampler = workload.native_workload_resources().sampler
             assert isinstance(sampler, SamplerRuntimeBinding)
             assert isinstance(sampler.provider, DeclaredSamplerOutput)
             view = _view(hidden)
+            sampler.stage_identity(7, view.request_ids, view.sample_idxs)
+            residual_runtime.advance_workload_anchor(pre_draw)
             modifier = sampler.provider.prepare_step(view)
             self.assertIsNotNone(modifier)
             sampler.provider.after_sample(view, torch.tensor([2, 3]))
@@ -358,6 +360,7 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
                 )
 
             state = ResidualRuntimeState()
+            state.event_step_id = step_id
             state.decode_count = 2
             state.decode_request_ids = ["req-a", "req-b"]
             state.decode_prompt_idxs = [0, 0]
@@ -374,7 +377,6 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
                 residual_runtime.prepare_physical_workgraph_step(step_id)
                 regions = compilation.decision.execution_regions
                 pre_draw = regions[0].placement_anchor
-                residual_runtime.advance_workload_anchor(pre_draw)
                 sampler = workload.native_workload_resources().sampler
                 assert isinstance(sampler, SamplerRuntimeBinding)
                 assert isinstance(sampler.provider, DeclaredSamplerOutput)
@@ -394,6 +396,10 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
                     model=torch.nn.Module(),
                     runner=object(),
                 )
+                sampler.stage_identity(
+                    step_id, view.request_ids, view.sample_idxs
+                )
+                residual_runtime.advance_workload_anchor(pre_draw)
                 self.assertIsNotNone(sampler.provider.prepare_step(view))
                 sampler.provider.after_sample(view, tokens)
                 for region in regions:
@@ -436,6 +442,7 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
         compilation = runtime.compile_workloads(_timeline())
         hidden = torch.randn(2, _HIDDEN)
         state = ResidualRuntimeState()
+        state.event_step_id = 8
         state.decode_count = 2
         state.decode_request_ids = ["0_req", "1_req"]
         state.decode_prompt_idxs = [0, 0]
@@ -455,11 +462,12 @@ class OverRIDEWorkloadUnitTest(unittest.TestCase):
             residual_runtime.prepare_physical_workgraph_step(8)
             regions = compilation.decision.execution_regions
             pre_draw = regions[0].placement_anchor
-            residual_runtime.advance_workload_anchor(pre_draw)
             sampler = workload.native_workload_resources().sampler
             assert isinstance(sampler, SamplerRuntimeBinding)
             assert isinstance(sampler.provider, DeclaredSamplerOutput)
             view = _view(hidden, sample_idxs=(3, 3), engine_step_id=8)
+            sampler.stage_identity(8, view.request_ids, view.sample_idxs)
+            residual_runtime.advance_workload_anchor(pre_draw)
             modifier = sampler.provider.prepare_step(view)
             self.assertIsNotNone(modifier)
             sampler.provider.after_sample(view, torch.tensor((2, 3)))

@@ -495,7 +495,9 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                     output_sinks = {
                         policy.name: RuntimeOutputBinding(publish_sampler)
                     }
-                    sampler_binding = SamplerRuntimeBinding(sampler)
+                    sampler_binding = SamplerRuntimeBinding(
+                        sampler, self._sampler_context.prepare_identity
+                    )
         output_sinks.update(
             {
                 port.key: RuntimeOutputBinding(

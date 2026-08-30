@@ -584,30 +584,39 @@ class VLLMParameterOverlayController:
     ) -> RequestFinishedBatch:
         finished: list[RequestIdentity] = []
         observed: set[RequestIdentity] = set()
+        stores = set(self.stores.values())
         for request_id in request_ids:
             identity = self.state.request_identities.get(request_id)
             if identity is None:
                 identity = self._identity(request_id)
             aliases = tuple(
-                raw_id
+                (raw_id, raw_identity)
                 for raw_id, raw_identity in self.state.request_identities.items()
-                if raw_identity == identity
+                if raw_identity.request_id == identity.request_id
             )
-            for raw_id in aliases:
+            for raw_id, _raw_identity in aliases:
                 self.state.request_identities.pop(raw_id)
                 self.state.attached_requests.discard(raw_id)
                 self.state.dense_request_ids.discard(raw_id)
             self.state.attached_requests.discard(request_id)
             self.state.dense_request_ids.discard(request_id)
-            if identity in observed:
-                continue
-            observed.add(identity)
-            finished.append(identity)
-            stores = set(self.stores.values())
-            for store in stores:
-                for lineage in store.lineages():
-                    if lineage.request is None:
-                        store.release(OverlayLeaseKey(identity, lineage))
+            alias_identities = tuple(
+                raw_identity for _raw_id, raw_identity in aliases
+            )
+            identities = tuple(
+                dict.fromkeys((*alias_identities, identity))
+            )
+            for alias_identity in identities:
+                if alias_identity in observed:
+                    continue
+                observed.add(alias_identity)
+                finished.append(alias_identity)
+                for store in stores:
+                    for lineage in store.lineages():
+                        if lineage.request is None:
+                            store.release(
+                                OverlayLeaseKey(alias_identity, lineage)
+                            )
         return RequestFinishedBatch(tuple(finished))
 
     def finish_requests(

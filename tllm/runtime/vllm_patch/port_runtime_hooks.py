@@ -7,7 +7,7 @@ import copy
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence, TYPE_CHECKING
 
 import torch
 
@@ -32,6 +32,9 @@ from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hots
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.stats import PlacementStats
 from tllm.runtime.workload_execution import BackendObservableEvent
+
+if TYPE_CHECKING:
+    from tllm.runtime.workload_execution import NativeWorkloadExecution
 
 
 _COMPUTE_LOGITS_HOOK_FLAG = "_tllm_compute_logits_wrapped"
@@ -227,6 +230,7 @@ class PortRuntimeStateLike(Protocol):
     target_resolved_path: str
     event_step_id: int
     dispatch_plan: DispatchPlan | None
+    workload_execution: "NativeWorkloadExecution | None"
 
 
 class DecodeHookCoreLike(Protocol):
@@ -327,6 +331,11 @@ def store_decode_localization(
         core.RUNTIME.decode_sample_idx_tensor = None
         core.RUNTIME.decode_compact_count = 0
         core.RUNTIME.decode_compact_row_ids = ()
+        execution = core.RUNTIME.workload_execution
+        if execution is not None:
+            execution.stage_sampler_identity(
+                core.RUNTIME.event_step_id, (), ()
+            )
         return
 
     k = int(row_idx.numel())
@@ -357,6 +366,13 @@ def store_decode_localization(
     core.RUNTIME.decode_prompt_idxs = [int(x) for x in prompt_idxs]
     core.RUNTIME.decode_sample_idxs = [int(x) for x in sample_idxs]
     core.RUNTIME.decode_request_ids = [str(x) for x in request_ids]
+    execution = core.RUNTIME.workload_execution
+    if execution is not None:
+        execution.stage_sampler_identity(
+            core.RUNTIME.event_step_id,
+            tuple(core.RUNTIME.decode_request_ids),
+            tuple(core.RUNTIME.decode_sample_idxs),
+        )
     if needs_device_metadata:
         core.RUNTIME.decode_prompt_idx_tensor = decode_prompt_idx_buf[:k]
         core.RUNTIME.decode_sample_idx_tensor = decode_sample_idx_buf[:k]
@@ -411,6 +427,11 @@ def _clear_decode_localization(core: DecodeHookCoreLike) -> None:
     core.RUNTIME.decode_sample_idx_tensor = None
     core.RUNTIME.decode_compact_count = 0
     core.RUNTIME.decode_compact_row_ids = ()
+    execution = core.RUNTIME.workload_execution
+    if execution is not None:
+        execution.stage_sampler_identity(
+            core.RUNTIME.event_step_id, (), ()
+        )
 
 
 def prepare_decode_localization(

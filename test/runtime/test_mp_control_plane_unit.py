@@ -293,6 +293,23 @@ class ControlPlaneUnitTest(unittest.TestCase):
         ):
             extension.tllm_finish_workload_requests(["request-0"])
 
+    def test_request_finish_releases_exact_worker_request_mapping(self) -> None:
+        from tllm.runtime.state import ResidualRuntimeState
+
+        extension = TllmWorkerExtension()
+        extension.model_runner = SimpleNamespace()
+        state = ResidualRuntimeState(
+            reqid_to_promptidx={"request-0": 3, "request-1": 4},
+            reqid_to_sampleidx={"request-0": 5, "request-1": 6},
+        )
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            reply = extension.tllm_finish_workload_requests(["request-0"])
+
+        self.assertEqual(reply["finished"], 0)
+        self.assertEqual(state.reqid_to_promptidx, {"request-1": 4})
+        self.assertEqual(state.reqid_to_sampleidx, {"request-1": 6})
+
     def test_workload_worker_spec_wire_is_closed_and_does_not_coerce(self) -> None:
         self.assertEqual(
             WorkloadWorkerSpec.from_wire(
@@ -468,9 +485,12 @@ class ControlPlaneUnitTest(unittest.TestCase):
         saved_prompt = dict(residual_runtime.RUNTIME.reqid_to_promptidx)
         saved_sample = dict(residual_runtime.RUNTIME.reqid_to_sampleidx)
         try:
-            plane.push_request_mapping([("req-a", 3, 0), ("0_req-b", 4, 1)])
+            plane.push_request_mapping(
+                [("req-a", 3, 0), ("0_req-b", 4, 1), ("req-c", 5, None)]
+            )
             self.assertEqual(residual_runtime.RUNTIME.reqid_to_promptidx["req-a"], 3)
             self.assertEqual(residual_runtime.RUNTIME.reqid_to_sampleidx["0_req-b"], 1)
+            self.assertNotIn("req-c", residual_runtime.RUNTIME.reqid_to_sampleidx)
             plane.push_request_mapping([])  # empty: no RPC at all
             methods = [c[0] for c in llm.llm_engine.engine_core.calls]
             self.assertEqual(methods, ["tllm_push_request_mapping"])
@@ -1860,6 +1880,226 @@ class ControlPlaneUnitTest(unittest.TestCase):
         plane.finish_workload_requests.assert_called_once_with(
             ("request-0",), expected_finished=None
         )
+
+    def test_runtime_generate_publishes_exact_prompt_and_sample_indices(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+        from tllm.runtime.state import ResidualRuntimeState
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+        plane = mock.Mock()
+        events: list[tuple[str, object]] = []
+        plane.push_request_mapping.side_effect = lambda rows: events.append(
+            ("mapping", tuple(rows))
+        )
+        engine = SimpleNamespace(
+            add_request=mock.Mock(
+                side_effect=lambda request_id, _prompt, _params: events.append(
+                    ("request", request_id)
+                )
+                or request_id
+            ),
+            sleep=lambda *, level, mode: events.append(
+                ("pause", (level, mode))
+            ),
+            wake_up=lambda *, tags: events.append(("resume", tuple(tags))),
+        )
+
+        def run_engine(request_ids):
+            events.append(("run", tuple(request_ids)))
+            return [
+                SimpleNamespace(request_id=request_id)
+                for request_id in request_ids
+            ]
+
+        def generate(prompts, params, *, use_tqdm):
+            del use_tqdm
+            request_ids = tuple(
+                str(next(llm.request_counter)) for _prompt in prompts
+            )
+            for request_id, prompt in zip(request_ids, prompts, strict=True):
+                engine.add_request(request_id, prompt, params)
+            return llm._run_engine(request_ids)
+
+        llm = SimpleNamespace(
+            generate=generate,
+            llm_engine=engine,
+            request_counter=iter((40, 41, 42)),
+            _run_engine=run_engine,
+        )
+        state = ResidualRuntimeState()
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(ControlPlane, "try_bind", return_value=plane),
+            mock.patch.object(
+                runtime,
+                "apply_pending_worker_shape_specializations",
+                return_value=False,
+            ),
+        ):
+            runtime._install_generate_boundary(llm, plane)
+            outputs = runtime.generate_requests(
+                llm,
+                (
+                    {"prompt_token_ids": [1, 2, 3]},
+                    {"prompt_token_ids": [4, 5]},
+                ),
+                SimpleNamespace(n=1),
+                prompt_indices=(7, 8),
+                sample_indices=(3, 4),
+            )
+
+        self.assertEqual(
+            tuple(output.request_id for output in outputs), ("40", "41")
+        )
+        self.assertEqual(state.reqid_to_promptidx, {"40": 7, "41": 8})
+        self.assertEqual(state.reqid_to_sampleidx, {"40": 3, "41": 4})
+        plane.push_request_mapping.assert_called_once_with(
+            [("40", 7, 3), ("41", 8, 4)]
+        )
+        self.assertEqual(
+            events,
+            [
+                ("pause", (0, "keep")),
+                ("mapping", (("40", 7, 3), ("41", 8, 4))),
+                ("request", "40"),
+                ("request", "41"),
+                ("resume", ("scheduling",)),
+                ("run", ("40", "41")),
+            ],
+        )
+        self.assertEqual(next(llm.request_counter), 42)
+        self.assertFalse(runtime._generate_request_mapping_active)
+        self.assertIsNone(runtime._generate_request_prompt_indices)
+        self.assertIsNone(runtime._generate_request_sample_indices)
+
+    def test_runtime_generate_failure_releases_prepublished_batch(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+        plane = mock.Mock()
+        events: list[str] = []
+        plane.finish_workload_requests.side_effect = (
+            lambda _request_ids: events.append("cleanup")
+        )
+        original_add_request = mock.Mock(side_effect=lambda *_args: events.append("add"))
+        engine = SimpleNamespace(
+            add_request=original_add_request,
+            sleep=lambda *, level, mode: events.append(f"pause:{level}:{mode}"),
+            wake_up=lambda *, tags: events.append(f"resume:{','.join(tags)}"),
+        )
+
+        def run_engine() -> list[object]:
+            events.append("run")
+            raise RuntimeError("engine failed")
+
+        def generate(prompts, params, *, use_tqdm):
+            del use_tqdm
+            for prompt in prompts:
+                request_id = str(next(llm.request_counter))
+                engine.add_request(request_id, prompt, params)
+            return llm._run_engine()
+
+        llm = SimpleNamespace(
+            generate=generate,
+            llm_engine=engine,
+            request_counter=iter((50, 51, 52)),
+            _run_engine=run_engine,
+        )
+        with (
+            mock.patch.object(ControlPlane, "try_bind", return_value=plane),
+            mock.patch.object(
+                runtime,
+                "apply_pending_worker_shape_specializations",
+                return_value=False,
+            ),
+        ):
+            runtime._install_generate_boundary(llm, plane)
+            with self.assertRaisesRegex(RuntimeError, "engine failed"):
+                runtime.generate_requests(
+                    llm,
+                    (
+                        {"prompt_token_ids": [1, 2]},
+                        {"prompt_token_ids": [3, 4]},
+                    ),
+                    SimpleNamespace(n=1),
+                    prompt_indices=(0, 1),
+                    sample_indices=(2, 3),
+                )
+
+        plane.finish_workload_requests.assert_called_once_with(("50", "51"))
+        self.assertEqual(
+            events,
+            [
+                "pause:0:keep",
+                "add",
+                "add",
+                "resume:scheduling",
+                "run",
+                "cleanup",
+            ],
+        )
+        self.assertIs(engine.add_request, original_add_request)
+        self.assertIs(llm._run_engine, run_engine)
+        self.assertEqual(next(llm.request_counter), 52)
+        self.assertFalse(runtime._generate_request_mapping_active)
+        self.assertIsNone(runtime._generate_request_prompt_indices)
+        self.assertIsNone(runtime._generate_request_sample_indices)
+
+    def test_runtime_generate_rejects_explicit_indices_for_parallel_samples(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+
+        with self.assertRaisesRegex(ValueError, "SamplingParams.n == 1"):
+            runtime.generate_requests(
+                SimpleNamespace(),
+                ({"prompt_token_ids": [1, 2]},),
+                SimpleNamespace(n=2),
+                sample_indices=(3,),
+            )
+
+    def test_runtime_generate_cleanup_quorum_failure_fail_stops_runtime(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+        plane = mock.Mock()
+        plane.finish_workload_requests.side_effect = RuntimeError(
+            "cleanup quorum lost"
+        )
+        engine = SimpleNamespace(
+            add_request=mock.Mock(),
+            sleep=mock.Mock(),
+            wake_up=mock.Mock(),
+        )
+        original_generate = mock.Mock(side_effect=RuntimeError("render failed"))
+        llm = SimpleNamespace(
+            generate=original_generate,
+            llm_engine=engine,
+            request_counter=iter((60, 61)),
+            _run_engine=mock.Mock(),
+        )
+        with (
+            mock.patch.object(ControlPlane, "try_bind", return_value=plane),
+            mock.patch.object(
+                runtime,
+                "apply_pending_worker_shape_specializations",
+                return_value=False,
+            ),
+        ):
+            runtime._install_generate_boundary(llm, plane)
+            with self.assertRaisesRegex(RuntimeError, "cleanup quorum lost"):
+                runtime.generate_requests(
+                    llm,
+                    ({"prompt_token_ids": [1, 2]},),
+                    SimpleNamespace(n=1),
+                    sample_indices=(3,),
+                )
+            with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
+                llm.generate("next")
+
+        plane.finish_workload_requests.assert_called_once_with(("60",))
+        engine.wake_up.assert_called_once_with(tags=["scheduling"])
+        original_generate.assert_called_once()
 
     def test_shape_generate_wrapper_rejects_fail_stopped_runtime(self) -> None:
         from tllm.runtime.runtime import TllmRuntime

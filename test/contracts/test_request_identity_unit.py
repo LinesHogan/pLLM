@@ -32,6 +32,16 @@ class RequestIdentityUnitTest(unittest.TestCase):
             (7, 3),
         )
 
+    def test_explicit_sample_mapping_overrides_parallel_child_index(self) -> None:
+        self.assertEqual(
+            resolve_prompt_sample(
+                "3_parent_with_underscores",
+                prompt_indices={"parent_with_underscores": 7},
+                sample_indices={"parent_with_underscores": 11},
+            ),
+            (7, 11),
+        )
+
     def test_vllm_internal_suffix_resolves_direct_and_parallel_ids(self) -> None:
         mapping = {"external-request": 5}
         self.assertEqual(

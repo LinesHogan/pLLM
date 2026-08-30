@@ -53,7 +53,9 @@ def resolve_request_identity(
             return RequestIdentity(
                 request_id=external_parent,
                 prompt_idx=int(prompt_indices[external_parent]),
-                sample_idx=int(sample_text),
+                sample_idx=int(
+                    sample_map.get(external_parent, int(sample_text))
+                ),
             )
     return None
 

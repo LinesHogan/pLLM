@@ -218,6 +218,8 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
         runtime.decode_prompt_idxs = []
         runtime.decode_sample_idxs = []
         runtime.decode_request_ids = []
+        runtime.event_step_id = 1
+        runtime.workload_execution = None
         core.RUNTIME = runtime
         core.pick_common_attn_metadata = staticmethod(lambda attn_metadata, spec_decode_common: attn_metadata)
         seen_max_rows: list[int] = []

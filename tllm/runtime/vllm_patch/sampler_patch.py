@@ -85,7 +85,12 @@ def runtime_has_active_sampler_provider(runtime: Any) -> bool:
     return bool(provider is not None and provider.is_active())
 
 
-def dispatch_sampler_pre_draw(*, runtime: Any, runner: Any, device: torch.device) -> None:
+def dispatch_sampler_pre_draw(
+    *,
+    runtime: Any,
+    runner: Any,
+    device: torch.device,
+) -> None:
     """Publish the sampler parameter-read fence, then drain placed side work."""
     predecessor_events: tuple[object, ...] = ()
     if device.type == "cuda" and torch.cuda.is_available():

@@ -248,12 +248,16 @@ retired with `DummyConsumer`; native synchronization is an explicit service.
 ## Current verification boundary
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, short GPU correctness smokes
-cover native Dummy, Recirculation, ESamp, and TLM. TLM's MRv2 eager smoke
+cover native Dummy, Recirculation, OverRIDE, ESamp, and TLM. TLM's MRv2 eager smoke
 performs real HF/PEFT training and installs the published generic LoRA version;
 Recirculation
 passed typed layer replay in-process and under EngineCore MP on MRv1/MRv2;
 each cell replayed two requests and seven prompt rows with zero fallback. The
-latest ESamp run recorded `loss_count=6`,
+OverRIDE passed MRv1/MRv2 × in-process/EngineCore-MP with fixed per-runner token
+goldens, cumulative state versions `[2, 4, 6]`, exact final-iteration no-op,
+finished-request cleanup, and zero fallback. The generic mapped-generate
+boundary pauses only admission until the complete typed request batch is
+queued; it does not carry a workload scheduling policy. The latest ESamp run recorded `loss_count=6`,
 `update_count=6`, `state_version=6`, and `fallback_count=0`. Native ESamp
 exact eager Regions also passed EngineCore MP correctness on both runners:
 loss, update, state-version, and intervention counters were nonzero, with

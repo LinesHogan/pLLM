@@ -47,6 +47,9 @@ def install_generate_boundary(
     owner: object,
     before_generate: Callable[[], None],
     after_generate: Callable[[Sequence[RequestOutput]], None],
+    abort_generate: Callable[[tuple[str, ...]], None],
+    request_prompt_indices: Callable[[], Sequence[int] | None],
+    request_sample_indices: Callable[[], Sequence[int] | None],
 ) -> None:
     dynamic = cast(Any, llm)
     installed_owner: object | None = getattr(
@@ -71,18 +74,82 @@ def install_generate_boundary(
         )
 
         engine = dynamic.llm_engine
-        original_add_request = engine.add_request
-        engine.add_request = make_mapping_add_request(
-            runtime=residual_runtime.RUNTIME,
-            plane=ControlPlane.try_bind(dynamic),
-            orig_add_request=original_add_request,
-            request_prompt_indices=None,
-            request_sample_indices=None,
+        plane = ControlPlane.try_bind(dynamic)
+        prompt_indices = request_prompt_indices()
+        sample_indices = request_sample_indices()
+        mapping_prepublished = plane is not None and (
+            prompt_indices is not None or sample_indices is not None
         )
+        original_add_request = engine.add_request
+        original_request_counter: Any = None
+        original_run_engine: Any = None
+        prepublished_request_ids: tuple[str, ...] = ()
+        scheduling_resumed = False
+        if mapping_prepublished:
+            original_request_counter = dynamic.request_counter
+            original_run_engine = dynamic._run_engine
         try:
+            if mapping_prepublished:
+                engine.sleep(level=0, mode="keep")
+                if prompt_indices is not None:
+                    mapping_count = len(prompt_indices)
+                else:
+                    assert sample_indices is not None
+                    mapping_count = len(sample_indices)
+                assert plane is not None
+                request_ids = tuple(
+                    next(original_request_counter) for _ in range(mapping_count)
+                )
+                prepublished_request_ids = tuple(
+                    str(request_id) for request_id in request_ids
+                )
+                dynamic.request_counter = iter(request_ids)
+                plane.push_request_mapping(
+                    [
+                        (
+                            request_id,
+                            index
+                            if prompt_indices is None
+                            else int(prompt_indices[index]),
+                            None
+                            if sample_indices is None
+                            else int(sample_indices[index]),
+                        )
+                        for index, request_id in enumerate(
+                            prepublished_request_ids
+                        )
+                    ]
+                )
+
+                def run_after_bulk_admission(
+                    *run_args: Any, **run_kwargs: Any
+                ) -> Any:
+                    nonlocal scheduling_resumed
+                    if not scheduling_resumed:
+                        engine.wake_up(tags=["scheduling"])
+                        scheduling_resumed = True
+                    return original_run_engine(*run_args, **run_kwargs)
+
+                dynamic._run_engine = run_after_bulk_admission
+            engine.add_request = make_mapping_add_request(
+                runtime=residual_runtime.RUNTIME,
+                plane=None if mapping_prepublished else plane,
+                orig_add_request=original_add_request,
+                request_prompt_indices=prompt_indices,
+                request_sample_indices=sample_indices,
+            )
             outputs = generate(*args, **kwargs)
+        except Exception:
+            if prepublished_request_ids:
+                abort_generate(prepublished_request_ids)
+            raise
         finally:
             engine.add_request = original_add_request
+            if mapping_prepublished:
+                dynamic.request_counter = original_request_counter
+                dynamic._run_engine = original_run_engine
+                if not scheduling_resumed:
+                    engine.wake_up(tags=["scheduling"])
         after_generate(outputs)
         return outputs
 

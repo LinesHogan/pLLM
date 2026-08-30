@@ -14,7 +14,7 @@ from tllm.runtime.vllm_patch.capture_runner import (
 
 class _RecordingPlane:
     def __init__(self) -> None:
-        self.pushes: list[list[tuple[str, int, int]]] = []
+        self.pushes: list[list[tuple[str, int, int | None]]] = []
 
     def push_request_mapping(self, mappings) -> None:
         self.pushes.append(list(mappings))
@@ -53,9 +53,9 @@ class MappingAddRequestUnitTest(unittest.TestCase):
         # Each mapping push must land BEFORE the request is submitted; the
         # FIFO input socket then guarantees the child sees the mapping first.
         self.assertEqual(events, ["push", "add:req-a", "push", "add:req-b"])
-        self.assertEqual(plane.pushes, [[("req-a", 7, 0)], [("req-b", 8, 0)]])
+        self.assertEqual(plane.pushes, [[("req-a", 7, None)], [("req-b", 8, None)]])
         self.assertEqual(runtime.reqid_to_promptidx, {"req-a": 7, "req-b": 8})
-        self.assertEqual(runtime.reqid_to_sampleidx, {"req-a": 0, "req-b": 0})
+        self.assertEqual(runtime.reqid_to_sampleidx, {})
 
     def test_default_indices_and_reset(self) -> None:
         runtime = _RuntimeStub()

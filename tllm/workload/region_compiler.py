@@ -316,9 +316,15 @@ def _execute_with_grad(
 ) -> Mapping[str, object]:
     # The typed command already selected the only currently supported context.
     # This function does not infer a policy from Region tasks or Python state.
-    with torch.inference_mode(False):
-        with torch.enable_grad():
-            result = callable_artifact(*(inputs[key] for key in input_keys))
+    with torch.inference_mode(False), torch.enable_grad():
+        arguments = tuple(inputs[key] for key in input_keys)
+        owned_arguments = tuple(
+            argument.clone()
+            if torch.is_tensor(argument) and torch.is_inference(argument)
+            else argument
+            for argument in arguments
+        )
+        result = callable_artifact(*owned_arguments)
     if len(result) != len(output_keys):
         raise RuntimeError("Region callable returned an invalid output tuple")
     return dict(zip(output_keys, result, strict=True))

@@ -50,7 +50,8 @@ class WorkloadDslUnitTest(unittest.TestCase):
         import torch
 
         parameter = torch.nn.Parameter(torch.tensor([2.0]))
-        value = torch.tensor([3.0])
+        with torch.inference_mode():
+            value = torch.tensor([3.0])
         artifact = RegionCallableArtifact(
             region_id="region-grad",
             artifact_key="0" * 64,
@@ -66,6 +67,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
         loss = outputs["loss"]
         self.assertIsInstance(loss, torch.Tensor)
         assert isinstance(loss, torch.Tensor)
+        self.assertFalse(torch.is_inference(loss))
         self.assertTrue(loss.requires_grad)
         loss.backward()
         self.assertEqual(parameter.grad, torch.tensor([3.0]))

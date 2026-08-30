@@ -140,6 +140,29 @@ mixed prefill/decode packed step, where the Rust-signed admission selected
 only prefill request rows. CUDA Graph capture, hook retirement, speculative
 decode, and distributed TP/PP/DP support remain outside this evidence.
 
+The same follow-up closed native OverRIDE eager correctness on
+MRv1/MRv2 × in-process/EngineCore-MP. Every cell executed three training
+iterations followed by the signed final no-op iteration, advanced versions
+exactly `[2, 4, 6]`, reported six losses and six optimizer updates, and kept
+`fallback_count=0`. Fixed-RNG tokens matched exactly between in-process and MP
+within each runner family; the smoke freezes a separate golden for MRv1 and
+MRv2 because those upstream sampler implementations do not share one RNG
+sequence. Finished request mappings were empty in every cell.
+
+Mapped generation uses one generic bulk-admission transaction: level-0 pause,
+one typed identity publication, enqueue the complete public batch, then resume
+scheduling. This preserves the batch boundary across EngineCore transport but
+does not select lanes, priorities, fusion, or execution order; after admission,
+the existing scheduler remains the sole physical scheduling authority. The
+shared Region invocation boundary also owns inference tensors before entering
+autograd, rather than assigning that responsibility to OverRIDE or an MP
+adapter. Decode localization stages the exact request/sample identity for the
+signed step before automatically placed work can run; the later sampler view
+owns only same-step logits and sampled tokens. Parallel sampling keeps child
+sample identities when no explicit map is supplied, while parent completion
+retires every child alias and overlay lease. An explicit one-to-one sample map
+is rejected when `SamplingParams.n > 1` instead of being silently reinterpreted.
+
 ## Part II: Legacy Inventory
 
 | Surface | Permitted role until migrated |
@@ -163,3 +186,32 @@ descriptors. The authoring surface should provide IDE completion, static
 validation, and rename-safe references while lowering to the same stable
 symbol names used by Rust signatures. This ergonomics work must not introduce
 Python-side scheduling choices or weaken deterministic declaration lowering.
+
+## Deferred Profiling Support TODO
+
+At the end of the migration work, add one workload-independent profiling
+surface built on the existing Region cost probes and workgraph statistics. A
+typed `ProfileSpec`/`ProfileWindow` must coordinate the parent and EngineCore
+workers and attach stable NVTX/`record_function` correlation metadata to the
+signed workload, Region, artifact, plan epoch, physical node, step, anchor,
+stream, fence, host-service, state-transition, and eager/capture/replay
+boundaries. It must not introduce per-workload profiler callbacks or become a
+source of lanes, priorities, fusion, or execution-order policy.
+
+The supported analysis workflow should use Nsight Systems for the
+multi-process CPU/GPU timeline and overlap analysis, `torch.profiler` for
+operator attribution, and Nsight Compute only after a kernel hotspot has been
+identified. CUDA Graph analysis must preserve three separate, correlated
+windows for eager attribution, capture cost, and warmed steady-state replay
+under the same signed plan and shapes; capture overhead must never be folded
+into replay throughput. Stream-local CUDA events should be read after the
+window rather than inserting global synchronization that destroys the overlap
+being measured.
+
+Expose the same method to maintainers and workload authors through a minimal
+runtime profile-window API plus an external profiler-launch CLI. Reports should
+retain Region GPU duration, host launch and queue delay, fence wait, overlap,
+capture/replay/fallback counts, memory peaks, and training evidence such as
+loss/update counts. Tool-specific dynamic integration belongs only in its
+explicit adapter quarantine; the remaining Python profiling surface must stay
+strictly typed and context-deterministic.
