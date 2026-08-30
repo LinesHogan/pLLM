@@ -34,6 +34,15 @@ both tail state and leases. Physical placement, streams, fusion, and overlap
 remain Rust scheduler decisions.
 
 Current validation includes exact CPU tensor parity, multi-step tail state,
-immutable version publication, and request cleanup. Dense-version application
-inside vLLM remains a backend-adapter validation item; do not claim official
-checkpoint parity or CUDA-Graph parity until that test is present.
+immutable multi-layer version publication, request cleanup, mixed
+prefill/decode row assignment, generate-end signed cleanup, and real
+eager-GPU dense application in all four MRv1/MRv2 × in-process/EngineCore-MP
+cells. The GPU smoke is
+`test/gpu/native_inplace_ttt_workload_smoke.py`; it requires nonzero native
+update and dense-apply counts, a token-level effect relative to the base
+weight, and zero request state after the public generate boundary. Its
+training pair is deliberately supplied through the typed host service;
+automatic model-hidden pair production remains an explicit integration item.
+TP>1, PP>1, quantized targets, and CUDA Graph currently fail closed; native
+support for those modes and official-checkpoint parity must not be inferred
+from the eager evidence.

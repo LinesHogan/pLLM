@@ -50,6 +50,7 @@ from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspo
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 
 if TYPE_CHECKING:
+    from vllm import LLM
     from tllm.workgraph.anchors import BackendResolution
     from tllm.workgraph.frontend import CapturedFlow
     from tllm.workgraph.hierarchy import CaptureAttachment
@@ -1160,7 +1161,7 @@ def install_runner_patch() -> None:
     _lifecycle.install_runner_patch(sys.modules[__name__])
 
 
-def make_llm(*args: object, **kwargs: object) -> object:
+def make_llm(*args: object, **kwargs: object) -> "LLM":
     return _lifecycle.make_llm(sys.modules[__name__], *args, **kwargs)
 
 

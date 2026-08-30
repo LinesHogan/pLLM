@@ -10,7 +10,10 @@ from typing import cast
 
 import torch
 
-from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.request_identity import (
+    RequestFinishedBatch,
+    RequestIdentity,
+)
 from tllm.kit.workload import Workload
 from tllm.runtime.parameter_overlay import (
     OverlayChannel,
@@ -34,6 +37,7 @@ from tllm.workload import (
     NumericConstraint,
     ServiceState,
     State,
+    StagedLifecycle,
     StagedPort,
     WorkloadConfig,
     config_field,
@@ -118,11 +122,6 @@ class InPlaceTTTPublication:
     request: RequestIdentity
     version: OverlayVersionRef | None
     update_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTFinishBatch:
-    requests: tuple[RequestIdentity, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +215,9 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
     ].service(transition="overlay_publish")
     batch_tensors: StagedPort[Mapping[str, torch.Tensor]] = StagedPort()
     batch_metadata: StagedPort[InPlaceTTTMetadata] = StagedPort()
-    finished_requests: StagedPort[InPlaceTTTFinishBatch] = StagedPort()
+    finished_requests: StagedPort[RequestFinishedBatch] = StagedPort(
+        lifecycle=StagedLifecycle.REQUEST_FINISHED
+    )
     steps: HostOutput[InPlaceTTTStep] = HostOutput()
     publications: HostOutput[InPlaceTTTPublication] = HostOutput()
     cleanup: HostOutput[InPlaceTTTCleanupReceipt] = HostOutput()
@@ -224,6 +225,7 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
     def __init__(self, config: InPlaceTTTConfig = InPlaceTTTConfig()) -> None:
         self.update_count = 0
         self.trained_rows = 0
+        self.fast_weight_slot_count = 0
         self._overlay_store = OverlayVersionStore()
         super().__init__(config)
 
@@ -290,6 +292,7 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
             self.advance_state(InPlaceTTTWorkload.fast_weights)
         self.update_count += step.update_count
         self.trained_rows += step.trained_rows
+        self.fast_weight_slot_count = len(self.fast_weights.slots)
         return step
 
     @task(
@@ -297,7 +300,19 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         outputs={"publication": host_output(publications)},
         effects=(read(fast_weights), maybe_transition(overlay_versions)),
         timing=Before("next.prepare"),
-        implementation=extern("tllm.parameter_overlay:publish_exact@1"),
+        implementation=extern(
+            "tllm.parameter_overlay:publish_exact@1",
+            capabilities=(
+                "eager_only",
+                "parameter_overlay/representation/dense_replace",
+                "parameter_overlay/scope/request",
+                "parameter_overlay/phase/prefill",
+                "parameter_overlay/phase/decode",
+                "parameter_overlay/pinning/explicit_request_advance",
+                "parameter_overlay/mixed_versions/true",
+                "parameter_overlay/tensor_parallel_size/1",
+            ),
+        ),
     )
     def publish(self, step: InPlaceTTTStep) -> InPlaceTTTPublication:
         if not step.update_count:
@@ -338,7 +353,7 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         timing=Before("next.prepare"),
         implementation=extern("tllm.parameter_overlay:release_requests@1"),
     )
-    def finish(self, finished: InPlaceTTTFinishBatch) -> tuple[RequestIdentity, ...]:
+    def finish(self, finished: RequestFinishedBatch) -> tuple[RequestIdentity, ...]:
         return finished.requests
 
     @task(
@@ -353,6 +368,7 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
         cleared = self.fast_weights.clear_requests(request_set)
         if cleared:
             self.advance_state(InPlaceTTTWorkload.fast_weights)
+        self.fast_weight_slot_count = len(self.fast_weights.slots)
         return cleared
 
     @task(
@@ -383,6 +399,9 @@ class InPlaceTTTWorkload(Workload[InPlaceTTTConfig]):
                 {
                     "update_count": self.update_count,
                     "trained_rows": self.trained_rows,
+                    "dense_apply_rows": self._overlay_store.backend_applied_rows,
+                    "fast_weight_slots": self.fast_weight_slot_count,
+                    "overlay_bytes": self._overlay_store.byte_size,
                 }
             ),
             stats=self._accounting.read,
@@ -405,7 +424,6 @@ __all__ = [
     "InPlaceTTTCleanupReceipt",
     "InPlaceTTTConfig",
     "InPlaceTTTFastWeightState",
-    "InPlaceTTTFinishBatch",
     "InPlaceTTTKey",
     "InPlaceTTTMetadata",
     "InPlaceTTTPhase",

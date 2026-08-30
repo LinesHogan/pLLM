@@ -8,17 +8,20 @@ from unittest import mock
 
 import torch
 
-from tllm.backends.protocol import BackendCapabilities, GraphSafety
+from tllm.backends.protocol import (
+    BackendCapabilities,
+    GraphSafety,
+    VersionedParameterOverlayCapabilities,
+)
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.inplace_ttt.workload import (
     InPlaceTTTConfig,
-    InPlaceTTTFinishBatch,
     InPlaceTTTKey,
     InPlaceTTTMetadata,
     InPlaceTTTPhase,
     InPlaceTTTWorkload,
 )
-from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.request_identity import RequestFinishedBatch, RequestIdentity
 from tllm.runtime.parameter_overlay import OverlayLeaseKey
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
@@ -28,7 +31,7 @@ from tllm.runtime.workload_bindings import LocalRuntimeServices
 from tllm.schedule import MainWorkloadTimeline, WorkloadCompilation
 
 
-def _timeline() -> MainWorkloadTimeline:
+def _timeline(graph_mode: str = "eager") -> MainWorkloadTimeline:
     return export_main_workload_timeline(
         BackendCapabilities(
             backend_id="vllm-0.27-mrv2",
@@ -38,8 +41,17 @@ def _timeline() -> MainWorkloadTimeline:
             tuple_sampler_return=False,
             split_execute_and_sample=True,
             graph_safety=GraphSafety.EAGER_ONLY,
+            parameter_overlay=VersionedParameterOverlayCapabilities(
+                representations=frozenset({"dense_replace"}),
+                scopes=frozenset({"request"}),
+                phases=frozenset({"prefill", "decode"}),
+                pinning=frozenset({"explicit_request_advance"}),
+                mixed_versions=True,
+                graph_safety=GraphSafety.EAGER_ONLY,
+                tensor_parallel_sizes=frozenset({1}),
+            ),
         ),
-        graph_mode="eager",
+        graph_mode=graph_mode,
         static_headroom_bytes=1 << 20,
     )
 
@@ -61,17 +73,20 @@ def _drive(
     runtime: TllmRuntime[InPlaceTTTWorkload],
     compilation: WorkloadCompilation,
     step_id: int,
+    finished: RequestFinishedBatch | None = None,
 ) -> tuple[int, int]:
     state = ResidualRuntimeState()
     with mock.patch.object(residual_runtime, "RUNTIME", state):
         residual_runtime.publish_workload_compilation(
             compilation, bindings=runtime.workload_execution_bindings
         )
+        execution = state.workload_execution
+        assert execution is not None
+        if finished is not None and execution.stage_request_finished(finished) != 1:
+            raise AssertionError("In-Place lifecycle port was not staged")
         residual_runtime.prepare_physical_workgraph_step(step_id)
         for region in compilation.decision.execution_regions:
             residual_runtime.advance_workload_anchor(region.placement_anchor)
-        execution = state.workload_execution
-        assert execution is not None
         return (
             execution.state_versions.observed_version("fast_weights", None),
             execution.state_versions.observed_version("overlay_versions", None),
@@ -79,6 +94,20 @@ def _drive(
 
 
 class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
+    def test_dense_overlay_rejects_non_eager_backend_timeline(self) -> None:
+        workload = InPlaceTTTWorkload(InPlaceTTTConfig())
+        runtime = TllmRuntime(
+            workloads=(workload,), workload_memory_budget_bytes=1 << 20
+        )
+        runtime.cold_specialize_workloads(
+            RuntimeSpecializationSpec(
+                2, 3, torch.float64, torch.device("cpu")
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "eager_only"):
+            runtime.compile_workloads(_timeline("piecewise"))
+
     def test_exact_chunk_output_precedes_update_and_publishes_owned_weight(self) -> None:
         config = InPlaceTTTConfig(
             layers=(0,), chunk_size=2, learning_rate=0.3
@@ -170,12 +199,15 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         assert publication.version is not None
         lease_key = OverlayLeaseKey(request, publication.version.lineage)
         self.assertIsNotNone(workload.overlay_versions.store.pinned(lease_key))
-        runtime.stage(
-            InPlaceTTTWorkload.finished_requests,
-            InPlaceTTTFinishBatch((request,)),
+        self.assertEqual(
+            _drive(
+                runtime,
+                compilation,
+                2,
+                RequestFinishedBatch((request,)),
+            ),
+            (2, 2),
         )
-
-        self.assertEqual(_drive(runtime, compilation, 2), (2, 2))
         receipt = runtime.drain(InPlaceTTTWorkload.cleanup)[0]
         self.assertEqual(receipt.cleared_slots, 1)
         self.assertEqual(receipt.released_versions, 1)
@@ -212,11 +244,12 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
         self.assertEqual(len(workload.overlay_versions.store.lineages()), 2)
         self.assertGreater(workload.overlay_versions.store.byte_size, 0)
 
-        runtime.stage(
-            InPlaceTTTWorkload.finished_requests,
-            InPlaceTTTFinishBatch((request,)),
+        _drive(
+            runtime,
+            compilation,
+            3,
+            RequestFinishedBatch((request,)),
         )
-        _drive(runtime, compilation, 3)
 
         receipt = runtime.drain(InPlaceTTTWorkload.cleanup)[0]
         self.assertEqual(receipt.cleared_slots, 2)

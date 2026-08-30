@@ -56,7 +56,12 @@ from tllm.workload.frontend import (
 from tllm.workload.ir import OptimizerSpec
 from tllm.workload.ir import EffectKind
 from tllm.workload.ir import ValueSourceKind
-from tllm.workload.staging import RuntimePortStore, StagedPort
+from tllm.workload.staging import (
+    RuntimePortStore,
+    StagedLifecycle,
+    StagedPort,
+)
+from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.workload.host import HostOutput, RuntimeHostOutputStore
 
 ConfigT = TypeVar("ConfigT", bound=WorkloadConfig)
@@ -336,6 +341,14 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         if port not in type(self)._staged_ports():
             raise ValueError("staged port belongs to another workload")
         return port.stage(self._port_store, value)
+
+    def stage_request_finished(self, batch: RequestFinishedBatch) -> int:
+        staged = 0
+        for port in type(self)._staged_ports():
+            if port.lifecycle is StagedLifecycle.REQUEST_FINISHED:
+                port.stage(self._port_store, batch)
+                staged += 1
+        return staged
 
     def prepare_port(self, key: str, transaction: str, value: object) -> None:
         self._staged_ports_by_key[key]

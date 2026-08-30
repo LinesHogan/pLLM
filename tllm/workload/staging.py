@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Generic, TypeVar, cast
 
 from tllm.workload.runtime_values import SKIPPED, RuntimeValueMarker
 
 T = TypeVar("T")
+
+
+class StagedLifecycle(StrEnum):
+    REQUEST_FINISHED = "request.finished"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,10 +142,11 @@ class RuntimePortStore:
 
 
 class StagedPort(Generic[T]):
-    def __init__(self) -> None:
+    def __init__(self, *, lifecycle: StagedLifecycle | None = None) -> None:
         self.name = ""
         self.key = ""
         self.owner: type[object] = object
+        self.lifecycle = lifecycle
 
     def __set_name__(self, owner: type[object], name: str) -> None:
         self.name = name
@@ -159,4 +165,4 @@ class StagedPort(Generic[T]):
         return cast(T, value)
 
 
-__all__ = ["RuntimePortStore", "StagedPort"]
+__all__ = ["RuntimePortStore", "StagedLifecycle", "StagedPort"]

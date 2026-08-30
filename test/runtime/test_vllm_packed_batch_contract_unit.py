@@ -92,8 +92,22 @@ def test_incomplete_active_prefix_fails_instead_of_compacting_slots_in_python() 
         )
 
 
+def test_empty_active_request_id_is_rejected_without_string_coercion() -> None:
+    with pytest.raises(RuntimeError, match="empty active request slot"):
+        runner_adapter.mrv2_packed_row_plan_inputs(
+            runner=SimpleNamespace(),
+            num_scheduled_tokens=[2, 1],
+            input_batch=SimpleNamespace(
+                req_ids=["request-z", None],
+                num_reqs=2,
+                prefill_len_np=[7, 3],
+                num_computed_tokens_np=[2, 0],
+            ),
+        )
+
+
 def test_mrv1_rejects_mrv2_private_batch_layout() -> None:
-    with pytest.raises(RuntimeError, match="MRv1 packed batch requires req_id_to_index"):
+    with pytest.raises(AttributeError, match="req_id_to_index"):
         runner_adapter.mrv1_packed_row_plan_inputs(
             runner=SimpleNamespace(),
             num_scheduled_tokens=[2, 1],
@@ -102,7 +116,7 @@ def test_mrv1_rejects_mrv2_private_batch_layout() -> None:
 
 
 def test_mrv2_rejects_mrv1_private_batch_layout() -> None:
-    with pytest.raises(RuntimeError, match="MRv2 packed batch requires prefill_len_np"):
+    with pytest.raises(AttributeError, match="prefill_len_np"):
         runner_adapter.mrv2_packed_row_plan_inputs(
             runner=SimpleNamespace(),
             num_scheduled_tokens=[2, 1],

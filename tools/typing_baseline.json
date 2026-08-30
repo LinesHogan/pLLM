@@ -1,6 +1,6 @@
 {
   "comment": "Basic-tier pyright baseline (only-decrease). --rebase refuses total or per-bucket regressions.",
-  "total": 156,
+  "total": 152,
   "buckets": {
     "tllm/common/state.py": 1,
     "tllm/consumers/esamp": 20,
@@ -8,7 +8,7 @@
     "tllm/runtime/graph_policy.py": 2,
     "tllm/runtime/sampler_bridge": 102,
     "tllm/runtime/state.py": 3,
-    "tllm/workflows/benchmarks": 13,
+    "tllm/workflows/benchmarks": 9,
     "tllm/workflows/common.py": 1,
     "tllm/workflows/esamp_support.py": 4,
     "tllm/workflows/repro": 9

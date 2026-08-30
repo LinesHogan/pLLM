@@ -391,7 +391,10 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
     def test_mrv1_dispatches_prepare_lifecycle_after_distributed_step_prepare(self) -> None:
         binding = self._prepare_binding()
         state = ResidualRuntimeState()
-        runner = SimpleNamespace(model=None)
+        runner = SimpleNamespace(
+            model=None,
+            input_batch=SimpleNamespace(req_ids=(), num_reqs=0),
+        )
         view = SimpleNamespace(
             logits_indices=None,
             spec_decode_metadata=None,
@@ -491,6 +494,10 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
             return result
 
         input_batch = SimpleNamespace(
+            req_ids=(),
+            num_reqs=0,
+            prefill_len_np=(),
+            num_computed_tokens_np=(),
             num_scheduled_tokens=(),
             logits_indices=None,
         )

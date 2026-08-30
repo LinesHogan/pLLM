@@ -146,3 +146,13 @@ intentionally not run for this freeze.
 
 Deleting a legacy item requires a reviewed migration preserving numerical and
 state semantics with a complete signed Region executor.
+
+## Deferred Authoring API TODO
+
+After workload-authority migration and legacy-stack retirement, replace
+stringly task/value references such as `result("task", "output")` and the
+remaining textual hidden/resource selectors with typed declaration
+descriptors. The authoring surface should provide IDE completion, static
+validation, and rename-safe references while lowering to the same stable
+symbol names used by Rust signatures. This ergonomics work must not introduce
+Python-side scheduling choices or weaken deterministic declaration lowering.

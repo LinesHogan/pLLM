@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 import torch
 
+from tllm.contracts.request_identity import RequestFinishedBatch
+
 WorkloadInstanceT = TypeVar("WorkloadInstanceT")
 
 
@@ -34,6 +36,8 @@ class WorkloadPortOwner(Protocol):
     def owns_output(self, key: str) -> bool: ...
 
     def drain_output(self, key: str) -> tuple[object, ...]: ...
+
+    def stage_request_finished(self, batch: RequestFinishedBatch) -> int: ...
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.shape_specialization import (
@@ -885,6 +889,12 @@ class NativeWorkloadExecution:
             if workload.owns_output(key):
                 return workload.drain_output(key)
         raise KeyError(key)
+
+    def stage_request_finished(self, batch: RequestFinishedBatch) -> int:
+        return sum(
+            workload.stage_request_finished(batch)
+            for workload in self._workload_instances
+        )
 
     @property
     def backend_region_binders(self) -> Mapping[str, "BackendRegionBinderSlot"]:

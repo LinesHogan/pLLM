@@ -23,6 +23,11 @@ class OverlayScope(StrEnum):
     REQUEST = "request"
 
 
+class OverlayRowPhase(StrEnum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+
+
 @dataclass(frozen=True, slots=True)
 class OverlayTarget:
     layer: int
@@ -48,6 +53,21 @@ class OverlayVersionRef:
     lineage: OverlayLineage
     epoch: int
     version: int
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayRowAssignment:
+    target: OverlayTarget
+    version: OverlayVersionRef
+    packed_rows: tuple[int, ...]
+    phases: tuple[OverlayRowPhase, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayStepPlan:
+    step_id: int
+    total_rows: int
+    assignments: tuple[OverlayRowAssignment, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,12 +194,22 @@ class OverlayVersionStore:
         self._next_versions: dict[OverlayLineage, int] = {}
         self._leases: dict[OverlayLeaseKey, OverlayLease] = {}
         self._bytes = 0
+        self._backend_applied_rows = 0
         self._lock = RLock()
 
     @property
     def byte_size(self) -> int:
         with self._lock:
             return self._bytes
+
+    @property
+    def backend_applied_rows(self) -> int:
+        with self._lock:
+            return self._backend_applied_rows
+
+    def record_backend_application(self, rows: int) -> None:
+        with self._lock:
+            self._backend_applied_rows += rows
 
     def stage(self, transaction: str, publication: OverlayPublication) -> None:
         with self._lock:
@@ -409,7 +439,10 @@ __all__ = [
     "OverlayPublication",
     "OverlayRepresentation",
     "OverlayRequestRetirement",
+    "OverlayRowAssignment",
+    "OverlayRowPhase",
     "OverlayScope",
+    "OverlayStepPlan",
     "OverlayTarget",
     "OverlayVersion",
     "OverlayVersionRef",

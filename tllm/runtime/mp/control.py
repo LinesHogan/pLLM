@@ -15,7 +15,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, TypedDict
 
 from tllm.contracts.consumer_stats import (
     TrainingStats,
@@ -28,6 +28,55 @@ if TYPE_CHECKING:
     from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 
 TLLM_WORKER_EXTENSION_QUALNAME = "tllm.runtime.mp.worker_extension.TllmWorkerExtension"
+
+
+class WorkerArtifactStatus(TypedDict):
+    region_id: str
+    artifact_key: str
+
+
+class WorkerStateVersionStatus(TypedDict):
+    resource: str
+    key: str | int | None
+    version: int
+
+
+class WorkerWorkloadStatus(TypedDict):
+    pid: int
+    signature: str
+    plan_epoch: int
+    artifacts: list[WorkerArtifactStatus]
+    state_versions: list[WorkerStateVersionStatus]
+    diagnostics: dict[str, dict[str, int | float]]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRequestFinishReply:
+    worker_id: str
+    request_ids: tuple[str, ...]
+    finished: int
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerRequestFinishReply":
+        fields = _exact_wire_object(
+            payload,
+            "request-finish reply",
+            frozenset({"worker_id", "request_ids", "finished"}),
+        )
+        worker_id = fields["worker_id"]
+        raw_request_ids = fields["request_ids"]
+        if type(worker_id) is not str or not worker_id:
+            raise TypeError("request-finish worker_id must be a non-empty string")
+        if type(raw_request_ids) is not list or any(
+            type(request_id) is not str or not request_id
+            for request_id in raw_request_ids
+        ):
+            raise TypeError("request-finish request_ids must be non-empty strings")
+        return cls(
+            worker_id,
+            tuple(raw_request_ids),
+            _nonnegative_wire_int(fields["finished"], "request-finish finished"),
+        )
 
 _SHAPE_SPECIALIZATION_REPLY_FIELDS = frozenset(
     {"signature", "plan_epoch", "requests"}
@@ -95,7 +144,7 @@ def _exact_wire_object(
     return wire
 
 
-def _workload_status_from_wire(payload: object) -> dict[str, object]:
+def _workload_status_from_wire(payload: object) -> WorkerWorkloadStatus:
     """Validate the closed, observational worker-status wire contract."""
 
     fields = _exact_wire_object(
@@ -110,7 +159,7 @@ def _workload_status_from_wire(payload: object) -> dict[str, object]:
     raw_artifacts = fields["artifacts"]
     if type(raw_artifacts) is not list:
         raise TypeError("status.artifacts must be a JSON array")
-    artifacts: list[dict[str, str]] = []
+    artifacts: list[WorkerArtifactStatus] = []
     artifact_ids: set[str] = set()
     for raw in raw_artifacts:
         artifact = _exact_wire_object(
@@ -134,7 +183,7 @@ def _workload_status_from_wire(payload: object) -> dict[str, object]:
     raw_versions = fields["state_versions"]
     if type(raw_versions) is not list:
         raise TypeError("status.state_versions must be a JSON array")
-    state_versions: list[dict[str, object]] = []
+    state_versions: list[WorkerStateVersionStatus] = []
     for raw in raw_versions:
         entry = _exact_wire_object(
             raw, "status state version", frozenset({"resource", "key", "version"})
@@ -644,13 +693,48 @@ class ControlPlane:
         self,
         *,
         timeout: float | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[WorkerWorkloadStatus]:
         """Read immutable native Region identity and worker execution evidence."""
 
         return [
             _workload_status_from_wire(entry)
             for entry in self.call("tllm_workload_status", timeout=timeout)
         ]
+
+    def finish_workload_requests(
+        self,
+        request_ids: tuple[str, ...],
+        *,
+        expected_finished: int | None = None,
+        timeout: float | None = None,
+    ) -> tuple[WorkerRequestFinishReply, ...]:
+        if not request_ids:
+            return ()
+        quorum = self.worker_quorum(timeout=timeout)
+        replies = tuple(
+            WorkerRequestFinishReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_finish_workload_requests",
+                list(request_ids),
+                timeout=timeout,
+            )
+        )
+        if (
+            len(replies) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in replies)
+            != quorum.worker_ids
+        ):
+            raise RuntimeError("request-finish reply quorum mismatch")
+        if any(reply.request_ids != request_ids for reply in replies):
+            raise RuntimeError("request-finish reply identity mismatch")
+        finished_counts = {reply.finished for reply in replies}
+        if len(finished_counts) != 1:
+            raise RuntimeError("request-finish reply count quorum mismatch")
+        if expected_finished is not None and finished_counts != {
+            expected_finished
+        }:
+            raise RuntimeError("request-finish reply count is incomplete")
+        return replies
 
     def install_workload_compilation(
         self,

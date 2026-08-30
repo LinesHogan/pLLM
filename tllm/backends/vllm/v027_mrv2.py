@@ -23,12 +23,14 @@ from tllm.backends.protocol import (
     BackendCapabilities,
     GraphSafety,
     ModelRegionCapabilities,
+    OverlayBackendState,
     OrderedRowFusionCapabilities,
     RunnerBinding,
     SamplerStage,
     VersionedParameterOverlayCapabilities,
 )
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.backends.vllm import runner_adapter as _runner_adapter
 from tllm.backends.vllm import model_region as _model_region
@@ -88,6 +90,16 @@ def _wrapped_prepare_inputs(
     if overlay_controller is not None:
         overlay_controller.sync_versions()
         overlay_controller.apply_mrv2_input_batch(input_batch)
+        if overlay_controller.has_dense_versions():
+            active_driver = driver or V027MRv2Driver()
+            columns = active_driver.packed_row_plan_inputs(
+                runner=runner,
+                num_scheduled_tokens=None,
+                input_batch=input_batch,
+            )
+            overlay_controller.prepare_dense_step(
+                step_id=int(runtime.event_step_id), columns=columns
+            )
     has_active_targets = active_targets.runtime_has_active_targets(runtime)
 
     if has_active_targets:
@@ -237,6 +249,9 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         session.fail(str(exc))
         _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
         raise
+    finally:
+        if overlay_controller is not None:
+            overlay_controller.clear_dense_step()
 
     state = getattr(runner, "execute_model_state", None)
     if state is not None:
@@ -414,10 +429,14 @@ class V027MRv2Driver:
                 {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
             ),
             parameter_overlay=VersionedParameterOverlayCapabilities(
-                representations=frozenset({"low_rank_add"}),
-                scopes=frozenset({"global"}),
+                representations=frozenset(
+                    {"low_rank_add", "dense_replace"}
+                ),
+                scopes=frozenset({"global", "request"}),
                 phases=frozenset({"prefill", "decode"}),
-                pinning=frozenset({"latest_at_admission"}),
+                pinning=frozenset(
+                    {"latest_at_admission", "explicit_request_advance"}
+                ),
                 mixed_versions=True,
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
@@ -534,4 +553,34 @@ class V027MRv2Driver:
         setattr(cls, self._HOOK_FLAG, True)
 
     def unbind(self, binding: RunnerBinding) -> None:
+        _parameter_overlay.unbind_parameter_overlays(
+            runner=binding.runner,
+            state=binding.parameter_overlay_state,
+        )
         _runner_adapter.unbind_runner(binding)
+
+    def finish_parameter_overlay_requests(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+        request_ids: tuple[str, ...],
+    ) -> RequestFinishedBatch:
+        return _parameter_overlay.finish_parameter_overlay_requests(
+            runtime=runtime,
+            runner=runner,
+            state=state,
+            request_ids=request_ids,
+        )
+
+    def synchronize_parameter_overlays(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+    ) -> int:
+        return _parameter_overlay.synchronize_parameter_overlays(
+            runtime=runtime, runner=runner, state=state
+        )

@@ -49,16 +49,17 @@ from tllm.runtime.workload_bindings import (
     WorkerRuntimeBinding,
 )
 from tllm.runtime.vllm_adapter import (
-    VllmHandle,
     bind_inprocess_runner,
     bind_runner_owner,
     create_llm,
-    install_generate_poll,
+    install_generate_boundary,
 )
 from tllm.runtime.torch_adapter import runtime_torch_values
 
 if TYPE_CHECKING:
     import torch
+    from vllm import LLM
+    from vllm.outputs import RequestOutput
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.runtime.mp.control import (
@@ -1310,7 +1311,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         for consumer in self._consumers:
             register_legacy_consumer(consumer)
 
-    def make_llm(self, *args: object, **kwargs: object) -> VllmHandle:
+    def make_llm(self, *args: object, **kwargs: object) -> LLM:
         from tllm.runtime.mp.control import set_active_control_plane
 
         # Resolve mixed-authority errors before constructing an engine. Pure
@@ -1336,14 +1337,14 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 if self.has_compilable_workloads:
                     self._coordinate_worker_compilation(plane)
                 set_active_control_plane(plane)
-                self._install_shape_specialization_poll(llm, plane)
+                self._install_generate_boundary(llm, plane)
                 return
         bind_inprocess_runner(llm, self)
 
-    def _install_shape_specialization_poll(
+    def _install_generate_boundary(
         self, llm: object, plane: "ControlPlane"
     ) -> None:
-        """Poll completed worker misses before the next user request.
+        """Poll cold misses before generate and flush signed finishes after it.
 
         A shape miss intentionally fails its current worker step.  The parent
         has no callback from an EngineCore child, so the next public generate
@@ -1362,7 +1363,25 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 self.apply_pending_worker_shape_specializations(plane)
                 self._require_workload_live()
 
-        install_generate_poll(llm, self, before_generate)
+        def after_generate(outputs: Sequence[RequestOutput]) -> None:
+            request_ids = tuple(output.request_id for output in outputs)
+            bindings = self.workload_execution_bindings
+            expected_finished = (
+                len(request_ids)
+                if bindings is not None and bindings.parameter_overlays
+                else None
+            )
+            try:
+                plane.finish_workload_requests(
+                    request_ids, expected_finished=expected_finished
+                )
+            except Exception:
+                self._fail_stop_workloads(
+                    "request-finish worker quorum diverged"
+                )
+                raise
+
+        install_generate_boundary(llm, self, before_generate, after_generate)
 
     def _coordinate_worker_compilation(self, plane: "ControlPlane") -> None:
         """Compile once in the parent from worker-reported pure timeline facts."""

@@ -20,13 +20,15 @@ from typing import TYPE_CHECKING, Any, Protocol
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.typed_replay import TypedLayerReplayHandle
 
 if TYPE_CHECKING:
     import torch
     from tllm.runtime.parameter_overlay import (
         OverlayChannel,
-        OverlayLease,
+        OverlayStepPlan,
+        OverlayTarget,
         OverlayVersion,
         OverlayVersionRef,
         OverlayVersionStore,
@@ -54,6 +56,30 @@ class GraphSafety(Enum):
     REPLAY_STATEFUL = auto()
 
 
+class DenseOverlayTargetHandle(Protocol):
+    @property
+    def target(self) -> OverlayTarget: ...
+
+    @property
+    def apply_count(self) -> int: ...
+
+    def has_version(self, ref: OverlayVersionRef) -> bool: ...
+
+    def install_version(
+        self,
+        version: OverlayVersion,
+        tensors: Mapping[str, torch.Tensor],
+    ) -> None: ...
+
+    def retain_versions(self, refs: frozenset[OverlayVersionRef]) -> None: ...
+
+    def prepare_step(self, plan: OverlayStepPlan) -> None: ...
+
+    def clear_step(self) -> None: ...
+
+    def restore(self) -> None: ...
+
+
 @dataclass(slots=True, init=False)
 class OverlayBackendState:
     """Runner-owned installation state shared across overlay store epochs."""
@@ -62,6 +88,10 @@ class OverlayBackendState:
     version_handles: dict[OverlayVersionRef, int]
     request_identities: dict[str, RequestIdentity]
     attached_requests: set[str]
+    dense_request_ids: set[str]
+    dense_targets: dict[OverlayTarget, DenseOverlayTargetHandle]
+    dense_reported_rows: dict[OverlayTarget, int]
+    dense_targets_validated: bool
     next_handle_ordinal: int
 
     def __init__(self) -> None:
@@ -69,6 +99,10 @@ class OverlayBackendState:
         self.version_handles = {}
         self.request_identities = {}
         self.attached_requests = set()
+        self.dense_request_ids = set()
+        self.dense_targets = {}
+        self.dense_reported_rows = {}
+        self.dense_targets_validated = False
         self.next_handle_ordinal = 0
 
     def owns_stores(
@@ -85,6 +119,10 @@ class OverlayBackendState:
         self.version_handles.clear()
         self.request_identities.clear()
         self.attached_requests.clear()
+        self.dense_request_ids.clear()
+        self.dense_targets.clear()
+        self.dense_reported_rows.clear()
+        self.dense_targets_validated = False
 
     def allocate_handle_ordinal(self) -> int:
         self.next_handle_ordinal += 1
@@ -110,6 +148,10 @@ class VersionedParameterOverlayCapabilities:
                 *(f"parameter_overlay/scope/{value}" for value in self.scopes),
                 *(f"parameter_overlay/phase/{value}" for value in self.phases),
                 *(f"parameter_overlay/pinning/{value}" for value in self.pinning),
+                *(
+                    f"parameter_overlay/tensor_parallel_size/{value}"
+                    for value in self.tensor_parallel_sizes
+                ),
                 f"parameter_overlay/mixed_versions/{str(self.mixed_versions).lower()}",
             }
         )
@@ -205,11 +247,52 @@ class BackendCapabilities:
         return parameter_names | region_names | extension_names | locator_names
 
 
+class RunnerBindingDriver(Protocol):
+    """Driver surface retained by a live per-runner binding."""
+
+    backend_id: str
+
+    def capabilities(self) -> BackendCapabilities: ...
+
+    def install_typed_layer_replay(
+        self, *, runtime: Any, runner: Any
+    ) -> TypedLayerReplayHandle: ...
+
+    def restore_typed_layer_replay(self, *, runtime: Any) -> int: ...
+
+    def finish_parameter_overlay_requests(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+        request_ids: tuple[str, ...],
+    ) -> RequestFinishedBatch: ...
+
+    def synchronize_parameter_overlays(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+    ) -> int: ...
+
+    def runner_model_layer_count(self, runner: Any) -> int: ...
+
+    def packed_row_plan_inputs(
+        self,
+        *,
+        runner: Any,
+        num_scheduled_tokens: Any | None,
+        input_batch: Any | None,
+    ) -> Any: ...
+
+
 @dataclass
 class RunnerBinding:
     """Per-runner-instance binding record."""
 
-    driver: "BackendDriver"
+    driver: RunnerBindingDriver
     runner: Any
     capabilities: BackendCapabilities
     parameter_overlay_state: OverlayBackendState = field(
@@ -219,12 +302,12 @@ class RunnerBinding:
     active: bool = True
 
 
-_RUNNER_BINDING_ATTR = "_tllm_runner_binding"
+RUNNER_BINDING_ATTR = "_tllm_runner_binding"
 
 
 def runner_binding_for(runner: Any) -> RunnerBinding | None:
     """Return the backend-neutral binding installed on a runner, if active."""
-    binding = getattr(runner, _RUNNER_BINDING_ATTR, None)
+    binding = getattr(runner, RUNNER_BINDING_ATTR, None)
     return binding if isinstance(binding, RunnerBinding) else None
 
 
@@ -256,29 +339,22 @@ class BackendDriver(Protocol):
     def unbind(self, binding: RunnerBinding) -> None:
         ...
 
-    def install_parameter_overlay_version(
+    def finish_parameter_overlay_requests(
         self,
         *,
-        binding: RunnerBinding,
-        version: "OverlayVersion",
-        tensors: Mapping[str, torch.Tensor],
-    ) -> None:
-        ...
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+        request_ids: tuple[str, ...],
+    ) -> RequestFinishedBatch: ...
 
-    def attach_parameter_overlay_request(
-        self, *, binding: RunnerBinding, lease: "OverlayLease"
-    ) -> None:
-        ...
-
-    def release_parameter_overlay_request(
-        self, *, binding: RunnerBinding, lease: "OverlayLease"
-    ) -> None:
-        ...
-
-    def remove_parameter_overlay_version(
-        self, *, binding: RunnerBinding, version: "OverlayVersion"
-    ) -> None:
-        ...
+    def synchronize_parameter_overlays(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+    ) -> int: ...
 
     def install_typed_layer_replay(
         self,

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import pytest
 import torch
+from torch.nn import Parameter
+from torch.nn import functional as F
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.request import LoRARequest
 
@@ -15,7 +17,8 @@ from tllm.backends.vllm.versioned_parameter_overlay import (
     VLLMParameterOverlayController,
     maybe_bind_publisher,
 )
-from tllm.contracts.request_identity import RequestIdentity
+from tllm.backends.vllm.runner_adapter import PackedRowPlanInputs
+from tllm.contracts.request_identity import RequestFinishedBatch, RequestIdentity
 from tllm.runtime.parameter_overlay import (
     OverlayChannel,
     OverlayLeaseKey,
@@ -23,6 +26,10 @@ from tllm.runtime.parameter_overlay import (
     OverlayPayload,
     OverlayPublication,
     OverlayRepresentation,
+    OverlayRowAssignment,
+    OverlayRowPhase,
+    OverlayTarget,
+    OverlayVersionRef,
     OverlayVersionStore,
 )
 
@@ -94,6 +101,63 @@ class _InputBatch:
     )
 
 
+_DenseOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
+
+
+class _DenseLinear:
+    def __init__(self) -> None:
+        self.weight = Parameter(
+            torch.tensor(
+                [[0.2, -0.3, 0.5], [0.4, 0.1, -0.2]],
+                dtype=torch.float64,
+            ),
+            requires_grad=False,
+        )
+        self.bias: Parameter | None = None
+        self.tp_size = 1
+        self.return_bias = True
+        self.forward: Callable[[torch.Tensor], _DenseOutput] = self._base_forward
+
+    def _base_forward(self, input_: torch.Tensor) -> _DenseOutput:
+        return F.linear(input_, self.weight), None
+
+
+@dataclass(slots=True)
+class _MLP:
+    down_proj: _DenseLinear
+
+
+@dataclass(slots=True)
+class _Layer:
+    mlp: _MLP
+
+
+@dataclass(slots=True)
+class _Decoder:
+    layers: Sequence[_Layer]
+
+
+@dataclass(slots=True)
+class _CausalModel:
+    model: _Decoder
+
+
+@dataclass(slots=True)
+class _ParallelConfig:
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+
+
+@dataclass(slots=True)
+class _ModelConfig:
+    quantization: str | None = None
+
+
+@dataclass(slots=True)
+class _VllmConfig:
+    model_config: _ModelConfig = field(default_factory=_ModelConfig)
+
+
 @dataclass(slots=True)
 class _Runner:
     lora_manager: _LoRAManager
@@ -101,11 +165,27 @@ class _Runner:
     req_states: _RequestStates
     lora_state: _LoRAState
     input_batch: _InputBatch
+    model: _CausalModel
+    parallel_config: _ParallelConfig
+    vllm_config: _VllmConfig
 
 
 @dataclass(slots=True)
 class _Execution:
     parameter_overlays: Mapping[OverlayChannel, OverlayVersionStore]
+    finished: list[RequestFinishedBatch] = field(
+        default_factory=list[RequestFinishedBatch]
+    )
+    lifecycle_ports: int = 1
+
+    def stage_request_finished(self, batch: RequestFinishedBatch) -> int:
+        if not self.lifecycle_ports:
+            return 0
+        self.finished.append(batch)
+        for store in set(self.parameter_overlays.values()):
+            for request in batch.requests:
+                store.retire_request(request)
+        return self.lifecycle_ports
 
 
 @dataclass(slots=True)
@@ -121,28 +201,34 @@ class _OverlayHarness:
     runner: _Runner
     runtime: _Runtime
     state: OverlayBackendState
+    dense_linear: _DenseLinear
 
     @classmethod
     def create(
         cls, stores: Mapping[OverlayChannel, OverlayVersionStore]
     ) -> _OverlayHarness:
         manager = _AdapterManager()
+        dense_linear = _DenseLinear()
         runner = _Runner(
             _LoRAManager(manager),
             _LoRAConfig(max_lora_rank=8),
             _RequestStates({}),
             _LoRAState(),
             _InputBatch(),
+            _CausalModel(_Decoder((_Layer(_MLP(dense_linear)),))),
+            _ParallelConfig(),
+            _VllmConfig(),
         )
         return cls(
             manager=manager,
             runner=runner,
             runtime=_Runtime(
-                reqid_to_promptidx={"active": 0, "new": 1},
-                reqid_to_sampleidx={"active": 0, "new": 0},
+                reqid_to_promptidx={"active": 0, "new": 1, "base": 2},
+                reqid_to_sampleidx={"active": 0, "new": 0, "base": 0},
                 workload_execution=_Execution(stores),
             ),
             state=OverlayBackendState(),
+            dense_linear=dense_linear,
         )
 
     def bind(self) -> VLLMParameterOverlayController:
@@ -218,7 +304,9 @@ def test_controller_materializes_and_keeps_request_version_stable() -> None:
         "model.layers.0.self_attn.q_proj",
         "model.layers.0.self_attn.v_proj",
     }
-    assert controller.release_finished(("active",)) == 1
+    assert controller.finish_requests(("active",)).requests == (
+        RequestIdentity("active", 0, 0),
+    )
 
 
 def test_epoch_rebind_releases_old_leases_removes_adapters_and_allocates_new_ids() -> None:
@@ -229,6 +317,12 @@ def test_epoch_rebind_releases_old_leases_removes_adapters_and_allocates_new_ids
     assert first.sync_versions() == 1
     first.pin_request("active")
     first_id = next(iter(harness.manager.models))
+
+    harness.runtime.workload_execution = _Execution({channel: second_store})
+    with pytest.raises(RuntimeError, match="requests are active"):
+        harness.bind()
+    harness.runtime.workload_execution = _Execution({channel: first_store})
+    first.finish_requests(("active",))
 
     harness.runtime.workload_execution = _Execution({channel: second_store})
     second = harness.bind()
@@ -259,6 +353,7 @@ def test_close_removes_remaining_adapters_after_one_remove_failure() -> None:
     store.commit("tx:2")
     assert controller.sync_versions() == 1
     harness.manager.fail_after_remove = first_id
+    controller.finish_requests(("active",))
 
     with pytest.raises(RuntimeError, match="could not remove"):
         controller.close()
@@ -269,3 +364,276 @@ def test_close_removes_remaining_adapters_after_one_remove_failure() -> None:
             RequestIdentity("active", 0, 0), OverlayLineage(channel)
         )
     ) is None
+
+
+def test_dense_versions_apply_by_packed_request_row_and_restore_on_close() -> None:
+    target = OverlayTarget(0, "mlp", "down_proj.weight")
+    channel = OverlayChannel("inplace_ttt", "layer-0", target)
+    store = OverlayVersionStore()
+    identities = (
+        RequestIdentity("active", 0, 0),
+        RequestIdentity("new", 1, 0),
+    )
+    weights = (
+        torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        torch.tensor(
+            [[0.0, 0.0, 1.0], [1.0, 1.0, 0.0]],
+            dtype=torch.float64,
+        ),
+    )
+    refs: list[OverlayVersionRef] = []
+    for ordinal, (identity, weight) in enumerate(
+        zip(identities, weights, strict=True), start=1
+    ):
+        lineage = OverlayLineage(channel, identity)
+        transaction = f"dense:{ordinal}"
+        store.stage(
+            transaction,
+            OverlayPublication(
+                lineage,
+                1,
+                OverlayPayload(
+                    OverlayRepresentation.DENSE_REPLACE,
+                    {"weight": weight},
+                ),
+            ),
+        )
+        version = store.commit(transaction)
+        store.advance_request(OverlayLeaseKey(identity, lineage), version.ref)
+        refs.append(version.ref)
+
+    harness = _OverlayHarness.create({channel: store})
+    original_forward = harness.dense_linear.forward
+    controller = harness.bind()
+    assert controller.sync_versions() == 2
+    plan = controller.prepare_dense_step(
+        step_id=7,
+        columns=PackedRowPlanInputs(
+            request_ids=("active-a1B2c3D4", "new", "base"),
+            scheduled_tokens=(2, 1, 1),
+            prompt_tokens=(3, 1, 1),
+            computed_tokens=(0, 1, 1),
+        ),
+    )
+    assignments = {assignment.version: assignment for assignment in plan.assignments}
+    assert assignments[refs[0]].packed_rows == (0, 1)
+    assert assignments[refs[0]].phases == (
+        OverlayRowPhase.PREFILL,
+        OverlayRowPhase.PREFILL,
+    )
+    assert assignments[refs[1]].packed_rows == (2,)
+    assert assignments[refs[1]].phases == (OverlayRowPhase.DECODE,)
+
+    hidden = torch.tensor(
+        [
+            [1.0, 2.0, 3.0],
+            [-1.0, 0.5, 2.0],
+            [4.0, -2.0, 1.0],
+            [0.25, 0.5, 0.75],
+        ],
+        dtype=torch.float64,
+    )
+    expected = F.linear(hidden, harness.dense_linear.weight)
+    expected[:2] = F.linear(hidden[:2], weights[0])
+    expected[2:3] = F.linear(hidden[2:3], weights[1])
+    output = harness.dense_linear.forward(hidden)[0]
+    torch.testing.assert_close(output, expected)
+
+    controller.clear_dense_step()
+    torch.testing.assert_close(
+        harness.dense_linear.forward(hidden)[0],
+        F.linear(hidden, harness.dense_linear.weight),
+    )
+    speculative = controller.prepare_dense_step(
+        step_id=8,
+        columns=PackedRowPlanInputs(
+            request_ids=("new",),
+            scheduled_tokens=(3,),
+            prompt_tokens=(1,),
+            computed_tokens=(1,),
+        ),
+    )
+    assert speculative.assignments == (
+        OverlayRowAssignment(
+            target=target,
+            version=refs[1],
+            packed_rows=(0, 1, 2),
+            phases=(
+                OverlayRowPhase.DECODE,
+                OverlayRowPhase.DECODE,
+                OverlayRowPhase.DECODE,
+            ),
+        ),
+    )
+    controller.clear_dense_step()
+    assert controller.finish_requests(("active",)).requests == (
+        identities[0],
+    )
+    assert "active-a1B2c3D4" not in harness.state.request_identities
+    assert "active-a1B2c3D4" not in harness.state.dense_request_ids
+    assert controller.sync_versions() == 0
+    handle = harness.state.dense_targets[target]
+    assert not handle.has_version(refs[0])
+    assert handle.has_version(refs[1])
+
+    assert controller.finish_requests(("new",)).requests == (identities[1],)
+    assert controller.sync_versions() == 0
+    assert target not in harness.state.dense_targets
+    assert harness.dense_linear.forward is original_forward
+
+    controller.finish_requests(("base",))
+    controller.close()
+    assert harness.dense_linear.forward is original_forward
+
+
+def test_dense_target_validation_rejects_physical_aliases() -> None:
+    first = OverlayChannel(
+        "inplace_ttt",
+        "first",
+        OverlayTarget(0, "mlp", "down_proj.weight"),
+    )
+    alias = OverlayChannel(
+        "inplace_ttt",
+        "alias",
+        OverlayTarget(-1, "mlp", "down_proj.weight"),
+    )
+    harness = _OverlayHarness.create(
+        {first: OverlayVersionStore(), alias: OverlayVersionStore()}
+    )
+
+    with pytest.raises(RuntimeError, match="alias the same physical"):
+        harness.bind()
+
+
+def test_global_lora_and_request_dense_versions_share_one_request_lifecycle() -> None:
+    lora_channel, lora_store = _store(1.0)
+    target = OverlayTarget(0, "mlp", "down_proj.weight")
+    dense_channel = OverlayChannel("inplace_ttt", "layer-0", target)
+    identity = RequestIdentity("active", 0, 0)
+    dense_lineage = OverlayLineage(dense_channel, identity)
+    dense_store = OverlayVersionStore()
+    dense_store.stage(
+        "dense:1",
+        OverlayPublication(
+            dense_lineage,
+            1,
+            OverlayPayload(
+                OverlayRepresentation.DENSE_REPLACE,
+                {"weight": torch.zeros((2, 3), dtype=torch.float64)},
+            ),
+        ),
+    )
+    dense_version = dense_store.commit("dense:1")
+    dense_store.advance_request(
+        OverlayLeaseKey(identity, dense_lineage), dense_version.ref
+    )
+    harness = _OverlayHarness.create(
+        {lora_channel: lora_store, dense_channel: dense_store}
+    )
+    controller = harness.bind()
+    assert controller.sync_versions() == 2
+    active_lora = controller.pin_request("active")
+    assert active_lora is not None
+    controller.prepare_dense_step(
+        step_id=1,
+        columns=PackedRowPlanInputs(
+            request_ids=("active",),
+            scheduled_tokens=(1,),
+            prompt_tokens=(1,),
+            computed_tokens=(1,),
+        ),
+    )
+
+    lora_store.stage(
+        "tx:2",
+        OverlayPublication(
+            OverlayLineage(lora_channel), 1, _payload(2.0)
+        ),
+    )
+    lora_store.commit("tx:2")
+    assert controller.sync_versions() == 1
+    repinned_lora = controller.pin_request("active")
+    assert repinned_lora is not None
+    assert repinned_lora.lora_int_id == active_lora.lora_int_id
+    new_lora = controller.pin_request("new")
+    assert new_lora is not None
+    assert new_lora.lora_int_id != active_lora.lora_int_id
+
+    controller.clear_dense_step()
+    assert controller.finish_requests(("active",)).requests == (identity,)
+    assert dense_store.lineages() == ()
+    assert lora_store.latest(OverlayLineage(lora_channel)) is not None
+    assert controller.sync_versions() == 0
+    assert target not in harness.state.dense_targets
+    controller.finish_requests(("new",))
+    controller.close()
+
+
+def test_finished_request_is_staged_before_its_first_dense_row_plan() -> None:
+    target = OverlayTarget(0, "mlp", "down_proj.weight")
+    channel = OverlayChannel("inplace_ttt", "layer-0", target)
+    identity = RequestIdentity("active", 0, 0)
+    lineage = OverlayLineage(channel, identity)
+    store = OverlayVersionStore()
+    store.stage(
+        "dense:1",
+        OverlayPublication(
+            lineage,
+            1,
+            OverlayPayload(
+                OverlayRepresentation.DENSE_REPLACE,
+                {
+                    "weight": torch.zeros(
+                        (2, 3), dtype=torch.float64
+                    )
+                },
+            ),
+        ),
+    )
+    version = store.commit("dense:1")
+    store.advance_request(OverlayLeaseKey(identity, lineage), version.ref)
+    harness = _OverlayHarness.create({channel: store})
+    controller = harness.bind()
+    assert controller.sync_versions() == 1
+
+    harness.runtime.workload_execution.lifecycle_ports = 0
+    with pytest.raises(RuntimeError, match="signed request-finished port"):
+        controller.finish_requests(("active",))
+    assert store.lineages() == (lineage,)
+    harness.runtime.workload_execution.lifecycle_ports = 1
+    assert controller.finish_requests(("active",)).requests == (identity,)
+    assert harness.runtime.workload_execution.finished == [
+        RequestFinishedBatch((identity,))
+    ]
+    assert store.lineages() == ()
+    assert controller.sync_versions() == 0
+    assert target not in harness.state.dense_targets
+
+
+@pytest.mark.parametrize(
+    ("parallel", "model_config", "message"),
+    (
+        (_ParallelConfig(tensor_parallel_size=2), _ModelConfig(), "tensor parallel"),
+        (_ParallelConfig(pipeline_parallel_size=2), _ModelConfig(), "pipeline parallel"),
+        (_ParallelConfig(), _ModelConfig(quantization="gptq"), "unquantized"),
+    ),
+)
+def test_dense_target_validation_rejects_unsupported_backend_facts(
+    parallel: _ParallelConfig,
+    model_config: _ModelConfig,
+    message: str,
+) -> None:
+    channel = OverlayChannel(
+        "inplace_ttt",
+        "layer-0",
+        OverlayTarget(0, "mlp", "down_proj.weight"),
+    )
+    harness = _OverlayHarness.create({channel: OverlayVersionStore()})
+    harness.runner.parallel_config = parallel
+    harness.runner.vllm_config = _VllmConfig(model_config)
+
+    with pytest.raises(RuntimeError, match=message):
+        harness.bind()

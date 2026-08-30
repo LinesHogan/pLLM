@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, Protocol, cast
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, cast
 import weakref
 
-
-class VllmHandle(Protocol):
-    def generate(self, *args: Any, **kwargs: Any) -> Any: ...
-
+if TYPE_CHECKING:
+    from vllm import LLM
+    from vllm.outputs import RequestOutput
 
 _runner_owners: "weakref.WeakKeyDictionary[Any, object]" = weakref.WeakKeyDictionary()
 
@@ -18,11 +17,10 @@ def bind_runner_owner(runner: object, owner: object) -> None:
     _runner_owners[cast(Any, runner)] = owner
 
 
-def create_llm(args: tuple[object, ...], kwargs: dict[str, object]) -> VllmHandle:
+def create_llm(args: tuple[object, ...], kwargs: dict[str, object]) -> LLM:
     from tllm.runtime import residual_runtime
 
-    factory = cast(Any, residual_runtime.make_llm)
-    return cast(VllmHandle, factory(*args, **kwargs))
+    return residual_runtime.make_llm(*args, **kwargs)
 
 
 def bind_inprocess_runner(llm: object, owner: object) -> None:
@@ -35,10 +33,11 @@ def bind_inprocess_runner(llm: object, owner: object) -> None:
     bind_runner_owner(runner, owner)
 
 
-def install_generate_poll(
+def install_generate_boundary(
     llm: object,
     owner: object,
     before_generate: Callable[[], None],
+    after_generate: Callable[[Sequence[RequestOutput]], None],
 ) -> None:
     dynamic = cast(Any, llm)
     installed_owner: object | None = getattr(
@@ -54,12 +53,14 @@ def install_generate_poll(
     if generate is None:
         return
 
-    def generate_after_shape_poll(*args: Any, **kwargs: Any) -> Any:
+    def generate_at_runtime_boundary(*args: Any, **kwargs: Any) -> Any:
         before_generate()
-        return generate(*args, **kwargs)
+        outputs = generate(*args, **kwargs)
+        after_generate(outputs)
+        return outputs
 
     dynamic._tllm_shape_specialization_poll_owner = owner
-    dynamic.generate = generate_after_shape_poll
+    dynamic.generate = generate_at_runtime_boundary
 
 
 def legacy_runner_graph_enabled(runner: object) -> bool:
@@ -76,10 +77,9 @@ def legacy_runner_graph_enabled(runner: object) -> bool:
 
 
 __all__ = [
-    "VllmHandle",
     "bind_inprocess_runner",
     "bind_runner_owner",
     "create_llm",
-    "install_generate_poll",
+    "install_generate_boundary",
     "legacy_runner_graph_enabled",
 ]

@@ -29,6 +29,9 @@ from typing import (
 if TYPE_CHECKING:
     import torch
 
+    from tllm.backends.vllm.versioned_parameter_overlay import (
+        VLLMParameterOverlayRunner,
+    )
     from tllm.contracts.runtime_context import RunnerLike
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
@@ -45,7 +48,7 @@ if TYPE_CHECKING:
 class _WorkerView(Protocol):
     """The one vLLM Worker attribute this extension touches."""
 
-    model_runner: object | None  # None only while v1 Worker is constructing
+    model_runner: VLLMParameterOverlayRunner | None
 
 
 class _ExternalRunner(Protocol):
@@ -106,7 +109,7 @@ class _StagedWorkloadDecision:
     activated: bool = False
 
 
-def _runner_of(worker: object) -> object | None:
+def _runner_of(worker: object) -> VLLMParameterOverlayRunner | None:
     return cast(_WorkerView, worker).model_runner
 
 
@@ -515,6 +518,55 @@ class TllmWorkerExtension:
                 workload_id: dict(metrics)
                 for workload_id, metrics in execution.read_resource_diagnostics().items()
             },
+        }
+
+    def tllm_finish_workload_requests(
+        self, request_ids: list[str]
+    ) -> dict[str, object]:
+        """Flush request-finished lifecycle inputs through one signed host step."""
+
+        from tllm.backends.protocol import runner_binding_for
+        from tllm.runtime import residual_runtime as core
+
+        runner = _runner_of(self)
+        if runner is None:
+            raise RuntimeError("worker has no model runner")
+        binding = runner_binding_for(runner)
+        if binding is None:
+            execution = core.RUNTIME.workload_execution
+            if execution is not None and execution.parameter_overlays:
+                raise RuntimeError(
+                    "parameter-overlay request finish requires a runner binding"
+                )
+            finished = 0
+        else:
+            batch = binding.driver.finish_parameter_overlay_requests(
+                runtime=core.RUNTIME,
+                runner=runner,
+                state=binding.parameter_overlay_state,
+                request_ids=tuple(request_ids),
+            )
+            finished = len(batch.requests)
+            if batch.requests:
+                step = int(core.RUNTIME.event_step_id) + 1
+                core.prepare_physical_workgraph_step(step)
+                compilation = core.RUNTIME.workload_compilation
+                if compilation is None:
+                    raise RuntimeError(
+                        "request-finish flush has no active workload compilation"
+                    )
+                for region in compilation.decision.execution_regions:
+                    core.advance_workload_anchor(region.placement_anchor)
+                core.RUNTIME.event_step_id = step
+                binding.driver.synchronize_parameter_overlays(
+                    runtime=core.RUNTIME,
+                    runner=runner,
+                    state=binding.parameter_overlay_state,
+                )
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "request_ids": list(request_ids),
+            "finished": finished,
         }
 
     def tllm_peek_shape_specialization_requests(self) -> dict[str, object]:

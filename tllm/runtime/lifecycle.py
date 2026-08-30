@@ -11,7 +11,10 @@ lives here.
 from __future__ import annotations
 
 import importlib
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from vllm import LLM
 
 #: Backend drivers are plugins loaded by id at patch-install time. The
 #: runtime never statically imports a concrete backend — backends are
@@ -42,7 +45,7 @@ def make_plain_llm(
     max_lora_rank: int | None = None,
     max_loras: int | None = None,
     max_cpu_loras: int | None = None,
-) -> Any:
+) -> LLM:
     """Construct a plain vLLM LLM with tLLM's standard single-GPU defaults.
 
     Canonical home for engine construction (previously ``tllm.util.tools``,
@@ -80,7 +83,7 @@ def make_plain_llm(
     )
 
 
-def make_llm(core: Any, *args: object, **kwargs: object) -> object:
+def make_llm(core: Any, *args: object, **kwargs: object) -> LLM:
     install_runner_patch(core)
     # Snapshot the runtime for the EngineCore child (multiprocess mode); the
     # tllm general plugin rehydrates from it there. Harmless in-process.

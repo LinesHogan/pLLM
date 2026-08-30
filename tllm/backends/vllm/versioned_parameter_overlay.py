@@ -1,7 +1,7 @@
-"""vLLM adapter for generic immutable low-rank parameter overlays.
+"""vLLM adapter for generic immutable parameter overlays.
 
-This module is backend quarantine: it translates generic overlay versions and
-leases into vLLM's native LoRA manager without owning training or ordering.
+It translates generic versions, row assignments, and leases into vLLM model
+state without owning workload computation, ordering, or scheduling policy.
 """
 
 from __future__ import annotations
@@ -10,12 +10,26 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 from tllm.backends.protocol import OverlayBackendState
-from tllm.contracts.request_identity import RequestIdentity, resolve_request_identity
+from tllm.backends.vllm.dense_parameter_overlay import (
+    DenseOverlayRunner,
+    install_dense_replacement_target,
+    validate_dense_replacement_targets,
+)
+from tllm.backends.vllm.runner_adapter import PackedRowPlanInputs
+from tllm.contracts.request_identity import (
+    RequestFinishedBatch,
+    RequestIdentity,
+    resolve_request_identity,
+)
 from tllm.runtime.parameter_overlay import (
     OverlayChannel,
     OverlayLeaseKey,
     OverlayLineage,
     OverlayRepresentation,
+    OverlayRowAssignment,
+    OverlayRowPhase,
+    OverlayStepPlan,
+    OverlayTarget,
     OverlayVersion,
     OverlayVersionRef,
     OverlayVersionStore,
@@ -36,6 +50,8 @@ class _OverlayExecution(Protocol):
     def parameter_overlays(
         self,
     ) -> Mapping[OverlayChannel, OverlayVersionStore]: ...
+
+    def stage_request_finished(self, batch: RequestFinishedBatch) -> int: ...
 
 
 class _OverlayRuntime(Protocol):
@@ -106,12 +122,7 @@ class _MRV2InputBatch(Protocol):
     def num_reqs(self) -> int: ...
 
 
-class _SchedulerOutput(Protocol):
-    @property
-    def finished_req_ids(self) -> Sequence[str]: ...
-
-
-class _OverlayRunner(Protocol):
+class VLLMParameterOverlayRunner(DenseOverlayRunner, Protocol):
     @property
     def lora_manager(self) -> _WorkerLoRAManager: ...
 
@@ -132,16 +143,21 @@ class VLLMParameterOverlayController:
         self,
         *,
         runtime: _OverlayRuntime,
-        runner: _OverlayRunner,
+        runner: VLLMParameterOverlayRunner,
         state: OverlayBackendState,
     ) -> None:
-        worker_manager = runner.lora_manager
         self.runtime = runtime
         self.runner = runner
         self.state = state
         self.stores = state.stores
-        self.adapter_manager = worker_manager._adapter_manager  # pyright: ignore[reportPrivateUsage] -- vLLM exposes in-memory model installation only on its internal manager
-        self.max_rank = runner.lora_config.max_lora_rank
+
+    @property
+    def adapter_manager(self) -> _AdapterManager:
+        return self.runner.lora_manager._adapter_manager  # pyright: ignore[reportPrivateUsage] -- vLLM exposes in-memory model installation only on its internal manager
+
+    @property
+    def max_rank(self) -> int:
+        return self.runner.lora_config.max_lora_rank
 
     def _global_lora_lineages(
         self,
@@ -153,6 +169,8 @@ class VLLMParameterOverlayController:
             for lineage in store.lineages():
                 latest = store.latest(lineage)
                 if (
+                    lineage.channel == _channel
+                    and
                     lineage.request is None
                     and latest is not None
                     and latest.manifest.representation
@@ -166,9 +184,29 @@ class VLLMParameterOverlayController:
     ) -> bool:
         return self.state.owns_stores(stores)
 
+    def validate_dense_targets(self) -> None:
+        if self.state.dense_targets_validated:
+            return
+        targets = tuple(
+            channel.target
+            for channel in self.stores
+            if channel.target is not None
+        )
+        if targets:
+            validate_dense_replacement_targets(self.runner, targets)
+        self.state.dense_targets_validated = True
+
     def close(self) -> None:
-        self.release_finished(tuple(self.state.request_identities))
+        if self.state.request_identities:
+            raise RuntimeError(
+                "cannot rebind parameter overlays while requests are active"
+            )
         failures: list[Exception] = []
+        for handle in self.state.dense_targets.values():
+            try:
+                handle.restore()
+            except Exception as error:
+                failures.append(error)
         for lora_id in self.state.version_handles.values():
             try:
                 self.adapter_manager.remove_adapter(lora_id)
@@ -251,13 +289,140 @@ class VLLMParameterOverlayController:
 
     def sync_versions(self) -> int:
         added = 0
+        active_lora_refs: set[OverlayVersionRef] = set()
         for store, lineage in self._global_lora_lineages():
             for version in store.versions(lineage):
+                active_lora_refs.add(version.ref)
                 lora_id = self._lora_id(version.ref)
                 if lora_id not in self.adapter_manager.list_adapters():
                     self._materialize(store, version)
                     added += 1
+        for ref, lora_id in tuple(self.state.version_handles.items()):
+            if ref not in active_lora_refs:
+                self.adapter_manager.remove_adapter(lora_id)
+                self.state.version_handles.pop(ref)
+
+        active_dense_refs: dict[OverlayTarget, set[OverlayVersionRef]] = {}
+        for channel, store in sorted(
+            self.stores.items(),
+            key=lambda item: (item[0].namespace, item[0].name),
+        ):
+            target = channel.target
+            if target is None:
+                continue
+            for lineage in store.lineages():
+                if lineage.channel != channel:
+                    continue
+                latest = store.latest(lineage)
+                if (
+                    latest is None
+                    or latest.manifest.representation
+                    is not OverlayRepresentation.DENSE_REPLACE
+                ):
+                    continue
+                handle = self.state.dense_targets.get(target)
+                if handle is None:
+                    handle = install_dense_replacement_target(
+                        self.runner, target
+                    )
+                    self.state.dense_targets[target] = handle
+                target_refs = active_dense_refs.setdefault(target, set())
+                for version in store.versions(lineage):
+                    target_refs.add(version.ref)
+                    if not handle.has_version(version.ref):
+                        handle.install_version(
+                            version, store.materialize(version.ref)
+                        )
+                        added += 1
+        for target, handle in tuple(self.state.dense_targets.items()):
+            refs = frozenset(active_dense_refs.get(target, set()))
+            if refs:
+                handle.retain_versions(refs)
+            else:
+                handle.restore()
+                self.state.dense_targets.pop(target)
+                self.state.dense_reported_rows.pop(target, None)
         return added
+
+    def has_dense_versions(self) -> bool:
+        return bool(self.state.dense_targets)
+
+    def prepare_dense_step(
+        self,
+        *,
+        step_id: int,
+        columns: PackedRowPlanInputs,
+    ) -> OverlayStepPlan:
+        from tllm import _core
+
+        row_plan = _core.plan_packed_prefill_rows(
+            list(columns.scheduled_tokens),
+            list(columns.prompt_tokens),
+            list(columns.computed_tokens),
+        )
+        rows: dict[tuple[OverlayTarget, OverlayVersionRef], list[int]] = {}
+        phases: dict[
+            tuple[OverlayTarget, OverlayVersionRef], list[OverlayRowPhase]
+        ] = {}
+        dense_channels = tuple(
+            (channel, store)
+            for channel, store in self.stores.items()
+            if channel.target is not None
+        )
+        for request_ordinal, packed_row, phase in zip(
+            row_plan.request_ordinals,
+            row_plan.packed_row_indices,
+            row_plan.phases,
+            strict=True,
+        ):
+            request_id = columns.request_ids[request_ordinal]
+            identity = self._identity(request_id)
+            for channel, store in dense_channels:
+                target = channel.target
+                if target is None:
+                    continue
+                lineage = OverlayLineage(channel, identity)
+                lease = store.pinned(OverlayLeaseKey(identity, lineage))
+                if lease is None:
+                    continue
+                key = (target, lease.ref)
+                rows.setdefault(key, []).append(packed_row)
+                phases.setdefault(key, []).append(OverlayRowPhase(phase))
+                self.state.dense_request_ids.add(request_id)
+        assignments = tuple(
+            OverlayRowAssignment(
+                target=target,
+                version=ref,
+                packed_rows=tuple(rows[(target, ref)]),
+                phases=tuple(phases[(target, ref)]),
+            )
+            for target, ref in sorted(
+                rows,
+                key=lambda item: (
+                    item[0].layer,
+                    item[0].module,
+                    item[0].parameter,
+                    item[1].epoch,
+                    item[1].version,
+                ),
+            )
+        )
+        plan = OverlayStepPlan(step_id, row_plan.total_rows, assignments)
+        for handle in self.state.dense_targets.values():
+            handle.prepare_step(plan)
+        return plan
+
+    def clear_dense_step(self) -> None:
+        for target, handle in self.state.dense_targets.items():
+            applied = handle.apply_count
+            reported = self.state.dense_reported_rows.get(target, 0)
+            delta = applied - reported
+            if delta:
+                for channel, store in self.stores.items():
+                    if channel.target == target:
+                        store.record_backend_application(delta)
+                self.state.dense_reported_rows[target] = applied
+            handle.clear_step()
 
     def _identity(self, request_id: str) -> RequestIdentity:
         identity = resolve_request_identity(
@@ -286,17 +451,55 @@ class VLLMParameterOverlayController:
         self._materialize(store, version)
         return self._request_for(version)
 
-    def release_finished(self, request_ids: tuple[str, ...]) -> int:
-        released = 0
+    def release_finished(
+        self, request_ids: tuple[str, ...]
+    ) -> RequestFinishedBatch:
+        finished: list[RequestIdentity] = []
+        observed: set[RequestIdentity] = set()
         for request_id in request_ids:
-            identity = self.state.request_identities.pop(request_id, None)
-            self.state.attached_requests.discard(request_id)
+            identity = self.state.request_identities.get(request_id)
             if identity is None:
+                identity = self._identity(request_id)
+            aliases = tuple(
+                raw_id
+                for raw_id, raw_identity in self.state.request_identities.items()
+                if raw_identity == identity
+            )
+            for raw_id in aliases:
+                self.state.request_identities.pop(raw_id)
+                self.state.attached_requests.discard(raw_id)
+                self.state.dense_request_ids.discard(raw_id)
+            self.state.attached_requests.discard(request_id)
+            self.state.dense_request_ids.discard(request_id)
+            if identity in observed:
                 continue
+            observed.add(identity)
+            finished.append(identity)
             stores = set(self.stores.values())
             for store in stores:
-                released += store.retire_request(identity).released_leases
-        return released
+                for lineage in store.lineages():
+                    if lineage.request is None:
+                        store.release(OverlayLeaseKey(identity, lineage))
+        return RequestFinishedBatch(tuple(finished))
+
+    def finish_requests(
+        self, request_ids: tuple[str, ...]
+    ) -> RequestFinishedBatch:
+        batch = self.release_finished(request_ids)
+        execution = self.runtime.workload_execution
+        if execution is not None and batch.requests:
+            requires_signed_cleanup = any(
+                lineage.request in batch.requests
+                for store in set(self.stores.values())
+                for lineage in store.lineages()
+            )
+            if requires_signed_cleanup:
+                staged = execution.stage_request_finished(batch)
+                if staged < 1:
+                    raise RuntimeError(
+                        "request-scoped overlays require a signed request-finished port"
+                    )
+        return batch
 
     def apply_mrv1_input_batch(self, input_batch: _MRV1InputBatch) -> int:
         applied = 0
@@ -317,10 +520,13 @@ class VLLMParameterOverlayController:
         applied = 0
         request_ids = tuple(input_batch.req_ids[: input_batch.num_reqs])
         active = frozenset(request_ids)
-        self.release_finished(
+        self.finish_requests(
             tuple(
                 request_id
-                for request_id in self.state.attached_requests
+                for request_id in (
+                    self.state.attached_requests
+                    | self.state.dense_request_ids
+                )
                 if request_id not in active
             )
         )
@@ -339,7 +545,7 @@ class VLLMParameterOverlayController:
 def maybe_bind_publisher(
     *,
     runtime: _OverlayRuntime,
-    runner: _OverlayRunner,
+    runner: VLLMParameterOverlayRunner,
     state: OverlayBackendState | None,
 ) -> VLLMParameterOverlayController | None:
     execution = runtime.workload_execution
@@ -369,28 +575,64 @@ def maybe_bind_publisher(
             runner=runner,
             state=state,
         )
+    controller.validate_dense_targets()
     return controller
 
 
-def sync_mrv1_before_prepare(
+def unbind_parameter_overlays(
+    *, runner: VLLMParameterOverlayRunner, state: OverlayBackendState
+) -> None:
+    failures: list[Exception] = []
+    for handle in state.dense_targets.values():
+        try:
+            handle.restore()
+        except Exception as error:
+            failures.append(error)
+    if state.version_handles:
+        adapter_manager = runner.lora_manager._adapter_manager  # pyright: ignore[reportPrivateUsage] -- vLLM exposes in-memory model removal only on its internal manager
+        for lora_id in state.version_handles.values():
+            try:
+                adapter_manager.remove_adapter(lora_id)
+            except Exception as error:
+                failures.append(error)
+    if failures:
+        raise RuntimeError(
+            "could not release all parameter overlays during runner unbind"
+        ) from failures[0]
+    state.rebind({})
+
+
+def finish_parameter_overlay_requests(
     *,
     runtime: _OverlayRuntime,
-    runner: _OverlayRunner,
-    state: OverlayBackendState | None,
-    scheduler_output: _SchedulerOutput,
-) -> int:
+    runner: VLLMParameterOverlayRunner,
+    state: OverlayBackendState,
+    request_ids: tuple[str, ...],
+) -> RequestFinishedBatch:
     controller = maybe_bind_publisher(
         runtime=runtime, runner=runner, state=state
     )
     if controller is None:
-        return 0
-    controller.release_finished(tuple(scheduler_output.finished_req_ids))
-    controller.sync_versions()
-    return controller.apply_mrv1_input_batch(runner.input_batch)
+        return RequestFinishedBatch(())
+    return controller.finish_requests(request_ids)
 
+
+def synchronize_parameter_overlays(
+    *,
+    runtime: _OverlayRuntime,
+    runner: VLLMParameterOverlayRunner,
+    state: OverlayBackendState,
+) -> int:
+    controller = maybe_bind_publisher(
+        runtime=runtime, runner=runner, state=state
+    )
+    return 0 if controller is None else controller.sync_versions()
 
 __all__ = [
+    "VLLMParameterOverlayRunner",
     "VLLMParameterOverlayController",
+    "finish_parameter_overlay_requests",
     "maybe_bind_publisher",
-    "sync_mrv1_before_prepare",
+    "synchronize_parameter_overlays",
+    "unbind_parameter_overlays",
 ]

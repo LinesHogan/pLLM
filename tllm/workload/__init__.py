@@ -64,7 +64,7 @@ from tllm.workload.config import (
     WorkloadConfig,
     config_field,
 )
-from tllm.workload.staging import StagedPort
+from tllm.workload.staging import StagedLifecycle, StagedPort
 from tllm.workload.host import HostOutput
 from tllm.workload.ir import (
     ApproximationPolicy,
@@ -145,6 +145,7 @@ __all__ = [
     "StateEffect",
     "StateScope",
     "StagedPort",
+    "StagedLifecycle",
     "WorkloadDeclaration",
     "WorkloadDefinition",
     "WorkloadEffect",

@@ -24,6 +24,7 @@ from tllm.backends.protocol import (
     BackendCapabilities,
     GraphSafety,
     ModelRegionCapabilities,
+    OverlayBackendState,
     OrderedRowFusionCapabilities,
     RunnerBinding,
     SamplerStage,
@@ -31,6 +32,7 @@ from tllm.backends.protocol import (
     VersionedParameterOverlayCapabilities,
 )
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.backends.vllm import runner_adapter as _runner_adapter
 from tllm.backends.vllm import model_region as _model_region
@@ -196,12 +198,17 @@ def _wrapped_prepare_inputs(
             "Refusing to guess: install a matching backend driver."
         )
     binding = _runner_adapter.get_runner_binding(runner)
-    _parameter_overlay.sync_mrv1_before_prepare(
+    overlay_controller = _parameter_overlay.maybe_bind_publisher(
         runtime=runtime,
         runner=runner,
         state=None if binding is None else binding.parameter_overlay_state,
-        scheduler_output=scheduler_output,
     )
+    if overlay_controller is not None:
+        overlay_controller.finish_requests(
+            _runner_adapter.mrv1_finished_request_ids(scheduler_output)
+        )
+        overlay_controller.sync_versions()
+        overlay_controller.apply_mrv1_input_batch(runner.input_batch)
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, scheduler_output, num_scheduled_tokens)
         view = _ADAPTER.unpack_prepare_inputs_output(
@@ -223,6 +230,14 @@ def _wrapped_prepare_inputs(
         num_scheduled_tokens=num_scheduled_tokens,
         input_batch=None,
     )
+    if (
+        overlay_controller is not None
+        and overlay_controller.has_dense_versions()
+    ):
+        overlay_controller.prepare_dense_step(
+            step_id=int(runtime.event_step_id) + 1,
+            columns=batch_columns,
+        )
     batch_phase = _scheduler_batch_phase.scheduler_batch_phase(columns=batch_columns)
     hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
 
@@ -427,10 +442,14 @@ class V027MRv1Driver:
                 {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
             ),
             parameter_overlay=VersionedParameterOverlayCapabilities(
-                representations=frozenset({"low_rank_add"}),
-                scopes=frozenset({"global"}),
+                representations=frozenset(
+                    {"low_rank_add", "dense_replace"}
+                ),
+                scopes=frozenset({"global", "request"}),
                 phases=frozenset({"prefill", "decode"}),
-                pinning=frozenset({"latest_at_admission"}),
+                pinning=frozenset(
+                    {"latest_at_admission", "explicit_request_advance"}
+                ),
                 mixed_versions=True,
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
@@ -547,6 +566,16 @@ class V027MRv1Driver:
 
         def _execute_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
             active = active_targets.runtime_has_active_targets(core.RUNTIME)
+            binding = _runner_adapter.get_runner_binding(runner)
+            overlay_controller = _parameter_overlay.maybe_bind_publisher(
+                runtime=core.RUNTIME,
+                runner=runner,
+                state=(
+                    None
+                    if binding is None
+                    else binding.parameter_overlay_state
+                ),
+            )
             if active:
                 # The next session is created by the nested _prepare_inputs
                 # call inside vLLM's original execute_model. Clearing the
@@ -572,17 +601,23 @@ class V027MRv1Driver:
                     step_id=None if session is None else session.step_id,
                 )
 
-            out = _hooks.wrapped_execute_model(
-                core=core,
-                runner=runner,
-                args=args,
-                kwargs=kwargs,
-                split_execute_and_sample=True,
-                phase=None,
-                before_runtime_event=_stage_event,
-                execute_pre_already_dispatched=active,
-                phase_after_inputs=_phase_after_nested_prepare if active else None,
-            )
+            try:
+                out = _hooks.wrapped_execute_model(
+                    core=core,
+                    runner=runner,
+                    args=args,
+                    kwargs=kwargs,
+                    split_execute_and_sample=True,
+                    phase=None,
+                    before_runtime_event=_stage_event,
+                    execute_pre_already_dispatched=active,
+                    phase_after_inputs=(
+                        _phase_after_nested_prepare if active else None
+                    ),
+                )
+            finally:
+                if overlay_controller is not None:
+                    overlay_controller.clear_dense_step()
             session = get_step_session(runner)
             if session is not None and session.state == StepState.INPUTS_READY:
                 session.transition(StepState.FORWARD_DONE)
@@ -605,4 +640,34 @@ class V027MRv1Driver:
         _sampler_mrv1.install_sampler_patch_v027(core=core)
 
     def unbind(self, binding: RunnerBinding) -> None:
+        _parameter_overlay.unbind_parameter_overlays(
+            runner=binding.runner,
+            state=binding.parameter_overlay_state,
+        )
         _runner_adapter.unbind_runner(binding)
+
+    def finish_parameter_overlay_requests(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+        request_ids: tuple[str, ...],
+    ) -> RequestFinishedBatch:
+        return _parameter_overlay.finish_parameter_overlay_requests(
+            runtime=runtime,
+            runner=runner,
+            state=state,
+            request_ids=request_ids,
+        )
+
+    def synchronize_parameter_overlays(
+        self,
+        *,
+        runtime: Any,
+        runner: Any,
+        state: OverlayBackendState,
+    ) -> int:
+        return _parameter_overlay.synchronize_parameter_overlays(
+            runtime=runtime, runner=runner, state=state
+        )

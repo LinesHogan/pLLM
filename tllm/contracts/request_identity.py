@@ -14,6 +14,11 @@ class RequestIdentity:
     sample_idx: int
 
 
+@dataclass(frozen=True, slots=True)
+class RequestFinishedBatch:
+    requests: tuple[RequestIdentity, ...]
+
+
 def _external_request_id(request_id: str, prompt_indices: Mapping[str, int]) -> str | None:
     if request_id in prompt_indices:
         return request_id
@@ -26,15 +31,14 @@ def _external_request_id(request_id: str, prompt_indices: Mapping[str, int]) -> 
 
 
 def resolve_request_identity(
-    request_id: object,
+    request_id: str,
     *,
     prompt_indices: Mapping[str, int],
     sample_indices: Mapping[str, int] | None = None,
 ) -> RequestIdentity | None:
     """Resolve direct, parallel-child, and vLLM-internal request ids."""
-    request_id_s = str(request_id)
     sample_map: Mapping[str, int] = {} if sample_indices is None else sample_indices
-    external = _external_request_id(request_id_s, prompt_indices)
+    external = _external_request_id(request_id, prompt_indices)
     if external is not None:
         return RequestIdentity(
             request_id=external,
@@ -42,7 +46,7 @@ def resolve_request_identity(
             sample_idx=int(sample_map.get(external, 0)),
         )
 
-    sample_text, separator, parent_id = request_id_s.partition("_")
+    sample_text, separator, parent_id = request_id.partition("_")
     if separator and sample_text.isdigit():
         external_parent = _external_request_id(parent_id, prompt_indices)
         if external_parent is not None:
@@ -55,7 +59,7 @@ def resolve_request_identity(
 
 
 def resolve_prompt_sample(
-    request_id: object,
+    request_id: str,
     *,
     prompt_indices: Mapping[str, int],
     sample_indices: Mapping[str, int] | None = None,

@@ -180,6 +180,24 @@ class _FakeLLM:
         self.llm_engine = type("Engine", (), {"engine_core": _FakeEngineCore()})()
 
 
+class _RequestFinishWorker:
+    def __init__(self, worker_id: str, finished: int) -> None:
+        self.worker_id = worker_id
+        self.finished = finished
+
+    def tllm_ping(self) -> dict[str, object]:
+        return {"worker_id": self.worker_id}
+
+    def tllm_finish_workload_requests(
+        self, request_ids: list[str]
+    ) -> dict[str, object]:
+        return {
+            "worker_id": self.worker_id,
+            "request_ids": request_ids,
+            "finished": self.finished,
+        }
+
+
 class _CoercibleInteger:
     def __int__(self) -> int:
         return 1
@@ -239,6 +257,42 @@ def _shape_specialization_state(signature: str, plan_epoch: int):
 
 
 class ControlPlaneUnitTest(unittest.TestCase):
+    def test_request_finish_rejects_worker_count_divergence(self) -> None:
+        llm = _FakeLLM()
+        llm.llm_engine.engine_core.handlers = [
+            _RequestFinishWorker("worker-0", 1),
+            _RequestFinishWorker("worker-1", 0),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "count quorum mismatch"):
+            ControlPlane(llm).finish_workload_requests(("request-0",))
+
+    def test_request_finish_rejects_incomplete_overlay_cleanup(self) -> None:
+        llm = _FakeLLM()
+        llm.llm_engine.engine_core.handlers = [
+            _RequestFinishWorker("worker-0", 0),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "count is incomplete"):
+            ControlPlane(llm).finish_workload_requests(
+                ("request-0",), expected_finished=1
+            )
+
+    def test_overlay_finish_requires_worker_runner_binding(self) -> None:
+        extension = TllmWorkerExtension()
+        extension.model_runner = SimpleNamespace()
+        execution = SimpleNamespace(parameter_overlays={"overlay": object()})
+
+        with (
+            mock.patch.object(
+                residual_runtime.RUNTIME,
+                "workload_execution",
+                execution,
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires a runner binding"),
+        ):
+            extension.tllm_finish_workload_requests(["request-0"])
+
     def test_workload_worker_spec_wire_is_closed_and_does_not_coerce(self) -> None:
         self.assertEqual(
             WorkloadWorkerSpec.from_wire(
@@ -1783,10 +1837,11 @@ class ControlPlaneUnitTest(unittest.TestCase):
         from tllm.runtime.runtime import TllmRuntime
 
         runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
-        plane = object()
+        plane = mock.Mock()
         events: list[str] = []
+        output = (SimpleNamespace(request_id="request-0"),)
         llm = SimpleNamespace(
-            generate=lambda prompt: events.append(f"generate:{prompt}") or "output"
+            generate=lambda prompt: events.append(f"generate:{prompt}") or output
         )
         with mock.patch.object(
             runtime,
@@ -1796,11 +1851,14 @@ class ControlPlaneUnitTest(unittest.TestCase):
             )
             or False,
         ):
-            runtime._install_shape_specialization_poll(llm, plane)
-            runtime._install_shape_specialization_poll(llm, plane)
-            self.assertEqual(llm.generate("next"), "output")
+            runtime._install_generate_boundary(llm, plane)
+            runtime._install_generate_boundary(llm, plane)
+            self.assertEqual(llm.generate("next"), output)
 
         self.assertEqual(events, ["poll", "generate:next"])
+        plane.finish_workload_requests.assert_called_once_with(
+            ("request-0",), expected_finished=None
+        )
 
     def test_shape_generate_wrapper_rejects_fail_stopped_runtime(self) -> None:
         from tllm.runtime.runtime import TllmRuntime
@@ -1808,12 +1866,31 @@ class ControlPlaneUnitTest(unittest.TestCase):
         runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
         original_generate = mock.Mock(return_value="unexpected")
         llm = SimpleNamespace(generate=original_generate)
-        runtime._install_shape_specialization_poll(llm, object())
+        runtime._install_generate_boundary(llm, object())
         runtime._fail_stop_workloads("activation quorum lost")
 
         with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
             llm.generate("next")
         original_generate.assert_not_called()
+
+    def test_request_finish_quorum_failure_fail_stops_runtime(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+        plane = mock.Mock()
+        plane.finish_workload_requests.side_effect = RuntimeError(
+            "finish quorum lost"
+        )
+        output = (SimpleNamespace(request_id="request-0"),)
+        original_generate = mock.Mock(return_value=output)
+        llm = SimpleNamespace(generate=original_generate)
+        runtime._install_generate_boundary(llm, plane)
+
+        with self.assertRaisesRegex(RuntimeError, "finish quorum lost"):
+            llm.generate("first")
+        with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
+            llm.generate("second")
+        original_generate.assert_called_once_with("first")
 
     def test_dummy_native_worker_reconstructs_without_dispatch_consumer(self) -> None:
         from tllm.backends.timeline import export_main_workload_timeline
