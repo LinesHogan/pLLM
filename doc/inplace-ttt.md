@@ -39,10 +39,20 @@ prefill/decode row assignment, generate-end signed cleanup, and real
 eager-GPU dense application in all four MRv1/MRv2 × in-process/EngineCore-MP
 cells. The GPU smoke is
 `test/gpu/native_inplace_ttt_workload_smoke.py`; it requires nonzero native
-update and dense-apply counts, a token-level effect relative to the base
-weight, and zero request state after the public generate boundary. Its
-training pair is deliberately supplied through the typed host service;
-automatic model-hidden pair production remains an explicit integration item.
+update and dense-apply counts, real captured training rows, and zero request
+state after the public generate boundary. The
+worker-local typed producer captures the real MLP input, activated
+down-projection input, base weight, and Rust-derived request/phase rows; one
+bundle is staged before `execute_model.post`, while selection and update math
+remain native tasks.
 TP>1, PP>1, quantized targets, and CUDA Graph currently fail closed; native
 support for those modes and official-checkpoint parity must not be inferred
 from the eager evidence.
+
+The current producer is deliberately deferred at model-step granularity: a
+model call observes one previously published weight, then publishes the next
+version for a later model step. It does not claim parity with an upstream
+implementation that updates after each chunk and uses the new weight for a
+later chunk inside the same long prefill. That synchronous behavior requires
+signed layer/chunk subregions rather than update logic hidden in the backend
+wrapper.

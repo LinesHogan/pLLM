@@ -22,7 +22,9 @@ from tllm.contracts.request_identity import (
     resolve_request_identity,
 )
 from tllm.runtime.parameter_overlay import (
+    DenseOperandCaptureBatch,
     OverlayChannel,
+    OverlayCaptureRows,
     OverlayLeaseKey,
     OverlayLineage,
     OverlayRepresentation,
@@ -52,6 +54,10 @@ class _OverlayExecution(Protocol):
     ) -> Mapping[OverlayChannel, OverlayVersionStore]: ...
 
     def stage_request_finished(self, batch: RequestFinishedBatch) -> int: ...
+
+    def stage_dense_operand_captured(
+        self, batch: DenseOperandCaptureBatch
+    ) -> int: ...
 
 
 class _OverlayRuntime(Protocol):
@@ -194,6 +200,16 @@ class VLLMParameterOverlayController:
         )
         if targets:
             validate_dense_replacement_targets(self.runner, targets)
+        for channel in self.stores:
+            target = channel.target
+            if (
+                target is not None
+                and channel.capture_operands
+                and target not in self.state.dense_targets
+            ):
+                self.state.dense_targets[target] = (
+                    install_dense_replacement_target(self.runner, target)
+                )
         self.state.dense_targets_validated = True
 
     def close(self) -> None:
@@ -334,10 +350,17 @@ class VLLMParameterOverlayController:
                             version, store.materialize(version.ref)
                         )
                         added += 1
+        capture_targets = frozenset(
+            channel.target
+            for channel in self.stores
+            if channel.target is not None and channel.capture_operands
+        )
         for target, handle in tuple(self.state.dense_targets.items()):
             refs = frozenset(active_dense_refs.get(target, set()))
             if refs:
                 handle.retain_versions(refs)
+            elif target in capture_targets:
+                handle.retain_versions(frozenset())
             else:
                 handle.restore()
                 self.state.dense_targets.pop(target)
@@ -345,6 +368,12 @@ class VLLMParameterOverlayController:
         return added
 
     def has_dense_versions(self) -> bool:
+        return any(
+            handle.version_count
+            for handle in self.state.dense_targets.values()
+        )
+
+    def requires_dense_step(self) -> bool:
         return bool(self.state.dense_targets)
 
     def prepare_dense_step(
@@ -364,30 +393,61 @@ class VLLMParameterOverlayController:
         phases: dict[
             tuple[OverlayTarget, OverlayVersionRef], list[OverlayRowPhase]
         ] = {}
+        capture_rows: dict[
+            tuple[OverlayTarget, RequestIdentity, OverlayRowPhase], list[int]
+        ] = {}
+        capture_offsets: dict[
+            tuple[OverlayTarget, RequestIdentity, OverlayRowPhase], list[int]
+        ] = {}
         dense_channels = tuple(
             (channel, store)
             for channel, store in self.stores.items()
             if channel.target is not None
         )
-        for request_ordinal, packed_row, phase in zip(
+        for request_ordinal, packed_row, token_offset, raw_phase in zip(
             row_plan.request_ordinals,
             row_plan.packed_row_indices,
+            row_plan.token_offsets,
             row_plan.phases,
             strict=True,
         ):
             request_id = columns.request_ids[request_ordinal]
-            identity = self._identity(request_id)
+            resolved_identity = resolve_request_identity(
+                request_id,
+                prompt_indices=self.runtime.reqid_to_promptidx,
+                sample_indices=self.runtime.reqid_to_sampleidx,
+            )
+            identity = (
+                RequestIdentity(request_id, -1, 0)
+                if resolved_identity is None
+                else resolved_identity
+            )
+            phase = OverlayRowPhase(raw_phase)
             for channel, store in dense_channels:
                 target = channel.target
                 if target is None:
                     continue
+                captured = (
+                    channel.capture_operands
+                    and resolved_identity is not None
+                )
+                if captured:
+                    capture_key = (target, identity, phase)
+                    capture_rows.setdefault(capture_key, []).append(packed_row)
+                    capture_offsets.setdefault(capture_key, []).append(
+                        token_offset
+                    )
+                    self.state.dense_request_ids.add(request_id)
                 lineage = OverlayLineage(channel, identity)
                 lease = store.pinned(OverlayLeaseKey(identity, lineage))
                 if lease is None:
+                    if captured:
+                        self.state.request_identities[request_id] = identity
                     continue
                 key = (target, lease.ref)
                 rows.setdefault(key, []).append(packed_row)
-                phases.setdefault(key, []).append(OverlayRowPhase(phase))
+                phases.setdefault(key, []).append(phase)
+                self.state.request_identities[request_id] = identity
                 self.state.dense_request_ids.add(request_id)
         assignments = tuple(
             OverlayRowAssignment(
@@ -407,10 +467,66 @@ class VLLMParameterOverlayController:
                 ),
             )
         )
-        plan = OverlayStepPlan(step_id, row_plan.total_rows, assignments)
+        captures = tuple(
+            OverlayCaptureRows(
+                target=target,
+                request=request,
+                phase=phase,
+                packed_rows=tuple(capture_rows[(target, request, phase)]),
+                token_offsets=tuple(
+                    capture_offsets[(target, request, phase)]
+                ),
+            )
+            for target, request, phase in sorted(
+                capture_rows,
+                key=lambda item: (
+                    item[0].layer,
+                    item[0].module,
+                    item[0].parameter,
+                    min(capture_rows[item]),
+                    item[2].value,
+                ),
+            )
+        )
+        plan = OverlayStepPlan(
+            step_id=step_id,
+            total_rows=row_plan.total_rows,
+            assignments=assignments,
+            captures=captures,
+        )
         for handle in self.state.dense_targets.values():
             handle.prepare_step(plan)
         return plan
+
+    def stage_dense_operand_captured(self) -> int:
+        expected = sum(
+            handle.capture_expected
+            for handle in self.state.dense_targets.values()
+        )
+        captures = tuple(
+            capture
+            for handle in self.state.dense_targets.values()
+            if (capture := handle.take_capture()) is not None
+        )
+        if not expected:
+            return 0
+        if len(captures) != expected:
+            raise RuntimeError(
+                "dense operand capture did not observe every signed target"
+            )
+        execution = self.runtime.workload_execution
+        if execution is None:
+            raise RuntimeError(
+                "dense operand capture requires an active native execution"
+            )
+        staged = execution.stage_dense_operand_captured(
+            DenseOperandCaptureBatch(captures)
+        )
+        if staged < 1:
+            raise RuntimeError(
+                "dense operand capture requires a signed capture port"
+            )
+        return staged
 
     def clear_dense_step(self) -> None:
         for target, handle in self.state.dense_targets.items():

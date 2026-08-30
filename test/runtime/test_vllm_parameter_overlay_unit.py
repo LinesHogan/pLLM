@@ -20,7 +20,9 @@ from tllm.backends.vllm.versioned_parameter_overlay import (
 from tllm.backends.vllm.runner_adapter import PackedRowPlanInputs
 from tllm.contracts.request_identity import RequestFinishedBatch, RequestIdentity
 from tllm.runtime.parameter_overlay import (
+    DenseOperandCaptureBatch,
     OverlayChannel,
+    OverlayCaptureRows,
     OverlayLeaseKey,
     OverlayLineage,
     OverlayPayload,
@@ -122,9 +124,18 @@ class _DenseLinear:
         return F.linear(input_, self.weight), None
 
 
-@dataclass(slots=True)
 class _MLP:
-    down_proj: _DenseLinear
+    def __init__(self, down_proj: _DenseLinear) -> None:
+        self.down_proj = down_proj
+        self.forward: Callable[[torch.Tensor], torch.Tensor] = (
+            self._base_forward
+        )
+
+    def _base_forward(self, mlp_input: torch.Tensor) -> torch.Tensor:
+        activated = torch.cat(
+            (mlp_input, mlp_input.sum(dim=1, keepdim=True)), dim=1
+        )
+        return self.down_proj.forward(activated)[0]
 
 
 @dataclass(slots=True)
@@ -177,6 +188,9 @@ class _Execution:
         default_factory=list[RequestFinishedBatch]
     )
     lifecycle_ports: int = 1
+    captured: list[DenseOperandCaptureBatch] = field(
+        default_factory=list[DenseOperandCaptureBatch]
+    )
 
     def stage_request_finished(self, batch: RequestFinishedBatch) -> int:
         if not self.lifecycle_ports:
@@ -186,6 +200,12 @@ class _Execution:
             for request in batch.requests:
                 store.retire_request(request)
         return self.lifecycle_ports
+
+    def stage_dense_operand_captured(
+        self, batch: DenseOperandCaptureBatch
+    ) -> int:
+        self.captured.append(batch)
+        return 1
 
 
 @dataclass(slots=True)
@@ -506,6 +526,64 @@ def test_dense_target_validation_rejects_physical_aliases() -> None:
 
     with pytest.raises(RuntimeError, match="alias the same physical"):
         harness.bind()
+
+
+def test_typed_capture_records_real_mlp_and_down_proj_operands_once() -> None:
+    target = OverlayTarget(0, "mlp", "down_proj.weight")
+    channel = OverlayChannel(
+        "inplace_ttt", "layer-0", target, capture_operands=True
+    )
+    harness = _OverlayHarness.create({channel: OverlayVersionStore()})
+    mlp = harness.runner.model.model.layers[0].mlp
+    original_mlp_forward = mlp.forward
+    original_down_forward = harness.dense_linear.forward
+    base_weight = harness.dense_linear.weight.detach().clone()
+    controller = harness.bind()
+    assert controller.sync_versions() == 0
+    assert controller.requires_dense_step()
+    assert not controller.has_dense_versions()
+    plan = controller.prepare_dense_step(
+        step_id=9,
+        columns=PackedRowPlanInputs(
+            request_ids=("active",),
+            scheduled_tokens=(2,),
+            prompt_tokens=(2,),
+            computed_tokens=(0,),
+        ),
+    )
+    assert plan.captures == (
+        OverlayCaptureRows(
+            target=target,
+            request=RequestIdentity("active", 0, 0),
+            phase=OverlayRowPhase.PREFILL,
+            packed_rows=(0, 1),
+            token_offsets=(0, 1),
+        ),
+    )
+    mlp_input = torch.tensor(
+        [[1.0, 2.0], [-0.5, 0.25]], dtype=torch.float64
+    )
+    expected_down_input = torch.cat(
+        (mlp_input, mlp_input.sum(dim=1, keepdim=True)), dim=1
+    )
+    with pytest.raises(RuntimeError, match="every signed target"):
+        controller.stage_dense_operand_captured()
+    mlp.forward(mlp_input)
+    assert controller.stage_dense_operand_captured() == 1
+    (captured_batch,) = harness.runtime.workload_execution.captured
+    (capture,) = captured_batch.captures
+    assert capture.step_id == 9
+    assert capture.target == target
+    assert capture.rows == plan.captures
+    torch.testing.assert_close(capture.mlp_input, mlp_input)
+    torch.testing.assert_close(capture.down_proj_input, expected_down_input)
+    torch.testing.assert_close(capture.base_weight, base_weight)
+
+    controller.clear_dense_step()
+    controller.finish_requests(("active",))
+    controller.close()
+    assert mlp.forward is original_mlp_forward
+    assert harness.dense_linear.forward is original_down_forward
 
 
 def test_global_lora_and_request_dense_versions_share_one_request_lifecycle() -> None:

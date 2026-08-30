@@ -232,7 +232,7 @@ def _wrapped_prepare_inputs(
     )
     if (
         overlay_controller is not None
-        and overlay_controller.has_dense_versions()
+        and overlay_controller.requires_dense_step()
     ):
         overlay_controller.prepare_dense_step(
             step_id=int(runtime.event_step_id) + 1,
@@ -451,6 +451,7 @@ class V027MRv1Driver:
                     {"latest_at_admission", "explicit_request_advance"}
                 ),
                 mixed_versions=True,
+                operand_captures=frozenset({"mlp_down_proj"}),
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
             ),
@@ -601,6 +602,10 @@ class V027MRv1Driver:
                     step_id=None if session is None else session.step_id,
                 )
 
+            def _stage_dense_capture() -> None:
+                if overlay_controller is not None:
+                    overlay_controller.stage_dense_operand_captured()
+
             try:
                 out = _hooks.wrapped_execute_model(
                     core=core,
@@ -614,6 +619,7 @@ class V027MRv1Driver:
                     phase_after_inputs=(
                         _phase_after_nested_prepare if active else None
                     ),
+                    after_model_forward=_stage_dense_capture,
                 )
             finally:
                 if overlay_controller is not None:

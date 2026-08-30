@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Any, cast
 import weakref
 
 if TYPE_CHECKING:
-    from vllm import LLM
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
     from vllm.outputs import RequestOutput
 
 _runner_owners: "weakref.WeakKeyDictionary[Any, object]" = weakref.WeakKeyDictionary()
@@ -21,6 +22,14 @@ def create_llm(args: tuple[object, ...], kwargs: dict[str, object]) -> LLM:
     from tllm.runtime import residual_runtime
 
     return residual_runtime.make_llm(*args, **kwargs)
+
+
+def generate_requests(
+    llm: LLM,
+    prompts: Sequence[TokensPrompt],
+    sampling_params: SamplingParams,
+) -> list[RequestOutput]:
+    return llm.generate(prompts, sampling_params, use_tqdm=False)
 
 
 def bind_inprocess_runner(llm: object, owner: object) -> None:
@@ -55,7 +64,25 @@ def install_generate_boundary(
 
     def generate_at_runtime_boundary(*args: Any, **kwargs: Any) -> Any:
         before_generate()
-        outputs = generate(*args, **kwargs)
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.mp.control import ControlPlane
+        from tllm.runtime.vllm_patch.capture_runner import (
+            make_mapping_add_request,
+        )
+
+        engine = dynamic.llm_engine
+        original_add_request = engine.add_request
+        engine.add_request = make_mapping_add_request(
+            runtime=residual_runtime.RUNTIME,
+            plane=ControlPlane.try_bind(dynamic),
+            orig_add_request=original_add_request,
+            request_prompt_indices=None,
+            request_sample_indices=None,
+        )
+        try:
+            outputs = generate(*args, **kwargs)
+        finally:
+            engine.add_request = original_add_request
         after_generate(outputs)
         return outputs
 
@@ -80,6 +107,7 @@ __all__ = [
     "bind_inprocess_runner",
     "bind_runner_owner",
     "create_llm",
+    "generate_requests",
     "install_generate_boundary",
     "legacy_runner_graph_enabled",
 ]

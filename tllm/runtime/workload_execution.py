@@ -39,13 +39,21 @@ class WorkloadPortOwner(Protocol):
 
     def stage_request_finished(self, batch: RequestFinishedBatch) -> int: ...
 
+    def stage_dense_operand_captured(
+        self, batch: DenseOperandCaptureBatch
+    ) -> int: ...
+
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationInput,
     RegionShapeSpecializationRequest,
 )
 from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
-from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
+from tllm.runtime.parameter_overlay import (
+    DenseOperandCaptureBatch,
+    OverlayChannel,
+    OverlayVersionStore,
+)
 from tllm.runtime.workload_bindings import (
     NoPerRequestStats,
     NoSamplerBinding,
@@ -893,6 +901,14 @@ class NativeWorkloadExecution:
     def stage_request_finished(self, batch: RequestFinishedBatch) -> int:
         return sum(
             workload.stage_request_finished(batch)
+            for workload in self._workload_instances
+        )
+
+    def stage_dense_operand_captured(
+        self, batch: DenseOperandCaptureBatch
+    ) -> int:
+        return sum(
+            workload.stage_dense_operand_captured(batch)
             for workload in self._workload_instances
         )
 

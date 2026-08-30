@@ -10,8 +10,10 @@ from tllm.consumers.inplace_ttt.workload import (
     InPlaceTTTMetadata,
     InPlaceTTTPhase,
     InPlaceTTTPublication,
+    InPlaceTTTPublicationBundle,
     InPlaceTTTSlot,
     InPlaceTTTStep,
+    InPlaceTTTStepBundle,
     InPlaceTTTWorkload,
 )
 
@@ -24,7 +26,9 @@ __all__ = [
     "InPlaceTTTMetadata",
     "InPlaceTTTPhase",
     "InPlaceTTTPublication",
+    "InPlaceTTTPublicationBundle",
     "InPlaceTTTSlot",
     "InPlaceTTTStep",
+    "InPlaceTTTStepBundle",
     "InPlaceTTTWorkload",
 ]

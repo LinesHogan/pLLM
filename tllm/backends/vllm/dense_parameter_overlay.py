@@ -10,6 +10,8 @@ import torch
 from torch.nn import Parameter
 from torch.nn import functional as F
 from tllm.runtime.parameter_overlay import (
+    DenseOperandCapture,
+    OverlayCaptureRows,
     OverlayStepPlan,
     OverlayTarget,
     OverlayVersion,
@@ -19,6 +21,7 @@ from tllm.runtime.parameter_overlay import (
 
 _LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
 _LinearForward = Callable[[torch.Tensor], _LinearOutput]
+_MLPForward = Callable[[torch.Tensor], torch.Tensor]
 
 
 class _DenseLinear(Protocol):
@@ -30,6 +33,8 @@ class _DenseLinear(Protocol):
 
 
 class _MLP(Protocol):
+    forward: _MLPForward
+
     @property
     def down_proj(self) -> _DenseLinear: ...
 
@@ -91,15 +96,24 @@ class VLLMDenseReplacementHandle:
         self,
         *,
         target: OverlayTarget,
+        mlp: _MLP,
         module: _DenseLinear,
     ) -> None:
         self._target = target
+        self.mlp = mlp
         self.module = module
+        self._original_mlp_forward: _MLPForward = mlp.forward
         self._original_forward: _LinearForward = module.forward
+        self._base_weight = module.weight.detach()
         self._versions: dict[OverlayVersionRef, torch.Tensor] = {}
         self._prepared: tuple[_PreparedRows, ...] = ()
+        self._capture_rows: tuple[OverlayCaptureRows, ...] = ()
+        self._mlp_input: torch.Tensor | None = None
+        self._capture: DenseOperandCapture | None = None
         self._total_rows = 0
+        self._step_id = 0
         self._apply_count = 0
+        mlp.forward = self.forward_mlp
         module.forward = self.forward
 
     @property
@@ -109,6 +123,14 @@ class VLLMDenseReplacementHandle:
     @property
     def apply_count(self) -> int:
         return self._apply_count
+
+    @property
+    def version_count(self) -> int:
+        return len(self._versions)
+
+    @property
+    def capture_expected(self) -> bool:
+        return bool(self._capture_rows)
 
     def has_version(self, ref: OverlayVersionRef) -> bool:
         return ref in self._versions
@@ -156,14 +178,56 @@ class VLLMDenseReplacementHandle:
             )
             for assignment in assignments
         )
+        self._capture_rows = tuple(
+            capture for capture in plan.captures if capture.target == self.target
+        )
+        self._capture = None
         self._total_rows = plan.total_rows
+        self._step_id = plan.step_id
 
     def clear_step(self) -> None:
         self._prepared = ()
+        self._capture_rows = ()
+        self._mlp_input = None
+        self._capture = None
         self._total_rows = 0
+        self._step_id = 0
+
+    def forward_mlp(self, mlp_input: torch.Tensor) -> torch.Tensor:
+        if self._capture_rows:
+            self._mlp_input = mlp_input.detach().clone()
+        try:
+            return self._original_mlp_forward(mlp_input)
+        finally:
+            self._mlp_input = None
 
     def forward(self, hidden: torch.Tensor) -> _LinearOutput:
         base = self._original_forward(hidden)
+        if self._capture_rows:
+            mlp_input = self._mlp_input
+            if mlp_input is None:
+                raise RuntimeError(
+                    "dense operand capture did not observe the parent MLP input"
+                )
+            if (
+                hidden.shape[0] != self._total_rows
+                or mlp_input.shape[0] != self._total_rows
+            ):
+                raise RuntimeError(
+                    "dense operand capture row plan does not match model inputs"
+                )
+            if self._capture is not None:
+                raise RuntimeError(
+                    "dense operand target executed more than once in one step"
+                )
+            self._capture = DenseOperandCapture(
+                step_id=self._step_id,
+                target=self.target,
+                rows=self._capture_rows,
+                down_proj_input=hidden.detach().clone(),
+                mlp_input=mlp_input,
+                base_weight=self._base_weight,
+            )
         if not self._prepared:
             return base
         if hidden.shape[0] != self._total_rows:
@@ -180,15 +244,21 @@ class VLLMDenseReplacementHandle:
             self._apply_count += prepared.rows.numel()
         return output, None
 
+    def take_capture(self) -> DenseOperandCapture | None:
+        capture = self._capture
+        self._capture = None
+        return capture
+
     def restore(self) -> None:
         self.clear_step()
         self._versions.clear()
+        self.mlp.forward = self._original_mlp_forward
         self.module.forward = self._original_forward
 
 
 def _resolve_dense_replacement_target(
     runner: DenseOverlayRunner, target: OverlayTarget
-) -> _DenseLinear:
+) -> tuple[_MLP, _DenseLinear]:
     if target.module != "mlp" or target.parameter != "down_proj.weight":
         raise RuntimeError(
             "vLLM dense overlays support only decoder MLP down_proj.weight"
@@ -197,12 +267,13 @@ def _resolve_dense_replacement_target(
     layer = target.layer if target.layer >= 0 else len(layers) + target.layer
     if layer < 0 or layer >= len(layers):
         raise RuntimeError("dense replacement layer index is out of range")
-    down_proj = layers[layer].mlp.down_proj
+    mlp = layers[layer].mlp
+    down_proj = mlp.down_proj
     if not down_proj.return_bias or down_proj.bias is not None:
         raise RuntimeError(
             "dense replacement requires tuple-returning biasless RowParallelLinear"
         )
-    return down_proj
+    return mlp, down_proj
 
 
 def validate_dense_replacement_targets(
@@ -220,7 +291,7 @@ def validate_dense_replacement_targets(
         raise RuntimeError("dense replacement requires an unquantized model")
     resolved: dict[int, OverlayTarget] = {}
     for target in targets:
-        module = _resolve_dense_replacement_target(runner, target)
+        _mlp, module = _resolve_dense_replacement_target(runner, target)
         module_identity = id(module)
         existing = resolved.get(module_identity)
         if existing is not None:
@@ -236,12 +307,14 @@ def install_dense_replacement_target(
     target: OverlayTarget,
 ) -> VLLMDenseReplacementHandle:
     validate_dense_replacement_targets(runner, (target,))
-    down_proj = _resolve_dense_replacement_target(runner, target)
+    mlp, down_proj = _resolve_dense_replacement_target(runner, target)
     if down_proj.tp_size != 1:
         raise RuntimeError(
             "dense target shard requires tensor parallel size 1"
         )
-    return VLLMDenseReplacementHandle(target=target, module=down_proj)
+    return VLLMDenseReplacementHandle(
+        target=target, mlp=mlp, module=down_proj
+    )
 
 
 __all__ = [

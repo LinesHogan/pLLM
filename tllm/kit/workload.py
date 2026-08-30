@@ -62,6 +62,7 @@ from tllm.workload.staging import (
     StagedPort,
 )
 from tllm.contracts.request_identity import RequestFinishedBatch
+from tllm.runtime.parameter_overlay import DenseOperandCaptureBatch
 from tllm.workload.host import HostOutput, RuntimeHostOutputStore
 
 ConfigT = TypeVar("ConfigT", bound=WorkloadConfig)
@@ -346,6 +347,16 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         staged = 0
         for port in type(self)._staged_ports():
             if port.lifecycle is StagedLifecycle.REQUEST_FINISHED:
+                port.stage(self._port_store, batch)
+                staged += 1
+        return staged
+
+    def stage_dense_operand_captured(
+        self, batch: DenseOperandCaptureBatch
+    ) -> int:
+        staged = 0
+        for port in type(self)._staged_ports():
+            if port.lifecycle is StagedLifecycle.DENSE_OPERAND_CAPTURED:
                 port.stage(self._port_store, batch)
                 staged += 1
         return staged

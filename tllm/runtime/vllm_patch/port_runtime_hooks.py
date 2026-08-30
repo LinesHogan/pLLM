@@ -821,6 +821,7 @@ def wrapped_execute_model(
     before_runtime_event: Callable[[BackendObservableEvent], None] | None = None,
     execute_pre_already_dispatched: bool = False,
     phase_after_inputs: Callable[[], str | None] | None = None,
+    after_model_forward: Callable[[], None] | None = None,
 ) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         return core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
@@ -852,6 +853,8 @@ def wrapped_execute_model(
         # signed logical step and consequently no post-execute work to emit.
         if phase is None:
             return out
+    if after_model_forward is not None:
+        after_model_forward()
     if not bool(getattr(getattr(runner, "model", None), _COMPUTE_LOGITS_HOOK_FLAG, False)):
         maybe_launch_post_logits_decode_work(core=core, runner=runner)
     t2 = time.perf_counter() if trace_hotspots else 0.0

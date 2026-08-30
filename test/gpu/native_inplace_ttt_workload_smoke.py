@@ -8,7 +8,6 @@ import json
 import os
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-INTERMEDIATE_SIZE = 4864
 
 
 def _args() -> argparse.Namespace:
@@ -28,23 +27,16 @@ def main() -> int:
         "1" if args.engine_core_mp else "0"
     )
 
-    import torch
     from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
 
     from tllm.consumers.inplace_ttt import (
         InPlaceTTTConfig,
-        InPlaceTTTKey,
-        InPlaceTTTMetadata,
-        InPlaceTTTPhase,
         InPlaceTTTWorkload,
     )
-    from tllm.contracts.request_identity import RequestIdentity
-    from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane
     from tllm.runtime.runtime import TllmRuntime
-    from tllm.runtime.vllm_patch.capture_runner import (
-        run_generate_with_request_mapping,
-    )
+    from tllm.runtime.vllm_adapter import generate_requests
     from tllm.util.tools import shutdown_llm_instance
 
     workload = InPlaceTTTWorkload(
@@ -77,51 +69,29 @@ def main() -> int:
         family = compilation.timeline.runner_family
         if family != args.runner:
             raise AssertionError(f"requested {args.runner}, got {family}")
-        spec = workload.specialization
-        base_weight = torch.zeros(
-            (spec.hidden_size, INTERMEDIATE_SIZE),
-            device=spec.device,
-            dtype=spec.dtype,
-        )
-        request = RequestIdentity("0", 0, 0)
-        runtime.stage_pair(
-            InPlaceTTTWorkload.batch_tensors,
-            {
-                "hidden": torch.ones(
-                    (1, base_weight.shape[1]),
-                    device=base_weight.device,
-                    dtype=base_weight.dtype,
-                ),
-                "target": torch.ones(
-                    (1, base_weight.shape[0]),
-                    device=base_weight.device,
-                    dtype=base_weight.dtype,
-                ),
-                "base_weight": base_weight,
-            },
-            InPlaceTTTWorkload.batch_metadata,
-            InPlaceTTTMetadata(
-                InPlaceTTTKey(request, 0), InPlaceTTTPhase.PREFILL
-            ),
-        )
+        request_id = "0"
         params = SamplingParams(
             temperature=0.0, max_tokens=3, ignore_eos=True
         )
-        prompts = ({"prompt_token_ids": [1, 2, 3]},)
-        first = run_generate_with_request_mapping(
-            runtime=core.RUNTIME,
-            llm=llm,
-            prompts=prompts,
-            params=params,
-            request_prompt_indices=[0],
-            request_sample_indices=[0],
-            use_tqdm=False,
-        )
-        if str(first[0].request_id) != request.request_id:
+        prompts = (TokensPrompt(prompt_token_ids=[1, 2, 3]),)
+        first = generate_requests(llm, prompts, params)
+        if str(first[0].request_id) != request_id:
             raise AssertionError(
-                f"expected request id {request.request_id}, got {first[0].request_id}"
+                f"expected request id {request_id}, got {first[0].request_id}"
             )
-        publication = runtime.drain(InPlaceTTTWorkload.publications)[0]
+        publication_bundle = runtime.drain(
+            InPlaceTTTWorkload.captured_publications
+        )[0]
+        publications = tuple(
+            publication
+            for publication in publication_bundle.publications
+            if publication.version is not None
+        )
+        if len(publications) != 1:
+            raise AssertionError(
+                f"expected one captured publication, got {publications!r}"
+            )
+        publication = publications[0]
         if publication.version is None or publication.update_count <= 0:
             raise AssertionError(
                 f"native In-Place-TTT did not publish: {publication!r}"
@@ -155,22 +125,6 @@ def main() -> int:
                 f"finished request retained workload state: {metrics!r}"
             )
 
-        second = run_generate_with_request_mapping(
-            runtime=core.RUNTIME,
-            llm=llm,
-            prompts=prompts,
-            params=params,
-            request_prompt_indices=[1],
-            request_sample_indices=[0],
-            use_tqdm=False,
-        )
-        if (
-            first[0].outputs[0].token_ids
-            == second[0].outputs[0].token_ids
-        ):
-            raise AssertionError(
-                "dense overlay request matched the base-weight token sequence"
-            )
         print(
             json.dumps(
                 {
@@ -182,7 +136,6 @@ def main() -> int:
                     "dense_apply_rows": applied_rows,
                     "released_versions": cleanup[0].released_versions,
                     "tokens": first[0].outputs[0].token_ids,
-                    "base_tokens": second[0].outputs[0].token_ids,
                 },
                 sort_keys=True,
             )

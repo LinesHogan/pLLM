@@ -1841,7 +1841,8 @@ class ControlPlaneUnitTest(unittest.TestCase):
         events: list[str] = []
         output = (SimpleNamespace(request_id="request-0"),)
         llm = SimpleNamespace(
-            generate=lambda prompt: events.append(f"generate:{prompt}") or output
+            generate=lambda prompt: events.append(f"generate:{prompt}") or output,
+            llm_engine=SimpleNamespace(add_request=mock.Mock()),
         )
         with mock.patch.object(
             runtime,
@@ -1865,7 +1866,10 @@ class ControlPlaneUnitTest(unittest.TestCase):
 
         runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
         original_generate = mock.Mock(return_value="unexpected")
-        llm = SimpleNamespace(generate=original_generate)
+        llm = SimpleNamespace(
+            generate=original_generate,
+            llm_engine=SimpleNamespace(add_request=mock.Mock()),
+        )
         runtime._install_generate_boundary(llm, object())
         runtime._fail_stop_workloads("activation quorum lost")
 
@@ -1883,7 +1887,10 @@ class ControlPlaneUnitTest(unittest.TestCase):
         )
         output = (SimpleNamespace(request_id="request-0"),)
         original_generate = mock.Mock(return_value=output)
-        llm = SimpleNamespace(generate=original_generate)
+        llm = SimpleNamespace(
+            generate=original_generate,
+            llm_engine=SimpleNamespace(add_request=mock.Mock()),
+        )
         runtime._install_generate_boundary(llm, plane)
 
         with self.assertRaisesRegex(RuntimeError, "finish quorum lost"):

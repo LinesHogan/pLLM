@@ -12,6 +12,7 @@ T = TypeVar("T")
 
 
 class StagedLifecycle(StrEnum):
+    DENSE_OPERAND_CAPTURED = "dense_operand.captured"
     REQUEST_FINISHED = "request.finished"
 
 

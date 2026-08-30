@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     import torch
     from tllm.runtime.parameter_overlay import (
         OverlayChannel,
+        DenseOperandCapture,
         OverlayStepPlan,
         OverlayTarget,
         OverlayVersion,
@@ -63,6 +64,12 @@ class DenseOverlayTargetHandle(Protocol):
     @property
     def apply_count(self) -> int: ...
 
+    @property
+    def version_count(self) -> int: ...
+
+    @property
+    def capture_expected(self) -> bool: ...
+
     def has_version(self, ref: OverlayVersionRef) -> bool: ...
 
     def install_version(
@@ -76,6 +83,8 @@ class DenseOverlayTargetHandle(Protocol):
     def prepare_step(self, plan: OverlayStepPlan) -> None: ...
 
     def clear_step(self) -> None: ...
+
+    def take_capture(self) -> DenseOperandCapture | None: ...
 
     def restore(self) -> None: ...
 
@@ -138,6 +147,7 @@ class VersionedParameterOverlayCapabilities:
     phases: frozenset[str]
     pinning: frozenset[str]
     mixed_versions: bool
+    operand_captures: frozenset[str] = frozenset()
     graph_safety: GraphSafety = GraphSafety.EAGER_ONLY
     tensor_parallel_sizes: frozenset[int] = frozenset({1})
 
@@ -148,6 +158,10 @@ class VersionedParameterOverlayCapabilities:
                 *(f"parameter_overlay/scope/{value}" for value in self.scopes),
                 *(f"parameter_overlay/phase/{value}" for value in self.phases),
                 *(f"parameter_overlay/pinning/{value}" for value in self.pinning),
+                *(
+                    f"parameter_overlay/operand_capture/{value}"
+                    for value in self.operand_captures
+                ),
                 *(
                     f"parameter_overlay/tensor_parallel_size/{value}"
                     for value in self.tensor_parallel_sizes

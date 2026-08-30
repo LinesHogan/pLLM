@@ -40,6 +40,7 @@ class OverlayChannel:
     namespace: str
     name: str
     target: OverlayTarget | None = None
+    capture_operands: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,10 +65,35 @@ class OverlayRowAssignment:
 
 
 @dataclass(frozen=True, slots=True)
+class OverlayCaptureRows:
+    target: OverlayTarget
+    request: RequestIdentity
+    phase: OverlayRowPhase
+    packed_rows: tuple[int, ...]
+    token_offsets: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OverlayStepPlan:
     step_id: int
     total_rows: int
     assignments: tuple[OverlayRowAssignment, ...]
+    captures: tuple[OverlayCaptureRows, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DenseOperandCapture:
+    step_id: int
+    target: OverlayTarget
+    rows: tuple[OverlayCaptureRows, ...]
+    down_proj_input: torch.Tensor
+    mlp_input: torch.Tensor
+    base_weight: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class DenseOperandCaptureBatch:
+    captures: tuple[DenseOperandCapture, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +457,9 @@ class OverlayVersionStore:
 
 __all__ = [
     "OverlayChannel",
+    "OverlayCaptureRows",
+    "DenseOperandCapture",
+    "DenseOperandCaptureBatch",
     "OverlayLease",
     "OverlayLeaseKey",
     "OverlayLineage",

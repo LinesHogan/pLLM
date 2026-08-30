@@ -90,7 +90,7 @@ def _wrapped_prepare_inputs(
     if overlay_controller is not None:
         overlay_controller.sync_versions()
         overlay_controller.apply_mrv2_input_batch(input_batch)
-        if overlay_controller.has_dense_versions():
+        if overlay_controller.requires_dense_step():
             active_driver = driver or V027MRv2Driver()
             columns = active_driver.packed_row_plan_inputs(
                 runner=runner,
@@ -245,6 +245,8 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
     try:
         out = orig(runner, *args, **kwargs)
+        if overlay_controller is not None:
+            overlay_controller.stage_dense_operand_captured()
     except Exception as exc:
         session.fail(str(exc))
         _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
@@ -438,6 +440,7 @@ class V027MRv2Driver:
                     {"latest_at_admission", "explicit_request_advance"}
                 ),
                 mixed_versions=True,
+                operand_captures=frozenset({"mlp_down_proj"}),
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
             ),

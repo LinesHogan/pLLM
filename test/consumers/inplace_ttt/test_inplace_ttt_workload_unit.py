@@ -15,14 +15,24 @@ from tllm.backends.protocol import (
 )
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.inplace_ttt.workload import (
+    InPlaceTTTBatch,
     InPlaceTTTConfig,
+    InPlaceTTTFastWeightState,
     InPlaceTTTKey,
     InPlaceTTTMetadata,
     InPlaceTTTPhase,
     InPlaceTTTWorkload,
 )
+from test.core.oracles.inplace_ttt import oracle_exact_step
 from tllm.contracts.request_identity import RequestFinishedBatch, RequestIdentity
-from tllm.runtime.parameter_overlay import OverlayLeaseKey
+from tllm.runtime.parameter_overlay import (
+    DenseOperandCapture,
+    DenseOperandCaptureBatch,
+    OverlayCaptureRows,
+    OverlayLeaseKey,
+    OverlayRowPhase,
+    OverlayTarget,
+)
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -47,6 +57,7 @@ def _timeline(graph_mode: str = "eager") -> MainWorkloadTimeline:
                 phases=frozenset({"prefill", "decode"}),
                 pinning=frozenset({"explicit_request_advance"}),
                 mixed_versions=True,
+                operand_captures=frozenset({"mlp_down_proj"}),
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
             ),
@@ -74,6 +85,7 @@ def _drive(
     compilation: WorkloadCompilation,
     step_id: int,
     finished: RequestFinishedBatch | None = None,
+    captured: DenseOperandCaptureBatch | None = None,
 ) -> tuple[int, int]:
     state = ResidualRuntimeState()
     with mock.patch.object(residual_runtime, "RUNTIME", state):
@@ -84,6 +96,11 @@ def _drive(
         assert execution is not None
         if finished is not None and execution.stage_request_finished(finished) != 1:
             raise AssertionError("In-Place lifecycle port was not staged")
+        if (
+            captured is not None
+            and execution.stage_dense_operand_captured(captured) != 1
+        ):
+            raise AssertionError("In-Place operand capture port was not staged")
         residual_runtime.prepare_physical_workgraph_step(step_id)
         for region in compilation.decision.execution_regions:
             residual_runtime.advance_workload_anchor(region.placement_anchor)
@@ -94,6 +111,70 @@ def _drive(
 
 
 class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
+    def test_native_multistep_tail_matches_frozen_historical_oracle(self) -> None:
+        state = InPlaceTTTFastWeightState()
+        key = InPlaceTTTKey(RequestIdentity("oracle", 0, 0), 0)
+        base = torch.tensor(
+            [[0.2, -0.3, 0.5], [0.4, 0.1, -0.2]],
+            dtype=torch.float64,
+        )
+        first_hidden = torch.tensor(
+            [[1.0, -0.5, 0.25]], dtype=torch.float64
+        )
+        first_target = torch.tensor([[0.5, -0.25]], dtype=torch.float64)
+        first_oracle = oracle_exact_step(
+            first_hidden,
+            first_target,
+            base,
+            chunk_size=2,
+            learning_rate=0.3,
+        )
+        first = state.execute(
+            InPlaceTTTBatch(
+                key,
+                InPlaceTTTPhase.PREFILL,
+                first_hidden,
+                first_target,
+                base,
+            ),
+            chunk_size=2,
+            learning_rate=0.3,
+            update_enabled=True,
+        )
+        torch.testing.assert_close(first.output, first_oracle.output)
+        torch.testing.assert_close(first.weight, first_oracle.weight)
+
+        second_hidden = torch.tensor(
+            [[0.2, 0.4, -0.3]], dtype=torch.float64
+        )
+        second_target = torch.tensor([[0.1, 0.75]], dtype=torch.float64)
+        second_oracle = oracle_exact_step(
+            second_hidden,
+            second_target,
+            base,
+            chunk_size=2,
+            learning_rate=0.3,
+            past_hidden=first_oracle.tail_hidden,
+            past_target=first_oracle.tail_target,
+            past_weight=first_oracle.weight,
+        )
+        second = state.execute(
+            InPlaceTTTBatch(
+                key,
+                InPlaceTTTPhase.PREFILL,
+                second_hidden,
+                second_target,
+                base,
+            ),
+            chunk_size=2,
+            learning_rate=0.3,
+            update_enabled=True,
+        )
+        torch.testing.assert_close(second.output, second_oracle.output)
+        torch.testing.assert_close(second.weight, second_oracle.weight)
+        self.assertEqual(second.update_count, second_oracle.update_count)
+        self.assertEqual(second.trained_rows, second_oracle.trained_rows)
+
     def test_dense_overlay_rejects_non_eager_backend_timeline(self) -> None:
         workload = InPlaceTTTWorkload(InPlaceTTTConfig())
         runtime = TllmRuntime(
@@ -107,6 +188,89 @@ class InPlaceTTTWorkloadUnitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "eager_only"):
             runtime.compile_workloads(_timeline("piecewise"))
+
+    def test_captured_bundle_updates_multiple_requests_and_layers_once(self) -> None:
+        workload, runtime, compilation = _build(
+            InPlaceTTTConfig(layers=(0, 1), chunk_size=1)
+        )
+        first = RequestIdentity("first", 0, 0)
+        second = RequestIdentity("second", 1, 0)
+        hidden = torch.tensor(
+            [[1.0, 0.0, 0.5], [0.5, 1.0, -0.5], [2.0, 1.0, 0.0]],
+            dtype=torch.float64,
+        )
+        target = torch.tensor(
+            [[0.5, 1.0], [1.0, -0.5], [0.25, 0.75]],
+            dtype=torch.float64,
+        )
+        base = torch.zeros((2, 3), dtype=torch.float64)
+        captures = tuple(
+            DenseOperandCapture(
+                step_id=1,
+                target=OverlayTarget(layer, "mlp", "down_proj.weight"),
+                rows=(
+                    OverlayCaptureRows(
+                        target=OverlayTarget(
+                            layer, "mlp", "down_proj.weight"
+                        ),
+                        request=first,
+                        phase=OverlayRowPhase.PREFILL,
+                        packed_rows=(0, 1),
+                        token_offsets=(0, 1),
+                    ),
+                    OverlayCaptureRows(
+                        target=OverlayTarget(
+                            layer, "mlp", "down_proj.weight"
+                        ),
+                        request=second,
+                        phase=OverlayRowPhase.DECODE,
+                        packed_rows=(2,),
+                        token_offsets=(3,),
+                    ),
+                ),
+                down_proj_input=hidden,
+                mlp_input=target,
+                base_weight=base,
+            )
+            for layer in (0, 1)
+        )
+
+        self.assertEqual(
+            _drive(
+                runtime,
+                compilation,
+                1,
+                captured=DenseOperandCaptureBatch(captures),
+            ),
+            (1, 1),
+        )
+        (step_bundle,) = runtime.drain(InPlaceTTTWorkload.captured_steps)
+        self.assertEqual(len(step_bundle.steps), 4)
+        self.assertEqual(
+            tuple(step.update_count for step in step_bundle.steps),
+            (2, 0, 2, 0),
+        )
+        (publication_bundle,) = runtime.drain(
+            InPlaceTTTWorkload.captured_publications
+        )
+        versions = tuple(
+            publication.version
+            for publication in publication_bundle.publications
+            if publication.version is not None
+        )
+        self.assertEqual(len(versions), 2)
+        self.assertEqual(workload.update_count, 4)
+        self.assertEqual(len(workload.fast_weights.slots), 2)
+        self.assertEqual(len(workload.overlay_versions.store.lineages()), 2)
+
+        _drive(
+            runtime,
+            compilation,
+            2,
+            finished=RequestFinishedBatch((first,)),
+        )
+        self.assertEqual(workload.fast_weights.slots, {})
+        self.assertEqual(workload.overlay_versions.store.lineages(), ())
 
     def test_exact_chunk_output_precedes_update_and_publishes_owned_weight(self) -> None:
         config = InPlaceTTTConfig(
