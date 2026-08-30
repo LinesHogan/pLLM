@@ -75,11 +75,6 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             unsupported.append("distiller_sampler_backend")
         if (
             resolved.per_request_models
-            and resolved.enable_distiller_intervention
-        ):
-            unsupported.append("enable_distiller_intervention")
-        if (
-            resolved.per_request_models
             and resolved.training_row_selection.value != "none"
         ):
             unsupported.append("training_row_selection")

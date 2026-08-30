@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.ports.sampler import SamplerHiddenReweightBatch
 from tllm.runtime.request_trainable_state import (
     RequestStateLossBatch,
     RequestStateSelectionBatch,
@@ -91,10 +92,6 @@ class ESampWorkload(Workload[ESampConfig]):
     request_distiller_selection = request_distiller.selection()
 
     def __init__(self, config: ESampConfig) -> None:
-        if config.per_request_models and config.intervention:
-            raise ValueError(
-                "per_request_models=True does not support sampler intervention"
-            )
         if (
             config.per_request_models
             and config.training_row_selection != "none"
@@ -236,7 +233,11 @@ class ESampWorkload(Workload[ESampConfig]):
             "selection": request_distiller_selection,
         },
         outputs={
-            "prediction": temporary(),
+            "guidance": sampler.hidden_reweight(
+                beta=ESampConfig.distiller_beta,
+                enabled=ESampConfig.intervention,
+                backend=ESampConfig.sampler_backend,
+            ),
             "training_source": temporary(),
             "training_target": temporary(),
         },
@@ -249,16 +250,56 @@ class ESampWorkload(Workload[ESampConfig]):
         source: torch.Tensor,
         target: torch.Tensor,
         selection: RequestStateSelectionBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        SamplerHiddenReweightBatch,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        groups = self.request_distiller.groups(selection)
+        active_leases = {
+            group.lease
+            for group in groups
+            if group.before_version > 0
+        }
+        affected_row_ids = tuple(
+            row_id
+            for row_id, row in enumerate(selection.rows)
+            if row.lease in active_leases
+        )
         with torch.no_grad():
-            prediction = torch.empty_like(source)
-            for group in self.request_distiller.groups(selection):
+            prediction = source.new_empty(
+                (len(affected_row_ids), int(source.shape[1]))
+            )
+            compact_position = {
+                row_id: position
+                for position, row_id in enumerate(affected_row_ids)
+            }
+            for group in groups:
+                if group.before_version <= 0:
+                    continue
+                destination = torch.tensor(
+                    tuple(
+                        compact_position[row_id]
+                        for row_id, row in enumerate(selection.rows)
+                        if row.lease == group.lease
+                    ),
+                    device=source.device,
+                    dtype=torch.long,
+                )
                 prediction.index_copy_(
                     0,
-                    group.row_indices,
+                    destination,
                     group.module(source.index_select(0, group.row_indices)),
                 )
-        return prediction, source, target
+        return (
+            SamplerHiddenReweightBatch(
+                prediction,
+                affected_row_ids,
+                len(selection.rows),
+            ),
+            source,
+            target,
+        )
 
     @task(
         inputs={

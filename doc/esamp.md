@@ -29,19 +29,32 @@ runtime = TllmRuntime(workloads=(workload,))
 `"native"` supports both replica state and eager request-scoped state through
 `per_request_models=True`. Request state is keyed by the stable parent request
 ID, so parallel `SamplingParams(n=...)` children share one slot, loss,
-optimizer update, and version transition. The first request-state tranche does
-not yet support sampler intervention, `first_per_prompt` row selection, model
-bank state, or disabling the output layer norm; those combinations fail at
-construction. Compact capture lanes and non-`post_filter_exact` samplers also
-remain legacy-only.
+optimizer update, and version transition. Request-state sampler intervention
+uses a generic typed compact-row payload: full step identity remains
+authoritative while only slots whose frozen before-version is positive publish
+hidden predictions. Version-zero rows therefore cannot receive fabricated
+guidance. `first_per_prompt` row selection, model-bank state, and disabling the
+output layer norm remain unsupported; those combinations fail at construction.
+Compact capture lanes and non-`post_filter_exact` samplers also remain
+legacy-only.
 
 The request-scoped path passed MRv1/MRv2 × in-process/EngineCore-MP eager GPU
 correctness with two parents, two children per parent, and two decode updates:
 every cell reported four losses and four updates, retired two parent slots at
 version 2, cleared live slots and request mappings, and kept fallback/replay at
-zero. Its signed request-state Regions are explicitly capture-ineligible, so
-this is not CUDA Graph or throughput evidence. Program and legacy remain
-migration/benchmark paths until the complete deletion gate passes.
+zero. With intervention enabled, every cell produced exactly one modifier
+state across two native decode updates: the version-zero step was excluded and
+the next step consumed compact typed guidance.
+
+This is not full legacy parity. A same-setting legacy probe also trained on
+prefill and reported six parent updates plus two modifier states, while the
+current native request path reported four updates plus one. Fixed-seed token
+outputs also remain different between the legacy and native sampler paths even
+with intervention disabled. Typed prefill identity/hidden staging and sampler
+token parity therefore remain deletion blockers. The signed request-state
+Regions are explicitly capture-ineligible, so these results are not CUDA Graph
+or throughput evidence. Program and legacy remain migration/benchmark paths
+until the complete deletion gate passes.
 
 ## Key config knobs (`ESampConsumerConfig`)
 

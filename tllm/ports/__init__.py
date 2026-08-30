@@ -10,7 +10,11 @@ from tllm.ports.mlp_activation import MLPActivation, MLPActivationLocator
 from tllm.ports.prompt_context import PromptContext, PromptContextLocator
 from tllm.ports.reward_outcome import RewardOutcome, RewardOutcomeLocator
 from tllm.ports.retry_control import RetryControl, RetryControlLocator
-from tllm.ports.sampler import Sampler, SamplerLocator
+from tllm.ports.sampler import (
+    Sampler,
+    SamplerHiddenReweightBatch,
+    SamplerLocator,
+)
 from tllm.ports.base import ConsumerFlow, Locator, PortKind, PortRead, PortWrite
 from tllm.ports.token_target import TokenTarget, TokenTargetLocator
 from tllm.ports.trajectory_event import TrajectoryEventLocator, TrajectoryEventPort
@@ -43,6 +47,7 @@ __all__ = [
     "RetryControl",
     "RetryControlLocator",
     "Sampler",
+    "SamplerHiddenReweightBatch",
     "SamplerLocator",
     "TokenTarget",
     "TokenTargetLocator",

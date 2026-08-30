@@ -204,13 +204,24 @@ prevent ABA reuse and retain bounded cleanup evidence. Source and target
 bindings use signed numeric layer indices, including `-1` for the target
 layer, and are resolved through the explicit residual-path contract.
 
-The initial request-state mode is eager-only and rejects per-request sampler
-intervention, model-bank state, `first_per_prompt` row selection, and disabled
-output layer normalization. Compact capture lanes and non-`post_filter_exact`
-sampler backends remain legacy-only. It passed MRv1/MRv2 ×
+The initial request-state mode is eager-only. Per-request sampler intervention
+uses a workload-independent compact hidden payload with complete step identity,
+sorted affected rows, and a full-to-compact device map. A frozen selection
+before-version gates version-zero rows without moving that policy into the
+sampler adapter. Model-bank state, `first_per_prompt` row selection, and
+disabled output layer normalization remain unsupported. Compact capture lanes
+and non-`post_filter_exact` sampler backends remain legacy-only. It passed MRv1/MRv2 ×
 in-process/EngineCore-MP with four real updates, two parent slots retired at
-version 2, empty live mappings, and zero fallback/replay in every cell. These
-are correctness and lifecycle results, not throughput or CUDA Graph claims.
+version 2, empty live mappings, and zero fallback/replay in every cell. The
+intervention matrix observed one modifier state after the first native update
+and none for version-zero rows.
+
+Legacy differential evidence is still red: legacy per-request execution also
+trains its prefill step (six updates and two intervention states in the aligned
+three-token probe), while native request state currently receives decode rows
+only (four updates and one intervention state). Fixed-seed native and legacy
+tokens also differ before intervention. These are correctness/lifecycle
+capability results, not parity, throughput, or CUDA Graph claims.
 
 A native ESamp Region cannot be co-installed with a legacy ESamp authority.
 During the current migration this

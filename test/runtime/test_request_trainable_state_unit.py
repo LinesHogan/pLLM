@@ -469,9 +469,13 @@ def test_epoch_replacement_requires_empty_lifecycle() -> None:
 def test_selection_rows_and_device_materialization_are_tamper_evident() -> None:
     store = _store(capacity=1)
     acquired = store.acquire((RequestIdentity("active", 0, 0),))
+    assert acquired.selection.before_versions == (0,)
     forged_rows = replace(acquired.selection, rows=())
     with pytest.raises(RuntimeError, match="leases differ"):
         store.read_receipt(forged_rows)
+    forged_versions = replace(acquired.selection, before_versions=(9,))
+    with pytest.raises(RuntimeError, match="leases differ"):
+        store.read_receipt(forged_versions)
 
     acquired.selection.device_slot_ids.fill_(9)
     with pytest.raises(RuntimeError, match="tensors differ"):

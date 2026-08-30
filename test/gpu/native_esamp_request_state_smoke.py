@@ -56,6 +56,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-name", default=MODEL)
     parser.add_argument("--gpu-mem", type=float, default=0.35)
+    parser.add_argument(
+        "--intervention",
+        action="store_true",
+        help="verify version-gated typed sampler guidance after the first update",
+    )
     return parser.parse_args()
 
 
@@ -108,9 +113,12 @@ def _signed_eager_contract(
     return tuple((region.region_id, region.artifact_key) for region in regions)
 
 
-def _assert_outputs(outputs: Sequence["RequestOutput"]) -> None:
+def _assert_outputs(
+    outputs: Sequence["RequestOutput"],
+) -> list[list[list[int]]]:
     if len(outputs) != _PARENTS:
         raise AssertionError(f"expected {_PARENTS} parent outputs, got {outputs!r}")
+    token_ids: list[list[list[int]]] = []
     for output in outputs:
         children = tuple(output.outputs)
         if len(children) != _PARALLEL_SAMPLES:
@@ -125,6 +133,8 @@ def _assert_outputs(outputs: Sequence["RequestOutput"]) -> None:
                 "decode updates: "
                 f"lengths={lengths!r} output={output!r}"
             )
+        token_ids.append([list(child.token_ids) for child in children])
+    return token_ids
 
 
 def _status_artifacts(
@@ -283,7 +293,8 @@ def main() -> int:
         ESampConfig(
             enabled=True,
             per_request_models=True,
-            intervention=False,
+            intervention=bool(args.intervention),
+            distiller_beta=0.5 if args.intervention else 0.0,
             distiller_hidden_dim=8,
             distiller_lr=1e-3,
         )
@@ -331,7 +342,7 @@ def main() -> int:
             params,
             prompt_indices=tuple(range(_PARENTS)),
         )
-        _assert_outputs(outputs)
+        output_token_ids = _assert_outputs(outputs)
         # In-process vLLM cold-compiles native Regions at the first forward;
         # EngineCore MP has already coordinated its epoch during make_llm.
         compilation = runtime.workload_compilation
@@ -358,6 +369,17 @@ def main() -> int:
             raise AssertionError(
                 "parent did not report all request-state losses: "
                 f"{training!r}"
+            )
+        timing = core.read_and_reset_distiller_timing_stats(sync=True)
+        intervention_count = int(timing.intervention_state_count)
+        expected_interventions = (
+            _DECODE_UPDATES - 1 if args.intervention else 0
+        )
+        if intervention_count != expected_interventions:
+            raise AssertionError(
+                "request guidance did not follow version-gated native timing: "
+                f"expected={expected_interventions} actual={intervention_count} "
+                f"timing={timing!r}"
             )
         physical_stats = core.read_workgraph_runtime_stats()
         if (
@@ -393,7 +415,10 @@ def main() -> int:
                     "parallel_samples": _PARALLEL_SAMPLES,
                     "generated_tokens": _GENERATED_TOKENS,
                     "decode_updates": _DECODE_UPDATES,
+                    "intervention": bool(args.intervention),
+                    "intervention_state_count": intervention_count,
                     "loss_count": training.loss_count,
+                    "output_token_ids": output_token_ids,
                     "update_count": _PARENTS * _DECODE_UPDATES,
                     "request_state_retirements": _retirement_json(retirement_audit),
                     "execute_count": physical_stats.execute_count,

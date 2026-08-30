@@ -19,6 +19,7 @@ from tllm.runtime.request_trainable_state import (
     RequestStateRuntimeService,
     RequestTrainableStateStore,
 )
+from tllm.ports.sampler import SamplerHiddenReweightBatch
 from tllm.kit.sampler_output import DeclaredSamplerOutput
 from tllm.kit.backend import (
     NoBackendAdapter,
@@ -647,7 +648,16 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                     sampler_binding = NoSamplerBinding()
                 else:
                     def publish_sampler(value: object, step_id: int) -> None:
-                        self._sinks.publish(policy.name, cast(torch.Tensor, value), step_id)
+                        match value:
+                            case torch.Tensor() | SamplerHiddenReweightBatch():
+                                self._sinks.publish(
+                                    policy.name, value, step_id
+                                )
+                            case _:
+                                raise TypeError(
+                                    "sampler output must be a Tensor or "
+                                    "SamplerHiddenReweightBatch"
+                                )
 
                     output_sinks = {
                         policy.name: RuntimeOutputBinding(publish_sampler)

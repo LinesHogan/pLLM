@@ -9,6 +9,7 @@ import torch
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.ports.sampler import SamplerHiddenReweightBatch
 from tllm.consumers.esamp.initializers.svd import (
     SVDModelBankInitializerConfig,
 )
@@ -39,6 +40,7 @@ from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
 from tllm.runtime.workload_bindings import (
     LocalRuntimeServices,
+    NoSamplerBinding,
     SamplerRuntimeBinding,
     WorkerRuntimeBinding,
 )
@@ -84,7 +86,14 @@ class _Model:
         self.lm_head = torch.nn.Linear(4, 7, bias=False)
 
 
-def _view(step_id: int, rows: int = 2, *, request_ids: tuple[str, ...] | None = None) -> SamplerStepView:
+def _view(
+    step_id: int,
+    rows: int = 2,
+    *,
+    request_ids: tuple[str, ...] | None = None,
+    prompt_idxs: tuple[int, ...] | None = None,
+    sample_idxs: tuple[int, ...] | None = None,
+) -> SamplerStepView:
     return SamplerStepView(
         engine_step_id=step_id,
         phase="decode",
@@ -92,8 +101,8 @@ def _view(step_id: int, rows: int = 2, *, request_ids: tuple[str, ...] | None = 
         sampling_metadata=object(),
         decode_count=rows,
         request_ids=request_ids or tuple(f"request-{row}" for row in range(rows)),
-        prompt_idxs=tuple(10 + row for row in range(rows)),
-        sample_idxs=tuple(row for row in range(rows)),
+        prompt_idxs=prompt_idxs or tuple(10 + row for row in range(rows)),
+        sample_idxs=sample_idxs or tuple(row for row in range(rows)),
         prompt_idx_tensor=None,
         sample_idx_tensor=None,
         source_hidden=torch.empty(rows, 4),
@@ -130,12 +139,19 @@ def _specialized_workload(**overrides: object) -> ESampWorkload:
     return workload
 
 
-def _request_workload(*, rows: int = 4) -> ESampWorkload:
+def _request_workload(
+    *,
+    rows: int = 4,
+    intervention: bool = False,
+    distiller_beta: float = 0.0,
+) -> ESampWorkload:
     workload = ESampWorkload(
         ESampConfig(
             per_request_models=True,
             distiller_hidden_dim=2,
             distiller_lr=1e-2,
+            intervention=intervention,
+            distiller_beta=distiller_beta,
         )
     )
     workload.cold_specialize(
@@ -155,7 +171,7 @@ def _run_request_step(
     source: torch.Tensor,
     target: torch.Tensor,
 ) -> tuple[
-    torch.Tensor,
+    SamplerHiddenReweightBatch,
     tuple[torch.Tensor, ...],
     RequestStateSelectionBatch,
 ]:
@@ -165,7 +181,7 @@ def _run_request_step(
     prediction_read = service.before(
         StateEffectOperation.READ, selection, step_id
     )
-    prediction, training_source, training_target = workload.request_predict(
+    guidance, training_source, training_target = workload.request_predict(
         source, target, selection
     )
     service.after(prediction_read)
@@ -182,7 +198,7 @@ def _run_request_step(
     workload.request_train(loss_batch, selection)
     service.after(transition)
     service.finish_step(step_id)
-    return prediction, loss_batch.losses, selection
+    return guidance, loss_batch.losses, selection
 
 
 def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
@@ -253,7 +269,6 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             dtype=torch.float32,
         )
 
-        expected_prediction = reference(source)
         expected_loss = torch.nn.functional.mse_loss(
             reference(source).float(), target.float()
         )
@@ -261,7 +276,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         expected_loss.backward()
         reference_optimizer.step()
 
-        prediction, losses, selection = _run_request_step(
+        guidance, losses, selection = _run_request_step(
             workload,
             service,
             step_id=3,
@@ -270,9 +285,12 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             target=target,
         )
 
-        torch.testing.assert_close(prediction, expected_prediction)
-        self.assertFalse(prediction.requires_grad)
-        self.assertIsNone(prediction.grad_fn)
+        self.assertEqual(guidance.affected_row_ids, ())
+        self.assertEqual(guidance.total_rows, 2)
+        self.assertEqual(tuple(guidance.pred_hidden.shape), (0, 4))
+        self.assertFalse(guidance.pred_hidden.requires_grad)
+        self.assertIsNone(guidance.pred_hidden.grad_fn)
+        self.assertEqual(selection.before_versions, (0,))
         self.assertEqual(len(selection.leases), 1)
         self.assertEqual(
             tuple(row.lease.slot for row in selection.rows),
@@ -291,6 +309,19 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             trained_module.parameters(), reference.parameters(), strict=True
         ):
             torch.testing.assert_close(actual, expected)
+        read_audit = service.before(
+            StateEffectOperation.READ, inspection, 4
+        )
+        next_guidance, _, _ = workload.request_predict(
+            source[:1], target[:1], inspection
+        )
+        service.after(read_audit)
+        self.assertEqual(inspection.before_versions, (1,))
+        self.assertEqual(next_guidance.affected_row_ids, (0,))
+        torch.testing.assert_close(
+            next_guidance.pred_hidden,
+            reference(source[:1]),
+        )
         service.finish_step(4)
         self.assertEqual(
             workload.native_workload_resources().services.diagnostics(),
@@ -326,19 +357,8 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         )
         target = -source
 
-        expected_prediction = torch.empty_like(source)
         parent_a_indices = torch.tensor((0, 2), dtype=torch.long)
         parent_b_indices = torch.tensor((1,), dtype=torch.long)
-        expected_prediction.index_copy_(
-            0,
-            parent_a_indices,
-            reference_a(source.index_select(0, parent_a_indices)),
-        )
-        expected_prediction.index_copy_(
-            0,
-            parent_b_indices,
-            reference_b(source.index_select(0, parent_b_indices)),
-        )
         expected_loss_a = torch.nn.functional.mse_loss(
             reference_a(source.index_select(0, parent_a_indices)).float(),
             target.index_select(0, parent_a_indices).float(),
@@ -354,7 +374,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         expected_loss_b.backward()
         optimizer_b.step()
 
-        prediction, losses, selection = _run_request_step(
+        guidance, losses, selection = _run_request_step(
             workload,
             service,
             step_id=5,
@@ -363,7 +383,10 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             target=target,
         )
 
-        torch.testing.assert_close(prediction, expected_prediction)
+        self.assertEqual(guidance.affected_row_ids, ())
+        self.assertEqual(guidance.total_rows, 3)
+        self.assertEqual(tuple(guidance.pred_hidden.shape), (0, 4))
+        self.assertEqual(selection.before_versions, (0, 0))
         self.assertEqual(len(selection.leases), 2)
         self.assertEqual(len(losses), 2)
         torch.testing.assert_close(losses[0], expected_loss_a)
@@ -407,11 +430,15 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.stage_identities(8, RequestIdentityBatch((parent_b,)))
         b_selection = service.selection_for_step(8)
         b_read = service.before(StateEffectOperation.READ, b_selection, 8)
-        b_prediction, _, _ = workload.request_predict(
+        b_guidance, _, _ = workload.request_predict(
             source[1:2], target[1:2], b_selection
         )
         service.after(b_read)
-        torch.testing.assert_close(b_prediction, reference_b(source[1:2]))
+        self.assertEqual(b_guidance.affected_row_ids, (0,))
+        self.assertEqual(b_guidance.total_rows, 1)
+        torch.testing.assert_close(
+            b_guidance.pred_hidden, reference_b(source[1:2])
+        )
         for actual, expected in zip(
             service.groups(b_selection)[0].module.parameters(),
             reference_b.parameters(),
@@ -421,6 +448,119 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.finish_step(8)
         service.retire_requests(RequestFinishedBatch(identities))
         self.assertEqual(service.versions(), ())
+
+    def test_request_guidance_skips_v0_and_keeps_full_step_identity(self) -> None:
+        workload = _request_workload(
+            intervention=True,
+            distiller_beta=0.5,
+        )
+        service = workload.request_distiller
+        parent_a = RequestIdentity("parent-a", 41, 0)
+        parent_b = RequestIdentity("parent-b", 92, 0)
+        first_source = torch.tensor(
+            [[0.2, -0.3, 0.4, -0.5]], dtype=torch.float32
+        )
+        first_guidance, _losses, first_selection = _run_request_step(
+            workload,
+            service,
+            step_id=20,
+            identities=(parent_a,),
+            source=first_source,
+            target=-first_source,
+        )
+        self.assertEqual(first_selection.before_versions, (0,))
+        self.assertEqual(first_guidance.affected_row_ids, ())
+
+        first_runtime = _decode_state(1)
+        first_runtime.decode_request_ids = ["0_parent-a"]
+        first_runtime.decode_prompt_idxs = [41]
+        first_runtime.decode_sample_idxs = [0]
+        match workload.native_workload_resources().sampler:
+            case SamplerRuntimeBinding() as sampler_binding:
+                pass
+            case NoSamplerBinding():
+                self.fail("request intervention omitted its sampler binding")
+        with mock.patch.object(residual_runtime, "RUNTIME", first_runtime):
+            workload.native_workload_resources().ports.outputs[
+                "guidance"
+            ].publish(first_guidance, 20)
+        self.assertIsNone(
+            sampler_binding.provider.prepare_step(
+                _view(
+                    20,
+                    1,
+                    request_ids=("0_parent-a",),
+                    prompt_idxs=(41,),
+                    sample_idxs=(0,),
+                )
+            )
+        )
+
+        source = torch.tensor(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [-0.5, 0.6, 0.7, -0.8],
+            ],
+            dtype=torch.float32,
+        )
+        identities = (parent_a, parent_b)
+        service.stage_identities(21, RequestIdentityBatch(identities))
+        selection = service.selection_for_step(21)
+        self.assertEqual(selection.before_versions, (1, 0))
+        read_audit = service.before(
+            StateEffectOperation.READ, selection, 21
+        )
+        guidance, _training_source, _training_target = (
+            workload.request_predict(source, -source, selection)
+        )
+        service.after(read_audit)
+        self.assertEqual(guidance.affected_row_ids, (0,))
+        self.assertEqual(guidance.total_rows, 2)
+        expected = service.groups(selection)[0].module(source[:1])
+        torch.testing.assert_close(guidance.pred_hidden, expected)
+
+        runtime_state = _decode_state(2)
+        runtime_state.decode_request_ids = ["0_parent-a", "0_parent-b"]
+        runtime_state.decode_prompt_idxs = [41, 92]
+        runtime_state.decode_sample_idxs = [0, 0]
+        with mock.patch.object(residual_runtime, "RUNTIME", runtime_state):
+            workload.native_workload_resources().ports.outputs[
+                "guidance"
+            ].publish(guidance, 21)
+        state = sampler_binding.provider.prepare_step(
+            _view(
+                21,
+                2,
+                request_ids=("0_parent-a", "0_parent-b"),
+                prompt_idxs=(41, 92),
+                sample_idxs=(0, 0),
+            )
+        )
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state.affected_row_ids.tolist(), [0])
+        torch.testing.assert_close(state.pred_hidden, expected)
+        self.assertIsNotNone(state.pred_hidden_row_map)
+        assert state.pred_hidden_row_map is not None
+        self.assertEqual(state.pred_hidden_row_map.tolist(), [0, -1])
+        self.assertEqual(state.beta, 0.5)
+        self.assertEqual(
+            workload.native_workload_resources().services.diagnostics()[
+                "guidance_rows"
+            ],
+            1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "active step"):
+            sampler_binding.provider.prepare_step(
+                _view(
+                    21,
+                    2,
+                    request_ids=("0_parent-a", "different-unaffected-row"),
+                    prompt_idxs=(41, 92),
+                    sample_idxs=(0, 0),
+                )
+            )
+        service.finish_step(21)
 
     def test_reused_slot_matches_the_next_legacy_owner_initialization(self) -> None:
         torch.manual_seed(117)
@@ -607,13 +747,6 @@ class ESampRegionUnitTest(unittest.TestCase):
             (
                 {
                     "per_request_models": True,
-                    "enable_distiller_intervention": True,
-                },
-                "enable_distiller_intervention",
-            ),
-            (
-                {
-                    "per_request_models": True,
                     "training_row_selection": "first_per_prompt",
                 },
                 "training_row_selection",
@@ -653,15 +786,48 @@ class ESampRegionUnitTest(unittest.TestCase):
             ESampConsumerConfig(
                 implementation="native",
                 per_request_models=True,
+                enable_distiller_intervention=True,
+                distiller_beta=0.5,
             )
         )
         self.assertIs(type(dispatched), ESampWorkload)
-        workload = ESampWorkload(ESampConfig(per_request_models=True))
+        workload = ESampWorkload(
+            ESampConfig(
+                per_request_models=True,
+                intervention=True,
+                distiller_beta=0.5,
+            )
+        )
         self.assertTrue(workload.config.per_request_models)
+        self.assertTrue(workload.config.intervention)
+        self.assertEqual(workload.config.distiller_beta, 0.5)
         declaration = declare_workload(workload)
         self.assertEqual(
             tuple(task.name for task in declaration.ir.tasks),
             ("request_predict", "request_loss", "request_train"),
+        )
+        self.assertEqual(
+            tuple(
+                (output.name, output.kind.value, output.target)
+                for output in declaration.ir.tasks[0].outputs
+            ),
+            (
+                ("guidance", "sampler", "guidance"),
+                (
+                    "training_source",
+                    "temporary",
+                    "temporary:training_source",
+                ),
+                (
+                    "training_target",
+                    "temporary",
+                    "temporary:training_target",
+                ),
+            ),
+        )
+        self.assertIn(
+            "guidance",
+            workload.native_workload_resources().ports.outputs,
         )
         request_state = declaration.ir.states[1]
         self.assertEqual(request_state.scope.value, "request")
@@ -732,7 +898,6 @@ class ESampRegionUnitTest(unittest.TestCase):
 
     def test_direct_request_workload_rejects_unsupported_first_phase_options(self) -> None:
         for overrides, message in (
-            ({"intervention": True}, "sampler intervention"),
             (
                 {"training_row_selection": "first_per_prompt"},
                 "training_row_selection",

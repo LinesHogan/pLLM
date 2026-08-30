@@ -71,10 +71,19 @@ def _select_generators(generators: dict[int, torch.Generator], row_ids: torch.Te
 
 
 def _subset_modifier_state(state: SamplerModifierState, row_ids: torch.Tensor) -> SamplerModifierState:
-    pos_tensor = torch.searchsorted(
-        state.affected_row_ids.to(device=row_ids.device, dtype=torch.long),
-        row_ids.to(device=row_ids.device, dtype=torch.long),
-    ).to(device=state.pred_hidden.device, dtype=torch.long)
+    if state.pred_hidden_row_map is None:
+        pos_tensor = torch.searchsorted(
+            state.affected_row_ids.to(device=row_ids.device, dtype=torch.long),
+            row_ids.to(device=row_ids.device, dtype=torch.long),
+        ).to(device=state.pred_hidden.device, dtype=torch.long)
+    else:
+        pos_tensor = state.pred_hidden_row_map.index_select(
+            0,
+            row_ids.to(
+                device=state.pred_hidden_row_map.device,
+                dtype=torch.long,
+            ),
+        ).to(device=state.pred_hidden.device, dtype=torch.long)
     precomputed_dense_logits = None
     if state.precomputed_dense_logits is not None:
         precomputed_dense_logits = state.precomputed_dense_logits.index_select(
@@ -89,9 +98,7 @@ def _subset_modifier_state(state: SamplerModifierState, row_ids: torch.Tensor) -
         lm_head_weight=state.lm_head_weight,
         lm_head_bias=state.lm_head_bias,
         precomputed_dense_logits=precomputed_dense_logits,
-        pred_hidden_row_map=state.pred_hidden_row_map.index_select(0, pos_tensor.to(device=state.pred_hidden_row_map.device, dtype=torch.long))
-        if state.pred_hidden_row_map is not None
-        else None,
+        pred_hidden_row_map=None,
     )
 
 

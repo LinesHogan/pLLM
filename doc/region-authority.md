@@ -151,6 +151,18 @@ The signed request Regions remain explicitly capture-disabled. This is
 request-state correctness and lifecycle evidence, not model-bank,
 sampler-intervention, CUDA Graph, distributed, or throughput evidence.
 
+The next request-state tranche added a generic compact sampler-output payload
+and frozen selection before-versions. Full step identity stays typed and
+tamper-evident, while only positive-version request groups become affected
+sampler rows; no ESamp callback or scheduling lane was introduced. The same
+four eager GPU cells each reported one modifier state after the first native
+update, four losses/updates, final parent versions 2, empty cleanup state, and
+zero fallback/replay. A legacy differential probe remains intentionally red:
+legacy also trains prefill and reported six updates/two modifier states, while
+native request state currently receives decode identities only; fixed-seed
+token parity is also unresolved. Prefill staging and sampler parity remain
+blocking evidence, so this tranche does not authorize legacy deletion.
+
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension
 had only libc, libgcc, and loader dependencies; it did not dynamically link

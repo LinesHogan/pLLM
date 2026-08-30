@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Mapping
+from typing import Literal, Mapping, NamedTuple
 
 import torch
 
@@ -51,6 +51,14 @@ class CandidateModifierState:
     pred_hidden_row_map: torch.Tensor | None = None
 
 
+class SamplerHiddenReweightBatch(NamedTuple):
+    """Compact hidden predictions for a sorted subset of one full step."""
+
+    pred_hidden: torch.Tensor
+    affected_row_ids: tuple[int, ...]
+    total_rows: int
+
+
 @dataclass(frozen=True)
 class CandidateSampleResult:
     sampled_token_ids: torch.Tensor
@@ -58,6 +66,7 @@ class CandidateSampleResult:
 
 
 SamplerModifierState = CandidateModifierState
+SamplerOutputValue = torch.Tensor | SamplerHiddenReweightBatch
 
 
 @dataclass(frozen=True)

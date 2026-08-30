@@ -101,6 +101,7 @@ class RequestStateSelectionBatch:
     epoch: int
     rows: tuple[RequestStateSelectionRow, ...]
     leases: tuple[RequestStateLease, ...]
+    before_versions: tuple[int, ...]
     device_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
 
@@ -198,6 +199,7 @@ class RequestStateVersion:
 class RequestStateModuleGroup(Generic[ModuleT]):
     lease: RequestStateLease
     row_indices: torch.Tensor
+    before_version: int
     module: ModuleT
 
 
@@ -228,6 +230,7 @@ class _RequestStateSlot(Generic[ModuleT]):
 class _ActiveSelection:
     rows: tuple[RequestStateSelectionRow, ...]
     leases: tuple[RequestStateLease, ...]
+    before_versions: tuple[int, ...]
     slot_ids: tuple[int, ...]
 
 
@@ -539,7 +542,11 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             active = self._active_selections[selection.selection_id]
         except KeyError as exc:
             raise RuntimeError("request state selection is no longer active") from exc
-        if selection.rows != active.rows or selection.leases != active.leases:
+        if (
+            selection.rows != active.rows
+            or selection.leases != active.leases
+            or selection.before_versions != active.before_versions
+        ):
             raise RuntimeError("request state selection leases differ from admission")
         if (
             selection.device_slot_ids.dtype is not torch.long
@@ -743,6 +750,10 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 active = _ActiveSelection(
                     rows=rows,
                     leases=leases,
+                    before_versions=tuple(
+                        self._slots[lease.slot.slot_id].version
+                        for lease in leases
+                    ),
                     slot_ids=tuple(row.lease.slot.slot_id for row in rows),
                 )
                 self._active_selections[selection_id] = active
@@ -758,6 +769,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 epoch=self._epoch,
                 rows=rows,
                 leases=leases,
+                before_versions=active.before_versions,
                 device_slot_ids=slot_ids,
                 valid_mask=valid_mask,
             )
@@ -777,7 +789,11 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             self._require_live()
             self._require_audited_selection(selection)
             groups: list[RequestStateModuleGroup[ModuleT]] = []
-            for lease in selection.leases:
+            for lease, before_version in zip(
+                selection.leases,
+                selection.before_versions,
+                strict=True,
+            ):
                 positions = [
                     position
                     for position, row in enumerate(selection.rows)
@@ -791,6 +807,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                             dtype=torch.long,
                             device=selection.device_slot_ids.device,
                         ),
+                        before_version=before_version,
                         module=self._slots[lease.slot.slot_id].module,
                     )
                 )

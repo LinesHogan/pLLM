@@ -1691,7 +1691,9 @@ def _author_metadata(
     tuple[ValueSourceKind, ...],
 ]:
     hidden_inputs: list[HiddenInput] = []
-    sampler_outputs: list[SamplerOutput] = []
+    sampler_output_declarations: list[
+        tuple[SamplerOutput, ConfigPredicate | None]
+    ] = []
     gradient_tasks: list[str] = []
     sampler_inputs: list[ValueSourceKind] = []
     for definition in tasks:
@@ -1701,8 +1703,8 @@ def _author_metadata(
             for _parameter, source in declaration.inputs
             if isinstance(source, HiddenInput)
         )
-        sampler_outputs.extend(
-            output
+        sampler_output_declarations.extend(
+            (output, declaration.predicate)
             for _output_name, output in declaration.outputs
             if isinstance(output, SamplerOutput)
         )
@@ -1713,11 +1715,32 @@ def _author_metadata(
         )
         if definition.is_gradient_task:
             gradient_tasks.append(definition.name)
-    if len(sampler_outputs) > 1:
-        raise ValueError("one workload may declare at most one sampler output")
+    sampler_outputs: tuple[SamplerOutput, ...] = ()
+    if sampler_output_declarations:
+        policy = sampler_output_declarations[0][0]
+        predicates = tuple(
+            predicate
+            for _output, predicate in sampler_output_declarations
+            if predicate is not None
+        )
+        if len(sampler_output_declarations) > 1 and (
+            any(
+                output != policy
+                for output, _predicate in sampler_output_declarations
+            )
+            or len(predicates) != len(sampler_output_declarations)
+            or len({predicate.field_name for predicate in predicates}) != 1
+            or len({predicate.expected for predicate in predicates})
+            != len(predicates)
+        ):
+            raise ValueError(
+                "one workload may declare at most one sampler output unless "
+                "identical policies are selected by mutually exclusive predicates"
+            )
+        sampler_outputs = (policy,)
     return (
         tuple(hidden_inputs),
-        tuple(sampler_outputs),
+        sampler_outputs,
         tuple(gradient_tasks),
         tuple(dict.fromkeys(sampler_inputs)),
     )

@@ -4,6 +4,8 @@ from dataclasses import replace
 import unittest
 from unittest import mock
 
+import torch
+
 from tllm.workload import (
     AdamWSpec,
     AffineAccess,
@@ -11,6 +13,7 @@ from tllm.workload import (
     ApproximationPolicy,
     Before,
     Between,
+    ConfigField,
     Domain,
     ExternImplementation,
     ExecutorRegistry,
@@ -19,18 +22,22 @@ from tllm.workload import (
     RegionCallableArtifact,
     State,
     StateScope,
+    WorkloadConfig,
     RequestKeyField,
     declare_workload,
     hidden,
     maybe_transition,
     read,
+    declared_config_field,
     request_key,
     result,
     sink,
+    sampler,
     step_id,
     task,
     temporary,
     transition,
+    when,
     workload,
     lower_program,
     lower_schedule_graph,
@@ -48,6 +55,121 @@ from tllm.schedule import (
 
 
 class WorkloadDslUnitTest(unittest.TestCase):
+    def test_identical_sampler_policy_allows_provably_exclusive_variants(
+        self,
+    ) -> None:
+        enabled_field = ConfigField.boolean(True)
+        variant_field = ConfigField.boolean(False)
+
+        class Config(WorkloadConfig):
+            enabled: bool = declared_config_field(enabled_field)
+            variant: bool = declared_config_field(variant_field)
+
+        @workload(
+            id="sampler.exclusive-variants",
+            config=Config,
+            enabled=enabled_field,
+        )
+        class ExclusiveVariants:
+            def __init__(self, config: Config | None = None) -> None:
+                self.config = config or Config()
+
+            @task(
+                outputs={"guidance": sampler.hidden_reweight(beta=0.5)},
+                timing=Between("model.execute", "sampler.pre_draw"),
+                when=when(variant_field, False),
+            )
+            def left(self) -> torch.Tensor:
+                return torch.empty((0, 0))
+
+            @task(
+                outputs={"guidance": sampler.hidden_reweight(beta=0.5)},
+                timing=Between("model.execute", "sampler.pre_draw"),
+                when=when(variant_field, True),
+            )
+            def right(self) -> torch.Tensor:
+                return torch.empty((0, 0))
+
+        self.assertEqual(
+            tuple(task.name for task in declare_workload(ExclusiveVariants()).ir.tasks),
+            ("left",),
+        )
+        self.assertEqual(
+            tuple(
+                task.name
+                for task in declare_workload(
+                    ExclusiveVariants(Config(variant=True))
+                ).ir.tasks
+            ),
+            ("right",),
+        )
+
+    def test_sampler_policy_rejects_simultaneously_active_duplicate_sink(
+        self,
+    ) -> None:
+        enabled_field = ConfigField.boolean(True)
+
+        class Config(WorkloadConfig):
+            enabled: bool = declared_config_field(enabled_field)
+
+        with self.assertRaisesRegex(ValueError, "at most one sampler output"):
+            @workload(
+                id="sampler.conflicting-producers",
+                config=Config,
+                enabled=enabled_field,
+            )
+            class ConflictingProducers:
+                @task(
+                    outputs={
+                        "guidance": sampler.hidden_reweight(beta=0.5)
+                    },
+                    timing=Between("model.execute", "sampler.pre_draw"),
+                )
+                def left(self) -> torch.Tensor:
+                    return torch.empty((0, 0))
+
+                @task(
+                    outputs={
+                        "guidance": sampler.hidden_reweight(beta=0.5)
+                    },
+                    timing=Between("model.execute", "sampler.pre_draw"),
+                )
+                def right(self) -> torch.Tensor:
+                    return torch.empty((0, 0))
+
+    def test_sampler_policy_rejects_conflicting_exclusive_variants(self) -> None:
+        enabled_field = ConfigField.boolean(True)
+        variant_field = ConfigField.boolean(False)
+
+        class Config(WorkloadConfig):
+            enabled: bool = declared_config_field(enabled_field)
+            variant: bool = declared_config_field(variant_field)
+
+        with self.assertRaisesRegex(ValueError, "at most one sampler output"):
+            @workload(
+                id="sampler.conflicting-exclusive-variants",
+                config=Config,
+                enabled=enabled_field,
+            )
+            class ConflictingVariants:
+                @task(
+                    outputs={
+                        "guidance": sampler.hidden_reweight(beta=0.5)
+                    },
+                    when=when(variant_field, False),
+                )
+                def left(self) -> torch.Tensor:
+                    return torch.empty((0, 0))
+
+                @task(
+                    outputs={
+                        "guidance": sampler.hidden_reweight(beta=0.75)
+                    },
+                    when=when(variant_field, True),
+                )
+                def right(self) -> torch.Tensor:
+                    return torch.empty((0, 0))
+
     def test_only_trainable_state_lowers_stable_optimizer_storage(self) -> None:
         @workload(id="state.storage-evidence")
         class StorageEvidence:

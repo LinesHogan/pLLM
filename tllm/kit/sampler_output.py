@@ -5,7 +5,11 @@ from __future__ import annotations
 import torch
 from typing import cast
 
-from tllm.ports.sampler import CandidateModifierState, SamplerBackend
+from tllm.ports.sampler import (
+    CandidateModifierState,
+    SamplerBackend,
+    SamplerHiddenReweightBatch,
+)
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.vllm_patch.lm_head import resolve_lm_head
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
@@ -65,14 +69,63 @@ class DeclaredSamplerOutput:
             or identity.prompt_idxs != tuple(view.prompt_idxs[:rows])
             or identity.sample_idxs != tuple(view.sample_idxs[:rows])
             or identity.phase != view.phase
-            or record.value.device != view.device
         ):
             raise RuntimeError(
                 f"sampler output {self._policy.name!r} does not match the active step"
             )
-        affected = torch.arange(rows, device=view.device, dtype=torch.long)
         match self._policy.kind:
             case SamplerOutputKind.HIDDEN_REWEIGHT:
+                match record.value:
+                    case SamplerHiddenReweightBatch(
+                        pred_hidden=pred_hidden,
+                        affected_row_ids=affected_row_ids,
+                        total_rows=total_rows,
+                    ):
+                        if (
+                            pred_hidden.ndim != 2
+                            or int(pred_hidden.shape[0])
+                            != len(affected_row_ids)
+                            or pred_hidden.device != view.device
+                            or total_rows != rows
+                        ):
+                            raise RuntimeError(
+                                f"sampler output {self._policy.name!r} has invalid hidden subset metadata"
+                            )
+                        if not affected_row_ids:
+                            return None
+                        affected = torch.tensor(
+                            affected_row_ids,
+                            device=view.device,
+                            dtype=torch.long,
+                        )
+                        row_map = torch.full(
+                            (rows,),
+                            -1,
+                            device=view.device,
+                            dtype=torch.long,
+                        )
+                        row_map.index_copy_(
+                            0,
+                            affected,
+                            torch.arange(
+                                len(affected_row_ids),
+                                device=view.device,
+                                dtype=torch.long,
+                            ),
+                        )
+                    case torch.Tensor() as pred_hidden:
+                        if (
+                            pred_hidden.ndim != 2
+                            or int(pred_hidden.shape[0]) != rows
+                            or pred_hidden.device != view.device
+                        ):
+                            raise RuntimeError(
+                                f"sampler output {self._policy.name!r} does not match the active step"
+                            )
+                        affected = torch.arange(
+                            rows, device=view.device, dtype=torch.long
+                        )
+                        row_map = None
                 head = resolve_lm_head(view.model)
                 return CandidateModifierState(
                     beta=float(self._policy.beta.resolve(self._config)),
@@ -81,11 +134,29 @@ class DeclaredSamplerOutput:
                         self._policy.backend.resolve(self._config),
                     ),
                     affected_row_ids=affected,
-                    pred_hidden=record.value,
+                    pred_hidden=pred_hidden,
                     lm_head_weight=head.weight,
                     lm_head_bias=head.bias,
+                    pred_hidden_row_map=row_map,
                 )
             case SamplerOutputKind.ADD_LOGITS:
+                match record.value:
+                    case torch.Tensor() as logit_delta:
+                        if (
+                            logit_delta.ndim != 2
+                            or int(logit_delta.shape[0]) != rows
+                            or logit_delta.device != view.device
+                        ):
+                            raise RuntimeError(
+                                f"sampler output {self._policy.name!r} does not match the active step"
+                            )
+                    case SamplerHiddenReweightBatch():
+                        raise RuntimeError(
+                            f"sampler output {self._policy.name!r} requires a dense logit delta"
+                        )
+                affected = torch.arange(
+                    rows, device=view.device, dtype=torch.long
+                )
                 return CandidateModifierState(
                     beta=1.0,
                     backend="pre_filter_dense",
@@ -95,7 +166,7 @@ class DeclaredSamplerOutput:
                         (0, 0), device=view.device, dtype=view.logits.dtype
                     ),
                     lm_head_bias=None,
-                    precomputed_dense_logits=(view.logits + record.value).detach(),
+                    precomputed_dense_logits=(view.logits + logit_delta).detach(),
                 )
 
     def after_sample(
