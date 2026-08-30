@@ -233,7 +233,10 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 match state:
                     case TrainableState(optimizer=optimizer):
                         optimizers[state.name] = _build_optimizer(
-                            optimizer, value, self.config
+                            optimizer,
+                            value,
+                            self.config,
+                            spec.device,
                         )
                     case PublishedModule():
                         pass
@@ -584,12 +587,14 @@ def _build_optimizer(
     spec: OptimizerSpec,
     value: torch.nn.Module,
     config: WorkloadConfig,
+    device: torch.device,
 ) -> torch.optim.Optimizer:
     parameters = list(value.parameters())
     options = dict(spec.options)
     lr = _optimizer_float(options["lr"], config)
     eps = float.fromhex(options["eps"])
     betas = _optimizer_betas(options["betas"])
+    fused = True if device.type == "cuda" else None
     match spec.kind:
         case "adam":
             return torch.optim.Adam(
@@ -598,6 +603,7 @@ def _build_optimizer(
                 betas=betas,
                 eps=eps,
                 foreach=False,
+                fused=fused,
             )
         case "adamw":
             return torch.optim.AdamW(
@@ -607,6 +613,7 @@ def _build_optimizer(
                 eps=eps,
                 weight_decay=float.fromhex(options["weight_decay"]),
                 foreach=False,
+                fused=fused,
             )
         case unsupported:
             raise ValueError(f"unsupported optimizer kind {unsupported!r}")
