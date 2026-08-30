@@ -163,6 +163,17 @@ native request state currently receives decode identities only; fixed-seed
 token parity is also unresolved. Prefill staging and sampler parity remain
 blocking evidence, so this tranche does not authorize legacy deletion.
 
+The first prefill foundation moves the four scheduler columns into a neutral
+typed contract and feeds them through the existing Rust packed-row planner.
+Its immutable staged rows retain plan epoch/step, raw request ID, canonical
+parent identity, packed row, token offset, and phase; MRv1 and MRv2 share the
+same service. This does not yet stage tensors or execute a workload. In
+particular, a decode-plan ordinal is not treated as a sampler mapping, and the
+current decode capture buffer is not reused for prompt-token rows. Signed
+packed hidden inputs and explicit driver sampler links remain required. A
+bounded retired-step high-watermark prevents a completed `(epoch, step)` from
+being staged again with different rows.
+
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension
 had only libc, libgcc, and loader dependencies; it did not dynamically link

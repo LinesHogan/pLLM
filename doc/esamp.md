@@ -56,6 +56,10 @@ Regions are explicitly capture-ineligible, so these results are not CUDA Graph
 or throughput evidence. Program and legacy remain migration/benchmark paths
 until the complete deletion gate passes.
 
+The neutral `PackedPhaseRowStaging` contract now preserves Rust-planned
+prefill/decode rows and stable parent identities across MRv1/MRv2, but it is
+not yet connected to packed hidden capture or native workload execution.
+
 ## Key config knobs (`ESampConsumerConfig`)
 
 - `implementation`: `"native"`, `"program"`, or `"legacy"`.

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Protocol, SupportsInt
 
 from tllm.backends.protocol import (
@@ -15,18 +14,9 @@ from tllm.backends.protocol import (
     runner_binding_for,
     runner_model_module,
 )
+from tllm.contracts.packed_rows import PackedRowPlanInputs
 
 _BINDING_ATTR = RUNNER_BINDING_ATTR
-
-
-@dataclass(frozen=True)
-class PackedRowPlanInputs:
-    """Backend-normalized inputs for the core packed-row planner."""
-
-    request_ids: tuple[str, ...]
-    scheduled_tokens: tuple[int, ...]
-    prompt_tokens: tuple[int, ...]
-    computed_tokens: tuple[int, ...]
 
 
 def ensure_runner_binding(

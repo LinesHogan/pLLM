@@ -15,7 +15,7 @@ from tllm.backends.vllm.dense_parameter_overlay import (
     install_dense_replacement_target,
     validate_dense_replacement_targets,
 )
-from tllm.backends.vllm.runner_adapter import PackedRowPlanInputs
+from tllm.contracts.packed_rows import PackedRowPlanInputs
 from tllm.contracts.request_identity import (
     RequestFinishedBatch,
     RequestIdentity,

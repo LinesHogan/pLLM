@@ -8,6 +8,11 @@ from tllm.contracts.hidden_locator import (
     HiddenPhase,
     HiddenSite,
 )
+from tllm.contracts.packed_rows import (
+    PackedPhaseRow,
+    PackedPhaseRowBatch,
+    PackedRowPlanInputs,
+)
 from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
@@ -25,6 +30,9 @@ __all__ = [
     "HiddenLocatorCapability",
     "HiddenPhase",
     "HiddenSite",
+    "PackedPhaseRow",
+    "PackedPhaseRowBatch",
+    "PackedRowPlanInputs",
     "RowBatchMeta",
     "RuntimeContext",
     "RegionShapeSpecializationInput",

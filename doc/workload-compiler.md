@@ -223,6 +223,17 @@ only (four updates and one intervention state). Fixed-seed native and legacy
 tokens also differ before intervention. These are correctness/lifecycle
 capability results, not parity, throughput, or CUDA Graph claims.
 
+The prefill follow-up now has a neutral foundation but is not yet executable:
+`PackedRowPlanInputs` lives in the contracts layer, and
+`PackedPhaseRowStaging` expands the Rust packed-row plan into immutable rows
+carrying plan epoch, step, raw backend ID, stable `RequestIdentity`, token
+offset, and closed prefill/decode phase. Decode plan ordinals are explicitly
+not sampler-row links. A single active epoch and retired-step high-watermark
+prevent `(epoch, step)` ABA reuse without retaining unbounded history. Packed
+hidden capture, signed runtime input kinds, and
+driver-provided sampler-row mappings still have to bind this batch before the
+native update count can include prefill.
+
 A native ESamp Region cannot be co-installed with a legacy ESamp authority.
 During the current migration this
 isolation is runtime-wide: a runtime with any native Region declaration also

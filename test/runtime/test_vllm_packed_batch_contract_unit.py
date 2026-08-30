@@ -9,6 +9,7 @@ import pytest
 from tllm.backends.vllm import runner_adapter
 from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
+from tllm.contracts.packed_rows import PackedRowPlanInputs
 
 
 def _mrv1_batch(*, indices: dict[str, int]) -> SimpleNamespace:
@@ -52,6 +53,7 @@ def test_v027_drivers_preserve_the_explicit_compact_request_order() -> None:
     )
     assert mrv1 == expected
     assert mrv2 == expected
+    assert runner_adapter.PackedRowPlanInputs is PackedRowPlanInputs
 
 
 def test_empty_batches_do_not_require_family_private_columns() -> None:
