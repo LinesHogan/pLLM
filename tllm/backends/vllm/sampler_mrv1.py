@@ -8,11 +8,9 @@
   ``logprobs_mode_override``.
 * ``apply_temperature`` takes an ``all_random`` guard and always divides
   in-place.
-* min-p is a native argmax-invariant logits processor, so tLLM no longer
-  patches ``InputBatch``/``SamplingMetadata``; the processor runs inside the
-  wrapped ``sample`` before the bridge sees the logits, which keeps the
-  declared "filter first, intervene on survivors" semantics intact (min-p,
-  top-k and top-p masking commute).
+* min-p is a native argmax-invariant logits processor. Post-filter providers
+  run after it; ``pre_filter_dense`` providers modify raw logits first so
+  penalties, temperature, and min-p observe the intervened distribution.
 
 The wrapper mirrors the upstream ``Sampler.sample`` control flow exactly so
 that an inactive provider is bit-for-bit the upstream algorithm, and injects
@@ -30,6 +28,10 @@ from tllm.runtime.vllm_patch.sampler_patch import (
     dispatch_sampler_pre_draw,
     _notify_after_sample,
     _resolve_provider,
+)
+from tllm.runtime.sampler_bridge.provider import (
+    SamplerInterventionStage,
+    validate_prepared_intervention,
 )
 
 _SAMPLING_EPS = 1e-5
@@ -113,7 +115,10 @@ def wrapped_sampler_sample_v027(
     logprobs_mode_override: Any = None,
     orig_sample: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from tllm.runtime.sampler_bridge.bridge import sample_with_optional_modifier
+    from tllm.runtime.sampler_bridge.bridge import (
+        apply_pre_filter_dense_logits,
+        sample_with_optional_modifier,
+    )
     from tllm.runtime.sampler_bridge.runtime_view import build_sampler_step_view
 
     runtime = getattr(sampler, "_tllm_runtime", None)
@@ -123,6 +128,31 @@ def wrapped_sampler_sample_v027(
         return orig_sample(sampler, logits, sampling_metadata, logprobs_mode_override=logprobs_mode_override)
 
     logprobs_mode = logprobs_mode_override or sampler.logprobs_mode
+    intervention_stage = provider.intervention_stage()
+    prepared_state = None
+    raw_view = None
+    if intervention_stage is SamplerInterventionStage.PRE_FILTER:
+        raw_view = build_sampler_step_view(
+            runtime=runtime,
+            runner=runner,
+            model=getattr(runner, "model", None),
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+        )
+        if raw_view is not None:
+            dispatch_sampler_pre_draw(
+                runtime=runtime,
+                runner=runner,
+                device=logits.device,
+            )
+            prepared_state = provider.prepare_step(raw_view)
+        if prepared_state is not None:
+            validate_prepared_intervention(provider, prepared_state)
+            runtime.sampler_precompute.intervention_state_count += 1
+            logits = apply_pre_filter_dense_logits(
+                logits=logits,
+                state=prepared_state,
+            )
     all_random = bool(sampling_metadata.all_random)
     greedy_sampled = None if all_random else sampler.greedy_sample(logits)
 
@@ -134,6 +164,22 @@ def wrapped_sampler_sample_v027(
             logits = processor.apply(logits)
 
     modified_logits = logits
+    if intervention_stage is SamplerInterventionStage.PRE_FILTER:
+        sampled, processed = _standard_completion(
+            sampler=sampler,
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+            greedy_sampled=greedy_sampled,
+            logprobs_mode=logprobs_mode,
+        )
+        if prepared_state is not None and raw_view is not None:
+            _notify_after_sample(
+                provider=provider,
+                view=raw_view,
+                sampled_token_ids=sampled,
+            )
+        return sampled, processed
+
     view = build_sampler_step_view(
         runtime=runtime,
         runner=runner,

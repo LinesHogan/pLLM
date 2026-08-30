@@ -36,7 +36,10 @@ from tllm.ports.base import (
 from tllm.ports.request_meta import RequestMeta
 from tllm.ports.residual_stream import ResidualStream
 from tllm.program import ProgramConsumer, StateSpec, compile_program
-from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
+from tllm.runtime.sampler_bridge.provider import (
+    SamplerInterventionStage,
+    SamplerModifierProvider,
+)
 from tllm.runtime.sampler_bridge.types import (
     CandidateModifierState,
     SamplerStepView,
@@ -128,6 +131,11 @@ class _ProgramSamplerModifierProvider(SamplerModifierProvider):
             and bool(self._config.enable_esamp_training)
             and float(self._config.distiller_beta or 0.0) != 0.0
         )
+
+    def intervention_stage(self) -> SamplerInterventionStage:
+        if self._config.distiller_sampler_backend == "pre_filter_dense":
+            return SamplerInterventionStage.PRE_FILTER
+        return SamplerInterventionStage.POST_FILTER
 
     def prepare_step(self, view: SamplerStepView) -> CandidateModifierState | None:
         if not self.is_active():

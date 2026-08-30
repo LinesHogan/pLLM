@@ -28,6 +28,7 @@ enum ScheduleInputKind {
     StepId,
     Staged,
     SamplerRequestIds,
+    SamplerSampleIdxs,
     SamplerLogits,
     SampledTokens,
 }
@@ -154,6 +155,7 @@ enum RegionInputKind {
     StepId,
     Staged,
     SamplerRequestIds,
+    SamplerSampleIdxs,
     SamplerLogits,
     SampledTokens,
 }
@@ -167,6 +169,7 @@ impl RegionInputKind {
             Self::StepId => "step_id",
             Self::Staged => "staged",
             Self::SamplerRequestIds => "sampler_request_ids",
+            Self::SamplerSampleIdxs => "sampler_sample_idxs",
             Self::SamplerLogits => "sampler_logits",
             Self::SampledTokens => "sampled_tokens",
         }
@@ -1965,6 +1968,7 @@ fn validate_inputs(
                 | ScheduleInputKind::Provided
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
+                | ScheduleInputKind::SamplerSampleIdxs
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId
@@ -1982,6 +1986,7 @@ fn validate_inputs(
                 ScheduleInputKind::Provided
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
+                | ScheduleInputKind::SamplerSampleIdxs
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId
@@ -2670,6 +2675,7 @@ fn draft_capture_safe(
                 ScheduleInputKind::Provided
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
+                | ScheduleInputKind::SamplerSampleIdxs
                 | ScheduleInputKind::SamplerLogits
                 | ScheduleInputKind::SampledTokens
                 | ScheduleInputKind::StepId => return false,
@@ -3463,6 +3469,7 @@ fn compile_impl(
                         ScheduleInputKind::Provided => RegionInputKind::Provided,
                         ScheduleInputKind::Staged => RegionInputKind::Staged,
                         ScheduleInputKind::SamplerRequestIds => RegionInputKind::SamplerRequestIds,
+                        ScheduleInputKind::SamplerSampleIdxs => RegionInputKind::SamplerSampleIdxs,
                         ScheduleInputKind::SamplerLogits => RegionInputKind::SamplerLogits,
                         ScheduleInputKind::SampledTokens => RegionInputKind::SampledTokens,
                         ScheduleInputKind::StepId => RegionInputKind::StepId,

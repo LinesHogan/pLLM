@@ -687,6 +687,9 @@ class _SamplerOutputs:
     def request_ids(self) -> SamplerRuntimeInput:
         return SamplerRuntimeInput(ValueSourceKind.SAMPLER_REQUEST_IDS)
 
+    def sample_indices(self) -> SamplerRuntimeInput:
+        return SamplerRuntimeInput(ValueSourceKind.SAMPLER_SAMPLE_IDXS)
+
     def logits(self) -> SamplerRuntimeInput:
         return SamplerRuntimeInput(ValueSourceKind.SAMPLER_LOGITS)
 

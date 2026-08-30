@@ -29,6 +29,7 @@ import torch
 
 from tllm.backends.vllm import sampler_mrv2
 from tllm.runtime import residual_runtime
+from tllm.runtime.sampler_bridge.provider import SamplerInterventionStage
 from tllm.runtime.sampler_bridge.types import CandidateModifierState
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import WorkloadExecutionBindings
@@ -126,6 +127,9 @@ class _RaceProvider:
 
     def is_active(self) -> bool:
         return True
+
+    def intervention_stage(self) -> SamplerInterventionStage:
+        return SamplerInterventionStage.PRE_FILTER
 
     def prepare_step(self, view: Any) -> CandidateModifierState:
         rows = int(view.logits.shape[0])

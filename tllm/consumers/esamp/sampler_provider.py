@@ -17,7 +17,10 @@ from tllm.runtime.vllm_patch.lm_head import (
 )
 from tllm.runtime.resources import SamplerPrecomputeCache
 from tllm.runtime.instrumentation import maybe_record_function
-from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
+from tllm.runtime.sampler_bridge.provider import (
+    SamplerInterventionStage,
+    SamplerModifierProvider,
+)
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 
 _SAMPLER_PRECOMPUTE_STREAM_PRIORITY = 2
@@ -104,6 +107,11 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
             and bool(self.config.enable_esamp_training)
             and float(getattr(self.config, "distiller_beta", 0.0) or 0.0) != 0.0
         )
+
+    def intervention_stage(self) -> SamplerInterventionStage:
+        if self.config.distiller_sampler_backend == "pre_filter_dense":
+            return SamplerInterventionStage.PRE_FILTER
+        return SamplerInterventionStage.POST_FILTER
 
     def _get_lm_head(self, model: object) -> ResolvedLMHead:
         if model is self._cached_lm_head_owner and self._cached_lm_head is not None:

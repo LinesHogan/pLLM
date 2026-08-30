@@ -13,8 +13,15 @@ from tllm.runtime.sampler_bridge.dense_backend import modify_rows_dense
 from tllm.runtime.sampler_bridge import exact_backend
 from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.minp_kernel import MinPCandidateKernelRequest, select_minp_candidate_kernel
-from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
-from tllm.runtime.sampler_bridge.types import CandidateSampleResult, SamplerStepView
+from tllm.runtime.sampler_bridge.provider import (
+    SamplerModifierProvider,
+    validate_prepared_intervention,
+)
+from tllm.runtime.sampler_bridge.types import (
+    CandidateModifierState,
+    CandidateSampleResult,
+    SamplerStepView,
+)
 
 _SAMPLING_EPS = 1e-5
 import os
@@ -250,6 +257,23 @@ def _build_dense_modified_logits(
     return modified
 
 
+def apply_pre_filter_dense_logits(
+    *, logits: torch.Tensor, state: CandidateModifierState
+) -> torch.Tensor:
+    """Apply a dense modifier to raw logits before sampler processors."""
+
+    affected_rows = state.affected_row_ids.to(
+        device=logits.device,
+        dtype=torch.long,
+    )
+    return _build_dense_modified_logits(
+        logits=logits,
+        state=state,
+        affected_rows=affected_rows,
+        in_place=False,
+    )
+
+
 def sample_with_optional_modifier(
     *,
     sampler: Any,
@@ -259,6 +283,7 @@ def sample_with_optional_modifier(
     provider: SamplerModifierProvider | None,
     greedy_sampled: torch.Tensor | None,
     before_draw: Callable[[], None] | None = None,
+    prepared_state: CandidateModifierState | None = None,
 ) -> torch.Tensor | None:
     with maybe_record_function("distiller.sample_with_optional_modifier"):
         if view is None or provider is None or not provider.is_active():
@@ -268,11 +293,15 @@ def sample_with_optional_modifier(
         # stream, and provider consumption after the join observes complete
         # results.  The reverse order raced side Regions signed before
         # sampler.pre_draw.
-        if before_draw is not None:
-            before_draw()
-        state = provider.prepare_step(view)
+        if prepared_state is None:
+            if before_draw is not None:
+                before_draw()
+            state = provider.prepare_step(view)
+        else:
+            state = prepared_state
         if state is None or int(state.affected_row_ids.numel()) <= 0:
             return None
+        validate_prepared_intervention(provider, state)
         try:
             runtime = view.runner._tllm_runtime
         except AttributeError:

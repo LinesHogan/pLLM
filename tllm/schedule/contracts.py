@@ -346,6 +346,7 @@ class ScheduleInputKind(StrEnum):
     STEP_ID = "step_id"
     STAGED = "staged"
     SAMPLER_REQUEST_IDS = "sampler_request_ids"
+    SAMPLER_SAMPLE_IDXS = "sampler_sample_idxs"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
 
@@ -364,6 +365,7 @@ class RegionInputKind(StrEnum):
     STEP_ID = "step_id"
     STAGED = "staged"
     SAMPLER_REQUEST_IDS = "sampler_request_ids"
+    SAMPLER_SAMPLE_IDXS = "sampler_sample_idxs"
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
 

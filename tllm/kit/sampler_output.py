@@ -9,6 +9,7 @@ from tllm.ports.sampler import CandidateModifierState, SamplerBackend
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.vllm_patch.lm_head import resolve_lm_head
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
+from tllm.runtime.sampler_bridge.provider import SamplerInterventionStage
 from tllm.runtime.workload_sinks import MissingSinkRecord, SinkRecord, SinkStore
 from tllm.workload.config import WorkloadConfig
 from tllm.workload.frontend import SamplerOutput, SamplerOutputKind
@@ -33,6 +34,15 @@ class DeclaredSamplerOutput:
         return bool(self._policy.enabled.resolve(self._config)) and float(
             self._policy.beta.resolve(self._config)
         ) != 0.0
+
+    def intervention_stage(self) -> SamplerInterventionStage:
+        backend = self._policy.backend.resolve(self._config)
+        if (
+            self._policy.kind is SamplerOutputKind.ADD_LOGITS
+            or backend == "pre_filter_dense"
+        ):
+            return SamplerInterventionStage.PRE_FILTER
+        return SamplerInterventionStage.POST_FILTER
 
     def prepare_step(self, view: SamplerStepView) -> CandidateModifierState | None:
         self._context.prepare(view)

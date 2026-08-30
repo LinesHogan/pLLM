@@ -22,7 +22,7 @@ from tllm.workload import (
     config_field,
     extern,
     hidden,
-    optimize,
+    maybe_optimize,
     read,
     result,
     sampler,
@@ -83,13 +83,8 @@ class OverRIDEHeads(torch.nn.Module):
         ).squeeze(1)
 
 
-def iteration_from_request_id(request_id: str) -> int:
-    prefix, separator, _suffix = request_id.partition("_")
-    return int(prefix) + 1 if separator and prefix.isdigit() else 1
-
-
 class OverRIDEWorkload(Workload[OverRIDEConfig]):
-    heads: State[OverRIDEHeads] = State[OverRIDEHeads].replica(
+    heads: TrainableState[OverRIDEHeads] = State[OverRIDEHeads].replica(
         optimizer=AdamSpec.configured(_OVERRIDE_LEARNING_RATE)
     )
 
@@ -106,7 +101,7 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
         )
 
     @task(
-        inputs={"request_ids": sampler.request_ids()},
+        inputs={"sample_indices": sampler.sample_indices()},
         outputs={
             "previous_heads": temporary(),
             "scales": temporary(),
@@ -117,13 +112,21 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
         implementation=extern("tllm.override:select_iteration_heads@1"),
     )
     def select_heads(
-        self, request_ids: tuple[str, ...]
+        self, sample_indices: tuple[int, ...]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        iterations = tuple(iteration_from_request_id(value) for value in request_ids)
+        if any(
+            sample_idx < 0 or sample_idx >= self.config.num_iterations
+            for sample_idx in sample_indices
+        ):
+            raise RuntimeError(
+                "OverRIDE sample indices must be within the configured iterations"
+            )
         head_count = self.config.num_iterations - 1
-        previous = tuple(iteration - 2 for iteration in iterations)
+        previous = tuple(sample_idx - 1 for sample_idx in sample_indices)
         train_rows = tuple(
-            row for row, iteration in enumerate(iterations) if iteration <= head_count
+            row
+            for row, sample_idx in enumerate(sample_indices)
+            if sample_idx < head_count
         )
         return (
             torch.tensor([max(index, 0) for index in previous], dtype=torch.long),
@@ -131,7 +134,10 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
                 [[self.config.lambd if index >= 0 else 0.0] for index in previous]
             ),
             torch.tensor(train_rows, dtype=torch.long),
-            torch.tensor([iterations[row] - 1 for row in train_rows], dtype=torch.long),
+            torch.tensor(
+                [sample_indices[row] for row in train_rows],
+                dtype=torch.long,
+            ),
         )
 
     @task(
@@ -161,8 +167,16 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
         scales: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            delta = self.heads(hidden, previous_heads.to(hidden.device))
-            delta = delta * scales.to(device=hidden.device, dtype=hidden.dtype)
+            if self.heads.down.shape[0] == 0:
+                delta = hidden.new_zeros(
+                    (hidden.shape[0], self.config.vocab_size)
+                )
+            else:
+                delta = self.heads(hidden, previous_heads.to(hidden.device))
+                delta = delta * scales.to(
+                    device=hidden.device,
+                    dtype=hidden.dtype,
+                )
         return delta, hidden
 
     @task(
@@ -174,9 +188,7 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
             "tokens": sampler.sampled_tokens(),
         },
         outputs={
-            "loss": optimize(
-                cast(TrainableState[object], heads), at=Before("step.end")
-            )
+            "loss": maybe_optimize(heads, at=Before("step.end"))
         },
         timing=Between("token.commit", "step.end"),
     )
@@ -187,7 +199,9 @@ class OverRIDEWorkload(Workload[OverRIDEConfig]):
         train_heads: torch.Tensor,
         base_logits: torch.Tensor,
         tokens: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
+        if train_rows.numel() == 0:
+            return None
         rows = train_rows.to(hidden.device)
         selected_hidden = hidden.index_select(0, rows)
         selected_logits = base_logits.index_select(0, rows)
@@ -210,5 +224,4 @@ __all__ = [
     "OverRIDEConfig",
     "OverRIDEHeads",
     "OverRIDEWorkload",
-    "iteration_from_request_id",
 ]

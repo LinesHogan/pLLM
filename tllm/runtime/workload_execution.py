@@ -1462,6 +1462,7 @@ class _RegionValueStore:
                 RegionInputKind.PROVIDED,
                 RegionInputKind.STAGED,
                 RegionInputKind.SAMPLER_REQUEST_IDS,
+                RegionInputKind.SAMPLER_SAMPLE_IDXS,
                 RegionInputKind.SAMPLER_LOGITS,
                 RegionInputKind.SAMPLED_TOKENS,
             ):
@@ -1934,6 +1935,7 @@ def _local_binding_requirements(
             RegionInputKind.PROVIDED,
             RegionInputKind.STAGED,
             RegionInputKind.SAMPLER_REQUEST_IDS,
+            RegionInputKind.SAMPLER_SAMPLE_IDXS,
             RegionInputKind.SAMPLER_LOGITS,
             RegionInputKind.SAMPLED_TOKENS,
         )

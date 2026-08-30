@@ -55,5 +55,11 @@ class SamplerStepContext:
         runtime = residual_runtime.RUNTIME
         return tuple(runtime.decode_request_ids[: runtime.decode_count])
 
+    def sample_indices(self, _step_id: int) -> tuple[int, ...]:
+        from tllm.runtime import residual_runtime
+
+        runtime = residual_runtime.RUNTIME
+        return tuple(runtime.decode_sample_idxs[: runtime.decode_count])
+
 
 __all__ = ["SamplerStepContext"]

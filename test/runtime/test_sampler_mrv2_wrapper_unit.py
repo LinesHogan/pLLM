@@ -22,6 +22,7 @@ import torch
 
 from tllm.backends.vllm import sampler_mrv2
 from tllm.runtime.residual_runtime import SamplerPrecomputeState
+from tllm.runtime.sampler_bridge.provider import SamplerInterventionStage
 from tllm.runtime.sampler_bridge.types import CandidateModifierState
 
 
@@ -123,6 +124,7 @@ class Mrv2SamplerWrapperOrderTest(unittest.TestCase):
         order: list[str] = []
         provider = SimpleNamespace(
             is_active=lambda: True,
+            intervention_stage=lambda: SamplerInterventionStage.POST_FILTER,
             prepare_step=lambda view: order.append("provider") or None,
         )
         runtime = _runtime()
@@ -154,6 +156,7 @@ class Mrv2SamplerWrapperOrderTest(unittest.TestCase):
         order: list[str] = []
         provider = SimpleNamespace(
             is_active=lambda: False,
+            intervention_stage=lambda: SamplerInterventionStage.POST_FILTER,
             prepare_step=lambda view: order.append("provider") or None,
         )
         runtime = _runtime()
@@ -172,9 +175,48 @@ class Mrv2SamplerWrapperOrderTest(unittest.TestCase):
 
 
 class Mrv2SamplerPipelineReorderTest(unittest.TestCase):
+    def test_declared_stage_must_match_prepared_backend(self) -> None:
+        raw = torch.ones((2, 4))
+        provider = SimpleNamespace(
+            is_active=lambda: True,
+            intervention_stage=lambda: SamplerInterventionStage.POST_FILTER,
+            prepare_step=lambda _view: _pre_filter_state(
+                raw=raw,
+                reweighted=raw,
+            ),
+        )
+        runtime = _runtime()
+        runtime.consumer = SimpleNamespace(
+            sampler_modifier_provider=lambda: provider
+        )
+        sampler = _FakeSampler()
+        wrapped = sampler_mrv2.make_mrv2_sample_wrapper(
+            sampler=sampler,
+            runtime=runtime,
+            runner=SimpleNamespace(model=object()),
+            orig_sample=mock.Mock(),
+        )
+
+        with (
+            mock.patch.object(
+                sampler_mrv2,
+                "dispatch_sampler_pre_draw",
+            ),
+            self.assertRaisesRegex(RuntimeError, "stage disagrees"),
+        ):
+            wrapped(
+                raw,
+                torch.arange(2, dtype=torch.long),
+                None,
+                torch.arange(2, dtype=torch.long),
+                torch.zeros(2, dtype=torch.long),
+                torch.arange(2, dtype=torch.long),
+            )
+
     def _run(self, *, raw: torch.Tensor, reweighted: torch.Tensor, temperature: float, min_p: float) -> dict[str, torch.Tensor]:
         provider = SimpleNamespace(
             is_active=lambda: True,
+            intervention_stage=lambda: SamplerInterventionStage.PRE_FILTER,
             prepare_step=lambda view: _pre_filter_state(raw=raw, reweighted=reweighted),
             after_sample=lambda view, sampled: None,
         )

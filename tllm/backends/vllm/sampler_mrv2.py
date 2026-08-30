@@ -39,6 +39,7 @@ import torch
 import torch.nn.functional as F
 
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
+from tllm.runtime.sampler_bridge.provider import validate_prepared_intervention
 from tllm.runtime.vllm_patch.sampler_patch import (
     _notify_after_sample,
     _resolve_provider,
@@ -492,6 +493,7 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
                 expanded_local_pos,
                 return_logprobs=return_logprobs,
             )
+        validate_prepared_intervention(provider, state)
         runtime.sampler_precompute.intervention_state_count += 1
 
         from vllm.config.model import PROCESSED_LOGPROBS_MODES
@@ -532,22 +534,11 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
             # Penalties, temperature and min-p then apply to the intervened
             # distribution.  The raw logits alias the runner's tensor, so the
             # intervention always works on a clone.
-            dense = state.precomputed_dense_logits
-            if dense is None:
-                pred_hidden = state.pred_hidden
-                dense = F.linear(
-                    pred_hidden.to(dtype=state.lm_head_weight.dtype),
-                    state.lm_head_weight,
-                    state.lm_head_bias,
-                ).to(torch.float32)
-            dense = dense.to(device=logits.device, dtype=logits.dtype)
-            affected = state.affected_row_ids.to(device=logits.device, dtype=torch.long)
-            intervened = logits.clone()
-            sub = intervened[affected]
-            sub.mul_(1.0 + float(state.beta))
-            sub.add_(dense[: int(affected.numel())], alpha=-float(state.beta))
-            intervened[affected] = sub
-            logits = intervened
+            from tllm.runtime.sampler_bridge.bridge import (
+                apply_pre_filter_dense_logits,
+            )
+
+            logits = apply_pre_filter_dense_logits(logits=logits, state=state)
         _ti = _hotspot("mrv2_sampler.pre_pipeline_intervene_cpu", _t0)
 
         processed_logits = sampler.apply_sampling_params(
