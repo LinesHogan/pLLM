@@ -10,6 +10,9 @@ from tllm.runtime.vllm_patch.capture_runner import (
     make_mapping_add_request,
     run_generate_with_request_mapping,
 )
+from tllm.runtime.vllm_adapter import install_generate_boundary
+from tllm.runtime.request_lifecycle import RequestLifecycleLedger
+from tllm.contracts.request_identity import RequestIdentity
 
 
 class _RecordingPlane:
@@ -21,8 +24,10 @@ class _RecordingPlane:
 
 
 class _RuntimeStub:
-    reqid_to_promptidx: dict = {}
-    reqid_to_sampleidx: dict = {}
+    def __init__(self) -> None:
+        self.reqid_to_promptidx: dict[str, int] = {}
+        self.reqid_to_sampleidx: dict[str, int] = {}
+        self.request_lifecycle = RequestLifecycleLedger()
 
 
 class MappingAddRequestUnitTest(unittest.TestCase):
@@ -56,6 +61,10 @@ class MappingAddRequestUnitTest(unittest.TestCase):
         self.assertEqual(plane.pushes, [[("req-a", 7, None)], [("req-b", 8, None)]])
         self.assertEqual(runtime.reqid_to_promptidx, {"req-a": 7, "req-b": 8})
         self.assertEqual(runtime.reqid_to_sampleidx, {})
+        self.assertEqual(
+            tuple(alias.identity for alias in runtime.request_lifecycle.active_aliases),
+            (RequestIdentity("req-a", 7, 0), RequestIdentity("req-b", 8, 0)),
+        )
 
     def test_default_indices_and_reset(self) -> None:
         runtime = _RuntimeStub()
@@ -113,6 +122,47 @@ class MappingAddRequestUnitTest(unittest.TestCase):
             )
 
         self.assertEqual(calls, [{"use_tqdm": False}])
+
+    def test_boundary_aborts_actual_admission_after_nonprepublished_failure(self) -> None:
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.state import ResidualRuntimeState
+
+        runtime = _RuntimeStub()
+        state = ResidualRuntimeState()
+        aborted: list[tuple[str, ...]] = []
+
+        class Engine:
+            def add_request(self, request_id, _prompt, _params):
+                return request_id
+
+        class LLM:
+            def __init__(self) -> None:
+                self.llm_engine = Engine()
+
+            def generate(self, _prompts, _params):
+                self.llm_engine.add_request("request-0", "prompt", None)
+                raise RuntimeError("engine failed after admission")
+
+        llm = LLM()
+        with (
+            patch("tllm.runtime.mp.control.ControlPlane.try_bind", return_value=None),
+            patch.object(residual_runtime, "RUNTIME", state),
+        ):
+            install_generate_boundary(
+                llm,
+                runtime,
+                lambda: None,
+                lambda _outputs: None,
+                lambda request_ids: aborted.append(request_ids),
+                lambda: (7,),
+                lambda: None,
+            )
+            with self.assertRaisesRegex(RuntimeError, "engine failed after admission"):
+                llm.generate(("prompt",), None)
+
+        self.assertEqual(aborted, [("request-0",)])
+        self.assertEqual(state.reqid_to_promptidx, {"request-0": 7})
+        self.assertEqual(len(state.request_lifecycle.active_aliases), 1)
 
 
 if __name__ == "__main__":

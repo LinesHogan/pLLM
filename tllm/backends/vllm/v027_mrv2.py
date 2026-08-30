@@ -87,6 +87,12 @@ def _wrapped_prepare_inputs(
         state=None if binding is None else binding.parameter_overlay_state,
     )
     input_batch = orig(runner, *args, **kwargs)
+    from tllm.runtime.request_lifecycle import observe_request_aliases
+
+    observe_request_aliases(
+        runtime,
+        _runner_adapter.mrv2_active_request_ids(runner, input_batch),
+    )
     if overlay_controller is not None:
         overlay_controller.sync_versions()
         overlay_controller.apply_mrv2_input_batch(input_batch)
@@ -572,19 +578,19 @@ class V027MRv2Driver:
         )
         _runner_adapter.unbind_runner(binding)
 
-    def finish_parameter_overlay_requests(
+    def consume_parameter_overlay_finished_batch(
         self,
         *,
         runtime: Any,
         runner: Any,
         state: OverlayBackendState,
-        request_ids: tuple[str, ...],
-    ) -> RequestFinishedBatch:
-        return _parameter_overlay.finish_parameter_overlay_requests(
+        batch: RequestFinishedBatch,
+    ) -> int:
+        return _parameter_overlay.consume_parameter_overlay_finished_batch(
             runtime=runtime,
             runner=runner,
             state=state,
-            request_ids=request_ids,
+            batch=batch,
         )
 
     def synchronize_parameter_overlays(

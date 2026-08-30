@@ -47,6 +47,7 @@ from tllm.runtime.workload_bindings import (
     RuntimePortRegistry,
     RuntimeInputBinding,
     RuntimeOutputBinding,
+    RequestStateRuntimeService,
     SamplerRuntimeBinding,
     WorkloadRuntimeBinding,
     WorkerRuntimeBinding,
@@ -59,10 +60,12 @@ from tllm.runtime.vllm_adapter import (
     install_generate_boundary,
 )
 from tllm.runtime.torch_adapter import runtime_torch_values
+from tllm.runtime.request_lifecycle import new_request_finish_id
 from tllm.contracts.workload_ports import (
     PortTransactionStatus,
     StagedPortTransactionResolution,
 )
+from tllm.contracts.request_identity import RequestFinishedBatch
 
 if TYPE_CHECKING:
     import torch
@@ -76,6 +79,7 @@ if TYPE_CHECKING:
         WorkerPortCommitReply,
         WorkerPortQuorum,
     )
+    from tllm.backends.protocol import RunnerBinding
     from tllm.runtime.mp.port_wire import EncodedPortPayload
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
     from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -101,6 +105,7 @@ SecondStagedT = TypeVar("SecondStagedT")
 HostOutputT = TypeVar("HostOutputT")
 RuntimeWorkloadT = TypeVar("RuntimeWorkloadT")
 PublishedModuleT = TypeVar("PublishedModuleT", bound="torch.nn.Module")
+
 
 ConfiguredWorkloadT = TypeVarWithDefault(
     "ConfiguredWorkloadT", default=Never
@@ -773,6 +778,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._generate_request_mapping_active = False
         self._generate_request_prompt_indices: tuple[int, ...] | None = None
         self._generate_request_sample_indices: tuple[int, ...] | None = None
+        self._inprocess_request_finish_binding: "RunnerBinding | None" = None
         native_workloads: list[
             tuple[ConfiguredWorkloadT, DeclarationDefinition]
         ] = []
@@ -988,6 +994,9 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         output_sinks: dict[str, RuntimeOutputBinding[object]] = {}
         snapshots: dict[str, Callable[[int], Mapping[Hashable, int]]] = {}
         optimizer_transitions: dict[str, OptimizerTransitionService] = {}
+        request_state_services: dict[
+            str, RequestStateRuntimeService["torch.nn.Module"]
+        ] = {}
         sampler_bindings: list[SamplerRuntimeBinding] = []
         diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
         residual_paths: dict["ResidualLocator", str] = {}
@@ -1041,6 +1050,20 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                         f"duplicate native optimizer transition binding {resource!r}"
                     )
                 optimizer_transitions[resource] = transition_service
+            for local_name, service in resources.request_state_services.items():
+                resource = (
+                    f"{declaration.ir.workload_id}/{local_name}"
+                    if multiple
+                    else local_name
+                )
+                if resource in request_state_services:
+                    raise RuntimeError(
+                        "duplicate native request-state service binding "
+                        f"{resource!r}"
+                    )
+                request_state_services[resource] = service.for_signed_resource(
+                    resource
+                )
             match resources.sampler:
                 case SamplerRuntimeBinding() as sampler:
                     sampler_bindings.append(sampler)
@@ -1106,6 +1129,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 outputs=output_sinks,
             ),
             state_versions=state_versions,
+            request_state_services=request_state_services,
             optimizer_transitions=optimizer_transitions,
             sampler=(NoSamplerBinding() if not sampler_bindings else sampler_bindings[0]),
             diagnostics_readers=diagnostics_readers,
@@ -1711,10 +1735,15 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 set_active_control_plane(plane)
                 self._install_generate_boundary(llm, plane)
                 return
-        bind_inprocess_runner(llm, self)
+        inprocess_runner = bind_inprocess_runner(llm, self)
+        if inprocess_runner is not None:
+            self._inprocess_request_finish_binding = inprocess_runner.binding
+            self._install_generate_boundary(llm, None)
 
     def _install_generate_boundary(
-        self, llm: object, plane: "ControlPlane"
+        self,
+        llm: object,
+        plane: "ControlPlane | None",
     ) -> None:
         """Poll cold misses before generate and flush signed finishes after it.
 
@@ -1732,22 +1761,23 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             # before another caller observes the parent-only next epoch.
             with self._shape_specialization_poll_lock:
                 self._require_workload_live()
-                if not self._staged_port_transactions:
+                if plane is not None and not self._staged_port_transactions:
                     self.apply_pending_worker_shape_specializations(plane)
                 self._require_workload_live()
 
         def after_generate(outputs: Sequence[RequestOutput]) -> None:
             request_ids = tuple(output.request_id for output in outputs)
-            bindings = self.workload_execution_bindings
-            expected_finished = (
-                sum(len(output.outputs) for output in outputs)
-                if bindings is not None and bindings.parameter_overlays
-                else None
-            )
             try:
-                plane.finish_workload_requests(
-                    request_ids, expected_finished=expected_finished
-                )
+                # Completion is a generic typed lifecycle transaction.  The
+                # worker validates its canonical batch quorum; parameter
+                # overlays are merely one cleanup consumer there.
+                if plane is not None:
+                    self._finish_multiprocess_workload_requests(
+                        plane,
+                        request_ids,
+                    )
+                else:
+                    self._finish_inprocess_workload_requests(request_ids)
             except Exception:
                 self._fail_stop_workloads(
                     "request-finish worker quorum diverged"
@@ -1756,7 +1786,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
 
         def abort_generate(request_ids: tuple[str, ...]) -> None:
             try:
-                plane.finish_workload_requests(request_ids)
+                if plane is not None:
+                    self._finish_multiprocess_workload_requests(plane, request_ids)
+                else:
+                    self._finish_inprocess_workload_requests(request_ids)
             except Exception:
                 self._fail_stop_workloads(
                     "request-abort worker quorum diverged"
@@ -1771,6 +1804,80 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             abort_generate,
             lambda: self._generate_request_prompt_indices,
             lambda: self._generate_request_sample_indices,
+        )
+
+    def _finish_multiprocess_workload_requests(
+        self,
+        plane: "ControlPlane",
+        request_ids: tuple[str, ...],
+    ) -> None:
+        """Finalize worker cleanup and the parent alias mirror as one epoch.
+
+        The parent has no local model cleanup to apply.  It nevertheless owns
+        the admission aliases created by ``add_request`` and therefore keeps
+        its ledger receipt pending until worker apply/finalize quorum proves
+        the exact same canonical identity batch.
+        """
+
+        from tllm.runtime import residual_runtime as core
+        from tllm.contracts.request_identity import resolve_request_identity
+        from tllm.runtime.request_lifecycle import (
+            finalize_prepared_request_finish,
+        )
+
+        finish_id = new_request_finish_id()
+
+        # A plain public generate test or a foreign engine can reach this
+        # boundary without this process having owned admission mappings.  Such
+        # a parent has no mirror to finalize; workers still remain strict.
+        resolved = tuple(
+            resolve_request_identity(
+                request_id,
+                prompt_indices=core.RUNTIME.reqid_to_promptidx,
+                sample_indices=core.RUNTIME.reqid_to_sampleidx,
+            )
+            for request_id in request_ids
+        )
+        if all(identity is None for identity in resolved):
+            plane.finish_workload_requests(request_ids, finish_id=finish_id)
+            return
+        if any(identity is None for identity in resolved):
+            raise RuntimeError(
+                "request-finish parent mirror is only partially resolved"
+            )
+        replies = plane.finish_workload_requests(
+            request_ids,
+            finish_id=finish_id,
+        )
+        if not replies:
+            raise RuntimeError("request-finish worker quorum returned no replies")
+        receipt = core.RUNTIME.request_lifecycle.prepare_canonical_finish(
+            request_ids,
+            RequestFinishedBatch(replies[0].finished_identities),
+            finish_id=finish_id,
+        )
+        finalize_prepared_request_finish(runtime=core.RUNTIME, receipt=receipt)
+
+    def _finish_inprocess_workload_requests(
+        self,
+        request_ids: tuple[str, ...],
+    ) -> None:
+        """Apply one generic finish transaction without a control plane."""
+
+        from tllm.runtime import residual_runtime as core
+        from tllm.runtime.native_request_finish import NativeRequestFinishCleanup
+        from tllm.runtime.request_lifecycle import finish_registered_requests
+
+        binding = self._inprocess_request_finish_binding
+        execution = core.RUNTIME.workload_execution
+        if binding is None and execution is not None and execution.parameter_overlays:
+            raise RuntimeError(
+                "parameter-overlay request finish requires a runner binding"
+            )
+        finish_registered_requests(
+            runtime=core.RUNTIME,
+            raw_request_ids=request_ids,
+            cleanup=NativeRequestFinishCleanup(core.RUNTIME, binding),
         )
 
     def _coordinate_worker_compilation(self, plane: "ControlPlane") -> None:

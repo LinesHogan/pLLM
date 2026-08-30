@@ -926,6 +926,7 @@ class ScheduleGraph:
                 for task_input in task.inputs
                 if task_input.kind is ScheduleInputKind.STATE_SELECTION
             }
+            request_effect_resources: set[str] = set()
             if self.schema_version < 4 and selection_inputs:
                 raise ValueError(
                     "ScheduleGraph schema before v4 cannot carry state selections"
@@ -960,6 +961,18 @@ class ScheduleGraph:
                     continue
                 if self.schema_version < 4:
                     continue
+                if effect.resource in request_effect_resources:
+                    raise ValueError(
+                        "one task cannot carry multiple effects on one request state"
+                    )
+                request_effect_resources.add(effect.resource)
+                if effect.kind not in (
+                    ScheduleEffectKind.STATE_READ,
+                    ScheduleEffectKind.STATE_TRANSITION,
+                ):
+                    raise ValueError(
+                        "request-state ScheduleEffect supports only read and strict transition"
+                    )
                 if not effect.selection_port:
                     raise ValueError(
                         "request-state ScheduleEffect requires a selection_port"
@@ -1807,6 +1820,13 @@ class RegionEffect:
             and self.selection_binding_id
         ):
             raise ValueError("extern_io RegionEffect cannot carry a selection binding")
+        if self.selection_binding_id and self.kind not in (
+            ScheduleEffectKind.STATE_READ,
+            ScheduleEffectKind.STATE_TRANSITION,
+        ):
+            raise ValueError(
+                "request-state RegionEffect supports only read and strict transition"
+            )
 
 
 @dataclass(frozen=True, slots=True)

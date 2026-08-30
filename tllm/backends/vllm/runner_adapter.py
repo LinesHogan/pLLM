@@ -273,7 +273,32 @@ def mrv2_packed_row_plan_inputs(
 def mrv1_finished_request_ids(
     scheduler_output: _MRV1SchedulerOutput,
 ) -> tuple[str, ...]:
-    return tuple(scheduler_output.finished_req_ids)
+    """Read the optional MRv1 terminal-id column without layout guessing."""
+
+    try:
+        finished = scheduler_output.finished_req_ids
+    except AttributeError:
+        return ()
+    if any(type(request_id) is not str or not request_id for request_id in finished):
+        raise RuntimeError("MRv1 finished_req_ids must contain non-empty strings")
+    return tuple(finished)
+
+
+def mrv1_active_request_ids(runner: _MRV1Runner) -> tuple[str, ...]:
+    """Expose the complete MRv1 active-prefix ids for lifecycle admission."""
+
+    batch = runner.input_batch
+    return () if batch is None else _active_request_ids(batch=batch, family="MRv1")
+
+
+def mrv2_active_request_ids(
+    runner: _MRV2Runner,
+    input_batch: _MRV2Batch | None = None,
+) -> tuple[str, ...]:
+    """Expose the complete MRv2 active-prefix ids for lifecycle admission."""
+
+    batch = input_batch if input_batch is not None else runner.input_batch
+    return () if batch is None else _active_request_ids(batch=batch, family="MRv2")
 
 
 def unbind_runner(binding: RunnerBinding) -> None:
@@ -290,6 +315,8 @@ __all__ = [
     "get_runner_binding",
     "mrv1_packed_row_plan_inputs",
     "mrv1_finished_request_ids",
+    "mrv1_active_request_ids",
+    "mrv2_active_request_ids",
     "mrv2_packed_row_plan_inputs",
     "runner_active_request_count",
     "runner_device",

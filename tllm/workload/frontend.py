@@ -45,6 +45,7 @@ from tllm.workload.ir import (
 
 if TYPE_CHECKING:
     from tllm.ports.consumer import BaseConsumer
+    from tllm.runtime.request_trainable_state import RequestStateRuntimeService
 
 
 _P = ParamSpec("_P")
@@ -61,10 +62,12 @@ class RequestKey:
     fields: tuple[RequestKeyField, ...]
 
     def __post_init__(self) -> None:
-        if not self.fields:
+        fields = tuple(RequestKeyField(field) for field in self.fields)
+        if not fields:
             raise ValueError("request_key requires at least one field")
-        if len(self.fields) != len(set(self.fields)):
+        if len(fields) != len(set(fields)):
             raise ValueError("request_key fields must be unique")
+        object.__setattr__(self, "fields", fields)
 
 
 def request_key(*fields: RequestKeyField) -> RequestKey:
@@ -191,6 +194,9 @@ class AdamSpec(OptimizerSpec):
 
 
 StateValueT = TypeVar("StateValueT")
+RequestStateValueT = TypeVar(
+    "RequestStateValueT", bound=torch.nn.Module
+)
 ConfiguredT_co = TypeVar("ConfiguredT_co", bound=ConfigAtom, covariant=True)
 ConfiguredT = TypeVar("ConfiguredT", bound=ConfigAtom)
 PortT = TypeVar("PortT")
@@ -199,6 +205,13 @@ PortT_co = TypeVar("PortT_co", covariant=True)
 
 class _StateOwner(Protocol[StateValueT]):
     def state_value(self, state: "State[StateValueT]") -> StateValueT: ...
+
+
+class _RequestTrainableStateOwner(Protocol):
+    def request_state_value(
+        self,
+        state: "RequestTrainableState[RequestStateValueT]",
+    ) -> "RequestStateRuntimeService[RequestStateValueT]": ...
 
 
 class _StateReference(Protocol):
@@ -261,7 +274,7 @@ NO_CONFIGURED_VALUE = NoConfiguredValue()
 class _PublishedModuleOwner(Protocol):
     def publish_module(
         self,
-        state: PublishedModule[object],
+        state: PublishedModule[torch.nn.Module],
         values: Mapping[str, torch.Tensor],
     ) -> None: ...
 
@@ -324,6 +337,22 @@ class State(Generic[StateValueT]):
         return TrainableState(
             scope=StateScope.REPLICA,
             parameters=None,
+            optimizer=optimizer,
+            transition=transition,
+        )
+
+    @classmethod
+    def request_trainable(
+        cls: type["State[RequestStateValueT]"],
+        *,
+        key: RequestKey,
+        optimizer: OptimizerSpec,
+        transition: str = "optimizer",
+    ) -> "RequestTrainableState[RequestStateValueT]":
+        """Declare one fixed-capacity, request-scoped trainable state bank."""
+
+        return RequestTrainableState(
+            key=key,
             optimizer=optimizer,
             transition=transition,
         )
@@ -428,6 +457,100 @@ class TrainableState(State[StateValueT]):
     storage = StateStorage.OPTIMIZER_STABLE
 
 
+class RequestTrainableState(Generic[RequestStateValueT]):
+    """A typed descriptor for one request-keyed eager trainable-state bank.
+
+    Instance access resolves its workload-owned runtime service, never a
+    module singleton, while preserving the concrete module type.
+    """
+
+    def __init__(
+        self,
+        *,
+        key: RequestKey,
+        optimizer: OptimizerSpec,
+        transition: str = "optimizer",
+    ) -> None:
+        self.scope = StateScope.REQUEST
+        self.key = key
+        self.parameters = ("__state_name__",)
+        self.optimizer = optimizer
+        self.transition_kind = _name(transition, "RequestTrainableState.transition")
+        self._name = ""
+        self._owner: type[object] | None = None
+        self._initializer: Callable[..., RequestStateValueT] | None = None
+
+    def __set_name__(self, owner: type[object], name: str) -> None:
+        self._owner = owner
+        self._name = _name(name, "RequestTrainableState name")
+        self.parameters = (self._name,)
+
+    @overload
+    def __get__(self, instance: None, owner: type[object] | None = None) -> Self: ...
+
+    @overload
+    def __get__(
+        self,
+        instance: _RequestTrainableStateOwner,
+        owner: type[object] | None = None,
+    ) -> "RequestStateRuntimeService[RequestStateValueT]": ...
+
+    def __get__(
+        self,
+        instance: _RequestTrainableStateOwner | None,
+        owner: type[object] | None = None,
+    ) -> "Self | RequestStateRuntimeService[RequestStateValueT]":
+        del owner
+        if instance is None:
+            return self
+        return instance.request_state_value(self)
+
+    def initialize(
+        self, function: Callable[..., RequestStateValueT]
+    ) -> Callable[..., RequestStateValueT]:
+        if not callable(function):
+            raise TypeError("RequestTrainableState.initialize requires a callable")
+        if self._initializer is not None:
+            raise RuntimeError(f"State {self.name!r} already has an initializer")
+        self._initializer = function
+        return function
+
+    @property
+    def initializer(self) -> Callable[..., RequestStateValueT]:
+        if self._initializer is None:
+            raise RuntimeError(f"State {self.name!r} has no initializer")
+        return self._initializer
+
+    @property
+    def name(self) -> str:
+        if not self._name:
+            raise ValueError(
+                "RequestTrainableState must be assigned to a workload class attribute"
+            )
+        return self._name
+
+    def to_ir(self) -> StateIR:
+        return StateIR(
+            name=self.name,
+            scope=self.scope,
+            request_key=self.key.fields,
+            parameters=self.parameters,
+            optimizer=self.optimizer,
+            storage=StateStorage.DYNAMIC,
+            transition=self.transition_kind,
+        )
+
+    @property
+    def effect_state(self) -> Self:
+        return self
+
+    def make_effect(self, kind: EffectKind) -> "StateEffect":
+        return StateEffect(kind, self)
+
+    def selection(self) -> "StateSelectionInput[RequestStateValueT]":
+        return StateSelectionInput(self)
+
+
 class ServiceState(State[StateValueT]):
     """Non-optimizer state mutated only by a signed extern task."""
 
@@ -454,6 +577,9 @@ class PublishedModule(State[StateValueT]):
     def __set_name__(self, owner: type[object], name: str) -> None:
         super().__set_name__(owner, name)
         self.port.__set_name__(owner, f"{name}__publish")
+
+
+StateDescriptor = State[torch.nn.Module] | RequestTrainableState[torch.nn.Module]
 
 
 def _state_id(state: _StateReference) -> str:
@@ -494,6 +620,13 @@ class StateEffect:
             raise ValueError("only request-state effects may declare a selection")
         if self.selection is not None and self.selection.selected_state is not self.state:
             raise ValueError("StateEffect selection must belong to its state")
+        if self.selection is not None and self.kind not in (
+            EffectKind.READ,
+            EffectKind.TRANSITION,
+        ):
+            raise ValueError(
+                "request-state selections support only read and strict transition effects"
+            )
 
     @property
     def resource_name(self) -> str:
@@ -1280,7 +1413,7 @@ class WorkloadDefinition:
     sampler_outputs: tuple[SamplerOutput, ...] = ()
     gradient_tasks: tuple[str, ...] = ()
     sampler_inputs: tuple[ValueSourceKind, ...] = ()
-    states: tuple[State[object], ...] = ()
+    states: tuple[StateDescriptor, ...] = ()
     staged_ports: tuple[StagedPort[object], ...] = ()
     host_outputs: tuple[HostOutput[object], ...] = ()
     legacy_consumer: LegacyConsumerBinding = NO_LEGACY_CONSUMER_ADAPTER
@@ -1299,7 +1432,7 @@ class NativeWorkloadDefinition:
     sampler_outputs: tuple[SamplerOutput, ...] = ()
     gradient_tasks: tuple[str, ...] = ()
     sampler_inputs: tuple[ValueSourceKind, ...] = ()
-    states: tuple[State[object], ...] = ()
+    states: tuple[StateDescriptor, ...] = ()
     staged_ports: tuple[StagedPort[object], ...] = ()
     host_outputs: tuple[HostOutput[object], ...] = ()
     legacy_consumer: LegacyConsumerBinding = NO_LEGACY_CONSUMER_ADAPTER
@@ -1402,10 +1535,15 @@ def workload(
                 "native workload config and enabled ConfigField must be declared together"
             )
         members = _class_members(target)
-        state_list: list[State[object]] = []
+        state_list: list[StateDescriptor] = []
         for _name_, member in members:
-            if isinstance(member, State):
-                state_list.append(cast(State[object], member))
+            match member:
+                case State():
+                    state_list.append(cast(State[torch.nn.Module], member))
+                case RequestTrainableState():
+                    state_list.append(member)
+                case _:
+                    pass
         states = tuple(state_list)
         author_tasks = _author_task_definitions(target)
         tasks = _expanded_task_definitions(author_tasks, states)
@@ -1477,7 +1615,7 @@ def task_declaration(function: FunctionType) -> TaskDecl:
 
 def _expanded_task_definitions(
     author_tasks: tuple[TaskDefinition, ...],
-    states: tuple[State[object], ...],
+    states: tuple[StateDescriptor, ...],
 ) -> tuple[TaskDefinition, ...]:
     publishers = _published_module_tasks(states)
     optimized = _optimized_task_definitions(author_tasks)
@@ -1500,7 +1638,7 @@ def _expanded_task_definitions(
 
 
 def _published_module_tasks(
-    states: tuple[State[object], ...],
+    states: tuple[StateDescriptor, ...],
 ) -> tuple[TaskDefinition, ...]:
     generated: list[TaskDefinition] = []
     for state in states:
@@ -1510,7 +1648,7 @@ def _published_module_tasks(
         generated_name = f"publish__{_state_id(published)}"
 
         def publisher_executor(
-            published: PublishedModule[object],
+            published: PublishedModule[torch.nn.Module],
         ) -> Callable[..., None]:
             def publish(
                 self: _PublishedModuleOwner,
@@ -2050,6 +2188,7 @@ __all__ = [
     "ExternImplementation",
     "Index",
     "RequestKey",
+    "RequestTrainableState",
     "State",
     "StateEffect",
     "StateSelectionInput",

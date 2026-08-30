@@ -28,7 +28,32 @@ class RuntimePortBridgeUnitTest(unittest.TestCase):
         localize = mock.Mock()
         runtime = SimpleNamespace(
             producer_executor=None,
-            workload_execution=SimpleNamespace(requires_decode_hidden=True),
+            workload_execution=SimpleNamespace(
+                requires_decode_hidden=True,
+                requires_request_identities=False,
+            ),
+            dispatch_plan=None,
+        )
+        core = SimpleNamespace(RUNTIME=runtime)
+
+        port_runtime_hooks.run_prepare_inputs_post_producers(
+            core=core,
+            runner=SimpleNamespace(),
+            localize_decode=localize,
+        )
+
+        localize.assert_called_once_with()
+
+    def test_native_request_state_runs_identity_localization_without_legacy_targets(
+        self,
+    ) -> None:
+        localize = mock.Mock()
+        runtime = SimpleNamespace(
+            producer_executor=None,
+            workload_execution=SimpleNamespace(
+                requires_decode_hidden=False,
+                requires_request_identities=True,
+            ),
             dispatch_plan=None,
         )
         core = SimpleNamespace(RUNTIME=runtime)

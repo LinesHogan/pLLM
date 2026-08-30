@@ -299,14 +299,14 @@ class RunnerBindingDriver(Protocol):
 
     def restore_typed_layer_replay(self, *, runtime: Any) -> int: ...
 
-    def finish_parameter_overlay_requests(
+    def consume_parameter_overlay_finished_batch(
         self,
         *,
         runtime: Any,
         runner: Any,
         state: OverlayBackendState,
-        request_ids: tuple[str, ...],
-    ) -> RequestFinishedBatch: ...
+        batch: RequestFinishedBatch,
+    ) -> int: ...
 
     def synchronize_parameter_overlays(
         self,
@@ -378,14 +378,14 @@ class BackendDriver(Protocol):
     def unbind(self, binding: RunnerBinding) -> None:
         ...
 
-    def finish_parameter_overlay_requests(
+    def consume_parameter_overlay_finished_batch(
         self,
         *,
         runtime: Any,
         runner: Any,
         state: OverlayBackendState,
-        request_ids: tuple[str, ...],
-    ) -> RequestFinishedBatch: ...
+        batch: RequestFinishedBatch,
+    ) -> int: ...
 
     def synchronize_parameter_overlays(
         self,

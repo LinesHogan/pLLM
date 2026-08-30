@@ -15,6 +15,7 @@ from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
 from tllm.contracts.hidden_locator import HiddenLocatorCapability, HiddenPhase, HiddenSite
 from tllm.contracts.consumer_stats import TrainingStats
+from tllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from tllm.contracts.shape_specialization import RegionShapeSpecializationRequest
 from tllm.contracts.runtime_context import CompilationConfigLike
 from tllm.contracts.workload_ports import SKIPPED
@@ -31,12 +32,19 @@ from tllm.runtime.workload_execution import (
     _RegionCudaGraph,
     _NativeShapeSpecializationQueue,
     _RegionValueStore,
+    _SerialStream,
+    _SignedMaterializationBindings,
     _bind_physical_region_nodes,
     lower_signed_materialization_bindings,
     _region_shape_specialization_request,
     StateVersionBinding,
     StateVersionRegistry,
     WorkloadExecutionBindings,
+)
+from tllm.runtime.request_trainable_state import (
+    RequestIdentityBatch,
+    RequestStateRuntimeService,
+    RequestTrainableStateStore,
 )
 from tllm.runtime.workload_execution import _hidden_value
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
@@ -1093,7 +1101,7 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
                 stream=StreamClass.DEFAULT,
             ),
             kind=PhysicalExecutionKind.EAGER,
-            stream=object(),
+            stream=_SerialStream(),
             tensors=(),
             leases=(),
         )
@@ -1103,6 +1111,98 @@ class NativeWorkloadExecutionUnitTest(unittest.TestCase):
         self.assertEqual(set(store._frames[9].values.values()), {"v1", "v2"})
         store.execute(consumer, context)
         self.assertEqual(store.retained_value_count, 0)
+
+    def test_state_selection_inputs_reuse_one_exact_step_resource_selection(self) -> None:
+        service = RequestStateRuntimeService(
+            RequestTrainableStateStore(
+                resource="weights",
+                key_fields=(RequestKeyField.REQUEST_ID,),
+                capacity=2,
+                epoch=1,
+                device=torch.device("cpu"),
+                module_factory=lambda: torch.nn.Linear(1, 1, bias=False),
+                optimizer_factory=lambda module: torch.optim.SGD(
+                    module.parameters(), lr=0.1
+                ),
+            )
+        )
+        bindings = (
+            RegionInputBinding(
+                binding_id="selection-a",
+                kind=RegionInputKind.STATE_SELECTION,
+                source="weights",
+                consumers=(RegionPort("read-a", "selection"),),
+            ),
+            RegionInputBinding(
+                binding_id="selection-b",
+                kind=RegionInputKind.STATE_SELECTION,
+                source="weights",
+                consumers=(RegionPort("read-b", "selection"),),
+            ),
+        )
+        artifact = RegionCallableArtifact(
+            region_id="request-selection",
+            artifact_key="0" * 64,
+            input_keys=("selection-a", "selection-b"),
+            output_keys=(),
+            callable=lambda *_selections: (),
+            compiled=False,
+            input_bindings=bindings,
+            output_bindings=(),
+            effects=(),
+        )
+        store = _RegionValueStore(
+            runtime=ResidualRuntimeState(),
+            providers={},
+            sinks={},
+            artifacts=(artifact,),
+            materializations=_SignedMaterializationBindings(()),
+            state_versions=StateVersionRegistry((), {}, ()),
+            lifecycle=NoExecutionLifecycle(),
+            request_state_services={"weights": service},
+        )
+        context = PhysicalExecutionContext(
+            step_id=17,
+            plan_epoch=1,
+            node=PhysicalNodePlan(
+                node_key=NodeKey("test", "request-selection"),
+                executor=ExecutorKey("test", "request-selection"),
+                stream=StreamClass.DEFAULT,
+            ),
+            kind=PhysicalExecutionKind.EAGER,
+            stream=object(),
+            tensors=(),
+            leases=(),
+        )
+        store.prepare_step(17)
+        store.stage_request_identities(
+            17,
+            RequestIdentityBatch(
+                (
+                    RequestIdentity("shared", 0, 0),
+                    RequestIdentity("shared", 0, 0),
+                )
+            ),
+        )
+        inputs = store.resolve_inputs(artifact, context)
+        self.assertIs(inputs["selection-a"], inputs["selection-b"])
+        selection = inputs["selection-a"]
+        self.assertEqual(len(selection.rows), 2)
+        self.assertEqual(len(selection.leases), 1)
+        self.assertIs(
+            store._frames[17].request_selections["weights"], selection
+        )
+        store.finish_step(17)
+
+        store.prepare_step(18)
+        store.stage_request_identities(18, RequestIdentityBatch(()))
+        empty_inputs = store.resolve_inputs(
+            artifact, replace(context, step_id=18)
+        )
+        self.assertIs(empty_inputs["selection-a"], SKIPPED)
+        self.assertIs(empty_inputs["selection-b"], SKIPPED)
+        store.execute(artifact, replace(context, step_id=18))
+        store.finish_step(18)
 
     def test_physical_region_binding_rejects_unsigned_node_reordering(self) -> None:
         trace: list[str] = []

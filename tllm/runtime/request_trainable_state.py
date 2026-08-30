@@ -123,6 +123,28 @@ class RequestStateSelectionBatch:
     valid_mask: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class RequestIdentityBatch:
+    """One exact backend-resolved identity batch for a native step.
+
+    The backend boundary stages this value once.  Request-state resources use
+    the same rows but independently project their signed key declaration.
+    """
+
+    identities: tuple[RequestIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if any(
+            not identity.request_id
+            or identity.prompt_idx < 0
+            or identity.sample_idx < 0
+            for identity in self.identities
+        ):
+            raise ValueError(
+                "request identity batch requires fully resolved identities"
+            )
+
+
 class StateEffectOperation(StrEnum):
     ADMIT = "admit"
     READ = "read"
@@ -146,6 +168,19 @@ class StateEffectReceipt:
     selection_id: int
     epoch: int
     slots: tuple[StateSlotEffect, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RequestStateEffectAudit:
+    """Typed before-image for one signed request-state Region effect."""
+
+    resource: str
+    epoch: int
+    step_id: int
+    selection: RequestStateSelectionBatch
+    operation: StateEffectOperation
+    selected_before: tuple[StateSlotEffect, ...]
+    store_before: tuple[RequestStateVersion, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +375,12 @@ class RequestTrainableStateStore(Generic[ModuleT]):
     @property
     def epoch(self) -> int:
         return self._epoch
+
+    @property
+    def device(self) -> torch.device:
+        """The fixed device whose stream owns this store's slot tensors."""
+
+        return self._device
 
     def _require_live(self) -> None:
         if self._poisoned:
@@ -651,6 +692,29 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 )
             return tuple(groups)
 
+    def selection_versions(
+        self, selection: RequestStateSelectionBatch
+    ) -> tuple[RequestStateVersion, ...]:
+        """Return the exact live versions selected by one active lease batch.
+
+        This is intentionally a typed, non-mutating observation.  Runtime
+        audits use it to form their before image; it never manufactures a
+        receipt or allows the legacy Hashable snapshot registry to inspect a
+        request resource.
+        """
+
+        with self._lock:
+            self._require_live()
+            active = self._require_audited_selection(selection)
+            return tuple(
+                RequestStateVersion(
+                    key=lease.key,
+                    slot=lease.slot,
+                    version=self._slots[lease.slot.slot_id].version,
+                )
+                for lease in active.leases
+            )
+
     def read_receipt(
         self, selection: RequestStateSelectionBatch
     ) -> StateEffectReceipt:
@@ -790,6 +854,62 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 slot.async_pins -= 1
             self._active_pins.pop(pin.pin_id)
 
+    def async_pin_complete(self, pin: RequestStateAsyncPin) -> bool:
+        """Query one exact completion token without releasing its slot pin."""
+
+        with self._lock:
+            if pin.resource != self._resource or pin.epoch != self._epoch:
+                raise RuntimeError(
+                    "request state async pin belongs to another epoch"
+                )
+            try:
+                active = self._active_pins[pin.pin_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "request state async pin is no longer active"
+                ) from exc
+            if pin.slots != active.slots:
+                raise RuntimeError("request state async pin slots differ")
+            completion = active.completion
+            return completion is None or completion.query()
+
+    def order_async_pin(
+        self,
+        pin: RequestStateAsyncPin,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Order one Rust-selected stream after a prior state completion."""
+
+        with self._lock:
+            if pin.resource != self._resource or pin.epoch != self._epoch:
+                raise RuntimeError(
+                    "request state async pin belongs to another epoch"
+                )
+            try:
+                active = self._active_pins[pin.pin_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "request state async pin is no longer active"
+                ) from exc
+            if pin.slots != active.slots:
+                raise RuntimeError("request state async pin slots differ")
+            if stream.device != self._device:
+                raise RuntimeError(
+                    "request state ordering stream uses another device"
+                )
+            completion = active.completion
+            if completion is None:
+                raise RuntimeError("CUDA request state pin has no completion event")
+            stream.wait_event(completion)
+            for slot_ref in active.slots:
+                slot = self._slots[slot_ref.slot_id]
+                if slot.generation != slot_ref.generation:
+                    raise RuntimeError(
+                        "request state async pin contains a stale slot"
+                    )
+                slot.async_pins -= 1
+            self._active_pins.pop(pin.pin_id)
+
     def wait_async_pin(self, pin: RequestStateAsyncPin) -> None:
         """Wait for a recorded completion fence, then release its slot pin."""
 
@@ -886,15 +1006,500 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             self._epoch = epoch
 
 
+@dataclass(slots=True)
+class _StagedRequestStateStep:
+    identities: RequestIdentityBatch
+    selection: RequestStateSelectionBatch | None = None
+
+
+class _RequestStateRuntimeCore(Generic[ModuleT]):
+    """Shared mutable authority behind locally and composition-qualified views."""
+
+    __slots__ = (
+        "store",
+        "steps",
+        "transition_receipts",
+        "completion_pins",
+        "lock",
+    )
+
+    def __init__(self, store: RequestTrainableStateStore[ModuleT]) -> None:
+        self.store = store
+        self.steps: dict[int, _StagedRequestStateStep] = {}
+        self.transition_receipts: dict[int, StateEffectReceipt] = {}
+        self.completion_pins: dict[int, list[RequestStateAsyncPin]] = {}
+        self.lock = RLock()
+
+
+class RequestStateRuntimeService(Generic[ModuleT]):
+    """The sole runtime authority for one request-state resource.
+
+    This service is deliberately a concrete typed object, rather than a
+    provider callback.  It owns identity staging, one acquisition per step,
+    exact receipt consumption, and selection retirement.  The initial CUDA
+    policy is fail-closed: native execution has not yet proved the stream
+    completion fence required before reusing a request slot.
+    """
+
+    __slots__ = ("_core", "_resource")
+
+    def __init__(
+        self,
+        store: RequestTrainableStateStore[ModuleT],
+        *,
+        signed_resource: str | None = None,
+        _core: _RequestStateRuntimeCore[ModuleT] | None = None,
+    ) -> None:
+        if signed_resource is not None and not signed_resource:
+            raise ValueError("signed request-state resource must be non-empty")
+        if _core is not None and _core.store is not store:
+            raise RuntimeError("request-state service core belongs to another store")
+        self._core = (
+            _RequestStateRuntimeCore(store) if _core is None else _core
+        )
+        self._resource = store.resource if signed_resource is None else signed_resource
+
+    @property
+    def _store(self) -> RequestTrainableStateStore[ModuleT]:
+        return self._core.store
+
+    @property
+    def _steps(self) -> dict[int, _StagedRequestStateStep]:
+        return self._core.steps
+
+    @property
+    def _transition_receipts(self) -> dict[int, StateEffectReceipt]:
+        return self._core.transition_receipts
+
+    @property
+    def _completion_pins(self) -> dict[int, list[RequestStateAsyncPin]]:
+        return self._core.completion_pins
+
+    @property
+    def _lock(self):
+        return self._core.lock
+
+    @property
+    def resource(self) -> str:
+        return self._resource
+
+    @property
+    def epoch(self) -> int:
+        return self._store.epoch
+
+    @property
+    def capacity(self) -> int:
+        return self._store.capacity
+
+    @property
+    def device(self) -> torch.device:
+        return self._store.device
+
+    def versions(self) -> tuple[RequestStateVersion, ...]:
+        """Read the service-owned version view without exposing the store."""
+
+        with self._lock:
+            return self._store.versions()
+
+    def for_signed_resource(
+        self, resource: str
+    ) -> "RequestStateRuntimeService[ModuleT]":
+        """Bind this cold store to one explicitly qualified schedule resource."""
+
+        if not resource:
+            raise ValueError("signed request-state resource must be non-empty")
+        with self._lock:
+            if self._steps or self._transition_receipts or self._completion_pins:
+                raise RuntimeError(
+                    "cannot qualify request-state service while it is active"
+                )
+            if resource == self.resource:
+                return self
+            return RequestStateRuntimeService(
+                self._store,
+                signed_resource=resource,
+                _core=self._core,
+            )
+
+    def stage_identities(self, step_id: int, batch: RequestIdentityBatch) -> None:
+        """Stage one immutable identity batch before any Region resolves it."""
+
+        if step_id < 0:
+            raise ValueError("request-state step id must be non-negative")
+        with self._lock:
+            self._collect_completed_pins()
+            existing = self._steps.get(step_id)
+            if existing is None:
+                self._steps[step_id] = _StagedRequestStateStep(batch)
+                return
+            if existing.identities != batch:
+                raise RuntimeError(
+                    "request-state step identity batch differs from its staged batch"
+                )
+
+    def _acquire_selection(self, step_id: int) -> RequestStateSelectionBatch:
+        """Acquire the exact resource projection once for a staged step."""
+
+        with self._lock:
+            try:
+                staged = self._steps[step_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "request-state identities must be staged before selection acquisition"
+                ) from exc
+            if staged.selection is not None:
+                return staged.selection
+            acquired = self._store.acquire(staged.identities.identities)
+            self._validate_admission(acquired)
+            self._store.consume_receipt(acquired.admission)
+            staged.selection = acquired.selection
+            return acquired.selection
+
+    def selection_for_step(
+        self,
+        step_id: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> RequestStateSelectionBatch:
+        """Resolve one non-empty selection on its signed execution stream."""
+
+        selection = self.selection_value_for_step(step_id, stream)
+        if selection is None:
+            raise RuntimeError("request-state identity batch is empty")
+        return selection
+
+    def selection_value_for_step(
+        self,
+        step_id: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> RequestStateSelectionBatch | None:
+        """Resolve an explicit empty identity batch to a skipped Region input."""
+
+        with self._lock:
+            try:
+                staged = self._steps[step_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "request-state identities must be staged before selection acquisition"
+                ) from exc
+            if self._store.device.type == "cuda":
+                if stream is None:
+                    raise RuntimeError(
+                        "CUDA request-state selection requires its signed execution stream"
+                    )
+                self._order_completion_pins(stream)
+            if not staged.identities.identities:
+                return None
+        return self._acquire_selection(step_id)
+
+    def before(
+        self,
+        operation: StateEffectOperation,
+        selection: RequestStateSelectionBatch,
+        step_id: int,
+    ) -> RequestStateEffectAudit:
+        """Capture a typed before image for a signed read or transition."""
+
+        with self._lock:
+            self._require_staged_selection(step_id, selection)
+            self._validate_operation(operation, selection)
+            selected = tuple(
+                StateSlotEffect(
+                    version.key,
+                    version.slot,
+                    version.version,
+                    version.version,
+                )
+                for version in self._store.selection_versions(selection)
+            )
+            return RequestStateEffectAudit(
+                resource=self.resource,
+                epoch=self.epoch,
+                step_id=step_id,
+                selection=selection,
+                operation=operation,
+                selected_before=selected,
+                store_before=self._store.versions(),
+            )
+
+    def optimize(
+        self,
+        selection: RequestStateSelectionBatch,
+        losses: tuple[torch.Tensor, ...],
+    ) -> StateEffectReceipt:
+        """Run one service-owned strict transition for the selected slots."""
+
+        with self._lock:
+            self._require_selection(selection)
+            if selection.selection_id in self._transition_receipts:
+                raise RuntimeError(
+                    "request-state selection already has an unaudited transition"
+                )
+            receipt = self._store.optimize(selection, losses)
+            self._transition_receipts[selection.selection_id] = receipt
+            return receipt
+
+    def groups(
+        self, selection: RequestStateSelectionBatch
+    ) -> tuple[RequestStateModuleGroup[ModuleT], ...]:
+        """Expose selected modules without exposing a second execution authority."""
+
+        with self._lock:
+            self._require_selection(selection)
+            return self._store.groups(selection)
+
+    def after(self, audit: RequestStateEffectAudit) -> None:
+        """Validate and consume the exact receipt for a previously begun effect."""
+
+        with self._lock:
+            self._require_staged_selection(audit.step_id, audit.selection)
+            if audit.resource != self.resource or audit.epoch != self.epoch:
+                raise RuntimeError("request-state audit belongs to another resource epoch")
+            if audit.operation is StateEffectOperation.READ:
+                receipt = self._store.read_receipt(audit.selection)
+            elif audit.operation is StateEffectOperation.TRANSITION:
+                try:
+                    receipt = self._transition_receipts[
+                        audit.selection.selection_id
+                    ]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "request-state transition has no service-owned effect receipt"
+                    ) from exc
+            else:
+                raise RuntimeError(
+                    "request-state runtime supports only strict read and transition effects"
+                )
+            self._validate_effect_receipt(audit, receipt)
+            self._store.consume_receipt(receipt)
+            if audit.operation is StateEffectOperation.TRANSITION:
+                self._transition_receipts.pop(audit.selection.selection_id)
+
+    def record_completion(
+        self,
+        step_id: int,
+        selection: RequestStateSelectionBatch,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Pin selected slots to the exact CUDA stream tail of one effect."""
+
+        with self._lock:
+            self._require_staged_selection(step_id, selection)
+            if self._store.device.type != "cuda":
+                raise RuntimeError(
+                    "CPU request state cannot record a CUDA completion"
+                )
+            pin = self._store.pin_cuda(selection, stream)
+            self._completion_pins.setdefault(step_id, []).append(pin)
+
+    def finish_step(self, step_id: int) -> None:
+        """Release this resource's exact step selection at executor retirement."""
+
+        with self._lock:
+            try:
+                staged = self._steps[step_id]
+            except KeyError:
+                return
+            selection = staged.selection
+            if selection is None:
+                self._steps.pop(step_id)
+                return
+            if selection.selection_id in self._transition_receipts:
+                raise RuntimeError(
+                    "request-state step retires with an unaudited transition receipt"
+                )
+            self._store.release_selection(selection)
+            self._steps.pop(step_id)
+
+    def retire_requests(
+        self, batch: RequestFinishedBatch
+    ) -> StateEffectReceipt:
+        """Retire completed identities only after the service reaches a safe point."""
+
+        with self._lock:
+            if self._steps or self._transition_receipts:
+                raise RuntimeError(
+                    "request-state retirement requires no active step, selection, "
+                    "or unaudited receipt"
+                )
+            for step_id in tuple(sorted(self._completion_pins)):
+                pins = self._completion_pins[step_id]
+                while pins:
+                    self._store.wait_async_pin(pins[0])
+                    pins.pop(0)
+                self._completion_pins.pop(step_id)
+            receipt = self._store.retire(batch)
+            if (
+                receipt.resource != self._store.resource
+                or receipt.epoch != self.epoch
+                or receipt.operation is not StateEffectOperation.RETIRE
+                or receipt.selection_id != 0
+                or any(
+                    effect.before_version != effect.after_version
+                    for effect in receipt.slots
+                )
+                or len({effect.slot for effect in receipt.slots}) != len(receipt.slots)
+            ):
+                raise RuntimeError("request-state retirement receipt has the wrong identity")
+            self._store.consume_receipt(receipt)
+            return receipt
+
+    def _collect_completed_pins(self) -> None:
+        for step_id in tuple(sorted(self._completion_pins)):
+            pending: list[RequestStateAsyncPin] = []
+            for pin in self._completion_pins[step_id]:
+                if self._store.async_pin_complete(pin):
+                    self._store.release_async_pin(pin)
+                else:
+                    pending.append(pin)
+            if pending:
+                self._completion_pins[step_id] = pending
+            else:
+                self._completion_pins.pop(step_id)
+
+    def _order_completion_pins(self, stream: torch.cuda.Stream) -> None:
+        for step_id in tuple(sorted(self._completion_pins)):
+            pins = self._completion_pins[step_id]
+            while pins:
+                self._store.order_async_pin(pins[0], stream)
+                pins.pop(0)
+            self._completion_pins.pop(step_id)
+
+    def _require_selection(self, selection: RequestStateSelectionBatch) -> None:
+        matching_steps = tuple(
+            step_id
+            for step_id, staged in self._steps.items()
+            if staged.selection is selection
+        )
+        if len(matching_steps) != 1:
+            raise RuntimeError("request-state selection is not owned by this runtime service")
+
+    def _require_staged_selection(
+        self,
+        step_id: int,
+        selection: RequestStateSelectionBatch,
+    ) -> None:
+        try:
+            staged = self._steps[step_id]
+        except KeyError as exc:
+            raise RuntimeError("request-state step is not staged") from exc
+        if staged.selection is not selection:
+            raise RuntimeError(
+                "request-state audit selection differs from the staged step selection"
+            )
+
+    def _validate_admission(self, acquisition: RequestStateAcquisition) -> None:
+        selection = acquisition.selection
+        receipt = acquisition.admission
+        if (
+            receipt.resource != self._store.resource
+            or receipt.epoch != self.epoch
+            or receipt.operation is not StateEffectOperation.ADMIT
+            or receipt.selection_id != selection.selection_id
+        ):
+            raise RuntimeError("request-state admission receipt has the wrong identity")
+        leases = tuple(row.lease for row in selection.rows)
+        lease_by_slot = {lease.slot: lease for lease in selection.leases}
+        if any(lease_by_slot.get(lease.slot) != lease for lease in leases):
+            raise RuntimeError("request-state admission selection has an invalid slot lease")
+        for effect in receipt.slots:
+            expected = lease_by_slot.get(effect.slot)
+            if (
+                expected is None
+                or effect.key != expected.key
+                or effect.before_version != 0
+                or effect.after_version != 0
+            ):
+                raise RuntimeError("request-state admission receipt differs from selection")
+
+    def _validate_operation(
+        self,
+        operation: StateEffectOperation,
+        selection: RequestStateSelectionBatch,
+    ) -> None:
+        if operation not in (
+            StateEffectOperation.READ,
+            StateEffectOperation.TRANSITION,
+        ):
+            raise RuntimeError(
+                "request-state runtime supports only strict read and transition effects"
+            )
+        if (
+            selection.resource != self._store.resource
+            or selection.epoch != self.epoch
+        ):
+            raise RuntimeError("request-state selection belongs to another resource epoch")
+
+    def _validate_effect_receipt(
+        self,
+        audit: RequestStateEffectAudit,
+        receipt: StateEffectReceipt,
+    ) -> None:
+        operation = (
+            StateEffectOperation.READ
+            if audit.operation is StateEffectOperation.READ
+            else StateEffectOperation.TRANSITION
+        )
+        selection = audit.selection
+        if (
+            receipt.resource != self._store.resource
+            or receipt.epoch != audit.epoch
+            or receipt.operation is not operation
+            or receipt.selection_id != selection.selection_id
+        ):
+            raise RuntimeError("request-state effect receipt has the wrong identity")
+        if tuple(effect.slot for effect in receipt.slots) != tuple(
+            effect.slot for effect in audit.selected_before
+        ):
+            raise RuntimeError("request-state effect receipt slot generation differs")
+        current = {version.slot: version for version in self._store.versions()}
+        before_all = {version.slot: version for version in audit.store_before}
+        if set(current) != set(before_all):
+            raise RuntimeError(
+                "request-state slot identity changed while a Region effect executed"
+            )
+        selected_slots = {effect.slot for effect in audit.selected_before}
+        if len(selected_slots) != len(audit.selected_before):
+            raise RuntimeError("request-state selection contains duplicate slot leases")
+        expected_delta = 0 if operation is StateEffectOperation.READ else 1
+        for before, effect in zip(
+            audit.selected_before, receipt.slots, strict=True
+        ):
+            expected_after = before.before_version + expected_delta
+            current_version = current.get(before.slot)
+            if (
+                effect.key != before.key
+                or effect.slot != before.slot
+                or effect.before_version != before.before_version
+                or effect.after_version != expected_after
+                or current_version is None
+                or current_version.key != before.key
+                or current_version.version != expected_after
+            ):
+                raise RuntimeError(
+                    "request-state selected slot violated its signed before/after effect"
+                )
+        for slot, before in before_all.items():
+            if slot in selected_slots:
+                continue
+            current_version = current[slot]
+            if current_version.key != before.key or current_version.version != before.version:
+                raise RuntimeError(
+                    "request-state unselected slot changed during a signed effect"
+                )
+
+
 __all__ = [
     "RequestStateAcquisition",
     "RequestStateAsyncPin",
+    "RequestStateEffectAudit",
+    "RequestIdentityBatch",
     "RequestStateKey",
     "RequestStateLease",
     "RequestStateModuleGroup",
     "RequestStateSelectionBatch",
     "RequestStateSelectionRow",
     "RequestStateVersion",
+    "RequestStateRuntimeService",
     "RequestTrainableStateStore",
     "StateEffectOperation",
     "StateEffectReceipt",

@@ -7,6 +7,7 @@ import torch
 from tllm.runtime.workload_execution import _plan_resources
 from tllm.runtime.request_trainable_state import RequestStateSelectionBatch
 from tllm.schedule import (
+    BackendObservableEvent,
     CompileOptions,
     MainWorkloadTimeline,
     TimelineAnchor,
@@ -40,13 +41,28 @@ def _timeline() -> MainWorkloadTimeline:
         runner_family="mrv2",
         graph_mode="eager",
         anchors=(
-            TimelineAnchor("model.execute", 0),
-            TimelineAnchor("sampler.pre_draw", 1),
-            TimelineAnchor("token.commit", 2),
-            TimelineAnchor("step.end", 3),
+            TimelineAnchor(
+                "model.execute",
+                0,
+                backend_events=(
+                    BackendObservableEvent.PREPARE_INPUTS_POST,
+                ),
+            ),
+            TimelineAnchor(
+                "sampler.pre_draw",
+                1,
+                backend_events=(BackendObservableEvent.SAMPLER_PRE_DRAW,),
+            ),
+            TimelineAnchor(
+                "token.commit",
+                2,
+                backend_events=(BackendObservableEvent.SAMPLE_TOKENS_POST,),
+            ),
+            TimelineAnchor("step.end", 3, backend_events=()),
         ),
         regions=(),
         static_headroom_bytes=64,
+        schema_version=2,
     )
 
 

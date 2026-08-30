@@ -69,6 +69,10 @@ def test_empty_batches_do_not_require_family_private_columns() -> None:
     ) == runner_adapter.PackedRowPlanInputs((), (), (), ())
 
 
+def test_mrv1_optional_finished_column_absence_means_no_lifecycle_event() -> None:
+    assert runner_adapter.mrv1_finished_request_ids(SimpleNamespace()) == ()
+
+
 def test_noncompact_request_indices_fail_instead_of_becoming_python_ordinals() -> None:
     with pytest.raises(RuntimeError, match="compact request-ordered prefix"):
         runner_adapter.mrv1_packed_row_plan_inputs(

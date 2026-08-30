@@ -36,6 +36,8 @@ from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hots
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.stats import PlacementStats
 from tllm.runtime.workload_execution import BackendObservableEvent
+from tllm.contracts.request_identity import resolve_request_identity
+from tllm.runtime.request_trainable_state import RequestIdentityBatch
 
 if TYPE_CHECKING:
     from tllm.runtime.workload_execution import NativeWorkloadExecution
@@ -235,6 +237,8 @@ class PortRuntimeStateLike(Protocol):
     event_step_id: int
     dispatch_plan: DispatchPlan | None
     workload_execution: "NativeWorkloadExecution | None"
+    reqid_to_promptidx: Mapping[str, int]
+    reqid_to_sampleidx: Mapping[str, int]
 
 
 class DecodeHookCoreLike(Protocol):
@@ -318,6 +322,11 @@ def store_decode_localization(
             execution.stage_sampler_identity(
                 core.RUNTIME.event_step_id, (), (), None
             )
+            if execution.requires_request_identities:
+                execution.stage_request_identities(
+                    core.RUNTIME.event_step_id,
+                    RequestIdentityBatch(()),
+                )
         return
 
     k = int(row_idx.numel())
@@ -369,6 +378,32 @@ def store_decode_localization(
             tuple(core.RUNTIME.decode_sample_idxs),
             core.RUNTIME.decode_sample_idx_tensor,
         )
+        if execution.requires_request_identities:
+            identities = []
+            for request_id, prompt_idx, sample_idx in zip(
+                core.RUNTIME.decode_request_ids,
+                core.RUNTIME.decode_prompt_idxs,
+                core.RUNTIME.decode_sample_idxs,
+                strict=True,
+            ):
+                identity = resolve_request_identity(
+                    request_id,
+                    prompt_indices=core.RUNTIME.reqid_to_promptidx,
+                    sample_indices=core.RUNTIME.reqid_to_sampleidx,
+                )
+                if (
+                    identity is None
+                    or identity.prompt_idx != prompt_idx
+                    or identity.sample_idx != sample_idx
+                ):
+                    raise RuntimeError(
+                        "native request-state identity differs from decode metadata"
+                    )
+                identities.append(identity)
+            execution.stage_request_identities(
+                core.RUNTIME.event_step_id,
+                RequestIdentityBatch(tuple(identities)),
+            )
 
     compact_row_idx = getattr(core.RUNTIME, "decode_compact_row_idx", None)
     if isinstance(compact_row_idx, torch.Tensor):
@@ -513,7 +548,7 @@ def run_prepare_inputs_post_producers(
     *,
     core: DecodeHookCoreLike,
     runner: RunnerLike,
-    localize_decode: object,
+    localize_decode: Callable[[], object],
 ) -> None:
     """Run compiler-selected prepare producers in DAG order."""
     _residual_bundle_dispatch.retire_step_device_leases(core=core, runner=runner)
@@ -524,14 +559,19 @@ def run_prepare_inputs_post_producers(
         executor.run_prepare_inputs_post(
             PrepareInputsPostContext(
                 runner=runner,
-                localize_decode=localize_decode,  # type: ignore[arg-type]
+                localize_decode=localize_decode,
                 runtime=core.RUNTIME,
             )
         )
+    elif (
+        core.RUNTIME.workload_execution is not None
+        and core.RUNTIME.workload_execution.requires_request_identities
+    ):
+        localize_decode()
     elif active_targets.runtime_requires_decode_hidden(core.RUNTIME):
-        localize_decode()  # type: ignore[operator]
+        localize_decode()
     elif not hasattr(core.RUNTIME, "producer_executor"):
-        localize_decode()  # type: ignore[operator]
+        localize_decode()
 
 
 

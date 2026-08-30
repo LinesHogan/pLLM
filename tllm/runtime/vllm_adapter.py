@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 import weakref
 
 if TYPE_CHECKING:
+    from tllm.backends.protocol import RunnerBinding
     from vllm import LLM, SamplingParams
     from vllm.inputs import PromptType
     from vllm.outputs import RequestOutput
 
 _runner_owners: "weakref.WeakKeyDictionary[Any, object]" = weakref.WeakKeyDictionary()
+
+
+@dataclass(frozen=True, slots=True)
+class InprocessRunner:
+    """Typed runner binding returned after quarantined vLLM graph traversal."""
+
+    binding: "RunnerBinding | None"
 
 
 def bind_runner_owner(runner: object, owner: object) -> None:
@@ -32,14 +41,17 @@ def generate_requests(
     return llm.generate(prompts, sampling_params, use_tqdm=False)
 
 
-def bind_inprocess_runner(llm: object, owner: object) -> None:
+def bind_inprocess_runner(llm: object, owner: object) -> InprocessRunner | None:
     dynamic = cast(Any, llm)
     try:
         driver = dynamic.llm_engine.engine_core.model_executor.driver_worker
         runner = driver.model_runner
     except AttributeError:
-        return
+        return None
     bind_runner_owner(runner, owner)
+    from tllm.backends.protocol import runner_binding_for
+
+    return InprocessRunner(runner_binding_for(runner))
 
 
 def install_generate_boundary(
@@ -84,6 +96,7 @@ def install_generate_boundary(
         original_request_counter: Any = None
         original_run_engine: Any = None
         prepublished_request_ids: tuple[str, ...] = ()
+        admitted_request_ids: list[str] = []
         scheduling_resumed = False
         if mapping_prepublished:
             original_request_counter = dynamic.request_counter
@@ -137,11 +150,15 @@ def install_generate_boundary(
                 orig_add_request=original_add_request,
                 request_prompt_indices=prompt_indices,
                 request_sample_indices=sample_indices,
+                admitted_request_ids=admitted_request_ids,
             )
             outputs = generate(*args, **kwargs)
         except Exception:
-            if prepublished_request_ids:
-                abort_generate(prepublished_request_ids)
+            aborted_request_ids = tuple(
+                dict.fromkeys((*prepublished_request_ids, *admitted_request_ids))
+            )
+            if aborted_request_ids:
+                abort_generate(aborted_request_ids)
             raise
         finally:
             engine.add_request = original_add_request
@@ -172,6 +189,7 @@ def legacy_runner_graph_enabled(runner: object) -> bool:
 
 __all__ = [
     "bind_inprocess_runner",
+    "InprocessRunner",
     "bind_runner_owner",
     "create_llm",
     "generate_requests",

@@ -13,6 +13,8 @@ from tllm.contracts.request_identity import (
     RequestKeyField,
 )
 from tllm.runtime.request_trainable_state import (
+    RequestIdentityBatch,
+    RequestStateRuntimeService,
     RequestStateSelectionBatch,
     RequestTrainableStateStore,
     StateEffectOperation,
@@ -42,9 +44,13 @@ def _optimizer(module: _ScalarModel) -> torch.optim.Optimizer:
     return torch.optim.SGD(module.parameters(), lr=0.1)
 
 
-def _store(capacity: int = 2) -> RequestTrainableStateStore[_ScalarModel]:
+def _store(
+    capacity: int = 2,
+    *,
+    resource: str = "distiller",
+) -> RequestTrainableStateStore[_ScalarModel]:
     return RequestTrainableStateStore(
-        resource="distiller",
+        resource=resource,
         key_fields=(RequestKeyField.REQUEST_ID,),
         capacity=capacity,
         epoch=3,
@@ -300,6 +306,128 @@ def test_retirement_receipt_pins_generation_until_audit_consumes_it() -> None:
         replacement.selection.leases[0].slot.generation
         == retirement.slots[0].slot.generation + 1
     )
+
+
+def test_runtime_service_reuses_duplicate_rows_and_retains_failed_audit_receipts() -> None:
+    service = RequestStateRuntimeService(_store())
+    first = RequestIdentity("first", 0, 0)
+    service.stage_identities(11, RequestIdentityBatch((first, first)))
+    selection = service.selection_for_step(11)
+    assert tuple(row.lease.slot for row in selection.rows) == (
+        selection.leases[0].slot,
+        selection.leases[0].slot,
+    )
+    assert len(selection.leases) == 1
+
+    transition = service.before(
+        StateEffectOperation.TRANSITION,
+        selection,
+        11,
+    )
+    source = torch.tensor([[1.0], [2.0]])
+    target = torch.zeros_like(source)
+    losses = tuple(
+        torch.nn.functional.mse_loss(
+            group.module(source.index_select(0, group.row_indices)),
+            target.index_select(0, group.row_indices),
+        )
+        for group in service.groups(selection)
+    )
+    service.optimize(selection, losses)
+    forged = replace(
+        transition,
+        selected_before=(
+            replace(
+                transition.selected_before[0],
+                before_version=transition.selected_before[0].before_version + 1,
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="before/after effect"):
+        service.after(forged)
+    with pytest.raises(RuntimeError, match="unaudited transition receipt"):
+        service.finish_step(11)
+    service.after(transition)
+    service.finish_step(11)
+
+    second = RequestIdentity("second", 1, 0)
+    service.stage_identities(12, RequestIdentityBatch((second,)))
+    second_selection = service.selection_for_step(12)
+    transition = service.before(
+        StateEffectOperation.TRANSITION,
+        second_selection,
+        12,
+    )
+    group = service.groups(second_selection)[0]
+    loss = torch.nn.functional.mse_loss(
+        group.module(torch.tensor([[3.0]])), torch.zeros((1, 1))
+    )
+    service.optimize(second_selection, (loss,))
+    service.after(transition)
+    read = service.before(StateEffectOperation.READ, second_selection, 12)
+    service.after(read)
+    assert tuple(version.version for version in service.versions()) == (1, 1)
+    service.finish_step(12)
+
+    retirement = service.retire_requests(RequestFinishedBatch((first, second)))
+    assert retirement.operation is StateEffectOperation.RETIRE
+    assert len(retirement.slots) == 2
+
+
+def test_runtime_identity_batch_rejects_unresolved_rows() -> None:
+    with pytest.raises(ValueError, match="fully resolved"):
+        RequestIdentityBatch((RequestIdentity("unknown", -1, 0),))
+
+
+def test_qualified_execution_services_share_task_receipts_across_two_workloads() -> None:
+    left_task_service = RequestStateRuntimeService(_store(resource="left"))
+    right_task_service = RequestStateRuntimeService(_store(resource="right"))
+    left_execution_service = left_task_service.for_signed_resource("alpha/left")
+    right_execution_service = right_task_service.for_signed_resource("beta/right")
+    registry = {
+        left_execution_service.resource: left_execution_service,
+        right_execution_service.resource: right_execution_service,
+    }
+    assert tuple(registry) == ("alpha/left", "beta/right")
+
+    for task_service, execution_service, identity in (
+        (
+            left_task_service,
+            left_execution_service,
+            RequestIdentity("left", 0, 0),
+        ),
+        (
+            right_task_service,
+            right_execution_service,
+            RequestIdentity("right", 1, 0),
+        ),
+    ):
+        execution_service.stage_identities(3, RequestIdentityBatch((identity,)))
+        selection = execution_service.selection_for_step(3)
+        audit = execution_service.before(
+            StateEffectOperation.TRANSITION,
+            selection,
+            3,
+        )
+        group = task_service.groups(selection)[0]
+        loss = torch.nn.functional.mse_loss(
+            group.module(torch.tensor([[1.0]])), torch.zeros((1, 1))
+        )
+        task_service.optimize(selection, (loss,))
+        execution_service.after(audit)
+        execution_service.finish_step(3)
+        assert task_service.versions()[0].version == 1
+
+
+def test_runtime_service_retires_a_staged_step_without_a_selection() -> None:
+    service = RequestStateRuntimeService(_store())
+    identity = RequestIdentity("disabled", 0, 0)
+    service.stage_identities(7, RequestIdentityBatch((identity,)))
+    service.finish_step(7)
+
+    receipt = service.retire_requests(RequestFinishedBatch((identity,)))
+    assert receipt.operation is StateEffectOperation.RETIRE
+    assert receipt.slots == ()
 
 
 def test_request_effect_cannot_fall_back_to_legacy_snapshot_audit() -> None:

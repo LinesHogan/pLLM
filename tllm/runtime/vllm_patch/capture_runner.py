@@ -9,6 +9,7 @@ from tllm.runtime.trajectory_store import apply_prompt_contexts
 from tllm.runtime.generation_trace_runtime import build_generation_trace_from_outputs
 from tllm.runtime.vllm_patch.port_runtime_hooks import dispatch_post_generate_port_bundles
 from tllm.contracts.request_identity import resolve_prompt_sample
+from tllm.runtime.request_lifecycle import register_request_alias
 
 
 def _resolve_prompt_sample_for_req_id(runtime: Any, request_id: str) -> tuple[int, int]:
@@ -28,6 +29,7 @@ def make_mapping_add_request(
     orig_add_request: Callable[..., Any],
     request_prompt_indices: Sequence[int] | None,
     request_sample_indices: Sequence[int] | None,
+    admitted_request_ids: list[str] | None = None,
 ) -> Callable[..., Any]:
     """Wrap LLMEngine.add_request so every request records its mapping.
 
@@ -55,6 +57,11 @@ def make_mapping_add_request(
         runtime.reqid_to_promptidx[str(request_id)] = prompt_idx
         if sample_idx is not None:
             runtime.reqid_to_sampleidx[str(request_id)] = sample_idx
+        # Admission owns the public raw id before vLLM can rewrite it into a
+        # parallel child or EngineCore-suffixed id.
+        register_request_alias(runtime, str(request_id))
+        if admitted_request_ids is not None:
+            admitted_request_ids.append(str(request_id))
         if plane is not None:
             plane.push_request_mapping([(str(request_id), prompt_idx, sample_idx)])
         return orig_add_request(request_id, prompt, p, *args, **kwargs)

@@ -16,6 +16,7 @@ from tllm.contracts.consumer_stats import TrainingStats
 from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
+from tllm.runtime.request_trainable_state import RequestStateRuntimeService
 
 if TYPE_CHECKING:
     import torch
@@ -91,6 +92,11 @@ class OptimizerTransitionService(Protocol):
 
 
 def _empty_optimizer_transitions() -> Mapping[str, OptimizerTransitionService]:
+    return MappingProxyType({})
+
+
+def _empty_request_state_services(
+) -> Mapping[str, RequestStateRuntimeService["torch.nn.Module"]]:
     return MappingProxyType({})
 
 
@@ -240,6 +246,11 @@ class WorkloadRuntimeBinding:
     optimizer_transitions: Mapping[str, OptimizerTransitionService] = field(
         default_factory=_empty_optimizer_transitions
     )
+    request_state_services: Mapping[
+        str, RequestStateRuntimeService["torch.nn.Module"]
+    ] = field(
+        default_factory=_empty_request_state_services
+    )
 
     def __post_init__(self) -> None:
         if any(not name or not value for name, value in self.specialization_key.items()):
@@ -260,6 +271,18 @@ class WorkloadRuntimeBinding:
             "optimizer_transitions",
             _frozen_bindings(self.optimizer_transitions),
         )
+        if any(
+            service.resource != resource
+            for resource, service in self.request_state_services.items()
+        ):
+            raise ValueError(
+                "request-state service resource names must match their registry keys"
+            )
+        object.__setattr__(
+            self,
+            "request_state_services",
+            _frozen_bindings(self.request_state_services),
+        )
 
 __all__ = [
     "BackendRuntimeBinding",
@@ -275,6 +298,7 @@ __all__ = [
     "RuntimeInputBinding",
     "RuntimeOutputBinding",
     "RuntimeStateRegistry",
+    "RequestStateRuntimeService",
     "SamplerRuntimeBinding",
     "StateSnapshot",
     "WorkerRuntimeBinding",

@@ -184,6 +184,107 @@ class TllmRuntimeUnitTest(unittest.TestCase):
         plane.call.assert_called_once_with("tllm_bind_runner_runtime")
         set_active.assert_called_once_with(plane)
 
+    def test_bind_engine_runners_installs_inprocess_generate_boundary(self) -> None:
+        from tllm.runtime.vllm_adapter import InprocessRunner
+
+        runtime = TllmRuntime()
+        llm = object()
+        with (
+            mock.patch(
+                "tllm.runtime.mp.control.ControlPlane.try_bind", return_value=None
+            ),
+            mock.patch(
+                "tllm.runtime.runtime.bind_inprocess_runner",
+                return_value=InprocessRunner(None),
+            ) as bind,
+            mock.patch.object(runtime, "_install_generate_boundary") as install,
+        ):
+            runtime._bind_engine_runners(llm)
+
+        bind.assert_called_once_with(llm, runtime)
+        install.assert_called_once_with(llm, None)
+
+    def test_inprocess_finish_commits_the_local_lifecycle_mirror(self) -> None:
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.request_lifecycle import register_request_alias
+        from tllm.runtime.state import ResidualRuntimeState
+
+        runtime = TllmRuntime()
+        state = ResidualRuntimeState(reqid_to_promptidx={"request": 3})
+        register_request_alias(state, "request")
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            runtime._finish_inprocess_workload_requests(("request",))
+
+        self.assertEqual(state.reqid_to_promptidx, {})
+        self.assertEqual(state.request_lifecycle.active_aliases, ())
+
+    def test_multiprocess_parent_accepts_worker_parallel_sample_expansion(self) -> None:
+        from tllm.contracts.request_identity import RequestIdentity
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.mp.control import (
+            ControlPlane,
+            WorkerRequestFinishReply,
+        )
+        from tllm.runtime.request_lifecycle import register_request_alias
+        from tllm.runtime.state import ResidualRuntimeState
+
+        runtime = TllmRuntime()
+        state = ResidualRuntimeState(reqid_to_promptidx={"parent": 4})
+        register_request_alias(state, "parent")
+        plane = mock.create_autospec(ControlPlane, instance=True)
+
+        def finish(
+            request_ids: tuple[str, ...],
+            *,
+            finish_id: int,
+        ) -> tuple[WorkerRequestFinishReply, ...]:
+            identities = (
+                RequestIdentity("parent", 4, 0),
+                RequestIdentity("parent", 4, 1),
+            )
+            return (
+                WorkerRequestFinishReply(
+                    "worker",
+                    request_ids,
+                    finish_id,
+                    len(identities),
+                    identities,
+                ),
+            )
+
+        plane.finish_workload_requests.side_effect = finish
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            runtime._finish_multiprocess_workload_requests(
+                plane, ("parent",)
+            )
+
+        self.assertEqual(state.reqid_to_promptidx, {})
+        self.assertEqual(state.request_lifecycle.active_aliases, ())
+
+    def test_multiprocess_parent_rejects_a_partial_lifecycle_mirror(self) -> None:
+        from tllm.runtime import residual_runtime
+        from tllm.runtime.mp.control import ControlPlane
+        from tllm.runtime.request_lifecycle import register_request_alias
+        from tllm.runtime.state import ResidualRuntimeState
+
+        runtime = TllmRuntime()
+        state = ResidualRuntimeState(reqid_to_promptidx={"known": 1})
+        register_request_alias(state, "known")
+        plane = mock.create_autospec(ControlPlane, instance=True)
+
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            self.assertRaisesRegex(RuntimeError, "partially resolved"),
+        ):
+            runtime._finish_multiprocess_workload_requests(
+                plane, ("known", "unknown")
+            )
+
+        plane.finish_workload_requests.assert_not_called()
+        self.assertEqual(state.reqid_to_promptidx, {"known": 1})
+        self.assertEqual(len(state.request_lifecycle.active_aliases), 1)
+
     def test_legacy_make_llm_installs_active_control_plane(self) -> None:
         from tllm.runtime import lifecycle
 

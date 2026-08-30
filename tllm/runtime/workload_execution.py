@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 import torch
 
 from tllm.contracts.request_identity import RequestFinishedBatch
-from tllm.contracts.workload_ports import PortTransactionStatus, SKIPPED
+from tllm.contracts.workload_ports import (
+    PortTransactionStatus,
+    RuntimeValueMarker,
+    SKIPPED,
+)
 
 WorkloadInstanceT = TypeVar("WorkloadInstanceT")
 
@@ -50,6 +54,8 @@ class WorkloadPortOwner(Protocol):
 
     def stage_request_finished(self, batch: RequestFinishedBatch) -> int: ...
 
+    def request_finished_port_keys(self) -> tuple[str, ...]: ...
+
     def stage_dense_operand_captured(
         self, batch: DenseOperandCaptureBatch
     ) -> int: ...
@@ -61,6 +67,7 @@ from tllm.contracts.shape_specialization import (
 )
 from tllm.runtime.region_cost_probe import RegionCostProbe, RegionCostReport
 from tllm.runtime.torch_adapter import (
+    torch_cuda_stream,
     torch_cuda_tensor_tuple,
     torch_record_stream_owners,
 )
@@ -78,8 +85,16 @@ from tllm.runtime.workload_bindings import (
     RuntimePortRegistry,
     RuntimeInputBinding,
     RuntimeOutputBinding,
+    RequestStateRuntimeService,
     SamplerBinding,
     SamplerRuntimeBinding,
+)
+from tllm.runtime.request_trainable_state import (
+    RequestIdentityBatch,
+    RequestStateEffectAudit,
+    RequestStateSelectionBatch,
+    StateEffectReceipt,
+    StateEffectOperation,
 )
 from tllm.runtime.scheduling.physical import Fence
 from tllm.runtime.scheduling.plan_store import (
@@ -488,9 +503,11 @@ class StateVersionRegistry:
         bindings: Mapping[str, StateVersionBinding] = MappingProxyType({}),
         effects: tuple[RegionEffect, ...] = (),
     ) -> None:
-        if any(effect.selection_binding_id for effect in effects):
+        if any(state.scope == "request" for state in states) or any(
+            effect.selection_binding_id for effect in effects
+        ):
             raise RuntimeError(
-                "request-state selection requires the typed request-state audit service"
+                "request-state resources require the typed request-state audit service"
             )
         state_by_resource = {state.resource: state for state in states}
         required = {
@@ -740,6 +757,11 @@ class WorkloadExecutionBindings:
     optimizer_transitions: Mapping[str, OptimizerTransitionService] = field(
         default_factory=dict[str, OptimizerTransitionService]
     )
+    request_state_services: Mapping[
+        str, RequestStateRuntimeService[torch.nn.Module]
+    ] = field(
+        default_factory=dict[str, RequestStateRuntimeService[torch.nn.Module]]
+    )
     sampler: SamplerBinding = field(default_factory=NoSamplerBinding)
     diagnostics_readers: Mapping[
         str, Callable[[], Mapping[str, int | float]]
@@ -774,6 +796,18 @@ class WorkloadExecutionBindings:
             self,
             "optimizer_transitions",
             MappingProxyType(dict(self.optimizer_transitions)),
+        )
+        if any(
+            service.resource != resource
+            for resource, service in self.request_state_services.items()
+        ):
+            raise ValueError(
+                "request-state service resource names must match their registry keys"
+            )
+        object.__setattr__(
+            self,
+            "request_state_services",
+            MappingProxyType(dict(self.request_state_services)),
         )
         if any(not workload_id for workload_id in self.diagnostics_readers):
             raise ValueError("diagnostic workload IDs must not be empty")
@@ -831,6 +865,23 @@ class _NoRegionValueStore:
 
     def finish_step(self, step_id: int) -> None:
         _ = step_id
+
+    def stage_request_identities(
+        self, step_id: int, batch: RequestIdentityBatch
+    ) -> None:
+        _ = step_id
+        _ = batch
+        raise RuntimeError("native execution has no request-state runtime service")
+
+    def retire_request_states(
+        self, batch: RequestFinishedBatch
+    ) -> tuple[StateEffectReceipt, ...]:
+        _ = batch
+        return ()
+
+    @property
+    def requires_request_identities(self) -> bool:
+        return False
 
     @property
     def retained_value_count(self) -> int:
@@ -924,6 +975,7 @@ class NativeWorkloadExecution:
     )
     _prepared_step: int = -1
     _executed_nodes: set[NodeKey] = field(default_factory=set[NodeKey])
+    _pending_request_finished_sources: tuple[str, ...] = ()
     _execution_lock: LockType = field(default_factory=Lock)
     _main_stream: torch.cuda.Stream | None = None
     _side_streams: tuple[torch.cuda.Stream, ...] = ()
@@ -1045,10 +1097,111 @@ class NativeWorkloadExecution:
         raise KeyError(key)
 
     def stage_request_finished(self, batch: RequestFinishedBatch) -> int:
-        return sum(
-            workload.stage_request_finished(batch)
-            for workload in self._workload_instances
-        )
+        with self._execution_lock:
+            if self._pending_request_finished_sources:
+                raise RuntimeError(
+                    "a request-finished lifecycle batch is already staged"
+                )
+            sources = tuple(
+                source
+                for workload in self._workload_instances
+                for source in workload.request_finished_port_keys()
+            )
+            if len(sources) != len(set(sources)):
+                raise RuntimeError(
+                    "request-finished staged port sources must be unique"
+                )
+            staged = sum(
+                workload.stage_request_finished(batch)
+                for workload in self._workload_instances
+            )
+            if staged != len(sources):
+                raise RuntimeError(
+                    "request-finished staged port coverage differs from its typed registry"
+                )
+            self._pending_request_finished_sources = sources
+            return staged
+
+    def execute_staged_request_finished(self, step_id: int) -> int:
+        """Execute only the signed Region closure rooted at lifecycle ports."""
+
+        step = int(step_id)
+        with self._execution_lock:
+            sources = self._pending_request_finished_sources
+            if not sources:
+                raise RuntimeError("no request-finished lifecycle batch is staged")
+            regions = self.compilation.decision.execution_regions
+            source_set = frozenset(sources)
+            observed_sources = frozenset(
+                binding.source
+                for region in regions
+                for binding in region.input_bindings
+                if binding.kind is RegionInputKind.STAGED
+                and binding.source in source_set
+            )
+            if observed_sources != source_set:
+                raise RuntimeError(
+                    "request-finished ports do not have exact signed Region consumers"
+                )
+            selected = {
+                region.region_id
+                for region in regions
+                if any(
+                    binding.kind is RegionInputKind.STAGED
+                    and binding.source in source_set
+                    for binding in region.input_bindings
+                )
+            }
+            changed = True
+            while changed:
+                changed = False
+                for materialization in self.compilation.decision.materializations:
+                    if (
+                        materialization.producer_region in selected
+                        and materialization.consumer_region not in selected
+                    ):
+                        selected.add(materialization.consumer_region)
+                        changed = True
+            region_by_id = {region.region_id: region for region in regions}
+            pending_dependencies = [
+                dependency
+                for region_id in tuple(selected)
+                for dependency in region_by_id[region_id].dependencies
+            ]
+            while pending_dependencies:
+                dependency = pending_dependencies.pop()
+                if dependency in selected:
+                    continue
+                selected.add(dependency)
+                pending_dependencies.extend(
+                    region_by_id[dependency].dependencies
+                )
+            selected_regions = tuple(
+                region for region in regions if region.region_id in selected
+            )
+            if any(
+                region.host_submission is not RegionHostSubmission.INLINE
+                for region in selected_regions
+            ):
+                raise RuntimeError(
+                    "request-finished Region closure requires a signed inline submission"
+                )
+            if self._prepared_step >= 0:
+                self._finish_step_locked(self._prepared_step)
+                self._drain_async_host_locked()
+            self.executor.prepare_step(step)
+            self._value_store.prepare_step(step)
+            self._prepared_step = step
+            self._executed_nodes.clear()
+            nodes = tuple(
+                self._region_nodes[region.region_id]
+                for region in selected_regions
+            )
+            self._advance_nodes_locked(nodes)
+            self._finish_step_locked(step)
+            self._drain_async_host_locked()
+            self._pending_request_finished_sources = ()
+            return len(nodes)
 
     def stage_dense_operand_captured(
         self, batch: DenseOperandCaptureBatch
@@ -1388,6 +1541,43 @@ class NativeWorkloadExecution:
             case NoSamplerBinding():
                 pass
 
+    def stage_request_identities(
+        self,
+        step_id: int,
+        batch: RequestIdentityBatch,
+    ) -> None:
+        """Stage exact request identities before a signed selection Region runs.
+
+        This is intentionally a direct typed API. Backend hook wiring is a
+        later integration concern; no untyped provider is consulted here.
+        """
+
+        step = int(step_id)
+        with self._execution_lock:
+            if self._prepared_step != step:
+                raise RuntimeError(
+                    "request identities must be staged for the prepared native step"
+                )
+            self._value_store.stage_request_identities(step, batch)
+
+    @property
+    def requires_request_identities(self) -> bool:
+        return self._value_store.requires_request_identities
+
+    def retire_request_states(
+        self, batch: RequestFinishedBatch
+    ) -> tuple[StateEffectReceipt, ...]:
+        """Retire all typed request resources at a verified execution safe point."""
+
+        with self._execution_lock:
+            self._drain_async_host_locked()
+            self._join_side_streams_locked()
+            if self._prepared_step >= 0:
+                raise RuntimeError(
+                    "request-state retirement requires the prepared native step to retire"
+                )
+            return self._value_store.retire_request_states(batch)
+
     def read_resource_diagnostics(self) -> Mapping[str, Mapping[str, int | float]]:
         """Return a validated, JSON-safe snapshot of local workload resources.
 
@@ -1656,9 +1846,36 @@ class NativeWorkloadExecutionStore:
             seen.add(identity)
             execution.close()
 
+@dataclass(frozen=True, slots=True)
+class _RegionStateAudit:
+    legacy_before: Mapping[str, Mapping[Hashable, int]]
+    request_before: tuple[RequestStateEffectAudit, ...]
+
+
+def _request_state_effect_operation(
+    effect: RegionEffect,
+) -> StateEffectOperation:
+    """Mechanically lower the signed effect kind at the runtime boundary."""
+
+    if effect.kind is ScheduleEffectKind.STATE_READ:
+        return StateEffectOperation.READ
+    if effect.kind is ScheduleEffectKind.STATE_TRANSITION:
+        return StateEffectOperation.TRANSITION
+    raise RuntimeError(
+        "request-state runtime supports only strict read and transition effects"
+    )
+
+
 @dataclass(slots=True)
 class _RegionStepFrame:
     values: dict[str, object] = field(default_factory=dict[str, object])
+    request_selections: dict[
+        str, RequestStateSelectionBatch | RuntimeValueMarker
+    ] = field(
+        default_factory=dict[
+            str, RequestStateSelectionBatch | RuntimeValueMarker
+        ]
+    )
     lock: LockType = field(default_factory=Lock)
 
 
@@ -1672,6 +1889,7 @@ class _RegionValueStore:
         "_hidden_inputs",
         "_materializations",
         "_state_versions",
+        "_request_state_services",
         "_lifecycle",
         "_frames",
         "_frames_lock",
@@ -1687,9 +1905,13 @@ class _RegionValueStore:
         materializations: _SignedMaterializationBindings,
         state_versions: StateVersionRegistry,
         lifecycle: ExecutionLifecycle,
+        request_state_services: Mapping[
+            str, RequestStateRuntimeService[torch.nn.Module]
+        ] = MappingProxyType({}),
     ) -> None:
         self._runtime = runtime
         self._state_versions = state_versions
+        self._request_state_services = MappingProxyType(dict(request_state_services))
         self._lifecycle = lifecycle
         self._providers = providers
         self._sinks = sinks
@@ -1717,6 +1939,10 @@ class _RegionValueStore:
                 )
         return retained
 
+    @property
+    def requires_request_identities(self) -> bool:
+        return bool(self._request_state_services)
+
     def prepare_step(self, step_id: int) -> None:
         with self._frames_lock:
             if step_id in self._frames:
@@ -1725,7 +1951,33 @@ class _RegionValueStore:
 
     def finish_step(self, step_id: int) -> None:
         with self._frames_lock:
-            self._frames.pop(step_id, None)
+            frame = self._frames.pop(step_id, None)
+        if frame is None:
+            return
+        # The physical executor has retired the step before this path runs.
+        # That is the only safe point at which the service may release a
+        # selection lease. CUDA remains rejected at acquisition until a real
+        # completion-stream fence is wired through this boundary.
+        for service in self._request_state_services.values():
+            service.finish_step(step_id)
+
+    def stage_request_identities(
+        self, step_id: int, batch: RequestIdentityBatch
+    ) -> None:
+        """Stage one backend-resolved identity batch for all typed resources."""
+
+        frame = self._frame(step_id)
+        with frame.lock:
+            for service in self._request_state_services.values():
+                service.stage_identities(step_id, batch)
+
+    def retire_request_states(
+        self, batch: RequestFinishedBatch
+    ) -> tuple[StateEffectReceipt, ...]:
+        return tuple(
+            service.retire_requests(batch)
+            for service in self._request_state_services.values()
+        )
 
     def _frame(self, step_id: int) -> _RegionStepFrame:
         with self._frames_lock:
@@ -1750,10 +2002,11 @@ class _RegionValueStore:
             return
         inputs = self.resolve_inputs(artifact, context)
         torch_record_stream_owners(tuple(inputs.values()), context.stream)
-        state_before = self.begin_state_effects(artifact, context)
         if any(value is SKIPPED for value in inputs.values()):
+            self.observe_skipped_state_effects(artifact, context)
             outputs = {key: SKIPPED for key in artifact.output_keys}
         else:
+            state_before = self.begin_state_effects(artifact, context)
             outputs = artifact.execute(inputs)
             torch_record_stream_owners(
                 tuple(outputs.values()), context.stream
@@ -1764,27 +2017,144 @@ class _RegionValueStore:
     def is_enabled(self) -> bool:
         return self._lifecycle.is_enabled()
 
+    def observe_skipped_state_effects(
+        self,
+        artifact: "RegionCallableArtifact",
+        context: PhysicalExecutionContext,
+    ) -> None:
+        """Record legacy baseline versions without auditing an unrun task."""
+
+        legacy_effects = tuple(
+            effect
+            for effect in artifact.effects
+            if effect.resource not in self._request_state_services
+        )
+        self._state_versions.before(legacy_effects, context.step_id)
+
     def begin_state_effects(
         self,
         artifact: "RegionCallableArtifact",
         context: PhysicalExecutionContext,
-    ) -> Mapping[str, Mapping[Hashable, int]]:
-        return self._state_versions.before(
-            artifact.effects,
-            context.step_id,
+    ) -> _RegionStateAudit:
+        legacy_effects = tuple(
+            effect
+            for effect in artifact.effects
+            if effect.resource not in self._request_state_services
+        )
+        request_effects = tuple(
+            effect
+            for effect in artifact.effects
+            if effect.resource in self._request_state_services
+        )
+        frame = self._frame(context.step_id)
+        with frame.lock:
+            selection_bindings = {
+                binding.binding_id: binding
+                for binding in artifact.input_bindings
+                if binding.kind is RegionInputKind.STATE_SELECTION
+            }
+            request_before: list[RequestStateEffectAudit] = []
+            for effect in request_effects:
+                selection_binding = selection_bindings.get(
+                    effect.selection_binding_id
+                )
+                if (
+                    selection_binding is None
+                    or selection_binding.source != effect.resource
+                ):
+                    raise RuntimeError(
+                        "request-state effect does not name its signed selection binding"
+                    )
+                operation = _request_state_effect_operation(effect)
+                request_before.append(
+                    self._request_state_services[effect.resource].before(
+                        operation,
+                        self._required_selection_for(
+                            frame,
+                            context.step_id,
+                            effect.resource,
+                            (
+                                torch_cuda_stream(context.stream)
+                                if self._request_state_services[
+                                    effect.resource
+                                ].device.type
+                                == "cuda"
+                                else None
+                            ),
+                        ),
+                        context.step_id,
+                    )
+                )
+        return _RegionStateAudit(
+            legacy_before=self._state_versions.before(
+                legacy_effects,
+                context.step_id,
+            ),
+            request_before=tuple(request_before),
         )
 
     def finish_state_effects(
         self,
         artifact: "RegionCallableArtifact",
         context: PhysicalExecutionContext,
-        before: Mapping[str, Mapping[Hashable, int]],
+        before: _RegionStateAudit,
     ) -> None:
-        self._state_versions.after(
-            artifact.effects,
-            context.step_id,
-            before,
+        legacy_effects = tuple(
+            effect
+            for effect in artifact.effects
+            if effect.resource not in self._request_state_services
         )
+        self._state_versions.after(
+            legacy_effects,
+            context.step_id,
+            before.legacy_before,
+        )
+        for audit in before.request_before:
+            service = self._request_state_services[audit.resource]
+            service.after(audit)
+            if service.device.type == "cuda":
+                service.record_completion(
+                    context.step_id,
+                    audit.selection,
+                    torch_cuda_stream(context.stream),
+                )
+
+    def _selection_for(
+        self,
+        frame: _RegionStepFrame,
+        step_id: int,
+        resource: str,
+        stream: torch.cuda.Stream | None,
+    ) -> RequestStateSelectionBatch | RuntimeValueMarker:
+        try:
+            return frame.request_selections[resource]
+        except KeyError:
+            try:
+                service = self._request_state_services[resource]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"native Region has no typed request-state service for {resource!r}"
+                ) from exc
+            selection = service.selection_value_for_step(step_id, stream)
+            value = SKIPPED if selection is None else selection
+            frame.request_selections[resource] = value
+            return value
+
+    def _required_selection_for(
+        self,
+        frame: _RegionStepFrame,
+        step_id: int,
+        resource: str,
+        stream: torch.cuda.Stream | None,
+    ) -> RequestStateSelectionBatch:
+        selection = self._selection_for(
+            frame, step_id, resource, stream
+        )
+        if selection is SKIPPED:
+            raise RuntimeError(
+                "skipped request-state selection reached effect execution"
+            )
+        return selection
 
     def resolve_inputs(
         self,
@@ -1824,6 +2194,18 @@ class _RegionValueStore:
                     inputs[binding.binding_id] = _hidden_value(
                         self._runtime,
                         self._hidden_inputs[binding.binding_id],
+                    )
+                elif binding.kind is RegionInputKind.STATE_SELECTION:
+                    service = self._request_state_services[binding.source]
+                    inputs[binding.binding_id] = self._selection_for(
+                        frame,
+                        context.step_id,
+                        binding.source,
+                        (
+                            torch_cuda_stream(context.stream)
+                            if service.device.type == "cuda"
+                            else None
+                        ),
                     )
                 else:
                     raise AssertionError(
@@ -2722,10 +3104,60 @@ def _local_binding_requirements(
         for region in compilation.decision.execution_regions
         for effect in region.effects
     )
+    request_resources = {
+        state.resource
+        for state in compilation.graph.states
+        if state.scope == "request"
+    }
+    request_selection_resources = {
+        binding.source
+        for region in compilation.decision.execution_regions
+        for binding in region.input_bindings
+        if binding.kind is RegionInputKind.STATE_SELECTION
+    }
+    unknown_request_selections = sorted(
+        request_selection_resources - request_resources
+    )
+    if unknown_request_selections:
+        raise RuntimeError(
+            "native Region state-selection references a non-request resource: "
+            + ", ".join(unknown_request_selections)
+        )
+    required_request_services = request_selection_resources.union(
+        effect.resource for effect in effects if effect.resource in request_resources
+    )
+    supplied_request_services = set(bindings.request_state_services)
+    missing_request_services = sorted(
+        required_request_services - supplied_request_services
+    )
+    unexpected_request_services = sorted(
+        supplied_request_services - required_request_services
+    )
+    if missing_request_services or unexpected_request_services:
+        raise RuntimeError(
+            "native Region request-state service coverage mismatch: "
+            f"missing={missing_request_services}, "
+            f"unexpected={unexpected_request_services}"
+        )
+    legacy_request_bindings = sorted(
+        set(bindings.state_versions).intersection(request_resources)
+    )
+    if legacy_request_bindings:
+        raise RuntimeError(
+            "request-state resources must not enter the legacy Hashable state "
+            "registry: "
+            + ", ".join(legacy_request_bindings)
+        )
     state_versions = StateVersionRegistry(
-        compilation.graph.states,
+        tuple(
+            state
+            for state in compilation.graph.states
+            if state.scope != "request"
+        ),
         bindings.state_versions,
-        effects,
+        tuple(
+            effect for effect in effects if effect.resource not in request_resources
+        ),
     )
     missing_provided = sorted(provided.difference(bindings.ports.inputs))
     if missing_provided:
@@ -2752,6 +3184,7 @@ def _plan_resources(
     compilation: "WorkloadCompilation",
     *,
     graphs: tuple[RuntimeGraph, ...] = (),
+    require_cuda_default_stream: bool = False,
 ) -> PlanResources:
     physical = compilation.physical
     if physical is None:
@@ -2787,7 +3220,9 @@ def _plan_resources(
     cuda = torch.cuda.is_available()
     # Without CUDA there is no stream to overlap on; serial tokens keep the
     # signed order, which is trivially correct for synchronous host execution.
-    real_side_streams = cuda and bool(side_classes)
+    real_cuda_streams = cuda and (
+        bool(side_classes) or require_cuda_default_stream
+    )
     streams = [
         RuntimeStream(
             stream_class,
@@ -2796,7 +3231,7 @@ def _plan_resources(
                 # CUDA events, and recording one requires a real stream: the
                 # main path is the ambient current stream.
                 torch.cuda.current_stream()
-                if real_side_streams and stream_class is StreamClass.DEFAULT
+                if real_cuda_streams and stream_class is StreamClass.DEFAULT
                 else (
                     _SerialStream()
                     if stream_class is StreamClass.DEFAULT or not cuda
@@ -2826,7 +3261,7 @@ def _plan_resources(
         events=tuple(
             RuntimeEvent(
                 key,
-                torch.cuda.Event() if real_side_streams else _ImmediateEvent(),
+                torch.cuda.Event() if real_cuda_streams else _ImmediateEvent(),
             )
             for key in event_keys
         ),
@@ -3026,6 +3461,7 @@ def _native_workload_execution(
         artifacts=artifacts,
         materializations=materializations,
         state_versions=state_versions,
+        request_state_services=bindings.request_state_services,
         lifecycle=bindings.lifecycle,
     )
     handlers: dict[
@@ -3195,7 +3631,14 @@ def _native_workload_execution(
         raise RuntimeError(
             "native Region execution cannot bind a legacy-adapter workload"
         )
-    resources = _plan_resources(compilation, graphs=tuple(runtime_graphs))
+    resources = _plan_resources(
+        compilation,
+        graphs=tuple(runtime_graphs),
+        require_cuda_default_stream=any(
+            service.device.type == "cuda"
+            for service in bindings.request_state_services.values()
+        ),
+    )
     executor = PhysicalExecutor(
         snapshots=PlanSnapshotStore(resources),
         handlers=handlers,

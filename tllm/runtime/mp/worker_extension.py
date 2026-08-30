@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tllm.backends.vllm.versioned_parameter_overlay import (
         VLLMParameterOverlayRunner,
     )
+    from tllm.runtime.request_lifecycle import RequestFinishReceipt
     from tllm.contracts.runtime_context import RunnerLike
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
@@ -302,6 +303,9 @@ class TllmWorkerExtension:
     _tllm_staged_workload: _StagedWorkloadDecision | None = None
     _tllm_last_finalized_workload: tuple[str, int] | None = None
     _tllm_last_drained_workload: tuple[str, int] | None = None
+    _tllm_request_finish_receipt: "RequestFinishReceipt | None" = None
+    _tllm_request_finish_apply_started_id: int | None = None
+    _tllm_request_finish_applied_id: int | None = None
 
     def _tllm_worker_id(self) -> str:
         return f"{os.getpid()}:{id(self):x}"
@@ -326,6 +330,7 @@ class TllmWorkerExtension:
         guarantees the mapping lands before the request is schedulable.
         """
         from tllm.runtime import residual_runtime as core
+        from tllm.runtime.request_lifecycle import register_request_alias
 
         count = 0
         for entry in mappings:
@@ -338,6 +343,7 @@ class TllmWorkerExtension:
                 core.RUNTIME.reqid_to_sampleidx[request_id] = (
                     _wire_nonnegative_int(entry[2], "sample_idx")
                 )
+            register_request_alias(core.RUNTIME, request_id)
             count += 1
         return count
 
@@ -620,57 +626,108 @@ class TllmWorkerExtension:
             },
         }
 
-    def tllm_finish_workload_requests(
-        self, request_ids: list[str]
+    def tllm_prepare_workload_request_finish(
+        self, finish_id: int, request_ids: list[str]
     ) -> dict[str, object]:
-        """Flush request-finished lifecycle inputs through one signed host step."""
+        """Prepare a typed finish batch without applying or committing it."""
 
         from tllm.backends.protocol import runner_binding_for
         from tllm.runtime import residual_runtime as core
+        from tllm.runtime.request_lifecycle import prepare_registered_request_finish
 
         runner = _runner_of(self)
         if runner is None:
             raise RuntimeError("worker has no model runner")
         binding = runner_binding_for(runner)
-        if binding is None:
-            execution = core.RUNTIME.workload_execution
-            if execution is not None and execution.parameter_overlays:
-                raise RuntimeError(
-                    "parameter-overlay request finish requires a runner binding"
-                )
-            finished = 0
-        else:
-            batch = binding.driver.finish_parameter_overlay_requests(
-                runtime=core.RUNTIME,
-                runner=runner,
-                state=binding.parameter_overlay_state,
-                request_ids=tuple(request_ids),
+        execution = core.RUNTIME.workload_execution
+        if binding is None and execution is not None and execution.parameter_overlays:
+            raise RuntimeError(
+                "parameter-overlay request finish requires a runner binding"
             )
-            finished = len(batch.requests)
-            if batch.requests:
-                step = int(core.RUNTIME.event_step_id) + 1
-                core.prepare_physical_workgraph_step(step)
-                compilation = core.RUNTIME.workload_compilation
-                if compilation is None:
-                    raise RuntimeError(
-                        "request-finish flush has no active workload compilation"
-                    )
-                for region in compilation.decision.execution_regions:
-                    core.advance_workload_anchor(region.placement_anchor)
-                core.RUNTIME.event_step_id = step
-                binding.driver.synchronize_parameter_overlays(
-                    runtime=core.RUNTIME,
-                    runner=runner,
-                    state=binding.parameter_overlay_state,
-                )
-        for request_id in request_ids:
-            core.RUNTIME.reqid_to_promptidx.pop(request_id, None)
-            core.RUNTIME.reqid_to_sampleidx.pop(request_id, None)
+        receipt = prepare_registered_request_finish(
+            runtime=core.RUNTIME,
+            raw_request_ids=tuple(request_ids),
+            finish_id=finish_id,
+        )
+        self._tllm_request_finish_receipt = receipt
+        self._tllm_request_finish_apply_started_id = None
+        self._tllm_request_finish_applied_id = None
         return {
             "worker_id": self._tllm_worker_id(),
             "request_ids": list(request_ids),
-            "finished": finished,
+            "finish_id": receipt.finish_id,
+            "finished_identities": [
+                identity.to_wire() for identity in receipt.batch.requests
+            ],
         }
+
+    def tllm_apply_workload_request_finish(
+        self, finish_id: int
+    ) -> dict[str, object]:
+        """Run signed cleanup while retaining the pending ledger receipt."""
+
+        from tllm.backends.protocol import runner_binding_for
+        from tllm.runtime import residual_runtime as core
+        from tllm.runtime.native_request_finish import NativeRequestFinishCleanup
+        from tllm.runtime.request_lifecycle import apply_prepared_request_finish
+
+        receipt = self._require_pending_request_finish(finish_id)
+        if self._tllm_request_finish_apply_started_id is not None:
+            raise RuntimeError("request-finish cleanup was already started")
+        runner = _runner_of(self)
+        if runner is None:
+            raise RuntimeError("worker has no model runner")
+        binding = runner_binding_for(runner)
+        self._tllm_request_finish_apply_started_id = receipt.finish_id
+        outcome = apply_prepared_request_finish(
+            runtime=core.RUNTIME,
+            receipt=receipt,
+            cleanup=NativeRequestFinishCleanup(core.RUNTIME, binding),
+        )
+        self._tllm_request_finish_applied_id = receipt.finish_id
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "finish_id": receipt.finish_id,
+            "finished": len(outcome.receipt.batch.requests),
+            "finished_identities": [
+                identity.to_wire() for identity in outcome.receipt.batch.requests
+            ],
+        }
+
+    def tllm_finalize_workload_request_finish(
+        self, finish_id: int
+    ) -> dict[str, object]:
+        """Commit a worker cleanup only after parent apply quorum succeeds."""
+
+        from tllm.runtime import residual_runtime as core
+        from tllm.runtime.request_lifecycle import finalize_prepared_request_finish
+
+        receipt = self._require_pending_request_finish(finish_id)
+        if self._tllm_request_finish_applied_id != receipt.finish_id:
+            raise RuntimeError("request-finish finalize requires a successful apply")
+        finalize_prepared_request_finish(runtime=core.RUNTIME, receipt=receipt)
+        self._tllm_request_finish_receipt = None
+        self._tllm_request_finish_apply_started_id = None
+        self._tllm_request_finish_applied_id = None
+        return {
+            "worker_id": self._tllm_worker_id(),
+            "request_ids": [
+                trigger.raw_request_id for trigger in receipt.triggers
+            ],
+            "finish_id": receipt.finish_id,
+            "finished": len(receipt.batch.requests),
+            "finished_identities": [
+                identity.to_wire() for identity in receipt.batch.requests
+            ],
+        }
+
+    def _require_pending_request_finish(self, finish_id: int) -> "RequestFinishReceipt":
+        if type(finish_id) is not int or finish_id < 1:
+            raise TypeError("request-finish finish_id must be a positive integer")
+        receipt = self._tllm_request_finish_receipt
+        if receipt is None or receipt.finish_id != finish_id:
+            raise RuntimeError("request-finish transaction is not pending on worker")
+        return receipt
 
     def tllm_peek_shape_specialization_requests(self) -> dict[str, object]:
         """Expose pending cold-path Region misses without consuming them.

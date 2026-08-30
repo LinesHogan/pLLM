@@ -19,6 +19,7 @@ from tllm.consumers.dummy.workload import DummyWorkload
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.contracts.consumer_stats import TrainingStats, merge_training_stats_maps
+from tllm.contracts.request_identity import RequestIdentity
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime import residual_runtime
 from tllm.runtime.mp.control import (
@@ -188,14 +189,51 @@ class _RequestFinishWorker:
     def tllm_ping(self) -> dict[str, object]:
         return {"worker_id": self.worker_id}
 
-    def tllm_finish_workload_requests(
-        self, request_ids: list[str]
+    def _identities(self) -> tuple[RequestIdentity, ...]:
+        return tuple(
+            RequestIdentity(f"canonical-{index}", index, 0)
+            for index in range(self.finished)
+        )
+
+    def tllm_prepare_workload_request_finish(
+        self, finish_id: int, request_ids: list[str]
     ) -> dict[str, object]:
         return {
             "worker_id": self.worker_id,
             "request_ids": request_ids,
-            "finished": self.finished,
+            "finish_id": finish_id,
+            "finished_identities": [
+                identity.to_wire() for identity in self._identities()
+            ],
         }
+
+    def tllm_apply_workload_request_finish(self, finish_id: int) -> dict[str, object]:
+        return {
+            "worker_id": self.worker_id,
+            "finish_id": finish_id,
+            "finished": self.finished,
+            "finished_identities": [
+                identity.to_wire() for identity in self._identities()
+            ],
+        }
+
+    def tllm_finalize_workload_request_finish(
+        self, finish_id: int
+    ) -> dict[str, object]:
+        return {
+            "worker_id": self.worker_id,
+            "request_ids": ["request-0"],
+            "finish_id": finish_id,
+            "finished": self.finished,
+            "finished_identities": [
+                identity.to_wire() for identity in self._identities()
+            ],
+        }
+
+
+class _MismatchedIdentityFinishWorker(_RequestFinishWorker):
+    def _identities(self) -> tuple[RequestIdentity, ...]:
+        return (RequestIdentity(f"{self.worker_id}-canonical", 0, 0),)
 
 
 class _CoercibleInteger:
@@ -278,6 +316,39 @@ class ControlPlaneUnitTest(unittest.TestCase):
                 ("request-0",), expected_finished=1
             )
 
+    def test_request_finish_rejects_canonical_identity_divergence(self) -> None:
+        llm = _FakeLLM()
+        llm.llm_engine.engine_core.handlers = [
+            _MismatchedIdentityFinishWorker("worker-0", 1),
+            _MismatchedIdentityFinishWorker("worker-1", 1),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "canonical identity quorum"):
+            ControlPlane(llm).finish_workload_requests(("request-0",))
+
+    def test_request_finish_applies_before_worker_finalize(self) -> None:
+        llm = _FakeLLM()
+        llm.llm_engine.engine_core.handlers = [_RequestFinishWorker("worker-0", 1)]
+
+        replies = ControlPlane(llm).finish_workload_requests(("request-0",))
+
+        self.assertEqual(replies[0].finished, 1)
+        self.assertEqual(
+            [call[0] for call in llm.llm_engine.engine_core.calls],
+            [
+                "tllm_ping",
+                "tllm_prepare_workload_request_finish",
+                "tllm_apply_workload_request_finish",
+                "tllm_finalize_workload_request_finish",
+            ],
+        )
+        calls = llm.llm_engine.engine_core.calls
+        finish_id = calls[1][1][0]
+        self.assertIsInstance(finish_id, int)
+        self.assertGreater(finish_id, 0)
+        self.assertEqual(calls[2][1], (finish_id,))
+        self.assertEqual(calls[3][1], (finish_id,))
+
     def test_overlay_finish_requires_worker_runner_binding(self) -> None:
         extension = TllmWorkerExtension()
         extension.model_runner = SimpleNamespace()
@@ -291,7 +362,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "requires a runner binding"),
         ):
-            extension.tllm_finish_workload_requests(["request-0"])
+            extension.tllm_prepare_workload_request_finish(101, ["request-0"])
 
     def test_request_finish_releases_exact_worker_request_mapping(self) -> None:
         from tllm.runtime.state import ResidualRuntimeState
@@ -304,11 +375,59 @@ class ControlPlaneUnitTest(unittest.TestCase):
         )
 
         with mock.patch.object(residual_runtime, "RUNTIME", state):
-            reply = extension.tllm_finish_workload_requests(["request-0"])
+            extension.tllm_push_request_mapping([["request-0", 3, 5]])
+            prepared = extension.tllm_prepare_workload_request_finish(
+                101, ["request-0"]
+            )
+            applied = extension.tllm_apply_workload_request_finish(
+                prepared["finish_id"]
+            )
+            self.assertEqual(state.reqid_to_promptidx["request-0"], 3)
+            self.assertIsNotNone(state.request_lifecycle.pending_finish)
+            reply = extension.tllm_finalize_workload_request_finish(
+                prepared["finish_id"]
+            )
 
-        self.assertEqual(reply["finished"], 0)
+        self.assertEqual(reply["finished"], 1)
+        self.assertEqual(applied["finished"], 1)
+        self.assertEqual(
+            reply["finished_identities"],
+            [RequestIdentity("request-0", 3, 5).to_wire()],
+        )
         self.assertEqual(state.reqid_to_promptidx, {"request-1": 4})
         self.assertEqual(state.reqid_to_sampleidx, {"request-1": 6})
+
+    def test_no_overlay_request_finish_failure_stays_pending_and_retains_mapping(self) -> None:
+        from tllm.runtime.state import ResidualRuntimeState
+        from tllm.runtime.workload_execution import NativeWorkloadExecution
+
+        extension = TllmWorkerExtension()
+        extension.model_runner = SimpleNamespace()
+        execution = mock.create_autospec(
+            NativeWorkloadExecution, instance=True
+        )
+        execution.parameter_overlays = {}
+        execution.stage_request_finished.return_value = 0
+        execution.retire_request_states.side_effect = RuntimeError(
+            "signed cleanup rejected"
+        )
+        state = ResidualRuntimeState(
+            workload_execution=execution,
+        )
+
+        with mock.patch.object(residual_runtime, "RUNTIME", state):
+            extension.tllm_push_request_mapping([["request-0", 3, None]])
+            prepared = extension.tllm_prepare_workload_request_finish(
+                101, ["request-0"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "signed cleanup rejected"):
+                extension.tllm_apply_workload_request_finish(prepared["finish_id"])
+            with self.assertRaisesRegex(RuntimeError, "already started"):
+                extension.tllm_apply_workload_request_finish(prepared["finish_id"])
+
+        self.assertEqual(state.reqid_to_promptidx, {"request-0": 3})
+        self.assertEqual(len(state.request_lifecycle.active_aliases), 1)
+        self.assertIsNotNone(state.request_lifecycle.pending_finish)
 
     def test_workload_worker_spec_wire_is_closed_and_does_not_coerce(self) -> None:
         self.assertEqual(
@@ -1877,9 +1996,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
             self.assertEqual(llm.generate("next"), output)
 
         self.assertEqual(events, ["poll", "generate:next"])
-        plane.finish_workload_requests.assert_called_once_with(
-            ("request-0",), expected_finished=None
-        )
+        plane.finish_workload_requests.assert_called_once()
+        self.assertEqual(plane.finish_workload_requests.call_args.args, (("request-0",),))
+        self.assertGreater(plane.finish_workload_requests.call_args.kwargs["finish_id"], 0)
 
     def test_generate_keeps_active_epoch_while_port_transaction_is_open(self) -> None:
         from tllm.runtime.runtime import TllmRuntime
@@ -1901,9 +2020,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
             self.assertEqual(llm.generate("next"), output)
 
         apply_pending.assert_not_called()
-        plane.finish_workload_requests.assert_called_once_with(
-            ("request-0",), expected_finished=None
-        )
+        plane.finish_workload_requests.assert_called_once()
+        self.assertEqual(plane.finish_workload_requests.call_args.args, (("request-0",),))
+        self.assertGreater(plane.finish_workload_requests.call_args.kwargs["finish_id"], 0)
 
     def test_runtime_generate_publishes_exact_prompt_and_sample_indices(self) -> None:
         from tllm.runtime.runtime import TllmRuntime
@@ -1914,6 +2033,14 @@ class ControlPlaneUnitTest(unittest.TestCase):
         events: list[tuple[str, object]] = []
         plane.push_request_mapping.side_effect = lambda rows: events.append(
             ("mapping", tuple(rows))
+        )
+        plane.finish_workload_requests.return_value = (
+            SimpleNamespace(
+                finished_identities=(
+                    RequestIdentity("40", 7, 3),
+                    RequestIdentity("41", 8, 4),
+                )
+            ),
         )
         engine = SimpleNamespace(
             add_request=mock.Mock(
@@ -1975,8 +2102,8 @@ class ControlPlaneUnitTest(unittest.TestCase):
         self.assertEqual(
             tuple(output.request_id for output in outputs), ("40", "41")
         )
-        self.assertEqual(state.reqid_to_promptidx, {"40": 7, "41": 8})
-        self.assertEqual(state.reqid_to_sampleidx, {"40": 3, "41": 4})
+        self.assertEqual(state.reqid_to_promptidx, {})
+        self.assertEqual(state.reqid_to_sampleidx, {})
         plane.push_request_mapping.assert_called_once_with(
             [("40", 7, 3), ("41", 8, 4)]
         )
@@ -2002,9 +2129,17 @@ class ControlPlaneUnitTest(unittest.TestCase):
         runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
         plane = mock.Mock()
         events: list[str] = []
-        plane.finish_workload_requests.side_effect = (
-            lambda _request_ids: events.append("cleanup")
-        )
+        plane.finish_workload_requests.side_effect = lambda _request_ids, **_kwargs: (
+            events.append("cleanup"),
+            (
+                SimpleNamespace(
+                    finished_identities=(
+                        RequestIdentity("50", 0, 2),
+                        RequestIdentity("51", 1, 3),
+                    )
+                ),
+            ),
+        )[1]
         original_add_request = mock.Mock(side_effect=lambda *_args: events.append("add"))
         engine = SimpleNamespace(
             add_request=original_add_request,
@@ -2050,7 +2185,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
                     sample_indices=(2, 3),
                 )
 
-        plane.finish_workload_requests.assert_called_once_with(("50", "51"))
+        plane.finish_workload_requests.assert_called_once()
+        self.assertEqual(plane.finish_workload_requests.call_args.args, (("50", "51"),))
+        self.assertGreater(plane.finish_workload_requests.call_args.kwargs["finish_id"], 0)
         self.assertEqual(
             events,
             [
@@ -2068,6 +2205,49 @@ class ControlPlaneUnitTest(unittest.TestCase):
         self.assertFalse(runtime._generate_request_mapping_active)
         self.assertIsNone(runtime._generate_request_prompt_indices)
         self.assertIsNone(runtime._generate_request_sample_indices)
+
+    def test_direct_generate_failure_releases_actual_nonprepublished_admission(self) -> None:
+        from tllm.runtime.runtime import TllmRuntime
+        from tllm.runtime.state import ResidualRuntimeState
+
+        runtime = TllmRuntime(workloads=(_NativeMPWorkload(),))
+        plane = mock.Mock()
+        plane.finish_workload_requests.return_value = (
+            SimpleNamespace(
+                finished_identities=(RequestIdentity("request-0", 0, 0),)
+            ),
+        )
+        engine = SimpleNamespace(add_request=lambda *_args: None)
+
+        class LLM:
+            llm_engine = engine
+
+            def generate(self, _prompts, _params):
+                engine.add_request("request-0", "prompt", None)
+                raise RuntimeError("engine failed after direct admission")
+
+        state = ResidualRuntimeState()
+        with (
+            mock.patch.object(residual_runtime, "RUNTIME", state),
+            mock.patch.object(ControlPlane, "try_bind", return_value=plane),
+            mock.patch.object(
+                runtime,
+                "apply_pending_worker_shape_specializations",
+                return_value=False,
+            ),
+        ):
+            llm = LLM()
+            runtime._install_generate_boundary(llm, plane)
+            with self.assertRaisesRegex(
+                RuntimeError, "engine failed after direct admission"
+            ):
+                llm.generate(("prompt",), SimpleNamespace(n=1))
+
+        plane.finish_workload_requests.assert_called_once()
+        self.assertEqual(plane.finish_workload_requests.call_args.args, (("request-0",),))
+        self.assertGreater(plane.finish_workload_requests.call_args.kwargs["finish_id"], 0)
+        self.assertEqual(state.reqid_to_promptidx, {})
+        self.assertEqual(state.request_lifecycle.active_aliases, ())
 
     def test_runtime_generate_rejects_explicit_indices_for_parallel_samples(self) -> None:
         from tllm.runtime.runtime import TllmRuntime
@@ -2121,7 +2301,9 @@ class ControlPlaneUnitTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
                 llm.generate("next")
 
-        plane.finish_workload_requests.assert_called_once_with(("60",))
+        plane.finish_workload_requests.assert_called_once()
+        self.assertEqual(plane.finish_workload_requests.call_args.args, (("60",),))
+        self.assertGreater(plane.finish_workload_requests.call_args.kwargs["finish_id"], 0)
         engine.wake_up.assert_called_once_with(tags=["scheduling"])
         original_generate.assert_called_once()
 

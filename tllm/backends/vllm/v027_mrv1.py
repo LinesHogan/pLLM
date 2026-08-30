@@ -203,10 +203,19 @@ def _wrapped_prepare_inputs(
         runner=runner,
         state=None if binding is None else binding.parameter_overlay_state,
     )
+    from tllm.runtime.request_lifecycle import observe_request_aliases
+
+    # The runner is the vLLM-private boundary where parallel children and
+    # EngineCore suffixes first become visible.  Completion itself is flushed
+    # by the common worker lifecycle service after public generate returns.
+    finished_request_ids = _runner_adapter.mrv1_finished_request_ids(
+        scheduler_output
+    )
+    observe_request_aliases(
+        runtime,
+        (*_runner_adapter.mrv1_active_request_ids(runner), *finished_request_ids),
+    )
     if overlay_controller is not None:
-        overlay_controller.finish_requests(
-            _runner_adapter.mrv1_finished_request_ids(scheduler_output)
-        )
         overlay_controller.sync_versions()
         overlay_controller.apply_mrv1_input_batch(runner.input_batch)
     if not active_targets.runtime_has_active_targets(runtime):
@@ -672,19 +681,19 @@ class V027MRv1Driver:
         )
         _runner_adapter.unbind_runner(binding)
 
-    def finish_parameter_overlay_requests(
+    def consume_parameter_overlay_finished_batch(
         self,
         *,
         runtime: Any,
         runner: Any,
         state: OverlayBackendState,
-        request_ids: tuple[str, ...],
-    ) -> RequestFinishedBatch:
-        return _parameter_overlay.finish_parameter_overlay_requests(
+        batch: RequestFinishedBatch,
+    ) -> int:
+        return _parameter_overlay.consume_parameter_overlay_finished_batch(
             runtime=runtime,
             runner=runner,
             state=state,
-            request_ids=request_ids,
+            batch=batch,
         )
 
     def synchronize_parameter_overlays(

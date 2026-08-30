@@ -21,6 +21,7 @@ from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.consumer_registry import ConsumerRegistry
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.resources import SamplerPrecomputeState
+from tllm.runtime.request_lifecycle import RequestLifecycleLedger
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeStore
 from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlStore
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
@@ -112,6 +113,11 @@ class ResidualRuntimeState:
     launch_consumer_from_hooks: bool = True
     reqid_to_promptidx: Dict[str, int] = field(default_factory=dict)
     reqid_to_sampleidx: Dict[str, int] = field(default_factory=dict)
+    # Raw vLLM aliases are owned until a signed request-finished cleanup has
+    # acknowledged the closed RequestIdentity batch.
+    request_lifecycle: RequestLifecycleLedger = field(
+        default_factory=RequestLifecycleLedger
+    )
     event_step_id: int = 0
     decode_post_logits_launched_step_id: int = -1
     sampler_precompute: SamplerPrecomputeState = field(default_factory=SamplerPrecomputeState)

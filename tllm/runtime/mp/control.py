@@ -22,7 +22,9 @@ from tllm.contracts.consumer_stats import (
     TrainingStats,
     training_stats_map_from_wire,
 )
+from tllm.contracts.request_identity import RequestIdentity
 from tllm.runtime.stats import DistillerTimingStats, PathHotspotStats, PlacementStats
+from tllm.runtime.request_lifecycle import new_request_finish_id
 from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
 
 if TYPE_CHECKING:
@@ -51,32 +53,137 @@ class WorkerWorkloadStatus(TypedDict):
     diagnostics: dict[str, dict[str, int | float]]
 
 
+def _request_finish_identities_from_wire(
+    fields: Mapping[str, object],
+) -> tuple[RequestIdentity, ...]:
+    raw_finished_identities = fields["finished_identities"]
+    if type(raw_finished_identities) is not list:
+        raise TypeError("request-finish finished_identities must be a list")
+    identities = tuple(
+        RequestIdentity.from_wire(identity)
+        for identity in raw_finished_identities
+    )
+    if len(identities) != len(set(identities)):
+        raise ValueError("request-finish finished_identities contain duplicates")
+    return identities
+
+
+def _request_finish_worker_id(fields: Mapping[str, object]) -> str:
+    worker_id = fields["worker_id"]
+    if type(worker_id) is not str or not worker_id:
+        raise TypeError("request-finish worker_id must be a non-empty string")
+    return worker_id
+
+
+def _request_finish_id(fields: Mapping[str, object]) -> int:
+    return _positive_wire_int(fields["finish_id"], "request-finish finish_id")
+
+
 @dataclass(frozen=True, slots=True)
-class WorkerRequestFinishReply:
+class WorkerRequestFinishPrepareReply:
     worker_id: str
     request_ids: tuple[str, ...]
-    finished: int
+    finish_id: int
+    finished_identities: tuple[RequestIdentity, ...]
 
     @classmethod
-    def from_wire(cls, payload: object) -> "WorkerRequestFinishReply":
+    def from_wire(cls, payload: object) -> "WorkerRequestFinishPrepareReply":
         fields = _exact_wire_object(
             payload,
-            "request-finish reply",
-            frozenset({"worker_id", "request_ids", "finished"}),
+            "request-finish prepare reply",
+            frozenset(
+                {"worker_id", "request_ids", "finish_id", "finished_identities"}
+            ),
         )
-        worker_id = fields["worker_id"]
         raw_request_ids = fields["request_ids"]
-        if type(worker_id) is not str or not worker_id:
-            raise TypeError("request-finish worker_id must be a non-empty string")
         if type(raw_request_ids) is not list or any(
             type(request_id) is not str or not request_id
             for request_id in raw_request_ids
         ):
             raise TypeError("request-finish request_ids must be non-empty strings")
         return cls(
-            worker_id,
+            _request_finish_worker_id(fields),
             tuple(raw_request_ids),
-            _nonnegative_wire_int(fields["finished"], "request-finish finished"),
+            _request_finish_id(fields),
+            _request_finish_identities_from_wire(fields),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRequestFinishApplyReply:
+    worker_id: str
+    finish_id: int
+    finished: int
+    finished_identities: tuple[RequestIdentity, ...]
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerRequestFinishApplyReply":
+        fields = _exact_wire_object(
+            payload,
+            "request-finish apply reply",
+            frozenset(
+                {"worker_id", "finish_id", "finished", "finished_identities"}
+            ),
+        )
+        identities = _request_finish_identities_from_wire(fields)
+        finished = _nonnegative_wire_int(
+            fields["finished"], "request-finish finished"
+        )
+        if finished != len(identities):
+            raise ValueError(
+                "request-finish finished count does not match canonical identities"
+            )
+        return cls(
+            _request_finish_worker_id(fields),
+            _request_finish_id(fields),
+            finished,
+            identities,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRequestFinishReply:
+    worker_id: str
+    request_ids: tuple[str, ...]
+    finish_id: int
+    finished: int
+    finished_identities: tuple[RequestIdentity, ...]
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "WorkerRequestFinishReply":
+        fields = _exact_wire_object(
+            payload,
+            "request-finish reply",
+            frozenset(
+                {
+                    "worker_id",
+                    "request_ids",
+                    "finish_id",
+                    "finished",
+                    "finished_identities",
+                }
+            ),
+        )
+        raw_request_ids = fields["request_ids"]
+        if type(raw_request_ids) is not list or any(
+            type(request_id) is not str or not request_id
+            for request_id in raw_request_ids
+        ):
+            raise TypeError("request-finish request_ids must be non-empty strings")
+        identities = _request_finish_identities_from_wire(fields)
+        finished = _nonnegative_wire_int(
+            fields["finished"], "request-finish finished"
+        )
+        if finished != len(identities):
+            raise ValueError(
+                "request-finish finished count does not match canonical identities"
+            )
+        return cls(
+            _request_finish_worker_id(fields),
+            tuple(raw_request_ids),
+            _request_finish_id(fields),
+            finished,
+            identities,
         )
 
 _SHAPE_SPECIALIZATION_REPLY_FIELDS = frozenset(
@@ -860,17 +967,83 @@ class ControlPlane:
         self,
         request_ids: tuple[str, ...],
         *,
+        finish_id: int | None = None,
         expected_finished: int | None = None,
         timeout: float | None = None,
     ) -> tuple[WorkerRequestFinishReply, ...]:
+        """Finalize one request batch through worker prepare/apply/finalize.
+
+        Workers retain ledger aliases and mappings until every worker has
+        reported the same canonical batch and every worker has applied its
+        local signed cleanup.  Failures are intentionally non-rollbackable:
+        the owner fail-stops the workload epoch rather than retrying a
+        potentially half-cleaned request family.
+        """
+
         if not request_ids:
             return ()
+        transaction_id = (
+            new_request_finish_id() if finish_id is None else finish_id
+        )
+        if type(transaction_id) is not int or transaction_id < 1:
+            raise ValueError("request-finish finish_id must be a positive integer")
         quorum = self.worker_quorum(timeout=timeout)
+        prepared = tuple(
+            WorkerRequestFinishPrepareReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_prepare_workload_request_finish",
+                transaction_id,
+                list(request_ids),
+                timeout=timeout,
+            )
+        )
+        if (
+            len(prepared) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in prepared)
+            != quorum.worker_ids
+        ):
+            raise RuntimeError("request-finish prepare quorum mismatch")
+        if any(reply.request_ids != request_ids for reply in prepared):
+            raise RuntimeError("request-finish prepare identity mismatch")
+        if any(reply.finish_id != transaction_id for reply in prepared):
+            raise RuntimeError("request-finish prepare transaction quorum mismatch")
+        prepared_counts = {len(reply.finished_identities) for reply in prepared}
+        if len(prepared_counts) != 1:
+            raise RuntimeError("request-finish reply count quorum mismatch")
+        finished_identities = {reply.finished_identities for reply in prepared}
+        if len(finished_identities) != 1:
+            raise RuntimeError("request-finish canonical identity quorum mismatch")
+        identities = prepared[0].finished_identities
+        if expected_finished is not None and len(identities) != expected_finished:
+            raise RuntimeError("request-finish reply count is incomplete")
+        finish_id = transaction_id
+
+        applied = tuple(
+            WorkerRequestFinishApplyReply.from_wire(reply)
+            for reply in self.call(
+                "tllm_apply_workload_request_finish",
+                finish_id,
+                timeout=timeout,
+            )
+        )
+        if (
+            len(applied) != len(quorum.worker_ids)
+            or frozenset(reply.worker_id for reply in applied)
+            != quorum.worker_ids
+        ):
+            raise RuntimeError("request-finish apply quorum mismatch")
+        if any(reply.finish_id != finish_id for reply in applied):
+            raise RuntimeError("request-finish apply transaction mismatch")
+        if any(reply.finished_identities != identities for reply in applied):
+            raise RuntimeError("request-finish apply canonical identity mismatch")
+        if any(reply.finished != len(identities) for reply in applied):
+            raise RuntimeError("request-finish apply count mismatch")
+
         replies = tuple(
             WorkerRequestFinishReply.from_wire(reply)
             for reply in self.call(
-                "tllm_finish_workload_requests",
-                list(request_ids),
+                "tllm_finalize_workload_request_finish",
+                finish_id,
                 timeout=timeout,
             )
         )
@@ -879,16 +1052,15 @@ class ControlPlane:
             or frozenset(reply.worker_id for reply in replies)
             != quorum.worker_ids
         ):
-            raise RuntimeError("request-finish reply quorum mismatch")
+            raise RuntimeError("request-finish finalize quorum mismatch")
         if any(reply.request_ids != request_ids for reply in replies):
-            raise RuntimeError("request-finish reply identity mismatch")
-        finished_counts = {reply.finished for reply in replies}
-        if len(finished_counts) != 1:
-            raise RuntimeError("request-finish reply count quorum mismatch")
-        if expected_finished is not None and finished_counts != {
-            expected_finished
-        }:
-            raise RuntimeError("request-finish reply count is incomplete")
+            raise RuntimeError("request-finish finalize identity mismatch")
+        if any(reply.finish_id != finish_id for reply in replies):
+            raise RuntimeError("request-finish finalize transaction mismatch")
+        if any(reply.finished_identities != identities for reply in replies):
+            raise RuntimeError("request-finish finalize canonical identity mismatch")
+        if any(reply.finished != len(identities) for reply in replies):
+            raise RuntimeError("request-finish finalize count mismatch")
         return replies
 
     def install_workload_compilation(

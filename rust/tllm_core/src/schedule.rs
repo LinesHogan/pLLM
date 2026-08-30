@@ -2232,6 +2232,7 @@ fn validate_inputs(
             }
         }
         if graph.schema_version == 4 {
+            let mut request_effect_resources = BTreeSet::new();
             for effect in &task.effects {
                 let selection_port = effect.selection_port.as_deref().ok_or_else(|| {
                     value_error(
@@ -2254,6 +2255,19 @@ fn validate_inputs(
                         value_error("schema v4 state effect references an unknown typed state")
                     })?;
                 if state.scope == StateScope::Request {
+                    if !request_effect_resources.insert(effect.resource.as_str()) {
+                        return Err(value_error(
+                            "one task cannot carry multiple effects on one request state",
+                        ));
+                    }
+                    if !matches!(
+                        effect.kind,
+                        ScheduleEffectKind::StateRead | ScheduleEffectKind::StateTransition
+                    ) {
+                        return Err(value_error(
+                            "request-scoped schedule effects support only read and strict transition",
+                        ));
+                    }
                     let selection = task
                         .inputs
                         .iter()
@@ -2337,6 +2351,23 @@ fn validate_inputs(
                 "task {:?} has no legal timeline interval",
                 task.task_id
             )));
+        }
+        if task
+            .inputs
+            .iter()
+            .any(|input| input.kind == ScheduleInputKind::StateSelection)
+        {
+            let ready = state_selection_ready_index(timeline).ok_or_else(|| {
+                schedule_error(
+                    "state_selection input requires an observable prepare_inputs.post event",
+                )
+            })?;
+            if ready >= before.expect("validated task deadline") {
+                return Err(schedule_error(format!(
+                    "task {:?} has no legal interval after request identities become available",
+                    task.task_id
+                )));
+            }
         }
         // V2 records only capability requirements common to all candidates;
         // candidate-specific requirements are checked by the Rust selector
@@ -2623,7 +2654,15 @@ fn effects_can_be_internalized(
                 .push((*task_index, effect));
         }
     }
-    for effects in effects_by_resource.values() {
+    for (resource, effects) in &effects_by_resource {
+        if effects.len() > 1
+            && graph
+                .states
+                .iter()
+                .any(|state| state.resource == *resource && state.scope == StateScope::Request)
+        {
+            return false;
+        }
         for (position, (left_task, left_effect)) in effects.iter().enumerate() {
             for (right_task, right_effect) in effects.iter().skip(position + 1) {
                 if !(effect_is_mutating(left_effect) || effect_is_mutating(right_effect)) {
@@ -2643,11 +2682,27 @@ fn effects_can_be_internalized(
 fn draft_window(
     graph: &ScheduleGraph,
     anchor_index: &HashMap<String, usize>,
+    state_selection_ready: Option<usize>,
     tasks: &[usize],
 ) -> (usize, usize) {
     let earliest = tasks
         .iter()
-        .map(|index| anchor_index[&graph.tasks[*index].timing.after])
+        .map(|index| {
+            let task = &graph.tasks[*index];
+            let declared = anchor_index[&task.timing.after];
+            if task
+                .inputs
+                .iter()
+                .any(|input| input.kind == ScheduleInputKind::StateSelection)
+            {
+                declared.max(
+                    state_selection_ready
+                        .expect("validated state_selection input requires prepare_inputs.post"),
+                )
+            } else {
+                declared
+            }
+        })
         .max()
         .expect("ExecutionRegion drafts are non-empty");
     let before = tasks
@@ -2656,6 +2711,15 @@ fn draft_window(
         .min()
         .expect("ExecutionRegion drafts are non-empty");
     (earliest, before)
+}
+
+fn state_selection_ready_index(timeline: &Timeline) -> Option<usize> {
+    timeline.anchors.iter().position(|anchor| {
+        anchor
+            .backend_events
+            .as_ref()
+            .is_some_and(|events| events.contains(&BackendObservableEvent::PrepareInputsPost))
+    })
 }
 
 fn task_order_rank(order: &[usize], task_count: usize) -> Vec<usize> {
@@ -2755,6 +2819,7 @@ fn task_approximation_policy<'a>(graph: &'a ScheduleGraph, task_id: &str) -> &'a
 fn drafts_can_merge(
     graph: &ScheduleGraph,
     selected: &[SelectedTaskImplementation],
+    timeline: &Timeline,
     anchor_index: &HashMap<String, usize>,
     left: &RegionDraft,
     right: &RegionDraft,
@@ -2764,7 +2829,12 @@ fn drafts_can_merge(
     let mut tasks = left.tasks.clone();
     tasks.extend(right.tasks.iter().copied());
     tasks.sort_by_key(|index| order_rank[*index]);
-    let (earliest, before) = draft_window(graph, anchor_index, &tasks);
+    let (earliest, before) = draft_window(
+        graph,
+        anchor_index,
+        state_selection_ready_index(timeline),
+        &tasks,
+    );
     let implementation_kind = selected[tasks[0]].kind;
     // Merging is per-policy: a shared Region would otherwise let a non-exact
     // workload's parity tolerance wash over an exact workload's outputs.
@@ -2866,6 +2936,7 @@ fn explore_region_partitions(
             let Some(merged) = drafts_can_merge(
                 graph,
                 selected,
+                timeline,
                 anchor_index,
                 &drafts[left],
                 &drafts[right],
@@ -2911,10 +2982,12 @@ fn make_region_drafts(
     budget: u64,
 ) -> PyResult<Vec<RegionDraft>> {
     let order_rank = task_order_rank(order, graph.tasks.len());
+    let state_selection_ready = state_selection_ready_index(timeline);
     let drafts: Vec<RegionDraft> = order
         .iter()
         .map(|index| {
-            let (earliest, before) = draft_window(graph, anchor_index, &[*index]);
+            let (earliest, before) =
+                draft_window(graph, anchor_index, state_selection_ready, &[*index]);
             RegionDraft {
                 tasks: vec![*index],
                 earliest,
@@ -4163,7 +4236,13 @@ fn compile_impl(
             && draft
                 .tasks
                 .iter()
-                .all(|index| selected[*index].compile_safe);
+                .all(|index| selected[*index].compile_safe)
+            && draft.tasks.iter().all(|index| {
+                graph.tasks[*index]
+                    .inputs
+                    .iter()
+                    .all(|input| input.kind != ScheduleInputKind::StateSelection)
+            });
         let capture_safe = compile_safe
             && draft
                 .tasks
@@ -5222,7 +5301,20 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             Some(slot) => *slot,
             None => return Err(schedule_error("placement references an unknown anchor")),
         };
-        let earliest = anchor_index[&task.timing.after];
+        let declared_earliest = anchor_index[&task.timing.after];
+        let earliest = if task
+            .inputs
+            .iter()
+            .any(|input| input.kind == ScheduleInputKind::StateSelection)
+        {
+            declared_earliest.max(state_selection_ready_index(&timeline_desc).ok_or_else(|| {
+                schedule_error(
+                    "state_selection input requires prepare_inputs.post placement evidence",
+                )
+            })?)
+        } else {
+            declared_earliest
+        };
         let latest = anchor_index[&task.timing.before] - 1;
         if slot < earliest || slot > latest {
             return Err(schedule_error(format!(
@@ -5942,7 +6034,7 @@ mod tests {
     #[test]
     fn schema_v4_request_effects_bind_selection_ports_into_signed_regions() {
         let graph = r#"{"workload_key":"request-selection","tasks":[{"task_id":"read","timing":{"after":"begin","before":"end"},"temporary_bytes":0,"implementation_ids":["test:read@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["torch.export"]],"required_capabilities":[],"capture_safe":false,"effects":[{"kind":"state_read","resource":"fast_weights","selection_port":"selection"}],"inputs":[{"name":"selection","kind":"state_selection","source":"fast_weights"}]}],"edges":[],"values":[],"states":[{"resource":"fast_weights","scope":"request","request_key":["request_id","sample_idx"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":4}"#;
-        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"full","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.pre"]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"full","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.post","execute_model.pre"]},{"anchor_id":"end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let options =
             r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#;
 
@@ -5966,9 +6058,16 @@ mod tests {
         assert_eq!(region.effects.len(), 1);
         assert_eq!(region.effects[0].resource, "fast_weights");
         assert_eq!(region.effects[0].selection_binding_id, selection.binding_id);
+        assert!(!region.compile_safe);
         assert!(!region.capture_safe);
         assert_eq!(region.capture_mode, RegionCaptureMode::Disabled);
         validate_schedule(graph, timeline, options, &compiled).unwrap();
+
+        let delayed_timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"full","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"ready","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.post"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
+        let delayed: Decision =
+            serde_json::from_str(&compile_schedule(graph, delayed_timeline, options).unwrap())
+                .unwrap();
+        assert_eq!(delayed.execution_regions[0].placement_anchor, "ready");
 
         let mut missing_selection_port: serde_json::Value = serde_json::from_str(graph).unwrap();
         missing_selection_port["tasks"][0]["effects"][0]
@@ -5989,6 +6088,15 @@ mod tests {
         assert!(error.to_string().contains(
             "request-scoped schedule effect requires its exact state_selection task input"
         ));
+
+        let conditional = graph.replace(
+            "\"kind\":\"state_read\"",
+            "\"kind\":\"state_transition_maybe\"",
+        );
+        let error = compile_schedule(&conditional, timeline, options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("support only read and strict transition"));
 
         let mut non_request: serde_json::Value = serde_json::from_str(graph).unwrap();
         non_request["states"][0]["scope"] = serde_json::json!("replica");

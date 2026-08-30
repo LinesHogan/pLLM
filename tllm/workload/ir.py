@@ -418,6 +418,7 @@ class WorkloadIR:
             state_by_name = {state.name: state for state in self.states}
             for task in self.tasks:
                 inputs_by_name = {task_input.name: task_input for task_input in task.inputs}
+                request_effect_resources: set[str] = set()
                 for task_input in task.inputs:
                     if task_input.kind is not ValueSourceKind.STATE_SELECTION:
                         continue
@@ -450,6 +451,18 @@ class WorkloadIR:
                             f"task {task.name!r} effect references unknown state {effect.state!r}"
                         )
                     if affected_state.scope is StateScope.REQUEST:
+                        if effect.state in request_effect_resources:
+                            raise ValueError(
+                                f"task {task.name!r} has multiple effects on request state {effect.state!r}"
+                            )
+                        request_effect_resources.add(effect.state)
+                        if effect.kind not in (
+                            EffectKind.READ,
+                            EffectKind.TRANSITION,
+                        ):
+                            raise ValueError(
+                                f"task {task.name!r} request-state selection supports only read and strict transition effects"
+                            )
                         if not effect.selection_port:
                             raise ValueError(
                                 f"task {task.name!r} request-state effect requires selection_port"

@@ -329,6 +329,18 @@ def test_controller_materializes_and_keeps_request_version_stable() -> None:
     )
 
 
+def test_unmapped_request_never_receives_a_synthetic_overlay_identity() -> None:
+    channel, store = _store(1.0)
+    harness = _OverlayHarness.create({channel: store})
+    harness.runtime.reqid_to_promptidx = {}
+    harness.runtime.reqid_to_sampleidx = {}
+    controller = harness.bind()
+
+    with pytest.raises(RuntimeError, match="requires a resolved request identity"):
+        controller.pin_request("unknown")
+    assert harness.state.request_identities == {}
+
+
 def test_parent_finish_releases_all_parallel_child_aliases_and_leases() -> None:
     channel, store = _store(1.0)
     harness = _OverlayHarness.create({channel: store})

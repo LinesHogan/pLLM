@@ -14,6 +14,10 @@ from tllm.contracts.consumer_stats import TrainingStats
 from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.runtime.request_trainable_state import (
+    RequestStateRuntimeService,
+    RequestTrainableStateStore,
+)
 from tllm.kit.sampler_output import DeclaredSamplerOutput
 from tllm.kit.backend import (
     NoBackendAdapter,
@@ -44,8 +48,10 @@ from tllm.workload.config import ConfigAtom, WorkloadConfig
 from tllm.workload.frontend import (
     NoConfiguredValue,
     PublishedModule,
+    RequestTrainableState,
     ServiceState,
     State,
+    StateDescriptor,
     SamplerOutput,
     TrainableState,
     WorkloadDeclaration,
@@ -55,6 +61,7 @@ from tllm.workload.frontend import (
 )
 from tllm.workload.ir import OptimizerSpec
 from tllm.workload.ir import StateStorage
+from tllm.workload.ir import StateScope
 from tllm.workload.ir import EffectKind
 from tllm.workload.ir import ValueSourceKind
 from tllm.contracts.workload_ports import (
@@ -82,6 +89,7 @@ class _Specialized:
     values: dict[str, torch.nn.Module]
     optimizers: dict[str, torch.optim.Optimizer]
     versions: dict[str, int]
+    request_state_services: dict[str, RequestStateRuntimeService[torch.nn.Module]]
 
 
 class _WorkloadAccounting:
@@ -183,11 +191,8 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     @classmethod
     def _states(
         cls,
-    ) -> tuple[State[torch.nn.Module], ...]:
-        return cast(
-            tuple[State[torch.nn.Module], ...],
-            cls._definition().states,
-        )
+    ) -> tuple[StateDescriptor, ...]:
+        return cls._definition().states
 
     @classmethod
     def _staged_ports(cls) -> tuple[StagedPort[object], ...]:
@@ -218,9 +223,11 @@ class Workload(NativeWorkload, Generic[ConfigT]):
     @property
     def state_version(self) -> int:
         states = type(self)._states()
-        if len(states) != 1:
-            raise RuntimeError(f"{type(self).__name__} has no single State")
-        return self.state_version_for(states[0])
+        match states:
+            case (State() as state,):
+                return self.state_version_for(state)
+            case _:
+                raise RuntimeError(f"{type(self).__name__} has no single State")
 
     def state_version_for(self, state: State[StateValueT]) -> int:
         match self._lifecycle:
@@ -233,6 +240,18 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         match self._lifecycle:
             case _Specialized(values=values):
                 return cast(StateValueT, values[state.name])
+            case _:
+                raise RuntimeError(f"State {state.name!r} is not specialized")
+
+    def request_state_value(
+        self,
+        state: RequestTrainableState[StateValueT],
+    ) -> RequestStateRuntimeService[StateValueT]:
+        if state not in type(self)._states():
+            raise ValueError("request state belongs to another workload")
+        match self._lifecycle:
+            case _Specialized(request_state_services=services):
+                return cast(RequestStateRuntimeService[StateValueT], services[state.name])
             case _:
                 raise RuntimeError(f"State {state.name!r} is not specialized")
 
@@ -249,12 +268,49 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
         values: dict[str, torch.nn.Module] = {}
         optimizers: dict[str, torch.optim.Optimizer] = {}
+        request_state_services: dict[
+            str, RequestStateRuntimeService[torch.nn.Module]
+        ] = {}
+        active_request_states = {
+            effect.state
+            for task in declare_workload(self).ir.tasks
+            for effect in task.effects
+            if effect.kind is not EffectKind.EXTERN_IO
+        }
         with torch.inference_mode(False), torch.enable_grad():
             for state in type(self)._states():
-                value = state.initializer(self, spec)
-                values[state.name] = value
                 match state:
+                    case RequestTrainableState(optimizer=optimizer, key=key):
+                        if state.name not in active_request_states:
+                            continue
+
+                        def module_factory() -> torch.nn.Module:
+                            return state.initializer(self, spec)
+
+                        def optimizer_factory(
+                            module: torch.nn.Module,
+                        ) -> torch.optim.Optimizer:
+                            return _build_optimizer(
+                                optimizer,
+                                module,
+                                self.config,
+                                spec.device,
+                            )
+
+                        request_state_services[state.name] = RequestStateRuntimeService(
+                            RequestTrainableStateStore(
+                                resource=state.name,
+                                key_fields=key.fields,
+                                capacity=spec.rows,
+                                epoch=1,
+                                device=spec.device,
+                                module_factory=module_factory,
+                                optimizer_factory=optimizer_factory,
+                            )
+                        )
                     case TrainableState(optimizer=optimizer):
+                        value = state.initializer(self, spec)
+                        values[state.name] = value
                         optimizers[state.name] = _build_optimizer(
                             optimizer,
                             value,
@@ -262,15 +318,24 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                             spec.device,
                         )
                     case PublishedModule():
+                        value = state.initializer(self, spec)
+                        values[state.name] = value
                         pass
                     case State():
+                        value = state.initializer(self, spec)
+                        values[state.name] = value
                         pass
         self.backend.specialize(spec)
         self._lifecycle = _Specialized(
             spec=spec,
             values=values,
             optimizers=optimizers,
-            versions={state.name: 0 for state in type(self)._states()},
+            versions={
+                state.name: 0
+                for state in type(self)._states()
+                if state.scope is not StateScope.REQUEST
+            },
+            request_state_services=request_state_services,
         )
         self._resources = self._assemble_resources()
 
@@ -391,6 +456,13 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 staged += 1
         return staged
 
+    def request_finished_port_keys(self) -> tuple[str, ...]:
+        return tuple(
+            port.key
+            for port in type(self)._staged_ports()
+            if port.lifecycle is StagedLifecycle.REQUEST_FINISHED
+        )
+
     def stage_dense_operand_captured(
         self, batch: DenseOperandCaptureBatch
     ) -> int:
@@ -484,11 +556,20 @@ class Workload(NativeWorkload, Generic[ConfigT]):
 
             return snapshot
 
-        state_snapshots: dict[str, StateSnapshot] = {
-            state.name: snapshot_for(state)
-            for state in type(self)._states()
-            if state.name in active_states
-        }
+        state_snapshots: dict[str, StateSnapshot] = {}
+        optimizer_transitions: dict[str, _WorkloadOptimizerTransition] = {}
+        for state in type(self)._states():
+            match state:
+                case State() if state.name in active_states:
+                    state_snapshots[state.name] = snapshot_for(state)
+                    if state.storage is StateStorage.OPTIMIZER_STABLE:
+                        optimizer_transitions[state.name] = _WorkloadOptimizerTransition(
+                            self, state.name
+                        )
+                case RequestTrainableState():
+                    pass
+                case State():
+                    pass
         provided_inputs = {
             port.key: RuntimeInputBinding(
                 lambda step_id, port=port: port.take(self._port_store, step_id)
@@ -567,6 +648,15 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             if name in active_inputs
         }
         services = self.runtime_services()
+        match self._lifecycle:
+            case _Specialized(request_state_services=all_request_services):
+                request_state_services = {
+                    name: service
+                    for name, service in all_request_services.items()
+                    if name in active_states
+                }
+            case _Unspecialized():
+                request_state_services = {}
         return WorkloadRuntimeBinding(
             owner=self,
             ports=RuntimePortRegistry(
@@ -593,11 +683,8 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             ),
             backend=backend_binding,
             parameter_overlays=self.parameter_overlay_bindings(),
-            optimizer_transitions={
-                state.name: _WorkloadOptimizerTransition(self, state.name)
-                for state in type(self)._states()
-                if state.storage is StateStorage.OPTIMIZER_STABLE
-            },
+            optimizer_transitions=optimizer_transitions,
+            request_state_services=request_state_services,
         )
 
     def runtime_services(self) -> RuntimeServices:

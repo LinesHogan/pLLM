@@ -228,6 +228,11 @@ class WorkloadDslUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "State.selection requires a REQUEST"):
             State.replica(optimizer=AdamWSpec.fixed(1e-3)).selection()
 
+        with self.assertRaisesRegex(
+            ValueError, "only read and strict transition"
+        ):
+            maybe_transition(selection)
+
     def test_jacobi_is_explicit_and_changes_semantic_key(self) -> None:
         def build(policy: ApproximationPolicy) -> str:
             @workload(id="recur", approximation=policy)

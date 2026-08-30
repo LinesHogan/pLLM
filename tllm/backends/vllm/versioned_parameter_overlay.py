@@ -429,20 +429,18 @@ class VLLMParameterOverlayController:
                 raise RuntimeError(
                     "dense operand capture could not resolve request identity"
                 )
-            identity = (
-                RequestIdentity(request_id, -1, 0)
-                if resolved_identity is None
-                else resolved_identity
-            )
+            if resolved_identity is None:
+                # An unmapped/base request has no request-scoped overlay
+                # identity.  Do not fabricate a sentinel identity that could
+                # later be released as a real lifecycle family.
+                continue
+            identity = resolved_identity
             phase = OverlayRowPhase(raw_phase)
             for channel, store in dense_channels:
                 target = channel.target
                 if target is None:
                     continue
-                captured = (
-                    channel.capture_operands
-                    and resolved_identity is not None
-                )
+                captured = channel.capture_operands
                 if captured:
                     capture_key = (target, identity, phase)
                     capture_rows.setdefault(capture_key, []).append(packed_row)
@@ -558,11 +556,12 @@ class VLLMParameterOverlayController:
             prompt_indices=self.runtime.reqid_to_promptidx,
             sample_indices=self.runtime.reqid_to_sampleidx,
         )
-        resolved = (
-            RequestIdentity(request_id, -1, 0) if identity is None else identity
-        )
-        self.state.request_identities[request_id] = resolved
-        return resolved
+        if identity is None:
+            raise RuntimeError(
+                "request-scoped overlay requires a resolved request identity"
+            )
+        self.state.request_identities[request_id] = identity
+        return identity
 
     def pin_request(self, request_id: str) -> LoRARequest | None:
         lineages = self._global_lora_lineages()
@@ -579,49 +578,72 @@ class VLLMParameterOverlayController:
         self._materialize(store, version)
         return self._request_for(version)
 
+    def consume_finished_batch(self, batch: RequestFinishedBatch) -> int:
+        """Release overlay leases for a lifecycle-owned typed finish batch.
+
+        The generic request lifecycle is the only component that resolves raw
+        ids and decides which parallel family is terminal.  Overlay cleanup
+        merely consumes its already-canonical batch after signed cleanup has
+        run successfully.
+        """
+
+        if len(batch.requests) != len(set(batch.requests)):
+            raise ValueError("request-finished batch contains duplicate identities")
+        stores = set(self.stores.values())
+        family_ids = {identity.request_id for identity in batch.requests}
+        aliases = tuple(
+            (raw_id, raw_identity)
+            for raw_id, raw_identity in self.state.request_identities.items()
+            if raw_identity.request_id in family_ids
+        )
+        for raw_id, _raw_identity in aliases:
+            self.state.request_identities.pop(raw_id)
+            self.state.attached_requests.discard(raw_id)
+            self.state.dense_request_ids.discard(raw_id)
+        released = tuple(
+            dict.fromkeys(
+                (*batch.requests, *(identity for _raw_id, identity in aliases))
+            )
+        )
+        for identity in released:
+            for store in stores:
+                for lineage in store.lineages():
+                    if lineage.request is None:
+                        store.release(OverlayLeaseKey(identity, lineage))
+        return len(released)
+
     def release_finished(
         self, request_ids: tuple[str, ...]
     ) -> RequestFinishedBatch:
+        """Legacy raw-id adapter retained for direct overlay unit coverage.
+
+        Runtime completion paths must call :meth:`consume_finished_batch` with
+        a lifecycle-issued batch instead.
+        """
+
         finished: list[RequestIdentity] = []
         observed: set[RequestIdentity] = set()
-        stores = set(self.stores.values())
         for request_id in request_ids:
             identity = self.state.request_identities.get(request_id)
             if identity is None:
                 identity = self._identity(request_id)
             aliases = tuple(
-                (raw_id, raw_identity)
-                for raw_id, raw_identity in self.state.request_identities.items()
+                raw_identity
+                for _raw_id, raw_identity in self.state.request_identities.items()
                 if raw_identity.request_id == identity.request_id
             )
-            for raw_id, _raw_identity in aliases:
-                self.state.request_identities.pop(raw_id)
-                self.state.attached_requests.discard(raw_id)
-                self.state.dense_request_ids.discard(raw_id)
-            self.state.attached_requests.discard(request_id)
-            self.state.dense_request_ids.discard(request_id)
-            alias_identities = tuple(
-                raw_identity for _raw_id, raw_identity in aliases
-            )
-            identities = tuple(
-                dict.fromkeys((*alias_identities, identity))
-            )
-            for alias_identity in identities:
+            for alias_identity in (*aliases, identity):
                 if alias_identity in observed:
                     continue
                 observed.add(alias_identity)
                 finished.append(alias_identity)
-                for store in stores:
-                    for lineage in store.lineages():
-                        if lineage.request is None:
-                            store.release(
-                                OverlayLeaseKey(alias_identity, lineage)
-                            )
         return RequestFinishedBatch(tuple(finished))
 
     def finish_requests(
         self, request_ids: tuple[str, ...]
     ) -> RequestFinishedBatch:
+        """Legacy direct-overlay path; runtime adapters do not call this."""
+
         batch = self.release_finished(request_ids)
         execution = self.runtime.workload_execution
         if execution is not None and batch.requests:
@@ -636,6 +658,7 @@ class VLLMParameterOverlayController:
                     raise RuntimeError(
                         "request-scoped overlays require a signed request-finished port"
                     )
+        self.consume_finished_batch(batch)
         return batch
 
     def apply_mrv1_input_batch(self, input_batch: _MRV1InputBatch) -> int:
@@ -656,17 +679,6 @@ class VLLMParameterOverlayController:
     def apply_mrv2_input_batch(self, input_batch: _MRV2InputBatch) -> int:
         applied = 0
         request_ids = tuple(input_batch.req_ids[: input_batch.num_reqs])
-        active = frozenset(request_ids)
-        self.finish_requests(
-            tuple(
-                request_id
-                for request_id in (
-                    self.state.attached_requests
-                    | self.state.dense_request_ids
-                )
-                if request_id not in active
-            )
-        )
         for request_id in request_ids:
             if request_id in self.state.attached_requests:
                 continue
@@ -739,19 +751,19 @@ def unbind_parameter_overlays(
     state.rebind({})
 
 
-def finish_parameter_overlay_requests(
+def consume_parameter_overlay_finished_batch(
     *,
     runtime: _OverlayRuntime,
     runner: VLLMParameterOverlayRunner,
     state: OverlayBackendState,
-    request_ids: tuple[str, ...],
-) -> RequestFinishedBatch:
+    batch: RequestFinishedBatch,
+) -> int:
+    """Consume a batch already authorized by the generic lifecycle ledger."""
+
     controller = maybe_bind_publisher(
         runtime=runtime, runner=runner, state=state
     )
-    if controller is None:
-        return RequestFinishedBatch(())
-    return controller.finish_requests(request_ids)
+    return 0 if controller is None else controller.consume_finished_batch(batch)
 
 
 def synchronize_parameter_overlays(
@@ -768,7 +780,7 @@ def synchronize_parameter_overlays(
 __all__ = [
     "VLLMParameterOverlayRunner",
     "VLLMParameterOverlayController",
-    "finish_parameter_overlay_requests",
+    "consume_parameter_overlay_finished_batch",
     "maybe_bind_publisher",
     "synchronize_parameter_overlays",
     "unbind_parameter_overlays",

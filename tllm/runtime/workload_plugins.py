@@ -22,8 +22,11 @@ from tllm.runtime.workload_bindings import (
     SamplerRuntimeBinding,
     WorkloadRuntimeBinding,
 )
+from tllm.runtime.request_trainable_state import RequestStateRuntimeService
 
 if TYPE_CHECKING:
+    import torch
+
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -373,6 +376,34 @@ def reconstruct_worker_bindings(
                     f"worker reconstruction references unknown state {resource!r}"
                 ) from exc
             state_versions[resource] = StateVersionBinding(state, snapshot)
+    request_state_services: dict[
+        str, RequestStateRuntimeService["torch.nn.Module"]
+    ] = {}
+    for declaration, item in zip(declarations, reconstructed, strict=True):
+        for local_name, service in item.request_state_services.items():
+            resource = (
+                f"{declaration.ir.workload_id}/{local_name}"
+                if multiple
+                else local_name
+            )
+            if resource in request_state_services:
+                raise RuntimeError(
+                    "worker reconstruction has duplicate request-state service "
+                    f"binding {resource!r}"
+                )
+            try:
+                state = schedule_states[resource]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "worker reconstruction references unknown request state "
+                    f"{resource!r}"
+                ) from exc
+            if state.scope != "request":
+                raise RuntimeError(
+                    "worker reconstruction request-state service is not bound to "
+                    f"a request resource {resource!r}"
+                )
+            request_state_services[resource] = service.for_signed_resource(resource)
     sampler_bindings: list[SamplerRuntimeBinding] = []
     for item in reconstructed:
         match item.sampler:
@@ -458,6 +489,7 @@ def reconstruct_worker_bindings(
             outputs=merge_outputs(),
         ),
         state_versions=state_versions,
+        request_state_services=request_state_services,
         optimizer_transitions=optimizer_transitions,
         sampler=(NoSamplerBinding() if not sampler_bindings else sampler_bindings[0]),
         diagnostics_readers=diagnostics_readers,

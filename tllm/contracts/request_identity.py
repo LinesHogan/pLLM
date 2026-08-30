@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import cast
 
 
 class RequestKeyField(StrEnum):
@@ -21,6 +22,39 @@ class RequestIdentity:
     request_id: str
     prompt_idx: int
     sample_idx: int
+
+    def to_wire(self) -> dict[str, str | int]:
+        """Encode the closed identity used by the MP lifecycle reply."""
+
+        return {
+            "request_id": self.request_id,
+            "prompt_idx": self.prompt_idx,
+            "sample_idx": self.sample_idx,
+        }
+
+    @classmethod
+    def from_wire(cls, payload: object) -> "RequestIdentity":
+        """Decode one exact, canonical request identity from MP wire data."""
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("request identity must be an exact wire object")
+        fields = cast(Mapping[str, object], payload)
+        if set(fields) != {
+            "request_id",
+            "prompt_idx",
+            "sample_idx",
+        }:
+            raise TypeError("request identity must be an exact wire object")
+        request_id = fields["request_id"]
+        prompt_idx = fields["prompt_idx"]
+        sample_idx = fields["sample_idx"]
+        if type(request_id) is not str or not request_id:
+            raise TypeError("request identity request_id must be a non-empty string")
+        if type(prompt_idx) is not int or prompt_idx < 0:
+            raise TypeError("request identity prompt_idx must be a non-negative integer")
+        if type(sample_idx) is not int or sample_idx < 0:
+            raise TypeError("request identity sample_idx must be a non-negative integer")
+        return cls(request_id, prompt_idx, sample_idx)
 
 
 @dataclass(frozen=True, slots=True)
