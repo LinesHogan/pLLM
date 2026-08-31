@@ -6,7 +6,12 @@ from dataclasses import dataclass
 
 import torch
 
-from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
+from tllm.canonical.ptts.dense_page_planning import (
+    DensePageCpuProviderFacts,
+    DensePageCudaProviderFacts,
+    DensePageProviderFacts,
+)
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from tllm.contracts.packed_hidden import (
     PackedHiddenResourceBinding,
@@ -24,6 +29,7 @@ from tllm.contracts.semantic_graph import (
 )
 from tllm.contracts.state_ref import StateRef
 from tllm.contracts.state_representation import StatePhysicalPlan
+from tllm.contracts.state_representation import StateDeviceKind
 from tllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 
 
@@ -35,6 +41,15 @@ ESAMP_REQUEST_PREDICT_IMPLEMENTATION = ImplementationId(
 )
 ESAMP_REQUEST_TRAIN_IMPLEMENTATION = ImplementationId(
     "canonical.esamp_request:cpu_train@1"
+)
+ESAMP_REQUEST_CUDA_LOSS_IMPLEMENTATION = ImplementationId(
+    "canonical.esamp_request:cuda_loss@1"
+)
+ESAMP_REQUEST_CUDA_PREDICT_IMPLEMENTATION = ImplementationId(
+    "canonical.esamp_request:cuda_predict@1"
+)
+ESAMP_REQUEST_CUDA_TRAIN_IMPLEMENTATION = ImplementationId(
+    "canonical.esamp_request:cuda_train@1"
 )
 
 ESAMP_PARAMETER_FIELD = LayoutFieldId(0)
@@ -92,6 +107,8 @@ class ESampRequestSpecialization:
     tensor_dtype: TensorDType
     initialization_seed: int
     hidden_bindings: "ESampRequestPackedHiddenBindings"
+    device_kind: StateDeviceKind
+    device_ordinal: int
 
     def __post_init__(self) -> None:
         if (
@@ -99,9 +116,16 @@ class ESampRequestSpecialization:
             or type(self.tensor_dtype) is not TensorDType
             or type(self.initialization_seed) is not int
             or type(self.hidden_bindings) is not ESampRequestPackedHiddenBindings
+            or type(self.device_kind) is not StateDeviceKind
+            or type(self.device_ordinal) is not int
             or self.hidden_size < 1
             or self.tensor_dtype is not TensorDType.FLOAT32
             or self.initialization_seed < 0
+            or self.device_ordinal < 0
+            or (
+                self.device_kind is StateDeviceKind.CPU
+                and self.device_ordinal != 0
+            )
         ):
             raise ValueError(
                 "CPU ESamp specialization requires positive float32 dimensions"
@@ -140,14 +164,15 @@ class ESampRequestPackedHiddenBindings:
 @dataclass(frozen=True, slots=True)
 class ESampRequestCompileOptions:
     timeline: SchedulerTimeline
-    providers: tuple[DensePageCpuProviderFacts, ...]
+    providers: tuple[DensePageProviderFacts, ...]
     max_admitted_lineages: int
     state_memory_budget_bytes: int
     plan_epoch: int = 1
 
     def __post_init__(self) -> None:
         if type(self.providers) is not tuple or any(
-            type(provider) is not DensePageCpuProviderFacts
+            type(provider)
+            not in (DensePageCpuProviderFacts, DensePageCudaProviderFacts)
             for provider in self.providers
         ):
             raise ValueError("ESamp providers must be exact CPU provider facts")
@@ -171,13 +196,15 @@ class ESampRequestCompileOptions:
 class ESampRequestStepInput:
     rows: PackedPhaseRowBatch
     sampler_rows: PackedSamplerRowBatch
-    hidden: PackedHiddenSnapshotBatch
+    hidden: PackedHiddenSnapshotBatch | CudaPackedHiddenSnapshotBatch
 
     def __post_init__(self) -> None:
-        if (
-            self.sampler_rows.row_batch != self.rows
-            or self.hidden.row_batch != self.rows
-        ):
+        match self.hidden:
+            case PackedHiddenSnapshotBatch(row_batch=row_batch):
+                pass
+            case CudaPackedHiddenSnapshotBatch(batch=batch):
+                row_batch = batch.row_batch
+        if self.sampler_rows.row_batch != self.rows or row_batch != self.rows:
             raise ValueError(
                 "ESamp request step requires one exact packed row provenance"
             )
@@ -209,6 +236,7 @@ class ESampRequestDiagnostics:
     loss_count: int
     update_count: int
     completed_sampler_pins: int
+    pending_state_releases: int
     state_plan: StatePhysicalPlan
 
 

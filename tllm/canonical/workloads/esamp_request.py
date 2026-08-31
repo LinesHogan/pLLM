@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout
+from tllm.canonical.ptts import CudaDensePageStateProvider
 from tllm.canonical.ptts.dense_page import DensePageStateProvider
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.canonical.scheduler import (
@@ -22,8 +23,12 @@ from tllm.canonical.tensor_layout import (
     validate_tensor_layouts,
 )
 from tllm.canonical.workloads.esamp_request_cpu import (
-    ESampRequestExecution,
-    ESampRequestStepHandle,
+    ESampRequestExecution as ESampRequestCpuExecution,
+    ESampRequestStepHandle as ESampRequestCpuStepHandle,
+)
+from tllm.canonical.workloads.esamp_request_cuda import (
+    ESampRequestCudaExecution,
+    ESampRequestCudaStepHandle,
 )
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions,
@@ -33,6 +38,9 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESAMP_EXP_AVG_SQ_FIELD,
     ESAMP_GRADIENT_FIELD,
     ESAMP_PARAMETER_FIELD,
+    ESAMP_REQUEST_CUDA_LOSS_IMPLEMENTATION,
+    ESAMP_REQUEST_CUDA_PREDICT_IMPLEMENTATION,
+    ESAMP_REQUEST_CUDA_TRAIN_IMPLEMENTATION,
     ESAMP_REQUEST_LOSS_IMPLEMENTATION,
     ESAMP_REQUEST_PREDICT_IMPLEMENTATION,
     ESAMP_REQUEST_TRAIN_IMPLEMENTATION,
@@ -65,6 +73,7 @@ from tllm.contracts.semantic_graph import (
     WorkloadId,
 )
 from tllm.contracts.state_representation import (
+    StateDeviceKind,
     StateLayoutRequirement,
     StateRepresentationRequest,
 )
@@ -83,6 +92,11 @@ _LOSS_TASK = TaskSymbol("loss")
 _PREDICT_TASK = TaskSymbol("predict")
 _TRAIN_TASK = TaskSymbol("train")
 
+ESampRequestExecution = ESampRequestCpuExecution | ESampRequestCudaExecution
+ESampRequestStepHandle = (
+    ESampRequestCpuStepHandle | ESampRequestCudaStepHandle
+)
+
 
 class ESampRequestWorkload:
     """Declare ESamp math/dataflow; Rust owns scheduling and representation."""
@@ -95,6 +109,11 @@ class ESampRequestWorkload:
     def semantic_graph(self) -> SemanticGraph:
         cpu_compute = ("compute/cpu@1",)
         cpu_transition = ("compute/cpu@1", "state/dense_page_cpu@1")
+        cuda_compute = ("compute/cuda@1",)
+        cuda_transition = (
+            "compute/cuda@1",
+            "state/dense_page_cuda@1",
+        )
         selection = StateSelectionInputSource(
             _STATE_RESOURCE,
             HiddenPhase.DECODE,
@@ -153,6 +172,11 @@ class ESampRequestWorkload:
                             ESAMP_REQUEST_LOSS_IMPLEMENTATION,
                             ExecutionKind.NATIVE_TASK,
                             cpu_compute,
+                        ),
+                        TaskImplementationSpec(
+                            ESAMP_REQUEST_CUDA_LOSS_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda_compute,
                         ),
                     ),
                 ),
@@ -214,6 +238,11 @@ class ESampRequestWorkload:
                             ExecutionKind.NATIVE_TASK,
                             cpu_compute,
                         ),
+                        TaskImplementationSpec(
+                            ESAMP_REQUEST_CUDA_PREDICT_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda_compute,
+                        ),
                     ),
                     effects=(
                         SemanticEffect(_STATE_RESOURCE, StateEffectKind.READ),
@@ -241,6 +270,11 @@ class ESampRequestWorkload:
                             ESAMP_REQUEST_TRAIN_IMPLEMENTATION,
                             ExecutionKind.NATIVE_TASK,
                             cpu_transition,
+                        ),
+                        TaskImplementationSpec(
+                            ESAMP_REQUEST_CUDA_TRAIN_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda_transition,
                         ),
                     ),
                     effects=(
@@ -351,6 +385,20 @@ class ESampRequestWorkload:
             )
             for provider in options.providers
         )
+        match specialization.device_kind:
+            case StateDeviceKind.CPU:
+                required_state_capabilities = (
+                    "device/cpu@1",
+                    "optimizer/adamw@1",
+                    "state/exact_versions@1",
+                )
+            case StateDeviceKind.CUDA:
+                required_state_capabilities = (
+                    "device/cuda@1",
+                    "optimizer/adamw@1",
+                    "state/exact_versions@1",
+                    "state/fenced_reclaim@1",
+                )
         representation_request = StateRepresentationRequest(
             memory_budget_bytes=options.state_memory_budget_bytes,
             states=(
@@ -360,11 +408,7 @@ class ESampRequestWorkload:
                     layout_namespace=binding.layout_namespace,
                     layout_digest=binding.layout_digest,
                     max_admitted_lineages=options.max_admitted_lineages,
-                    required_capabilities=(
-                        "device/cpu@1",
-                        "optimizer/adamw@1",
-                        "state/exact_versions@1",
-                    ),
+                    required_capabilities=required_state_capabilities,
                 ),
             ),
             candidates=candidates,
@@ -381,15 +425,6 @@ class ESampRequestWorkload:
             representation,
             plan_epoch=options.plan_epoch,
         )
-        provider = DensePageStateProvider(
-            tensor_layout_request=layout_request,
-            tensor_layout_decision=layout_decision,
-            representation_request=representation_request,
-            representation_decision=representation,
-            physical_plan=state_physical,
-            local_candidates=candidates,
-            resource=str(_STATE_RESOURCE),
-        )
         sampler_anchor_ids = tuple(
             AnchorId(anchor.ordinal)
             for anchor in options.timeline.anchors
@@ -397,24 +432,69 @@ class ESampRequestWorkload:
         )
         if len(sampler_anchor_ids) != 1:
             raise RuntimeError("ESamp timeline requires one sampler.pre_draw anchor")
-        return ESampRequestExecution(
-            config=self.config,
-            specialization=specialization,
-            plan=physical,
-            state_plan=state_physical,
-            kernel_layout=kernel_layout,
-            provider=provider,
-            directory=RequestStateDirectory(
-                binding.layout_id,
-                self.config.key_fields,
-            ),
-            sampler_completion_anchor_id=sampler_anchor_ids[0],
+        (selected_provider,) = representation.plans
+        if (
+            selected_provider.device_kind is not specialization.device_kind
+            or selected_provider.device_ordinal != specialization.device_ordinal
+        ):
+            raise RuntimeError(
+                "Rust-selected state placement differs from specialization"
+            )
+        directory = RequestStateDirectory(
+            binding.layout_id,
+            self.config.key_fields,
         )
+        match selected_provider.device_kind:
+            case StateDeviceKind.CPU:
+                provider = DensePageStateProvider(
+                    tensor_layout_request=layout_request,
+                    tensor_layout_decision=layout_decision,
+                    representation_request=representation_request,
+                    representation_decision=representation,
+                    physical_plan=state_physical,
+                    local_candidates=candidates,
+                    resource=str(_STATE_RESOURCE),
+                )
+                return ESampRequestCpuExecution(
+                    config=self.config,
+                    specialization=specialization,
+                    plan=physical,
+                    state_plan=state_physical,
+                    kernel_layout=kernel_layout,
+                    provider=provider,
+                    directory=directory,
+                    sampler_completion_anchor_id=sampler_anchor_ids[0],
+                )
+            case StateDeviceKind.CUDA:
+                cuda_provider = CudaDensePageStateProvider(
+                    tensor_layout_request=layout_request,
+                    tensor_layout_decision=layout_decision,
+                    representation_request=representation_request,
+                    representation_decision=representation,
+                    physical_plan=state_physical,
+                    local_candidates=candidates,
+                    resource=str(_STATE_RESOURCE),
+                    device_ordinal=selected_provider.device_ordinal,
+                )
+                return ESampRequestCudaExecution(
+                    config=self.config,
+                    specialization=specialization,
+                    plan=physical,
+                    state_plan=state_physical,
+                    kernel_layout=kernel_layout,
+                    provider=cuda_provider,
+                    directory=directory,
+                    sampler_completion_anchor_id=sampler_anchor_ids[0],
+                )
 
 
 __all__ = [
     "ESampRequestCompileOptions",
     "ESampRequestConfig",
+    "ESampRequestCpuExecution",
+    "ESampRequestCpuStepHandle",
+    "ESampRequestCudaExecution",
+    "ESampRequestCudaStepHandle",
     "ESampRequestExecution",
     "ESampRequestSpecialization",
     "ESampRequestStepHandle",

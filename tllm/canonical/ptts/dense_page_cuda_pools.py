@@ -14,7 +14,7 @@ from tllm.canonical.ptts.dense_page_cuda_types import (
     CudaDensePageInitialRoot,
 )
 from tllm.canonical.ptts.dense_page_validation import DensePageSignedSpec
-from tllm.contracts.tensor_layout import TensorDType
+from tllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 
 
 def _cuda_dtype(dtype: TensorDType) -> torch.dtype:
@@ -250,6 +250,29 @@ class CudaDensePagePools:
             return tuple(
                 pool[page_id].detach().clone() for pool in self._pools
             )
+
+    def field_rows(
+        self,
+        page_ids: tuple[int, ...],
+        field_id: LayoutFieldId,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        self._require_stream(stream)
+        if (
+            type(page_ids) is not tuple
+            or not page_ids
+            or type(field_id) is not int
+            or int(field_id) < 0
+            or int(field_id) >= len(self._pools)
+        ):
+            raise ValueError("CUDA field-row projection is invalid")
+        with torch.cuda.stream(stream):
+            indices = torch.tensor(
+                page_ids,
+                dtype=torch.long,
+                device=self._device,
+            )
+            return self._pools[int(field_id)].index_select(0, indices)
 
     def _require_stream(self, stream: torch.cuda.Stream) -> None:
         if type(stream) is not torch.cuda.Stream or stream.device != self._device:

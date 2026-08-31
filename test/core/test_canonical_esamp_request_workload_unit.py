@@ -42,7 +42,10 @@ from tllm.contracts.semantic_graph import (
     SchedulerTimeline,
     TimelineAnchor,
 )
-from tllm.contracts.state_representation import StateRepresentation
+from tllm.contracts.state_representation import (
+    StateDeviceKind,
+    StateRepresentation,
+)
 from tllm.contracts.tensor_layout import TensorDType
 
 
@@ -79,6 +82,8 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
             tensor_dtype=TensorDType.FLOAT32,
             initialization_seed=7,
             hidden_bindings=hidden_bindings,
+            device_kind=StateDeviceKind.CPU,
+            device_ordinal=0,
         ),
         ESampRequestCompileOptions(
             timeline=SchedulerTimeline(

@@ -40,7 +40,11 @@ from tllm.contracts.state_representation import (
     StateRepresentationDecision,
     StateRepresentationRequest,
 )
-from tllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutRequest
+from tllm.contracts.tensor_layout import (
+    LayoutFieldId,
+    TensorLayoutDecision,
+    TensorLayoutRequest,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +420,6 @@ class CudaDensePageStateProvider:
 
     def discard_gradients(self, token: CudaDensePageGradientBatch) -> None:
         with self._lock:
-            self._require_live()
             self._bound_gradients(token)
             self._gradient_batches.pop(token.batch_id)
 
@@ -472,6 +475,17 @@ class CudaDensePageStateProvider:
     ) -> tuple[torch.Tensor, ...]:
         with self._lock:
             return self._snapshot(pin, ref, stream)
+
+    def pinned_field_rows(
+        self,
+        pin: CudaDensePageVersionPin,
+        field_id: LayoutFieldId,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        with self._lock:
+            self._require_stream(stream)
+            page_ids = self._ledger.pinned_page_ids(pin, stream)
+            return self._pools.field_rows(page_ids, field_id, stream)
 
     def _snapshot(
         self,
