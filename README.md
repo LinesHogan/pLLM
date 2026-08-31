@@ -217,7 +217,10 @@ establish Region throughput; no Region throughput claim is currently made.
 
 **Program path** (measured, RTX 4090, synthetic probe: 128 rows × hidden 896, bf16, 50 decode steps): the compiled consumer's train step costs **0.082 ms/step host time vs 0.51 ms/step** for the legacy eager pipeline, and 0.35 ms/step vs 0.55 ms/step wall time — the whole step replays as one captured CUDA graph instead of ~70–90 kernel launches.
 
-The full paired in-engine benchmark (5 alternating rounds, gate: program/legacy ≥ 0.98 output tok/s) is scripted and pending GPU availability; results land in `docs/p5_paired_benchmark_report.json`.
+The five-round Program/legacy report is available at
+`docs/p5_paired_benchmark_report.json`; its ratio is about `0.7968` with
+`gate_pass=false`. It is historical blocking evidence, not native Region
+throughput.
 
 ## What You Can Build
 

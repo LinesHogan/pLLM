@@ -26,10 +26,12 @@ workload = build_esamp_workload(ESampConsumerConfig(implementation="native"))
 runtime = TllmRuntime(workloads=(workload,))
 ```
 
-`"native"` 会拒绝 legacy-only 的 per-request/model-bank 模式、compact capture lane、row
-selection 与非 `post_filter_exact` sampler。model-backed native piecewise CUDA Graph 路径仍未验证
-且未完成；native ESamp 的证据仅为 eager 正确性。Program 与 legacy 仍是迁移/benchmark 路径，
-不是 native workload 吞吐证据。
+`"native"` 已支持 shared state 与 eager per-request state。per-request 模式使用 stable parent
+request ID、Rust 签名的 packed decode selection、显式 sampler-row link、version-2 retire receipt
+和 request cleanup；MRv1/MRv2 in-process 的 legacy/native comparator 已实现 token/loss/update/
+intervention parity。model-bank、compact capture lane、`first_per_prompt` request row selection
+与非 `post_filter_exact` sampler 仍会 fail closed。Program 与 legacy 仍是迁移/benchmark 路径，
+不能用作 native workload 吞吐证据。
 
 ## 主要配置项（`ESampConsumerConfig`）
 
@@ -55,4 +57,4 @@ python -m tllm.workflows.benchmarks.per_request_esamp_benchmark \
 
 - legacy 管线 vs 优化 vLLM 基线（Qwen2.5-7B，min-p 活跃路径，RTX 4090）：**比值 0.9878**（5304.9 vs 5370.6 tok/s）。
 - program 路径单训练步 host 开销（合成探针，128×896 bf16）：**0.082 ms，legacy eager 为 0.51 ms**；整步 CUDA Graph replay ≈ 3–5 次 kernel launch，对比约 70–90 次。
-- 5 轮配对 in-engine benchmark（门禁 program/legacy ≥ 0.98）脚本已备好，结果写入 `docs/p5_paired_benchmark_report.json`，撰写本文时等待 GPU 空出。
+- 5 轮 Program/legacy 配对报告已写入 `docs/p5_paired_benchmark_report.json`；其 ratio 约为 `0.7968`、`gate_pass=false`，是阻断证据而非 native 结果。

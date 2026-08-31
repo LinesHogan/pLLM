@@ -74,6 +74,15 @@ fallback fields with:
   --compare legacy.json native.json
 ```
 
+The comparator is green for both MRv1 and MRv2 in-process. MRv1 aggregate
+loss differs by `2.38e-7`, within the declared `rtol=1e-5, atol=1e-6`; MRv2
+is exact. The MP differential is not green: after clearing initialization
+statistics, the retained MRv1 legacy child performs two intervention states
+for a two-decode request instead of one. A current native MP rerun is also
+environment-blocked before workload startup by a `torchcodec 0.16.0+cu129`
+spawn-child FFmpeg-op import mismatch. Neither blocker is being hidden by a
+relaxed comparator.
+
 Native request cleanup remains the authoritative target: it retires both
 slots at version 2 and clears request mappings. The retained legacy baseline
 has no equivalent request-finish transaction and reports its two prompt-keyed

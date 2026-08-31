@@ -51,11 +51,19 @@ may still report that FlashInfer does not support per-request generators and
 fall back to PyTorch sampling; record that as part of the arm identity. Do not
 disable the compile cache on older installations.
 
-`test/gpu/esamp_ratio_benchmark.py` is the stricter raw/capture-only/tLLM
-ratio harness. It fixes 128 active sequences and 4096 batched tokens and
-requires sampler, placement, capture, training-density, and scheduler-shape
-evidence. Its current `tllm` arm is the hand-tuned legacy baseline, not the
-native `ESampWorkload`.
+`test/gpu/esamp_ratio_benchmark.py` is the stricter
+raw/capture-only/legacy/native ratio harness. It fixes 128 active sequences
+and 4096 batched tokens and requires sampler, capture, training-density, and
+scheduler-shape evidence. The `native` arm exercises shared-state
+`ESampWorkload`; it is not per-request or model-bank evidence.
+
+One 2026-08-31 diagnostic pair on the verified vLLM 0.27.1 environment used
+the 0.5B model, MRv2 in-process, batch `8 × n16`, 128 output tokens, one
+warmup, and one measured round. Raw measured `41,495.6 tok/s`; native measured
+`42,973.9 tok/s`, ratio `1.0356`. Native recorded exactly 127 losses, 127
+intervention samples, 127 Triton candidate-kernel uses, 512 Region executions,
+509 replays, and zero fallback. This one pair is shared-state diagnostic
+evidence, not the formal five-pair native-vs-legacy retirement gate.
 
 ## Memory precondition
 

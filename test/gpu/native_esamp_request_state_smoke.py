@@ -530,6 +530,10 @@ def _run_legacy(args: argparse.Namespace) -> int:
             max_num_seqs=_PARENTS * _PARALLEL_SAMPLES,
             max_num_batched_tokens=16,
         )
+        core.synchronize_esamp()
+        _ = core.read_and_reset_esamp_stats(sync=True)
+        _ = core.read_and_reset_esamp_per_request_stats(sync=True)
+        _ = core.read_and_reset_distiller_timing_stats(sync=True)
         params = SamplingParams(
             n=_PARALLEL_SAMPLES,
             temperature=0.8,
@@ -553,15 +557,16 @@ def _run_legacy(args: argparse.Namespace) -> int:
         per_request = core.read_and_reset_esamp_per_request_stats(sync=True)
         timing = core.read_and_reset_distiller_timing_stats(sync=True)
         expected_updates = _PARENTS * _DECODE_UPDATES
-        if training.loss_count != expected_updates:
-            raise AssertionError(
-                "legacy request baseline did not train every decode step: "
-                f"{training!r}"
-            )
         per_request_loss_counts = {
             str(prompt_idx): stats.loss_count
             for prompt_idx, stats in sorted(per_request.items())
         }
+        if training.loss_count != expected_updates:
+            raise AssertionError(
+                "legacy request baseline did not train every decode step: "
+                f"aggregate={training!r} "
+                f"per_request={per_request_loss_counts!r}"
+            )
         if tuple(per_request_loss_counts.values()) != (
             _DECODE_UPDATES,
         ) * _PARENTS:
@@ -680,6 +685,10 @@ def main() -> int:
             max_num_seqs=_PARENTS * _PARALLEL_SAMPLES,
             max_num_batched_tokens=16,
         )
+        core.synchronize_esamp()
+        _ = core.read_and_reset_esamp_stats(sync=True)
+        _ = core.read_and_reset_esamp_per_request_stats(sync=True)
+        _ = core.read_and_reset_distiller_timing_stats(sync=True)
         plane = ControlPlane.try_bind(llm)
         if plane is None:
             raise AssertionError("native request ESamp smoke has no worker control plane")

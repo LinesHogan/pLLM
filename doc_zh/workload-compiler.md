@@ -142,15 +142,14 @@ worker reconstruction 会按父进程签名的 runtime specialization envelope �
 specialize，重新声明并比较完整 schedule graph，然后物化并上报有序的 Region artifact 集合。
 specialization、graph、binding 或 artifact 任一不匹配都会拒绝 epoch。
 
-`ESampConsumerConfig(implementation="native")` 是独立的 native、已由 CPU 测试覆盖的
-ESamp declaration，而不是 legacy consumer 的包装。它拥有 replica state 及其 optimizer，
-对 distiller 做 cold specialize，并有两个签名 Region：`predict_and_loss` 读取签名 hidden
-input 并发布 guidance；显式的 `update` extern Region 消费其唯一的跨 Region
-materialization（可微 loss）并推进 state version。sampler bridge 只消费同一步、metadata
-匹配的 guidance，不会重算 Region output。source/target binding 使用签名后的数值 layer
-index，其中 target layer 可为 `-1`，并通过显式 residual-path 契约解析。该模式拒绝
-per-request/model-bank state、compact capture lane、row selection 和非
-`post_filter_exact` sampler backend 等 legacy-only feature。native ESamp Region 不能与
+`ESampConsumerConfig(implementation="native")` 是独立的 native declaration，而不是 legacy
+consumer 的包装。shared state 走签名的 prediction/loss/optimizer Region；per-request state
+走 `request_predict`、`request_loss`、`request_train`，并由 packed row/hidden/sampler link 与
+`phase=decode` state selection 共同确定输入。selection 保留原始 packed tensor index，纯
+prefill batch 不 admission、不更新。sampler bridge 只消费同一步、identity 匹配且 version
+大于零的 guidance。source/target binding 使用签名后的数值 layer index，其中 target layer
+可为 `-1`。该模式仍拒绝 model-bank、compact capture、request `first_per_prompt` row
+selection 和非 `post_filter_exact` sampler backend。native ESamp Region 不能与
 legacy ESamp authority 共存。当前迁移期该隔离是 runtime-wide 的：只要 runtime 含有任一
 native Region declaration，所有 legacy dispatch consumer（即使表面上是无关的
 GTTA/TTRL sidecar）都会被拒绝。legacy consumer 尚未声明并签名其 anchor、residual
