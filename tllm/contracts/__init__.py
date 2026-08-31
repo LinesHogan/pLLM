@@ -13,6 +13,11 @@ from tllm.contracts.packed_rows import (
     PackedPhaseRowBatch,
     PackedRowPlanInputs,
 )
+from tllm.contracts.packed_hidden import (
+    PackedHiddenRole,
+    PackedHiddenSnapshotBatch,
+    PackedHiddenSnapshotSpecialization,
+)
 from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
@@ -33,6 +38,9 @@ __all__ = [
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedRowPlanInputs",
+    "PackedHiddenRole",
+    "PackedHiddenSnapshotBatch",
+    "PackedHiddenSnapshotSpecialization",
     "RowBatchMeta",
     "RuntimeContext",
     "RegionShapeSpecializationInput",

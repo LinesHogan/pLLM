@@ -174,6 +174,13 @@ packed hidden inputs and explicit driver sampler links remain required. A
 bounded retired-step high-watermark prevents a completed `(epoch, step)` from
 being staged again with different rows.
 
+An eager `PackedHiddenSnapshotService` now provides the next neutral layer:
+source and target can arrive in either order but must share one canonical row
+batch and exact cold specialization. It owns ordinary tensor clones, returns
+fresh clones to readers, and has bounded step-retirement semantics. It is not
+installed in a backend hook, signed Region input, compile path, or CUDA Graph;
+therefore this foundation alone changes no workload execution claim.
+
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension
 had only libc, libgcc, and loader dependencies; it did not dynamically link

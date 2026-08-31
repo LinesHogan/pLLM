@@ -234,6 +234,14 @@ hidden capture, signed runtime input kinds, and
 driver-provided sampler-row mappings still have to bind this batch before the
 native update count can include prefill.
 
+The matching eager packed-hidden foundation owns source and target snapshots
+under one canonical row batch and an explicit cold capacity/shape/dtype/device
+specialization. Backend inference tensors are cloned into ordinary
+service-owned storage, and reads return independent clones; a bounded finish
+high-watermark prevents step ABA without invalidating an older active step.
+This service is not wired to vLLM hooks or Region inputs yet, and it is not a
+compile/CUDA-Graph path.
+
 A native ESamp Region cannot be co-installed with a legacy ESamp authority.
 During the current migration this
 isolation is runtime-wide: a runtime with any native Region declaration also

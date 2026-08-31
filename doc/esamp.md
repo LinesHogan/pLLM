@@ -58,7 +58,11 @@ until the complete deletion gate passes.
 
 The neutral `PackedPhaseRowStaging` contract now preserves Rust-planned
 prefill/decode rows and stable parent identities across MRv1/MRv2, but it is
-not yet connected to packed hidden capture or native workload execution.
+not yet connected to native workload execution. A separate eager
+`PackedHiddenSnapshotService` now owns exact full-packed source/target clones
+under an explicit epoch, capacity, hidden-size, dtype, and device
+specialization; it deliberately does not reuse decode buffers or claim
+compile/CUDA-Graph support.
 
 ## Key config knobs (`ESampConsumerConfig`)
 
