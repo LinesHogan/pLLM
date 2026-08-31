@@ -16,7 +16,10 @@ import torch
 import torch.nn.functional as F
 
 from tllm.consumers.esamp.engine import group_row_indices_by_prompt
-from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.consumers.esamp.model import (
+    BatchedLowRankGatedResidualModel,
+    LowRankGatedResidualModel,
+)
 from tllm.contracts.request_identity import (
     RequestFinishedBatch,
     RequestIdentity,
@@ -36,6 +39,48 @@ _DTYPE = torch.float32
 _HIDDEN_SIZE = 4
 _RANK = 2
 _LEARNING_RATE = 1e-2
+
+
+def test_batched_low_rank_bank_matches_repeated_independent_slots() -> None:
+    torch.manual_seed(904)
+    bank = BatchedLowRankGatedResidualModel(
+        capacity=2,
+        hidden_size=_HIDDEN_SIZE,
+        rank=_RANK,
+        use_output_layernorm=True,
+        device=_DEVICE,
+        dtype=_DTYPE,
+    )
+    references = tuple(_model() for _ in range(2))
+    with torch.no_grad():
+        for slot, reference in enumerate(references):
+            reference.a.copy_(bank.a[slot])
+            reference.g.copy_(bank.g[slot])
+            reference.b.copy_(bank.b[slot])
+            reference.gate_bias.copy_(bank.gate_bias[slot])
+            match reference.out_ln:
+                case torch.nn.LayerNorm() as output_norm:
+                    output_norm.weight.copy_(bank.out_ln_weight[slot])
+                    output_norm.bias.copy_(bank.out_ln_bias[slot])
+    source = torch.tensor(
+        (
+            (0.1, -0.2, 0.3, -0.4),
+            (0.5, 0.6, -0.7, 0.8),
+            (-0.9, 1.0, 1.1, -1.2),
+        ),
+        dtype=_DTYPE,
+    )
+    slot_ids = torch.tensor((0, 1, 0), dtype=torch.long)
+    expected = torch.cat(
+        tuple(
+            references[slot](source[row : row + 1])
+            for row, slot in enumerate((0, 1, 0))
+        ),
+        dim=0,
+    )
+    torch.testing.assert_close(
+        bank(slot_ids, source), expected, rtol=0.0, atol=0.0
+    )
 
 
 def _model() -> LowRankGatedResidualModel:

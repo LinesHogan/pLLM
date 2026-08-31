@@ -4,20 +4,44 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-from tllm.runtime.config import ModelBankForwardBackendName, normalize_model_bank_forward_backend
+from tllm.runtime.config import (
+    ModelBankForwardBackendName,
+    normalize_model_bank_forward_backend,
+)
 
 __all__ = [
+    "ModelBankParameters",
     "ModelBankForwardBackendName",
     "normalize_model_bank_forward_backend",
 ]
 
-import triton
-import triton.language as tl
+
+class ModelBankParameters(Protocol):
+    @property
+    def a(self) -> torch.Tensor: ...
+
+    @property
+    def g(self) -> torch.Tensor: ...
+
+    @property
+    def b(self) -> torch.Tensor: ...
+
+    @property
+    def gate_bias(self) -> torch.Tensor: ...
+
+    @property
+    def out_ln_weight(self) -> torch.Tensor: ...
+
+    @property
+    def out_ln_bias(self) -> torch.Tensor: ...
+
 
 class ESampModelBankForwardBackend(Protocol):
     name: str
@@ -27,7 +51,7 @@ class ESampModelBankForwardBackend(Protocol):
         *,
         slot_ids: torch.Tensor,
         src: torch.Tensor,
-        params: Any,
+        params: ModelBankParameters,
         use_output_layernorm: bool,
     ) -> torch.Tensor:
         ...
@@ -42,7 +66,7 @@ class TorchModelBankForwardBackend:
         *,
         slot_ids: torch.Tensor,
         src: torch.Tensor,
-        params: Any,
+        params: ModelBankParameters,
         use_output_layernorm: bool,
     ) -> torch.Tensor:
         a_rows = params.a.index_select(0, slot_ids)
@@ -64,7 +88,7 @@ def _apply_output_layernorm(
     *,
     out: torch.Tensor,
     slot_ids: torch.Tensor,
-    params: Any,
+    params: ModelBankParameters,
     use_output_layernorm: bool,
 ) -> torch.Tensor:
     if not use_output_layernorm:
@@ -81,7 +105,11 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (int(value) - 1).bit_length()
 
 
-def _triton_supported(slot_ids: torch.Tensor, src: torch.Tensor, params: Any) -> bool:
+def _triton_supported(
+    slot_ids: torch.Tensor,
+    src: torch.Tensor,
+    params: ModelBankParameters,
+) -> bool:
     if not _triton_available():
         return False
     if src.device.type != "cuda" or slot_ids.device.type != "cuda":
@@ -171,7 +199,7 @@ class TritonGroupedModelBankForwardBackend:
         *,
         slot_ids: torch.Tensor,
         src: torch.Tensor,
-        params: Any,
+        params: ModelBankParameters,
         use_output_layernorm: bool,
     ) -> torch.Tensor:
         if not _triton_supported(slot_ids, src, params):
