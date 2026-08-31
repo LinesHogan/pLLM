@@ -39,8 +39,11 @@ Its core is a compiler middle-end with three data contracts:
 the same dependence/effect vocabulary only during migration.
 
 **Current GPU correctness evidence (not a throughput result):** with
-`torch==2.13.0+cu129` and `vllm==0.27.1`, native Dummy, native Recirculation,
-and native ESamp passed exact eager, in-process MRv1/MRv2 short smokes.
+`torch==2.13.0+cu129` and `vllm==0.27.1`, native Recirculation and native
+ESamp passed exact eager, in-process MRv1/MRv2 short smokes. The former
+runtime-backed Dummy GPU/MP evidence is frozen historical context: the public
+Dummy entry now targets a clean-room CPU vertical oracle and makes no GPU/MP
+claim.
 Recirculation also passed EngineCore MP on both runners, including a mixed
 prefill/decode packed step; each cell replayed two requests and seven prompt
 rows with zero fallback. ESamp reported

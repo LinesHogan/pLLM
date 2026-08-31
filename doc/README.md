@@ -31,8 +31,10 @@ Unsupported native or compatibility declarations fail closed; there is no
 silent fallback.
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, GPU correctness covers exact
-eager in-process native Dummy, native Recirculation, and native ESamp on
-MRv1/MRv2. Recirculation also passed EngineCore MP on both runners, replaying
+eager in-process native Recirculation and native ESamp on MRv1/MRv2.
+The former runtime-backed Dummy GPU/MP evidence is frozen historical context:
+its public entry now targets a clean-room CPU vertical oracle and makes no
+GPU/MP claim. Recirculation also passed EngineCore MP on both runners, replaying
 two requests and seven prompt rows with zero fallback. The
 latest request-scoped ESamp smoke records four losses/updates, two parent
 slots retired at version 2, one intervention state when enabled, and zero

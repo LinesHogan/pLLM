@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
-"""Native Dummy CPU-export workload."""
+"""Public routing boundary for the clean-room Dummy workload."""
 
-from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
+from tllm.canonical.workloads.dummy import DummyConfig, DummyWorkload
 
 __all__ = ["DummyConfig", "DummyWorkload"]

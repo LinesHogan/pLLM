@@ -173,22 +173,20 @@ capture、decode recurrence、speculative decoding、TP/PP/DP、正常 hook reti
 model-family 支持仍在已验证边界之外。旧 standalone/vLLM 专用 workload class、legacy Rust
 planner 与 model-region adapter 已删除。
 
-Dummy、FTTT、GTTA、In-Place-TTT、TLM、TTRL、ReFT、OverRIDE、Recirculation 与
-ESamp 都已有 native workload definition。只有 ESamp 在最终 parity/吞吐门禁关闭前保留
-显式命名的 legacy/Program benchmark baseline。
+FTTT、GTTA、In-Place-TTT、TLM、TTRL、ReFT、OverRIDE、Recirculation 与 ESamp 都已有
+native workload definition。只有 ESamp 在最终 parity/吞吐门禁关闭前保留显式命名的
+legacy/Program benchmark baseline。
 
-独立 Dummy workload 现在是完整的 `NativeWorkload`。它的 typed singleton extern
-Region 使用通用 Region executor，并返回闭合 `WorkloadRuntimeBinding`，其中包含 layer-0
-residual path、CPU-export service、specialization identity 和 worker reconstruction。它不再
-注册或查询 legacy `DummyConsumer`，旧的 Dummy 专用物化分支已删除。
-缺少 binding、`eager_only` capability 或已解析 residual resource 都会 fail closed。
-旧 `feedback_interval` 与 `capture_policy` 兼容开关已随 `DummyConsumer` 退役；native
-同步通过显式 service 完成。
+public Dummy 入口现已切换到 clean-room CPU vertical workload。它的 SemanticGraph、Rust
+schedule decision、PhysicalPlan 与 execution 走同一闭合路径；旧的
+`tllm.workload`/runtime 实现及其 stream、transfer、worker 与 GPU smoke 入口均已删除。
+当前证据仅为 CPU vertical oracle，不宣称 GPU 或 EngineCore-MP 覆盖。
 
 ## 当前验证边界
 
-在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，短 GPU 正确性 smoke 已覆盖通用 native Dummy、
-native Recirculation vLLM prefill 与 native ESamp 的 exact eager in-process MRv1/MRv2。
+在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，短 GPU 正确性 smoke 已覆盖
+native Recirculation vLLM prefill 与 native ESamp 的 exact eager in-process MRv1/MRv2；
+Dummy 仅由 clean-room CPU vertical oracle 覆盖。
 Recirculation 还通过了两种 runner 的 EngineCore MP；四格均 replay 两个请求、七个 prompt
 rows，fallback 为零。最新 ESamp：`loss_count=6`、
 `update_count=6`、`state_version=6`、`fallback_count=0`。native ESamp exact eager Region 还通过

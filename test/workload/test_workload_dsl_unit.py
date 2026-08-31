@@ -587,36 +587,18 @@ class WorkloadDslUnitTest(unittest.TestCase):
         self.assertEqual(tuple(edge.kind.value for edge in ir.edges), ("data", "effect"))
         self.assertEqual(tuple(task.task_id for task in graph.tasks), ("predict", "update"))
 
-    def test_builtin_dummy_is_native_while_legacy_esamp_keeps_its_adapter(self) -> None:
-        from tllm.consumers.dummy import DummyWorkload
+    def test_legacy_esamp_keeps_its_adapter(self) -> None:
         from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
         from tllm.runtime.runtime import TllmRuntime
 
-        dummy = DummyWorkload()
         esamp = build_esamp_workload(ESampConsumerConfig(implementation="legacy"))
-        dummy_runtime = TllmRuntime(workloads=(dummy,))
         esamp_runtime = TllmRuntime(workloads=(esamp,))
 
-        self.assertFalse(hasattr(dummy, "legacy_consumer"))
-        self.assertEqual(dummy_runtime.consumers, ())
-        self.assertIsNotNone(dummy_runtime.workload_execution_bindings)
         self.assertEqual(len(esamp_runtime.consumers), 1)
-        self.assertEqual(declare_workload(dummy).ir.workload_id, "dummy")
-        self.assertEqual(
-            tuple(item.name for item in declare_workload(dummy).ir.tasks[0].inputs),
-            ("hidden_rows", "step_id"),
-        )
-        self.assertEqual(
-            tuple(item.kind.value for item in declare_workload(dummy).ir.tasks[0].inputs),
-            ("hidden", "step_id"),
-        )
         esamp_ir = declare_workload(esamp).ir
         self.assertEqual(esamp_ir.workload_id, "esamp")
         self.assertEqual(esamp_ir.schedule, ("predict_and_loss", "update"))
-        self.assertEqual(
-            esamp_ir.states[0].request_key,
-            (),
-        )
+        self.assertEqual(esamp_ir.states[0].request_key, ())
 
         per_request_esamp = build_esamp_workload(
             ESampConsumerConfig(

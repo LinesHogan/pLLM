@@ -11,6 +11,12 @@ boundary 收口后，不再向旧 frontend/runtime/WorkGraph 回填。新 Python
 `tllm/canonical/`，Rust 核心位于 `rust/tllm_core/src/canonical/`；新旧共存
 只允许发生在最外层 routing boundary。
 
+第一个纵向切片 Dummy 已经通过该边界：public `tllm.consumers.dummy`
+只在 package routing boundary 转发到 clean-room implementation，实际执行链为
+`SemanticGraph → Rust schedule → Rust PhysicalPlan → strict single-task execution`。旧
+Dummy workload/stream/transfer/worker 与只验证它们的 runtime/MP/GPU 测试已删除。
+当前 Dummy 证据只是 CPU public-entry vertical oracle，不宣称 GPU/MP 已迁移。
+
 ## 总结
 
 当前代码具有一个有效的最小 immutable-root prototype：固定地址 tensor pools、

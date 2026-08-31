@@ -18,6 +18,7 @@ mod workload_frontend;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    canonical::scheduler::register(m)?;
     canonical::state_representation::register(m)?;
     canonical::tensor_layout::register(m)?;
     decode_localization::register(m)?;

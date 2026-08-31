@@ -216,11 +216,15 @@ had only libc, libgcc, and loader dependencies; it did not dynamically link
 
 With `CUDA_VISIBLE_DEVICES=0`, offline model loading, and
 `--gpu-mem 0.15`, serial correctness smokes passed for Region CUDA Graph,
-native Dummy MRv1/MRv2, native Recirculation MRv1/MRv2, native ESamp
+native Recirculation MRv1/MRv2, native ESamp
 in-process MRv1/MRv2, and native ESamp EngineCore MP MRv1/MRv2. ESamp reported
 nonzero loss/update/state/intervention evidence and zero fallback; Recirculation
 reported typed layer replay and zero fallback. Throughput benchmarks were
 intentionally not run for this freeze.
+
+The runtime-backed Dummy smoke mentioned by earlier revisions is frozen
+historical evidence. The public Dummy entry now targets the clean-room CPU
+vertical oracle; no Dummy GPU or EngineCore-MP claim remains.
 
 A 2026-08-30 follow-up extended native Recirculation eager correctness to
 MRv1/MRv2 × in-process/EngineCore-MP. Every cell replayed two requests and

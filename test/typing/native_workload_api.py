@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from tllm.kit.workload import Workload
-from tllm.consumers.dummy.workload import DummyConfig, DummyWorkload
 from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
 from tllm.consumers.override.workload import OverRIDEConfig, OverRIDEWorkload
@@ -53,8 +52,7 @@ from tllm.workload import (
 )
 
 NativeWorkloadSet = (
-    DummyWorkload
-    | ESampWorkload
+    ESampWorkload
     | OverRIDEWorkload
     | ReftWorkload
     | TTRLWorkload
@@ -63,7 +61,6 @@ NativeWorkloadSet = (
 
 
 def declarations() -> tuple[
-    DummyWorkload,
     ESampWorkload,
     OverRIDEWorkload,
     ReftWorkload,
@@ -71,7 +68,6 @@ def declarations() -> tuple[
     RecirculationWorkload,
 ]:
     return (
-        DummyWorkload(DummyConfig()),
         ESampWorkload(ESampConfig()),
         OverRIDEWorkload(OverRIDEConfig()),
         ReftWorkload(ReftConfig()),

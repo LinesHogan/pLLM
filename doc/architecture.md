@@ -17,8 +17,10 @@ infer capture from task types, streams, or runtime names. Unsupported
 capability, artifact, or binding is a cold-install rejection.
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, verified GPU correctness covers
-native Dummy, native Recirculation, and native ESamp exact eager, in-process
-execution on MRv1 and MRv2. Recirculation also passed EngineCore MP on both
+native Recirculation and native ESamp exact eager, in-process execution on
+MRv1 and MRv2. The former runtime-backed Dummy GPU/MP evidence is frozen
+historical context: the public Dummy entry now targets a clean-room CPU
+vertical oracle and makes no GPU/MP claim. Recirculation also passed EngineCore MP on both
 runners, replaying two requests and seven prompt rows with zero fallback. The
 latest short ESamp smoke had `loss_count=6`, `update_count=6`,
 `state_version=6`, and `fallback_count=0`. Native ESamp exact eager Regions

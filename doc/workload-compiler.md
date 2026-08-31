@@ -328,25 +328,22 @@ TP/PP/DP, normal hook retirement, and general model-family support remain
 outside its verified boundary. The old standalone and vLLM-specific workload classes,
 legacy Rust planner, and model-region adapter have been removed.
 
-Dummy, FTTT, GTTA, In-Place-TTT, TLM, TTRL, ReFT, OverRIDE, Recirculation,
-and ESamp all have native workload definitions. Only ESamp retains explicitly
-named legacy/Program benchmark baselines while its final parity and throughput
-gate remains open.
+FTTT, GTTA, In-Place-TTT, TLM, TTRL, ReFT, OverRIDE, Recirculation, and ESamp
+have native workload definitions. Only ESamp retains explicitly named
+legacy/Program benchmark baselines while its final parity and throughput gate
+remains open.
 
-The standalone Dummy workload is now a complete `NativeWorkload`. Its typed
-singleton extern Region uses the generic Region executor and returns a closed
-`WorkloadRuntimeBinding` for the layer-0 residual path, CPU-export service,
-specialization identity, and worker reconstruction.
-It neither registers nor consults a legacy `DummyConsumer`, and the old
-Dummy-specific materialization branch has been removed. Missing bindings,
-the `eager_only` capability, or a resolved residual resource fail closed.
-The old `feedback_interval` and `capture_policy` compatibility knobs were
-retired with `DummyConsumer`; native synchronization is an explicit service.
+The public Dummy entry now routes to a clean-room CPU vertical workload. Its
+semantic graph, Rust schedule decision, physical plan, and execution are one
+closed path; the old `tllm.workload`/runtime implementation and its stream,
+transfer, worker, and GPU smoke entry have been deleted. Its current evidence
+is the CPU vertical oracle only, not GPU or EngineCore-MP coverage.
 
 ## Current verification boundary
 
 With `torch==2.13.0+cu129` and `vllm==0.27.1`, short GPU correctness smokes
-cover native Dummy, Recirculation, OverRIDE, TTRL, ESamp, and TLM. TLM's MRv2 eager smoke
+cover native Recirculation, OverRIDE, TTRL, ESamp, and TLM. Dummy is covered
+only by its clean-room CPU vertical oracle. TLM's MRv2 eager smoke
 performs real HF/PEFT training and installs the published generic LoRA version;
 Recirculation
 passed typed layer replay in-process and under EngineCore MP on MRv1/MRv2;

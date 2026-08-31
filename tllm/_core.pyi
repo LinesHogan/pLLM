@@ -709,6 +709,24 @@ def validate_canonical_tensor_layouts(
     request_json: str,
     decision_json: str,
 ) -> None: ...
+def compile_canonical_schedule(graph_json: str, timeline_json: str) -> str: ...
+def validate_canonical_schedule(
+    graph_json: str,
+    timeline_json: str,
+    decision_json: str,
+) -> None: ...
+def lower_canonical_physical_plan(
+    graph_json: str,
+    timeline_json: str,
+    decision_json: str,
+    plan_epoch: int,
+) -> str: ...
+def validate_canonical_physical_plan(
+    graph_json: str,
+    timeline_json: str,
+    decision_json: str,
+    physical_json: str,
+) -> None: ...
 def validate_workload_compilation_wire(
     cache_key: str,
     graph_json: str,

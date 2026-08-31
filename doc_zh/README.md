@@ -26,7 +26,9 @@ adapter，但不会用于新的物理调度决策。
 不支持的 native 或兼容声明都会 fail closed；没有静默 fallback。
 
 在 `torch==2.13.0+cu129` 与 `vllm==0.27.1` 上，GPU 正确性已覆盖 exact eager in-process 的
-native Dummy、native Recirculation 与 native ESamp，均通过 MRv1/MRv2。Recirculation 观察到
+native Recirculation 与 native ESamp，均通过 MRv1/MRv2。旧 runtime-backed Dummy 的 GPU/MP
+证据冻结为历史；public Dummy 入口当前仅由 clean-room CPU vertical oracle 覆盖，不宣称
+GPU/MP。Recirculation 观察到
 typed layer replay 且 fallback 为零；它还通过了两种 runner 的 EngineCore MP，四格均 replay
 两个请求、七个 prompt rows。最新 ESamp 短 smoke：`loss_count=6`、
 `update_count=6`、`state_version=6`、`fallback_count=0`。native ESamp exact eager Region

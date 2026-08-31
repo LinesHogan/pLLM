@@ -108,8 +108,9 @@ boundary 回归分别位于
 动态链接 `libisl`。
 
 在 `CUDA_VISIBLE_DEVICES=0`、离线 model cache、`--gpu-mem 0.15` 下，严格串行的正确性 smoke
-全部通过：Region CUDA Graph、native Dummy MRv1/MRv2、native Recirculation MRv1/MRv2、native
-ESamp in-process MRv1/MRv2、native ESamp EngineCore MP MRv1/MRv2。ESamp 的
+全部通过：Region CUDA Graph、native Recirculation MRv1/MRv2、native ESamp in-process
+MRv1/MRv2、native ESamp EngineCore MP MRv1/MRv2。旧 runtime-backed Dummy 的 GPU/MP 证据
+冻结为历史；public Dummy 当前仅由 clean-room CPU vertical oracle 覆盖。ESamp 的
 loss/update/state/intervention 证据非零且 fallback 为零；Recirculation 观察到 typed layer replay 且
 fallback 为零。本次冻结按要求没有运行吞吐 benchmark。
 
