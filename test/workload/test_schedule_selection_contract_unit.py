@@ -378,7 +378,7 @@ class ScheduleSelectionContractUnitTest(unittest.TestCase):
 
         stale = json.loads(decision.to_json())
         stale["schema_version"] = 5
-        with self.assertRaisesRegex(ValueError, "schema v5 is stale.*v6"):
+        with self.assertRaisesRegex(ValueError, "schema v5 is stale.*v7"):
             ScheduleDecision.from_json(json.dumps(stale))
 
         with self.assertRaisesRegex(ValueError, "schema v4 cannot carry"):

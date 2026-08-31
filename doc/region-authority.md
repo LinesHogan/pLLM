@@ -23,7 +23,7 @@ artifact key, and decision signature, not capability evidence.
 
 | Interface | Required stable fields | Failure behavior |
 | --- | --- | --- |
-| `ScheduleDecision` v5 / `ExecutionRegion` | ids, anchors, dependencies, materializations, effects, capture/stream/fallback, signed side waits and host commands, async-batch mode/key, artifact key, `compile_command` | unknown, missing, unsigned, stale-v2/v3/v4, or noncanonical field rejects |
+| `ScheduleDecision` v7 / `ExecutionRegion` | ids, anchors, dependencies, materializations, effects, capture/stream/fallback, packed-row provenance, signed side waits and host commands, async-batch mode/key, artifact key, `compile_command` | unknown, missing, unsigned, stale or noncanonical field rejects; prior schemas never execute as current |
 | `RegionCompileCommand` | adapter, fullgraph, dynamic, ordered shape specialization, autograd, fallback | unsupported adapter or compiler failure raises; no eager retry |
 | `RegionCallableArtifact` | Region id/key, ordered input/output keys, exact typed bindings/effects, local callable, compiled marker, command | missing/mismatched callable/key/binding rejects before execution |
 | `BackendRegionBinderSlot` | signed implementation id and event context; exact-once `stage` then `invoke`, `clear`, or `abort` | duplicate/stale/missing stage rejects; a failed callback is never retried |
@@ -52,7 +52,8 @@ stream, or backend model object crosses it.
 1. Declare typed input/output/effect/timing/affine data with `tllm.workload`.
 2. Add a failing schedule-contract test for Region boundaries, effects,
    materializations, and unavailable capabilities.
-3. Assert schema v2, complete Region coverage, and a Rust-signed command for
+3. Assert WorkloadIR v4 / ScheduleGraph v5 / Decision v7, complete Region
+   coverage, and a Rust-signed command for
    every compiled Region.
 4. Bind only local declarations, Tensor/buffers, sinks, residual paths, and
    exact backend stagers. Do not create a task plan, stream placement, or event
@@ -106,11 +107,11 @@ PATH=.venv/bin:$PATH /workspace/pllm/.venv/bin/python tools/check_typing.py
 /workspace/pllm/.venv/bin/python tools/check_region_authority.py
 ```
 
-Results: Rust `46 passed`; Python `1218 passed, 1075 subtests passed`; strict
+Latest follow-up results: Rust `49 passed`; Python `1323 passed, 1082 subtests passed`; strict
 typing `0 errors`; basic typing `152 errors` against a baseline of 152; and the
 authority gate passed across 20 production files. The frozen schema examples
-are `test/workload/golden/schedule_v5_region.json` for a maximal compiled
-Region and `test/workload/golden/schedule_v5_complex_region.json` for typed
+are `test/workload/golden/schedule_v7_region.json` for a maximal compiled
+Region and `test/workload/golden/schedule_v7_complex_region.json` for typed
 extern staging, state effects, materialization, and a fence. Schedule,
 binder/state, recurrence, worker reconstruction, and authority-boundary
 regressions are in
@@ -121,7 +122,7 @@ regressions are in
 `test/runtime/test_execution_region_core_v1_boundary_unit.py`.
 
 Native optimizer tails now carry typed `optimizer_stable` storage evidence
-through ScheduleGraph v3. ScheduleDecision v5 can sign a closed
+through ScheduleGraph v5. ScheduleDecision v7 can sign a closed
 `optimizer_transition` async batch only for a consecutive, Tensor-only,
 strict state-transition chain. Python executes the signed membership and
 order atomically, uses thread-local CUDA capture on the async host thread,
@@ -170,16 +171,19 @@ parent identity, packed row, token offset, and phase; MRv1 and MRv2 share the
 same service. This does not yet stage tensors or execute a workload. In
 particular, a decode-plan ordinal is not treated as a sampler mapping, and the
 current decode capture buffer is not reused for prompt-token rows. Signed
-packed hidden inputs and explicit driver sampler links remain required. A
+runtime binding and explicit driver sampler links remain required. A
 bounded retired-step high-watermark prevents a completed `(epoch, step)` from
 being staged again with different rows.
 
 An eager `PackedHiddenSnapshotService` now provides the next neutral layer:
 source and target can arrive in either order but must share one canonical row
 batch and exact cold specialization. It owns ordinary tensor clones, returns
-fresh clones to readers, and has bounded step-retirement semantics. It is not
-installed in a backend hook, signed Region input, compile path, or CUDA Graph;
-therefore this foundation alone changes no workload execution claim.
+fresh clones to readers, and has bounded step-retirement semantics. WorkloadIR
+v4 / ScheduleGraph v5 / Decision v7 now sign packed-row, packed-hidden, and
+selection provenance and force the initial implementation to eager/default/
+inline. The service is still not installed in a backend hook or runtime input
+resolver, and no CUDA Graph path is claimed; therefore this foundation alone
+changes no workload execution claim.
 
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension

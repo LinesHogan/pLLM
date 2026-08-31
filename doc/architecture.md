@@ -76,7 +76,7 @@ Two principles:
       ▼
 ScheduleGraph ──► Rust legality + granularity + memory planning
       ▼
-signed ScheduleDecision v5 ──► ExecutionRegions + RegionCaptureMode + HostCommands
+signed ScheduleDecision v7 ──► ExecutionRegions + RegionCaptureMode + HostCommands
       ▼
 PhysicalFlowPlan ──► one artifact/callable per Region at signed anchors
 ```

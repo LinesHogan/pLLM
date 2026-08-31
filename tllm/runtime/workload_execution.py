@@ -246,8 +246,8 @@ def lower_signed_materialization_bindings(
     lifetime, producer, or consumer count themselves.
     """
 
-    if decision.schema_version != 6:
-        raise TypeError("decision must be a ScheduleDecision schema v6")
+    if decision.schema_version != 7:
+        raise TypeError("decision must be a ScheduleDecision schema v7")
 
     regions_by_id = {region.region_id: region for region in decision.execution_regions}
     artifacts_by_id: dict[str, RegionCallableArtifact] = {}

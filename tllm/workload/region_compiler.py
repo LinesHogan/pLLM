@@ -367,8 +367,8 @@ class RegionArtifactRegistry:
         decision: ScheduleDecision,
         artifacts: tuple[RegionCallableArtifact, ...],
     ) -> None:
-        if decision.schema_version != 6:
-            raise ValueError("decision must use ScheduleDecision schema v6")
+        if decision.schema_version != 7:
+            raise ValueError("decision must use ScheduleDecision schema v7")
         by_region: dict[str, RegionCallableArtifact] = {}
         for artifact in artifacts:
             if artifact.region_id in by_region:
@@ -678,8 +678,8 @@ def materialize_region_artifacts(
 ) -> tuple[RegionCallableArtifact, ...]:
     """Materialize every signed Region without changing its partition or order."""
 
-    if decision.schema_version != 6:
-        raise ValueError("decision must use ScheduleDecision schema v6")
+    if decision.schema_version != 7:
+        raise ValueError("decision must use ScheduleDecision schema v7")
     artifacts = tuple(
         materialize_region_callable(
             declarations,

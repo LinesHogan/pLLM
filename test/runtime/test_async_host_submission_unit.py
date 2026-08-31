@@ -288,7 +288,7 @@ class AsyncHostSubmissionUnitTest(unittest.TestCase):
         if async_started.is_set() and "main-cuda-wait" not in trace:
             trace.append("main-cuda-wait")
 
-    def test_rust_v6_signs_closed_host_commands_in_region_order(self) -> None:
+    def test_rust_v7_signs_closed_host_commands_in_region_order(self) -> None:
         _, compilation = self._compile(_TailControl())
         regions = {
             task_name: region.region_id
@@ -307,7 +307,7 @@ class AsyncHostSubmissionUnitTest(unittest.TestCase):
             if regions["update"] in advance.region_ids
         )
 
-        self.assertEqual(compilation.decision.schema_version, 6)
+        self.assertEqual(compilation.decision.schema_version, 7)
         self.assertEqual(execute_advance.region_ids, (regions["predict"],))
         self.assertEqual(
             execute_advance.host_commands,

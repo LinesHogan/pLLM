@@ -234,7 +234,7 @@ def workload_compilation_cache_key(
     options = effective_compile_options(options)
     payload = "\0".join(
         (
-            "workload-compilation-v6",
+            "workload-compilation-v7",
             graph.to_json(),
             timeline.to_json(),
             options.to_json(),

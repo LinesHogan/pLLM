@@ -7,6 +7,7 @@ import hashlib
 from tllm.schedule.contracts import (
     ScheduleAffineAccess,
     ScheduleAffineExpr,
+    ScheduleCapability,
     ScheduleDomain,
     ScheduleEdge,
     ScheduleEdgeKind,
@@ -52,14 +53,21 @@ def lower_schedule_graph(
 
     if persistent_state_bytes < 0:
         raise ValueError("persistent_state_bytes must be non-negative")
+    has_native_v4 = any(workload.schema_version == 4 for workload in workloads)
     has_native_v3 = any(workload.schema_version == 3 for workload in workloads)
+    if has_native_v4 and any(
+        workload.schema_version != 4 for workload in workloads
+    ):
+        raise ValueError(
+            "cannot combine native WorkloadIR v4 with an older WorkloadIR"
+        )
     if has_native_v3 and any(
         workload.schema_version < 3 for workload in workloads
     ):
         raise ValueError(
             "cannot combine native WorkloadIR v3 with legacy WorkloadIR"
         )
-    graph_schema_version = 4 if has_native_v3 else 3
+    graph_schema_version = 5 if has_native_v4 else 4 if has_native_v3 else 3
     semantic_keys = tuple(workload.semantic_key for workload in workloads)
     combined_key = hashlib.sha256("\n".join(semantic_keys).encode("ascii")).hexdigest()
     multiple = len(workloads) > 1
@@ -121,6 +129,20 @@ def lower_schedule_graph(
                     for capability in implementation.capabilities
                     if capability not in _IMPLEMENTATION_EVIDENCE
                 )
+            if any(
+                task_input.kind is ValueSourceKind.PACKED_REQUEST_ROWS
+                for task_input in task.inputs
+            ):
+                common_capabilities.add(
+                    ScheduleCapability.PACKED_PHASE_ROWS.value
+                )
+            if any(
+                task_input.kind is ValueSourceKind.PACKED_HIDDEN
+                for task_input in task.inputs
+            ):
+                common_capabilities.add(
+                    ScheduleCapability.PACKED_HIDDEN_BLOCK_OUTPUT.value
+                )
             tasks.append(
                 ScheduleTask(
                     task_id(workload, task.name),
@@ -163,6 +185,14 @@ def lower_schedule_graph(
                             "runtime.async_host_safe"
                             not in implementation.capabilities
                             for implementation in task.implementations
+                        )
+                        and all(
+                            task_input.kind
+                            not in (
+                                ValueSourceKind.PACKED_REQUEST_ROWS,
+                                ValueSourceKind.PACKED_HIDDEN,
+                            )
+                            for task_input in task.inputs
                         )
                     ),
                     effects=tuple(
@@ -214,6 +244,7 @@ def lower_schedule_graph(
                             ),
                             site=task_input.site,
                             phase=task_input.phase,
+                            packed_rows_port=task_input.packed_rows_port,
                         )
                         for task_input in task.inputs
                     ),

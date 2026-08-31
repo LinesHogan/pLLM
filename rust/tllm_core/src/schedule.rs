@@ -24,6 +24,8 @@ enum TaskImplementationKind {
 #[serde(rename_all = "snake_case")]
 enum ScheduleInputKind {
     Hidden,
+    PackedRequestRows,
+    PackedHidden,
     Result,
     StateSelection,
     Provided,
@@ -171,6 +173,8 @@ enum ScheduleStateStorage {
 #[serde(rename_all = "snake_case")]
 enum RegionInputKind {
     Hidden,
+    PackedRequestRows,
+    PackedHidden,
     Provided,
     Materialized,
     StateSelection,
@@ -187,6 +191,8 @@ impl RegionInputKind {
     fn as_wire(self) -> &'static str {
         match self {
             Self::Hidden => "hidden",
+            Self::PackedRequestRows => "packed_request_rows",
+            Self::PackedHidden => "packed_hidden",
             Self::Provided => "provided",
             Self::Materialized => "materialized",
             Self::StateSelection => "state_selection",
@@ -440,6 +446,8 @@ struct ScheduleInput {
     site: HiddenSite,
     #[serde(default)]
     phase: HiddenPhase,
+    #[serde(default)]
+    packed_rows_port: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -765,6 +773,8 @@ struct RegionInputBinding {
     site: HiddenSite,
     #[serde(default)]
     phase: HiddenPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packed_rows_binding_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -904,7 +914,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 fn workload_compilation_wire_cache_key(graph: &str, timeline: &str, options: &str) -> String {
     digest(&format!(
-        "workload-compilation-v6\0{graph}\0{timeline}\0{options}"
+        "workload-compilation-v7\0{graph}\0{timeline}\0{options}"
     ))
 }
 
@@ -1646,6 +1656,8 @@ fn validate_affine_regions(
 const TORCH_EXPORT_CAPABILITY: &str = "torch.export";
 const SIDE_STREAM_SAFE_CAPABILITY: &str = "runtime.side_stream_safe";
 const ASYNC_HOST_SAFE_CAPABILITY: &str = "runtime.async_host_safe";
+const PACKED_REQUEST_ROWS_CAPABILITY: &str = "runtime/packed_phase_rows@1";
+const PACKED_HIDDEN_CAPABILITY: &str = "hidden/block_output/packed@1";
 const CAPTURE_STABLE_STATE_TRANSITION: &str = "optimizer";
 
 /// CUDA graph replay requires every captured state read to retain the same
@@ -1694,7 +1706,7 @@ fn validate_optimizer_transition_task(graph: &ScheduleGraph, task: &ScheduleTask
                         SIDE_STREAM_SAFE_CAPABILITY.to_owned(),
                     ]
             });
-    if !matches!(graph.schema_version, 3 | 4)
+    if !matches!(graph.schema_version, 3 | 4 | 5)
         || optimizer_candidates != 1
         || task.implementation_ids.len() != 1
         || task.implementation_kinds.len() != 1
@@ -1736,6 +1748,25 @@ fn backend_capabilities(capabilities: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
+fn packed_input_capabilities(task: &ScheduleTask) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    if task
+        .inputs
+        .iter()
+        .any(|input| input.kind == ScheduleInputKind::PackedRequestRows)
+    {
+        required.insert(PACKED_REQUEST_ROWS_CAPABILITY.to_owned());
+    }
+    if task
+        .inputs
+        .iter()
+        .any(|input| input.kind == ScheduleInputKind::PackedHidden)
+    {
+        required.insert(PACKED_HIDDEN_CAPABILITY.to_owned());
+    }
+    required
+}
+
 /// Select the first declaration-order implementation that the signed
 /// timeline can actually provide.  A candidate's `torch.export` marker is
 /// compiler evidence, not a backend requirement; every other capability must
@@ -1750,6 +1781,13 @@ fn select_task_implementations(
         .tasks
         .iter()
         .map(|task| {
+            let input_requirements = packed_input_capabilities(task);
+            let has_packed_inputs = task.inputs.iter().any(|input| {
+                matches!(
+                    input.kind,
+                    ScheduleInputKind::PackedRequestRows | ScheduleInputKind::PackedHidden
+                )
+            });
             let candidates = if graph.schema_version == 1 {
                 vec![(
                     0usize,
@@ -1780,6 +1818,8 @@ fn select_task_implementations(
                 .iter()
                 .map(|(_, _, implementation_id, capabilities, _)| {
                     let missing: Vec<String> = backend_capabilities(capabilities)
+                        .union(&input_requirements)
+                        .cloned()
                         .into_iter()
                         .filter(|capability| !available.contains(capability.as_str()))
                         .collect();
@@ -1791,14 +1831,20 @@ fn select_task_implementations(
                 .into_iter()
                 .find_map(
                     |(_candidate_index, kind, implementation_id, capabilities, export_safe)| {
-                        let required_capabilities = backend_capabilities(&capabilities);
+                        let required_capabilities: BTreeSet<String> =
+                            backend_capabilities(&capabilities)
+                                .union(&input_requirements)
+                                .cloned()
+                                .collect();
                         required_capabilities
                             .iter()
                             .all(|capability| available.contains(capability.as_str()))
                             .then(|| {
-                                let compile_safe = kind == TaskImplementationKind::Captured
+                                let compile_safe = !has_packed_inputs
+                                    && kind == TaskImplementationKind::Captured
                                     && (graph.schema_version == 1 || export_safe);
-                                let async_host_safe = graph.schema_version >= 2
+                                let async_host_safe = !has_packed_inputs
+                                    && graph.schema_version >= 2
                                     && capabilities
                                         .iter()
                                         .any(|capability| capability == ASYNC_HOST_SAFE_CAPABILITY);
@@ -1815,10 +1861,11 @@ fn select_task_implementations(
                                             &task.effects,
                                         ),
                                     compile_safe,
-                                    side_stream_safe: compile_safe
-                                        || capabilities.iter().any(|capability| {
-                                            capability == SIDE_STREAM_SAFE_CAPABILITY
-                                        }),
+                                    side_stream_safe: !has_packed_inputs
+                                        && (compile_safe
+                                            || capabilities.iter().any(|capability| {
+                                                capability == SIDE_STREAM_SAFE_CAPABILITY
+                                            })),
                                     async_host_safe,
                                 }
                             })
@@ -1839,7 +1886,7 @@ fn select_task_implementations(
 /// signed, inspectable evidence; the scheduler refuses to use them unless
 /// they agree with this Rust-owned derivation.
 fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
-    if matches!(graph.schema_version, 3 | 4)
+    if matches!(graph.schema_version, 3 | 4 | 5)
         && graph.states.iter().any(|state| state.storage.is_none())
     {
         return Err(schedule_error(
@@ -1898,17 +1945,23 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
         // A graph-level field can only express requirements shared by every
         // candidate.  Candidate-specific requirements are selected above and
         // emitted only on the resulting ExecutionRegion.
-        let expected_capabilities: Vec<String> = required_by_all_candidates
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let mut expected_capability_set = required_by_all_candidates.unwrap_or_default();
+        expected_capability_set.extend(packed_input_capabilities(task));
+        let expected_capabilities: Vec<String> = expected_capability_set.into_iter().collect();
         if task.required_capabilities != expected_capabilities {
             return Err(schedule_error(format!(
                 "task {:?} derived required_capabilities disagree with implementation evidence",
                 task.task_id
             )));
         }
-        let expected_capture_safe = capture_effects_have_stable_storage(graph, &task.effects)
+        let has_packed_inputs = task.inputs.iter().any(|input| {
+            matches!(
+                input.kind,
+                ScheduleInputKind::PackedRequestRows | ScheduleInputKind::PackedHidden
+            )
+        });
+        let expected_capture_safe = !has_packed_inputs
+            && capture_effects_have_stable_storage(graph, &task.effects)
             && task
                 .implementation_kinds
                 .iter()
@@ -2034,7 +2087,9 @@ fn validate_inputs(
     timeline: &Timeline,
     options: &CompileOptions,
 ) -> PyResult<(HashMap<String, usize>, HashMap<String, usize>)> {
-    if !matches!(graph.schema_version, 1 | 2 | 3 | 4) || !matches!(timeline.schema_version, 1 | 2) {
+    if !matches!(graph.schema_version, 1 | 2 | 3 | 4 | 5)
+        || !matches!(timeline.schema_version, 1 | 2)
+    {
         return Err(value_error("unsupported schedule schema version"));
     }
     validate_derived_graph_semantics(graph)?;
@@ -2123,7 +2178,7 @@ fn validate_inputs(
             || state.transition.is_empty()
             || (state.scope == StateScope::Request) != !state.request_key.is_empty()
             || request_key_fields.len() != state.request_key.len()
-            || (matches!(graph.schema_version, 3 | 4) && state.storage.is_none())
+            || (matches!(graph.schema_version, 3 | 4 | 5) && state.storage.is_none())
             || (graph.schema_version < 3 && state.storage.is_some())
             || !state_resources.insert(state.resource.as_str())
         {
@@ -2141,6 +2196,88 @@ fn validate_inputs(
             return Err(value_error(
                 "schedule task implementation ids and kinds are inconsistent",
             ));
+        }
+        if graph.schema_version == 5
+            && task
+                .inputs
+                .iter()
+                .any(|input| input.packed_rows_port.is_none())
+        {
+            return Err(value_error(
+                "schema v5 schedule inputs require an explicit packed_rows_port field",
+            ));
+        }
+        if graph.schema_version < 5
+            && task
+                .inputs
+                .iter()
+                .any(|input| input.packed_rows_port.is_some())
+        {
+            return Err(value_error(
+                "schedule schemas before v5 forbid packed_rows_port fields",
+            ));
+        }
+        let packed_rows_inputs: Vec<&ScheduleInput> = task
+            .inputs
+            .iter()
+            .filter(|input| input.kind == ScheduleInputKind::PackedRequestRows)
+            .collect();
+        let packed_hidden_inputs: Vec<&ScheduleInput> = task
+            .inputs
+            .iter()
+            .filter(|input| input.kind == ScheduleInputKind::PackedHidden)
+            .collect();
+        let has_packed_relation = task.inputs.iter().any(|input| {
+            input
+                .packed_rows_port
+                .as_deref()
+                .is_some_and(|port| !port.is_empty())
+        });
+        if graph.schema_version < 5
+            && (!packed_rows_inputs.is_empty() || !packed_hidden_inputs.is_empty())
+        {
+            return Err(value_error(
+                "schedule schemas before v5 forbid packed inputs",
+            ));
+        }
+        if graph.schema_version == 5 {
+            if packed_rows_inputs.len() > 1 {
+                return Err(value_error(
+                    "one task may declare only one packed_request_rows input",
+                ));
+            }
+            if (!packed_hidden_inputs.is_empty() || has_packed_relation)
+                && packed_rows_inputs.is_empty()
+            {
+                return Err(value_error(
+                    "packed_rows_port requires one packed_request_rows input",
+                ));
+            }
+            if !packed_rows_inputs.is_empty()
+                && task
+                    .inputs
+                    .iter()
+                    .any(|input| input.kind == ScheduleInputKind::Hidden)
+            {
+                return Err(value_error(
+                    "packed task cannot mix packed inputs with ordinary hidden inputs",
+                ));
+            }
+            if let Some(rows) = packed_rows_inputs.first() {
+                for input in &task.inputs {
+                    let relation = input.packed_rows_port.as_deref().unwrap_or("");
+                    if input.kind == ScheduleInputKind::PackedHidden && relation != rows.name {
+                        return Err(value_error(
+                            "packed_hidden packed_rows_port must name the task's packed_request_rows input",
+                        ));
+                    }
+                    if input.kind == ScheduleInputKind::StateSelection && relation != rows.name {
+                        return Err(value_error(
+                            "state_selection packed_rows_port must name the task's packed_request_rows input",
+                        ));
+                    }
+                }
+            }
         }
         for effect in &task.effects {
             if effect.resource.is_empty() {
@@ -2177,8 +2314,19 @@ fn validate_inputs(
                         "hidden schedule input requires a typed locator",
                     ));
                 }
+                ScheduleInputKind::PackedHidden
+                    if input.layer.is_empty()
+                        || input.layer_kind == HiddenLayerKind::None
+                        || input.site != HiddenSite::BlockOutput
+                        || input.phase != HiddenPhase::None =>
+                {
+                    return Err(value_error(
+                        "packed_hidden schedule input requires a block-output locator with phase NONE",
+                    ));
+                }
                 ScheduleInputKind::Result
                 | ScheduleInputKind::StateSelection
+                | ScheduleInputKind::PackedRequestRows
                 | ScheduleInputKind::Provided
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
@@ -2199,6 +2347,7 @@ fn validate_inputs(
                     return Err(value_error("result schedule input requires an output name"));
                 }
                 ScheduleInputKind::Provided
+                | ScheduleInputKind::PackedRequestRows
                 | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
@@ -2218,7 +2367,29 @@ fn validate_inputs(
                         "step_id schedule input requires the built-in step_id source",
                     ));
                 }
+                ScheduleInputKind::PackedRequestRows
+                    if input.source != "runtime.packed_phase_rows" =>
+                {
+                    return Err(value_error(
+                        "packed_request_rows input requires runtime.packed_phase_rows",
+                    ));
+                }
                 _ => {}
+            }
+            let relation = input.packed_rows_port.as_deref().unwrap_or("");
+            if input.kind == ScheduleInputKind::PackedRequestRows && !relation.is_empty() {
+                return Err(value_error(
+                    "packed_request_rows input must not declare packed_rows_port",
+                ));
+            }
+            if !matches!(
+                input.kind,
+                ScheduleInputKind::PackedHidden | ScheduleInputKind::StateSelection
+            ) && !relation.is_empty()
+            {
+                return Err(value_error(
+                    "only packed_hidden or state_selection may declare packed_rows_port",
+                ));
             }
             if input.kind == ScheduleInputKind::Hidden {
                 let capability = hidden_locator_capability(input.site, input.phase)
@@ -2230,13 +2401,27 @@ fn validate_inputs(
                     )));
                 }
             }
+            if input.kind == ScheduleInputKind::PackedRequestRows
+                && !capabilities.contains(PACKED_REQUEST_ROWS_CAPABILITY)
+            {
+                return Err(schedule_error(
+                    "packed_request_rows input requires runtime/packed_phase_rows@1",
+                ));
+            }
+            if input.kind == ScheduleInputKind::PackedHidden
+                && !capabilities.contains(PACKED_HIDDEN_CAPABILITY)
+            {
+                return Err(schedule_error(
+                    "packed_hidden input requires hidden/block_output/packed@1",
+                ));
+            }
         }
-        if graph.schema_version == 4 {
+        if matches!(graph.schema_version, 4 | 5) {
             let mut request_effect_resources = BTreeSet::new();
             for effect in &task.effects {
                 let selection_port = effect.selection_port.as_deref().ok_or_else(|| {
                     value_error(
-                        "schema v4 schedule effects require an explicit selection_port field",
+                        "schema v4+ schedule effects require an explicit selection_port field",
                     )
                 })?;
                 if effect.kind == ScheduleEffectKind::ExternIo {
@@ -2252,7 +2437,7 @@ fn validate_inputs(
                     .iter()
                     .find(|state| state.resource == effect.resource)
                     .ok_or_else(|| {
-                        value_error("schema v4 state effect references an unknown typed state")
+                        value_error("schema v4+ state effect references an unknown typed state")
                     })?;
                 if state.scope == StateScope::Request {
                     if !request_effect_resources.insert(effect.resource.as_str()) {
@@ -3060,6 +3245,8 @@ fn draft_capture_safe(
                     }
                 }
                 ScheduleInputKind::Provided
+                | ScheduleInputKind::PackedRequestRows
+                | ScheduleInputKind::PackedHidden
                 | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
@@ -3679,7 +3866,7 @@ fn async_optimizer_capture_eligible(
     materializations: &[Materialization],
     region_ids: &[String],
 ) -> bool {
-    if !matches!(graph.schema_version, 3 | 4)
+    if !matches!(graph.schema_version, 3 | 4 | 5)
         || options.capture_policy == "disabled"
         || timeline.graph_mode == "eager"
         || region_ids.len() < 2
@@ -4449,6 +4636,8 @@ fn compile_impl(
                 } else {
                     let region_kind = match input.kind {
                         ScheduleInputKind::Hidden => RegionInputKind::Hidden,
+                        ScheduleInputKind::PackedRequestRows => RegionInputKind::PackedRequestRows,
+                        ScheduleInputKind::PackedHidden => RegionInputKind::PackedHidden,
                         ScheduleInputKind::StateSelection => RegionInputKind::StateSelection,
                         ScheduleInputKind::Provided => RegionInputKind::Provided,
                         ScheduleInputKind::Staged => RegionInputKind::Staged,
@@ -4465,13 +4654,23 @@ fn compile_impl(
                         }
                     };
                     let identity = format!(
-                        "{}\0{}\0{}\0{}\0{}\0{}",
+                        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                         region_kind.as_wire(),
                         input.source,
                         input.layer,
                         input.layer_kind.as_wire(),
                         input.site.as_wire(),
-                        input.phase.as_wire()
+                        input.phase.as_wire(),
+                        input.packed_rows_port.as_deref().unwrap_or(""),
+                        if input
+                            .packed_rows_port
+                            .as_deref()
+                            .is_some_and(|port| !port.is_empty())
+                        {
+                            task_id.as_str()
+                        } else {
+                            ""
+                        }
                     );
                     let layer_index = match input.layer_kind {
                         HiddenLayerKind::Index => {
@@ -4517,6 +4716,7 @@ fn compile_impl(
                         layer_kind,
                         site,
                         phase,
+                        packed_rows_binding_id: Some(String::new()),
                     });
                 }
             }
@@ -4558,6 +4758,45 @@ fn compile_impl(
                 inputs: invocation_inputs,
                 outputs: invocation_outputs,
             });
+        }
+        let binding_id_by_port: BTreeMap<(String, String), String> = region_inputs[region_index]
+            .iter()
+            .flat_map(|binding| {
+                binding.consumers.iter().map(|consumer| {
+                    (
+                        (consumer.task_id.clone(), consumer.port_name.clone()),
+                        binding.binding_id.clone(),
+                    )
+                })
+            })
+            .collect();
+        for binding in &mut region_inputs[region_index] {
+            let mut related_rows = BTreeSet::new();
+            for consumer in &binding.consumers {
+                let task = &graph.tasks[task_index[&consumer.task_id]];
+                let input = task
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == consumer.port_name)
+                    .ok_or_else(|| schedule_error("typed Region input consumer port is missing"))?;
+                let packed_rows_port = input.packed_rows_port.as_deref().unwrap_or("");
+                if packed_rows_port.is_empty() {
+                    continue;
+                }
+                let rows_binding_id = binding_id_by_port
+                    .get(&(consumer.task_id.clone(), packed_rows_port.to_owned()))
+                    .ok_or_else(|| {
+                        schedule_error("packed input has no Region packed rows binding")
+                    })?;
+                related_rows.insert(rows_binding_id.clone());
+            }
+            if related_rows.len() > 1 {
+                return Err(schedule_error(
+                    "one Region input cannot reference multiple packed rows bindings",
+                ));
+            }
+            binding.packed_rows_binding_id =
+                Some(related_rows.into_iter().next().unwrap_or_default());
         }
     }
     for materialization in &materializations {
@@ -4813,7 +5052,7 @@ fn compile_impl(
             explanations
         },
         signature: String::new(),
-        schema_version: 6,
+        schema_version: 7,
     };
     let unsigned = serde_json::to_string(&decision)
         .map_err(|error| schedule_error(format!("failed to serialize decision: {error}")))?;
@@ -4846,7 +5085,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     let supplied: Decision = decode(decision, "ScheduleDecision")?;
     let (anchor_index, task_index) = validate_inputs(&graph_desc, &timeline_desc, &options_desc)?;
     let selected = select_task_implementations(&graph_desc, &timeline_desc)?;
-    if supplied.schema_version != 6
+    if supplied.schema_version != 7
         || supplied.graph_key != digest(graph)
         || supplied.timeline_key != digest(timeline)
     {
@@ -4860,7 +5099,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         .any(|region| region.stream.is_none() || region.fallback_policy.is_none())
     {
         return Err(schedule_error(
-            "ScheduleDecision v6 ExecutionRegion requires explicit stream and fallback_policy",
+            "ScheduleDecision v7 ExecutionRegion requires explicit stream and fallback_policy",
         ));
     }
     if supplied.execution_regions.iter().any(|region| {
@@ -4868,7 +5107,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
             != region.compile_command.is_some()
     }) {
         return Err(schedule_error(
-            "ScheduleDecision v6 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
+            "ScheduleDecision v7 compiled ExecutionRegion requires a compile_command and extern Region forbids one",
         ));
     }
     let mut unsigned = supplied.clone();
@@ -4880,7 +5119,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
     if supplied.fallback != "explicit_regions" || !supplied.capture_partitions.is_empty() {
         return Err(schedule_error(
-            "ScheduleDecision v6 requires explicit regions and forbids capture_partitions",
+            "ScheduleDecision v7 requires explicit regions and forbids capture_partitions",
         ));
     }
     if supplied.execution_order.len() != graph_desc.tasks.len()
@@ -5035,6 +5274,12 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
         let mut covered_inputs = BTreeSet::new();
         let mut input_binding_by_port = BTreeMap::new();
         for binding in &region.input_bindings {
+            let packed_rows_binding_id =
+                binding.packed_rows_binding_id.as_deref().ok_or_else(|| {
+                    schedule_error(
+                        "ScheduleDecision v7 input bindings require packed_rows_binding_id",
+                    )
+                })?;
             if binding.binding_id.is_empty()
                 || binding.source.is_empty()
                 || binding.consumers.is_empty()
@@ -5045,12 +5290,26 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                     && (binding.layer_kind == HiddenLayerKind::None
                         || binding.site == HiddenSite::None
                         || binding.phase == HiddenPhase::None))
+                || (binding.kind == RegionInputKind::PackedHidden
+                    && (binding.layer_kind == HiddenLayerKind::None
+                        || binding.site != HiddenSite::BlockOutput
+                        || binding.phase != HiddenPhase::None
+                        || packed_rows_binding_id.is_empty()))
+                || (binding.kind == RegionInputKind::PackedRequestRows
+                    && (binding.source != "runtime.packed_phase_rows"
+                        || !packed_rows_binding_id.is_empty()))
                 || (binding.layer_kind == HiddenLayerKind::Index && binding.layer_index.is_none())
                 || (binding.layer_kind != HiddenLayerKind::Index && binding.layer_index.is_some())
-                || (binding.kind != RegionInputKind::Hidden
-                    && (binding.layer_kind != HiddenLayerKind::None
-                        || binding.site != HiddenSite::None
-                        || binding.phase != HiddenPhase::None))
+                || (!matches!(
+                    binding.kind,
+                    RegionInputKind::Hidden | RegionInputKind::PackedHidden
+                ) && (binding.layer_kind != HiddenLayerKind::None
+                    || binding.site != HiddenSite::None
+                    || binding.phase != HiddenPhase::None))
+                || (!matches!(
+                    binding.kind,
+                    RegionInputKind::PackedHidden | RegionInputKind::StateSelection
+                ) && !packed_rows_binding_id.is_empty())
             {
                 return Err(schedule_error(
                     "ExecutionRegion has an invalid typed input binding",
@@ -5083,8 +5342,78 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                         "ExecutionRegion state selection binding disagrees with its task input",
                     ));
                 }
+                if (input.kind == ScheduleInputKind::PackedRequestRows)
+                    != (binding.kind == RegionInputKind::PackedRequestRows)
+                    || (input.kind == ScheduleInputKind::PackedHidden)
+                        != (binding.kind == RegionInputKind::PackedHidden)
+                {
+                    return Err(schedule_error(
+                        "ExecutionRegion packed input binding disagrees with its task input",
+                    ));
+                }
                 input_binding_by_port
                     .insert((port.task_id.as_str(), port.port_name.as_str()), binding);
+            }
+        }
+        let packed_rows_bindings: BTreeMap<&str, &RegionInputBinding> = region
+            .input_bindings
+            .iter()
+            .filter(|binding| binding.kind == RegionInputKind::PackedRequestRows)
+            .map(|binding| (binding.binding_id.as_str(), binding))
+            .collect();
+        for binding in &region.input_bindings {
+            let relation = binding
+                .packed_rows_binding_id
+                .as_deref()
+                .expect("v7 field presence was validated");
+            if !relation.is_empty() {
+                let rows_binding = packed_rows_bindings.get(relation).ok_or_else(|| {
+                    schedule_error(
+                        "ExecutionRegion packed rows binding does not name packed_request_rows",
+                    )
+                })?;
+                let binding_tasks: BTreeSet<&str> = binding
+                    .consumers
+                    .iter()
+                    .map(|port| port.task_id.as_str())
+                    .collect();
+                let rows_tasks: BTreeSet<&str> = rows_binding
+                    .consumers
+                    .iter()
+                    .map(|port| port.task_id.as_str())
+                    .collect();
+                if binding_tasks.is_disjoint(&rows_tasks) {
+                    return Err(schedule_error(
+                        "ExecutionRegion packed rows binding has no shared consumer task",
+                    ));
+                }
+            }
+            for consumer in &binding.consumers {
+                let task = &graph_desc.tasks[task_index[&consumer.task_id]];
+                let input = task
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == consumer.port_name)
+                    .expect("consumer input presence was validated");
+                let rows_port = input.packed_rows_port.as_deref().unwrap_or("");
+                let expected_relation = if rows_port.is_empty() {
+                    ""
+                } else {
+                    input_binding_by_port
+                        .get(&(consumer.task_id.as_str(), rows_port))
+                        .ok_or_else(|| {
+                            schedule_error(
+                                "ExecutionRegion packed input has no same-task rows binding",
+                            )
+                        })?
+                        .binding_id
+                        .as_str()
+                };
+                if relation != expected_relation {
+                    return Err(schedule_error(
+                        "ExecutionRegion packed rows binding disagrees with its task relation",
+                    ));
+                }
             }
         }
         let mut expected_effects = Vec::new();
@@ -5219,10 +5548,10 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
     }
 
     let supplied_runtime_plan = supplied.runtime_advance_plan.as_ref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v6 requires an explicit runtime_advance_plan")
+        schedule_error("ScheduleDecision v7 requires an explicit runtime_advance_plan")
     })?;
     let supplied_completion_anchor = supplied.completion_anchor.as_deref().ok_or_else(|| {
-        schedule_error("ScheduleDecision v6 requires an explicit completion_anchor")
+        schedule_error("ScheduleDecision v7 requires an explicit completion_anchor")
     })?;
     let supplied_regions_by_id: HashMap<&str, &ExecutionRegion> = supplied
         .execution_regions
@@ -6040,7 +6369,7 @@ mod tests {
 
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
-        assert_eq!(decision.schema_version, 6);
+        assert_eq!(decision.schema_version, 7);
         let region = &decision.execution_regions[0];
         let selection = region
             .input_bindings
@@ -6147,6 +6476,90 @@ mod tests {
         assert!(error
             .to_string()
             .contains("ScheduleDecision identity or schema does not match its inputs"));
+    }
+
+    #[test]
+    fn schema_v5_packed_inputs_sign_one_row_binding_and_force_eager_inline() {
+        pyo3::prepare_freethreaded_python();
+        let graph = r#"{"workload_key":"packed","tasks":[{"task_id":"train","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["test:packed@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe","torch.export"]],"required_capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights","selection_port":"selection"}],"inputs":[{"name":"rows","kind":"packed_request_rows","source":"runtime.packed_phase_rows","packed_rows_port":""},{"name":"source","kind":"packed_hidden","source":"source","layer":"0","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"target","kind":"packed_hidden","source":"target","layer":"-1","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"selection","kind":"state_selection","source":"weights","packed_rows_port":"rows"}]}],"edges":[],"values":[],"states":[{"resource":"weights","scope":"request","request_key":["request_id"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":5,"workload_approximations":[]}"#;
+        let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.post","execute_model.post"]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"schema_version":2}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+
+        let compiled = compile_schedule(graph, timeline, options).unwrap();
+        let decision: Decision = serde_json::from_str(&compiled).unwrap();
+        assert_eq!(decision.schema_version, 7);
+        let region = &decision.execution_regions[0];
+        assert!(!region.compile_safe);
+        assert!(!region.capture_safe);
+        assert!(!region.side_stream_safe);
+        assert_eq!(region.stream, Some(RegionStreamClass::Default));
+        assert_eq!(region.host_submission, RegionHostSubmission::Inline);
+        assert_eq!(
+            region.compile_command.as_ref().unwrap().adapter,
+            super::RegionCompilerAdapter::Eager
+        );
+        let rows = region
+            .input_bindings
+            .iter()
+            .find(|binding| binding.kind == RegionInputKind::PackedRequestRows)
+            .unwrap();
+        assert_eq!(rows.source, "runtime.packed_phase_rows");
+        for binding in region.input_bindings.iter().filter(|binding| {
+            matches!(
+                binding.kind,
+                RegionInputKind::PackedHidden | RegionInputKind::StateSelection
+            )
+        }) {
+            assert_eq!(
+                binding.packed_rows_binding_id,
+                Some(rows.binding_id.clone())
+            );
+        }
+        validate_schedule(graph, timeline, options, &compiled).unwrap();
+
+        let missing_capability = timeline.replace(
+            "[\"hidden/block_output/packed@1\",\"runtime/packed_phase_rows@1\"]",
+            "[\"runtime/packed_phase_rows@1\"]",
+        );
+        let error = compile_schedule(graph, &missing_capability, options).unwrap_err();
+        assert!(error.to_string().contains("hidden/block_output/packed@1"));
+
+        let mut tampered = decision.clone();
+        let hidden = tampered.execution_regions[0]
+            .input_bindings
+            .iter_mut()
+            .find(|binding| binding.kind == RegionInputKind::PackedHidden)
+            .unwrap();
+        hidden.packed_rows_binding_id = Some("wrong".into());
+        tampered.signature.clear();
+        let unsigned = serde_json::to_string(&tampered).unwrap();
+        tampered.signature = digest(&unsigned);
+        let resigned = serde_json::to_string(&tampered).unwrap();
+        let error = validate_schedule(graph, timeline, options, &resigned).unwrap_err();
+        assert!(error.to_string().contains("packed rows binding"));
+
+        let duplicate_rows = graph.replace(
+            "{\"name\":\"source\",\"kind\":\"packed_hidden\"",
+            "{\"name\":\"other_rows\",\"kind\":\"packed_request_rows\",\"source\":\"runtime.packed_phase_rows\",\"packed_rows_port\":\"\"},{\"name\":\"source\",\"kind\":\"packed_hidden\"",
+        );
+        let error = compile_schedule(&duplicate_rows, timeline, options).unwrap_err();
+        assert!(error.to_string().contains("one packed_request_rows"));
+
+        let missing_selection_relation = graph.replace(
+            "{\"name\":\"selection\",\"kind\":\"state_selection\",\"source\":\"weights\",\"packed_rows_port\":\"rows\"}",
+            "{\"name\":\"selection\",\"kind\":\"state_selection\",\"source\":\"weights\",\"packed_rows_port\":\"\"}",
+        );
+        let error = compile_schedule(&missing_selection_relation, timeline, options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("state_selection packed_rows_port"));
+
+        let mixed_hidden = graph.replace(
+            "{\"name\":\"target\",\"kind\":\"packed_hidden\",\"source\":\"target\",\"layer\":\"-1\",\"layer_kind\":\"index\",\"site\":\"block_output\",\"phase\":\"\",\"packed_rows_port\":\"rows\"}",
+            "{\"name\":\"target\",\"kind\":\"hidden\",\"source\":\"hidden:-1:block_output:prefill\",\"layer\":\"-1\",\"layer_kind\":\"index\",\"site\":\"block_output\",\"phase\":\"prefill\",\"packed_rows_port\":\"\"}",
+        );
+        let error = compile_schedule(&mixed_hidden, timeline, options).unwrap_err();
+        assert!(error.to_string().contains("ordinary hidden"));
     }
 
     #[test]
@@ -6387,7 +6800,7 @@ mod tests {
 
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
-        assert_eq!(decision.schema_version, 6);
+        assert_eq!(decision.schema_version, 7);
         let update_region = decision
             .execution_regions
             .iter()
@@ -7199,7 +7612,7 @@ mod tests {
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         validate_schedule(graph, timeline, options, &compiled).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
-        assert_eq!(decision.schema_version, 6);
+        assert_eq!(decision.schema_version, 7);
         let optimizer_region = decision
             .execution_regions
             .iter()

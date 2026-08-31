@@ -89,6 +89,8 @@ class ImplementationKind(StrEnum):
 
 class ValueSourceKind(StrEnum):
     HIDDEN = "hidden"
+    PACKED_REQUEST_ROWS = "packed_request_rows"
+    PACKED_HIDDEN = "packed_hidden"
     RESULT = "result"
     PROVIDED = "provided"
     STEP_ID = "step_id"
@@ -102,6 +104,7 @@ class ValueSourceKind(StrEnum):
 
 
 class HiddenLayerKind(StrEnum):
+    NONE = "none"
     INDEX = "index"
     PATH = "path"
     WILDCARD = "wildcard"
@@ -193,6 +196,7 @@ class TaskInputIR:
     layer_kind: str = ""
     site: HiddenSite = HiddenSite.NONE
     phase: HiddenPhase = HiddenPhase.NONE
+    packed_rows_port: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _nonempty(self.name, "TaskInputIR.name"))
@@ -200,14 +204,69 @@ class TaskInputIR:
         object.__setattr__(self, "source", _nonempty(self.source, "TaskInputIR.source"))
         object.__setattr__(self, "site", HiddenSite(self.site))
         object.__setattr__(self, "phase", HiddenPhase(self.phase))
-        if self.kind is ValueSourceKind.HIDDEN:
+        if self.packed_rows_port:
+            object.__setattr__(
+                self,
+                "packed_rows_port",
+                _nonempty(
+                    self.packed_rows_port,
+                    "TaskInputIR.packed_rows_port",
+                ),
+            )
+        if self.kind is ValueSourceKind.PACKED_HIDDEN and not self.layer_kind:
+            raise ValueError(
+                "packed_hidden TaskInputIR requires a block-output locator"
+            )
+        if self.kind in (
+            ValueSourceKind.HIDDEN,
+            ValueSourceKind.PACKED_HIDDEN,
+        ):
             object.__setattr__(self, "layer_kind", HiddenLayerKind(self.layer_kind).value)
-            if self.site is HiddenSite.NONE or self.phase is HiddenPhase.NONE:
+        if self.kind is ValueSourceKind.HIDDEN:
+            if (
+                self.layer_kind == HiddenLayerKind.NONE.value
+                or self.site is HiddenSite.NONE
+                or self.phase is HiddenPhase.NONE
+            ):
                 raise ValueError("hidden TaskInputIR requires site and phase")
+        elif self.kind is ValueSourceKind.PACKED_HIDDEN:
+            if (
+                not self.layer
+                or self.layer_kind == HiddenLayerKind.NONE.value
+                or self.site is not HiddenSite.BLOCK_OUTPUT
+            ):
+                raise ValueError(
+                    "packed_hidden TaskInputIR requires a block-output locator"
+                )
+            if self.phase is not HiddenPhase.NONE:
+                raise ValueError("packed_hidden TaskInputIR requires phase NONE")
         elif self.layer_kind:
             raise ValueError("only hidden TaskInputIR may declare layer_kind")
         elif self.site is not HiddenSite.NONE or self.phase is not HiddenPhase.NONE:
             raise ValueError("only hidden TaskInputIR may declare a locator")
+        if self.kind is ValueSourceKind.PACKED_HIDDEN:
+            if not self.packed_rows_port:
+                raise ValueError(
+                "packed_hidden TaskInputIR requires packed_rows_port"
+                )
+        elif self.kind is ValueSourceKind.PACKED_REQUEST_ROWS:
+            if self.source != "runtime.packed_phase_rows":
+                raise ValueError(
+                    "packed_request_rows TaskInputIR source must be "
+                    "runtime.packed_phase_rows"
+                )
+            if self.packed_rows_port:
+                raise ValueError(
+                    "packed_request_rows TaskInputIR must not declare packed_rows_port"
+                )
+        elif (
+            self.kind is not ValueSourceKind.STATE_SELECTION
+            and self.packed_rows_port
+        ):
+            raise ValueError(
+                "only packed_hidden or state_selection TaskInputIR may declare "
+                "packed_rows_port"
+            )
         if self.kind is ValueSourceKind.RESULT and not self.output:
             raise ValueError("result TaskInputIR requires an output name")
         if self.kind is ValueSourceKind.STEP_ID and self.source != "step_id":
@@ -385,12 +444,12 @@ class WorkloadIR:
     edges: tuple[WorkloadEdge, ...]
     schedule: tuple[str, ...]
     approximation: ApproximationPolicy = ApproximationPolicy.EXACT
-    schema_version: int = 3
+    schema_version: int = 4
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workload_id", _nonempty(self.workload_id, "WorkloadIR.workload_id"))
         object.__setattr__(self, "approximation", ApproximationPolicy(self.approximation))
-        if self.schema_version not in {1, 2, 3}:
+        if self.schema_version not in {1, 2, 3, 4}:
             raise ValueError(f"unsupported WorkloadIR.schema_version {self.schema_version}")
         if self.schema_version == 1 and any(
             state.storage is not StateStorage.DYNAMIC for state in self.states
@@ -414,10 +473,78 @@ class WorkloadIR:
             raise ValueError(
                 f"WorkloadIR schema v{self.schema_version} cannot carry request-state selection evidence"
             )
-        if self.schema_version == 3:
+        packed_inputs = tuple(
+            task_input
+            for task in self.tasks
+            for task_input in task.inputs
+            if task_input.kind
+            in (
+                ValueSourceKind.PACKED_REQUEST_ROWS,
+                ValueSourceKind.PACKED_HIDDEN,
+            )
+            or task_input.packed_rows_port
+        )
+        if self.schema_version < 4 and packed_inputs:
+            raise ValueError(
+                f"WorkloadIR schema v{self.schema_version} cannot carry packed input evidence"
+            )
+        if self.schema_version >= 3:
             state_by_name = {state.name: state for state in self.states}
             for task in self.tasks:
                 inputs_by_name = {task_input.name: task_input for task_input in task.inputs}
+                packed_rows_inputs = tuple(
+                    task_input
+                    for task_input in task.inputs
+                    if task_input.kind is ValueSourceKind.PACKED_REQUEST_ROWS
+                )
+                packed_hidden_inputs = tuple(
+                    task_input
+                    for task_input in task.inputs
+                    if task_input.kind is ValueSourceKind.PACKED_HIDDEN
+                )
+                if self.schema_version >= 4:
+                    if len(packed_rows_inputs) > 1:
+                        raise ValueError(
+                            f"task {task.name!r} may declare only one packed_request_rows input"
+                        )
+                    if packed_hidden_inputs and not packed_rows_inputs:
+                        raise ValueError(
+                            f"task {task.name!r} packed_hidden input requires packed_request_rows"
+                        )
+                    if (
+                        any(
+                            task_input.packed_rows_port
+                            for task_input in task.inputs
+                        )
+                        and not packed_rows_inputs
+                    ):
+                        raise ValueError(
+                            f"task {task.name!r} packed_rows_port requires "
+                            "packed_request_rows"
+                        )
+                    if packed_rows_inputs and any(
+                        task_input.kind is ValueSourceKind.HIDDEN
+                        for task_input in task.inputs
+                    ):
+                        raise ValueError(
+                            f"task {task.name!r} cannot mix packed inputs with ordinary hidden inputs"
+                        )
+                    if packed_rows_inputs:
+                        packed_rows_port = packed_rows_inputs[0].name
+                        for task_input in task.inputs:
+                            if task_input.kind is ValueSourceKind.PACKED_HIDDEN and (
+                                task_input.packed_rows_port != packed_rows_port
+                            ):
+                                raise ValueError(
+                                    f"task {task.name!r} packed_rows_port must name its packed_request_rows input"
+                                )
+                            if task_input.kind is ValueSourceKind.STATE_SELECTION and (
+                                task_input.packed_rows_port != packed_rows_port
+                            ):
+                                raise ValueError(
+                                    f"task {task.name!r} state_selection packed_rows_port "
+                                    "must name its packed_request_rows input"
+                                )
                 request_effect_resources: set[str] = set()
                 for task_input in task.inputs:
                     if task_input.kind is not ValueSourceKind.STATE_SELECTION:

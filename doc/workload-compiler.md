@@ -25,12 +25,14 @@ callables stay in the declaration's executor table and are never serialized.
 
 ## Middle-end contracts
 
+- `WorkloadIR` schema v4: author declarations after deterministic lowering,
+  including request-selection and packed-row provenance relations.
 - `MainWorkloadTimeline`: pinned backend regions, observable anchors, graph
   boundaries, capabilities, reservations, and startup-time static headroom.
-- `ScheduleGraph`: auxiliary tasks, typed input/output ports, values, versions,
+- `ScheduleGraph` schema v5: auxiliary tasks, typed input/output ports, values, versions,
   dependencies, effects, timing, implementation candidates, and static memory
   requirements.
-- `ScheduleDecision` schema v5: the fine-grained execution order and schedule
+- `ScheduleDecision` schema v7: the fine-grained execution order and schedule
   tree plus authoritative `ExecutionRegion` records, cross-Region
   materializations and lifetimes, memory plan, cross-Region fences, cost
   breakdown, explanations, artifact keys, and signature.
@@ -43,7 +45,10 @@ Rust derives each Region's typed input/output descriptors and ordered task
 invocations from the fine-grained task ports. Every invocation parameter and
 return value refers to an opaque stable value-binding ID; Region boundary
 bindings cover provided values, typed hidden locators, built-in step IDs,
-sinks, and cross-Region materializations. All descriptors are covered by the
+sinks, packed request rows/hidden snapshots, and cross-Region materializations.
+Packed hidden and request-state selection bindings carry the Rust-signed ID of
+their same-task packed-row binding; runtime epoch/step values remain runtime
+facts. All descriptors are covered by the
 artifact key and decision signature and independently recomputed by the Rust
 validator. Rust represents input/output/effect/implementation/state/layer and
 Region binding kinds as closed serde enums, so unknown variants fail during
@@ -68,8 +73,9 @@ registered rather than inferred on every replay.
 
 `compile_schedule(graph, timeline, options)` and `validate_schedule(...)`
 serialize only primitive JSON across the Rust FFI. New decisions must use
-schema v2 and contain Regions; schema v1 remains parseable only for old golden
-fixtures and is rejected by execution validation. Memory is a hard constraint
+schema v7 and contain Regions; selected older schemas remain parseable only as
+compatibility fixtures and are rejected by current execution validation.
+Memory is a hard constraint
 using the smaller non-zero value of user budget and backend static headroom.
 Missing capabilities, invalid deadlines, dependency cycles, invalid Region
 coverage, artifact mismatches, and memory overflow fail closed.
@@ -230,16 +236,19 @@ carrying plan epoch, step, raw backend ID, stable `RequestIdentity`, token
 offset, and closed prefill/decode phase. Decode plan ordinals are explicitly
 not sampler-row links. A single active epoch and retired-step high-watermark
 prevent `(epoch, step)` ABA reuse without retaining unbounded history. Packed
-hidden capture, signed runtime input kinds, and
-driver-provided sampler-row mappings still have to bind this batch before the
-native update count can include prefill.
+input kinds and same-task row provenance are now signed by WorkloadIR v4,
+ScheduleGraph v5, and Decision v7. Runtime resolution,
+`NativeWorkloadExecution` staging, packed hidden capture, and driver-provided
+sampler-row mappings still have to bind this batch before the native update
+count can include prefill.
 
 The matching eager packed-hidden foundation owns source and target snapshots
 under one canonical row batch and an explicit cold capacity/shape/dtype/device
 specialization. Backend inference tensors are cloned into ordinary
 service-owned storage, and reads return independent clones; a bounded finish
 high-watermark prevents step ABA without invalidating an older active step.
-This service is not wired to vLLM hooks or Region inputs yet, and it is not a
+The schema can now name this service through signed packed input bindings, but
+the runtime resolver and vLLM hooks are not wired yet. It is not a
 compile/CUDA-Graph path.
 
 A native ESamp Region cannot be co-installed with a legacy ESamp authority.

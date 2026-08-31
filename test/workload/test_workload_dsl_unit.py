@@ -195,7 +195,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
         )
 
         graph = lower_schedule_graph((declaration.ir,))
-        self.assertEqual(graph.schema_version, 4)
+        self.assertEqual(graph.schema_version, 5)
         self.assertEqual(
             {state.resource: state.storage for state in graph.states},
             {
@@ -285,7 +285,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
             (RequestKeyField.REQUEST_ID, RequestKeyField.SAMPLE_IDX),
         )
         self.assertEqual(ir.tasks[0].domain.name, "tokens")
-        self.assertEqual(ir.schema_version, 3)
+        self.assertEqual(ir.schema_version, 4)
         self.assertEqual(ir.tasks[0].inputs[1].kind.value, "state_selection")
         self.assertEqual(ir.tasks[0].inputs[1].source, "distiller")
         self.assertEqual(ir.tasks[0].effects[0].selection_port, "selection")
@@ -304,7 +304,7 @@ class WorkloadDslUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bind exactly one effect"):
             replace(ir, tasks=(tampered_predict, *ir.tasks[1:]))
         graph = lower_schedule_graph((ir,))
-        self.assertEqual(graph.schema_version, 4)
+        self.assertEqual(graph.schema_version, 5)
         self.assertEqual(graph.states[0].resource, "distiller")
         self.assertEqual(graph.states[0].scope, "request")
         self.assertEqual(

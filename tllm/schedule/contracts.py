@@ -342,6 +342,8 @@ class ScheduleEffectKind(StrEnum):
 
 class ScheduleInputKind(StrEnum):
     HIDDEN = "hidden"
+    PACKED_REQUEST_ROWS = "packed_request_rows"
+    PACKED_HIDDEN = "packed_hidden"
     RESULT = "result"
     PROVIDED = "provided"
     STEP_ID = "step_id"
@@ -352,6 +354,11 @@ class ScheduleInputKind(StrEnum):
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
     STATE_SELECTION = "state_selection"
+
+
+class ScheduleCapability(StrEnum):
+    PACKED_PHASE_ROWS = "runtime/packed_phase_rows@1"
+    PACKED_HIDDEN_BLOCK_OUTPUT = "hidden/block_output/packed@1"
 
 
 class ScheduleOutputKind(StrEnum):
@@ -370,6 +377,8 @@ class ScheduleStateStorage(StrEnum):
 
 class RegionInputKind(StrEnum):
     HIDDEN = "hidden"
+    PACKED_REQUEST_ROWS = "packed_request_rows"
+    PACKED_HIDDEN = "packed_hidden"
     PROVIDED = "provided"
     MATERIALIZED = "materialized"
     STEP_ID = "step_id"
@@ -543,6 +552,7 @@ class ScheduleInput:
     layer_kind: HiddenLayerKind = HiddenLayerKind.NONE
     site: HiddenSite = HiddenSite.NONE
     phase: HiddenPhase = HiddenPhase.NONE
+    packed_rows_port: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "ScheduleInput.name"))
@@ -551,11 +561,31 @@ class ScheduleInput:
         object.__setattr__(self, "layer_kind", HiddenLayerKind(self.layer_kind))
         object.__setattr__(self, "site", HiddenSite(self.site))
         object.__setattr__(self, "phase", HiddenPhase(self.phase))
+        if self.packed_rows_port:
+            object.__setattr__(
+                self,
+                "packed_rows_port",
+                _name(
+                    self.packed_rows_port,
+                    "ScheduleInput.packed_rows_port",
+                ),
+            )
         if self.kind is ScheduleInputKind.HIDDEN:
             if self.layer_kind is HiddenLayerKind.NONE:
                 raise ValueError("hidden ScheduleInput requires layer_kind")
             if self.site is HiddenSite.NONE or self.phase is HiddenPhase.NONE:
                 raise ValueError("hidden ScheduleInput requires site and phase")
+        elif self.kind is ScheduleInputKind.PACKED_HIDDEN:
+            if (
+                not self.layer
+                or self.layer_kind is HiddenLayerKind.NONE
+                or self.site is not HiddenSite.BLOCK_OUTPUT
+            ):
+                raise ValueError(
+                    "packed_hidden ScheduleInput requires a block-output locator"
+                )
+            if self.phase is not HiddenPhase.NONE:
+                raise ValueError("packed_hidden ScheduleInput requires phase NONE")
         elif self.layer_kind is not HiddenLayerKind.NONE:
             raise ValueError("only hidden ScheduleInput may declare layer_kind")
         elif self.site is not HiddenSite.NONE or self.phase is not HiddenPhase.NONE:
@@ -564,6 +594,29 @@ class ScheduleInput:
             raise ValueError("result ScheduleInput requires an output name")
         if self.kind is ScheduleInputKind.STEP_ID and self.source != "step_id":
             raise ValueError("step_id ScheduleInput requires the built-in step_id source")
+        if self.kind is ScheduleInputKind.PACKED_HIDDEN:
+            if not self.packed_rows_port:
+                raise ValueError(
+                    "packed_hidden ScheduleInput requires packed_rows_port"
+                )
+        elif self.kind is ScheduleInputKind.PACKED_REQUEST_ROWS:
+            if self.source != "runtime.packed_phase_rows":
+                raise ValueError(
+                    "packed_request_rows ScheduleInput source must be "
+                    "runtime.packed_phase_rows"
+                )
+            if self.packed_rows_port:
+                raise ValueError(
+                    "packed_request_rows ScheduleInput must not declare packed_rows_port"
+                )
+        elif (
+            self.kind is not ScheduleInputKind.STATE_SELECTION
+            and self.packed_rows_port
+        ):
+            raise ValueError(
+                "only packed_hidden or state_selection ScheduleInput may declare "
+                "packed_rows_port"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -903,7 +956,7 @@ class ScheduleGraph:
             if any(consumer not in known for consumer in value.consumers):
                 raise ValueError("ScheduleGraph value references an unknown consumer")
         object.__setattr__(self, "persistent_state_bytes", _bytes(self.persistent_state_bytes, "ScheduleGraph.persistent_state_bytes"))
-        if self.schema_version not in {1, 2, 3, 4}:
+        if self.schema_version not in {1, 2, 3, 4, 5}:
             raise ValueError("unsupported ScheduleGraph schema version")
         if self.schema_version >= 2 and any(
             len(task.implementation_capabilities) != len(task.implementation_ids)
@@ -921,6 +974,67 @@ class ScheduleGraph:
             )
         state_by_resource = {state.resource: state for state in self.states}
         for task in self.tasks:
+            packed_rows_inputs = tuple(
+                task_input
+                for task_input in task.inputs
+                if task_input.kind is ScheduleInputKind.PACKED_REQUEST_ROWS
+            )
+            packed_hidden_inputs = tuple(
+                task_input
+                for task_input in task.inputs
+                if task_input.kind is ScheduleInputKind.PACKED_HIDDEN
+            )
+            packed_evidence = bool(packed_rows_inputs or packed_hidden_inputs) or any(
+                task_input.packed_rows_port for task_input in task.inputs
+            )
+            if self.schema_version < 5 and packed_evidence:
+                raise ValueError(
+                    "ScheduleGraph schema before v5 cannot carry packed inputs"
+                )
+            if self.schema_version >= 5:
+                if len(packed_rows_inputs) > 1:
+                    raise ValueError(
+                        "one ScheduleTask may declare only one packed_request_rows input"
+                    )
+                if packed_hidden_inputs and not packed_rows_inputs:
+                    raise ValueError(
+                        "packed_hidden ScheduleInput requires packed_request_rows"
+                    )
+                if (
+                    any(
+                        task_input.packed_rows_port
+                        for task_input in task.inputs
+                    )
+                    and not packed_rows_inputs
+                ):
+                    raise ValueError(
+                        "ScheduleInput.packed_rows_port requires "
+                        "packed_request_rows"
+                    )
+                if packed_rows_inputs and any(
+                    task_input.kind is ScheduleInputKind.HIDDEN
+                    for task_input in task.inputs
+                ):
+                    raise ValueError(
+                        "ScheduleTask cannot mix packed inputs with ordinary hidden inputs"
+                    )
+                if packed_rows_inputs:
+                    packed_rows_port = packed_rows_inputs[0].name
+                    for task_input in task.inputs:
+                        if task_input.kind is ScheduleInputKind.PACKED_HIDDEN and (
+                            task_input.packed_rows_port != packed_rows_port
+                        ):
+                            raise ValueError(
+                                "ScheduleInput.packed_rows_port must name the task's "
+                                "packed_request_rows input"
+                            )
+                        if task_input.kind is ScheduleInputKind.STATE_SELECTION and (
+                            task_input.packed_rows_port != packed_rows_port
+                        ):
+                            raise ValueError(
+                                "state_selection ScheduleInput.packed_rows_port must "
+                                "name the task's packed_request_rows input"
+                            )
             selection_inputs = {
                 task_input.name: task_input
                 for task_input in task.inputs
@@ -1048,6 +1162,16 @@ class ScheduleGraph:
                 for effect in effects:
                     assert isinstance(effect, dict)
                     effect.pop("selection_port")
+        if self.schema_version < 5:
+            tasks = payload["tasks"]
+            assert isinstance(tasks, list)
+            for task in tasks:
+                assert isinstance(task, dict)
+                inputs = task["inputs"]
+                assert isinstance(inputs, list)
+                for task_input in inputs:
+                    assert isinstance(task_input, dict)
+                    task_input.pop("packed_rows_port")
         if self.schema_version < 4 and not self.workload_approximations:
             # Exact-only graphs keep a byte-identical wire form and identity.
             payload.pop("workload_approximations")
@@ -1061,7 +1185,7 @@ class ScheduleGraph:
         schema_version = raw.get("schema_version", 1)
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise TypeError("ScheduleGraph.schema_version must be int")
-        if schema_version == 4:
+        if schema_version in {4, 5}:
             graph_fields = (
                 "workload_key",
                 "tasks",
@@ -1101,6 +1225,7 @@ class ScheduleGraph:
                 "layer_kind",
                 "site",
                 "phase",
+                *(("packed_rows_port",) if schema_version == 5 else ()),
             )
             output_fields = ("name", "kind", "target")
             edge_fields = ("source", "target", "kind")
@@ -1307,6 +1432,9 @@ class ScheduleGraph:
                             layer_kind=task_input.get("layer_kind", "none"),
                             site=task_input.get("site", ""),
                             phase=task_input.get("phase", ""),
+                            packed_rows_port=task_input.get(
+                                "packed_rows_port", ""
+                            ),
                         )
                         for task_input in task.get("inputs", ())
                     ),
@@ -1676,6 +1804,7 @@ class RegionInputBinding:
     layer_kind: HiddenLayerKind = HiddenLayerKind.NONE
     site: HiddenSite = HiddenSite.NONE
     phase: HiddenPhase = HiddenPhase.NONE
+    packed_rows_binding_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1685,11 +1814,37 @@ class RegionInputBinding:
         object.__setattr__(self, "layer_kind", HiddenLayerKind(self.layer_kind))
         object.__setattr__(self, "site", HiddenSite(self.site))
         object.__setattr__(self, "phase", HiddenPhase(self.phase))
+        if self.packed_rows_binding_id:
+            object.__setattr__(
+                self,
+                "packed_rows_binding_id",
+                _name(
+                    self.packed_rows_binding_id,
+                    "RegionInputBinding.packed_rows_binding_id",
+                ),
+            )
         if self.kind is RegionInputKind.HIDDEN:
             if self.layer_kind is HiddenLayerKind.NONE:
                 raise ValueError("hidden RegionInputBinding requires layer_kind")
             if self.site is HiddenSite.NONE or self.phase is HiddenPhase.NONE:
                 raise ValueError("hidden RegionInputBinding requires site and phase")
+        elif self.kind is RegionInputKind.PACKED_HIDDEN:
+            if (
+                not self.layer
+                or self.layer_kind is HiddenLayerKind.NONE
+                or self.site is not HiddenSite.BLOCK_OUTPUT
+            ):
+                raise ValueError(
+                    "packed_hidden RegionInputBinding requires a block-output locator"
+                )
+            if self.phase is not HiddenPhase.NONE:
+                raise ValueError(
+                    "packed_hidden RegionInputBinding requires phase NONE"
+                )
+            if not self.packed_rows_binding_id:
+                raise ValueError(
+                    "packed_hidden RegionInputBinding requires packed_rows_binding_id"
+                )
         elif self.layer_kind is not HiddenLayerKind.NONE:
             raise ValueError("only hidden RegionInputBinding may declare layer_kind")
         elif self.site is not HiddenSite.NONE or self.phase is not HiddenPhase.NONE:
@@ -1704,6 +1859,25 @@ class RegionInputBinding:
                 )
         elif self.layer_index is not None:
             raise ValueError("only indexed RegionInputBinding may declare layer_index")
+        if self.kind is RegionInputKind.PACKED_REQUEST_ROWS:
+            if self.source != "runtime.packed_phase_rows":
+                raise ValueError(
+                    "packed_request_rows RegionInputBinding source must be "
+                    "runtime.packed_phase_rows"
+                )
+            if self.packed_rows_binding_id:
+                raise ValueError(
+                    "packed_request_rows RegionInputBinding must not reference itself"
+                )
+        elif (
+            self.kind is not RegionInputKind.PACKED_HIDDEN
+            and self.kind is not RegionInputKind.STATE_SELECTION
+            and self.packed_rows_binding_id
+        ):
+            raise ValueError(
+                "only packed_hidden or state_selection RegionInputBinding may "
+                "declare packed_rows_binding_id"
+            )
         object.__setattr__(
             self, "source", _name(self.source, "RegionInputBinding.source")
         )
@@ -1961,6 +2135,58 @@ class ExecutionRegion:
             for binding in self.input_bindings
             if binding.kind is RegionInputKind.STATE_SELECTION
         }
+        packed_rows_bindings = {
+            binding.binding_id: binding
+            for binding in self.input_bindings
+            if binding.kind is RegionInputKind.PACKED_REQUEST_ROWS
+        }
+        packed_rows_by_task: dict[str, str] = {}
+        for rows_binding in packed_rows_bindings.values():
+            for port in rows_binding.consumers:
+                previous = packed_rows_by_task.setdefault(
+                    port.task_id, rows_binding.binding_id
+                )
+                if previous != rows_binding.binding_id:
+                    raise ValueError(
+                        "one Region task may consume only one packed rows binding"
+                    )
+        for binding in self.input_bindings:
+            if not binding.packed_rows_binding_id:
+                continue
+            if binding.packed_rows_binding_id not in packed_rows_bindings:
+                raise ValueError(
+                    "RegionInputBinding packed rows relation must name a "
+                    "packed_request_rows binding"
+                )
+            rows_binding = packed_rows_bindings[
+                binding.packed_rows_binding_id
+            ]
+            binding_tasks = {
+                port.task_id for port in binding.consumers
+            }
+            rows_tasks = {
+                port.task_id for port in rows_binding.consumers
+            }
+            if binding_tasks.isdisjoint(rows_tasks):
+                raise ValueError(
+                    "packed input relation must share a consumer task with its "
+                    "packed rows binding"
+                )
+        for binding in self.input_bindings:
+            if binding.kind not in (
+                RegionInputKind.PACKED_HIDDEN,
+                RegionInputKind.STATE_SELECTION,
+            ):
+                continue
+            for port in binding.consumers:
+                expected_rows = packed_rows_by_task.get(port.task_id)
+                if (
+                    expected_rows is not None
+                    and binding.packed_rows_binding_id != expected_rows
+                ):
+                    raise ValueError(
+                        "packed task input must reference its same-task packed rows binding"
+                    )
         for effect in self.effects:
             if not effect.selection_binding_id:
                 continue
@@ -2245,10 +2471,10 @@ class ScheduleDecision:
     cost: CostBreakdown = CostBreakdown(0, 0, 0, 0)
     explanations: tuple[str, ...] = ()
     signature: str = ""
-    schema_version: int = 6
+    schema_version: int = 7
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 4, 6}:
+        if self.schema_version not in {1, 4, 6, 7}:
             raise ValueError("unsupported ScheduleDecision schema version")
         if not isinstance(self.execution_regions, tuple) or any(
             not isinstance(region, ExecutionRegion) for region in self.execution_regions
@@ -2278,6 +2504,20 @@ class ScheduleDecision:
             ):
                 raise ValueError(
                     "ScheduleDecision schema v4 cannot carry request-state selection evidence"
+                )
+            if self.schema_version < 7 and any(
+                binding.kind
+                in (
+                    RegionInputKind.PACKED_REQUEST_ROWS,
+                    RegionInputKind.PACKED_HIDDEN,
+                )
+                or binding.packed_rows_binding_id
+                for region in self.execution_regions
+                for binding in region.input_bindings
+            ):
+                raise ValueError(
+                    f"ScheduleDecision schema v{self.schema_version} cannot carry "
+                    "packed input evidence"
                 )
             if not isinstance(self.runtime_advance_plan, tuple) or any(
                 not isinstance(advance, RuntimeAdvancePlan)
@@ -2428,6 +2668,16 @@ class ScheduleDecision:
                 for effect in effects:
                     assert isinstance(effect, dict)
                     effect.pop("selection_binding_id")
+        if self.schema_version < 7 and self.schema_version != 1:
+            regions = payload["execution_regions"]
+            assert isinstance(regions, list)
+            for region in regions:
+                assert isinstance(region, dict)
+                bindings = region["input_bindings"]
+                assert isinstance(bindings, list)
+                for binding in bindings:
+                    assert isinstance(binding, dict)
+                    binding.pop("packed_rows_binding_id")
         payload["signature"] = self.signature
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -2444,13 +2694,13 @@ class ScheduleDecision:
         if schema_version in {2, 3, 5}:
             raise ValueError(
                 f"ScheduleDecision schema v{schema_version} is stale; "
-                "recompile with schema v6"
+                "recompile with schema v7"
             )
-        if schema_version not in {1, 4, 6}:
+        if schema_version not in {1, 4, 6, 7}:
             raise ValueError("unsupported ScheduleDecision schema version")
 
-        has_region_data = schema_version in {4, 6}
-        is_v6 = schema_version == 6
+        has_region_data = schema_version in {4, 6, 7}
+        has_selection_evidence = schema_version in {6, 7}
         if has_region_data:
             _require_json_fields(
                 raw,
@@ -2519,6 +2769,7 @@ class ScheduleDecision:
             "layer_kind",
             "site",
             "phase",
+            *(("packed_rows_binding_id",) if schema_version == 7 else ()),
         )
         output_binding_fields = (
             "binding_id",
@@ -2540,7 +2791,7 @@ class ScheduleDecision:
         )
         effect_fields = (
             ("kind", "resource", "selection_binding_id")
-            if is_v6
+            if has_selection_evidence
             else ("kind", "resource")
         )
         binder_stage_fields = ("backend_event", "region_id", "implementation_id")
@@ -2884,6 +3135,14 @@ class ScheduleDecision:
                     _json_string(
                         nested_value(binding, "phase", ""), f"{label}.phase"
                     )
+                ),
+                packed_rows_binding_id=_json_string(
+                    (
+                        binding["packed_rows_binding_id"]
+                        if schema_version == 7
+                        else binding.get("packed_rows_binding_id", "")
+                    ),
+                    f"{label}.packed_rows_binding_id",
                 ),
             )
 
@@ -3360,6 +3619,7 @@ __all__ = [
     "RuntimeHostCommand",
     "ScheduleAffineAccess",
     "ScheduleAffineExpr",
+    "ScheduleCapability",
     "ScheduleDecision",
     "ScheduleDomain",
     "ScheduleEdge",
