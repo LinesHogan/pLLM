@@ -470,6 +470,7 @@ class DensePageStateProvider:
         batch: DensePageTransitionBatch,
         fields: DensePageAdamWFieldBinding,
         config: DensePageAdamWConfig,
+        gradients: tuple[torch.Tensor, ...],
     ) -> None:
         """Copy every source root and compute the batch's private CPU targets."""
 
@@ -477,6 +478,21 @@ class DensePageStateProvider:
             reserved = self._reserved_transition(batch)
             try:
                 self._require_adamw_fields(fields)
+                if len(gradients) != len(reserved.target_page_ids):
+                    raise ValueError(
+                        "dense page AdamW gradients must align with transitions"
+                    )
+                gradient_pool = self._pools[int(fields.gradient)]
+                if any(
+                    tuple(gradient.shape)
+                    != tuple(gradient_pool.shape[1:])
+                    or gradient.dtype != gradient_pool.dtype
+                    or gradient.device != self._device
+                    for gradient in gradients
+                ):
+                    raise ValueError(
+                        "dense page AdamW gradient differs from signed layout"
+                    )
                 with torch.no_grad():
                     for source_page_id, target_page_id in zip(
                         reserved.source_page_ids,
@@ -485,6 +501,12 @@ class DensePageStateProvider:
                     ):
                         for pool in self._pools:
                             pool[target_page_id].copy_(pool[source_page_id])
+                    for target_page_id, gradient in zip(
+                        reserved.target_page_ids,
+                        gradients,
+                        strict=True,
+                    ):
+                        gradient_pool[target_page_id].copy_(gradient)
                     adamw(
                         params=[
                             self._pools[int(fields.parameter)][page_id]

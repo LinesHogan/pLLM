@@ -15,10 +15,26 @@ ImplementationId = NewType("ImplementationId", str)
 AnchorSymbol = NewType("AnchorSymbol", str)
 TaskId = NewType("TaskId", int)
 AnchorId = NewType("AnchorId", int)
+StateResource = NewType("StateResource", str)
 
 
 class ExecutionKind(StrEnum):
     HOST_SERVICE = "host_service"
+
+
+class StateScope(StrEnum):
+    REQUEST = "request"
+
+
+class SemanticOutputKind(StrEnum):
+    HOST = "host"
+    TEMPORARY = "temporary"
+    SAMPLER = "sampler"
+
+
+class StateEffectKind(StrEnum):
+    READ = "read"
+    TRANSITION = "transition"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,13 +43,53 @@ class HiddenInputSource:
     site: HiddenSite
     phase: HiddenPhase
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.layer) is not int
+            or type(self.site) is not HiddenSite
+            or type(self.phase) is not HiddenPhase
+            or self.site is HiddenSite.NONE
+            or self.phase is HiddenPhase.NONE
+        ):
+            raise TypeError("hidden input source requires a closed locator")
+
 
 @dataclass(frozen=True, slots=True)
 class StepIdInputSource:
     pass
 
 
-SemanticInputSource = HiddenInputSource | StepIdInputSource
+@dataclass(frozen=True, slots=True)
+class PackedRowsInputSource:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class StateSelectionInputSource:
+    resource: StateResource
+
+    def __post_init__(self) -> None:
+        if not self.resource:
+            raise ValueError("state selection requires a resource")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResultInputSource:
+    task: TaskSymbol
+    output: str
+
+    def __post_init__(self) -> None:
+        if not self.task or not self.output:
+            raise ValueError("task result source requires task and output")
+
+
+SemanticInputSource = (
+    HiddenInputSource
+    | StepIdInputSource
+    | PackedRowsInputSource
+    | StateSelectionInputSource
+    | TaskResultInputSource
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,15 +100,47 @@ class SemanticInput:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("semantic input requires a name")
+        match self.source:
+            case (
+                HiddenInputSource()
+                | StepIdInputSource()
+                | PackedRowsInputSource()
+                | StateSelectionInputSource()
+                | TaskResultInputSource()
+            ):
+                pass
+            case _:
+                raise TypeError("semantic input requires a closed source")
 
 
 @dataclass(frozen=True, slots=True)
 class SemanticOutput:
     name: str
+    kind: SemanticOutputKind = SemanticOutputKind.HOST
 
     def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("semantic output requires a name")
+        if not self.name or type(self.kind) is not SemanticOutputKind:
+            raise ValueError("semantic output requires a name and closed kind")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticState:
+    resource: StateResource
+    scope: StateScope
+
+    def __post_init__(self) -> None:
+        if not self.resource or type(self.scope) is not StateScope:
+            raise ValueError("semantic state requires a resource and closed scope")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEffect:
+    resource: StateResource
+    kind: StateEffectKind
+
+    def __post_init__(self) -> None:
+        if not self.resource or type(self.kind) is not StateEffectKind:
+            raise ValueError("semantic effect requires a resource and closed kind")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +160,13 @@ class TaskImplementationSpec:
     required_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.implementation_id:
-            raise ValueError("task implementation requires a stable ID")
+        if (
+            not self.implementation_id
+            or type(self.execution_kind) is not ExecutionKind
+        ):
+            raise ValueError(
+                "task implementation requires a stable ID and closed execution kind"
+            )
         if (
             tuple(sorted(self.required_capabilities))
             != self.required_capabilities
@@ -93,6 +186,7 @@ class SemanticTask:
     inputs: tuple[SemanticInput, ...]
     outputs: tuple[SemanticOutput, ...]
     implementations: tuple[TaskImplementationSpec, ...]
+    effects: tuple[SemanticEffect, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.symbol or not self.implementations:
@@ -102,11 +196,13 @@ class SemanticTask:
         implementation_ids = tuple(
             item.implementation_id for item in self.implementations
         )
+        effect_resources = tuple(effect.resource for effect in self.effects)
         if (
             len(set(input_names)) != len(input_names)
             or len(set(output_names)) != len(output_names)
             or tuple(sorted(implementation_ids)) != implementation_ids
             or len(set(implementation_ids)) != len(implementation_ids)
+            or len(set(effect_resources)) != len(effect_resources)
         ):
             raise ValueError("semantic task ports or implementations are not canonical")
 
@@ -125,17 +221,21 @@ class SemanticEdge:
 class SemanticGraph:
     workload_id: WorkloadId
     tasks: tuple[SemanticTask, ...]
+    states: tuple[SemanticState, ...] = ()
     edges: tuple[SemanticEdge, ...] = ()
     schema_version: int = 1
 
     def __post_init__(self) -> None:
         symbols = tuple(task.symbol for task in self.tasks)
+        resources = tuple(state.resource for state in self.states)
         edges = tuple((edge.source, edge.target) for edge in self.edges)
         if (
             not self.workload_id
             or not symbols
             or tuple(sorted(symbols)) != symbols
             or len(set(symbols)) != len(symbols)
+            or tuple(sorted(resources)) != resources
+            or len(set(resources)) != len(resources)
             or tuple(sorted(edges)) != edges
             or len(set(edges)) != len(edges)
             or self.schema_version != 1
@@ -144,6 +244,43 @@ class SemanticGraph:
         known = set(symbols)
         if any(edge.source not in known or edge.target not in known for edge in self.edges):
             raise ValueError("semantic edge references an unknown task")
+        known_resources = set(resources)
+        if any(
+            effect.resource not in known_resources
+            for task in self.tasks
+            for effect in task.effects
+        ):
+            raise ValueError("semantic effect references an unknown state")
+        for task in self.tasks:
+            for task_input in task.inputs:
+                match task_input.source:
+                    case StateSelectionInputSource(resource=resource):
+                        if resource not in known_resources:
+                            raise ValueError(
+                                "state selection references an unknown state"
+                            )
+                    case TaskResultInputSource(
+                        task=producer,
+                        output=output,
+                    ):
+                        producer_tasks = tuple(
+                            candidate
+                            for candidate in self.tasks
+                            if candidate.symbol == producer
+                        )
+                        if len(producer_tasks) != 1 or all(
+                            candidate.name != output
+                            for candidate in producer_tasks[0].outputs
+                        ):
+                            raise ValueError(
+                                "task result references an unknown producer output"
+                            )
+                        if SemanticEdge(producer, task.symbol) not in self.edges:
+                            raise ValueError(
+                                "task result requires an explicit dependency edge"
+                            )
+                    case _:
+                        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,18 +377,27 @@ __all__ = [
     "ImplementationId",
     "PhysicalPlan",
     "PhysicalTask",
+    "PackedRowsInputSource",
     "ScheduleDecision",
     "ScheduledTask",
     "SchedulerTimeline",
     "SemanticEdge",
+    "SemanticEffect",
     "SemanticGraph",
     "SemanticInput",
     "SemanticOutput",
+    "SemanticOutputKind",
+    "SemanticState",
     "SemanticTask",
     "StepIdInputSource",
+    "StateEffectKind",
+    "StateResource",
+    "StateScope",
+    "StateSelectionInputSource",
     "TaskId",
     "TaskImplementationSpec",
     "TaskSymbol",
+    "TaskResultInputSource",
     "TimelineAnchor",
     "TimingConstraint",
     "WorkloadId",

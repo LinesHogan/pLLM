@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn scheduler_selects_capabilities_dense_ids_timing_dependencies_and_rejects_tampering() {
         let graph = decode_graph(
-            r#"{"workload_id":"dummy","tasks":[{"symbol":"export","timing":{"after":"decode","before":"end"},"inputs":[{"name":"hidden","kind":"hidden","source":"layer.0"},{"name":"step","kind":"step_id","source":"step_id"}],"outputs":[],"implementations":[{"implementation_id":"dummy:cpu@1","execution_kind":"host_service","required_capabilities":["cpu"]},{"implementation_id":"dummy:gpu@1","execution_kind":"host_service","required_capabilities":["cuda"]}]},{"symbol":"prepare","timing":{"after":"begin","before":"decode"},"inputs":[],"outputs":[{"name":"ready","kind":"host"}],"implementations":[{"implementation_id":"dummy:prepare@1","execution_kind":"host_service","required_capabilities":[]}]}],"edges":[{"source":"prepare","target":"export"}],"schema_version":1}"#,
+            r#"{"workload_id":"esamp.request","tasks":[{"symbol":"predict","timing":{"after":"begin","before":"decode"},"inputs":[{"name":"hidden","source":{"kind":"hidden","layer":0,"site":"block_output","phase":"decode"}},{"name":"rows","source":{"kind":"packed_rows"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller"}}],"outputs":[{"name":"guidance","kind":"sampler"},{"name":"loss_batch","kind":"temporary"}],"effects":[{"resource":"request_distiller","kind":"read"}],"implementations":[{"implementation_id":"esamp:cpu@1","execution_kind":"host_service","required_capabilities":["cpu"]},{"implementation_id":"esamp:gpu@1","execution_kind":"host_service","required_capabilities":["cuda"]}]},{"symbol":"train","timing":{"after":"decode","before":"end"},"inputs":[{"name":"loss_batch","source":{"kind":"result","task":"predict","output":"loss_batch"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller"}}],"outputs":[],"effects":[{"resource":"request_distiller","kind":"transition"}],"implementations":[{"implementation_id":"esamp:train@1","execution_kind":"host_service","required_capabilities":[]}]}],"edges":[{"source":"predict","target":"train"}],"states":[{"resource":"request_distiller","scope":"request"}],"schema_version":1}"#,
         )
         .unwrap();
         let timeline = decode_timeline(
@@ -351,12 +351,12 @@ mod tests {
         )
         .unwrap();
         let decision = compile(&graph, &timeline).unwrap();
-        assert_eq!(decision.tasks[0].task_symbol, "prepare");
-        assert_eq!(decision.tasks[0].task_id, 1);
+        assert_eq!(decision.tasks[0].task_symbol, "predict");
+        assert_eq!(decision.tasks[0].task_id, 0);
         assert_eq!(decision.tasks[0].anchor_id, 0);
-        assert_eq!(decision.tasks[1].task_symbol, "export");
-        assert_eq!(decision.tasks[1].task_id, 0);
-        assert_eq!(decision.tasks[1].implementation_id, "dummy:cpu@1");
+        assert_eq!(decision.tasks[1].task_symbol, "train");
+        assert_eq!(decision.tasks[1].task_id, 1);
+        assert_eq!(decision.tasks[0].implementation_id, "esamp:cpu@1");
         assert_eq!(decision.tasks[1].anchor_id, 1);
         validate_decision(&graph, &timeline, &decision).unwrap();
         let physical = lower_physical(&graph, &timeline, &decision, 4).unwrap();

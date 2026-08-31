@@ -161,13 +161,13 @@ def test_cpu_dense_page_provider_consumes_signed_plans_and_preserves_pinned_v0()
                     torch.tensor(0.0),
                     torch.tensor(0.0),
                     torch.tensor(0.0),
-                    torch.tensor(0.25),
+                    torch.tensor(0.0),
                 ),
             ),
             DensePageAdmission(
                 second_v0,
                 (
-                    torch.tensor(2.0),
+                    torch.tensor(0.0),
                     torch.tensor(2.0),
                     torch.tensor(2.0),
                     torch.tensor(2.0),
@@ -201,6 +201,7 @@ def test_cpu_dense_page_provider_consumes_signed_plans_and_preserves_pinned_v0()
             eps=1e-8,
             weight_decay=0.0,
         ),
+        (torch.tensor(0.25), torch.tensor(2.0)),
     )
     first_v1_root, second_v1_root = provider.publish_transition_batch(
         transition_batch

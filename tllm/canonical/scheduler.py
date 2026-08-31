@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 from tllm import _core
 from tllm.contracts.semantic_graph import (
@@ -13,13 +13,16 @@ from tllm.contracts.semantic_graph import (
     ImplementationId,
     PhysicalPlan,
     PhysicalTask,
+    PackedRowsInputSource,
     ScheduleDecision,
     ScheduledTask,
     SchedulerTimeline,
     SemanticGraph,
+    StateSelectionInputSource,
     StepIdInputSource,
     TaskId,
     TaskSymbol,
+    TaskResultInputSource,
 )
 
 
@@ -28,10 +31,44 @@ class _TimingWire(TypedDict):
     before: str
 
 
+class _HiddenSourceWire(TypedDict):
+    kind: Literal["hidden"]
+    layer: int
+    site: str
+    phase: str
+
+
+class _StepIdSourceWire(TypedDict):
+    kind: Literal["step_id"]
+
+
+class _PackedRowsSourceWire(TypedDict):
+    kind: Literal["packed_rows"]
+
+
+class _StateSelectionSourceWire(TypedDict):
+    kind: Literal["state_selection"]
+    resource: str
+
+
+class _TaskResultSourceWire(TypedDict):
+    kind: Literal["result"]
+    task: str
+    output: str
+
+
+_InputSourceWire = (
+    _HiddenSourceWire
+    | _StepIdSourceWire
+    | _PackedRowsSourceWire
+    | _StateSelectionSourceWire
+    | _TaskResultSourceWire
+)
+
+
 class _InputWire(TypedDict):
     name: str
-    kind: str
-    source: str
+    source: _InputSourceWire
 
 
 class _OutputWire(TypedDict):
@@ -45,12 +82,18 @@ class _ImplementationWire(TypedDict):
     required_capabilities: list[str]
 
 
+class _EffectWire(TypedDict):
+    resource: str
+    kind: str
+
+
 class _TaskWire(TypedDict):
     symbol: str
     timing: _TimingWire
     inputs: list[_InputWire]
     outputs: list[_OutputWire]
     implementations: list[_ImplementationWire]
+    effects: list[_EffectWire]
 
 
 class _EdgeWire(TypedDict):
@@ -58,9 +101,15 @@ class _EdgeWire(TypedDict):
     target: str
 
 
+class _StateWire(TypedDict):
+    resource: str
+    scope: str
+
+
 class _GraphWire(TypedDict):
     workload_id: str
     tasks: list[_TaskWire]
+    states: list[_StateWire]
     edges: list[_EdgeWire]
     schema_version: int
 
@@ -86,16 +135,47 @@ def _graph_json(graph: SemanticGraph) -> str:
                     inputs.append(
                         _InputWire(
                             name=task_input.name,
-                            kind="hidden",
-                            source=f"{layer}:{site.value}:{phase.value}",
+                            source=_HiddenSourceWire(
+                                kind="hidden",
+                                layer=layer,
+                                site=site.value,
+                                phase=phase.value,
+                            ),
                         )
                     )
                 case StepIdInputSource():
                     inputs.append(
                         _InputWire(
                             name=task_input.name,
-                            kind="step_id",
-                            source="step_id",
+                            source=_StepIdSourceWire(kind="step_id"),
+                        )
+                    )
+                case PackedRowsInputSource():
+                    inputs.append(
+                        _InputWire(
+                            name=task_input.name,
+                            source=_PackedRowsSourceWire(kind="packed_rows"),
+                        )
+                    )
+                case StateSelectionInputSource(resource=resource):
+                    inputs.append(
+                        _InputWire(
+                            name=task_input.name,
+                            source=_StateSelectionSourceWire(
+                                kind="state_selection",
+                                resource=str(resource),
+                            ),
+                        )
+                    )
+                case TaskResultInputSource(task=producer, output=output):
+                    inputs.append(
+                        _InputWire(
+                            name=task_input.name,
+                            source=_TaskResultSourceWire(
+                                kind="result",
+                                task=str(producer),
+                                output=output,
+                            ),
                         )
                     )
         tasks.append(
@@ -107,7 +187,7 @@ def _graph_json(graph: SemanticGraph) -> str:
                 ),
                 inputs=inputs,
                 outputs=[
-                    _OutputWire(name=output.name, kind="host")
+                    _OutputWire(name=output.name, kind=output.kind.value)
                     for output in task.outputs
                 ],
                 implementations=[
@@ -120,11 +200,22 @@ def _graph_json(graph: SemanticGraph) -> str:
                     )
                     for implementation in task.implementations
                 ],
+                effects=[
+                    _EffectWire(
+                        resource=str(effect.resource),
+                        kind=effect.kind.value,
+                    )
+                    for effect in task.effects
+                ],
             )
         )
     wire = _GraphWire(
         workload_id=str(graph.workload_id),
         tasks=tasks,
+        states=[
+            _StateWire(resource=str(state.resource), scope=state.scope.value)
+            for state in graph.states
+        ],
         edges=[
             _EdgeWire(source=str(edge.source), target=str(edge.target))
             for edge in graph.edges

@@ -9,15 +9,56 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum InputKind {
-    Hidden,
+pub(crate) enum HiddenSite {
+    Post,
+    BlockOutput,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HiddenPhase {
+    Prefill,
+    Decode,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum InputSource {
+    Hidden {
+        layer: i64,
+        site: HiddenSite,
+        phase: HiddenPhase,
+    },
     StepId,
+    StateSelection {
+        resource: String,
+    },
+    Result {
+        task: String,
+        output: String,
+    },
+    PackedRows,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OutputKind {
     Host,
+    Temporary,
+    Sampler,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateScope {
+    Request,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateEffectKind {
+    Read,
+    Transition,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,8 +78,7 @@ pub(crate) struct TimingWindow {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TypedInput {
     pub(crate) name: String,
-    pub(crate) kind: InputKind,
-    pub(crate) source: String,
+    pub(crate) source: InputSource,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -46,6 +86,20 @@ pub(crate) struct TypedInput {
 pub(crate) struct TypedOutput {
     pub(crate) name: String,
     pub(crate) kind: OutputKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SemanticState {
+    pub(crate) resource: String,
+    pub(crate) scope: StateScope,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SemanticEffect {
+    pub(crate) resource: String,
+    pub(crate) kind: StateEffectKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,6 +117,7 @@ pub(crate) struct SemanticTask {
     pub(crate) timing: TimingWindow,
     pub(crate) inputs: Vec<TypedInput>,
     pub(crate) outputs: Vec<TypedOutput>,
+    pub(crate) effects: Vec<SemanticEffect>,
     pub(crate) implementations: Vec<ImplementationCandidate>,
 }
 
@@ -79,6 +134,7 @@ pub(crate) struct SemanticGraph {
     pub(crate) workload_id: String,
     pub(crate) tasks: Vec<SemanticTask>,
     pub(crate) edges: Vec<SemanticEdge>,
+    pub(crate) states: Vec<SemanticState>,
     pub(crate) schema_version: u64,
 }
 
@@ -128,9 +184,17 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
     require_text(&task.timing.before, "tasks.timing.before")?;
     for input in &task.inputs {
         require_text(&input.name, "tasks.inputs.name")?;
-        require_text(&input.source, "tasks.inputs.source")?;
-        if input.kind == InputKind::StepId && input.source != "step_id" {
-            return Err("step_id input source must be step_id".to_owned());
+        match &input.source {
+            InputSource::StateSelection { resource } => {
+                require_text(resource, "tasks.inputs.source.resource")?;
+            }
+            InputSource::Result { task, output } => {
+                require_text(task, "tasks.inputs.source.task")?;
+                require_text(output, "tasks.inputs.source.output")?;
+            }
+            InputSource::Hidden { .. }
+            | InputSource::StepId
+            | InputSource::PackedRows => {}
         }
     }
     if task
@@ -155,6 +219,19 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
         != task.outputs.len()
     {
         return Err("task outputs must have unique names".to_owned());
+    }
+    for effect in &task.effects {
+        require_text(&effect.resource, "tasks.effects.resource")?;
+    }
+    if task
+        .effects
+        .iter()
+        .map(|effect| effect.resource.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != task.effects.len()
+    {
+        return Err("task may have at most one effect per state resource".to_owned());
     }
     if task.implementations.is_empty() {
         return Err("task requires at least one implementation candidate".to_owned());
@@ -200,6 +277,16 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     {
         return Err("semantic graph tasks must be sorted by unique symbol".to_owned());
     }
+    for state in &graph.states {
+        require_text(&state.resource, "states.resource")?;
+    }
+    if graph
+        .states
+        .windows(2)
+        .any(|pair| pair[0].resource >= pair[1].resource)
+    {
+        return Err("semantic graph states must be sorted by unique resource".to_owned());
+    }
     for edge in &graph.edges {
         require_text(&edge.source, "edges.source")?;
         require_text(&edge.target, "edges.target")?;
@@ -224,6 +311,62 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
                 .is_err()
         {
             return Err("semantic graph edge references an unknown task".to_owned());
+        }
+    }
+    for task in &graph.tasks {
+        for input in &task.inputs {
+            match &input.source {
+                InputSource::Hidden { .. } | InputSource::StepId => {}
+                InputSource::StateSelection { resource } => {
+                    let state = graph
+                        .states
+                        .binary_search_by(|state| state.resource.cmp(resource))
+                        .map(|index| &graph.states[index])
+                        .map_err(|_| {
+                            "state_selection input references an unknown state resource".to_owned()
+                        })?;
+                    if state.scope != StateScope::Request {
+                        return Err("state_selection input must reference request state".to_owned());
+                    }
+                }
+                InputSource::Result {
+                    task: producer,
+                    output,
+                } => {
+                    let producer_index = graph
+                        .tasks
+                        .binary_search_by(|candidate| candidate.symbol.as_str().cmp(producer))
+                        .map_err(|_| "result input producer is unknown".to_owned())?;
+                    if !graph.tasks[producer_index]
+                        .outputs
+                        .iter()
+                        .any(|candidate| candidate.name == *output)
+                    {
+                        return Err("result input producer output is unknown".to_owned());
+                    }
+                    if !graph
+                        .edges
+                        .iter()
+                        .any(|edge| edge.source == *producer && edge.target == task.symbol)
+                    {
+                        return Err(
+                            "result input requires an explicit producer-to-consumer edge"
+                                .to_owned(),
+                        );
+                    }
+                }
+                InputSource::PackedRows => {}
+            }
+        }
+        for effect in &task.effects {
+            let state = graph
+                .states
+                .binary_search_by(|state| state.resource.cmp(&effect.resource))
+                .map(|index| &graph.states[index])
+                .map_err(|_| "state effect references an unknown state resource".to_owned())?;
+            if state.scope != StateScope::Request {
+                return Err("state effect must reference request state".to_owned());
+            }
         }
     }
     Ok(())
