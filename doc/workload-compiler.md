@@ -241,9 +241,15 @@ The initial request-state mode is eager-only. Per-request sampler intervention
 uses a workload-independent compact hidden payload with complete step identity,
 sorted affected rows, and a full-to-compact device map. A frozen selection
 before-version gates version-zero rows without moving that policy into the
-sampler adapter. Model-bank state, `first_per_prompt` row selection, and
-disabled output layer normalization remain unsupported. Compact capture lanes
-and non-`post_filter_exact` sampler backends remain legacy-only. It passed MRv1/MRv2 ×
+sampler adapter. A later PTTS-0 tranche added the generic
+`StateStorage.FIXED_BATCHED` representation: one capacity-first module, one
+per-slot AdamW state, and the same arena-owned key/version/pin/retire
+lifecycle. ESamp's compatibility model-bank inputs select the model-bank
+algorithm and its first-row-per-key loss; that state's typed descriptor
+declares the capacity-first layout without adding a scheduler policy. Rust signs
+the storage fact but continues to derive packed request Regions as eager until
+compact fixed-buffer provenance exists. SVD initialization, compact capture,
+and non-`post_filter_exact` sampler backends remain legacy-only. The resident path passed MRv1/MRv2 ×
 in-process/EngineCore-MP with four real updates, two parent slots retired at
 version 2, empty live mappings, and zero fallback/replay in every cell. The
 intervention matrix observed one modifier state after the first native update

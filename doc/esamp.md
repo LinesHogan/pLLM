@@ -33,10 +33,20 @@ optimizer update, and version transition. Request-state sampler intervention
 uses a generic typed compact-row payload: full step identity remains
 authoritative while only slots whose frozen before-version is positive publish
 hidden predictions. Version-zero rows therefore cannot receive fabricated
-guidance. `first_per_prompt` row selection, model-bank state, and disabling the
-output layer norm remain unsupported; those combinations fail at construction.
-Compact capture lanes and non-`post_filter_exact` samplers also remain
-legacy-only.
+guidance.
+
+PTTS-0 now also provides a signed `fixed_batched` request-state layout. Native
+ESamp can map the compatibility `per_request_model_bank/model_bank_slots`
+inputs to one capacity-first bank module and one optimizer whose moment and
+step tensors are independently indexed by logical slot. Admission restores
+only newly bound rows from the cold snapshot; transition updates only the
+selection's unique slots; retire/reuse remains owned by the same
+`RequestSlotArena`. The Rust scheduler receives `fixed_batched` only as
+storage evidence and still derives these packed request Regions as eager.
+There is no ESamp lane, priority, flush, pipeline, or CUDA-Graph policy.
+
+The SVD initializer, compact capture, non-`post_filter_exact` samplers, GPU
+model-bank differential, and aligned throughput gate remain open.
 
 The request-scoped path passed MRv1/MRv2 × in-process/EngineCore-MP eager GPU
 correctness with two parents, two children per parent, and two decode updates:
@@ -87,9 +97,10 @@ Native request cleanup remains the authoritative target: it retires both
 slots at version 2 and clears request mappings. The retained legacy baseline
 has no equivalent request-finish transaction and reports its two prompt-keyed
 trainers/mappings as still live. This legacy lifetime limitation is recorded,
-not copied into native. Program and legacy remain present because model-bank,
+not copied into native. Program and legacy remain present because the fixed
+bank has not yet passed the GPU model-bank differential, SVD initialization,
 compact-capture, CUDA Graph, aligned throughput, and the rest of the deletion
-gate are still open.
+gate.
 
 The neutral packed-row contract preserves Rust-planned prefill/decode rows,
 stable parent identities, resource-keyed hidden snapshots, and explicit
@@ -104,6 +115,11 @@ generic packed state-selection facility, not an ESamp scheduling rule.
 
 - `implementation`: `"native"`, `"program"`, or `"legacy"`.
 - `distiller_hidden_dim`, `distiller_lr`: model rank capacity and AdamW learning rate.
+- `per_request_models`, `per_request_model_bank`: select per-owner or
+  model-bank algorithm semantics. Native maps the latter to a typed
+  capacity-first layout; adapter and scheduling decisions remain structural.
+- `model_bank_slots`, `model_bank_rank`, `model_bank_use_output_layernorm`:
+  fixed-bank layout inputs now accepted by the native builder.
 - `enable_distiller_intervention`, `distiller_beta`: sampler guidance on/off and strength.
 - `distiller_sampler_backend`: candidate filtering backend (default `post_filter_exact`).
 - `model_bank_train_cudagraph` (legacy only): whole-step CUDA graph capture in the legacy engine. It does not apply to the native eager workload path.

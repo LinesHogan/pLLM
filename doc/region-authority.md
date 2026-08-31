@@ -152,6 +152,16 @@ The signed request Regions remain explicitly capture-disabled. This is
 request-state correctness and lifecycle evidence, not model-bank,
 sampler-intervention, CUDA Graph, distributed, or throughput evidence.
 
+PTTS-0 subsequently split that service into a single logical
+`RequestSlotArena` plus physical adapters. `ResidentModuleAdapter` retains
+the per-owner module implementation; `FixedBatchedSlotAdapter` owns one
+capacity-first module and slot-indexed AdamW state. Both use the same
+admission/transition/pin/receipt/retire lifecycle. The fixed adapter passed a
+CPU exact oracle with repeated rows, two updates, untouched unselected state,
+and retire/ABA reset. `fixed_batched` is signed storage evidence only: Rust
+still rejects request selection as capture-safe until the later compact
+fixed-buffer tranche supplies the missing structural facts.
+
 The next request-state tranches added generic compact sampler output, explicit
 sampler-to-packed links, and signed phase projection for packed state
 selection. Full step identity stays typed and tamper-evident; only decode rows

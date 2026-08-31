@@ -33,6 +33,7 @@ class StateStorage(StrEnum):
 
     DYNAMIC = "dynamic"
     OPTIMIZER_STABLE = "optimizer_stable"
+    FIXED_BATCHED = "fixed_batched"
 
 
 class ApproximationPolicy(StrEnum):

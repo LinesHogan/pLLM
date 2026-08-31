@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Literal
+from typing import Literal, TypeVar
 
 import pytest
 import torch
@@ -16,8 +16,11 @@ from tllm.contracts.request_identity import (
 from tllm.runtime.request_trainable_state import (
     RequestIdentityBatch,
     RequestStateRuntimeService,
+    RequestStateModuleGroup,
+    RequestStateSelected,
     RequestStateSelectionBatch,
     RequestTrainableStateStore,
+    ResidentSlotView,
     StateEffectOperation,
 )
 from tllm.runtime.workload_execution import StateVersionRegistry
@@ -35,6 +38,19 @@ class _ScalarModel(torch.nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return value @ self.weight
+
+
+SelectedModuleT = TypeVar("SelectedModuleT", bound=torch.nn.Module)
+
+
+def _resident_groups(
+    selected: RequestStateSelected[SelectedModuleT],
+) -> tuple[RequestStateModuleGroup[SelectedModuleT], ...]:
+    match selected:
+        case ResidentSlotView(groups=groups):
+            return groups
+        case _:
+            raise AssertionError("test requires resident request storage")
 
 
 def _model() -> _ScalarModel:
@@ -72,7 +88,7 @@ def _losses(
             group.module(source.index_select(0, group.canonical_row_indices)),
             target.index_select(0, group.canonical_row_indices),
         )
-        for group in store.groups(selection)
+        for group in _resident_groups(store.selected(selection))
     )
 
 
@@ -102,7 +118,7 @@ def test_parallel_aliases_share_one_transition_and_other_requests_are_isolated()
     target = torch.zeros_like(source)
     before = tuple(
         group.module.weight.detach().clone()
-        for group in store.groups(acquired.selection)
+        for group in _resident_groups(store.selected(acquired.selection))
     )
     receipt = store.optimize(
         acquired.selection,
@@ -117,7 +133,7 @@ def test_parallel_aliases_share_one_transition_and_other_requests_are_isolated()
     store.consume_receipt(receipt)
     after = tuple(
         group.module.weight.detach().clone()
-        for group in store.groups(acquired.selection)
+        for group in _resident_groups(store.selected(acquired.selection))
     )
     assert not torch.equal(before[0], after[0])
     assert not torch.equal(before[1], after[1])
@@ -177,7 +193,9 @@ def test_shared_alias_retires_only_after_last_identity_and_reuse_resets_paramete
         _losses(store, acquired.selection, source, target),
     )
     store.consume_receipt(transition_receipt)
-    trained = store.groups(acquired.selection)[0].module.weight.detach().clone()
+    trained = _resident_groups(
+        store.selected(acquired.selection)
+    )[0].module.weight.detach().clone()
     assert not torch.equal(trained, torch.tensor([[1.0]]))
     store.release_selection(acquired.selection)
 
@@ -192,7 +210,9 @@ def test_shared_alias_retires_only_after_last_identity_and_reuse_resets_paramete
 
     replacement = store.acquire((RequestIdentity("replacement", 2, 0),))
     store.consume_receipt(replacement.admission)
-    reset = store.groups(replacement.selection)[0].module.weight.detach()
+    reset = _resident_groups(
+        store.selected(replacement.selection)
+    )[0].module.weight.detach()
     torch.testing.assert_close(reset, torch.tensor([[1.0]]))
     store.release_selection(replacement.selection)
 
@@ -230,7 +250,7 @@ def test_cold_slots_preserve_rng_and_each_new_key_runs_logical_initialization() 
     first_identity = RequestIdentity("first", 0, 0)
     first = store.acquire((first_identity,))
     store.consume_receipt(first.admission)
-    first_module = store.groups(first.selection)[0].module
+    first_module = _resident_groups(store.selected(first.selection))[0].module
     first_address = first_module.weight.data_ptr()
     torch.testing.assert_close(first_module.weight, expected_first)
     store.release_selection(first.selection)
@@ -239,7 +259,7 @@ def test_cold_slots_preserve_rng_and_each_new_key_runs_logical_initialization() 
     second_identity = RequestIdentity("second", 1, 0)
     second = store.acquire((second_identity,))
     store.consume_receipt(second.admission)
-    second_module = store.groups(second.selection)[0].module
+    second_module = _resident_groups(store.selected(second.selection))[0].module
     assert second_module.weight.data_ptr() == first_address
     torch.testing.assert_close(second_module.weight, expected_second)
     assert not torch.equal(expected_first, expected_second)
@@ -278,7 +298,7 @@ def test_admission_builds_initial_state_outside_backend_inference_mode() -> None
     assert initializer_modes == [False]
     assert optimizer_modes == [False]
     store.consume_receipt(acquired.admission)
-    module = store.groups(acquired.selection)[0].module
+    module = _resident_groups(store.selected(acquired.selection))[0].module
     assert not any(parameter.is_inference() for parameter in module.parameters())
     store.release_selection(acquired.selection)
 
@@ -591,7 +611,7 @@ def test_runtime_service_reuses_duplicate_rows_and_retains_failed_audit_receipts
             group.module(source.index_select(0, group.canonical_row_indices)),
             target.index_select(0, group.canonical_row_indices),
         )
-        for group in service.groups(selection)
+        for group in _resident_groups(service.selected(selection))
     )
     service.optimize(selection, losses)
     forged = replace(
@@ -618,7 +638,7 @@ def test_runtime_service_reuses_duplicate_rows_and_retains_failed_audit_receipts
         second_selection,
         12,
     )
-    group = service.groups(second_selection)[0]
+    group = _resident_groups(service.selected(second_selection))[0]
     loss = torch.nn.functional.mse_loss(
         group.module(torch.tensor([[3.0]])), torch.zeros((1, 1))
     )
@@ -669,7 +689,7 @@ def test_qualified_execution_services_share_task_receipts_across_two_workloads()
             selection,
             3,
         )
-        group = task_service.groups(selection)[0]
+        group = _resident_groups(task_service.selected(selection))[0]
         loss = torch.nn.functional.mse_loss(
             group.module(torch.tensor([[1.0]])), torch.zeros((1, 1))
         )

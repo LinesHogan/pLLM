@@ -9,6 +9,10 @@ import torch.nn.functional as F
 from tllm.consumers.esamp.model_bank_backend import (
     TorchModelBankForwardBackend,
 )
+from tllm.runtime.fixed_batched_slot_adapter import (
+    FixedBatchedSlotLayout,
+    FixedBatchedSlotModule,
+)
 
 
 class NoOutputLayerNorm(torch.nn.Module):
@@ -71,7 +75,7 @@ class LowRankGatedResidualModel(torch.nn.Module):
         return self.out_ln(out)
 
 
-class BatchedLowRankGatedResidualModel(torch.nn.Module):
+class BatchedLowRankGatedResidualModel(FixedBatchedSlotModule):
     """One fixed-layout low-rank bank indexed by typed request slots."""
 
     def __init__(
@@ -136,6 +140,29 @@ class BatchedLowRankGatedResidualModel(torch.nn.Module):
         else:
             self.register_buffer("out_ln_weight", output_weight)
             self.register_buffer("out_ln_bias", output_bias)
+
+    def fixed_batched_slot_layout(self) -> FixedBatchedSlotLayout:
+        base_parameters = (self.a, self.g, self.b, self.gate_bias)
+        if self.use_output_layernorm:
+            match self.out_ln_weight, self.out_ln_bias:
+                case (
+                    torch.nn.Parameter() as weight,
+                    torch.nn.Parameter() as bias,
+                ):
+                    return FixedBatchedSlotLayout(
+                        capacity=self.capacity,
+                        slot_parameters=base_parameters + (weight, bias),
+                        slot_buffers=(),
+                    )
+                case _:
+                    raise AssertionError(
+                        "enabled batched output normalization must be trainable"
+                    )
+        return FixedBatchedSlotLayout(
+            capacity=self.capacity,
+            slot_parameters=base_parameters,
+            slot_buffers=(self.out_ln_weight, self.out_ln_bias),
+        )
 
     def forward(
         self, slot_ids: torch.Tensor, source: torch.Tensor

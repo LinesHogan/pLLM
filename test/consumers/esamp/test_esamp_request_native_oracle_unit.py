@@ -27,9 +27,11 @@ from tllm.contracts.request_identity import (
 )
 from tllm.runtime.request_trainable_state import (
     RequestIdentityBatch,
+    RequestStateModuleGroup,
     RequestStateRuntimeService,
     RequestStateSelectionBatch,
     RequestTrainableStateStore,
+    ResidentSlotView,
     StateEffectOperation,
 )
 
@@ -127,6 +129,17 @@ def _service(capacity: int) -> _ServiceFixture:
         )
     )
     return _ServiceFixture(service, optimizers)
+
+
+def _resident_groups(
+    service: RequestStateRuntimeService[LowRankGatedResidualModel],
+    selection: RequestStateSelectionBatch,
+) -> tuple[RequestStateModuleGroup[LowRankGatedResidualModel], ...]:
+    match service.selected(selection):
+        case ResidentSlotView(groups=groups):
+            return groups
+        case _:
+            raise AssertionError("oracle requires resident request storage")
 
 
 def _group_tensors(
@@ -260,7 +273,7 @@ def test_native_request_oracle_groups_samples_and_predicts_before_training() -> 
     )
 
     read_audit = service.before(StateEffectOperation.READ, selection, 101)
-    groups = service.groups(selection)
+    groups = _resident_groups(service, selection)
     references: list[tuple[LowRankGatedResidualModel, torch.optim.Optimizer]] = []
     predictions: list[torch.Tensor] = []
     expected_losses: list[torch.Tensor] = []
@@ -291,7 +304,7 @@ def test_native_request_oracle_groups_samples_and_predicts_before_training() -> 
     losses = tuple(
         F.mse_loss(group.module(group_source).float(), group_target.float())
         for group, (group_source, group_target) in zip(
-            service.groups(selection),
+            _resident_groups(service, selection),
             _group_tensors(selection, source, target),
             strict=True,
         )
@@ -316,7 +329,7 @@ def test_native_request_oracle_groups_samples_and_predicts_before_training() -> 
     assert tuple(version.version for version in service.versions()) == (1, 1)
 
     for group, (reference, reference_optimizer), prediction, (group_source, _) in zip(
-        service.groups(selection),
+        _resident_groups(service, selection),
         references,
         predictions,
         _group_tensors(selection, source, target),
@@ -349,7 +362,7 @@ def test_native_request_oracle_groups_samples_and_predicts_before_training() -> 
     second_audit = service.before(
         StateEffectOperation.TRANSITION, second_selection, 102
     )
-    parent_a_group = service.groups(second_selection)[0]
+    parent_a_group = _resident_groups(service, second_selection)[0]
     second_loss = F.mse_loss(
         parent_a_group.module(source[:2]).float(), target[:2].float()
     )
@@ -379,13 +392,15 @@ def test_native_request_oracle_retires_last_alias_and_reinitializes_reused_slot(
     service.stage_identities(201, RequestIdentityBatch((first_alias, final_alias)))
     selection = service.selection_for_step(201)
     original_slot = selection.leases[0].slot
-    initial_parameters = _parameter_copies(service.groups(selection)[0].module)
+    initial_parameters = _parameter_copies(
+        _resident_groups(service, selection)[0].module
+    )
     _assert_tensor_sequences_close(
         initial_parameters, expected_first_parameters
     )
 
     audit = service.before(StateEffectOperation.TRANSITION, selection, 201)
-    group = service.groups(selection)[0]
+    group = _resident_groups(service, selection)[0]
     train_loss = F.mse_loss(
         group.module(torch.ones((2, _HIDDEN_SIZE))).float(),
         torch.zeros((2, _HIDDEN_SIZE)),
@@ -418,7 +433,7 @@ def test_native_request_oracle_retires_last_alias_and_reinitializes_reused_slot(
     replacement = RequestIdentity("replacement", 8, 0)
     service.stage_identities(203, RequestIdentityBatch((replacement,)))
     replacement_selection = service.selection_for_step(203)
-    replacement_group = service.groups(replacement_selection)[0]
+    replacement_group = _resident_groups(service, replacement_selection)[0]
     assert replacement_selection.leases[0].slot.slot_id == original_slot.slot_id
     assert (
         replacement_selection.leases[0].slot.generation

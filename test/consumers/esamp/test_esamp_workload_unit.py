@@ -8,7 +8,10 @@ import torch
 
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.config import ESampConsumerConfig
-from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.consumers.esamp.model import (
+    BatchedLowRankGatedResidualModel,
+    LowRankGatedResidualModel,
+)
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenLocatorCapability
 from tllm.contracts.packed_rows import (
     PackedPhaseRow,
@@ -36,8 +39,10 @@ from tllm.runtime.request_trainable_state import (
     IndexedRequestIdentityBatch,
     IndexedRequestIdentityRow,
     RequestIdentityBatch,
+    RequestStateModuleGroup,
     RequestStateSelectionBatch,
     RequestStateRuntimeService,
+    ResidentSlotView,
     StateEffectOperation,
 )
 from tllm.runtime.sampler_bridge.types import SamplerStepView
@@ -162,7 +167,7 @@ def _request_workload(
 ) -> ESampWorkload:
     workload = ESampWorkload(
         ESampConfig(
-            per_request_models=True,
+            state_mode="per_request",
             distiller_hidden_dim=2,
             distiller_lr=1e-2,
             intervention=intervention,
@@ -175,6 +180,17 @@ def _request_workload(
         )
     )
     return workload
+
+
+def _resident_groups(
+    service: RequestStateRuntimeService[LowRankGatedResidualModel],
+    selection: RequestStateSelectionBatch,
+) -> tuple[RequestStateModuleGroup[LowRankGatedResidualModel], ...]:
+    match service.selected(selection):
+        case ResidentSlotView(groups=groups):
+            return groups
+        case _:
+            raise AssertionError("test requires resident request storage")
 
 
 def _request_rows(
@@ -272,6 +288,89 @@ def _publish_guidance(workload: ESampWorkload, step_id: int) -> torch.Tensor:
 
 
 class ESampRequestWorkloadUnitTest(unittest.TestCase):
+    def test_native_model_bank_uses_one_fixed_service_and_compat_capacity(
+        self,
+    ) -> None:
+        dispatched = build_esamp_workload(
+            ESampConsumerConfig(
+                implementation="native",
+                per_request_models=True,
+                per_request_model_bank=True,
+                model_bank_slots=2,
+                model_bank_rank=2,
+                distiller_lr=1e-2,
+            )
+        )
+        match dispatched:
+            case ESampWorkload() as workload:
+                pass
+            case _:
+                raise AssertionError("native model bank did not build a workload")
+        self.assertEqual(workload.config.state_mode, "model_bank")
+        self.assertEqual(workload.config.request_capacity, 2)
+        workload.cold_specialize(
+            RuntimeSpecializationSpec(
+                3,
+                4,
+                torch.float32,
+                torch.device("cpu"),
+            )
+        )
+        service: RequestStateRuntimeService[
+            BatchedLowRankGatedResidualModel
+        ] = workload.request_distiller_bank
+        identities = (
+            RequestIdentity("parent-a", 0, 0),
+            RequestIdentity("parent-a", 0, 1),
+            RequestIdentity("parent-b", 1, 0),
+        )
+        service.stage_identities(1, RequestIdentityBatch(identities))
+        selection = service.selection_for_step(1)
+        torch.testing.assert_close(
+            selection.device_slot_ids,
+            torch.tensor((0, 0, 1)),
+        )
+        torch.testing.assert_close(
+            selection.device_lease_slot_ids,
+            torch.tensor((0, 1)),
+        )
+        rows = _request_rows(step_id=1, identities=identities)
+        source = torch.tensor(
+            (
+                (0.1, -0.2, 0.3, -0.4),
+                (0.5, 0.6, -0.7, 0.8),
+                (-0.9, 1.0, 1.1, -1.2),
+            )
+        )
+        target = -source
+        read_audit = service.before(
+            StateEffectOperation.READ,
+            selection,
+            1,
+        )
+        loss_batch = workload.bank_loss(
+            rows,
+            source,
+            target,
+            selection,
+        )
+        service.after(read_audit)
+        self.assertEqual(len(loss_batch.losses), 2)
+        transition_audit = service.before(
+            StateEffectOperation.TRANSITION,
+            selection,
+            1,
+        )
+        workload.bank_train(rows, loss_batch, selection)
+        service.after(transition_audit)
+        self.assertEqual(
+            tuple(version.version for version in service.versions()),
+            (1, 1),
+        )
+        service.finish_step(1)
+        service.retire_requests(RequestFinishedBatch(identities))
+        self.assertEqual(service.versions(), ())
+
     def _legacy_reference(self) -> LowRankGatedResidualModel:
         train_model = LowRankGatedResidualModel(
             hidden_size=4,
@@ -360,7 +459,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         self.assertEqual(selection_versions[0].version, 1)
         service.stage_identities(4, RequestIdentityBatch((identities[0],)))
         inspection = service.selection_for_step(4)
-        trained_module = service.groups(inspection)[0].module
+        trained_module = _resident_groups(service, inspection)[0].module
         for actual, expected in zip(
             trained_module.parameters(), reference.parameters(), strict=True
         ):
@@ -463,7 +562,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         inspection = service.selection_for_step(7)
         modules = {
             group.lease.key.request_id: group.module
-            for group in service.groups(inspection)
+            for group in _resident_groups(service, inspection)
         }
         for actual, expected in zip(
             modules["parent-a"].parameters(),
@@ -508,7 +607,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             b_guidance.pred_hidden, reference_b(source[1:2])
         )
         for actual, expected in zip(
-            service.groups(b_selection)[0].module.parameters(),
+            _resident_groups(service, b_selection)[0].module.parameters(),
             reference_b.parameters(),
             strict=True,
         ):
@@ -602,7 +701,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.after(read_audit)
         self.assertEqual(guidance.affected_row_ids, (0, 1))
         self.assertEqual(guidance.total_rows, 3)
-        expected = service.groups(selection)[0].module(source[:1])
+        expected = _resident_groups(service, selection)[0].module(source[:1])
         torch.testing.assert_close(
             guidance.pred_hidden,
             torch.cat((expected, expected), dim=0),
@@ -640,7 +739,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             9, RequestIdentityBatch((first_identity,))
         )
         first_selection = service.selection_for_step(9)
-        first_module = service.groups(first_selection)[0].module
+        first_module = _resident_groups(service, first_selection)[0].module
         first_address = next(first_module.parameters()).data_ptr()
         for actual, expected in zip(
             first_module.parameters(),
@@ -656,7 +755,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             10, RequestIdentityBatch((second_identity,))
         )
         second_selection = service.selection_for_step(10)
-        second_module = service.groups(second_selection)[0].module
+        second_module = _resident_groups(service, second_selection)[0].module
         self.assertEqual(
             next(second_module.parameters()).data_ptr(), first_address
         )
@@ -785,16 +884,8 @@ class ESampRegionUnitTest(unittest.TestCase):
             ({"consumer_id": "custom"}, "consumer_id"),
             ({"graph_scratch_rows": 8}, "graph_scratch_rows"),
             ({"enable_workgraph_execution": False}, "enable_workgraph_execution"),
-            (
-                {
-                    "per_request_models": True,
-                    "per_request_model_bank": True,
-                },
-                "per_request_model_bank",
-            ),
             ({"model_bank_slots": 2}, "model_bank_slots"),
             ({"model_bank_flush_interval": 2}, "model_bank_flush_interval"),
-            ({"model_bank_rank": 32}, "model_bank_rank"),
             (
                 {"model_bank_initializer": SVDModelBankInitializerConfig()},
                 "model_bank_initializer",
@@ -815,13 +906,6 @@ class ESampRegionUnitTest(unittest.TestCase):
                     "training_row_selection": "first_per_prompt",
                 },
                 "training_row_selection",
-            ),
-            (
-                {
-                    "per_request_models": True,
-                    "model_bank_use_output_layernorm": False,
-                },
-                "model_bank_use_output_layernorm",
             ),
         )
         for overrides, option in cases:
@@ -858,12 +942,12 @@ class ESampRegionUnitTest(unittest.TestCase):
         self.assertIs(type(dispatched), ESampWorkload)
         workload = ESampWorkload(
             ESampConfig(
-                per_request_models=True,
+                state_mode="per_request",
                 intervention=True,
                 distiller_beta=0.5,
             )
         )
-        self.assertTrue(workload.config.per_request_models)
+        self.assertEqual(workload.config.state_mode, "per_request")
         self.assertTrue(workload.config.intervention)
         self.assertEqual(workload.config.distiller_beta, 0.5)
         declaration = declare_workload(workload)
@@ -913,7 +997,7 @@ class ESampRegionUnitTest(unittest.TestCase):
             with self.subTest(runner=driver.capabilities().runner_family):
                 workload = ESampWorkload(
                     ESampConfig(
-                        per_request_models=True,
+                        state_mode="per_request",
                         distiller_hidden_dim=2,
                     )
                 )
@@ -965,19 +1049,61 @@ class ESampRegionUnitTest(unittest.TestCase):
                     )
                 )
 
+    def test_fixed_batched_storage_is_signed_without_request_capture(self) -> None:
+        workload = ESampWorkload(
+            ESampConfig(
+                state_mode="model_bank",
+                request_capacity=2,
+                distiller_hidden_dim=2,
+            )
+        )
+        runtime = TllmRuntime(
+            workloads=(workload,),
+            workload_memory_budget_bytes=1 << 20,
+        )
+        runtime.cold_specialize_workloads(
+            RuntimeSpecializationSpec(
+                3,
+                4,
+                torch.float32,
+                torch.device("cpu"),
+            )
+        )
+        compilation = runtime.compile_workloads(
+            replace(_timeline(), graph_mode="full")
+        )
+        bank_state = next(
+            state
+            for state in compilation.graph.states
+            if state.resource == "request_distiller_bank"
+        )
+        self.assertIs(
+            bank_state.storage,
+            ScheduleStateStorage.FIXED_BATCHED,
+        )
+        bank_regions = tuple(
+            region
+            for region in compilation.decision.execution_regions
+            if any(task.startswith("bank_") for task in region.tasks)
+        )
+        self.assertTrue(bank_regions)
+        self.assertTrue(
+            all(
+                not region.compile_safe
+                and not region.capture_safe
+                and region.capture_mode is RegionCaptureMode.DISABLED
+                for region in bank_regions
+            )
+        )
+
     def test_direct_request_workload_rejects_unsupported_first_phase_options(self) -> None:
-        for overrides, message in (
-            (
-                {"training_row_selection": "first_per_prompt"},
-                "training_row_selection",
-            ),
-            ({"output_layernorm": False}, "output_layernorm"),
-        ):
-            with self.subTest(overrides=overrides):
-                with self.assertRaisesRegex(ValueError, message):
-                    ESampWorkload(
-                        ESampConfig(per_request_models=True, **overrides)
-                    )
+        with self.assertRaisesRegex(ValueError, "training_row_selection"):
+            ESampWorkload(
+                ESampConfig(
+                    state_mode="per_request",
+                    training_row_selection="first_per_prompt",
+                )
+            )
 
     def test_first_per_prompt_selection_uses_typed_sample_identity(self) -> None:
         workload = _specialized_workload(

@@ -52,6 +52,7 @@ from tllm.runtime.workload_bindings import (
 )
 from tllm.workload.config import ConfigAtom, WorkloadConfig
 from tllm.workload.frontend import (
+    FixedBatchedRequestTrainableState,
     NoConfiguredValue,
     PublishedModule,
     RequestTrainableState,
@@ -300,36 +301,70 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             for effect in task.effects
             if effect.kind is not EffectKind.EXTERN_IO
         }
+
+        def resident_request_service(
+            state: RequestTrainableState[torch.nn.Module],
+            optimizer: OptimizerSpec,
+        ) -> RequestStateRuntimeService[torch.nn.Module]:
+            def module_factory() -> torch.nn.Module:
+                return state.initializer(self, spec)
+
+            def optimizer_factory(
+                module: torch.nn.Module,
+            ) -> torch.optim.Optimizer:
+                return _build_optimizer(
+                    optimizer,
+                    module,
+                    self.config,
+                    spec.device,
+                    capture_safe=False,
+                )
+
+            return RequestStateRuntimeService(
+                RequestTrainableStateStore(
+                    resource=state.name,
+                    key_fields=state.key.fields,
+                    capacity=spec.rows,
+                    epoch=1,
+                    device=spec.device,
+                    module_factory=module_factory,
+                    optimizer_factory=optimizer_factory,
+                )
+            )
+
         with torch.inference_mode(False), torch.enable_grad():
             for state in type(self)._states():
                 if state.name not in active_state_names:
                     continue
                 match state:
-                    case RequestTrainableState(optimizer=optimizer, key=key):
-                        def module_factory() -> torch.nn.Module:
-                            return state.initializer(self, spec)
-
-                        def optimizer_factory(
-                            module: torch.nn.Module,
-                        ) -> torch.optim.Optimizer:
-                            return _build_optimizer(
-                                optimizer,
-                                module,
-                                self.config,
-                                spec.device,
-                                capture_safe=False,
+                    case FixedBatchedRequestTrainableState(
+                        optimizer=optimizer,
+                        key=key,
+                    ):
+                        bank: torch.nn.Module = state.initializer(self, spec)
+                        options = _resolve_optimizer_options(
+                            optimizer,
+                            self.config,
+                        )
+                        request_state_services[state.name] = (
+                            RequestStateRuntimeService(
+                                RequestTrainableStateStore[
+                                    torch.nn.Module
+                                ].fixed_batched(
+                                    resource=state.name,
+                                    key_fields=key.fields,
+                                    epoch=1,
+                                    bank=bank,
+                                    lr=options.lr,
+                                    betas=options.betas,
+                                    eps=options.eps,
+                                    weight_decay=options.weight_decay,
+                                )
                             )
-
-                        request_state_services[state.name] = RequestStateRuntimeService(
-                            RequestTrainableStateStore(
-                                resource=state.name,
-                                key_fields=key.fields,
-                                capacity=spec.rows,
-                                epoch=1,
-                                device=spec.device,
-                                module_factory=module_factory,
-                                optimizer_factory=optimizer_factory,
-                            )
+                        )
+                    case RequestTrainableState(optimizer=optimizer):
+                        request_state_services[state.name] = (
+                            resident_request_service(state, optimizer)
                         )
                     case TrainableState(optimizer=optimizer):
                         value = state.initializer(self, spec)
@@ -806,6 +841,34 @@ class Workload(NativeWorkload, Generic[ConfigT]):
         return MappingProxyType(values)
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedOptimizerOptions:
+    kind: str
+    lr: float
+    betas: tuple[float, float]
+    eps: float
+    weight_decay: float
+
+
+def _resolve_optimizer_options(
+    spec: OptimizerSpec,
+    config: WorkloadConfig,
+) -> _ResolvedOptimizerOptions:
+    options = dict(spec.options)
+    weight_decay = (
+        float.fromhex(options["weight_decay"])
+        if spec.kind == "adamw"
+        else 0.0
+    )
+    return _ResolvedOptimizerOptions(
+        kind=spec.kind,
+        lr=_optimizer_float(options["lr"], config),
+        betas=_optimizer_betas(options["betas"]),
+        eps=float.fromhex(options["eps"]),
+        weight_decay=weight_decay,
+    )
+
+
 def _build_optimizer(
     spec: OptimizerSpec,
     value: torch.nn.Module,
@@ -815,19 +878,16 @@ def _build_optimizer(
     capture_safe: bool,
 ) -> torch.optim.Optimizer:
     parameters = tuple(value.parameters())
-    options = dict(spec.options)
-    lr = _optimizer_float(options["lr"], config)
-    eps = float.fromhex(options["eps"])
-    betas = _optimizer_betas(options["betas"])
+    options = _resolve_optimizer_options(spec, config)
     capture_optimizer = device.type == "cuda" and capture_safe
-    match spec.kind:
+    match options.kind:
         case "adam":
             optimizer: torch.optim.Optimizer = (
                 torch.optim.Adam(
                     parameters,
-                    lr=lr,
-                    betas=betas,
-                    eps=eps,
+                    lr=options.lr,
+                    betas=options.betas,
+                    eps=options.eps,
                     foreach=False,
                     fused=True,
                     capturable=True,
@@ -835,9 +895,9 @@ def _build_optimizer(
                 if capture_optimizer
                 else torch.optim.Adam(
                     parameters,
-                    lr=lr,
-                    betas=betas,
-                    eps=eps,
+                    lr=options.lr,
+                    betas=options.betas,
+                    eps=options.eps,
                     foreach=False,
                     fused=None,
                 )
@@ -846,10 +906,10 @@ def _build_optimizer(
             optimizer = (
                 torch.optim.AdamW(
                     parameters,
-                    lr=lr,
-                    betas=betas,
-                    eps=eps,
-                    weight_decay=float.fromhex(options["weight_decay"]),
+                    lr=options.lr,
+                    betas=options.betas,
+                    eps=options.eps,
+                    weight_decay=options.weight_decay,
                     foreach=False,
                     fused=True,
                     capturable=True,
@@ -857,10 +917,10 @@ def _build_optimizer(
                 if capture_optimizer
                 else torch.optim.AdamW(
                     parameters,
-                    lr=lr,
-                    betas=betas,
-                    eps=eps,
-                    weight_decay=float.fromhex(options["weight_decay"]),
+                    lr=options.lr,
+                    betas=options.betas,
+                    eps=options.eps,
+                    weight_decay=options.weight_decay,
                     foreach=False,
                     fused=None,
                 )

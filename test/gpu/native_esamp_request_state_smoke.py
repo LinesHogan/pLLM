@@ -659,7 +659,7 @@ def main() -> int:
     workload = ESampWorkload(
         ESampConfig(
             enabled=True,
-            per_request_models=True,
+            state_mode="per_request",
             intervention=bool(args.intervention),
             distiller_beta=0.5 if args.intervention else 0.0,
             distiller_hidden_dim=8,

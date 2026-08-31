@@ -168,6 +168,7 @@ enum RequestKeyField {
 enum ScheduleStateStorage {
     Dynamic,
     OptimizerStable,
+    FixedBatched,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -6643,6 +6644,16 @@ mod tests {
         assert!(!region.capture_safe);
         assert_eq!(region.capture_mode, RegionCaptureMode::Disabled);
         validate_schedule(graph, timeline, options, &compiled).unwrap();
+
+        let fixed_batched =
+            graph.replace("\"storage\":\"dynamic\"", "\"storage\":\"fixed_batched\"");
+        let fixed_decision: Decision =
+            serde_json::from_str(&compile_schedule(&fixed_batched, timeline, options).unwrap())
+                .unwrap();
+        let fixed_region = &fixed_decision.execution_regions[0];
+        assert!(!fixed_region.compile_safe);
+        assert!(!fixed_region.capture_safe);
+        assert_eq!(fixed_region.capture_mode, RegionCaptureMode::Disabled);
 
         let delayed_timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"full","anchors":[{"anchor_id":"begin","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.pre"]},{"anchor_id":"ready","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.post"]},{"anchor_id":"end","ordinal":2,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["execute_model.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":[],"schema_version":2}"#;
         let delayed: Decision =

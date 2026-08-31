@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.register import build as build_legacy_consumer
 from tllm.ports.consumer import BaseConsumer
@@ -43,13 +45,12 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             unsupported.append("graph_scratch_rows")
         if not resolved.enable_workgraph_execution:
             unsupported.append("enable_workgraph_execution")
-        if resolved.per_request_model_bank:
-            unsupported.append("per_request_model_bank")
-        if resolved.model_bank_slots != 0:
-            unsupported.append("model_bank_slots")
         if resolved.model_bank_flush_interval != 1:
             unsupported.append("model_bank_flush_interval")
-        if resolved.model_bank_rank != 64:
+        if (
+            not resolved.per_request_model_bank
+            and resolved.model_bank_rank != 64
+        ):
             unsupported.append("model_bank_rank")
         if resolved.model_bank_initializer is not None:
             unsupported.append("model_bank_initializer")
@@ -78,11 +79,8 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             and resolved.training_row_selection.value != "none"
         ):
             unsupported.append("training_row_selection")
-        if (
-            resolved.per_request_models
-            and not resolved.model_bank_use_output_layernorm
-        ):
-            unsupported.append("model_bank_use_output_layernorm")
+        if resolved.model_bank_slots and not resolved.per_request_model_bank:
+            unsupported.append("model_bank_slots")
         if unsupported:
             raise ValueError(
                 "implementation='native' does not support legacy-only "
@@ -94,19 +92,35 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
             source_layer_path = "model.layers[0].input_layernorm"
         if target_layer_path == "model.model.layers[-1].input_layernorm":
             target_layer_path = "model.layers[-1].input_layernorm"
+        state_mode: Literal["shared", "per_request", "model_bank"] = (
+            "model_bank"
+            if resolved.per_request_model_bank
+            else "per_request"
+            if resolved.per_request_models
+            else "shared"
+        )
         return ESampWorkload(
             ESampConfig(
                 source_layer_path=source_layer_path,
                 target_layer_path=target_layer_path,
                 enabled=bool(resolved.enable_esamp_training),
-                distiller_hidden_dim=int(resolved.distiller_hidden_dim),
+                distiller_hidden_dim=int(
+                    resolved.model_bank_rank
+                    if resolved.per_request_model_bank
+                    else resolved.distiller_hidden_dim
+                ),
                 distiller_lr=float(resolved.distiller_lr),
                 output_layernorm=bool(resolved.model_bank_use_output_layernorm),
                 intervention=bool(resolved.enable_distiller_intervention),
                 distiller_beta=float(resolved.distiller_beta),
                 sampler_backend="post_filter_exact",
                 training_row_selection=resolved.training_row_selection.value,
-                per_request_models=bool(resolved.per_request_models),
+                state_mode=state_mode,
+                request_capacity=(
+                    int(resolved.model_bank_slots)
+                    if resolved.per_request_model_bank
+                    else 0
+                ),
             )
         )
     identifier = str(resolved.consumer_id)

@@ -376,6 +376,7 @@ class ScheduleStateStorage(StrEnum):
 
     DYNAMIC = "dynamic"
     OPTIMIZER_STABLE = "optimizer_stable"
+    FIXED_BATCHED = "fixed_batched"
 
 
 class RegionInputKind(StrEnum):

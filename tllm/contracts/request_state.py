@@ -99,6 +99,7 @@ class RequestStateSelectionBatch:
     leases: tuple[RequestStateLease, ...]
     before_versions: tuple[int, ...]
     device_slot_ids: torch.Tensor
+    device_lease_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
 
 

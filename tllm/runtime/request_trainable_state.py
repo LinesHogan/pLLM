@@ -33,28 +33,68 @@ from tllm.contracts.request_state import (
     StateSlotRef,
 )
 from tllm.runtime.request_slot_arena import (
+    RequestSlotAdmissionPlan,
     RequestSlotArena,
     RequestSlotPinPlan,
 )
-from tllm.runtime.resident_module_adapter import (
+from tllm.runtime.request_slot_adapter import (
     CompletionFence,
+    RequestSlotAdapter,
+)
+from tllm.runtime.fixed_batched_slot_adapter import (
+    FixedBatchedAdmissionPreparation,
+    FixedBatchedSlotAdapter,
+    FixedBatchedSlotView,
+)
+from tllm.runtime.resident_module_adapter import (
     RequestStateModuleGroup,
+    ResidentAdmissionPreparation,
     ResidentModuleAdapter,
+    ResidentSlotView,
 )
 
 
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 
+@dataclass(frozen=True, slots=True)
+class _ResidentPhysical(Generic[ModuleT]):
+    adapter: ResidentModuleAdapter[ModuleT]
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedBatchedPhysical(Generic[ModuleT]):
+    adapter: FixedBatchedSlotAdapter[ModuleT]
+
+
+_RequestStatePhysical = (
+    _ResidentPhysical[ModuleT] | _FixedBatchedPhysical[ModuleT]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResidentPreparation:
+    value: ResidentAdmissionPreparation
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedBatchedPreparation:
+    value: FixedBatchedAdmissionPreparation
+
+
+_PhysicalPreparation = _ResidentPreparation | _FixedBatchedPreparation
+RequestStateSelected = ResidentSlotView[ModuleT] | FixedBatchedSlotView[ModuleT]
+
+
 class RequestTrainableStateStore(Generic[ModuleT]):
-    """Compose logical request slots with resident physical modules.
+    """Compose logical request slots with one selected physical adapter.
 
     The arena is the only logical authority. This class holds a transaction
     lock across arena reservation, physical preparation/commit, and logical
     commit; it does not mirror any key, generation, version, pin, or receipt.
     """
 
-    __slots__ = ("_arena", "_resident", "_lock")
+    __slots__ = ("_arena", "_physical", "_lock")
 
     def __init__(
         self,
@@ -74,13 +114,47 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             epoch=epoch,
             device=device,
         )
-        self._resident = ResidentModuleAdapter(
-            capacity=capacity,
-            device=device,
-            module_factory=module_factory,
-            optimizer_factory=optimizer_factory,
+        self._physical: _RequestStatePhysical[ModuleT] = _ResidentPhysical(
+            ResidentModuleAdapter(
+                capacity=capacity,
+                device=device,
+                module_factory=module_factory,
+                optimizer_factory=optimizer_factory,
+            )
         )
         self._lock = RLock()
+
+    @classmethod
+    def fixed_batched(
+        cls,
+        *,
+        resource: str,
+        key_fields: tuple[RequestKeyField, ...],
+        epoch: int,
+        bank: ModuleT,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        weight_decay: float,
+    ) -> "RequestTrainableStateStore[ModuleT]":
+        store = cls.__new__(cls)
+        adapter = FixedBatchedSlotAdapter(
+            bank,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        store._arena = RequestSlotArena(
+            resource=resource,
+            key_fields=key_fields,
+            capacity=adapter.capacity,
+            epoch=epoch,
+            device=adapter.device,
+        )
+        store._physical = _FixedBatchedPhysical(adapter)
+        store._lock = RLock()
+        return store
 
     @property
     def resource(self) -> str:
@@ -96,7 +170,15 @@ class RequestTrainableStateStore(Generic[ModuleT]):
 
     @property
     def device(self) -> torch.device:
-        return self._resident.device
+        return self._adapter.device
+
+    @property
+    def _adapter(self) -> RequestSlotAdapter:
+        match self._physical:
+            case _ResidentPhysical(adapter=adapter):
+                return adapter
+            case _FixedBatchedPhysical(adapter=adapter):
+                return adapter
 
     def acquire(
         self, identities: tuple[RequestIdentity, ...]
@@ -125,14 +207,14 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 canonical_row_indices,
             )
             try:
-                preparation = self._resident.prepare_admission(plan)
+                preparation = self._prepare_admission(plan)
             except Exception:
                 self._arena.abort_admission(plan, poison=False)
                 raise
             try:
-                self._resident.commit_admission(plan, preparation)
+                self._commit_admission(plan, preparation)
             except Exception:
-                self._resident.poison()
+                self._adapter.poison()
                 self._arena.abort_admission(plan, poison=True)
                 raise
             try:
@@ -141,12 +223,49 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 self._fail_stop()
                 raise
 
-    def groups(
+    def _prepare_admission(
+        self,
+        plan: RequestSlotAdmissionPlan,
+    ) -> _PhysicalPreparation:
+        match self._physical:
+            case _ResidentPhysical(adapter=adapter):
+                return _ResidentPreparation(adapter.prepare_admission(plan))
+            case _FixedBatchedPhysical(adapter=adapter):
+                return _FixedBatchedPreparation(
+                    adapter.prepare_admission(plan)
+                )
+
+    def _commit_admission(
+        self,
+        plan: RequestSlotAdmissionPlan,
+        preparation: _PhysicalPreparation,
+    ) -> None:
+        match self._physical, preparation:
+            case (
+                _ResidentPhysical(adapter=adapter),
+                _ResidentPreparation(value=value),
+            ):
+                adapter.commit_admission(plan, value)
+            case (
+                _FixedBatchedPhysical(adapter=adapter),
+                _FixedBatchedPreparation(value=value),
+            ):
+                adapter.commit_admission(plan, value)
+            case _:
+                raise RuntimeError(
+                    "request-state physical admission variant changed"
+                )
+
+    def selected(
         self, selection: RequestStateSelectionBatch
-    ) -> tuple[RequestStateModuleGroup[ModuleT], ...]:
+    ) -> RequestStateSelected[ModuleT]:
         with self._lock:
             self._arena.validate_selection(selection, audited=True)
-            return self._resident.groups(selection)
+            match self._physical:
+                case _ResidentPhysical(adapter=adapter):
+                    return adapter.selected(selection)
+                case _FixedBatchedPhysical(adapter=adapter):
+                    return adapter.selected(selection)
 
     def selection_versions(
         self, selection: RequestStateSelectionBatch
@@ -172,9 +291,13 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             plan = self._arena.plan_transition(selection)
             try:
-                self._resident.execute_transition(plan, losses)
+                match self._physical:
+                    case _ResidentPhysical(adapter=adapter):
+                        adapter.execute_transition(plan, losses)
+                    case _FixedBatchedPhysical(adapter=adapter):
+                        adapter.execute_transition(plan, losses)
             except Exception:
-                self._resident.poison()
+                self._adapter.poison()
                 self._arena.abort_transition(plan, poison=True)
                 raise
             try:
@@ -193,7 +316,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             plan = self._arena.plan_pin(selection)
             try:
-                fence = self._resident.record_synchronous_fence()
+                fence = self._adapter.record_synchronous_fence()
             except Exception:
                 self._arena.abort_pin(plan, poison=False)
                 raise
@@ -207,7 +330,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             plan = self._arena.plan_pin(selection)
             try:
-                fence = self._resident.record_cuda_fence(stream)
+                fence = self._adapter.record_cuda_fence(stream)
             except Exception:
                 self._arena.abort_pin(plan, poison=False)
                 raise
@@ -219,9 +342,9 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         fence: CompletionFence,
     ) -> RequestStateAsyncPin:
         try:
-            self._resident.commit_fence(plan, fence)
+            self._adapter.commit_fence(plan, fence)
         except Exception:
-            self._resident.poison()
+            self._adapter.poison()
             self._arena.abort_pin(plan, poison=True)
             raise
         try:
@@ -234,7 +357,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             self._arena.validate_pin(pin)
             try:
-                complete = self._resident.fence_complete(pin)
+                complete = self._adapter.fence_complete(pin)
             except Exception:
                 self._fail_stop()
                 raise
@@ -250,7 +373,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             self._arena.validate_pin(pin)
             try:
-                return self._resident.fence_complete(pin)
+                return self._adapter.fence_complete(pin)
             except Exception:
                 self._fail_stop()
                 raise
@@ -267,7 +390,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             self._arena.validate_pin(pin)
             try:
-                self._resident.order_fence(pin, stream)
+                self._adapter.order_fence(pin, stream)
                 self._release_completed_pin(pin)
             except Exception:
                 self._fail_stop()
@@ -277,14 +400,14 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         with self._lock:
             self._arena.validate_pin(pin)
             try:
-                self._resident.wait_fence(pin)
+                self._adapter.wait_fence(pin)
                 self._release_completed_pin(pin)
             except Exception:
                 self._fail_stop()
                 raise
 
     def _release_completed_pin(self, pin: RequestStateAsyncPin) -> None:
-        self._resident.discard_fence(pin)
+        self._adapter.discard_fence(pin)
         self._arena.release_pin(pin)
 
     def retire(self, batch: RequestFinishedBatch) -> StateEffectReceipt:
@@ -304,7 +427,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             self._arena.replace_epoch(epoch)
 
     def _fail_stop(self) -> None:
-        self._resident.poison()
+        self._adapter.poison()
         self._arena.poison()
 
 
@@ -546,12 +669,12 @@ class RequestStateRuntimeService(Generic[ModuleT]):
             self._transition_receipts[selection.selection_id] = receipt
             return receipt
 
-    def groups(
+    def selected(
         self, selection: RequestStateSelectionBatch
-    ) -> tuple[RequestStateModuleGroup[ModuleT], ...]:
+    ) -> RequestStateSelected[ModuleT]:
         with self._lock:
             self._require_selection(selection)
-            return self._store.groups(selection)
+            return self._store.selected(selection)
 
     def after(self, audit: RequestStateEffectAudit) -> None:
         with self._lock:
@@ -834,6 +957,7 @@ class RequestStateRuntimeService(Generic[ModuleT]):
 __all__ = [
     "IndexedRequestIdentityBatch",
     "IndexedRequestIdentityRow",
+    "FixedBatchedSlotView",
     "RequestIdentityBatch",
     "RequestStateAcquisition",
     "RequestStateAsyncPin",
@@ -842,11 +966,13 @@ __all__ = [
     "RequestStateLease",
     "RequestStateLossBatch",
     "RequestStateModuleGroup",
+    "RequestStateSelected",
     "RequestStateRuntimeService",
     "RequestStateSelectionBatch",
     "RequestStateSelectionRow",
     "RequestStateVersion",
     "RequestTrainableStateStore",
+    "ResidentSlotView",
     "StateEffectOperation",
     "StateEffectReceipt",
     "StateSlotEffect",

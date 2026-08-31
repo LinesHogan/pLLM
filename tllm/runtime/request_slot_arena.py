@@ -90,7 +90,9 @@ class _ActiveSelection:
     leases: tuple[RequestStateLease, ...]
     before_versions: tuple[int, ...]
     slot_ids: tuple[int, ...]
+    lease_slot_ids: tuple[int, ...]
     device_slot_ids: torch.Tensor
+    device_lease_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
 
 
@@ -110,6 +112,9 @@ class _PendingAdmission:
     plan: RequestSlotAdmissionPlan
     device_slot_ids: torch.Tensor
     selection_slot_ids: torch.Tensor
+    lease_slot_ids: tuple[int, ...]
+    device_lease_slot_ids: torch.Tensor
+    selection_lease_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
     selection_valid_mask: torch.Tensor
 
@@ -276,6 +281,12 @@ class RequestSlotArena:
                 dtype=torch.long,
                 device=self._device,
             )
+            lease_slot_ids = tuple(planned[key] for key in unique_keys)
+            device_lease_slot_ids = torch.tensor(
+                lease_slot_ids,
+                dtype=torch.long,
+                device=self._device,
+            )
             valid_mask = torch.ones(
                 (len(planned_slot_ids),),
                 dtype=torch.bool,
@@ -295,6 +306,9 @@ class RequestSlotArena:
                 plan,
                 device_slot_ids,
                 device_slot_ids.clone(),
+                lease_slot_ids,
+                device_lease_slot_ids,
+                device_lease_slot_ids.clone(),
                 valid_mask,
                 valid_mask.clone(),
             )
@@ -353,7 +367,9 @@ class RequestSlotArena:
                 leases=leases,
                 before_versions=before_versions,
                 slot_ids=plan.planned_slot_ids,
+                lease_slot_ids=pending.lease_slot_ids,
                 device_slot_ids=pending.device_slot_ids,
+                device_lease_slot_ids=pending.device_lease_slot_ids,
                 valid_mask=pending.valid_mask,
             )
             selection = RequestStateSelectionBatch(
@@ -364,6 +380,7 @@ class RequestSlotArena:
                 leases=leases,
                 before_versions=before_versions,
                 device_slot_ids=pending.selection_slot_ids,
+                device_lease_slot_ids=pending.selection_lease_slot_ids,
                 valid_mask=pending.selection_valid_mask,
             )
             effects = tuple(
@@ -731,6 +748,14 @@ class RequestSlotArena:
             or selection.device_slot_ids.device != self._device
             or tuple(selection.device_slot_ids.shape) != (len(active.slot_ids),)
             or not torch.equal(selection.device_slot_ids, active.device_slot_ids)
+            or selection.device_lease_slot_ids.dtype is not torch.long
+            or selection.device_lease_slot_ids.device != self._device
+            or tuple(selection.device_lease_slot_ids.shape)
+            != (len(active.lease_slot_ids),)
+            or not torch.equal(
+                selection.device_lease_slot_ids,
+                active.device_lease_slot_ids,
+            )
             or selection.valid_mask.dtype is not torch.bool
             or selection.valid_mask.device != self._device
             or tuple(selection.valid_mask.shape) != (len(active.slot_ids),)

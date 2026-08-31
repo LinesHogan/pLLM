@@ -358,6 +358,22 @@ class State(Generic[StateValueT]):
         )
 
     @classmethod
+    def request_batched_trainable(
+        cls: type["State[RequestStateValueT]"],
+        *,
+        key: RequestKey,
+        optimizer: OptimizerSpec,
+        transition: str = "optimizer",
+    ) -> "FixedBatchedRequestTrainableState[RequestStateValueT]":
+        """Declare one capacity-first fixed-address request state bank."""
+
+        return FixedBatchedRequestTrainableState(
+            key=key,
+            optimizer=optimizer,
+            transition=transition,
+        )
+
+    @classmethod
     def published_module(cls) -> "PublishedModule[StateValueT]":
         return PublishedModule(
             scope=StateScope.REPLICA,
@@ -464,6 +480,8 @@ class RequestTrainableState(Generic[RequestStateValueT]):
     module singleton, while preserving the concrete module type.
     """
 
+    storage = StateStorage.DYNAMIC
+
     def __init__(
         self,
         *,
@@ -536,7 +554,7 @@ class RequestTrainableState(Generic[RequestStateValueT]):
             request_key=self.key.fields,
             parameters=self.parameters,
             optimizer=self.optimizer,
-            storage=StateStorage.DYNAMIC,
+            storage=self.storage,
             transition=self.transition_kind,
         )
 
@@ -549,6 +567,14 @@ class RequestTrainableState(Generic[RequestStateValueT]):
 
     def selection(self) -> "StateSelectionInput[RequestStateValueT]":
         return StateSelectionInput(self)
+
+
+class FixedBatchedRequestTrainableState(
+    RequestTrainableState[RequestStateValueT]
+):
+    """A request-keyed bank whose mutable tensors have a capacity first axis."""
+
+    storage = StateStorage.FIXED_BATCHED
 
 
 class ServiceState(State[StateValueT]):
@@ -2496,6 +2522,7 @@ __all__ = [
     "PackedSamplerRowsInput",
     "RequestKey",
     "RequestTrainableState",
+    "FixedBatchedRequestTrainableState",
     "State",
     "StateEffect",
     "StateSelectionInput",

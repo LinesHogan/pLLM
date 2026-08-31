@@ -9,13 +9,12 @@ from typing import Generic, TypeVar
 import torch
 
 from tllm.contracts.request_state import (
-    RequestStateAsyncPin,
     RequestStateLease,
     RequestStateSelectionBatch,
 )
+from tllm.runtime.request_slot_adapter import RequestSlotAdapter
 from tllm.runtime.request_slot_arena import (
     RequestSlotAdmissionPlan,
-    RequestSlotPinPlan,
     RequestSlotTransitionPlan,
 )
 
@@ -32,16 +31,9 @@ class RequestStateModuleGroup(Generic[ModuleT]):
 
 
 @dataclass(frozen=True, slots=True)
-class NoCompletionFence:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class CudaCompletionFence:
-    event: torch.cuda.Event
-
-
-CompletionFence = NoCompletionFence | CudaCompletionFence
+class ResidentSlotView(Generic[ModuleT]):
+    selection: RequestStateSelectionBatch
+    groups: tuple[RequestStateModuleGroup[ModuleT], ...]
 
 
 @dataclass(slots=True)
@@ -79,7 +71,7 @@ class _CudaRngState:
 _TorchRngState = _CpuRngState | _CudaRngState
 
 
-class ResidentModuleAdapter(Generic[ModuleT]):
+class ResidentModuleAdapter(RequestSlotAdapter, Generic[ModuleT]):
     """Own modules, optimizers, buffers, and completion events.
 
     Logical identity arrives only through an arena-issued plan and is never
@@ -88,8 +80,6 @@ class ResidentModuleAdapter(Generic[ModuleT]):
     """
 
     __slots__ = (
-        "_capacity",
-        "_device",
         "_module_factory",
         "_optimizer_factory",
         "_slots",
@@ -100,8 +90,6 @@ class ResidentModuleAdapter(Generic[ModuleT]):
         "_physical_buffer_ids",
         "_physical_buffer_addresses",
         "_physical_storage_addresses",
-        "_fences",
-        "_poisoned",
     )
 
     def __init__(
@@ -112,10 +100,7 @@ class ResidentModuleAdapter(Generic[ModuleT]):
         module_factory: Callable[[], ModuleT],
         optimizer_factory: Callable[[ModuleT], torch.optim.Optimizer],
     ) -> None:
-        if capacity < 1:
-            raise ValueError("resident module adapter capacity must be positive")
-        self._capacity = capacity
-        self._device = device
+        super().__init__(capacity=capacity, device=device)
         self._module_factory = module_factory
         self._optimizer_factory = optimizer_factory
 
@@ -195,20 +180,6 @@ class ResidentModuleAdapter(Generic[ModuleT]):
         self._physical_buffer_ids = buffer_ids
         self._physical_buffer_addresses = buffer_addresses
         self._physical_storage_addresses = storage_addresses
-        self._fences: dict[int, CompletionFence] = {}
-        self._poisoned = False
-
-    @property
-    def capacity(self) -> int:
-        return self._capacity
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
-
-    def poison(self) -> None:
-        self._poisoned = True
-
     def prepare_admission(
         self, plan: RequestSlotAdmissionPlan
     ) -> ResidentAdmissionPreparation:
@@ -295,7 +266,7 @@ class ResidentModuleAdapter(Generic[ModuleT]):
                         buffer.copy_(initial)
                     slot.optimizer = prepared.optimizer
         except Exception:
-            self._poisoned = True
+            self.poison()
             raise
 
     def groups(
@@ -327,6 +298,12 @@ class ResidentModuleAdapter(Generic[ModuleT]):
             )
         return tuple(groups)
 
+    def selected(
+        self,
+        selection: RequestStateSelectionBatch,
+    ) -> ResidentSlotView[ModuleT]:
+        return ResidentSlotView(selection, self.groups(selection))
+
     def execute_transition(
         self,
         plan: RequestSlotTransitionPlan,
@@ -345,82 +322,8 @@ class ResidentModuleAdapter(Generic[ModuleT]):
                     torch.autograd.backward(loss)
                     slot.optimizer.step()
         except Exception:
-            self._poisoned = True
+            self.poison()
             raise
-
-    def record_synchronous_fence(self) -> NoCompletionFence:
-        self._require_live()
-        if self._device.type == "cuda":
-            raise RuntimeError(
-                "CUDA resident state pins require a recorded completion event"
-            )
-        return NoCompletionFence()
-
-    def record_cuda_fence(
-        self,
-        stream: torch.cuda.Stream,
-    ) -> CudaCompletionFence:
-        self._require_live()
-        if self._device.type != "cuda":
-            raise RuntimeError("CPU resident state cannot record a CUDA pin")
-        if stream.device != self._device:
-            raise RuntimeError("resident completion stream uses another device")
-        event = torch.cuda.Event()
-        event.record(stream)
-        return CudaCompletionFence(event)
-
-    def commit_fence(
-        self,
-        plan: RequestSlotPinPlan,
-        fence: CompletionFence,
-    ) -> None:
-        self._require_live()
-        if plan.pin.pin_id in self._fences:
-            raise RuntimeError("resident completion fence already exists")
-        self._fences[plan.pin.pin_id] = fence
-
-    def discard_fence(self, pin: RequestStateAsyncPin) -> None:
-        self._require_live()
-        try:
-            self._fences.pop(pin.pin_id)
-        except KeyError as exc:
-            raise RuntimeError("resident completion fence is unknown") from exc
-
-    def fence_complete(self, pin: RequestStateAsyncPin) -> bool:
-        self._require_live()
-        match self._fence(pin):
-            case NoCompletionFence():
-                return True
-            case CudaCompletionFence(event=event):
-                return event.query()
-
-    def order_fence(
-        self,
-        pin: RequestStateAsyncPin,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        self._require_live()
-        if stream.device != self._device:
-            raise RuntimeError("resident ordering stream uses another device")
-        match self._fence(pin):
-            case NoCompletionFence():
-                raise RuntimeError("CUDA resident pin has no completion event")
-            case CudaCompletionFence(event=event):
-                stream.wait_event(event)
-
-    def wait_fence(self, pin: RequestStateAsyncPin) -> None:
-        self._require_live()
-        match self._fence(pin):
-            case NoCompletionFence():
-                return
-            case CudaCompletionFence(event=event):
-                event.synchronize()
-
-    def _fence(self, pin: RequestStateAsyncPin) -> CompletionFence:
-        try:
-            return self._fences[pin.pin_id]
-        except KeyError as exc:
-            raise RuntimeError("resident completion fence is unknown") from exc
 
     def _validate_slot_layout(self, slot_id: int) -> None:
         slot = self._slots[slot_id]
@@ -511,16 +414,9 @@ class ResidentModuleAdapter(Generic[ModuleT]):
                 torch.set_rng_state(cpu)
                 torch.cuda.set_rng_state(cuda, device)
 
-    def _require_live(self) -> None:
-        if self._poisoned:
-            raise RuntimeError("resident module adapter is poisoned")
-
-
 __all__ = [
-    "CompletionFence",
-    "CudaCompletionFence",
-    "NoCompletionFence",
     "RequestStateModuleGroup",
     "ResidentAdmissionPreparation",
     "ResidentModuleAdapter",
+    "ResidentSlotView",
 ]

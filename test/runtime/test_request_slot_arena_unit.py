@@ -83,6 +83,12 @@ def test_selection_tensors_are_exact_physical_provenance() -> None:
     )
     with pytest.raises(RuntimeError, match="tensors differ"):
         arena.read_receipt(wrong_dtype)
+    wrong_unique_slot = replace(
+        acquired.selection,
+        device_lease_slot_ids=torch.tensor((1,), dtype=torch.long),
+    )
+    with pytest.raises(RuntimeError, match="tensors differ"):
+        arena.read_receipt(wrong_unique_slot)
     wrong_shape = replace(
         acquired.selection,
         valid_mask=torch.tensor(True),
