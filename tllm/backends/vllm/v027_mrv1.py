@@ -258,6 +258,13 @@ def _wrapped_prepare_inputs(
             # Prepare that next step before its PREPARE lifecycle event.
             int(runtime.event_step_id) + 1
         )
+    _scheduler_batch_phase.stage_prepared_packed_rows(
+        execution=runtime.workload_execution,
+        step_id=int(runtime.event_step_id) + 1,
+        columns=batch_columns,
+        prompt_indices=runtime.reqid_to_promptidx,
+        sample_indices=runtime.reqid_to_sampleidx,
+    )
     _model_region.stage_signed_backend_region_event(
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,
         runtime=runtime,

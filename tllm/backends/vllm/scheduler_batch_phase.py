@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Protocol
+
 from tllm import _core
-from tllm.contracts.packed_rows import PackedRowPlanInputs
+from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedRowPlanInputs
 from tllm.runtime.step_session import StepSession
+
+
+class PreparedPackedRowsExecution(Protocol):
+    """Native execution surface required at the vLLM prepare-input boundary."""
+
+    @property
+    def requires_packed_rows(self) -> bool: ...
+
+    def stage_packed_row_plan(
+        self,
+        step_id: int,
+        columns: PackedRowPlanInputs,
+        prompt_indices: Mapping[str, int],
+        sample_indices: Mapping[str, int],
+    ) -> PackedPhaseRowBatch: ...
 
 
 def scheduler_batch_phase(
@@ -49,3 +67,29 @@ def session_hook_phase(session: StepSession | None) -> str:
     if session is None or session.batch_phase is None:
         raise RuntimeError("vLLM step session has no Rust-derived scheduler batch phase")
     return hook_phase(session.batch_phase)
+
+
+def stage_prepared_packed_rows(
+    *,
+    execution: PreparedPackedRowsExecution | None,
+    step_id: int,
+    columns: PackedRowPlanInputs,
+    prompt_indices: Mapping[str, int],
+    sample_indices: Mapping[str, int],
+) -> PackedPhaseRowBatch | None:
+    """Stage exact packed rows when the prepared native plan consumes them.
+
+    Driver wrappers provide only their normalized scheduler columns and the
+    backend-resolved request mappings.  Rust expands phase rows, and the
+    native execution validates that the resulting batch belongs to its
+    already-prepared plan epoch and step.
+    """
+
+    if execution is None or not execution.requires_packed_rows:
+        return None
+    return execution.stage_packed_row_plan(
+        step_id,
+        columns,
+        prompt_indices,
+        sample_indices,
+    )

@@ -357,6 +357,41 @@ def test_native_execution_stages_only_its_prepared_epoch_and_step() -> None:
     execution.finish_step(8)
 
 
+def test_native_execution_owns_and_retires_the_canonical_packed_row_batch() -> None:
+    artifact = _packed_artifact([])
+    execution = _native_execution(
+        _value_store(artifact, _request_state_service())
+    )
+    columns = PackedRowPlanInputs(
+        request_ids=("parent",),
+        scheduled_tokens=(1,),
+        prompt_tokens=(1,),
+        computed_tokens=(1,),
+    )
+
+    execution.prepare_step(7)
+    rows = execution.stage_packed_row_plan(
+        7,
+        columns,
+        {"parent": 3},
+        {"parent": 9},
+    )
+    assert execution.packed_rows_for_step(7) is rows
+    execution.finish_step(7)
+    with pytest.raises(RuntimeError, match="were not staged"):
+        execution.packed_rows_for_step(7)
+
+    execution.prepare_step(8)
+    next_rows = execution.stage_packed_row_plan(
+        8,
+        columns,
+        {"parent": 3},
+        {"parent": 9},
+    )
+    assert next_rows.step_id == 8
+    execution.finish_step(8)
+
+
 def test_packed_inputs_reject_missing_or_mismatched_runtime_provenance() -> None:
     artifact = _packed_artifact([])
     store = _value_store(artifact, _request_state_service())

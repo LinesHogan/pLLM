@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +12,8 @@ import pytest
 from tllm.backends.vllm import v027_mrv1, v027_mrv2
 from tllm.backends.vllm import scheduler_batch_phase
 from tllm import _core
+from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedRowPlanInputs
+from tllm.runtime.packed_phase_row_staging import PackedPhaseRowStaging
 from tllm.contracts.subscription import ConsumerSubscription
 from tllm.runtime.backend_region_binders import (
     BackendRegionBinderSlot,
@@ -20,6 +24,34 @@ from tllm.runtime.dispatch_plan import DispatchPlan, DispatchTarget
 from tllm.runtime.vllm_patch import common_hooks
 from tllm.runtime.workload_execution import BackendObservableEvent
 from tllm.schedule import BackendRegionBinderStage
+
+
+@dataclass
+class _PreparedPackedRowsExecution:
+    order: list[str]
+    plan_epoch: int = 17
+    requires_packed_rows: bool = True
+    parameter_overlays: dict[str, int] = field(default_factory=dict)
+    step_ids: list[int] = field(default_factory=list)
+    columns: list[PackedRowPlanInputs] = field(default_factory=list)
+
+    def stage_packed_row_plan(
+        self,
+        step_id: int,
+        columns: PackedRowPlanInputs,
+        prompt_indices: Mapping[str, int],
+        sample_indices: Mapping[str, int],
+    ) -> PackedPhaseRowBatch:
+        self.order.append("stage:packed_rows")
+        self.step_ids.append(step_id)
+        self.columns.append(columns)
+        return PackedPhaseRowStaging().stage(
+            self.plan_epoch,
+            step_id,
+            columns,
+            prompt_indices=prompt_indices,
+            sample_indices=sample_indices,
+        )
 
 
 def _runtime() -> SimpleNamespace:
@@ -60,10 +92,16 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
     driver: str,
 ) -> None:
     runtime = _runtime()
+    runtime.reqid_to_promptidx = {"request": 3}
+    runtime.reqid_to_sampleidx = {"request": 7}
     runner = SimpleNamespace(model=SimpleNamespace())
     phases: list[tuple[BackendObservableEvent, str | None]] = []
+    order: list[str] = []
+    packed_execution = _PreparedPackedRowsExecution(order)
+    runtime.workload_execution = packed_execution
 
     def dispatch(**kwargs: object) -> int:
+        order.append(f"dispatch:{kwargs['event'].value}")
         phases.append((kwargs["event"], kwargs["phase"]))
         return 0
 
@@ -80,8 +118,14 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
             mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
             mock.patch.object(v027_mrv1._model_region, "prepare_model_region_step"),
+            mock.patch.object(
+                v027_mrv1._model_region,
+                "stage_signed_backend_region_event",
+                return_value=False,
+            ),
             mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
+            mock.patch("tllm.runtime.request_lifecycle.observe_request_aliases"),
         ):
             core = SimpleNamespace(RUNTIME=runtime)
             v027_mrv1._wrapped_prepare_inputs(
@@ -136,8 +180,19 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
             mock.patch.object(v027_mrv2._hooks, "maybe_launch_post_logits_decode_work"),
             mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
+            mock.patch.object(
+                v027_mrv2._model_region,
+                "stage_signed_backend_region_event",
+                return_value=False,
+            ),
+            mock.patch.object(
+                v027_mrv2._model_region,
+                "abort_model_region_step",
+                return_value=False,
+            ),
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
+            mock.patch("tllm.runtime.request_lifecycle.observe_request_aliases"),
         ):
             core = SimpleNamespace(RUNTIME=runtime)
             v027_mrv2._wrapped_execute_model(
@@ -163,6 +218,19 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
         BackendObservableEvent.SAMPLE_TOKENS_POST,
     ]
     assert [phase for _event, phase in phases] == ["prefill"] * len(phases)
+    assert packed_execution.step_ids == [1]
+    assert packed_execution.columns == [
+        PackedRowPlanInputs(
+            request_ids=("request",),
+            scheduled_tokens=(2,),
+            prompt_tokens=(4,),
+            computed_tokens=(0,),
+        )
+    ]
+    assert order[:2] == [
+        "stage:packed_rows",
+        "dispatch:prepare_inputs.pre",
+    ]
 
 
 def test_mixed_scheduler_batch_is_rust_derived_for_the_full_mrv2_lifecycle() -> None:
@@ -406,6 +474,7 @@ def test_signed_prepare_post_binder_stages_after_pre_and_prepare_producers(
     runtime = _runtime()
     runtime.workload_execution = SimpleNamespace(
         parameter_overlays={},
+        requires_packed_rows=False,
         backend_region_binders={implementation_id: slot},
         backend_region_binder_stages=lambda event: (
             (

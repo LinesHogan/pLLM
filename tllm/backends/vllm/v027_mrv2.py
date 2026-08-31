@@ -122,6 +122,13 @@ def _wrapped_prepare_inputs(
             columns=batch_columns
         )
         hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
+        _scheduler_batch_phase.stage_prepared_packed_rows(
+            execution=runtime.workload_execution,
+            step_id=int(runtime.event_step_id),
+            columns=batch_columns,
+            prompt_indices=runtime.reqid_to_promptidx,
+            sample_indices=runtime.reqid_to_sampleidx,
+        )
     _model_region.prepare_model_region_step(
         runtime=runtime,
         runner=runner,

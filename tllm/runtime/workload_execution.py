@@ -24,7 +24,10 @@ import torch
 from tllm.contracts.packed_hidden import (
     PackedHiddenSnapshotBatch,
 )
-from tllm.contracts.packed_rows import PackedPhaseRowBatch
+from tllm.contracts.packed_rows import (
+    PackedPhaseRowBatch,
+    PackedRowPlanInputs,
+)
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.workload_ports import (
@@ -81,6 +84,7 @@ from tllm.runtime.parameter_overlay import (
     OverlayChannel,
     OverlayVersionStore,
 )
+from tllm.runtime.packed_phase_row_staging import PackedPhaseRowStaging
 from tllm.runtime.workload_bindings import (
     NoPerRequestStats,
     NoSamplerBinding,
@@ -1013,6 +1017,10 @@ class NativeWorkloadExecution:
         default_factory=_NativeShapeSpecializationQueue
     )
     _prepared_step: int = -1
+    _packed_row_staging: PackedPhaseRowStaging = field(
+        default_factory=PackedPhaseRowStaging
+    )
+    _packed_row_staged_steps: set[int] = field(default_factory=set[int])
     _executed_nodes: set[NodeKey] = field(default_factory=set[NodeKey])
     _pending_request_finished_sources: tuple[str, ...] = ()
     _last_request_state_retirements: tuple[StateEffectReceipt, ...] = ()
@@ -1325,8 +1333,13 @@ class NativeWorkloadExecution:
         self._executed_nodes.clear()
 
     def _retire_step_resources_locked(self, step: int) -> None:
-        self.executor.finish_step(step)
-        self._value_store.finish_step(step)
+        try:
+            self.executor.finish_step(step)
+            self._value_store.finish_step(step)
+        finally:
+            if step in self._packed_row_staged_steps:
+                self._packed_row_staging.finish_step(self.plan_epoch, step)
+                self._packed_row_staged_steps.remove(step)
         self._cost_probe.harvest()
 
     def advance_anchor(self, anchor: str) -> bool:
@@ -1638,6 +1651,49 @@ class NativeWorkloadExecution:
                     "packed rows must be staged for the prepared native step"
                 )
             self._value_store.stage_packed_rows(batch.step_id, batch)
+
+    def stage_packed_row_plan(
+        self,
+        step_id: int,
+        columns: PackedRowPlanInputs,
+        prompt_indices: Mapping[str, int],
+        sample_indices: Mapping[str, int],
+    ) -> PackedPhaseRowBatch:
+        """Expand and stage one prepared packed-row plan under this epoch."""
+
+        with self._execution_lock:
+            if not self._value_store.requires_packed_rows:
+                raise RuntimeError("native execution has no signed packed-row input")
+            if self._prepared_step != step_id:
+                raise RuntimeError(
+                    "packed rows must be staged for the prepared native step"
+                )
+            batch = self._packed_row_staging.stage(
+                self.plan_epoch,
+                step_id,
+                columns,
+                prompt_indices=prompt_indices,
+                sample_indices=sample_indices,
+            )
+            previously_staged = step_id in self._packed_row_staged_steps
+            try:
+                self._value_store.stage_packed_rows(step_id, batch)
+            except Exception:
+                if not previously_staged:
+                    self._packed_row_staging.finish_step(self.plan_epoch, step_id)
+                raise
+            self._packed_row_staged_steps.add(step_id)
+            return batch
+
+    def packed_rows_for_step(self, step_id: int) -> PackedPhaseRowBatch:
+        """Return the canonical packed rows retained for one active step."""
+
+        with self._execution_lock:
+            if step_id not in self._packed_row_staged_steps:
+                raise RuntimeError("packed rows were not staged for this native step")
+            return self._packed_row_staging.batch_for_step(
+                self.plan_epoch, step_id
+            )
 
     def stage_packed_hidden_snapshots(
         self, batch: PackedHiddenSnapshotBatch
