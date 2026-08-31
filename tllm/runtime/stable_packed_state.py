@@ -12,13 +12,12 @@ from tllm.contracts.request_state import (
     RequestStateSelectionBatch,
     RequestStateVersion,
 )
+from tllm.contracts.state_ref import StateRef
 from tllm.runtime.paged_state import (
     FrozenTensorLayout,
     ImmutableStateVersionRoot,
     PagedStateVersionArena,
     StateResourceId,
-    StateVersionLineage,
-    StateVersionRef,
     StateVersionRootPin,
     TensorFieldId,
 )
@@ -93,7 +92,7 @@ class StateStabilityEpoch:
 @dataclass(frozen=True, slots=True)
 class PinnedStateVersionEpoch:
     selection_id: int
-    refs: tuple[StateVersionRef, ...]
+    refs: tuple[StateRef, ...]
     roots: tuple[ImmutableStateVersionRoot, ...]
     root_pin: StateVersionRootPin
     page_ids: torch.Tensor
@@ -200,7 +199,7 @@ _ViewBufferState = (
 @dataclass(frozen=True, slots=True)
 class _PreparedView:
     selection_id: int
-    refs: tuple[StateVersionRef, ...]
+    refs: tuple[StateRef, ...]
     canonical_row_ids: tuple[int, ...]
     row_slot_ids: tuple[int, ...]
     lease_slot_ids: tuple[int, ...]
@@ -487,7 +486,9 @@ class StablePackedStateViewArena:
         if lease_count < 1 or lease_count > self._layout.lease_capacity:
             raise RuntimeError("stable view lease capacity is exhausted")
         if len(versions) != lease_count or any(
-            version.key != lease.key or version.slot != lease.slot
+            version.key != lease.key
+            or version.slot != lease.slot
+            or version.lineage_id != lease.lineage_id
             for version, lease in zip(
                 versions,
                 selection.leases,
@@ -517,19 +518,12 @@ class StablePackedStateViewArena:
             for position, row in reversed(tuple(enumerate(selection.rows)))
         }
         refs = tuple(
-            StateVersionRef(
-                StateVersionLineage(
-                    self._resource,
-                    selection.epoch,
-                    lease.slot,
-                ),
+            StateRef(
+                self._roots.bundle.layout.layout_id,
+                version.lineage_id,
                 version.version,
             )
-            for lease, version in zip(
-                selection.leases,
-                versions,
-                strict=True,
-            )
+            for version in versions
         )
         return _PreparedView(
             selection_id=selection.selection_id,

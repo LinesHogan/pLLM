@@ -948,6 +948,37 @@ fn digest(payload: &str) -> String {
     format!("{:x}", Sha256::digest(payload.as_bytes()))
 }
 
+#[derive(Serialize)]
+struct StateLayoutIdBinding<'a> {
+    resource: &'a str,
+    layout_id: u32,
+}
+
+#[pyfunction]
+fn intern_state_layout_ids(graph: &str) -> PyResult<String> {
+    let graph_desc: ScheduleGraph = decode(graph, "ScheduleGraph")?;
+    let mut resources = BTreeSet::new();
+    let bindings: Vec<StateLayoutIdBinding<'_>> = graph_desc
+        .states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            if state.resource.is_empty() || !resources.insert(state.resource.as_str()) {
+                return Err(value_error(
+                    "state layout interner requires unique non-empty resources",
+                ));
+            }
+            let layout_id = u32::try_from(index)
+                .map_err(|_| value_error("state layout interner exhausted u32 IDs"))?;
+            Ok(StateLayoutIdBinding {
+                resource: state.resource.as_str(),
+                layout_id,
+            })
+        })
+        .collect::<PyResult<_>>()?;
+    canonical_ascii_json(&bindings).map_err(value_error)
+}
+
 fn is_lowercase_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -6549,6 +6580,7 @@ fn apply_region_shape_specializations(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(intern_state_layout_ids, module)?)?;
     module.add_function(wrap_pyfunction!(compile_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(validate_schedule, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -6582,7 +6614,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         apply_region_shape_specializations_wire, compile_schedule, digest, is_lowercase_sha256,
-        normalize_runtime_specialization_options_wire, validate_compile_options_preflight,
+        intern_state_layout_ids, normalize_runtime_specialization_options_wire,
+        validate_compile_options_preflight,
         validate_runtime_specialization_facts, validate_schedule,
         workload_compilation_wire_cache_key, AsyncBatchCaptureMode, CompileOptions, Decision,
         ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind, RegionCaptureMode,
@@ -6611,6 +6644,15 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid or duplicate typed schedule state"));
+    }
+
+    #[test]
+    fn state_layout_interner_uses_canonical_dense_state_order() {
+        let graph = r#"{"workload_key":"layouts","tasks":[],"edges":[],"values":[],"states":[{"resource":"first","scope":"replica","request_key":[],"storage":"dynamic","transition":"optimizer"},{"resource":"second","scope":"request","request_key":["request_id"],"storage":"fixed_batched","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":3}"#;
+        assert_eq!(
+            intern_state_layout_ids(graph).unwrap(),
+            r#"[{"layout_id":0,"resource":"first"},{"layout_id":1,"resource":"second"}]"#
+        );
     }
 
     #[test]

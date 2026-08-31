@@ -13,16 +13,14 @@ from tllm.contracts.request_state import (
     StateEffectOperation,
     StateEffectReceipt,
 )
+from tllm.contracts.state_ref import LayoutId, StateRef, VersionId
 from tllm.runtime.paged_state import (
     AdmissionPageWrite,
     FrozenTensorField,
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
-    StateLayoutId,
     StateResourceId,
-    StateVersionLineage,
-    StateVersionRef,
     StateVersionRootPin,
     TensorFieldId,
     TransitionPageWrite,
@@ -69,7 +67,7 @@ BankT = TypeVar("BankT", bound=torch.nn.Module)
 class FixedBatchedAdmissionPreparation:
     transaction_id: int
     slot_ids: tuple[int, ...]
-    refs: tuple[StateVersionRef, ...]
+    refs: tuple[StateRef, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +77,7 @@ class FixedBatchedSlotView(Generic[BankT]):
     row_slot_ids: torch.Tensor
     unique_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
-    before_versions: tuple[int, ...]
+    before_versions: tuple[VersionId, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +254,7 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         bank: BankT,
         *,
         resource: StateResourceId,
+        layout_id: LayoutId,
         epoch: int,
         lr: float,
         betas: tuple[float, float] = (0.9, 0.999),
@@ -370,7 +369,7 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
             *self._optimizer.state_tensors,
         )
         tensor_layout = FrozenTensorLayout(
-            StateLayoutId(0),
+            layout_id,
             1,
             tuple(
                 FrozenTensorField(
@@ -415,13 +414,10 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         if self._roots.free_pages < required_pages:
             raise RuntimeError("fixed batched root capacity is exhausted")
         refs = tuple(
-            StateVersionRef(
-                StateVersionLineage(
-                    self._resource,
-                    plan.epoch,
-                    admission.slot,
-                ),
-                0,
+            StateRef(
+                self._roots.bundle.layout.layout_id,
+                admission.lineage_id,
+                VersionId(0),
             )
             for admission in plan.admissions
         )
@@ -439,13 +435,10 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         self._require_live()
         slot_ids = tuple(admission.slot.slot_id for admission in plan.admissions)
         refs = tuple(
-            StateVersionRef(
-                StateVersionLineage(
-                    self._resource,
-                    plan.epoch,
-                    admission.slot,
-                ),
-                0,
+            StateRef(
+                self._roots.bundle.layout.layout_id,
+                admission.lineage_id,
+                VersionId(0),
             )
             for admission in plan.admissions
         )
@@ -542,18 +535,19 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         if self._roots.free_pages < len(plan.transitions):
             raise RuntimeError("fixed batched root capacity is exhausted")
         source_refs = tuple(
-            StateVersionRef(
-                StateVersionLineage(
-                    self._resource,
-                    plan.epoch,
-                    effect.slot,
-                ),
+            StateRef(
+                self._roots.bundle.layout.layout_id,
+                effect.lineage_id,
                 effect.before_version,
             )
             for effect in plan.transitions
         )
         target_refs = tuple(
-            StateVersionRef(source.lineage, effect.after_version)
+            StateRef(
+                source.layout_id,
+                source.lineage_id,
+                effect.after_version,
+            )
             for source, effect in zip(
                 source_refs,
                 plan.transitions,
@@ -593,12 +587,9 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         try:
             for effect in receipt.slots:
                 self._roots.retire(
-                    StateVersionRef(
-                        StateVersionLineage(
-                            self._resource,
-                            receipt.epoch,
-                            effect.slot,
-                        ),
+                    StateRef(
+                        self._roots.bundle.layout.layout_id,
+                        effect.lineage_id,
                         effect.after_version,
                     )
                 )
@@ -625,31 +616,26 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         self,
         selection: RequestStateSelectionBatch,
         versions: tuple[RequestStateVersion, ...],
-    ) -> tuple[StateVersionRef, ...]:
+    ) -> tuple[StateRef, ...]:
         if len(versions) != len(selection.leases) or any(
-            version.key != lease.key or version.slot != lease.slot
+            version.key != lease.key
+            or version.slot != lease.slot
+            or version.lineage_id != lease.lineage_id
             for version, lease in zip(versions, selection.leases, strict=True)
         ):
             raise RuntimeError("fixed batched versions differ from selection leases")
         return tuple(
-            StateVersionRef(
-                StateVersionLineage(
-                    self._resource,
-                    selection.epoch,
-                    lease.slot,
-                ),
+            StateRef(
+                self._roots.bundle.layout.layout_id,
+                version.lineage_id,
                 version.version,
             )
-            for lease, version in zip(
-                selection.leases,
-                versions,
-                strict=True,
-            )
+            for version in versions
         )
 
     def _pin_roots(
         self,
-        refs: tuple[StateVersionRef, ...],
+        refs: tuple[StateRef, ...],
     ) -> StateVersionRootPin:
         if self.device.type == "cpu":
             return self._roots.pin_exact_synchronous(refs)
@@ -660,8 +646,8 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
 
     def _prepare_transition(
         self,
-        source: StateVersionRef,
-        target: StateVersionRef,
+        source: StateRef,
+        target: StateRef,
     ) -> TransitionPageWrite:
         if self.device.type == "cpu":
             return self._roots.prepare_transition_synchronous(source, target)

@@ -12,8 +12,9 @@ PTTS 与 AER 术语、数据结构和研究边界的权威来源。该研究文�
 page-id root、source-to-distinct-target COW、exact root pin、readiness/completion
 fence、old-root reclaim，以及 tensor-only stable projection 都有 CPU/GPU 证据。
 
-它尚不是研究文档定义的 PTTS canonical core，原因主要是 logical identity、
-public semantic API、容量证明、layout 泛化和 MP transport 尚未闭合。AER 的
+它尚不是研究文档定义的 PTTS canonical core。arena-local logical
+identity 已经不再依赖 physical slot，但 LayoutId/LineageId 的 graph、epoch 和
+MP 作用域、public semantic API、容量证明、layout 泛化与 transport 仍未闭合。AER 的
 `SemanticGraph`、dense typed IDs、derived `GraphIndex`、incremental
 `RegionSummary` 与 partition+placement oracle 尚未实现。
 
@@ -37,7 +38,7 @@ MP 或 legacy deletion gate 已完成。
 - fixed `2 × logical_capacity` headroom 位于 physical adapter 内，没有进入 workload
   config、lane、priority 或 scheduler policy。
 
-### P0：logical StateRef 不符合
+### P0：arena-local StateRef 已落地，全局作用域未闭合
 
 研究定义要求：
 
@@ -45,16 +46,22 @@ MP 或 legacy deletion gate 已完成。
 StateRef(LayoutId, LineageId, VersionId)
 ```
 
-当前 root key 实际为：
+当前 root arena 已以 `StateRef` 为键；request lease/effect/receipt/pin 携带独立
+`LineageId` 和 `VersionId`，`StateSlotRef` 只保留 allocator/ABA 证明。同一 slot
+reuse 会获得新 lineage，exact V0 pin 在 publish V1 后仍可验证并阻止 retire。
 
-```text
-resource + epoch + StateSlotRef(slot_id, generation) + version
-```
+这只是 **arena-local identity prototype**，还不能称为完整 PTTS identity：
 
-`StateSlotRef` 是 allocator/ABA witness，不是 logical lineage。必须在 admission 时
-生成独立 typed `LineageId`；logical lease 同时携带 lineage 与 slot ref，root 只以
-`StateRef` 为逻辑键。slot relocation、page compaction 或同 lineage 的新 physical
-mapping 不得改变 StateRef。
+- Rust 目前按一个 composed `ScheduleGraph` 的 state declaration 顺序签发 dense
+  `LayoutId`。它保证同一 graph 内唯一，但尚未基于 frozen tensor fields、shape、
+  dtype、alignment 与 mutation granularity 进行 layout interning；因此它是临时的
+  declaration-layout ID，不是已经完成泛化的 TensorLayout identity。
+- coordinator 与 worker 现在都从已验证的同一 graph 派生相同 binding，但 PTTS
+  root/page/pin/receipt 尚未进入 signed MP wire；`LineageId` 仍由每个
+  `RequestSlotArena` 本地签发。
+- 在 cross-workload shared arena、epoch overlap 或 StateRef 跨进程传输前，必须冻结
+  LayoutId namespace 和 coordinator-owned/deterministically witnessed lineage
+  issuance；不得恢复 Python ordinal fallback。
 
 ### P0：physical representation 泄漏进 workload 语义
 
@@ -95,7 +102,8 @@ record fence，再在一个 root-arena commit 中发布全部 refs；logical com
 
 ### P1：typed layout 仍是最小子集
 
-已有 dense field IDs、shape 与 dtype；仍缺：
+物理 `FrozenTensorLayout` 已有 dense field IDs、shape 与 dtype，但这些事实尚未进入
+Rust layout interner 的 semantic/cold input；仍缺：
 
 - `ShapeExpr`/layout family；
 - alignment；
@@ -115,7 +123,8 @@ record fence，再在一个 root-arena commit 中发布全部 refs；logical com
 - 只有 `free_pages`，尚缺 logical/reserved bytes、utilization、fragmentation、
   admitted/in-flight/retiring pages、pinned roots、pending receipts/fences 与 admission
   failures。
-- 尚无 PTTS root/page/pin/receipt 的 EngineCore-MP typed reconstruction wire。
+- worker cold specialization 已从验证后的 signed graph 派生同一 declaration-layout
+  binding；仍无 PTTS root/page/pin/receipt 的 EngineCore-MP typed reconstruction wire。
 
 ### P1：跨 workload 泛化未完成
 
@@ -144,15 +153,16 @@ page allocation/version lifecycle。
 ## 修正后的实施门序
 
 ```text
-1. typed LayoutId / LineageId / VersionId / StateRef
-2. RequestSlotArena lease 同时携带 logical lineage 与 physical SlotRef
-3. root arena 改用 StateRef，补 slot-relocation/ABA oracle
-4. admission capacity entitlement + atomic multi-root publication
-5. internalize FIXED_BATCHED，physical representation 进入 signed solution
-6. 补 layout alignment/mutation granularity 与 PTTS metrics
-7. 再完成 stable tensor projection / Rust capture predicate
-8. 再接 ESamp read-only capture；training loss/optimizer 保持 eager
-9. MP wire 与第二、第三、第四个真实 producer
+1. [arena-local 已落地] typed LayoutId / LineageId / VersionId / StateRef
+2. [已落地] RequestSlotArena lease 同时携带 logical lineage 与 physical SlotRef
+3. [已落地] root arena 改用 StateRef，补 ABA 与 old-version pin oracle
+4. 冻结 TensorLayout-based LayoutId namespace、epoch 边界和 MP lineage issuance witness
+5. admission capacity entitlement + atomic multi-root publication
+6. internalize FIXED_BATCHED，physical representation 进入 signed solution
+7. 补 layout alignment/mutation granularity 与 PTTS metrics
+8. [projection ABI 已落地] 在前述 P0 门禁后再完成 Rust capture predicate
+9. 再接 ESamp read-only capture；training loss/optimizer 保持 eager
+10. PTTS MP wire 与第二、第三、第四个真实 producer
 ```
 
 AER 独立按以下门序推进：
@@ -171,7 +181,8 @@ SemanticGraph boundary
 
 保留：
 
-- two-request/two-version/two-page、alias、ABA、slot relocation oracle；
+- two-request/two-version/two-page、alias、ABA、slot relocation oracle，以及
+  pin V0 → publish V1 → release selection → pin 阻止 retire → release pin 后 retire；
 - parameter 与 optimizer moments old-root immutability；
 - readiness/completion/reclaim GPU smoke；
 - identity/fragmented producer 共用 tensor-only executor；

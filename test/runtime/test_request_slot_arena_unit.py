@@ -111,6 +111,14 @@ def test_pin_blocks_retirement_and_reuse_advances_generation() -> None:
     arena.consume_receipt(acquired.admission)
     pin_plan = arena.plan_pin(acquired.selection)
     pin = arena.commit_pin(pin_plan)
+    assert pin.versions[0].lineage_id == acquired.selection.leases[0].lineage_id
+    assert pin.versions[0].version == 0
+
+    transition = arena.plan_transition(acquired.selection)
+    transition_receipt = arena.commit_transition(transition)
+    arena.consume_receipt(transition_receipt)
+    assert arena.versions()[0].version == 1
+    arena.validate_pin(pin)
     arena.release_selection(acquired.selection)
 
     with pytest.raises(RuntimeError, match="active leases, pins, or receipts"):
@@ -118,6 +126,7 @@ def test_pin_blocks_retirement_and_reuse_advances_generation() -> None:
     arena.release_pin(pin)
     retired = arena.retire(RequestFinishedBatch((identity,)))
     old_slot = retired.slots[0].slot
+    old_lineage = retired.slots[0].lineage_id
     arena.consume_receipt(retired)
 
     replacement = arena.plan_admission(
@@ -127,8 +136,10 @@ def test_pin_blocks_retirement_and_reuse_advances_generation() -> None:
     reacquired = arena.commit_admission(replacement)
     arena.consume_receipt(reacquired.admission)
     new_slot = reacquired.selection.leases[0].slot
+    new_lineage = reacquired.selection.leases[0].lineage_id
     assert new_slot.slot_id == old_slot.slot_id
     assert new_slot.generation == old_slot.generation + 1
+    assert new_lineage != old_lineage
 
 
 def test_poison_is_a_fail_stop_for_effects_and_cleanup() -> None:

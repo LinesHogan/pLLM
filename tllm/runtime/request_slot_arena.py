@@ -25,12 +25,14 @@ from tllm.contracts.request_state import (
     StateSlotEffect,
     StateSlotRef,
 )
+from tllm.contracts.state_ref import LineageId, VersionId
 
 
 @dataclass(frozen=True, slots=True)
 class SlotAdmission:
     key: RequestStateKey
     slot: StateSlotRef
+    lineage_id: LineageId
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,14 +68,15 @@ class RequestSlotPinPlan:
 @dataclass(slots=True)
 class _FreeSlot:
     generation: int = 0
-    version: int = 0
+    version: VersionId = VersionId(0)
     pending_receipts: int = 0
 
 
 @dataclass(slots=True)
 class _BoundSlot:
     generation: int
-    version: int
+    lineage_id: LineageId
+    version: VersionId
     key: RequestStateKey
     aliases: set[RequestIdentity] = field(default_factory=set[RequestIdentity])
     selection_leases: int = 0
@@ -88,7 +91,7 @@ _Slot = _FreeSlot | _BoundSlot
 class _ActiveSelection:
     rows: tuple[RequestStateSelectionRow, ...]
     leases: tuple[RequestStateLease, ...]
-    before_versions: tuple[int, ...]
+    before_versions: tuple[VersionId, ...]
     slot_ids: tuple[int, ...]
     lease_slot_ids: tuple[int, ...]
     device_slot_ids: torch.Tensor
@@ -99,7 +102,7 @@ class _ActiveSelection:
 @dataclass(frozen=True, slots=True)
 class _ActivePin:
     epoch: int
-    slots: tuple[StateSlotRef, ...]
+    versions: tuple[RequestStateVersion, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +167,7 @@ class RequestSlotArena:
         "_next_pin_id",
         "_next_receipt_id",
         "_next_transaction_id",
+        "_next_lineage_id",
         "_revision",
         "_poisoned",
         "_lock",
@@ -200,6 +204,7 @@ class RequestSlotArena:
         self._next_pin_id = 1
         self._next_receipt_id = 1
         self._next_transaction_id = 1
+        self._next_lineage_id = 1
         self._revision = 0
         self._poisoned = False
         self._lock = RLock()
@@ -263,18 +268,24 @@ class RequestSlotArena:
             selected_free_slots = free_slots[: len(new_keys)]
             planned = dict(self._slot_by_key)
             admissions: list[SlotAdmission] = []
-            for key, slot_id in zip(
+            for lineage_offset, (key, slot_id) in enumerate(zip(
                 new_keys,
                 selected_free_slots,
                 strict=True,
-            ):
+            )):
                 match self._slots[slot_id]:
                     case _FreeSlot() as free:
                         slot_ref = StateSlotRef(slot_id, free.generation + 1)
                     case _:
                         raise AssertionError("planned request slot is not free")
                 planned[key] = slot_id
-                admissions.append(SlotAdmission(key, slot_ref))
+                admissions.append(
+                    SlotAdmission(
+                        key,
+                        slot_ref,
+                        LineageId(self._next_lineage_id + lineage_offset),
+                    )
+                )
             planned_slot_ids = tuple(planned[key] for key in keys)
             device_slot_ids = torch.tensor(
                 planned_slot_ids,
@@ -313,6 +324,7 @@ class RequestSlotArena:
                 valid_mask.clone(),
             )
             self._next_transaction_id += 1
+            self._next_lineage_id += len(admissions)
             return plan
 
     def abort_admission(
@@ -335,14 +347,18 @@ class RequestSlotArena:
             lease_by_key: dict[RequestStateKey, RequestStateLease] = {}
             for key in dict.fromkeys(plan.keys):
                 if key in admission_by_key:
-                    slot_ref = admission_by_key[key].slot
+                    admission = admission_by_key[key]
+                    slot_ref = admission.slot
+                    lineage_id = admission.lineage_id
                 else:
                     slot_id = self._slot_by_key[key]
                     bound = self._bound_slot(slot_id)
                     slot_ref = StateSlotRef(slot_id, bound.generation)
+                    lineage_id = bound.lineage_id
                 lease_by_key[key] = RequestStateLease(
                     key=key,
                     slot=slot_ref,
+                    lineage_id=lineage_id,
                     epoch=self._epoch,
                 )
             rows = tuple(
@@ -356,7 +372,7 @@ class RequestSlotArena:
             )
             leases = tuple(lease_by_key[key] for key in dict.fromkeys(plan.keys))
             before_versions = tuple(
-                0
+                VersionId(0)
                 if lease.key in admission_by_key
                 else self._bound_slot(lease.slot.slot_id).version
                 for lease in leases
@@ -387,8 +403,9 @@ class RequestSlotArena:
                 StateSlotEffect(
                     admission.key,
                     admission.slot,
-                    0,
-                    0,
+                    admission.lineage_id,
+                    VersionId(0),
+                    VersionId(0),
                 )
                 for admission in plan.admissions
             )
@@ -411,7 +428,8 @@ class RequestSlotArena:
             for admission in plan.admissions:
                 self._slots[admission.slot.slot_id] = _BoundSlot(
                     generation=admission.slot.generation,
-                    version=0,
+                    lineage_id=admission.lineage_id,
+                    version=VersionId(0),
                     key=admission.key,
                 )
                 self._slot_by_key[admission.key] = admission.slot.slot_id
@@ -449,6 +467,7 @@ class RequestSlotArena:
                 RequestStateVersion(
                     lease.key,
                     lease.slot,
+                    lease.lineage_id,
                     self._bound_slot(lease.slot.slot_id).version,
                 )
                 for lease in selection.leases
@@ -463,6 +482,7 @@ class RequestSlotArena:
                 StateSlotEffect(
                     lease.key,
                     lease.slot,
+                    lease.lineage_id,
                     self._bound_slot(lease.slot.slot_id).version,
                     self._bound_slot(lease.slot.slot_id).version,
                 )
@@ -491,8 +511,11 @@ class RequestSlotArena:
                     StateSlotEffect(
                         lease.key,
                         lease.slot,
+                        lease.lineage_id,
                         self._bound_slot(lease.slot.slot_id).version,
-                        self._bound_slot(lease.slot.slot_id).version + 1,
+                        VersionId(
+                            int(self._bound_slot(lease.slot.slot_id).version) + 1
+                        ),
                     )
                     for lease in selection.leases
                 ),
@@ -525,9 +548,11 @@ class RequestSlotArena:
                 if (
                     bound.generation != effect.slot.generation
                     or bound.key != effect.key
+                    or bound.lineage_id != effect.lineage_id
                     or bound.version != effect.before_version
                     or bound.pending_receipts
-                    or effect.after_version != effect.before_version + 1
+                    or int(effect.after_version)
+                    != int(effect.before_version) + 1
                 ):
                     raise AssertionError("request slot transition is not monotonic")
             for effect in plan.transitions:
@@ -550,12 +575,20 @@ class RequestSlotArena:
     ) -> RequestSlotPinPlan:
         with self._lock:
             self.validate_selection(selection, audited=True)
-            slots = tuple(lease.slot for lease in selection.leases)
+            versions = tuple(
+                RequestStateVersion(
+                    lease.key,
+                    lease.slot,
+                    lease.lineage_id,
+                    self._bound_slot(lease.slot.slot_id).version,
+                )
+                for lease in selection.leases
+            )
             pin = RequestStateAsyncPin(
                 self._resource,
                 self._next_pin_id,
                 self._epoch,
-                slots,
+                versions,
             )
             plan = RequestSlotPinPlan(
                 self._next_transaction_id,
@@ -579,10 +612,10 @@ class RequestSlotArena:
     def commit_pin(self, plan: RequestSlotPinPlan) -> RequestStateAsyncPin:
         with self._lock:
             self._require_pending_pin(plan)
-            active = _ActivePin(self._epoch, plan.pin.slots)
+            active = _ActivePin(self._epoch, plan.pin.versions)
             self._active_pins[plan.pin.pin_id] = active
-            for slot in plan.pin.slots:
-                self._bound_slot(slot.slot_id).pins += 1
+            for version in plan.pin.versions:
+                self._bound_slot(version.slot.slot_id).pins += 1
             self._pending = _NO_PENDING
             self._revision += 1
             return plan.pin
@@ -592,17 +625,21 @@ class RequestSlotArena:
             self._require_live()
             self._require_no_pending_plan()
             active = self._active_pin(pin)
-            for slot in active.slots:
-                bound = self._bound_slot(slot.slot_id)
-                if bound.generation != slot.generation:
-                    raise RuntimeError("request slot pin contains a stale generation")
+            for version in active.versions:
+                bound = self._bound_slot(version.slot.slot_id)
+                if (
+                    bound.generation != version.slot.generation
+                    or bound.key != version.key
+                    or bound.lineage_id != version.lineage_id
+                ):
+                    raise RuntimeError("request slot pin contains a stale lineage")
 
     def release_pin(self, pin: RequestStateAsyncPin) -> None:
         with self._lock:
             self.validate_pin(pin)
             active = self._active_pin(pin)
-            for slot in active.slots:
-                self._bound_slot(slot.slot_id).pins -= 1
+            for version in active.versions:
+                self._bound_slot(version.slot.slot_id).pins -= 1
             self._active_pins.pop(pin.pin_id)
             self._revision += 1
 
@@ -642,6 +679,7 @@ class RequestSlotArena:
                         self._slot_by_key[key],
                         self._bound_slot(self._slot_by_key[key]).generation,
                     ),
+                    self._bound_slot(self._slot_by_key[key]).lineage_id,
                     self._bound_slot(self._slot_by_key[key]).version,
                     self._bound_slot(self._slot_by_key[key]).version,
                 )
@@ -657,6 +695,7 @@ class RequestSlotArena:
                 if (
                     bound.generation != effect.slot.generation
                     or bound.key != effect.key
+                    or bound.lineage_id != effect.lineage_id
                     or bound.version != effect.after_version
                     or bound.pending_receipts
                 ):
@@ -684,6 +723,7 @@ class RequestSlotArena:
                 RequestStateVersion(
                     key,
                     StateSlotRef(slot_id, self._bound_slot(slot_id).generation),
+                    self._bound_slot(slot_id).lineage_id,
                     self._bound_slot(slot_id).version,
                 )
                 for key, slot_id in sorted(
@@ -776,6 +816,7 @@ class RequestSlotArena:
             if (
                 bound.generation != lease.slot.generation
                 or bound.key != lease.key
+                or bound.lineage_id != lease.lineage_id
                 or lease.epoch != self._epoch
             ):
                 raise RuntimeError("request slot selection contains a stale lease")
@@ -790,7 +831,7 @@ class RequestSlotArena:
             pin.resource != self._resource
             or pin.epoch != self._epoch
             or active.epoch != pin.epoch
-            or active.slots != pin.slots
+            or active.versions != pin.versions
         ):
             raise RuntimeError("request slot pin differs from its lease")
         return active
@@ -826,8 +867,11 @@ class RequestSlotArena:
                 raise RuntimeError("request slot receipt no longer matches state")
             if receipt.operation is not StateEffectOperation.RETIRE:
                 bound = self._bound_slot(effect.slot.slot_id)
-                if bound.key != effect.key:
-                    raise RuntimeError("request slot receipt key changed")
+                if (
+                    bound.key != effect.key
+                    or bound.lineage_id != effect.lineage_id
+                ):
+                    raise RuntimeError("request slot receipt lineage changed")
 
     def _publish_receipt(self, receipt: StateEffectReceipt) -> None:
         slots = tuple(dict.fromkeys(effect.slot for effect in receipt.slots))

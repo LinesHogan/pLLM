@@ -10,16 +10,13 @@ from tllm.contracts.request_identity import (
     RequestIdentity,
     RequestKeyField,
 )
-from tllm.contracts.request_state import StateSlotRef
+from tllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from tllm.runtime.paged_state import (
     FrozenTensorField,
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
-    StateLayoutId,
     StateResourceId,
-    StateVersionLineage,
-    StateVersionRef,
     TensorFieldId,
 )
 from tllm.runtime.request_slot_arena import RequestSlotArena
@@ -69,7 +66,7 @@ class StablePackedStateUnitTest(unittest.TestCase):
         selection = acquisition.selection
 
         state_layout = FrozenTensorLayout(
-            StateLayoutId(4),
+            LayoutId(4),
             1,
             (
                 FrozenTensorField(
@@ -96,8 +93,9 @@ class StablePackedStateUnitTest(unittest.TestCase):
             bundle_epoch=3,
         )
         refs = tuple(
-            StateVersionRef(
-                StateVersionLineage(resource, 3, lease.slot),
+            StateRef(
+                state_layout.layout_id,
+                lease.lineage_id,
                 version,
             )
             for lease, version in zip(
@@ -111,13 +109,10 @@ class StablePackedStateUnitTest(unittest.TestCase):
             fixed_write.target_pages[0][0].fill_(float(index + 1))
             fixed_roots.publish(fixed_write, NoCompletionFence())
 
-        dummy_ref = StateVersionRef(
-            StateVersionLineage(
-                resource,
-                3,
-                StateSlotRef(99, 1),
-            ),
-            0,
+        dummy_ref = StateRef(
+            state_layout.layout_id,
+            LineageId(999),
+            VersionId(0),
         )
         dummy_write = fragmented_roots.prepare_admission(dummy_ref)
         dummy_write.target_pages[0][0].fill_(99.0)

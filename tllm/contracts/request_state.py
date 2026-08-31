@@ -11,6 +11,7 @@ from tllm.contracts.request_identity import (
     RequestIdentity,
     RequestKeyField,
 )
+from tllm.contracts.state_ref import LineageId, VersionId
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,7 @@ class StateSlotRef:
 class RequestStateLease:
     key: RequestStateKey
     slot: StateSlotRef
+    lineage_id: LineageId
     epoch: int
 
 
@@ -97,7 +99,7 @@ class RequestStateSelectionBatch:
     epoch: int
     rows: tuple[RequestStateSelectionRow, ...]
     leases: tuple[RequestStateLease, ...]
-    before_versions: tuple[int, ...]
+    before_versions: tuple[VersionId, ...]
     device_slot_ids: torch.Tensor
     device_lease_slot_ids: torch.Tensor
     valid_mask: torch.Tensor
@@ -188,8 +190,9 @@ class StateEffectOperation(StrEnum):
 class StateSlotEffect:
     key: RequestStateKey
     slot: StateSlotRef
-    before_version: int
-    after_version: int
+    lineage_id: LineageId
+    before_version: VersionId
+    after_version: VersionId
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +209,8 @@ class StateEffectReceipt:
 class RequestStateVersion:
     key: RequestStateKey
     slot: StateSlotRef
-    version: int
+    lineage_id: LineageId
+    version: VersionId
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +237,7 @@ class RequestStateAsyncPin:
     resource: str
     pin_id: int
     epoch: int
-    slots: tuple[StateSlotRef, ...]
+    versions: tuple[RequestStateVersion, ...]
 
 
 __all__ = [

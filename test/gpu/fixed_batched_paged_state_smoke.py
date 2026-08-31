@@ -20,6 +20,7 @@ from tllm.runtime.fixed_batched_slot_adapter import (
     FixedBatchedSlotLayout,
     FixedBatchedSlotModule,
 )
+from tllm.contracts.state_ref import LayoutId
 from tllm.runtime.paged_state import TensorFieldId
 from tllm.runtime.request_trainable_state import (
     RequestStateRuntimeService,
@@ -79,6 +80,7 @@ def main() -> int:
     device = torch.device("cuda:0")
     store = RequestTrainableStateStore[_CudaScalarBank].fixed_batched(
         resource="state",
+        layout_id=LayoutId(9),
         key_fields=(RequestKeyField.REQUEST_ID,),
         epoch=1,
         bank=_CudaScalarBank(device),

@@ -6,16 +6,12 @@ import unittest
 
 import torch
 
-from tllm.contracts.request_state import StateSlotRef
+from tllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from tllm.runtime.paged_state import (
     FrozenTensorField,
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
-    StateLayoutId,
-    StateResourceId,
-    StateVersionLineage,
-    StateVersionRef,
     TensorFieldId,
 )
 from tllm.runtime.request_slot_adapter import NoCompletionFence
@@ -24,7 +20,7 @@ from tllm.runtime.request_slot_adapter import NoCompletionFence
 class PagedStateUnitTest(unittest.TestCase):
     def test_pinned_root_capacity_reclaim_and_aba(self) -> None:
         layout = FrozenTensorLayout(
-            StateLayoutId(7),
+            LayoutId(7),
             2,
             (
                 FrozenTensorField(
@@ -45,19 +41,10 @@ class PagedStateUnitTest(unittest.TestCase):
             device=torch.device("cpu"),
         )
         arena = PagedStateVersionArena(bundle, bundle_epoch=3)
-        resource = StateResourceId("test.request_state")
-        first_lineage = StateVersionLineage(
-            resource,
-            3,
-            StateSlotRef(0, 1),
-        )
-        second_lineage = StateVersionLineage(
-            resource,
-            3,
-            StateSlotRef(1, 1),
-        )
-        first_v0 = StateVersionRef(first_lineage, 0)
-        second_v0 = StateVersionRef(second_lineage, 0)
+        first_lineage = LineageId(1)
+        second_lineage = LineageId(2)
+        first_v0 = StateRef(layout.layout_id, first_lineage, VersionId(0))
+        second_v0 = StateRef(layout.layout_id, second_lineage, VersionId(0))
 
         first_admission = arena.prepare_admission(first_v0)
         for virtual_page, page in enumerate(first_admission.target_pages):
@@ -73,7 +60,7 @@ class PagedStateUnitTest(unittest.TestCase):
         self.assertEqual(arena.free_pages, 2)
 
         pinned_v0 = arena.pin_exact_synchronous((first_v0, second_v0))
-        first_v1 = StateVersionRef(first_lineage, 1)
+        first_v1 = StateRef(layout.layout_id, first_lineage, VersionId(1))
         aborted_transition = arena.prepare_transition_synchronous(
             first_v0,
             first_v1,
@@ -122,7 +109,7 @@ class PagedStateUnitTest(unittest.TestCase):
         )
         self.assertEqual(arena.free_pages, 0)
 
-        first_v2 = StateVersionRef(first_lineage, 2)
+        first_v2 = StateRef(layout.layout_id, first_lineage, VersionId(2))
         with self.assertRaisesRegex(RuntimeError, "capacity"):
             arena.prepare_transition_synchronous(first_v1, first_v2)
         self.assertEqual(arena.root(first_v1), first_v1_root)
@@ -153,12 +140,12 @@ class PagedStateUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unknown or reclaimed"):
             arena.root(first_v0)
 
-        reused_lineage = StateVersionLineage(
-            resource,
-            3,
-            StateSlotRef(0, 2),
+        reused_lineage = LineageId(3)
+        reused_v0 = StateRef(
+            layout.layout_id,
+            reused_lineage,
+            VersionId(0),
         )
-        reused_v0 = StateVersionRef(reused_lineage, 0)
         reused_admission = arena.prepare_admission(reused_v0)
         for page in reused_admission.target_pages:
             for tensor in page:

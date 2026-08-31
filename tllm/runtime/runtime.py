@@ -1190,6 +1190,16 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             raise RuntimeError(
                 "cannot specialize a workload epoch with unresolved staged ports"
             )
+        compiler = self._workload_compiler
+        if compiler is None:
+            raise RuntimeError("runtime has no workload graph to intern state layouts")
+        from tllm.runtime.specialization import bind_state_layout_ids
+
+        spec = bind_state_layout_ids(
+            spec,
+            compiler.graph.to_json(),
+            compiler.declarations,
+        )
         import json
         from tllm import _core
         from tllm.schedule import CompileOptions

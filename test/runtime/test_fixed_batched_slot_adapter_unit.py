@@ -15,6 +15,7 @@ from tllm.contracts.request_state import (
     RequestIdentityBatch,
     StateEffectOperation,
 )
+from tllm.contracts.state_ref import LayoutId, StateRef
 from tllm.runtime.fixed_batched_slot_adapter import (
     FixedBatchedSlotAdapter,
     FixedBatchedSlotLayout,
@@ -22,8 +23,6 @@ from tllm.runtime.fixed_batched_slot_adapter import (
 )
 from tllm.runtime.paged_state import (
     StateResourceId,
-    StateVersionLineage,
-    StateVersionRef,
     StateVersionRootPin,
     TensorFieldId,
 )
@@ -88,6 +87,7 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
     adapter = FixedBatchedSlotAdapter(
         bank,
         resource=StateResourceId("state"),
+        layout_id=LayoutId(7),
         epoch=1,
         lr=0.03,
         betas=(0.8, 0.9),
@@ -147,12 +147,9 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
         if update == 1:
             current_versions = arena.selection_versions(acquired.selection)
             old_refs = tuple(
-                StateVersionRef(
-                    StateVersionLineage(
-                        StateResourceId("state"),
-                        1,
-                        version.slot,
-                    ),
+                StateRef(
+                    adapter.version_roots.bundle.layout.layout_id,
+                    version.lineage_id,
                     version.version,
                 )
                 for version in current_versions
@@ -349,6 +346,7 @@ def test_stable_view_bridge_blocks_step_finish_until_completion() -> None:
         bank.bias.fill_(0.5)
     store = RequestTrainableStateStore[_ScalarBank].fixed_batched(
         resource="state",
+        layout_id=LayoutId(7),
         key_fields=(RequestKeyField.REQUEST_ID,),
         epoch=1,
         bank=bank,

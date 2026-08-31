@@ -30,6 +30,12 @@ from tllm.contracts.shape_specialization import (
     RegionShapeSpecializationRequest,
 )
 from tllm.contracts.subscription import ConsumerSubscription
+from tllm.contracts.state_ref import (
+    LayoutId,
+    LineageId,
+    StateRef,
+    VersionId,
+)
 
 __all__ = [
     "ConsumerSubscription",
@@ -53,4 +59,8 @@ __all__ = [
     "RuntimeContext",
     "RegionShapeSpecializationInput",
     "RegionShapeSpecializationRequest",
+    "LayoutId",
+    "LineageId",
+    "StateRef",
+    "VersionId",
 ]

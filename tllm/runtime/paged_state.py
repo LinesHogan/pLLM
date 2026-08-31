@@ -13,7 +13,12 @@ from typing import NewType
 
 import torch
 
-from tllm.contracts.request_state import StateSlotRef
+from tllm.contracts.state_ref import (
+    LayoutId,
+    LineageId,
+    StateRef,
+    VersionId,
+)
 from tllm.runtime.request_slot_adapter import (
     CompletionFence,
     CudaCompletionFence,
@@ -21,7 +26,6 @@ from tllm.runtime.request_slot_adapter import (
 )
 
 
-StateLayoutId = NewType("StateLayoutId", int)
 StateResourceId = NewType("StateResourceId", str)
 TensorFieldId = NewType("TensorFieldId", int)
 
@@ -41,7 +45,7 @@ class FrozenTensorField:
 
 @dataclass(frozen=True, slots=True)
 class FrozenTensorLayout:
-    layout_id: StateLayoutId
+    layout_id: LayoutId
     root_page_count: int
     fields: tuple[FrozenTensorField, ...]
 
@@ -165,33 +169,9 @@ class PageBundle:
                 raise RuntimeError("page bundle tensor signature changed")
 
 @dataclass(frozen=True, slots=True)
-class StateVersionLineage:
-    resource: StateResourceId
-    epoch: int
-    slot: StateSlotRef
-
-    def __post_init__(self) -> None:
-        if not str(self.resource):
-            raise ValueError("state version lineage requires a resource")
-        if self.epoch < 1:
-            raise ValueError("state version lineage epoch must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class StateVersionRef:
-    lineage: StateVersionLineage
-    version: int
-
-    def __post_init__(self) -> None:
-        if self.version < 0:
-            raise ValueError("state version must be non-negative")
-
-
-@dataclass(frozen=True, slots=True)
 class ImmutableStateVersionRoot:
     root_id: int
-    ref: StateVersionRef
-    layout_id: StateLayoutId
+    ref: StateRef
     bundle_epoch: int
     page_ids: tuple[int, ...]
     readiness: CompletionFence
@@ -208,7 +188,7 @@ class AdmissionPageWrite:
     """Pending capability held only by a trusted physical producer."""
 
     transaction_id: int
-    target: StateVersionRef
+    target: StateRef
     target_page_ids: tuple[int, ...]
     target_pages: PageTensorRows
 
@@ -218,8 +198,8 @@ class TransitionPageWrite:
     """Pending COW capability held only by a trusted physical producer."""
 
     transaction_id: int
-    source: StateVersionRef
-    target: StateVersionRef
+    source: StateRef
+    target: StateRef
     source_page_ids: tuple[int, ...]
     target_page_ids: tuple[int, ...]
     source_pages: PageTensorRows
@@ -241,7 +221,7 @@ class _StagedPage:
 
 @dataclass(frozen=True, slots=True)
 class _RootPage:
-    ref: StateVersionRef
+    ref: StateRef
 
 
 _PageOwner = _FreePage | _StagedPage | _RootPage
@@ -280,7 +260,7 @@ class _PendingPinRelease:
 
 @dataclass(frozen=True, slots=True)
 class _PendingTransitionRelease:
-    source: StateVersionRef
+    source: StateRef
     event: torch.cuda.Event
 
 
@@ -319,9 +299,9 @@ class PagedStateVersionArena:
         self._page_owners: list[_PageOwner] = [
             _FreePage() for _ in range(bundle.capacity)
         ]
-        self._roots: dict[StateVersionRef, _StoredRoot] = {}
+        self._roots: dict[StateRef, _StoredRoot] = {}
         self._latest_published_root: dict[
-            StateVersionLineage, StateVersionRef
+            LineageId, StateRef
         ] = {}
         self._pins: dict[int, StateVersionRootPin] = {}
         self._pending_pin_releases: dict[int, _PendingPinRelease] = {}
@@ -362,15 +342,18 @@ class PagedStateVersionArena:
 
     def prepare_admission(
         self,
-        target: StateVersionRef,
+        target: StateRef,
     ) -> AdmissionPageWrite:
         with self._lock:
             self._require_no_pending_write()
             self._collect_completed_locked()
-            if target.version != 0:
+            if (
+                target.layout_id != self._bundle.layout.layout_id
+                or target.version_id != VersionId(0)
+            ):
                 raise ValueError("admission state root must begin at version zero")
             if (
-                target.lineage in self._latest_published_root
+                target.lineage_id in self._latest_published_root
                 or target in self._roots
             ):
                 raise RuntimeError("state lineage is already admitted")
@@ -388,8 +371,8 @@ class PagedStateVersionArena:
 
     def prepare_transition_synchronous(
         self,
-        source: StateVersionRef,
-        target: StateVersionRef,
+        source: StateRef,
+        target: StateRef,
     ) -> TransitionPageWrite:
         with self._lock:
             self._require_cpu()
@@ -402,8 +385,8 @@ class PagedStateVersionArena:
 
     def prepare_transition_cuda(
         self,
-        source: StateVersionRef,
-        target: StateVersionRef,
+        source: StateRef,
+        target: StateRef,
         stream: torch.cuda.Stream,
     ) -> TransitionPageWrite:
         with self._lock:
@@ -449,13 +432,12 @@ class PagedStateVersionArena:
             root = ImmutableStateVersionRoot(
                 root_id=self._next_root_id,
                 ref=target,
-                layout_id=self._bundle.layout.layout_id,
                 bundle_epoch=self._bundle_epoch,
                 page_ids=target_page_ids,
                 readiness=readiness,
             )
             self._roots[target] = _StoredRoot(root)
-            self._latest_published_root[target.lineage] = target
+            self._latest_published_root[target.lineage_id] = target
             for page_id in target_page_ids:
                 self._page_owners[page_id] = _RootPage(target)
             match write, readiness:
@@ -506,7 +488,7 @@ class PagedStateVersionArena:
 
     def pin_exact_synchronous(
         self,
-        refs: tuple[StateVersionRef, ...],
+        refs: tuple[StateRef, ...],
     ) -> StateVersionRootPin:
         with self._lock:
             self._require_cpu()
@@ -521,7 +503,7 @@ class PagedStateVersionArena:
 
     def pin_exact_cuda(
         self,
-        refs: tuple[StateVersionRef, ...],
+        refs: tuple[StateRef, ...],
         stream: torch.cuda.Stream,
     ) -> StateVersionRootPin:
         with self._lock:
@@ -597,11 +579,11 @@ class PagedStateVersionArena:
         with self._lock:
             self._collect_completed_locked()
 
-    def root(self, ref: StateVersionRef) -> ImmutableStateVersionRoot:
+    def root(self, ref: StateRef) -> ImmutableStateVersionRoot:
         with self._lock:
             return self._stored_root(ref).root
 
-    def retire(self, ref: StateVersionRef) -> None:
+    def retire(self, ref: StateRef) -> None:
         """Retire an exact latest root after logical RETIRE is authorized."""
 
         with self._lock:
@@ -609,34 +591,35 @@ class PagedStateVersionArena:
             self._collect_completed_locked()
             stored = self._stored_root(ref)
             if (
-                ref.lineage not in self._latest_published_root
-                or self._latest_published_root[ref.lineage] != ref
+                ref.lineage_id not in self._latest_published_root
+                or self._latest_published_root[ref.lineage_id] != ref
             ):
                 raise RuntimeError("only the latest root may retire its lineage")
             if stored.pins:
                 raise RuntimeError("cannot retire a pinned state root")
             if not self._fence_complete(stored.root.readiness):
                 raise RuntimeError("cannot retire a root before its writer completes")
-            self._latest_published_root.pop(ref.lineage)
+            self._latest_published_root.pop(ref.lineage_id)
             self._roots.pop(ref)
             self._free_root_pages(stored.root)
 
     def _reserve_transition(
         self,
-        source: StateVersionRef,
-        target: StateVersionRef,
+        source: StateRef,
+        target: StateRef,
     ) -> TransitionPageWrite:
         self._require_no_pending_write()
         self._collect_completed_locked()
         if (
-            target.lineage != source.lineage
-            or target.version != source.version + 1
+            target.layout_id != source.layout_id
+            or target.lineage_id != source.lineage_id
+            or int(target.version_id) != int(source.version_id) + 1
         ):
             raise ValueError("transition target must be the next lineage version")
-        if source.lineage not in self._latest_published_root:
+        if source.lineage_id not in self._latest_published_root:
             raise RuntimeError("state transition lineage is not admitted")
         if (
-            self._latest_published_root[source.lineage] != source
+            self._latest_published_root[source.lineage_id] != source
             or target in self._roots
         ):
             raise RuntimeError("state transition source is not the latest root")
@@ -678,7 +661,7 @@ class PagedStateVersionArena:
     @staticmethod
     def _write_target(
         write: PageWrite,
-    ) -> tuple[StateVersionRef, tuple[int, ...]]:
+    ) -> tuple[StateRef, tuple[int, ...]]:
         match write:
             case AdmissionPageWrite(target=target, target_page_ids=page_ids):
                 return target, page_ids
@@ -687,7 +670,7 @@ class PagedStateVersionArena:
 
     def _roots_for_pin(
         self,
-        refs: tuple[StateVersionRef, ...],
+        refs: tuple[StateRef, ...],
     ) -> tuple[ImmutableStateVersionRoot, ...]:
         self._require_live()
         if not refs or len(refs) != len(set(refs)):
@@ -761,7 +744,7 @@ class PagedStateVersionArena:
                 case _:
                     raise RuntimeError("state root lost one of its physical pages")
 
-    def _stored_root(self, ref: StateVersionRef) -> _StoredRoot:
+    def _stored_root(self, ref: StateRef) -> _StoredRoot:
         self._require_live()
         try:
             return self._roots[ref]
@@ -841,10 +824,7 @@ __all__ = [
     "PageBundle",
     "PagedStateVersionArena",
     "PageWrite",
-    "StateLayoutId",
     "StateResourceId",
-    "StateVersionLineage",
-    "StateVersionRef",
     "StateVersionRootPin",
     "TensorFieldId",
     "TransitionPageWrite",

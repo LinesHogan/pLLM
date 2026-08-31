@@ -11,15 +11,13 @@ from tllm.contracts.request_identity import (
     RequestIdentity,
     RequestKeyField,
 )
+from tllm.contracts.state_ref import LayoutId, StateRef, VersionId
 from tllm.runtime.paged_state import (
     FrozenTensorField,
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
-    StateLayoutId,
     StateResourceId,
-    StateVersionLineage,
-    StateVersionRef,
     TensorFieldId,
 )
 from tllm.runtime.request_slot_arena import RequestSlotArena
@@ -53,12 +51,8 @@ def main() -> int:
     logical.consume_receipt(acquisition.admission)
     selection = acquisition.selection
     lease = selection.leases[0]
-    lineage = StateVersionLineage(resource, 5, lease.slot)
-    version_zero = StateVersionRef(lineage, 0)
-    version_one = StateVersionRef(lineage, 1)
-
     state_layout = FrozenTensorLayout(
-        StateLayoutId(11),
+        LayoutId(11),
         1,
         (
             FrozenTensorField(
@@ -67,6 +61,16 @@ def main() -> int:
                 torch.float32,
             ),
         ),
+    )
+    version_zero = StateRef(
+        state_layout.layout_id,
+        lease.lineage_id,
+        VersionId(0),
+    )
+    version_one = StateRef(
+        state_layout.layout_id,
+        lease.lineage_id,
+        VersionId(1),
     )
     bundle = PageBundle(state_layout, capacity=2, device=device)
     roots = PagedStateVersionArena(bundle, bundle_epoch=5)

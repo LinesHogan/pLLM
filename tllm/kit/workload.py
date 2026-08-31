@@ -290,6 +290,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             case _Unspecialized():
                 pass
 
+        definition = type(self)._definition()
         values: dict[str, torch.nn.Module] = {}
         optimizers: dict[str, torch.optim.Optimizer] = {}
         request_state_services: dict[
@@ -352,6 +353,10 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                                     torch.nn.Module
                                 ].fixed_batched(
                                     resource=state.name,
+                                    layout_id=spec.state_layout_id(
+                                        definition.workload_id,
+                                        state.name,
+                                    ),
                                     key_fields=key.fields,
                                     epoch=1,
                                     bank=bank,

@@ -372,6 +372,13 @@ def reconstruct_worker_bindings(
         static_binding_manifest_json,
     )
     if specialization is not None:
+        from tllm.runtime.specialization import bind_state_layout_ids
+
+        specialization = bind_state_layout_ids(
+            specialization,
+            compilation.graph.to_json(),
+            declarations,
+        )
         for specialize in cold_specializers:
             specialize(specialization)
         # A request-state service is allocated by cold specialization, so its

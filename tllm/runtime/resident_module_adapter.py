@@ -12,6 +12,7 @@ from tllm.contracts.request_state import (
     RequestStateLease,
     RequestStateSelectionBatch,
 )
+from tllm.contracts.state_ref import VersionId
 from tllm.runtime.request_slot_adapter import RequestSlotAdapter
 from tllm.runtime.request_slot_arena import (
     RequestSlotAdmissionPlan,
@@ -26,7 +27,7 @@ ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 class RequestStateModuleGroup(Generic[ModuleT]):
     lease: RequestStateLease
     canonical_row_indices: torch.Tensor
-    before_version: int
+    before_version: VersionId
     module: ModuleT
 
 

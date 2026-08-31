@@ -46,7 +46,10 @@ from tllm.runtime.request_trainable_state import (
     StateEffectOperation,
 )
 from tllm.runtime.sampler_bridge.types import SamplerStepView
-from tllm.runtime.specialization import RuntimeSpecializationSpec
+from tllm.runtime.specialization import (
+    RuntimeSpecializationSpec,
+    bind_state_layout_ids,
+)
 from tllm.runtime import residual_runtime
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.runtime import TllmRuntime
@@ -72,6 +75,7 @@ from tllm.schedule import (
     ScheduleStateStorage,
 )
 from tllm.workload import declare_workload
+from tllm.workload.lowering import lower_schedule_graph
 from tllm.workgraph.physical import CapturePolicy
 
 
@@ -308,12 +312,19 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
                 raise AssertionError("native model bank did not build a workload")
         self.assertEqual(workload.config.state_mode, "model_bank")
         self.assertEqual(workload.config.request_capacity, 2)
+        declaration = declare_workload(workload)
         workload.cold_specialize(
-            RuntimeSpecializationSpec(
-                3,
-                4,
-                torch.float32,
-                torch.device("cpu"),
+            bind_state_layout_ids(
+                RuntimeSpecializationSpec(
+                    3,
+                    4,
+                    torch.float32,
+                    torch.device("cpu"),
+                ),
+                lower_schedule_graph(
+                    (declaration.ir,)
+                ).to_json(),
+                (declaration,),
             )
         )
         service: RequestStateRuntimeService[

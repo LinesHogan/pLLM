@@ -32,6 +32,7 @@ from tllm.contracts.request_state import (
     StateSlotEffect,
     StateSlotRef,
 )
+from tllm.contracts.state_ref import LayoutId, VersionId
 from tllm.runtime.request_slot_arena import (
     RequestSlotAdmissionPlan,
     RequestSlotArena,
@@ -142,6 +143,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         cls,
         *,
         resource: str,
+        layout_id: LayoutId,
         key_fields: tuple[RequestKeyField, ...],
         epoch: int,
         bank: ModuleT,
@@ -154,6 +156,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         adapter = FixedBatchedSlotAdapter(
             bank,
             resource=StateResourceId(resource),
+            layout_id=layout_id,
             epoch=epoch,
             lr=lr,
             betas=betas,
@@ -802,6 +805,7 @@ class RequestStateRuntimeService(Generic[ModuleT]):
                 StateSlotEffect(
                     version.key,
                     version.slot,
+                    version.lineage_id,
                     version.version,
                     version.version,
                 )
@@ -1020,8 +1024,10 @@ class RequestStateRuntimeService(Generic[ModuleT]):
             if (
                 effect.slot not in lease_by_slot
                 or effect.key != lease_by_slot[effect.slot].key
-                or effect.before_version != 0
-                or effect.after_version != 0
+                or effect.lineage_id
+                != lease_by_slot[effect.slot].lineage_id
+                or effect.before_version != VersionId(0)
+                or effect.after_version != VersionId(0)
             ):
                 raise RuntimeError(
                     "request-state admission receipt differs from selection"
@@ -1093,7 +1099,9 @@ class RequestStateRuntimeService(Generic[ModuleT]):
             receipt.slots,
             strict=True,
         ):
-            expected_after = before.before_version + expected_delta
+            expected_after = VersionId(
+                int(before.before_version) + expected_delta
+            )
             if before.slot not in current:
                 raise RuntimeError(
                     "request-state selected slot violated its signed "
@@ -1103,9 +1111,11 @@ class RequestStateRuntimeService(Generic[ModuleT]):
             if (
                 effect.key != before.key
                 or effect.slot != before.slot
+                or effect.lineage_id != before.lineage_id
                 or effect.before_version != before.before_version
                 or effect.after_version != expected_after
                 or current_version.key != before.key
+                or current_version.lineage_id != before.lineage_id
                 or current_version.version != expected_after
             ):
                 raise RuntimeError(
@@ -1118,6 +1128,7 @@ class RequestStateRuntimeService(Generic[ModuleT]):
             current_version = current[slot]
             if (
                 current_version.key != before.key
+                or current_version.lineage_id != before.lineage_id
                 or current_version.version != before.version
             ):
                 raise RuntimeError(
