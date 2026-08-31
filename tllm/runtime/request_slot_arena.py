@@ -692,22 +692,29 @@ class RequestSlotArena:
             )
 
     def replace_epoch(self, epoch: int) -> None:
-        if epoch <= self._epoch:
-            raise ValueError("request slot epoch replacement must advance")
         with self._lock:
-            self._require_live()
-            self._require_no_pending_plan()
-            if (
-                self._slot_by_key
-                or self._active_selections
-                or self._active_pins
-                or self._issued_receipts
-            ):
-                raise RuntimeError(
-                    "cannot replace request state epoch while requests are active"
-                )
+            self._validate_epoch_replacement(epoch)
             self._epoch = epoch
             self._revision += 1
+
+    def validate_epoch_replacement(self, epoch: int) -> None:
+        with self._lock:
+            self._validate_epoch_replacement(epoch)
+
+    def _validate_epoch_replacement(self, epoch: int) -> None:
+        if epoch <= self._epoch:
+            raise ValueError("request slot epoch replacement must advance")
+        self._require_live()
+        self._require_no_pending_plan()
+        if (
+            self._slot_by_key
+            or self._active_selections
+            or self._active_pins
+            or self._issued_receipts
+        ):
+            raise RuntimeError(
+                "cannot replace request state epoch while requests are active"
+            )
 
     def consume_receipt(self, receipt: StateEffectReceipt) -> None:
         with self._lock:

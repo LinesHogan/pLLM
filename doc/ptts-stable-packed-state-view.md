@@ -28,6 +28,22 @@ buffer 或 module input 改名不能补出 immutable root，当前 compact-captu
 实现 page allocator、COW 策略、eviction、paging、fragmentation 或跨 workload
 page reuse。
 
+### 1.1 后续实现状态
+
+上述 NO-GO 判断针对已撤除的原地更新 prototype。后续实现已经落下最小
+`PageBundle`/root/pin/fence core、唯一 `StablePackedStateView`，并将
+`FixedBatchedSlotAdapter` 的 module parameters、buffers 与 AdamW moments 重绑为
+physical page pools。fixed transition 现在从 immutable source page 读取并写入
+distinct target page；logical current version 每次只由
+`RequestSlotArena.selection_versions()` 显式提供，physical 层不反推 latest。
+
+fixed representation 预留 `2 × logical_capacity` 个 cold pages，保证正常 signed
+step 在 current root 之外拥有一个 next-root 位置；该 headroom 不进入 workload
+declaration 或调度策略。identity-root 与 fragmented-root 已通过同一 tensor-only
+consumer，CPU/GPU completion-gated reclaim 也已验证。Rust stable-view predicate、
+CUDA Graph consumer 与 ESamp compact capture 仍未启用，因此这些证据不能解释为
+capture 或 legacy deletion gate 已通过。
+
 ## 2. 唯一 closed ABI
 
 `StablePackedStateView` 只有以下顶层字段类别：

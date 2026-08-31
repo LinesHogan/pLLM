@@ -166,10 +166,12 @@ class StablePackedStateUnitTest(unittest.TestCase):
         target = source + 20.0
         fixed_view = fixed_views.create_synchronous(
             selection,
+            logical.selection_versions(selection),
             (source, target),
         )
         fragmented_view = fragmented_views.create_synchronous(
             selection,
+            logical.selection_versions(selection),
             (source, target),
         )
 
@@ -236,6 +238,7 @@ class StablePackedStateUnitTest(unittest.TestCase):
         )
         replay_view = fixed_views.create_synchronous(
             selection,
+            logical.selection_versions(selection),
             (source + 1.0, target + 1.0),
         )
         self.assertEqual(

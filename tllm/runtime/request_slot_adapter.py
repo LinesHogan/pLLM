@@ -6,7 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
-from tllm.contracts.request_state import RequestStateAsyncPin
+from tllm.contracts.request_state import (
+    RequestStateAsyncPin,
+    StateEffectReceipt,
+)
 from tllm.runtime.request_slot_arena import RequestSlotPinPlan
 
 
@@ -51,6 +54,12 @@ class RequestSlotAdapter:
 
     def poison(self) -> None:
         self._poisoned = True
+
+    def retire(self, receipt: StateEffectReceipt) -> None:
+        """Release representation state after logical RETIRE authorization."""
+
+    def replace_epoch(self, epoch: int) -> None:
+        """Advance representation epoch after the logical arena is empty."""
 
     def record_synchronous_fence(self) -> NoCompletionFence:
         self._require_live()

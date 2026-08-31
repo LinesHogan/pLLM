@@ -108,7 +108,12 @@ def main() -> int:
         dtype=torch.float32,
         device=device,
     )
-    view = views.create_cuda(selection, (packed_source,), writer)
+    view = views.create_cuda(
+        selection,
+        logical.selection_versions(selection),
+        (packed_source,),
+        writer,
+    )
 
     transition = roots.prepare_transition_cuda(
         version_zero,

@@ -11,12 +11,33 @@ from tllm.contracts.request_identity import (
     RequestIdentity,
     RequestKeyField,
 )
+from tllm.contracts.request_state import (
+    RequestIdentityBatch,
+    StateEffectOperation,
+)
 from tllm.runtime.fixed_batched_slot_adapter import (
     FixedBatchedSlotAdapter,
     FixedBatchedSlotLayout,
     FixedBatchedSlotModule,
 )
+from tllm.runtime.paged_state import (
+    StateResourceId,
+    StateVersionLineage,
+    StateVersionRef,
+    StateVersionRootPin,
+    TensorFieldId,
+)
+from tllm.runtime.request_trainable_state import (
+    RequestStateRuntimeService,
+    RequestTrainableStateStore,
+)
 from tllm.runtime.request_slot_arena import RequestSlotArena
+from tllm.runtime.request_slot_adapter import NoCompletionFence
+from tllm.runtime.stable_packed_state import (
+    FrozenPackedTensorField,
+    FrozenPackedTensorLayout,
+    PackedLayoutId,
+)
 
 
 class _ScalarBank(FixedBatchedSlotModule):
@@ -34,6 +55,17 @@ class _ScalarBank(FixedBatchedSlotModule):
             slot_parameters=(self.weight,),
             slot_buffers=(self.bias,),
         )
+
+    def install_fixed_batched_slot_layout(
+        self,
+        layout: FixedBatchedSlotLayout,
+    ) -> None:
+        match layout.slot_parameters, layout.slot_buffers:
+            case (weight,), (bias,):
+                self.weight = weight
+                self.bias = bias
+            case _:
+                raise ValueError("scalar bank received the wrong page layout")
 
     def forward(
         self,
@@ -55,6 +87,8 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
     initial_bias = bank.bias.detach().clone()
     adapter = FixedBatchedSlotAdapter(
         bank,
+        resource=StateResourceId("state"),
+        epoch=1,
         lr=0.03,
         betas=(0.8, 0.9),
         eps=1e-6,
@@ -85,6 +119,12 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
         torch.zeros_like(weight) for weight in baseline_weights
     )
     baseline_steps = tuple(torch.zeros(()) for _weight in baseline_weights)
+    old_root_pins: list[StateVersionRootPin] = []
+    old_root_pages: tuple[int, ...] = ()
+    old_root_weights: tuple[torch.Tensor, ...] = ()
+    old_root_steps: tuple[torch.Tensor, ...] = ()
+    old_root_exp_avgs: tuple[torch.Tensor, ...] = ()
+    old_root_exp_avg_sqs: tuple[torch.Tensor, ...] = ()
     for update, (source, target) in enumerate((
         (
             torch.tensor([[1.0], [2.0], [-3.0]]),
@@ -95,14 +135,80 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
             torch.tensor([[1.0], [0.0], [-2.0]]),
         ),
     ), start=1):
-        prediction = adapter.bank(acquired.selection.device_slot_ids, source)
+        selected = adapter.selected(
+            acquired.selection,
+            arena.selection_versions(acquired.selection),
+        )
+        prediction = adapter.bank(selected.row_slot_ids, source)
         losses = (
             torch.nn.functional.mse_loss(prediction[:2], target[:2]),
             torch.nn.functional.mse_loss(prediction[2:], target[2:]),
         )
+        if update == 1:
+            current_versions = arena.selection_versions(acquired.selection)
+            old_refs = tuple(
+                StateVersionRef(
+                    StateVersionLineage(
+                        StateResourceId("state"),
+                        1,
+                        version.slot,
+                    ),
+                    version.version,
+                )
+                for version in current_versions
+            )
+            old_pin = adapter.version_roots.pin_exact_synchronous(old_refs)
+            old_root_pins.append(old_pin)
+            old_root_pages = tuple(root.page_ids[0] for root in old_pin.roots)
+            old_root_weights = tuple(
+                bank.weight[page_id].detach().clone()
+                for page_id in old_root_pages
+            )
+            old_root_steps = tuple(
+                adapter.optimizer.states[0].step[page_id].clone()
+                for page_id in old_root_pages
+            )
+            old_root_exp_avgs = tuple(
+                adapter.optimizer.states[0].exp_avg[page_id].clone()
+                for page_id in old_root_pages
+            )
+            old_root_exp_avg_sqs = tuple(
+                adapter.optimizer.states[0].exp_avg_sq[page_id].clone()
+                for page_id in old_root_pages
+            )
         transition = arena.plan_transition(acquired.selection)
         acquired.selection.device_lease_slot_ids.fill_(2)
         adapter.execute_transition(transition, losses)
+        if update == 1:
+            for page_id, expected in zip(
+                old_root_pages,
+                old_root_weights,
+                strict=True,
+            ):
+                torch.testing.assert_close(bank.weight[page_id], expected)
+            for page_id, step, exp_avg, exp_avg_sq in zip(
+                old_root_pages,
+                old_root_steps,
+                old_root_exp_avgs,
+                old_root_exp_avg_sqs,
+                strict=True,
+            ):
+                torch.testing.assert_close(
+                    adapter.optimizer.states[0].step[page_id],
+                    step,
+                )
+                torch.testing.assert_close(
+                    adapter.optimizer.states[0].exp_avg[page_id],
+                    exp_avg,
+                )
+                torch.testing.assert_close(
+                    adapter.optimizer.states[0].exp_avg_sq[page_id],
+                    exp_avg_sq,
+                )
+            adapter.version_roots.release_pin(
+                old_root_pins.pop(),
+                NoCompletionFence(),
+            )
         acquired.selection.device_lease_slot_ids.copy_(
             torch.tensor((0, 1), dtype=torch.long)
         )
@@ -157,36 +263,46 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
         for weight in baseline_weights:
             weight.grad = torch.zeros_like(weight)
 
-    for slot_id, (weight, exp_avg, exp_avg_sq, step) in enumerate(
+    latest = adapter.selected(
+        acquired.selection,
+        arena.selection_versions(acquired.selection),
+    )
+    latest_page_ids = tuple(
+        int(latest.unique_slot_ids[index].item())
+        for index in range(len(acquired.selection.leases))
+    )
+    for page_id, (weight, exp_avg, exp_avg_sq, step) in zip(
+        latest_page_ids,
         zip(
             baseline_weights,
             baseline_exp_avgs,
             baseline_exp_avg_sqs,
             baseline_steps,
             strict=True,
-        )
+        ),
+        strict=True,
     ):
-        torch.testing.assert_close(bank.weight[slot_id], weight)
+        torch.testing.assert_close(bank.weight[page_id], weight)
         torch.testing.assert_close(
-            adapter.optimizer.states[0].exp_avg[slot_id],
+            adapter.optimizer.states[0].exp_avg[page_id],
             exp_avg,
         )
         torch.testing.assert_close(
-            adapter.optimizer.states[0].exp_avg_sq[slot_id],
+            adapter.optimizer.states[0].exp_avg_sq[page_id],
             exp_avg_sq,
         )
         torch.testing.assert_close(
-            adapter.optimizer.states[0].step[slot_id],
+            adapter.optimizer.states[0].step[page_id],
             step,
         )
     assert tuple(version.version for version in arena.versions()) == (2, 2)
-    torch.testing.assert_close(bank.weight[2], initial_weight[2])
-    torch.testing.assert_close(adapter.optimizer.states[0].step[2], torch.tensor(0.0))
+    adapter.complete_reads_synchronous(acquired.selection)
 
     with torch.no_grad():
-        bank.bias[0].fill_(7.0)
+        bank.bias[latest_page_ids[0]].fill_(7.0)
     arena.release_selection(acquired.selection)
     retired = arena.retire(RequestFinishedBatch((first, first_alias)))
+    adapter.retire(retired)
     arena.consume_receipt(retired)
     replacement = arena.plan_admission((RequestIdentity("replacement", 2, 0),), (0,))
     adapter.commit_admission(replacement, adapter.prepare_admission(replacement))
@@ -195,11 +311,26 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
 
     assert reacquired.selection.leases[0].slot.slot_id == 0
     assert reacquired.selection.leases[0].slot.generation == 2
-    torch.testing.assert_close(bank.weight[0], initial_weight[0])
-    torch.testing.assert_close(bank.bias[0], initial_bias[0])
-    torch.testing.assert_close(adapter.optimizer.states[0].exp_avg[0], torch.zeros(1))
-    torch.testing.assert_close(adapter.optimizer.states[0].exp_avg_sq[0], torch.zeros(1))
-    torch.testing.assert_close(adapter.optimizer.states[0].step[0], torch.tensor(0.0))
+    replacement_view = adapter.selected(
+        reacquired.selection,
+        arena.selection_versions(reacquired.selection),
+    )
+    replacement_page = int(replacement_view.unique_slot_ids[0].item())
+    torch.testing.assert_close(bank.weight[replacement_page], initial_weight[0])
+    torch.testing.assert_close(bank.bias[replacement_page], initial_bias[0])
+    torch.testing.assert_close(
+        adapter.optimizer.states[0].exp_avg[replacement_page],
+        torch.zeros(1),
+    )
+    torch.testing.assert_close(
+        adapter.optimizer.states[0].exp_avg_sq[replacement_page],
+        torch.zeros(1),
+    )
+    torch.testing.assert_close(
+        adapter.optimizer.states[0].step[replacement_page],
+        torch.tensor(0.0),
+    )
+    adapter.complete_reads_synchronous(reacquired.selection)
 
     pending = arena.plan_admission(
         (RequestIdentity("third", 3, 0),),
@@ -209,3 +340,59 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
     with pytest.raises(RuntimeError, match="poisoned"):
         adapter.prepare_admission(pending)
     arena.abort_admission(pending, poison=False)
+
+
+def test_stable_view_bridge_blocks_step_finish_until_completion() -> None:
+    bank = _ScalarBank(capacity=1)
+    with torch.no_grad():
+        bank.weight.fill_(2.0)
+        bank.bias.fill_(0.5)
+    store = RequestTrainableStateStore[_ScalarBank].fixed_batched(
+        resource="state",
+        key_fields=(RequestKeyField.REQUEST_ID,),
+        epoch=1,
+        bank=bank,
+        lr=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
+    service = RequestStateRuntimeService(store)
+    packed_layout = FrozenPackedTensorLayout(
+        PackedLayoutId(2),
+        row_capacity=1,
+        lease_capacity=1,
+        fields=(
+            FrozenPackedTensorField(
+                TensorFieldId(0),
+                (1,),
+                torch.float32,
+            ),
+        ),
+    )
+    views = service.stable_view_service(
+        view_epoch=1,
+        layout=packed_layout,
+        buffer_count=1,
+    )
+    identity = RequestIdentity("bridge", 0, 0)
+    service.stage_identities(0, RequestIdentityBatch((identity,)))
+    selection = service.selection_for_step(0)
+    audit = service.before(StateEffectOperation.READ, selection, 0)
+    view = views.create_synchronous(
+        0,
+        selection,
+        (torch.tensor(((3.0,),)),),
+    )
+    with pytest.raises(RuntimeError, match="uncompleted stable packed view"):
+        service.finish_step(0)
+    torch.testing.assert_close(
+        view.packed_tensors.tensors[0],
+        torch.tensor(((3.0,),)),
+    )
+    views.complete_synchronous(view)
+    service.after(audit)
+    service.finish_step(0)
+    service.retire_requests(RequestFinishedBatch((identity,)))
+    store.replace_epoch(2)
+    assert service.epoch == 2

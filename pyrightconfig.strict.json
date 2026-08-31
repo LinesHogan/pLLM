@@ -73,6 +73,7 @@
     "test/consumers/ttrl/test_ttrl_workload_unit.py",
     "test/gpu/native_fttt_workload_smoke.py",
     "test/gpu/native_inplace_ttt_workload_smoke.py",
+    "test/gpu/fixed_batched_paged_state_smoke.py",
     "test/gpu/paged_state_fence_smoke.py",
     "test/gpu/native_esamp_request_state_smoke.py",
     "test/gpu/native_override_workload_smoke.py",

@@ -98,6 +98,37 @@ class PageBundle:
         )
         self._addresses = tuple(pool.data_ptr() for pool in self._pools)
 
+    @classmethod
+    def from_pools(
+        cls,
+        layout: FrozenTensorLayout,
+        pools: tuple[torch.Tensor, ...],
+    ) -> "PageBundle":
+        if len(pools) != len(layout.fields):
+            raise ValueError("page bundle pools differ from their layout")
+        capacity = int(pools[0].shape[0])
+        device = pools[0].device
+        if capacity < layout.root_page_count:
+            raise ValueError(
+                "page bundle capacity must fit one complete version root"
+            )
+        if device.type not in ("cpu", "cuda"):
+            raise ValueError("page bundle requires a CPU or CUDA device")
+        for field, pool in zip(layout.fields, pools, strict=True):
+            if (
+                tuple(pool.shape) != (capacity, *field.shape)
+                or pool.dtype is not field.dtype
+                or pool.device != device
+            ):
+                raise ValueError("page bundle pool signature differs from layout")
+        bundle = cls.__new__(cls)
+        bundle._layout = layout
+        bundle._capacity = capacity
+        bundle._device = device
+        bundle._pools = pools
+        bundle._addresses = tuple(pool.data_ptr() for pool in pools)
+        return bundle
+
     @property
     def layout(self) -> FrozenTensorLayout:
         return self._layout
@@ -275,6 +306,7 @@ class PagedStateVersionArena:
         "_next_root_id",
         "_next_pin_id",
         "_next_transaction_id",
+        "_poisoned",
         "_lock",
     )
 
@@ -300,6 +332,7 @@ class PagedStateVersionArena:
         self._next_root_id = 1
         self._next_pin_id = 1
         self._next_transaction_id = 1
+        self._poisoned = False
         self._lock = RLock()
 
     @property
@@ -313,6 +346,7 @@ class PagedStateVersionArena:
     @property
     def free_pages(self) -> int:
         with self._lock:
+            self._require_live()
             count = 0
             for owner in self._page_owners:
                 match owner:
@@ -321,6 +355,10 @@ class PagedStateVersionArena:
                     case _StagedPage() | _RootPage():
                         pass
             return count
+
+    def poison(self) -> None:
+        with self._lock:
+            self._poisoned = True
 
     def prepare_admission(
         self,
@@ -440,6 +478,7 @@ class PagedStateVersionArena:
         """Discard a reserved write before its producer submits device work."""
 
         with self._lock:
+            self._require_live()
             match self._pending_write, write:
                 case (
                     _PendingAdmission(write=issued),
@@ -650,6 +689,7 @@ class PagedStateVersionArena:
         self,
         refs: tuple[StateVersionRef, ...],
     ) -> tuple[ImmutableStateVersionRoot, ...]:
+        self._require_live()
         if not refs or len(refs) != len(set(refs)):
             raise ValueError("state root pin requires unique version references")
         return tuple(self._stored_root(ref).root for ref in refs)
@@ -666,6 +706,7 @@ class PagedStateVersionArena:
         return pin
 
     def _active_pin(self, pin: StateVersionRootPin) -> StateVersionRootPin:
+        self._require_live()
         try:
             issued = self._pins[pin.pin_id]
         except KeyError as exc:
@@ -684,6 +725,7 @@ class PagedStateVersionArena:
         self._collect_unpinned_roots()
 
     def _collect_completed_locked(self) -> None:
+        self._require_live()
         completed_pin_ids = tuple(
             pin_id
             for pin_id, pending in self._pending_pin_releases.items()
@@ -720,12 +762,14 @@ class PagedStateVersionArena:
                     raise RuntimeError("state root lost one of its physical pages")
 
     def _stored_root(self, ref: StateVersionRef) -> _StoredRoot:
+        self._require_live()
         try:
             return self._roots[ref]
         except KeyError as exc:
             raise RuntimeError("state version root is unknown or reclaimed") from exc
 
     def _require_no_pending_write(self) -> None:
+        self._require_live()
         match self._pending_write:
             case _NoPendingWrite():
                 return
@@ -733,6 +777,7 @@ class PagedStateVersionArena:
                 raise RuntimeError("paged state already has a pending write")
 
     def _require_fence_domain(self, fence: CompletionFence) -> None:
+        self._require_live()
         match self._bundle.device.type, fence:
             case "cpu", NoCompletionFence():
                 return
@@ -754,14 +799,20 @@ class PagedStateVersionArena:
                 return event.query()
 
     def _require_cpu(self) -> None:
+        self._require_live()
         if self._bundle.device.type != "cpu":
             raise RuntimeError("synchronous paged-state operation requires CPU")
 
     def _require_cuda_stream(self, stream: torch.cuda.Stream) -> None:
+        self._require_live()
         if self._bundle.device.type != "cuda":
             raise RuntimeError("CUDA paged-state operation requires CUDA storage")
         if stream.device != self._bundle.device:
             raise RuntimeError("paged-state stream belongs to another device")
+
+    def _require_live(self) -> None:
+        if self._poisoned:
+            raise RuntimeError("paged state version arena is poisoned")
 
 
 def _producer_page_rows(

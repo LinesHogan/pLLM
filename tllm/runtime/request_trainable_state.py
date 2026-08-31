@@ -46,11 +46,18 @@ from tllm.runtime.fixed_batched_slot_adapter import (
     FixedBatchedSlotAdapter,
     FixedBatchedSlotView,
 )
+from tllm.runtime.paged_state import StateResourceId
 from tllm.runtime.resident_module_adapter import (
     RequestStateModuleGroup,
     ResidentAdmissionPreparation,
     ResidentModuleAdapter,
     ResidentSlotView,
+)
+from tllm.runtime.stable_packed_state import (
+    FrozenPackedTensorLayout,
+    StablePackedStateView,
+    StablePackedStateViewArena,
+    StateViewCompletionFence,
 )
 
 
@@ -94,7 +101,12 @@ class RequestTrainableStateStore(Generic[ModuleT]):
     commit; it does not mirror any key, generation, version, pin, or receipt.
     """
 
-    __slots__ = ("_arena", "_physical", "_lock")
+    __slots__ = (
+        "_arena",
+        "_physical",
+        "_stable_view_arenas",
+        "_lock",
+    )
 
     def __init__(
         self,
@@ -122,6 +134,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 optimizer_factory=optimizer_factory,
             )
         )
+        self._stable_view_arenas: list[StablePackedStateViewArena] = []
         self._lock = RLock()
 
     @classmethod
@@ -140,6 +153,8 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         store = cls.__new__(cls)
         adapter = FixedBatchedSlotAdapter(
             bank,
+            resource=StateResourceId(resource),
+            epoch=epoch,
             lr=lr,
             betas=betas,
             eps=eps,
@@ -153,6 +168,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
             device=adapter.device,
         )
         store._physical = _FixedBatchedPhysical(adapter)
+        store._stable_view_arenas = []
         store._lock = RLock()
         return store
 
@@ -202,6 +218,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         canonical_row_indices: tuple[int, ...],
     ) -> RequestStateAcquisition:
         with self._lock:
+            self._collect_stable_views()
             plan = self._arena.plan_admission(
                 identities,
                 canonical_row_indices,
@@ -265,7 +282,77 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 case _ResidentPhysical(adapter=adapter):
                     return adapter.selected(selection)
                 case _FixedBatchedPhysical(adapter=adapter):
-                    return adapter.selected(selection)
+                    return adapter.selected(
+                        selection,
+                        self._arena.selection_versions(selection),
+                    )
+
+    def make_stable_view_arena(
+        self,
+        *,
+        view_epoch: int,
+        layout: FrozenPackedTensorLayout,
+        buffer_count: int,
+    ) -> StablePackedStateViewArena:
+        with self._lock:
+            match self._physical:
+                case _FixedBatchedPhysical(adapter=adapter):
+                    views = StablePackedStateViewArena(
+                        adapter.version_roots,
+                        resource=StateResourceId(self.resource),
+                        state_epoch=self.epoch,
+                        view_epoch=view_epoch,
+                        layout=layout,
+                        buffer_count=buffer_count,
+                    )
+                    self._stable_view_arenas.append(views)
+                    return views
+                case _ResidentPhysical():
+                    raise RuntimeError(
+                        "resident request state cannot produce stable packed views"
+                    )
+
+    def create_stable_view_synchronous(
+        self,
+        views: StablePackedStateViewArena,
+        selection: RequestStateSelectionBatch,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> StablePackedStateView:
+        with self._lock:
+            self._validate_stable_view_arena(views)
+            versions = self._arena.selection_versions(selection)
+            return views.create_synchronous(selection, versions, tensors)
+
+    def create_stable_view_cuda(
+        self,
+        views: StablePackedStateViewArena,
+        selection: RequestStateSelectionBatch,
+        tensors: tuple[torch.Tensor, ...],
+        stream: torch.cuda.Stream,
+    ) -> StablePackedStateView:
+        with self._lock:
+            self._validate_stable_view_arena(views)
+            versions = self._arena.selection_versions(selection)
+            return views.create_cuda(selection, versions, tensors, stream)
+
+    def _validate_stable_view_arena(
+        self,
+        views: StablePackedStateViewArena,
+    ) -> None:
+        match self._physical:
+            case _FixedBatchedPhysical(adapter=adapter):
+                if (
+                    views.version_roots is not adapter.version_roots
+                    or views.resource != StateResourceId(self.resource)
+                    or views.state_epoch != self.epoch
+                ):
+                    raise RuntimeError(
+                        "stable packed view belongs to another physical state"
+                    )
+            case _ResidentPhysical():
+                raise RuntimeError(
+                    "resident request state cannot produce stable packed views"
+                )
 
     def selection_versions(
         self, selection: RequestStateSelectionBatch
@@ -277,6 +364,13 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         self, selection: RequestStateSelectionBatch
     ) -> StateEffectReceipt:
         with self._lock:
+            match self._physical:
+                case _FixedBatchedPhysical(adapter=adapter) if (
+                    self.device.type == "cpu"
+                ):
+                    adapter.complete_reads_synchronous(selection)
+                case _ResidentPhysical() | _FixedBatchedPhysical():
+                    pass
             return self._arena.read_receipt(selection)
 
     def optimize(
@@ -289,6 +383,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
         if any(loss.numel() != 1 for loss in losses):
             raise ValueError("request state optimizer loss must be scalar")
         with self._lock:
+            self._collect_stable_views()
             plan = self._arena.plan_transition(selection)
             try:
                 match self._physical:
@@ -412,7 +507,14 @@ class RequestTrainableStateStore(Generic[ModuleT]):
 
     def retire(self, batch: RequestFinishedBatch) -> StateEffectReceipt:
         with self._lock:
-            return self._arena.retire(batch)
+            self._collect_stable_views()
+            receipt = self._arena.retire(batch)
+            try:
+                self._adapter.retire(receipt)
+            except Exception:
+                self._fail_stop()
+                raise
+            return receipt
 
     def versions(self) -> tuple[RequestStateVersion, ...]:
         with self._lock:
@@ -424,7 +526,30 @@ class RequestTrainableStateStore(Generic[ModuleT]):
 
     def replace_epoch(self, epoch: int) -> None:
         with self._lock:
-            self._arena.replace_epoch(epoch)
+            self._arena.validate_epoch_replacement(epoch)
+            self._collect_stable_views()
+            if any(
+                views.free_buffers != views.buffer_count
+                for views in self._stable_view_arenas
+            ):
+                raise RuntimeError(
+                    "cannot replace request-state epoch with live stable views"
+                )
+            try:
+                self._adapter.replace_epoch(epoch)
+                self._arena.replace_epoch(epoch)
+                self._stable_view_arenas.clear()
+            except Exception:
+                self._fail_stop()
+                raise
+
+    def _collect_stable_views(self) -> None:
+        for views in self._stable_view_arenas:
+            views.collect_completed()
+
+    def fail_stop(self) -> None:
+        with self._lock:
+            self._fail_stop()
 
     def _fail_stop(self) -> None:
         self._adapter.poison()
@@ -453,6 +578,7 @@ class _RequestStateRuntimeCore(Generic[ModuleT]):
         "steps",
         "transition_receipts",
         "completion_pins",
+        "stable_view_counts",
         "lock",
     )
 
@@ -461,6 +587,7 @@ class _RequestStateRuntimeCore(Generic[ModuleT]):
         self.steps: dict[int, _StagedRequestStateStep] = {}
         self.transition_receipts: dict[int, StateEffectReceipt] = {}
         self.completion_pins: dict[int, list[RequestStateAsyncPin]] = {}
+        self.stable_view_counts: dict[int, int] = {}
         self.lock = RLock()
 
 
@@ -501,6 +628,10 @@ class RequestStateRuntimeService(Generic[ModuleT]):
         return self._core.completion_pins
 
     @property
+    def _stable_view_counts(self) -> dict[int, int]:
+        return self._core.stable_view_counts
+
+    @property
     def _lock(self) -> RLock:
         return self._core.lock
 
@@ -530,13 +661,45 @@ class RequestStateRuntimeService(Generic[ModuleT]):
         if not resource:
             raise ValueError("signed request-state resource must be non-empty")
         with self._lock:
-            if self._steps or self._transition_receipts or self._completion_pins:
+            if (
+                self._steps
+                or self._transition_receipts
+                or self._completion_pins
+                or self._stable_view_counts
+            ):
                 raise RuntimeError(
                     "cannot qualify request-state service while it is active"
                 )
             if resource == self.resource:
                 return self
             return self._for_core(self._core, resource)
+
+    def stable_view_service(
+        self,
+        *,
+        view_epoch: int,
+        layout: FrozenPackedTensorLayout,
+        buffer_count: int,
+    ) -> "RequestStateStableViewService[ModuleT]":
+        with self._lock:
+            if (
+                self._steps
+                or self._transition_receipts
+                or self._completion_pins
+                or self._stable_view_counts
+            ):
+                raise RuntimeError(
+                    "stable view service must be created before request execution"
+                )
+            return RequestStateStableViewService(
+                self._core,
+                self._resource,
+                self._store.make_stable_view_arena(
+                    view_epoch=view_epoch,
+                    layout=layout,
+                    buffer_count=buffer_count,
+                ),
+            )
 
     def stage_identities(self, step_id: int, batch: RequestIdentityBatch) -> None:
         self._stage_identity_batch(step_id, batch)
@@ -734,6 +897,10 @@ class RequestStateRuntimeService(Generic[ModuleT]):
                 raise RuntimeError(
                     "request-state step retires with an unaudited transition receipt"
                 )
+            if self._stable_view_counts.get(step_id, 0):
+                raise RuntimeError(
+                    "request-state step has an uncompleted stable packed view"
+                )
             self._store.release_selection(selection)
             self._steps.pop(step_id)
 
@@ -745,6 +912,10 @@ class RequestStateRuntimeService(Generic[ModuleT]):
                 raise RuntimeError(
                     "request-state retirement requires no active step, selection, "
                     "or unaudited receipt"
+                )
+            if self._stable_view_counts:
+                raise RuntimeError(
+                    "request-state retirement has an uncompleted stable view"
                 )
             for step_id in tuple(sorted(self._completion_pins)):
                 pins = self._completion_pins[step_id]
@@ -954,6 +1125,171 @@ class RequestStateRuntimeService(Generic[ModuleT]):
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class _IssuedRequestStableView:
+    step_id: int
+    selection: RequestStateSelectionBatch
+    view: StablePackedStateView
+
+
+class RequestStateStableViewService(RequestStateRuntimeService[ModuleT]):
+    """Bind stable physical views to staged logical selection ownership."""
+
+    __slots__ = ("_views", "_issued")
+
+    def __init__(
+        self,
+        core: _RequestStateRuntimeCore[ModuleT],
+        resource: str,
+        views: StablePackedStateViewArena,
+    ) -> None:
+        self._core = core
+        self._resource = resource
+        self._views = views
+        self._issued: dict[
+            StateViewCompletionFence,
+            _IssuedRequestStableView,
+        ] = {}
+
+    def create_synchronous(
+        self,
+        step_id: int,
+        selection: RequestStateSelectionBatch,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> StablePackedStateView:
+        with self._lock:
+            self._require_staged_selection(step_id, selection)
+            try:
+                view = self._store.create_stable_view_synchronous(
+                    self._views,
+                    selection,
+                    tensors,
+                )
+            except Exception:
+                if self._views.poisoned:
+                    self._store.fail_stop()
+                raise
+            self._track(step_id, selection, view)
+            return view
+
+    def create_cuda(
+        self,
+        step_id: int,
+        selection: RequestStateSelectionBatch,
+        tensors: tuple[torch.Tensor, ...],
+        stream: torch.cuda.Stream,
+    ) -> StablePackedStateView:
+        with self._lock:
+            self._require_staged_selection(step_id, selection)
+            try:
+                view = self._store.create_stable_view_cuda(
+                    self._views,
+                    selection,
+                    tensors,
+                    stream,
+                )
+            except Exception:
+                if self._views.poisoned:
+                    self._store.fail_stop()
+                raise
+            self._track(step_id, selection, view)
+            return view
+
+    def order_cuda(
+        self,
+        view: StablePackedStateView,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        with self._lock:
+            issued = self._issued_view(view)
+            self._require_staged_selection(
+                issued.step_id,
+                issued.selection,
+            )
+            self._views.order_cuda(view, stream)
+
+    def complete_synchronous(self, view: StablePackedStateView) -> None:
+        with self._lock:
+            issued = self._issued_view(view)
+            self._require_staged_selection(
+                issued.step_id,
+                issued.selection,
+            )
+            self._views.complete_synchronous(view.completion_fence)
+            self._finish_issued(issued)
+
+    def complete_cuda(
+        self,
+        view: StablePackedStateView,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        with self._lock:
+            issued = self._issued_view(view)
+            self._require_staged_selection(
+                issued.step_id,
+                issued.selection,
+            )
+            self._views.complete_cuda(view.completion_fence, stream)
+            try:
+                pin = self._store.pin_cuda(issued.selection, stream)
+            except Exception:
+                self._views.poison()
+                self._store.fail_stop()
+                raise
+            self._completion_pins.setdefault(
+                issued.step_id,
+                [],
+            ).append(pin)
+            self._finish_issued(issued)
+
+    def collect_completed(self) -> None:
+        with self._lock:
+            self._views.collect_completed()
+
+    def wait_completion(self, completion: StateViewCompletionFence) -> None:
+        with self._lock:
+            self._views.wait_completion(completion)
+
+    def _track(
+        self,
+        step_id: int,
+        selection: RequestStateSelectionBatch,
+        view: StablePackedStateView,
+    ) -> None:
+        completion = view.completion_fence
+        if completion in self._issued:
+            raise RuntimeError("stable view completion token is already issued")
+        self._issued[completion] = _IssuedRequestStableView(
+            step_id,
+            selection,
+            view,
+        )
+        if step_id in self._stable_view_counts:
+            self._stable_view_counts[step_id] += 1
+        else:
+            self._stable_view_counts[step_id] = 1
+
+    def _issued_view(
+        self,
+        view: StablePackedStateView,
+    ) -> _IssuedRequestStableView:
+        try:
+            issued = self._issued[view.completion_fence]
+        except KeyError as exc:
+            raise RuntimeError("stable view is unknown or completed") from exc
+        if issued.view is not view:
+            raise RuntimeError("stable view differs from its issued token")
+        return issued
+
+    def _finish_issued(self, issued: _IssuedRequestStableView) -> None:
+        self._issued.pop(issued.view.completion_fence)
+        count = self._stable_view_counts[issued.step_id]
+        if count == 1:
+            self._stable_view_counts.pop(issued.step_id)
+        else:
+            self._stable_view_counts[issued.step_id] = count - 1
+
+
 __all__ = [
     "IndexedRequestIdentityBatch",
     "IndexedRequestIdentityRow",
@@ -968,6 +1304,7 @@ __all__ = [
     "RequestStateModuleGroup",
     "RequestStateSelected",
     "RequestStateRuntimeService",
+    "RequestStateStableViewService",
     "RequestStateSelectionBatch",
     "RequestStateSelectionRow",
     "RequestStateVersion",

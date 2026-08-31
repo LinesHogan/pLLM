@@ -8,7 +8,10 @@ from typing import NewType
 
 import torch
 
-from tllm.contracts.request_state import RequestStateSelectionBatch
+from tllm.contracts.request_state import (
+    RequestStateSelectionBatch,
+    RequestStateVersion,
+)
 from tllm.runtime.paged_state import (
     ImmutableStateVersionRoot,
     PagedStateVersionArena,
@@ -285,14 +288,39 @@ class StablePackedStateViewArena:
                         pass
             return count
 
+    @property
+    def buffer_count(self) -> int:
+        return len(self._buffers)
+
+    @property
+    def version_roots(self) -> PagedStateVersionArena:
+        return self._roots
+
+    @property
+    def resource(self) -> StateResourceId:
+        return self._resource
+
+    @property
+    def state_epoch(self) -> int:
+        return self._state_epoch
+
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    def poison(self) -> None:
+        with self._lock:
+            self._poisoned = True
+
     def create_synchronous(
         self,
         selection: RequestStateSelectionBatch,
+        versions: tuple[RequestStateVersion, ...],
         tensors: tuple[torch.Tensor, ...],
     ) -> StablePackedStateView:
         with self._lock:
             self._require_cpu()
-            prepared = self._prepare(selection, tensors)
+            prepared = self._prepare(selection, versions, tensors)
             buffer = self._reserve_buffer()
             try:
                 root_pin = self._roots.pin_exact_synchronous(prepared.refs)
@@ -315,12 +343,13 @@ class StablePackedStateViewArena:
     def create_cuda(
         self,
         selection: RequestStateSelectionBatch,
+        versions: tuple[RequestStateVersion, ...],
         tensors: tuple[torch.Tensor, ...],
         stream: torch.cuda.Stream,
     ) -> StablePackedStateView:
         with self._lock:
             self._require_cuda_stream(stream)
-            prepared = self._prepare(selection, tensors)
+            prepared = self._prepare(selection, versions, tensors)
             buffer = self._reserve_buffer()
             try:
                 root_pin = self._roots.pin_exact_cuda(prepared.refs, stream)
@@ -410,6 +439,7 @@ class StablePackedStateViewArena:
     def _prepare(
         self,
         selection: RequestStateSelectionBatch,
+        versions: tuple[RequestStateVersion, ...],
         tensors: tuple[torch.Tensor, ...],
     ) -> _PreparedView:
         self._require_live()
@@ -424,6 +454,15 @@ class StablePackedStateViewArena:
             raise RuntimeError("stable view row capacity is exhausted")
         if lease_count < 1 or lease_count > self._layout.lease_capacity:
             raise RuntimeError("stable view lease capacity is exhausted")
+        if len(versions) != lease_count or any(
+            version.key != lease.key or version.slot != lease.slot
+            for version, lease in zip(
+                versions,
+                selection.leases,
+                strict=True,
+            )
+        ):
+            raise RuntimeError("stable view versions differ from selection leases")
         if len(tensors) != len(self._layout.fields):
             raise ValueError("stable view tensors differ from the packed layout")
         canonical_row_ids = tuple(
@@ -452,11 +491,11 @@ class StablePackedStateViewArena:
                     selection.epoch,
                     lease.slot,
                 ),
-                version,
+                version.version,
             )
             for lease, version in zip(
                 selection.leases,
-                selection.before_versions,
+                versions,
                 strict=True,
             )
         )

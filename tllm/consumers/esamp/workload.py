@@ -503,7 +503,11 @@ class ESampWorkload(Workload[ESampConfig]):
         torch.Tensor,
     ]:
         match self.request_distiller_bank.selected(selection):
-            case FixedBatchedSlotView(module=bank):
+            case FixedBatchedSlotView(
+                module=bank,
+                row_slot_ids=row_slot_ids,
+                before_versions=before_versions,
+            ):
                 pass
             case _:
                 raise RuntimeError(
@@ -513,7 +517,7 @@ class ESampWorkload(Workload[ESampConfig]):
             lease
             for lease, version in zip(
                 selection.leases,
-                selection.before_versions,
+                before_versions,
                 strict=True,
             )
             if version > 0
@@ -534,9 +538,9 @@ class ESampWorkload(Workload[ESampConfig]):
         affected_row_ids = tuple(
             link.sampler_row_index for link in affected_links
         )
-        slot_by_packed_row = {
-            row.canonical_row_index: row.lease.slot.slot_id
-            for row in selection.rows
+        position_by_packed_row = {
+            row.canonical_row_index: position
+            for position, row in enumerate(selection.rows)
         }
         packed_row_ids = torch.tensor(
             tuple(
@@ -545,14 +549,15 @@ class ESampWorkload(Workload[ESampConfig]):
             device=source.device,
             dtype=torch.long,
         )
-        slot_ids = torch.tensor(
+        selected_row_positions = torch.tensor(
             tuple(
-                slot_by_packed_row[link.packed_row_index]
+                position_by_packed_row[link.packed_row_index]
                 for link in affected_links
             ),
             device=source.device,
             dtype=torch.long,
         )
+        slot_ids = row_slot_ids.index_select(0, selected_row_positions)
         with torch.no_grad():
             prediction = bank(
                 slot_ids,

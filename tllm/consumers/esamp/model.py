@@ -164,6 +164,38 @@ class BatchedLowRankGatedResidualModel(FixedBatchedSlotModule):
             slot_buffers=(self.out_ln_weight, self.out_ln_bias),
         )
 
+    def install_fixed_batched_slot_layout(
+        self,
+        layout: FixedBatchedSlotLayout,
+    ) -> None:
+        if self.use_output_layernorm:
+            match layout.slot_parameters, layout.slot_buffers:
+                case (a, g, b, gate_bias, out_weight, out_bias), ():
+                    self.a = a
+                    self.g = g
+                    self.b = b
+                    self.gate_bias = gate_bias
+                    self.out_ln_weight = out_weight
+                    self.out_ln_bias = out_bias
+                case _:
+                    raise ValueError(
+                        "trainable output normalization has the wrong page layout"
+                    )
+        else:
+            match layout.slot_parameters, layout.slot_buffers:
+                case (a, g, b, gate_bias), (out_weight, out_bias):
+                    self.a = a
+                    self.g = g
+                    self.b = b
+                    self.gate_bias = gate_bias
+                    self.out_ln_weight = out_weight
+                    self.out_ln_bias = out_bias
+                case _:
+                    raise ValueError(
+                        "buffered output normalization has the wrong page layout"
+                    )
+        self.capacity = layout.capacity
+
     def forward(
         self, slot_ids: torch.Tensor, source: torch.Tensor
     ) -> torch.Tensor:
