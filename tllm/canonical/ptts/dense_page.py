@@ -8,29 +8,25 @@ from threading import RLock
 import torch
 from torch.optim.adamw import adamw
 
-from tllm.canonical.state_representation import (
-    validate_state_physical_plan,
-    validate_state_representation,
-    validate_state_representation_reconstruction,
+from tllm.canonical.ptts.dense_page_adamw import (
+    DensePageAdamWConfig,
+    DensePageAdamWFieldBinding,
 )
-from tllm.canonical.tensor_layout import validate_tensor_layouts
+from tllm.canonical.ptts.dense_page_validation import (
+    validate_dense_page_provider,
+)
 from tllm.contracts.state_ref import LineageId, StateRef, VersionId
 from tllm.contracts.state_representation import (
     StateDeviceKind,
-    StateLayoutRequirement,
     StatePhysicalPlan,
     StateProviderPlan,
-    StateRepresentation,
     StateRepresentationDecision,
     StateRepresentationRequest,
 )
 from tllm.contracts.tensor_layout import (
-    LayoutFieldId,
-    StateTensorLayout,
     TensorDType,
     TensorLayoutDecision,
     TensorLayoutRequest,
-    TensorLayoutSpec,
 )
 
 
@@ -105,51 +101,6 @@ _PendingTransition = (
 _NO_PENDING_TRANSITION = _NoPendingTransition()
 
 
-@dataclass(frozen=True, slots=True)
-class DensePageAdamWFieldBinding:
-    """Typed layout-field binding for one reusable AdamW transition."""
-
-    parameter: LayoutFieldId
-    gradient: LayoutFieldId
-    step: LayoutFieldId
-    exp_avg: LayoutFieldId
-    exp_avg_sq: LayoutFieldId
-
-    def __post_init__(self) -> None:
-        field_ids = (
-            int(self.parameter),
-            int(self.gradient),
-            int(self.step),
-            int(self.exp_avg),
-            int(self.exp_avg_sq),
-        )
-        if any(field_id < 0 for field_id in field_ids) or len(
-            set(field_ids)
-        ) != len(field_ids):
-            raise ValueError("dense page AdamW fields must be distinct non-negative IDs")
-
-
-@dataclass(frozen=True, slots=True)
-class DensePageAdamWConfig:
-    """Closed numeric configuration for a provider-owned CPU AdamW step."""
-
-    lr: float
-    betas: tuple[float, float]
-    eps: float
-    weight_decay: float
-
-    def __post_init__(self) -> None:
-        beta_one, beta_two = self.betas
-        if (
-            self.lr <= 0.0
-            or not 0.0 <= beta_one < 1.0
-            or not 0.0 <= beta_two < 1.0
-            or self.eps <= 0.0
-            or self.weight_decay < 0.0
-        ):
-            raise ValueError("dense page AdamW configuration is invalid")
-
-
 def _cpu_dtype(dtype: TensorDType) -> torch.dtype:
     match dtype:
         case TensorDType.BOOL:
@@ -207,80 +158,20 @@ class DensePageStateProvider:
         local_candidates: tuple[StateProviderPlan, ...],
         resource: str,
     ) -> None:
-        validate_tensor_layouts(tensor_layout_request, tensor_layout_decision)
-        validate_state_representation(
-            representation_request,
-            representation_decision,
+        signed = validate_dense_page_provider(
+            tensor_layout_request=tensor_layout_request,
+            tensor_layout_decision=tensor_layout_decision,
+            representation_request=representation_request,
+            representation_decision=representation_decision,
+            physical_plan=physical_plan,
+            local_candidates=local_candidates,
+            resource=resource,
+            device_kind=StateDeviceKind.CPU,
+            device_ordinal=0,
         )
-        validate_state_representation_reconstruction(
-            representation_request,
-            representation_decision,
-            local_candidates,
-        )
-        validate_state_physical_plan(
-            representation_request,
-            representation_decision,
-            physical_plan,
-        )
-        if (
-            physical_plan.request_digest != representation_decision.request_digest
-            or physical_plan.representation_signature
-            != representation_decision.signature
-            or physical_plan.representations != representation_decision.plans
-            or physical_plan.reserved_bytes != representation_decision.reserved_bytes
-        ):
-            raise RuntimeError("physical state plan differs from its signed decision")
-        if not resource:
-            raise ValueError("dense page provider requires a resource")
-        layout_items = tuple(
-            item
-            for item in tensor_layout_request.layouts
-            if item.resource == resource
-        )
-        layout_bindings = tuple(
-            binding
-            for binding in tensor_layout_decision.bindings
-            if binding.resource == resource
-        )
-        selected_plans = tuple(
-            plan
-            for plan in representation_decision.plans
-            if plan.resource == resource
-        )
-        requirements = tuple(
-            requirement
-            for requirement in representation_request.states
-            if requirement.resource == resource
-        )
-        if (
-            len(layout_items) != 1
-            or len(layout_bindings) != 1
-            or len(selected_plans) != 1
-            or len(requirements) != 1
-        ):
-            raise RuntimeError("signed plans do not define one selected state resource")
-        layout_item: StateTensorLayout = layout_items[0]
-        layout: TensorLayoutSpec = layout_item.layout
-        layout_binding = layout_bindings[0]
-        selected = selected_plans[0]
-        requirement: StateLayoutRequirement = requirements[0]
-        if selected.representation is not StateRepresentation.DENSE_PAGE_ARENA:
-            raise RuntimeError("signed state representation is not dense_page_arena")
-        if (
-            selected.device_kind is not StateDeviceKind.CPU
-            or selected.device_ordinal != 0
-            or selected.layout_id != layout_binding.layout_id
-            or selected.layout_namespace != layout_binding.layout_namespace
-            or selected.layout_digest != layout_binding.layout_digest
-            or selected.max_admitted_lineages
-            != requirement.max_admitted_lineages
-            or selected.root_page_count != 1
-        ):
-            raise RuntimeError("signed dense provider differs from tensor layout binding")
-        physical_rows = (
-            selected.max_admitted_lineages
-            * selected.max_live_versions_per_lineage
-        )
+        layout = signed.layout
+        selected = signed.selected_plan
+        physical_rows = signed.physical_rows
         device = torch.device("cpu")
         pools = tuple(
             torch.zeros(
