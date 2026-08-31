@@ -8,11 +8,18 @@ import json
 import pytest
 
 from tllm.contracts.hidden_locator import HiddenSite
+from tllm.contracts.hidden_locator import HiddenLayerKind as ContractHiddenLayerKind
 from tllm.schedule import (
     CompileOptions,
     HiddenLayerKind,
     PackedHiddenResourceBinding,
 )
+from tllm.workload.ir import HiddenLayerKind as WorkloadHiddenLayerKind
+
+
+def test_hidden_layer_kind_is_one_shared_contract_with_compatible_exports() -> None:
+    assert HiddenLayerKind is ContractHiddenLayerKind
+    assert WorkloadHiddenLayerKind is ContractHiddenLayerKind
 
 
 def test_packed_hidden_resource_binding_is_a_closed_typed_locator() -> None:
@@ -42,6 +49,24 @@ def test_packed_hidden_resource_binding_is_a_closed_typed_locator() -> None:
     ):
         with pytest.raises(ValueError, match=message):
             replace(indexed, **changes)
+
+
+def test_packed_hidden_resource_wire_rejects_non_string_names_in_python() -> None:
+    options = CompileOptions(
+        packed_hidden_resource_manifest=(
+            PackedHiddenResourceBinding(
+                layer="source",
+                layer_kind=HiddenLayerKind.PATH,
+                site=HiddenSite.BLOCK_OUTPUT,
+                module_path="model.layers.0",
+            ),
+        )
+    )
+    for field_name in ("layer", "module_path"):
+        wire = json.loads(options.to_json())
+        wire["packed_hidden_resource_manifest"][0][field_name] = 7
+        with pytest.raises(TypeError, match=f"{field_name} must be str"):
+            CompileOptions.from_json(json.dumps(wire))
 
 
 def test_compile_options_v2_wire_requires_explicit_sorted_unique_manifest() -> None:

@@ -5,6 +5,15 @@ from __future__ import annotations
 from enum import StrEnum
 
 
+class HiddenLayerKind(StrEnum):
+    """Closed hidden-layer locator forms shared by author IR and schedules."""
+
+    NONE = "none"
+    INDEX = "index"
+    PATH = "path"
+    WILDCARD = "wildcard"
+
+
 class HiddenSite(StrEnum):
     """Signed hidden-activation tap sites.
 
@@ -46,4 +55,9 @@ class HiddenLocatorCapability(StrEnum):
         return cls(f"hidden/{normalized_site.value}/{normalized_phase.value}")
 
 
-__all__ = ["HiddenLocatorCapability", "HiddenPhase", "HiddenSite"]
+__all__ = [
+    "HiddenLayerKind",
+    "HiddenLocatorCapability",
+    "HiddenPhase",
+    "HiddenSite",
+]

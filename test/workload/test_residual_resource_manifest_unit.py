@@ -146,6 +146,7 @@ class ResidualResourceManifestContractTest(unittest.TestCase):
                 "null",
                 local_manifest,
                 "[]",
+                "[]",
             )
 
     @staticmethod

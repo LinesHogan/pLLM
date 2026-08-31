@@ -8,7 +8,8 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, StrEnum
 from typing import Mapping
 
-from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
+from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.request_identity import RequestKeyField
 
 
@@ -389,13 +390,6 @@ class RegionInputKind(StrEnum):
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
     STATE_SELECTION = "state_selection"
-
-
-class HiddenLayerKind(StrEnum):
-    INDEX = "index"
-    PATH = "path"
-    WILDCARD = "wildcard"
-    NONE = "none"
 
 
 class RegionOutputKind(StrEnum):
@@ -1532,69 +1526,6 @@ class ResidualResourceBinding:
     @property
     def locator_key(self) -> tuple[int, str, str]:
         return (self.layer_index, self.site.value, self.phase.value)
-
-
-@dataclass(frozen=True, slots=True)
-class PackedHiddenResourceBinding:
-    """One signed backend module for a packed block-output locator."""
-
-    layer: str
-    layer_kind: HiddenLayerKind
-    site: HiddenSite
-    module_path: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "layer",
-            _name(self.layer, "PackedHiddenResourceBinding.layer"),
-        )
-        object.__setattr__(
-            self,
-            "layer_kind",
-            HiddenLayerKind(self.layer_kind),
-        )
-        object.__setattr__(self, "site", HiddenSite(self.site))
-        if self.layer_kind not in (
-            HiddenLayerKind.INDEX,
-            HiddenLayerKind.PATH,
-        ):
-            raise ValueError(
-                "PackedHiddenResourceBinding.layer_kind must be index or path"
-            )
-        if self.site is not HiddenSite.BLOCK_OUTPUT:
-            raise ValueError(
-                "PackedHiddenResourceBinding.site must be block_output"
-            )
-        if self.layer_kind is HiddenLayerKind.INDEX:
-            try:
-                layer_index = int(self.layer)
-            except ValueError as error:
-                raise ValueError(
-                    "PackedHiddenResourceBinding INDEX layer must be a canonical "
-                    "signed integer"
-                ) from error
-            if (
-                str(layer_index) != self.layer
-                or layer_index < -(1 << 63)
-                or layer_index >= (1 << 63)
-            ):
-                raise ValueError(
-                    "PackedHiddenResourceBinding INDEX layer must be a canonical "
-                    "signed 64-bit integer"
-                )
-        object.__setattr__(
-            self,
-            "module_path",
-            _name(
-                self.module_path,
-                "PackedHiddenResourceBinding.module_path",
-            ),
-        )
-
-    @property
-    def locator_key(self) -> tuple[str, str, str]:
-        return (self.layer, self.layer_kind.value, self.site.value)
 
 
 @dataclass(frozen=True, slots=True)

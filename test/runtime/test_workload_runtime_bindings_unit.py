@@ -52,6 +52,7 @@ class WorkloadRuntimeBindingTest(unittest.TestCase):
         self.assertIsInstance(binding.worker, NoWorkerBinding)
         self.assertEqual(binding.ports.inputs, {})
         self.assertEqual(binding.states.snapshots, {})
+        self.assertEqual(binding.packed_hidden_resources, ())
 
     def test_registries_are_immutable_and_lifecycle_is_closed(self) -> None:
         owner = _BindingOwner()

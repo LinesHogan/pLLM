@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, StrEnum
 from typing import Mapping, TypeVar, cast
 
-from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.request_identity import RequestKeyField
 
 
@@ -101,13 +101,6 @@ class ValueSourceKind(StrEnum):
     SAMPLER_LOGITS = "sampler_logits"
     SAMPLED_TOKENS = "sampled_tokens"
     STATE_SELECTION = "state_selection"
-
-
-class HiddenLayerKind(StrEnum):
-    NONE = "none"
-    INDEX = "index"
-    PATH = "path"
-    WILDCARD = "wildcard"
 
 
 class ValueTargetKind(StrEnum):

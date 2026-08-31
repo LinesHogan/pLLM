@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 import torch
 
+from tllm.contracts.packed_hidden import (
+    PackedHiddenSnapshotBatch,
+)
+from tllm.contracts.packed_rows import PackedPhaseRowBatch
 from tllm.contracts.request_identity import RequestFinishedBatch
+from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.workload_ports import (
     PortTransactionStatus,
     RuntimeValueMarker,
@@ -773,6 +778,7 @@ class WorkloadExecutionBindings:
     residual_paths: Mapping["ResidualLocator", str] = field(
         default_factory=dict["ResidualLocator", str]
     )
+    packed_hidden_resources: tuple[PackedHiddenResourceBinding, ...] = ()
     backend_region_binders: Mapping[str, "BackendRegionBinderSlot"] = field(
         default_factory=dict[str, "BackendRegionBinderSlot"]
     )
@@ -822,6 +828,15 @@ class WorkloadExecutionBindings:
         object.__setattr__(
             self, "residual_paths", MappingProxyType(dict(self.residual_paths))
         )
+        packed_locator_keys = tuple(
+            binding.locator_key for binding in self.packed_hidden_resources
+        )
+        if tuple(sorted(packed_locator_keys)) != packed_locator_keys or len(
+            set(packed_locator_keys)
+        ) != len(packed_locator_keys):
+            raise ValueError(
+                "packed hidden resources must have sorted unique locators"
+            )
         if any(
             not implementation_id or slot.implementation_id != implementation_id
             for implementation_id, slot in self.backend_region_binders.items()
@@ -874,6 +889,20 @@ class _NoRegionValueStore:
         _ = batch
         raise RuntimeError("native execution has no request-state runtime service")
 
+    def stage_packed_rows(
+        self, step_id: int, batch: PackedPhaseRowBatch
+    ) -> None:
+        _ = step_id
+        _ = batch
+        raise RuntimeError("native execution has no signed packed-row input")
+
+    def stage_packed_hidden_snapshots(
+        self, step_id: int, batch: PackedHiddenSnapshotBatch
+    ) -> None:
+        _ = step_id
+        _ = batch
+        raise RuntimeError("native execution has no signed packed-hidden input")
+
     def retire_request_states(
         self, batch: RequestFinishedBatch
     ) -> tuple[StateEffectReceipt, ...]:
@@ -882,6 +911,10 @@ class _NoRegionValueStore:
 
     @property
     def requires_request_identities(self) -> bool:
+        return False
+
+    @property
+    def requires_packed_rows(self) -> bool:
         return False
 
     def request_state_version_report(
@@ -1592,9 +1625,45 @@ class NativeWorkloadExecution:
                 )
             self._value_store.stage_request_identities(step, batch)
 
+    def stage_packed_rows(self, batch: PackedPhaseRowBatch) -> None:
+        """Stage the complete signed row provenance for the prepared step."""
+
+        with self._execution_lock:
+            if batch.plan_epoch != self.plan_epoch:
+                raise RuntimeError(
+                    "packed rows belong to another native execution epoch"
+                )
+            if self._prepared_step != batch.step_id:
+                raise RuntimeError(
+                    "packed rows must be staged for the prepared native step"
+                )
+            self._value_store.stage_packed_rows(batch.step_id, batch)
+
+    def stage_packed_hidden_snapshots(
+        self, batch: PackedHiddenSnapshotBatch
+    ) -> None:
+        """Stage owned eager hidden snapshots for the exact packed rows."""
+
+        with self._execution_lock:
+            if batch.plan_epoch != self.plan_epoch:
+                raise RuntimeError(
+                    "packed hidden snapshots belong to another native execution epoch"
+                )
+            if self._prepared_step != batch.step_id:
+                raise RuntimeError(
+                    "packed hidden snapshots must be staged for the prepared native step"
+                )
+            self._value_store.stage_packed_hidden_snapshots(
+                batch.step_id, batch
+            )
+
     @property
     def requires_request_identities(self) -> bool:
         return self._value_store.requires_request_identities
+
+    @property
+    def requires_packed_rows(self) -> bool:
+        return self._value_store.requires_packed_rows
 
     def retire_request_states(
         self, batch: RequestFinishedBatch
@@ -1907,6 +1976,20 @@ def _request_state_effect_operation(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _NoPackedRows:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _NoPackedHiddenSnapshots:
+    pass
+
+
+_PackedRowsFrameValue = _NoPackedRows | PackedPhaseRowBatch
+_PackedHiddenFrameValue = _NoPackedHiddenSnapshots | PackedHiddenSnapshotBatch
+
+
 @dataclass(slots=True)
 class _RegionStepFrame:
     values: dict[str, object] = field(default_factory=dict[str, object])
@@ -1916,6 +1999,10 @@ class _RegionStepFrame:
         default_factory=dict[
             str, RequestStateSelectionBatch | RuntimeValueMarker
         ]
+    )
+    packed_rows: _PackedRowsFrameValue = field(default_factory=_NoPackedRows)
+    packed_hidden: _PackedHiddenFrameValue = field(
+        default_factory=_NoPackedHiddenSnapshots
     )
     lock: LockType = field(default_factory=Lock)
 
@@ -1928,6 +2015,11 @@ class _RegionValueStore:
         "_providers",
         "_sinks",
         "_hidden_inputs",
+        "_packed_hidden_resources",
+        "_packed_hidden_resources_by_binding",
+        "_ordinary_request_state_resources",
+        "_packed_request_state_resources",
+        "_requires_packed_rows",
         "_materializations",
         "_state_versions",
         "_request_state_services",
@@ -1949,6 +2041,9 @@ class _RegionValueStore:
         request_state_services: Mapping[
             str, RequestStateRuntimeService[torch.nn.Module]
         ] = MappingProxyType({}),
+        packed_hidden_resources: tuple[
+            PackedHiddenResourceBinding, ...
+        ] = (),
     ) -> None:
         self._runtime = runtime
         self._state_versions = state_versions
@@ -1957,13 +2052,85 @@ class _RegionValueStore:
         self._providers = providers
         self._sinks = sinks
         self._materializations = materializations
+        artifact_inputs = tuple(
+            binding
+            for artifact in artifacts
+            for binding in artifact.input_bindings
+        )
         self._hidden_inputs = MappingProxyType(
             {
                 binding.binding_id: binding
-                for artifact in artifacts
-                for binding in artifact.input_bindings
+                for binding in artifact_inputs
                 if binding.kind is RegionInputKind.HIDDEN
             }
+        )
+        packed_hidden_inputs = tuple(
+            binding
+            for binding in artifact_inputs
+            if binding.kind is RegionInputKind.PACKED_HIDDEN
+        )
+        packed_hidden_by_locator = {
+            resource.locator_key: resource
+            for resource in packed_hidden_resources
+        }
+        required_packed_hidden = {
+            (
+                binding.layer,
+                binding.layer_kind.value,
+                binding.site.value,
+            )
+            for binding in packed_hidden_inputs
+        }
+        if required_packed_hidden != set(packed_hidden_by_locator):
+            raise RuntimeError(
+                "local packed-hidden resources differ from signed Region inputs"
+            )
+        self._packed_hidden_resources = packed_hidden_resources
+        self._packed_hidden_resources_by_binding = MappingProxyType(
+            {
+                binding.binding_id: packed_hidden_by_locator[
+                    (
+                        binding.layer,
+                        binding.layer_kind.value,
+                        binding.site.value,
+                    )
+                ]
+                for binding in packed_hidden_inputs
+            }
+        )
+        packed_request_state_resources = {
+            binding.source
+            for binding in artifact_inputs
+            if binding.kind is RegionInputKind.STATE_SELECTION
+            and binding.packed_rows_binding_id
+        }
+        ordinary_request_state_resources = {
+            binding.source
+            for binding in artifact_inputs
+            if binding.kind is RegionInputKind.STATE_SELECTION
+            and not binding.packed_rows_binding_id
+        }
+        mixed_request_state_resources = ordinary_request_state_resources.intersection(
+            packed_request_state_resources
+        )
+        if mixed_request_state_resources:
+            raise RuntimeError(
+                "one request-state resource cannot mix ordinary and packed identity provenance"
+            )
+        ordinary_request_state_resources.update(
+            set(self._request_state_services).difference(
+                packed_request_state_resources
+            )
+        )
+        self._ordinary_request_state_resources = tuple(
+            sorted(ordinary_request_state_resources)
+        )
+        self._packed_request_state_resources = tuple(
+            sorted(packed_request_state_resources)
+        )
+        self._requires_packed_rows = any(
+            binding.kind is RegionInputKind.PACKED_REQUEST_ROWS
+            for binding in artifact_inputs
         )
         self._frames: dict[int, _RegionStepFrame] = {}
         self._frames_lock = Lock()
@@ -1982,7 +2149,11 @@ class _RegionValueStore:
 
     @property
     def requires_request_identities(self) -> bool:
-        return bool(self._request_state_services)
+        return bool(self._ordinary_request_state_resources)
+
+    @property
+    def requires_packed_rows(self) -> bool:
+        return self._requires_packed_rows
 
     def request_state_version_report(
         self,
@@ -2014,12 +2185,78 @@ class _RegionValueStore:
     def stage_request_identities(
         self, step_id: int, batch: RequestIdentityBatch
     ) -> None:
-        """Stage one backend-resolved identity batch for all typed resources."""
+        """Stage ordinary backend identities for non-packed selections."""
 
         frame = self._frame(step_id)
         with frame.lock:
-            for service in self._request_state_services.values():
-                service.stage_identities(step_id, batch)
+            for resource in self._ordinary_request_state_resources:
+                self._request_state_services[resource].stage_identities(
+                    step_id, batch
+                )
+
+    def stage_packed_rows(
+        self, step_id: int, batch: PackedPhaseRowBatch
+    ) -> None:
+        """Bind one complete packed-row batch and its exact state identities."""
+
+        if not self._requires_packed_rows:
+            raise RuntimeError("native execution has no signed packed-row input")
+        if batch.step_id != step_id:
+            raise RuntimeError("packed row batch belongs to another step")
+        frame = self._frame(step_id)
+        with frame.lock:
+            match frame.packed_rows:
+                case _NoPackedRows():
+                    frame.packed_rows = batch
+                case PackedPhaseRowBatch() as staged if staged == batch:
+                    return
+                case PackedPhaseRowBatch():
+                    raise RuntimeError(
+                        "packed row batch differs from the staged step"
+                    )
+            identities = RequestIdentityBatch(batch.identities)
+            for resource in self._packed_request_state_resources:
+                self._request_state_services[resource].stage_identities(
+                    step_id, identities
+                )
+
+    def stage_packed_hidden_snapshots(
+        self, step_id: int, batch: PackedHiddenSnapshotBatch
+    ) -> None:
+        """Bind two owned hidden tensors to the already-staged packed rows."""
+
+        if not self._packed_hidden_resources_by_binding:
+            raise RuntimeError("native execution has no signed packed-hidden input")
+        if batch.step_id != step_id:
+            raise RuntimeError("packed hidden snapshots belong to another step")
+        frame = self._frame(step_id)
+        with frame.lock:
+            match frame.packed_rows:
+                case PackedPhaseRowBatch() as rows if rows == batch.row_batch:
+                    pass
+                case PackedPhaseRowBatch():
+                    raise RuntimeError(
+                        "packed hidden snapshots differ from the staged rows"
+                    )
+                case _NoPackedRows():
+                    raise RuntimeError(
+                        "packed rows must be staged before hidden snapshots"
+                    )
+            if tuple(
+                snapshot.resource for snapshot in batch.snapshots
+            ) != self._packed_hidden_resources:
+                raise RuntimeError(
+                    "packed hidden snapshots differ from signed local resources"
+                )
+            match frame.packed_hidden:
+                case _NoPackedHiddenSnapshots():
+                    frame.packed_hidden = batch
+                case PackedHiddenSnapshotBatch() as staged if staged is batch:
+                    return
+                case PackedHiddenSnapshotBatch():
+                    raise RuntimeError(
+                        "packed hidden snapshots are already staged"
+                    )
 
     def retire_request_states(
         self, batch: RequestFinishedBatch
@@ -2206,6 +2443,48 @@ class _RegionValueStore:
             )
         return selection
 
+    def _required_packed_rows(
+        self,
+        frame: _RegionStepFrame,
+        context: PhysicalExecutionContext,
+    ) -> PackedPhaseRowBatch:
+        match frame.packed_rows:
+            case PackedPhaseRowBatch() as rows:
+                if (
+                    rows.plan_epoch != context.plan_epoch
+                    or rows.step_id != context.step_id
+                ):
+                    raise RuntimeError(
+                        "packed rows differ from the executing plan epoch or step"
+                    )
+                return rows
+            case _NoPackedRows():
+                raise RuntimeError(
+                    "packed rows must be staged before Region execution"
+                )
+
+    def _required_packed_hidden(
+        self,
+        frame: _RegionStepFrame,
+        context: PhysicalExecutionContext,
+        binding: RegionInputBinding,
+    ) -> torch.Tensor:
+        rows = self._required_packed_rows(frame, context)
+        match frame.packed_hidden:
+            case PackedHiddenSnapshotBatch() as snapshots:
+                if snapshots.row_batch != rows:
+                    raise RuntimeError(
+                        "packed hidden snapshots differ from executing rows"
+                    )
+            case _NoPackedHiddenSnapshots():
+                raise RuntimeError(
+                    "packed hidden snapshots must be staged before Region execution"
+                )
+        resource = self._packed_hidden_resources_by_binding[
+            binding.binding_id
+        ]
+        return snapshots.hidden_for(resource)
+
     def resolve_inputs(
         self,
         artifact: "RegionCallableArtifact",
@@ -2244,6 +2523,16 @@ class _RegionValueStore:
                     inputs[binding.binding_id] = _hidden_value(
                         self._runtime,
                         self._hidden_inputs[binding.binding_id],
+                    )
+                elif binding.kind is RegionInputKind.PACKED_REQUEST_ROWS:
+                    inputs[binding.binding_id] = self._required_packed_rows(
+                        frame, context
+                    )
+                elif binding.kind is RegionInputKind.PACKED_HIDDEN:
+                    inputs[binding.binding_id] = self._required_packed_hidden(
+                        frame,
+                        context,
+                        binding,
                     )
                 elif binding.kind is RegionInputKind.STATE_SELECTION:
                     service = self._request_state_services[binding.source]
@@ -3479,6 +3768,7 @@ def _native_workload_execution(
         1 if compilation.physical is None else compilation.physical.plan_epoch,
         reconstructed_graph.to_json(),
         reconstructed_manifest_json,
+        canonical_json(bindings.packed_hidden_resources),
         static_backend_binding_manifest_wire(bindings.static_binding_entries),
     )
     state_versions = _local_binding_requirements(compilation, bindings)
@@ -3512,6 +3802,7 @@ def _native_workload_execution(
         materializations=materializations,
         state_versions=state_versions,
         request_state_services=bindings.request_state_services,
+        packed_hidden_resources=bindings.packed_hidden_resources,
         lifecycle=bindings.lifecycle,
     )
     handlers: dict[

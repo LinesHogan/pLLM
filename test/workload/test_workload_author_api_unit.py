@@ -6,6 +6,7 @@ import unittest
 from typing import Literal
 
 import torch
+from tllm.contracts.packed_rows import PackedPhaseRowBatch
 from tllm.kit.workload import Workload
 from tllm.runtime.workload_bindings import LocalRuntimeServices
 
@@ -25,6 +26,8 @@ from tllm.workload import (
     declare_workload,
     hidden,
     optimize,
+    packed_hidden,
+    packed_request_rows,
     staged,
     task,
     workload,
@@ -121,6 +124,75 @@ class _PublishedWorkload(Workload[_Config]):
         return torch.nn.Linear(spec.hidden_size, spec.hidden_size, bias=False)
 
 
+_PACKED_MODE: ConfigField[Literal["online", "offline"]] = ConfigField.choice(
+    "online", ("online", "offline")
+)
+
+
+class _PackedConfig(WorkloadConfig):
+    enabled: bool = config_field(default=True, kind=ConfigKind.BOOL)
+    mode: Literal["online", "offline"] = declared_config_field(_PACKED_MODE)
+    source_path: str = config_field(
+        default="model.layers.0", kind=ConfigKind.STR
+    )
+    target_path: str = config_field(
+        default="model.layers.7", kind=ConfigKind.STR
+    )
+
+
+_ONLINE_PACKED_ROWS = packed_request_rows()
+_OFFLINE_PACKED_ROWS = packed_request_rows()
+
+
+@workload(
+    id="author.packed-resources",
+    config=_PackedConfig,
+    enabled=_PackedConfig.enabled,
+)
+class _PackedAuthorWorkload(Workload[_PackedConfig]):
+    @task(
+        when=when(_PACKED_MODE, "online"),
+        inputs={
+            "rows": _ONLINE_PACKED_ROWS,
+            "source": packed_hidden(
+                0,
+                rows=_ONLINE_PACKED_ROWS,
+                path=_PackedConfig.source_path,
+            ),
+            "target": packed_hidden(
+                -1,
+                rows=_ONLINE_PACKED_ROWS,
+                path=_PackedConfig.target_path,
+            ),
+        },
+    )
+    def online(
+        self,
+        rows: PackedPhaseRowBatch,
+        source: torch.Tensor,
+        target: torch.Tensor,
+    ) -> None:
+        _ = rows, source, target
+
+    @task(
+        when=when(_PACKED_MODE, "offline"),
+        inputs={
+            "rows": _OFFLINE_PACKED_ROWS,
+            "hidden": packed_hidden(
+                "teacher",
+                rows=_OFFLINE_PACKED_ROWS,
+                path="model.teacher",
+            ),
+        },
+    )
+    def offline(
+        self,
+        rows: PackedPhaseRowBatch,
+        hidden: torch.Tensor,
+    ) -> None:
+        _ = rows, hidden
+
+
 class WorkloadAuthorApiUnitTest(unittest.TestCase):
     def test_rust_normalized_choice_selects_one_signed_semantic_variant(self) -> None:
         self.assertEqual(
@@ -145,6 +217,46 @@ class WorkloadAuthorApiUnitTest(unittest.TestCase):
         self.assertTrue(resources.services.is_enabled())
         self.assertNotIn("algorithm", vars(_AuthorWorkload))
         self.assertNotIn("config_type", vars(_AuthorWorkload))
+
+    def test_packed_resource_manifest_uses_only_active_typed_locators(self) -> None:
+        online = _PackedAuthorWorkload(
+            _PackedConfig(
+                mode="online",
+                source_path="model.layers.2",
+                target_path="model.layers.9",
+            )
+        ).native_workload_resources()
+        self.assertEqual(
+            tuple(
+                (
+                    binding.layer,
+                    binding.layer_kind.value,
+                    binding.site.value,
+                    binding.module_path,
+                )
+                for binding in online.packed_hidden_resources
+            ),
+            (
+                ("-1", "index", "block_output", "model.layers.9"),
+                ("0", "index", "block_output", "model.layers.2"),
+            ),
+        )
+
+        offline = _PackedAuthorWorkload(
+            _PackedConfig(mode="offline")
+        ).native_workload_resources()
+        self.assertEqual(
+            tuple(
+                (
+                    binding.layer,
+                    binding.layer_kind.value,
+                    binding.site.value,
+                    binding.module_path,
+                )
+                for binding in offline.packed_hidden_resources
+            ),
+            (("teacher", "path", "block_output", "model.teacher"),),
+        )
 
     def test_state_initializer_binds_module_and_configured_optimizer(self) -> None:
         workload_instance = _AuthorWorkload(_Config(learning_rate=3e-4))

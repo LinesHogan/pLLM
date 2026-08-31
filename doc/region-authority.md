@@ -168,22 +168,28 @@ The first prefill foundation moves the four scheduler columns into a neutral
 typed contract and feeds them through the existing Rust packed-row planner.
 Its immutable staged rows retain plan epoch/step, raw request ID, canonical
 parent identity, packed row, token offset, and phase; MRv1 and MRv2 share the
-same service. This does not yet stage tensors or execute a workload. In
-particular, a decode-plan ordinal is not treated as a sampler mapping, and the
-current decode capture buffer is not reused for prompt-token rows. Signed
-runtime binding and explicit driver sampler links remain required. A
+same service. Native CPU execution now stages those rows and an owned snapshot
+batch under the signed plan epoch/step, resolves packed Region inputs, and
+derives request-state leases from the complete row identities. In particular,
+a decode-plan ordinal is not treated as a sampler mapping, and the current
+decode capture buffer is not reused for prompt-token rows. Explicit driver
+capture and sampler links remain required. A
 bounded retired-step high-watermark prevents a completed `(epoch, step)` from
 being staged again with different rows.
 
 An eager `PackedHiddenSnapshotService` now provides the next neutral layer:
-source and target can arrive in either order but must share one canonical row
-batch and exact cold specialization. It owns ordinary tensor clones, returns
-fresh clones to readers, and has bounded step-retirement semantics. WorkloadIR
+any number of exact signed resources can arrive in any order but must share one
+canonical row batch and exact cold specialization. It owns ordinary tensor
+clones, returns fresh resource-keyed clones to readers, and has bounded
+finish/abort semantics. WorkloadIR
 v4 / ScheduleGraph v5 / Decision v7 now sign packed-row, packed-hidden, and
 selection provenance and force the initial implementation to eager/default/
-inline. The service is still not installed in a backend hook or runtime input
-resolver, and no CUDA Graph path is claimed; therefore this foundation alone
-changes no workload execution claim.
+inline. Parent, worker, and local execution also compare an independent packed
+module-path manifest before binding resources. The CPU runtime resolver maps
+signed binding IDs directly to exact resource-keyed snapshots; it never reads
+ordinary residual buffers or infers roles from workload names. The service is
+still not installed in a backend hook and no CUDA Graph path is claimed;
+therefore this foundation alone changes no ESamp execution claim.
 
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension

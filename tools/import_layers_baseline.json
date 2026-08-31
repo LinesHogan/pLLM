@@ -105,6 +105,7 @@
       "tllm.runtime.workload_plugins -> tllm.workload",
       "tllm.runtime.workload_plugins -> tllm.workload.lowering",
       "tllm.schedule.contracts -> tllm.contracts.hidden_locator",
+      "tllm.schedule.contracts -> tllm.contracts.packed_hidden",
       "tllm.schedule.contracts -> tllm.contracts.request_identity",
       "tllm.schedule.coordinator -> tllm.contracts.physical_plan",
       "tllm.schedule.coordinator -> tllm.workload.frontend",

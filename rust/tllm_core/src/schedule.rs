@@ -6164,6 +6164,7 @@ fn validate_reconstructed_workload_wire_inputs(
     plan_epoch: u64,
     reconstructed_graph_json: &str,
     reconstructed_residual_resource_manifest_json: &str,
+    reconstructed_packed_hidden_resource_manifest_json: &str,
     reconstructed_static_binding_manifest_json: &str,
 ) -> PyResult<CompileOptions> {
     validate_workload_compilation_wire_inputs(
@@ -6204,6 +6205,21 @@ fn validate_reconstructed_workload_wire_inputs(
             "worker residual resource manifest does not match the parent-signed CompileOptions",
         ));
     }
+    let reconstructed_packed_manifest: Vec<PackedHiddenResourceBinding> = decode(
+        reconstructed_packed_hidden_resource_manifest_json,
+        "reconstructed packed hidden resource manifest",
+    )?;
+    validate_packed_hidden_resource_manifest(&reconstructed, &reconstructed_packed_manifest)?;
+    if reconstructed_packed_manifest
+        != options
+            .packed_hidden_resource_manifest
+            .as_deref()
+            .unwrap_or(&[])
+    {
+        return Err(schedule_error(
+            "worker packed hidden resource manifest does not match the parent-signed CompileOptions",
+        ));
+    }
     let signed_static_bindings = validate_static_backend_binding_manifest(&options)?;
     let reconstructed_static_bindings = parse_static_backend_binding_manifest(
         reconstructed_static_binding_manifest_json,
@@ -6229,6 +6245,7 @@ fn validate_local_execution_binding_wire(
     plan_epoch: &Bound<'_, PyAny>,
     reconstructed_graph_json: &str,
     reconstructed_residual_resource_manifest_json: &str,
+    reconstructed_packed_hidden_resource_manifest_json: &str,
     reconstructed_static_binding_manifest_json: &str,
 ) -> PyResult<()> {
     if !plan_epoch.is_exact_instance_of::<PyInt>() {
@@ -6246,6 +6263,7 @@ fn validate_local_execution_binding_wire(
         plan_epoch,
         reconstructed_graph_json,
         reconstructed_residual_resource_manifest_json,
+        reconstructed_packed_hidden_resource_manifest_json,
         reconstructed_static_binding_manifest_json,
     )?;
     Ok(())
@@ -6265,6 +6283,7 @@ fn validate_worker_reconstruction_wire(
     reconstructed_graph_json: &str,
     runtime_specialization_facts_json: &str,
     reconstructed_residual_resource_manifest_json: &str,
+    reconstructed_packed_hidden_resource_manifest_json: &str,
     reconstructed_static_binding_manifest_json: &str,
 ) -> PyResult<()> {
     if !plan_epoch.is_exact_instance_of::<PyInt>() {
@@ -6283,6 +6302,7 @@ fn validate_worker_reconstruction_wire(
         plan_epoch,
         reconstructed_graph_json,
         reconstructed_residual_resource_manifest_json,
+        reconstructed_packed_hidden_resource_manifest_json,
         reconstructed_static_binding_manifest_json,
     )?;
     validate_runtime_specialization_facts(&options, runtime_specialization_facts_json)?;

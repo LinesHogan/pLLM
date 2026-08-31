@@ -11,7 +11,8 @@ from typing import ClassVar, Generic, Protocol, TypeVar, cast
 import torch
 
 from tllm.contracts.consumer_stats import TrainingStats
-from tllm.contracts.hidden_locator import HiddenPhase
+from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
+from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.request_trainable_state import (
@@ -458,6 +459,45 @@ class Workload(NativeWorkload, Generic[ConfigT]):
             ] = module_path
         return MappingProxyType(paths)
 
+    def packed_hidden_resources(
+        self,
+    ) -> tuple[PackedHiddenResourceBinding, ...]:
+        active_packed_hidden = {
+            (
+                input_.layer,
+                HiddenLayerKind(input_.layer_kind),
+                input_.site,
+            )
+            for task in declare_workload(self).ir.tasks
+            for input_ in task.inputs
+            if input_.kind is ValueSourceKind.PACKED_HIDDEN
+        }
+        bindings: dict[
+            tuple[str, HiddenLayerKind, HiddenSite],
+            PackedHiddenResourceBinding,
+        ] = {}
+        for source in type(self)._definition().packed_hidden_inputs:
+            locator = (source.layer, source.layer_kind, source.site)
+            if locator not in active_packed_hidden:
+                continue
+            match source.path:
+                case NoConfiguredValue():
+                    continue
+                case configured:
+                    module_path = configured.resolve(self.config)
+            binding = PackedHiddenResourceBinding(
+                layer=source.layer,
+                layer_kind=source.layer_kind,
+                site=source.site,
+                module_path=module_path,
+            )
+            if locator in bindings and bindings[locator] != binding:
+                raise RuntimeError(
+                    "packed hidden locator has conflicting module paths"
+                )
+            bindings[locator] = binding
+        return tuple(sorted(bindings.values(), key=lambda item: item.locator_key))
+
     def _create_sampler_binding(self) -> _SamplerState:
         outputs = type(self)._definition().sampler_outputs
         if not outputs:
@@ -716,6 +756,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                 **self.backend.specialization_key(),
             },
             residual_paths=self.residual_paths(),
+            packed_hidden_resources=self.packed_hidden_resources(),
             worker=WorkerRuntimeBinding(
                 WorkloadWorkerSpec(
                     factory=f"{type(self).__module__}:{type(self).__qualname__}.reconstruct",

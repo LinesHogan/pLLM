@@ -57,12 +57,17 @@ or throughput evidence. Program and legacy remain migration/benchmark paths
 until the complete deletion gate passes.
 
 The neutral `PackedPhaseRowStaging` contract now preserves Rust-planned
-prefill/decode rows and stable parent identities across MRv1/MRv2, but it is
-not yet connected to native workload execution. A separate eager
-`PackedHiddenSnapshotService` now owns exact full-packed source/target clones
+prefill/decode rows and stable parent identities across MRv1/MRv2. The native
+CPU execution boundary now accepts the exact epoch/step rows and owned hidden
+snapshot batch, resolves signed packed inputs, and derives request-state
+selection only from the complete row identities. A separate eager
+`PackedHiddenSnapshotService` now owns exact full-packed resource-keyed clones
 under an explicit epoch, capacity, hidden-size, dtype, and device
-specialization; it deliberately does not reuse decode buffers or claim
-compile/CUDA-Graph support.
+specialization. The underlying service is generic: tensors are keyed by exact
+signed packed resources rather than source/target role text. ESamp does not
+yet declare these packed inputs and the service
+is not installed in vLLM hooks, so this deliberately does not reuse decode
+buffers or claim prefill parity, compile, or CUDA-Graph support.
 
 ## Key config knobs (`ESampConsumerConfig`)
 

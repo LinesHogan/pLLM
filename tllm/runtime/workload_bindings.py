@@ -20,6 +20,7 @@ from tllm.runtime.request_trainable_state import RequestStateRuntimeService
 
 if TYPE_CHECKING:
     import torch
+    from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.workload_plugins import NativeWorkload, WorkloadWorkerSpec
@@ -239,6 +240,7 @@ class WorkloadRuntimeBinding:
     residual_paths: Mapping["ResidualLocator", str] = field(
         default_factory=_empty_residual_paths
     )
+    packed_hidden_resources: tuple["PackedHiddenResourceBinding", ...] = ()
     backend: BackendRuntimeBinding = field(default_factory=BackendRuntimeBinding)
     parameter_overlays: Mapping[OverlayChannel, OverlayVersionStore] = field(
         default_factory=_empty_parameter_overlays
@@ -261,6 +263,15 @@ class WorkloadRuntimeBinding:
             MappingProxyType(dict(sorted(self.specialization_key.items()))),
         )
         object.__setattr__(self, "residual_paths", MappingProxyType(dict(self.residual_paths)))
+        packed_locator_keys = tuple(
+            binding.locator_key for binding in self.packed_hidden_resources
+        )
+        if tuple(sorted(packed_locator_keys)) != packed_locator_keys or len(
+            set(packed_locator_keys)
+        ) != len(packed_locator_keys):
+            raise ValueError(
+                "packed hidden resources must have sorted unique locators"
+            )
         object.__setattr__(
             self,
             "parameter_overlays",

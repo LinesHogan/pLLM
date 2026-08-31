@@ -256,7 +256,7 @@ only (four updates and one intervention state). Fixed-seed native and legacy
 tokens also differ before intervention. These are correctness/lifecycle
 capability results, not parity, throughput, or CUDA Graph claims.
 
-The prefill follow-up now has a neutral foundation but is not yet executable:
+The prefill follow-up now has a neutral CPU-executable foundation:
 `PackedRowPlanInputs` lives in the contracts layer, and
 `PackedPhaseRowStaging` expands the Rust packed-row plan into immutable rows
 carrying plan epoch, step, raw backend ID, stable `RequestIdentity`, token
@@ -264,19 +264,22 @@ offset, and closed prefill/decode phase. Decode plan ordinals are explicitly
 not sampler-row links. A single active epoch and retired-step high-watermark
 prevent `(epoch, step)` ABA reuse without retaining unbounded history. Packed
 input kinds and same-task row provenance are now signed by WorkloadIR v4,
-ScheduleGraph v5, and Decision v7. Runtime resolution,
-`NativeWorkloadExecution` staging, packed hidden capture, and driver-provided
-sampler-row mappings still have to bind this batch before the native update
-count can include prefill.
+ScheduleGraph v5, and Decision v7. `NativeWorkloadExecution` stages one exact
+row/snapshot batch, the Region resolver binds signed packed inputs, and packed
+request-state selections come only from `PackedPhaseRowBatch.identities`.
+Driver-provided packed hidden capture and sampler-row mappings still have to
+bind this batch before the native update count can include prefill.
 
-The matching eager packed-hidden foundation owns source and target snapshots
-under one canonical row batch and an explicit cold capacity/shape/dtype/device
-specialization. Backend inference tensors are cloned into ordinary
-service-owned storage, and reads return independent clones; a bounded finish
-high-watermark prevents step ABA without invalidating an older active step.
-The schema can now name this service through signed packed input bindings, but
-the runtime resolver and vLLM hooks are not wired yet. It is not a
-compile/CUDA-Graph path.
+The matching eager packed-hidden foundation owns an arbitrary non-empty set of
+exact resource-keyed snapshots under one canonical row batch and an explicit
+cold capacity/shape/dtype/device specialization. Backend inference tensors are
+cloned into ordinary service-owned storage, and reads return independent
+clones; bounded finish/abort high-watermark semantics prevent step ABA without
+invalidating an older active step.
+The schema names this service through signed packed input bindings, and an
+independent exact module-path manifest is reconstructed and compared in the
+parent, EngineCore worker, and local execution gate. The CPU resolver is wired;
+vLLM hooks are not. It is not a compile/CUDA-Graph path.
 
 A native ESamp Region cannot be co-installed with a legacy ESamp authority.
 During the current migration this

@@ -27,11 +27,15 @@ from tllm.runtime.request_trainable_state import RequestStateRuntimeService
 if TYPE_CHECKING:
     import torch
 
+    from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
     from tllm.ports.residual_stream import ResidualLocator
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
-    from tllm.schedule import ResidualResourceBinding, WorkloadCompilation
+    from tllm.schedule import (
+        ResidualResourceBinding,
+        WorkloadCompilation,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +298,16 @@ def reconstruct_worker_bindings(
     residual_resource_manifest_json = _residual_resource_manifest_wire(
         tuple(reconstructed)
     )
+    packed_hidden_resources: tuple["PackedHiddenResourceBinding", ...] = tuple(
+        sorted(
+            (
+                binding
+                for item in reconstructed
+                for binding in item.packed_hidden_resources
+            ),
+            key=lambda binding: binding.locator_key,
+        )
+    )
     static_binding_manifest_json = static_backend_binding_manifest_wire(
         tuple(
             (declaration.ir.workload_id, resource, spec)
@@ -340,6 +354,21 @@ def reconstruct_worker_bindings(
         expected_graph.to_json(),
         specialization_facts_json,
         residual_resource_manifest_json,
+        json.dumps(
+            [
+                {
+                    "layer": binding.layer,
+                    "layer_kind": binding.layer_kind.value,
+                    "site": binding.site.value,
+                    "module_path": binding.module_path,
+                }
+                for binding in packed_hidden_resources
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ),
         static_binding_manifest_json,
     )
     if specialization is not None:
@@ -539,6 +568,7 @@ def reconstruct_worker_bindings(
             )
         ),
         residual_paths=residual_paths,
+        packed_hidden_resources=packed_hidden_resources,
         backend_region_binders=backend_region_binders,
         parameter_overlays=parameter_overlays,
         static_binding_entries=tuple(

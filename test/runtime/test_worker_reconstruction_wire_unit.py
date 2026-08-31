@@ -103,6 +103,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
             graph if reconstructed_graph is None else reconstructed_graph,
             facts,
             "[]",
+            "[]",
             (
                 signed_static_bindings
                 if reconstructed_static_bindings is None
@@ -128,6 +129,7 @@ class WorkerReconstructionWireContractTest(unittest.TestCase):
             decision,
             1,
             graph if reconstructed_graph is None else reconstructed_graph,
+            "[]",
             "[]",
             (
                 signed_static_bindings

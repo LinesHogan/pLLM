@@ -4,6 +4,7 @@
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_batch import HiddenBatch
 from tllm.contracts.hidden_locator import (
+    HiddenLayerKind,
     HiddenLocatorCapability,
     HiddenPhase,
     HiddenSite,
@@ -14,7 +15,8 @@ from tllm.contracts.packed_rows import (
     PackedRowPlanInputs,
 )
 from tllm.contracts.packed_hidden import (
-    PackedHiddenRole,
+    PackedHiddenResourceBinding,
+    PackedHiddenSnapshot,
     PackedHiddenSnapshotBatch,
     PackedHiddenSnapshotSpecialization,
 )
@@ -32,13 +34,15 @@ __all__ = [
     "BackendCapability",
     "DeviceTensorLease",
     "HiddenBatch",
+    "HiddenLayerKind",
     "HiddenLocatorCapability",
     "HiddenPhase",
     "HiddenSite",
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedRowPlanInputs",
-    "PackedHiddenRole",
+    "PackedHiddenResourceBinding",
+    "PackedHiddenSnapshot",
     "PackedHiddenSnapshotBatch",
     "PackedHiddenSnapshotSpecialization",
     "RowBatchMeta",

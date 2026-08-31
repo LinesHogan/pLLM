@@ -711,6 +711,7 @@ def validate_worker_reconstruction_wire(
     reconstructed_graph_json: str,
     runtime_specialization_facts_json: str,
     reconstructed_residual_resource_manifest_json: str,
+    reconstructed_packed_hidden_resource_manifest_json: str,
     reconstructed_static_binding_manifest_json: str,
 ) -> None: ...
 def validate_local_execution_binding_wire(
@@ -722,6 +723,7 @@ def validate_local_execution_binding_wire(
     plan_epoch: int,
     reconstructed_graph_json: str,
     reconstructed_residual_resource_manifest_json: str,
+    reconstructed_packed_hidden_resource_manifest_json: str,
     reconstructed_static_binding_manifest_json: str,
 ) -> None: ...
 def normalize_runtime_specialization_options(

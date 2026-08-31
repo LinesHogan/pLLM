@@ -71,6 +71,7 @@ from tllm.contracts.request_identity import RequestFinishedBatch
 
 if TYPE_CHECKING:
     import torch
+    from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
     from vllm import LLM, SamplingParams
     from vllm.inputs import PromptType
     from vllm.outputs import RequestOutput
@@ -834,6 +835,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             tuple[str, "WorkloadRuntimeBinding | NoWorkloadRuntimeBinding"]
         ] = []
         residual_paths: dict["ResidualLocator", str] = {}
+        packed_hidden_resources: list["PackedHiddenResourceBinding"] = []
         for workload_instance, definition in self._native_workloads:
             resources = self._native_workload_resources.get(id(workload_instance))
             workload_id = definition.workload_id
@@ -856,6 +858,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                     "native workloads declare duplicate residual locator bindings"
                 )
             residual_paths.update(resources.residual_paths)
+            packed_hidden_resources.extend(resources.packed_hidden_resources)
         runtime_entries = (
             (name, value)
             for name, value in self._workload_compile_options.shape_specialization
@@ -883,6 +886,12 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             shape_specialization=normalized,
             residual_resource_manifest=residual_resource_manifest_from_paths(
                 residual_paths
+            ),
+            packed_hidden_resource_manifest=tuple(
+                sorted(
+                    packed_hidden_resources,
+                    key=lambda binding: binding.locator_key,
+                )
             ),
             static_binding_manifest=static_backend_binding_manifest_wire(
                 static_binding_entries
@@ -1002,6 +1011,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         sampler_bindings: list[SamplerRuntimeBinding] = []
         diagnostics_readers: dict[str, Callable[[], Mapping[str, int | float]]] = {}
         residual_paths: dict["ResidualLocator", str] = {}
+        packed_hidden_resources: list["PackedHiddenResourceBinding"] = []
         backend_region_binders: dict[str, "BackendRegionBinderSlot"] = {}
         from tllm.runtime.parameter_overlay import OverlayChannel, OverlayVersionStore
 
@@ -1094,6 +1104,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                     "native workloads declare duplicate residual locator bindings"
                 )
             residual_paths.update(resources.residual_paths)
+            packed_hidden_resources.extend(resources.packed_hidden_resources)
             binder_overlap = set(backend_region_binders).intersection(
                 resources.backend.binders
             )
@@ -1160,6 +1171,12 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 )
             ),
             residual_paths=residual_paths,
+            packed_hidden_resources=tuple(
+                sorted(
+                    packed_hidden_resources,
+                    key=lambda binding: binding.locator_key,
+                )
+            ),
             backend_region_binders=backend_region_binders,
             parameter_overlays=parameter_overlays,
             static_binding_entries=static_binding_entries,
