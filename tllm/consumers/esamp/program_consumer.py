@@ -42,6 +42,7 @@ from tllm.runtime.sampler_bridge.provider import (
 )
 from tllm.runtime.sampler_bridge.types import (
     CandidateModifierState,
+    NoSamplerSourceHidden,
     SamplerStepView,
 )
 from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -143,12 +144,17 @@ class _ProgramSamplerModifierProvider(SamplerModifierProvider):
         compiled = self._consumer.compiled
         if compiled is None:
             return None
+        match view.source_hidden:
+            case NoSamplerSourceHidden():
+                return None
+            case torch.Tensor() as source_hidden:
+                pass
         rows = int(view.decode_count)
-        if rows <= 0 or view.source_hidden.ndim != 2:
+        if rows <= 0 or source_hidden.ndim != 2:
             return None
-        if int(view.source_hidden.shape[0]) < rows:
+        if int(source_hidden.shape[0]) < rows:
             return None
-        source = view.source_hidden[:rows]
+        source = source_hidden[:rows]
         prediction = compiled.run_flow("predict", source)["prediction"]
         if prediction.ndim != 2 or int(prediction.shape[0]) != rows:
             raise WorkGraphError(

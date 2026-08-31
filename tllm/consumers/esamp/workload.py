@@ -8,7 +8,11 @@ import torch
 import torch.nn.functional as F
 
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
-from tllm.ports.sampler import SamplerHiddenReweightBatch
+from tllm.contracts.packed_rows import (
+    PackedPhaseRowBatch,
+    PackedSamplerRowBatch,
+)
+from tllm.ports.sampler import PackedSamplerGuidanceBatch
 from tllm.runtime.request_trainable_state import (
     RequestStateLossBatch,
     RequestStateSelectionBatch,
@@ -32,6 +36,10 @@ from tllm.workload import (
     declared_config_field,
     hidden,
     optimize,
+    packed_hidden,
+    packed_request_rows,
+    packed_sampler_rows,
+    packed_selection,
     read,
     result,
     sampler,
@@ -53,10 +61,10 @@ _ESAMP_PER_REQUEST_MODE = ConfigField.boolean(False)
 
 class ESampConfig(WorkloadConfig):
     source_layer_path: str = config_field(
-        default="model.model.layers[0].input_layernorm", kind=ConfigKind.STR
+        default="model.layers[0].input_layernorm", kind=ConfigKind.STR
     )
     target_layer_path: str = config_field(
-        default="model.model.layers[-1].input_layernorm", kind=ConfigKind.STR
+        default="model.layers[-1].input_layernorm", kind=ConfigKind.STR
     )
     enabled: bool = declared_config_field(_ESAMP_ENABLED)
     distiller_hidden_dim: int = config_field(
@@ -89,7 +97,11 @@ class ESampWorkload(Workload[ESampConfig]):
             optimizer=AdamWSpec.configured(_ESAMP_DISTILLER_LR),
         )
     )
-    request_distiller_selection = request_distiller.selection()
+    request_rows = packed_request_rows()
+    request_sampler_rows = packed_sampler_rows(rows=request_rows)
+    request_distiller_selection = packed_selection(
+        request_distiller.selection(), rows=request_rows
+    )
 
     def __init__(self, config: ESampConfig) -> None:
         if (
@@ -218,16 +230,16 @@ class ESampWorkload(Workload[ESampConfig]):
 
     @task(
         inputs={
-            "source": hidden(
+            "rows": request_rows,
+            "sampler_rows": request_sampler_rows,
+            "source": packed_hidden(
                 0,
-                "block_output",
-                "decode",
+                rows=request_rows,
                 path=ESampConfig.source_layer_path,
             ),
-            "target": hidden(
+            "target": packed_hidden(
                 -1,
-                "block_output",
-                "decode",
+                rows=request_rows,
                 path=ESampConfig.target_layer_path,
             ),
             "selection": request_distiller_selection,
@@ -247,11 +259,13 @@ class ESampWorkload(Workload[ESampConfig]):
     )
     def request_predict(
         self,
+        rows: PackedPhaseRowBatch,
+        sampler_rows: PackedSamplerRowBatch,
         source: torch.Tensor,
         target: torch.Tensor,
         selection: RequestStateSelectionBatch,
     ) -> tuple[
-        SamplerHiddenReweightBatch,
+        PackedSamplerGuidanceBatch,
         torch.Tensor,
         torch.Tensor,
     ]:
@@ -262,40 +276,60 @@ class ESampWorkload(Workload[ESampConfig]):
             if group.before_version > 0
         }
         affected_row_ids = tuple(
-            row_id
-            for row_id, row in enumerate(selection.rows)
-            if row.lease in active_leases
+            link.sampler_row_index
+            for link in sampler_rows.links
+            if selection.rows[link.packed_row_index].lease in active_leases
         )
         with torch.no_grad():
-            prediction = source.new_empty(
-                (len(affected_row_ids), int(source.shape[1]))
+            predictions_by_sampler_row = source.new_empty(
+                (len(sampler_rows.links), int(source.shape[1]))
             )
-            compact_position = {
-                row_id: position
-                for position, row_id in enumerate(affected_row_ids)
-            }
             for group in groups:
                 if group.before_version <= 0:
                     continue
-                destination = torch.tensor(
+                sampler_row_ids = tuple(
+                    link.sampler_row_index
+                    for link in sampler_rows.links
+                    if selection.rows[link.packed_row_index].lease
+                    == group.lease
+                )
+                if not sampler_row_ids:
+                    continue
+                packed_row_ids = torch.tensor(
                     tuple(
-                        compact_position[row_id]
-                        for row_id, row in enumerate(selection.rows)
-                        if row.lease == group.lease
+                        sampler_rows.links[row_id].packed_row_index
+                        for row_id in sampler_row_ids
                     ),
                     device=source.device,
                     dtype=torch.long,
                 )
-                prediction.index_copy_(
-                    0,
-                    destination,
-                    group.module(source.index_select(0, group.row_indices)),
+                local_row_ids = torch.searchsorted(
+                    group.canonical_row_indices, packed_row_ids
                 )
+                predictions_by_sampler_row.index_copy_(
+                    0,
+                    torch.tensor(
+                        sampler_row_ids,
+                        device=source.device,
+                        dtype=torch.long,
+                    ),
+                    group.module(
+                        source.index_select(0, group.canonical_row_indices)
+                    ).index_select(0, local_row_ids),
+                )
+            prediction = predictions_by_sampler_row.index_select(
+                0,
+                torch.tensor(
+                    affected_row_ids,
+                    device=source.device,
+                    dtype=torch.long,
+                ),
+            )
         return (
-            SamplerHiddenReweightBatch(
-                prediction,
-                affected_row_ids,
-                len(selection.rows),
+            PackedSamplerGuidanceBatch(
+                sampler_rows=sampler_rows,
+                pred_hidden=prediction,
+                affected_row_ids=affected_row_ids,
             ),
             source,
             target,
@@ -303,6 +337,7 @@ class ESampWorkload(Workload[ESampConfig]):
 
     @task(
         inputs={
+            "rows": request_rows,
             "source": result("request_predict", "training_source"),
             "target": result("request_predict", "training_target"),
             "selection": request_distiller_selection,
@@ -314,14 +349,18 @@ class ESampWorkload(Workload[ESampConfig]):
     )
     def request_loss(
         self,
+        rows: PackedPhaseRowBatch,
         source: torch.Tensor,
         target: torch.Tensor,
         selection: RequestStateSelectionBatch,
     ) -> RequestStateLossBatch:
+        del rows
         losses = tuple(
             F.mse_loss(
-                group.module(source.index_select(0, group.row_indices)).float(),
-                target.index_select(0, group.row_indices).float(),
+                group.module(
+                    source.index_select(0, group.canonical_row_indices)
+                ).float(),
+                target.index_select(0, group.canonical_row_indices).float(),
             )
             for group in self.request_distiller.groups(selection)
         )
@@ -329,6 +368,7 @@ class ESampWorkload(Workload[ESampConfig]):
 
     @task(
         inputs={
+            "rows": request_rows,
             "loss_batch": result("request_loss", "loss_batch"),
             "selection": request_distiller_selection,
         },
@@ -338,9 +378,11 @@ class ESampWorkload(Workload[ESampConfig]):
     )
     def request_train(
         self,
+        rows: PackedPhaseRowBatch,
         loss_batch: RequestStateLossBatch,
         selection: RequestStateSelectionBatch,
     ) -> None:
+        del rows
         if loss_batch.selection is not selection:
             raise RuntimeError("request loss batch selection differs from transition")
         self.optimize_request_state(ESampWorkload.request_distiller, loss_batch)

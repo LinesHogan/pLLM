@@ -11,7 +11,9 @@ from tllm.ports.prompt_context import PromptContext, PromptContextLocator
 from tllm.ports.reward_outcome import RewardOutcome, RewardOutcomeLocator
 from tllm.ports.retry_control import RetryControl, RetryControlLocator
 from tllm.ports.sampler import (
+    PackedSamplerGuidanceBatch,
     Sampler,
+    SamplerPhase,
     SamplerHiddenReweightBatch,
     SamplerLocator,
 )
@@ -46,7 +48,9 @@ __all__ = [
     "RewardOutcomeLocator",
     "RetryControl",
     "RetryControlLocator",
+    "PackedSamplerGuidanceBatch",
     "Sampler",
+    "SamplerPhase",
     "SamplerHiddenReweightBatch",
     "SamplerLocator",
     "TokenTarget",

@@ -7,10 +7,14 @@ from typing import cast
 
 from tllm.ports.sampler import (
     CandidateModifierState,
+    PackedSamplerGuidanceBatch,
     SamplerBackend,
     SamplerHiddenReweightBatch,
 )
-from tllm.runtime.sampler_bridge.types import SamplerStepView
+from tllm.runtime.sampler_bridge.types import (
+    NoSamplerSourceHidden,
+    SamplerStepView,
+)
 from tllm.runtime.vllm_patch.lm_head import resolve_lm_head
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
 from tllm.runtime.sampler_bridge.provider import SamplerInterventionStage
@@ -76,10 +80,17 @@ class DeclaredSamplerOutput:
         match self._policy.kind:
             case SamplerOutputKind.HIDDEN_REWEIGHT:
                 match record.value:
-                    case SamplerHiddenReweightBatch(
-                        pred_hidden=pred_hidden,
-                        affected_row_ids=affected_row_ids,
-                        total_rows=total_rows,
+                    case (
+                        PackedSamplerGuidanceBatch(
+                            pred_hidden=pred_hidden,
+                            affected_row_ids=affected_row_ids,
+                            total_rows=total_rows,
+                        )
+                        | SamplerHiddenReweightBatch(
+                            pred_hidden=pred_hidden,
+                            affected_row_ids=affected_row_ids,
+                            total_rows=total_rows,
+                        )
                     ):
                         if (
                             pred_hidden.ndim != 2
@@ -140,6 +151,13 @@ class DeclaredSamplerOutput:
                     pred_hidden_row_map=row_map,
                 )
             case SamplerOutputKind.ADD_LOGITS:
+                match view.source_hidden:
+                    case NoSamplerSourceHidden():
+                        raise RuntimeError(
+                            "add-logits sampler output requires source hidden rows"
+                        )
+                    case torch.Tensor() as source_hidden:
+                        pass
                 match record.value:
                     case torch.Tensor() as logit_delta:
                         if (
@@ -150,7 +168,10 @@ class DeclaredSamplerOutput:
                             raise RuntimeError(
                                 f"sampler output {self._policy.name!r} does not match the active step"
                             )
-                    case SamplerHiddenReweightBatch():
+                    case (
+                        PackedSamplerGuidanceBatch()
+                        | SamplerHiddenReweightBatch()
+                    ):
                         raise RuntimeError(
                             f"sampler output {self._policy.name!r} requires a dense logit delta"
                         )
@@ -161,7 +182,7 @@ class DeclaredSamplerOutput:
                     beta=1.0,
                     backend="pre_filter_dense",
                     affected_row_ids=affected,
-                    pred_hidden=view.source_hidden.detach(),
+                    pred_hidden=source_hidden.detach(),
                     lm_head_weight=torch.empty(
                         (0, 0), device=view.device, dtype=view.logits.dtype
                     ),

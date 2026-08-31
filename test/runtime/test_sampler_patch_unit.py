@@ -40,6 +40,7 @@ class SamplerPatchUnitTest(unittest.TestCase):
     def test_wrapped_sampler_sample_uses_bridge_when_provider_is_active(self) -> None:
         sampler = _FakeSampler()
         runtime = SimpleNamespace(
+            workload_execution=None,
             consumer=SimpleNamespace(
                 sampler_modifier_provider=lambda: SimpleNamespace(is_active=lambda: True)
             ),

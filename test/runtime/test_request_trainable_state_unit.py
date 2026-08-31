@@ -69,8 +69,8 @@ def _losses(
 ) -> tuple[torch.Tensor, ...]:
     return tuple(
         torch.nn.functional.mse_loss(
-            group.module(source.index_select(0, group.row_indices)),
-            target.index_select(0, group.row_indices),
+            group.module(source.index_select(0, group.canonical_row_indices)),
+            target.index_select(0, group.canonical_row_indices),
         )
         for group in store.groups(selection)
     )
@@ -588,8 +588,8 @@ def test_runtime_service_reuses_duplicate_rows_and_retains_failed_audit_receipts
     target = torch.zeros_like(source)
     losses = tuple(
         torch.nn.functional.mse_loss(
-            group.module(source.index_select(0, group.row_indices)),
-            target.index_select(0, group.row_indices),
+            group.module(source.index_select(0, group.canonical_row_indices)),
+            target.index_select(0, group.canonical_row_indices),
         )
         for group in service.groups(selection)
     )

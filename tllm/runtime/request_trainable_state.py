@@ -198,7 +198,7 @@ class RequestStateVersion:
 @dataclass(frozen=True, slots=True)
 class RequestStateModuleGroup(Generic[ModuleT]):
     lease: RequestStateLease
-    row_indices: torch.Tensor
+    canonical_row_indices: torch.Tensor
     before_version: int
     module: ModuleT
 
@@ -802,7 +802,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 groups.append(
                     RequestStateModuleGroup(
                         lease=lease,
-                        row_indices=torch.tensor(
+                        canonical_row_indices=torch.tensor(
                             positions,
                             dtype=torch.long,
                             device=selection.device_slot_ids.device,

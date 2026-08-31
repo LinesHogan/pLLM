@@ -915,6 +915,12 @@ class _NoRegionValueStore:
         _ = batch
         raise RuntimeError("native execution has no signed packed-sampler-row input")
 
+    def packed_sampler_rows_for_step(
+        self, step_id: int
+    ) -> PackedSamplerRowBatch:
+        _ = step_id
+        raise RuntimeError("native execution has no signed packed-sampler-row input")
+
     def retire_request_states(
         self, batch: RequestFinishedBatch
     ) -> tuple[StateEffectReceipt, ...]:
@@ -1715,6 +1721,18 @@ class NativeWorkloadExecution:
                 batch.step_id, batch
             )
 
+    def packed_sampler_rows_for_step(
+        self, step_id: int
+    ) -> PackedSamplerRowBatch:
+        """Return explicit sampler links retained for the prepared step."""
+
+        with self._execution_lock:
+            if self._prepared_step != step_id:
+                raise RuntimeError(
+                    "packed sampler rows require the prepared native step"
+                )
+            return self._value_store.packed_sampler_rows_for_step(step_id)
+
     def packed_rows_for_step(self, step_id: int) -> PackedPhaseRowBatch:
         """Return the canonical packed rows retained for one active step."""
 
@@ -2408,6 +2426,19 @@ class _RegionValueStore:
                 case PackedSamplerRowBatch():
                     raise RuntimeError(
                         "packed sampler rows are already staged"
+                    )
+
+    def packed_sampler_rows_for_step(
+        self, step_id: int
+    ) -> PackedSamplerRowBatch:
+        frame = self._frame(step_id)
+        with frame.lock:
+            match frame.packed_sampler_rows:
+                case PackedSamplerRowBatch() as sampler_rows:
+                    return sampler_rows
+                case _NoPackedSamplerRows():
+                    raise RuntimeError(
+                        "packed sampler rows were not staged for this step"
                     )
 
     def retire_request_states(

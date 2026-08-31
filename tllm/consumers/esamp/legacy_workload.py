@@ -88,10 +88,16 @@ def build_esamp_workload(config: ESampConsumerConfig | None = None) -> object:
                 "implementation='native' does not support legacy-only "
                 f"option(s): {', '.join(unsupported)}"
             )
+        source_layer_path = str(resolved.source_layer_path)
+        target_layer_path = str(resolved.target_layer_path)
+        if source_layer_path == "model.model.layers[0].input_layernorm":
+            source_layer_path = "model.layers[0].input_layernorm"
+        if target_layer_path == "model.model.layers[-1].input_layernorm":
+            target_layer_path = "model.layers[-1].input_layernorm"
         return ESampWorkload(
             ESampConfig(
-                source_layer_path=str(resolved.source_layer_path),
-                target_layer_path=str(resolved.target_layer_path),
+                source_layer_path=source_layer_path,
+                target_layer_path=target_layer_path,
                 enabled=bool(resolved.enable_esamp_training),
                 distiller_hidden_dim=int(resolved.distiller_hidden_dim),
                 distiller_lr=float(resolved.distiller_lr),

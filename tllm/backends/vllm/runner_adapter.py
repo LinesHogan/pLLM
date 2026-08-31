@@ -273,6 +273,15 @@ def mrv2_packed_row_plan_inputs(
     )
 
 
+def is_v027_warmup_packed_rows(columns: PackedRowPlanInputs) -> bool:
+    """Recognize vLLM 0.27's explicit kernel-warmup request namespace."""
+
+    return bool(columns.request_ids) and all(
+        request_id.startswith("_warmup_") and request_id.endswith("_")
+        for request_id in columns.request_ids
+    )
+
+
 def _packed_sampler_row_batch(
     *,
     row_batch: PackedPhaseRowBatch,
@@ -382,6 +391,7 @@ __all__ = [
     "mrv1_active_request_ids",
     "mrv2_active_request_ids",
     "mrv2_packed_row_plan_inputs",
+    "is_v027_warmup_packed_rows",
     "mrv2_packed_sampler_row_batch",
     "runner_active_request_count",
     "runner_device",

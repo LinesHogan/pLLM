@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 
 from tllm.ports.sampler import (
+    PackedSamplerGuidanceBatch,
+    SamplerPhase,
     SamplerHiddenReweightBatch,
     SamplerOutputValue,
 )
@@ -18,7 +20,7 @@ class StepRowIdentity:
     request_ids: tuple[str, ...]
     prompt_idxs: tuple[int, ...]
     sample_idxs: tuple[int, ...]
-    phase: str
+    phase: SamplerPhase
     engine_step_id: int
 
     @property
@@ -40,6 +42,21 @@ class MissingSinkRecord:
 SinkLookup = SinkRecord | MissingSinkRecord
 
 
+def _decode_step_identity(active_rows: int, step_id: int) -> StepRowIdentity:
+    from tllm.runtime import residual_runtime
+
+    request_ids, prompt_idxs, sample_idxs = active_request_prompt_sample_metadata(
+        residual_runtime.RUNTIME, active_rows
+    )
+    return StepRowIdentity(
+        request_ids=tuple(request_ids),
+        prompt_idxs=tuple(prompt_idxs),
+        sample_idxs=tuple(sample_idxs),
+        phase="decode",
+        engine_step_id=step_id,
+    )
+
+
 class SinkStore:
     """Keep one runtime-validated publication per signed sink."""
 
@@ -49,9 +66,35 @@ class SinkStore:
     def publish(
         self, sink: str, value: SamplerOutputValue, step_id: int
     ) -> None:
-        from tllm.runtime import residual_runtime
-
         match value:
+            case PackedSamplerGuidanceBatch(
+                sampler_rows=sampler_rows,
+                pred_hidden=pred_hidden,
+                affected_row_ids=affected_row_ids,
+            ):
+                if sampler_rows.step_id != step_id:
+                    raise ValueError(
+                        f"sink {sink!r} packed sampler rows belong to another step"
+                    )
+                stored_value = PackedSamplerGuidanceBatch(
+                    sampler_rows,
+                    pred_hidden.detach().clone(),
+                    affected_row_ids,
+                )
+                linked_identities = sampler_rows.identities
+                identity = StepRowIdentity(
+                    request_ids=tuple(
+                        identity.request_id for identity in linked_identities
+                    ),
+                    prompt_idxs=tuple(
+                        identity.prompt_idx for identity in linked_identities
+                    ),
+                    sample_idxs=tuple(
+                        identity.sample_idx for identity in linked_identities
+                    ),
+                    phase="packed",
+                    engine_step_id=step_id,
+                )
             case SamplerHiddenReweightBatch(
                 pred_hidden=pred_hidden,
                 affected_row_ids=affected_row_ids,
@@ -85,26 +128,19 @@ class SinkStore:
                     affected_row_ids,
                     total_rows,
                 )
-                active_rows = total_rows
+                identity = _decode_step_identity(total_rows, step_id)
             case torch.Tensor() as tensor:
                 if tensor.ndim != 2:
                     raise ValueError(
                         f"sink {sink!r} requires a matrix payload"
                     )
                 stored_value = tensor.detach().clone()
-                active_rows = int(tensor.shape[0])
-        request_ids, prompt_idxs, sample_idxs = active_request_prompt_sample_metadata(
-            residual_runtime.RUNTIME, active_rows
-        )
+                identity = _decode_step_identity(
+                    int(tensor.shape[0]), step_id
+                )
         self._records[sink] = SinkRecord(
             value=stored_value,
-            identity=StepRowIdentity(
-                request_ids=tuple(request_ids),
-                prompt_idxs=tuple(prompt_idxs),
-                sample_idxs=tuple(sample_idxs),
-                phase="decode",
-                engine_step_id=step_id,
-            ),
+            identity=identity,
         )
 
     def lookup(self, sink: str, step_id: int) -> SinkLookup:
@@ -119,6 +155,10 @@ class SinkStore:
             case None:
                 return 0
             case SinkRecord(
+                value=PackedSamplerGuidanceBatch(
+                    affected_row_ids=affected_row_ids
+                )
+            ) | SinkRecord(
                 value=SamplerHiddenReweightBatch(
                     affected_row_ids=affected_row_ids
                 )

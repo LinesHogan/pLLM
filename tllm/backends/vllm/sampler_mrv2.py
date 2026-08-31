@@ -38,6 +38,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from tllm.backends.protocol import runner_model_module
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 from tllm.runtime.sampler_bridge.provider import validate_prepared_intervention
 from tllm.runtime.vllm_patch.sampler_patch import (
@@ -56,6 +57,19 @@ _INTERVENTION_CANDIDATE_CAP = int(os.getenv("TLLM_MRV2_INTERVENTION_CANDIDATE_CA
 
 
 def _build_mrv2_step_view(*, runtime: Any, runner: Any, logits: torch.Tensor) -> SamplerStepView | None:
+    from tllm.runtime.sampler_bridge.runtime_view import (
+        build_packed_sampler_step_view,
+    )
+
+    execution = runtime.workload_execution
+    if execution is not None and execution.requires_packed_sampler_rows:
+        return build_packed_sampler_step_view(
+            runtime=runtime,
+            runner=runner,
+            model=runner_model_module(runner),
+            logits=logits,
+            sampling_metadata=None,
+        )
     decode_count = int(getattr(runtime, "decode_count", 0) or 0)
     if logits.ndim != 2 or decode_count <= 0 or int(logits.shape[0]) < decode_count:
         return None

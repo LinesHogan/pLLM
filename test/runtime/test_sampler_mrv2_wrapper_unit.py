@@ -27,6 +27,7 @@ from tllm.runtime.sampler_bridge.types import CandidateModifierState
 
 
 def _runtime(**kwargs: Any) -> Any:
+    kwargs.setdefault("workload_execution", None)
     kwargs.setdefault("decode_count", 2)
     kwargs.setdefault("source_resolved_path", "layers.0")
     kwargs.setdefault("tap_decode_hidden", {"layers.0": torch.ones((2, 4))})

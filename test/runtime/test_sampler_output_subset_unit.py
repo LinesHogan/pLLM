@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from unittest import mock
 
 import pytest
 import torch
 
 from tllm.kit.sampler_output import DeclaredSamplerOutput
-from tllm.ports.sampler import SamplerHiddenReweightBatch
+from tllm.ports.sampler import (
+    PackedSamplerGuidanceBatch,
+    SamplerHiddenReweightBatch,
+)
+from tllm.contracts.packed_rows import (
+    PackedSamplerRowBatch,
+    PackedSamplerRowLink,
+    PackedRowPlanInputs,
+)
 from tllm.runtime import residual_runtime
+from tllm.runtime.packed_phase_row_staging import PackedPhaseRowStaging
 from tllm.runtime.sampler_bridge.context import SamplerStepContext
 from tllm.runtime.sampler_bridge.exact_backend import build_modified_logits_exact
+from tllm.runtime.sampler_bridge.runtime_view import (
+    build_packed_sampler_step_view,
+)
 from tllm.runtime.sampler_bridge.types import SamplerStepView
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_sinks import SinkRecord, SinkStore
@@ -33,16 +46,44 @@ class _SamplerConfig(WorkloadConfig):
 
 @dataclass(frozen=True, slots=True)
 class _SamplingMetadata:
-    pass
+    all_greedy: bool = True
+    all_random: bool = False
+    top_k: torch.Tensor | None = None
+    top_p: torch.Tensor | None = None
+    min_p: torch.Tensor | None = None
+    generators: Mapping[int, torch.Generator] = field(
+        default_factory=dict[int, torch.Generator]
+    )
 
 
-class _Model:
+class _Model(torch.nn.Module):
     def __init__(self) -> None:
+        super().__init__()
         self.lm_head = torch.nn.Linear(3, 5, bias=False)
 
 
+@dataclass(frozen=True, slots=True)
 class _Runner:
-    pass
+    model: torch.nn.Module
+
+
+@dataclass(frozen=True, slots=True)
+class _PackedSamplerExecution:
+    batch: PackedSamplerRowBatch
+    requires_packed_sampler_rows: bool = True
+
+    def packed_sampler_rows_for_step(
+        self, step_id: int
+    ) -> PackedSamplerRowBatch:
+        if step_id != self.batch.step_id:
+            raise RuntimeError("packed sampler test step differs")
+        return self.batch
+
+
+@dataclass(frozen=True, slots=True)
+class _PackedSamplerRuntime:
+    workload_execution: _PackedSamplerExecution
+    event_step_id: int
 
 
 def _runtime_state() -> ResidualRuntimeState:
@@ -68,7 +109,7 @@ def _view(step_id: int, model: _Model) -> SamplerStepView:
         source_hidden=torch.zeros((4, 3)),
         device=torch.device("cpu"),
         model=model,
-        runner=_Runner(),
+        runner=_Runner(model),
     )
 
 
@@ -156,6 +197,63 @@ def test_empty_hidden_subset_does_not_resolve_a_model_head() -> None:
         assert provider.prepare_step(_view(8, _Model())) is None
     resolve.assert_not_called()
     assert store.latest_rows("guidance") == 0
+
+
+def test_packed_guidance_uses_explicit_sampler_links_and_canonical_identity() -> None:
+    rows = PackedPhaseRowStaging().stage(
+        3,
+        7,
+        PackedRowPlanInputs(
+            request_ids=("0_parent", "1_parent"),
+            scheduled_tokens=(1, 1),
+            prompt_tokens=(1, 1),
+            computed_tokens=(0, 0),
+        ),
+        prompt_indices={"parent": 11},
+        sample_indices={},
+    )
+    sampler_rows = PackedSamplerRowBatch(
+        rows,
+        (
+            PackedSamplerRowLink(0, 1),
+            PackedSamplerRowLink(1, 0),
+        ),
+    )
+    runtime = _PackedSamplerRuntime(
+        _PackedSamplerExecution(sampler_rows),
+        event_step_id=7,
+    )
+    model = _Model()
+    view = build_packed_sampler_step_view(
+        runtime=runtime,
+        runner=_Runner(model),
+        model=model,
+        logits=torch.zeros((3, 5)),
+        sampling_metadata=_SamplingMetadata(),
+    )
+    assert view is not None
+    assert view.sample_idxs == (1, 0)
+
+    pred_hidden = torch.tensor(((0.4, 0.5, 0.6),))
+    store = SinkStore()
+    store.publish(
+        "guidance",
+        PackedSamplerGuidanceBatch(sampler_rows, pred_hidden, (1,)),
+        7,
+    )
+    provider = DeclaredSamplerOutput(
+        sampler.hidden_reweight(beta=_BETA),
+        _SamplerConfig(),
+        store,
+        SamplerStepContext(),
+    )
+    state = provider.prepare_step(view)
+    assert state is not None
+    torch.testing.assert_close(state.pred_hidden, pred_hidden)
+    torch.testing.assert_close(
+        state.affected_row_ids,
+        torch.tensor((1,), dtype=torch.long),
+    )
 
 
 @pytest.mark.parametrize(

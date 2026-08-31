@@ -7,8 +7,9 @@ One invocation covers one of the four required topology cells:
 
 The workload is intentionally small but not synthetic: two public parent
 requests use ``SamplingParams(n=2)`` so vLLM creates parallel child samples.
-Each child emits three tokens: the initial sampled token can come from
-prefill, leaving exactly two decode updates. After the public call returns,
+Each child emits three tokens. Native packed rows train once on prefill and
+twice on decode, while all parallel children share their parent slot. After
+the public call returns,
 the closed worker-status DTO proves both live slots and request-id mappings
 were retired while retaining a bounded immutable retirement receipt.
 
@@ -43,6 +44,7 @@ _PARENTS = 2
 _PARALLEL_SAMPLES = 2
 _GENERATED_TOKENS = 3
 _DECODE_UPDATES = 2
+_TOTAL_UPDATES = 1 + _DECODE_UPDATES
 _REQUEST_STATE_RESOURCE = "request_distiller"
 
 
@@ -180,9 +182,9 @@ def _typed_retirement_audit(
                 "worker request-state retirement violates the native parent-key "
                 f"contract: {entry!r}"
             )
-        if entry.after_version != _DECODE_UPDATES:
+        if entry.after_version != _TOTAL_UPDATES:
             raise AssertionError(
-                "each parent slot must retire at exactly its final decode version: "
+                "each parent slot must retire at its packed prefill/decode version: "
                 f"{entry!r}"
             )
     return tuple(
@@ -206,7 +208,7 @@ def _assert_post_finish_statuses(
     if not statuses:
         raise AssertionError(f"post-cleanup workload status is empty: {statuses!r}")
     canonical: tuple["WorkerRequestStateRetirementStatus", ...] | None = None
-    expected_loss_updates = _PARENTS * _DECODE_UPDATES
+    expected_loss_updates = _PARENTS * _TOTAL_UPDATES
     for status in statuses:
         if status["signature"] != signature or status["plan_epoch"] != plan_epoch:
             raise AssertionError(f"worker changed signed plan identity: {status!r}")
@@ -365,7 +367,7 @@ def main() -> int:
             artifacts=artifacts,
         )
         training = core.read_and_reset_esamp_stats(sync=True)
-        if training.loss_count != _PARENTS * _DECODE_UPDATES:
+        if training.loss_count != _PARENTS * _TOTAL_UPDATES:
             raise AssertionError(
                 "parent did not report all request-state losses: "
                 f"{training!r}"
@@ -373,7 +375,7 @@ def main() -> int:
         timing = core.read_and_reset_distiller_timing_stats(sync=True)
         intervention_count = int(timing.intervention_state_count)
         expected_interventions = (
-            _DECODE_UPDATES - 1 if args.intervention else 0
+            _TOTAL_UPDATES - 1 if args.intervention else 0
         )
         if intervention_count != expected_interventions:
             raise AssertionError(
@@ -415,11 +417,12 @@ def main() -> int:
                     "parallel_samples": _PARALLEL_SAMPLES,
                     "generated_tokens": _GENERATED_TOKENS,
                     "decode_updates": _DECODE_UPDATES,
+                    "total_updates_per_parent": _TOTAL_UPDATES,
                     "intervention": bool(args.intervention),
                     "intervention_state_count": intervention_count,
                     "loss_count": training.loss_count,
                     "output_token_ids": output_token_ids,
-                    "update_count": _PARENTS * _DECODE_UPDATES,
+                    "update_count": _PARENTS * _TOTAL_UPDATES,
                     "request_state_retirements": _retirement_json(retirement_audit),
                     "execute_count": physical_stats.execute_count,
                     "eager_count": physical_stats.eager_count,

@@ -242,6 +242,13 @@ def _wrapped_prepare_inputs(
         num_scheduled_tokens=num_scheduled_tokens,
         input_batch=None,
     )
+    packed_execution = runtime.workload_execution
+    if (
+        packed_execution is not None
+        and packed_execution.requires_packed_rows
+        and _runner_adapter.is_v027_warmup_packed_rows(batch_columns)
+    ):
+        return orig(runner, scheduler_output, num_scheduled_tokens)
     if (
         overlay_controller is not None
         and overlay_controller.requires_dense_step()
@@ -272,7 +279,6 @@ def _wrapped_prepare_inputs(
         prompt_indices=runtime.reqid_to_promptidx,
         sample_indices=runtime.reqid_to_sampleidx,
     )
-    packed_execution = runtime.workload_execution
     if (
         packed_rows is not None
         and packed_execution is not None

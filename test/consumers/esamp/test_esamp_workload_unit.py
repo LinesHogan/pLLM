@@ -9,7 +9,14 @@ import torch
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
-from tllm.ports.sampler import SamplerHiddenReweightBatch
+from tllm.contracts.hidden_locator import HiddenPhase, HiddenLocatorCapability
+from tllm.contracts.packed_rows import (
+    PackedPhaseRow,
+    PackedPhaseRowBatch,
+    PackedSamplerRowBatch,
+    PackedSamplerRowLink,
+)
+from tllm.ports.sampler import PackedSamplerGuidanceBatch
 from tllm.consumers.esamp.initializers.svd import (
     SVDModelBankInitializerConfig,
 )
@@ -18,7 +25,7 @@ from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
-from tllm.contracts.hidden_locator import HiddenLocatorCapability
+from tllm.contracts.backend_capability import BackendCapability
 from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
 from tllm.contracts.request_identity import (
     RequestFinishedBatch,
@@ -40,7 +47,6 @@ from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_plugins import reconstruct_worker_bindings
 from tllm.runtime.workload_bindings import (
     LocalRuntimeServices,
-    NoSamplerBinding,
     SamplerRuntimeBinding,
     WorkerRuntimeBinding,
 )
@@ -121,6 +127,13 @@ def _capabilities() -> BackendCapabilities:
         tuple_sampler_return=False,
         split_execute_and_sample=True,
         graph_safety=GraphSafety.EAGER_ONLY,
+        eager_extensions=frozenset(
+            {
+                BackendCapability.PACKED_PHASE_ROWS,
+                BackendCapability.PACKED_SAMPLER_ROWS,
+                BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT,
+            }
+        ),
         hidden_locators=frozenset({HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}),
     )
 
@@ -162,6 +175,45 @@ def _request_workload(
     return workload
 
 
+def _request_rows(
+    *,
+    step_id: int,
+    identities: tuple[RequestIdentity, ...],
+) -> PackedPhaseRowBatch:
+    return PackedPhaseRowBatch(
+        plan_epoch=1,
+        step_id=step_id,
+        total_rows=len(identities),
+        rows=tuple(
+            PackedPhaseRow(
+                packed_row_index=row_index,
+                request_ordinal=row_index,
+                raw_request_id=identity.request_id,
+                token_offset=0,
+                phase=HiddenPhase.DECODE,
+                identity=identity,
+                decode_plan_ordinal=row_index,
+            )
+            for row_index, identity in enumerate(identities)
+        ),
+    )
+
+
+def _sampler_rows(
+    rows: PackedPhaseRowBatch,
+) -> PackedSamplerRowBatch:
+    return PackedSamplerRowBatch(
+        row_batch=rows,
+        links=tuple(
+            PackedSamplerRowLink(
+                sampler_row_index=row_index,
+                packed_row_index=row_index,
+            )
+            for row_index in range(rows.total_rows)
+        ),
+    )
+
+
 def _run_request_step(
     workload: ESampWorkload,
     service: RequestStateRuntimeService[LowRankGatedResidualModel],
@@ -171,31 +223,33 @@ def _run_request_step(
     source: torch.Tensor,
     target: torch.Tensor,
 ) -> tuple[
-    SamplerHiddenReweightBatch,
+    PackedSamplerGuidanceBatch,
     tuple[torch.Tensor, ...],
     RequestStateSelectionBatch,
 ]:
     service.stage_identities(step_id, RequestIdentityBatch(identities))
     selection = service.selection_for_step(step_id)
+    rows = _request_rows(step_id=step_id, identities=identities)
+    sampler_rows = _sampler_rows(rows)
 
     prediction_read = service.before(
         StateEffectOperation.READ, selection, step_id
     )
     guidance, training_source, training_target = workload.request_predict(
-        source, target, selection
+        rows, sampler_rows, source, target, selection
     )
     service.after(prediction_read)
 
     loss_read = service.before(StateEffectOperation.READ, selection, step_id)
     loss_batch = workload.request_loss(
-        training_source, training_target, selection
+        rows, training_source, training_target, selection
     )
     service.after(loss_read)
 
     transition = service.before(
         StateEffectOperation.TRANSITION, selection, step_id
     )
-    workload.request_train(loss_batch, selection)
+    workload.request_train(rows, loss_batch, selection)
     service.after(transition)
     service.finish_step(step_id)
     return guidance, loss_batch.losses, selection
@@ -312,8 +366,15 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         read_audit = service.before(
             StateEffectOperation.READ, inspection, 4
         )
+        inspection_rows = _request_rows(
+            step_id=4, identities=(identities[0],)
+        )
         next_guidance, _, _ = workload.request_predict(
-            source[:1], target[:1], inspection
+            inspection_rows,
+            _sampler_rows(inspection_rows),
+            source[:1],
+            target[:1],
+            inspection,
         )
         service.after(read_audit)
         self.assertEqual(inspection.before_versions, (1,))
@@ -430,8 +491,13 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.stage_identities(8, RequestIdentityBatch((parent_b,)))
         b_selection = service.selection_for_step(8)
         b_read = service.before(StateEffectOperation.READ, b_selection, 8)
+        b_rows = _request_rows(step_id=8, identities=(parent_b,))
         b_guidance, _, _ = workload.request_predict(
-            source[1:2], target[1:2], b_selection
+            b_rows,
+            _sampler_rows(b_rows),
+            source[1:2],
+            target[1:2],
+            b_selection,
         )
         service.after(b_read)
         self.assertEqual(b_guidance.affected_row_ids, (0,))
@@ -449,7 +515,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.retire_requests(RequestFinishedBatch(identities))
         self.assertEqual(service.versions(), ())
 
-    def test_request_guidance_skips_v0_and_keeps_full_step_identity(self) -> None:
+    def test_request_guidance_maps_sampler_links_while_training_all_packed_rows(self) -> None:
         workload = _request_workload(
             intervention=True,
             distiller_beta=0.5,
@@ -471,31 +537,6 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         self.assertEqual(first_selection.before_versions, (0,))
         self.assertEqual(first_guidance.affected_row_ids, ())
 
-        first_runtime = _decode_state(1)
-        first_runtime.decode_request_ids = ["0_parent-a"]
-        first_runtime.decode_prompt_idxs = [41]
-        first_runtime.decode_sample_idxs = [0]
-        match workload.native_workload_resources().sampler:
-            case SamplerRuntimeBinding() as sampler_binding:
-                pass
-            case NoSamplerBinding():
-                self.fail("request intervention omitted its sampler binding")
-        with mock.patch.object(residual_runtime, "RUNTIME", first_runtime):
-            workload.native_workload_resources().ports.outputs[
-                "guidance"
-            ].publish(first_guidance, 20)
-        self.assertIsNone(
-            sampler_binding.provider.prepare_step(
-                _view(
-                    20,
-                    1,
-                    request_ids=("0_parent-a",),
-                    prompt_idxs=(41,),
-                    sample_idxs=(0,),
-                )
-            )
-        )
-
         source = torch.tensor(
             [
                 [0.1, 0.2, -0.3, 0.4],
@@ -507,59 +548,77 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.stage_identities(21, RequestIdentityBatch(identities))
         selection = service.selection_for_step(21)
         self.assertEqual(selection.before_versions, (1, 0))
+        rows = PackedPhaseRowBatch(
+            plan_epoch=1,
+            step_id=21,
+            total_rows=2,
+            rows=(
+                PackedPhaseRow(
+                    packed_row_index=0,
+                    request_ordinal=0,
+                    raw_request_id="parent-a",
+                    token_offset=0,
+                    phase=HiddenPhase.PREFILL,
+                    identity=parent_a,
+                    decode_plan_ordinal=None,
+                ),
+                PackedPhaseRow(
+                    packed_row_index=1,
+                    request_ordinal=1,
+                    raw_request_id="parent-b",
+                    token_offset=0,
+                    phase=HiddenPhase.DECODE,
+                    identity=parent_b,
+                    decode_plan_ordinal=0,
+                ),
+            ),
+        )
+        sampler_rows = PackedSamplerRowBatch(
+            row_batch=rows,
+            links=(
+                PackedSamplerRowLink(0, 0),
+                PackedSamplerRowLink(1, 0),
+                PackedSamplerRowLink(2, 1),
+            ),
+        )
         read_audit = service.before(
             StateEffectOperation.READ, selection, 21
         )
-        guidance, _training_source, _training_target = (
-            workload.request_predict(source, -source, selection)
+        guidance, training_source, training_target = (
+            workload.request_predict(
+                rows,
+                sampler_rows,
+                source,
+                -source,
+                selection,
+            )
         )
         service.after(read_audit)
-        self.assertEqual(guidance.affected_row_ids, (0,))
-        self.assertEqual(guidance.total_rows, 2)
+        self.assertEqual(guidance.affected_row_ids, (0, 1))
+        self.assertEqual(guidance.total_rows, 3)
         expected = service.groups(selection)[0].module(source[:1])
-        torch.testing.assert_close(guidance.pred_hidden, expected)
-
-        runtime_state = _decode_state(2)
-        runtime_state.decode_request_ids = ["0_parent-a", "0_parent-b"]
-        runtime_state.decode_prompt_idxs = [41, 92]
-        runtime_state.decode_sample_idxs = [0, 0]
-        with mock.patch.object(residual_runtime, "RUNTIME", runtime_state):
-            workload.native_workload_resources().ports.outputs[
-                "guidance"
-            ].publish(guidance, 21)
-        state = sampler_binding.provider.prepare_step(
-            _view(
-                21,
-                2,
-                request_ids=("0_parent-a", "0_parent-b"),
-                prompt_idxs=(41, 92),
-                sample_idxs=(0, 0),
-            )
+        torch.testing.assert_close(
+            guidance.pred_hidden,
+            torch.cat((expected, expected), dim=0),
         )
-        self.assertIsNotNone(state)
-        assert state is not None
-        self.assertEqual(state.affected_row_ids.tolist(), [0])
-        torch.testing.assert_close(state.pred_hidden, expected)
-        self.assertIsNotNone(state.pred_hidden_row_map)
-        assert state.pred_hidden_row_map is not None
-        self.assertEqual(state.pred_hidden_row_map.tolist(), [0, -1])
-        self.assertEqual(state.beta, 0.5)
+        loss_read = service.before(StateEffectOperation.READ, selection, 21)
+        loss_batch = workload.request_loss(
+            rows, training_source, training_target, selection
+        )
+        service.after(loss_read)
+        self.assertEqual(len(loss_batch.losses), 2)
+        transition = service.before(
+            StateEffectOperation.TRANSITION, selection, 21
+        )
+        workload.request_train(rows, loss_batch, selection)
+        service.after(transition)
         self.assertEqual(
-            workload.native_workload_resources().services.diagnostics()[
-                "guidance_rows"
-            ],
-            1,
+            {
+                version.key.request_id: version.version
+                for version in service.versions()
+            },
+            {"parent-a": 2, "parent-b": 1},
         )
-        with self.assertRaisesRegex(RuntimeError, "active step"):
-            sampler_binding.provider.prepare_step(
-                _view(
-                    21,
-                    2,
-                    request_ids=("0_parent-a", "different-unaffected-row"),
-                    prompt_idxs=(41, 92),
-                    sample_idxs=(0, 0),
-                )
-            )
         service.finish_step(21)
 
     def test_reused_slot_matches_the_next_legacy_owner_initialization(self) -> None:
@@ -807,6 +866,16 @@ class ESampRegionUnitTest(unittest.TestCase):
             ("request_predict", "request_loss", "request_train"),
         )
         self.assertEqual(
+            tuple(item.kind.value for item in declaration.ir.tasks[0].inputs),
+            (
+                "packed_request_rows",
+                "packed_sampler_rows",
+                "packed_hidden",
+                "packed_hidden",
+                "state_selection",
+            ),
+        )
+        self.assertEqual(
             tuple(
                 (output.name, output.kind.value, output.target)
                 for output in declaration.ir.tasks[0].outputs
@@ -835,66 +904,60 @@ class ESampRegionUnitTest(unittest.TestCase):
 
     def test_request_state_regions_remain_scheduler_selected_eager_work(self) -> None:
         for driver in (V027MRv1Driver(), V027MRv2Driver()):
-            for graph_mode in ("eager", "piecewise"):
-                with self.subTest(
-                    runner=driver.capabilities().runner_family,
-                    graph_mode=graph_mode,
-                ):
-                    workload = ESampWorkload(
-                        ESampConfig(
-                            per_request_models=True,
-                            distiller_hidden_dim=2,
-                        )
+            with self.subTest(runner=driver.capabilities().runner_family):
+                workload = ESampWorkload(
+                    ESampConfig(
+                        per_request_models=True,
+                        distiller_hidden_dim=2,
                     )
-                    runtime = TllmRuntime(
-                        workloads=(workload,),
-                        workload_memory_budget_bytes=1 << 20,
+                )
+                runtime = TllmRuntime(
+                    workloads=(workload,),
+                    workload_memory_budget_bytes=1 << 20,
+                )
+                runtime.cold_specialize_workloads(
+                    RuntimeSpecializationSpec(
+                        4,
+                        4,
+                        torch.float32,
+                        torch.device("cpu"),
                     )
-                    runtime.cold_specialize_workloads(
-                        RuntimeSpecializationSpec(
-                            4,
-                            4,
-                            torch.float32,
-                            torch.device("cpu"),
-                        )
+                )
+                compilation = runtime.compile_workloads(
+                    driver.export_main_workload_timeline(
+                        graph_mode="eager",
+                        static_headroom_bytes=1 << 20,
                     )
-                    compilation = runtime.compile_workloads(
-                        driver.export_main_workload_timeline(
-                            graph_mode=graph_mode,
-                            static_headroom_bytes=1 << 20,
-                        )
+                )
+                regions = compilation.decision.execution_regions
+                self.assertEqual(
+                    tuple(task for region in regions for task in region.tasks),
+                    (
+                        "request_predict",
+                        "request_loss",
+                        "request_train",
+                    ),
+                )
+                for region in regions:
+                    self.assertIs(region.stream, RegionStreamClass.DEFAULT)
+                    self.assertIs(
+                        region.host_submission,
+                        RegionHostSubmission.INLINE,
                     )
-                    regions = compilation.decision.execution_regions
-                    self.assertEqual(
-                        tuple(task for region in regions for task in region.tasks),
-                        (
-                            "request_predict",
-                            "request_loss",
-                            "request_train",
-                        ),
+                    self.assertFalse(region.compile_safe)
+                    self.assertFalse(region.capture_safe)
+                    self.assertIs(
+                        region.capture_mode,
+                        RegionCaptureMode.DISABLED,
                     )
-                    for region in regions:
-                        self.assertIs(
-                            region.stream, RegionStreamClass.DEFAULT
-                        )
-                        self.assertIs(
-                            region.host_submission,
-                            RegionHostSubmission.INLINE,
-                        )
-                        self.assertFalse(region.compile_safe)
-                        self.assertFalse(region.capture_safe)
-                        self.assertIs(
-                            region.capture_mode,
-                            RegionCaptureMode.DISABLED,
-                        )
-                    physical = compilation.physical
-                    assert physical is not None
-                    self.assertTrue(
-                        all(
-                            node.capture_policy is CapturePolicy.DISABLED
-                            for node in physical.nodes
-                        )
+                physical = compilation.physical
+                assert physical is not None
+                self.assertTrue(
+                    all(
+                        node.capture_policy is CapturePolicy.DISABLED
+                        for node in physical.nodes
                     )
+                )
 
     def test_direct_request_workload_rejects_unsupported_first_phase_options(self) -> None:
         for overrides, message in (

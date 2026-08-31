@@ -82,6 +82,7 @@ class SamplerPrecomputeUnitTest(unittest.TestCase):
         sampler_patch._ORIG_VLLM_SAMPLER_SAMPLE = None
 
     def _runtime(self, **kwargs):
+        kwargs.setdefault("workload_execution", None)
         kwargs.setdefault("sampler_precompute", SamplerPrecomputeState())
         return SimpleNamespace(**kwargs)
 

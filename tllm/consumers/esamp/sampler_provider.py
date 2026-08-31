@@ -21,7 +21,11 @@ from tllm.runtime.sampler_bridge.provider import (
     SamplerInterventionStage,
     SamplerModifierProvider,
 )
-from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
+from tllm.runtime.sampler_bridge.types import (
+    CandidateModifierState,
+    NoSamplerSourceHidden,
+    SamplerStepView,
+)
 
 _SAMPLER_PRECOMPUTE_STREAM_PRIORITY = 2
 
@@ -394,6 +398,11 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
             if cache is None:
                 if not self.engine.prediction_ready:
                     return None
+                match view.source_hidden:
+                    case NoSamplerSourceHidden():
+                        return None
+                    case torch.Tensor() as source_hidden:
+                        pass
                 prompt_input = (
                     view.prompt_idx_tensor.to(device=view.device, dtype=torch.long)
                     if view.prompt_idx_tensor is not None
@@ -408,7 +417,7 @@ class ESampSamplerModifierProvider(SamplerModifierProvider):
                     fallback_timing_start.record(current_stream)
                 with maybe_record_function("distiller.prepare_step.fallback_predict"):
                     row_ids, pred_hidden = self.engine.predict_hidden_for_sampling(
-                        view.source_hidden,
+                        source_hidden,
                         prompt_input,
                         assume_all_model_bank_slots_ready=bool(self.engine.using_model_bank),
                     )

@@ -20,6 +20,7 @@ from tllm.ports.sampler import (
     SamplerBackend,
     SamplerFilterSpec,
     SamplerModifierState,
+    SamplerPhase,
     TemperatureMode,
 )
 
@@ -31,6 +32,8 @@ __all__ = [
     "SamplerBackend",
     "SamplerFilterSpec",
     "SamplerModifierState",
+    "SamplerPhase",
+    "NoSamplerSourceHidden",
     "SamplerStepView",
     "TemperatureMode",
     "filter_spec_from_sampling_metadata",
@@ -44,6 +47,11 @@ _SAMPLER_BACKEND_ALIASES: dict[str, CanonicalSamplerBackend] = {
     "pre_filter_dense": "pre_filter_dense",
     "post_filter_dense_cache": "post_filter_dense_cache",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class NoSamplerSourceHidden:
+    """A packed sampler view whose source rows stay in the signed Region."""
 
 
 def normalize_sampler_backend(backend: str | None) -> CanonicalSamplerBackend:
@@ -105,7 +113,7 @@ def _normalize_min_p(min_p: torch.Tensor | None) -> torch.Tensor | None:
 @dataclass(frozen=True)
 class SamplerStepView:
     engine_step_id: int
-    phase: str
+    phase: SamplerPhase
     logits: torch.Tensor
     sampling_metadata: Any
     decode_count: int
@@ -114,7 +122,7 @@ class SamplerStepView:
     sample_idxs: tuple[int, ...]
     prompt_idx_tensor: torch.Tensor | None
     sample_idx_tensor: torch.Tensor | None
-    source_hidden: torch.Tensor
+    source_hidden: torch.Tensor | NoSamplerSourceHidden
     device: torch.device
     model: Any
     runner: Any

@@ -90,6 +90,24 @@ def _wrapped_prepare_inputs(
         state=None if binding is None else binding.parameter_overlay_state,
     )
     input_batch = orig(runner, *args, **kwargs)
+    has_active_targets = active_targets.runtime_has_active_targets(runtime)
+    active_driver = driver or V027MRv2Driver()
+    batch_columns = active_driver.packed_row_plan_inputs(
+        runner=runner,
+        num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+        input_batch=input_batch,
+    )
+    if (
+        has_active_targets
+        and _runner_adapter.is_v027_warmup_packed_rows(batch_columns)
+    ):
+        session = get_step_session(runner)
+        if session is None or session.state is not StepState.CREATED:
+            raise RuntimeError(
+                "MRv2 backend warmup requires its newly-created step session"
+            )
+        session.transition(StepState.BACKEND_WARMUP)
+        return input_batch
     from tllm.runtime.request_lifecycle import observe_request_aliases
 
     observe_request_aliases(
@@ -100,77 +118,72 @@ def _wrapped_prepare_inputs(
         overlay_controller.sync_versions()
         overlay_controller.apply_mrv2_input_batch(input_batch)
         if overlay_controller.requires_dense_step():
-            active_driver = driver or V027MRv2Driver()
-            columns = active_driver.packed_row_plan_inputs(
-                runner=runner,
-                num_scheduled_tokens=None,
-                input_batch=input_batch,
-            )
             overlay_controller.prepare_dense_step(
-                step_id=int(runtime.event_step_id), columns=columns
+                step_id=int(runtime.event_step_id), columns=batch_columns
             )
-    has_active_targets = active_targets.runtime_has_active_targets(runtime)
 
-    if has_active_targets:
-        # InputBatch is the first point where all three scheduler columns are
-        # available in MRv2. Rust classifies them before any lifecycle event is
-        # visible to a phase-filtered legacy target.
-        active_driver = driver or V027MRv2Driver()
-        batch_columns = active_driver.packed_row_plan_inputs(
+    if not has_active_targets:
+        _model_region.prepare_model_region_step(
+            runtime=runtime,
             runner=runner,
-            num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
+            num_scheduled_tokens=getattr(
+                input_batch, "num_scheduled_tokens", None
+            ),
             input_batch=input_batch,
         )
-        batch_phase = _scheduler_batch_phase.scheduler_batch_phase(
-            columns=batch_columns
-        )
-        hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
-        _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
-            binding=binding,
-            execution=runtime.workload_execution,
-        )
-        packed_rows = _scheduler_batch_phase.stage_prepared_packed_rows(
-            execution=runtime.workload_execution,
-            step_id=int(runtime.event_step_id),
-            columns=batch_columns,
-            prompt_indices=runtime.reqid_to_promptidx,
-            sample_indices=runtime.reqid_to_sampleidx,
-        )
-        packed_execution = runtime.workload_execution
-        if (
-            packed_rows is not None
-            and packed_execution is not None
-            and packed_execution.requires_packed_hidden
-        ):
-            from tllm.runtime.graph_policy import resolve_graph_mode
+        return input_batch
 
-            _packed_hidden_capture.begin_runner_packed_hidden_capture(
-                binding=binding,
-                model=runner_model_module(runner),
-                execution=packed_execution,
-                specialization=runner_runtime_specialization(runner),
-                graph_mode=resolve_graph_mode(runner),
+    # InputBatch is the first point where all three scheduler columns are
+    # available in MRv2. Rust classifies them before any lifecycle event is
+    # visible to a phase-filtered legacy target.
+    packed_execution = runtime.workload_execution
+    batch_phase = _scheduler_batch_phase.scheduler_batch_phase(
+        columns=batch_columns
+    )
+    hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
+    _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
+        binding=binding,
+        execution=runtime.workload_execution,
+    )
+    packed_rows = _scheduler_batch_phase.stage_prepared_packed_rows(
+        execution=runtime.workload_execution,
+        step_id=int(runtime.event_step_id),
+        columns=batch_columns,
+        prompt_indices=runtime.reqid_to_promptidx,
+        sample_indices=runtime.reqid_to_sampleidx,
+    )
+    if (
+        packed_rows is not None
+        and packed_execution is not None
+        and packed_execution.requires_packed_hidden
+    ):
+        from tllm.runtime.graph_policy import resolve_graph_mode
+
+        _packed_hidden_capture.begin_runner_packed_hidden_capture(
+            binding=binding,
+            model=runner_model_module(runner),
+            execution=packed_execution,
+            specialization=runner_runtime_specialization(runner),
+            graph_mode=resolve_graph_mode(runner),
+            row_batch=packed_rows,
+        )
+    if (
+        packed_rows is not None
+        and packed_execution is not None
+        and packed_execution.requires_packed_sampler_rows
+    ):
+        packed_execution.stage_packed_sampler_rows(
+            _runner_adapter.mrv2_packed_sampler_row_batch(
                 row_batch=packed_rows,
+                input_batch=input_batch,
             )
-        if (
-            packed_rows is not None
-            and packed_execution is not None
-            and packed_execution.requires_packed_sampler_rows
-        ):
-            packed_execution.stage_packed_sampler_rows(
-                _runner_adapter.mrv2_packed_sampler_row_batch(
-                    row_batch=packed_rows,
-                    input_batch=input_batch,
-                )
-            )
+        )
     _model_region.prepare_model_region_step(
         runtime=runtime,
         runner=runner,
         num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
         input_batch=input_batch,
     )
-    if not has_active_targets:
-        return input_batch
     session = get_step_session(runner)
     if session is None or session.state is not StepState.CREATED:
         raise RuntimeError(
@@ -297,6 +310,8 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     capture_attempted = False
     try:
         out = orig(runner, *args, **kwargs)
+        if session.state is StepState.BACKEND_WARMUP:
+            return out
         if session.state is not StepState.CREATED:
             _packed_hidden_capture.publish_runner_packed_hidden_capture(
                 binding=binding,
@@ -306,6 +321,8 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
             capture_attempted = True
             overlay_controller.stage_dense_operand_captured()
     except Exception as exc:
+        if session.state is StepState.BACKEND_WARMUP:
+            raise
         _packed_hidden_capture.abort_runner_packed_hidden_capture(binding)
         session.fail(str(exc))
         _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
@@ -373,6 +390,8 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     if not active_targets.runtime_has_active_targets(runtime):
         return orig(runner, grammar_output)
     session = get_step_session(runner)
+    if session is not None and session.state is StepState.BACKEND_WARMUP:
+        return orig(runner, grammar_output)
     hook_phase = _scheduler_batch_phase.session_hook_phase(session)
     _model_region.stage_signed_backend_region_event(
         event=BackendObservableEvent.SAMPLE_TOKENS_PRE,

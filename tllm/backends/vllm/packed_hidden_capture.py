@@ -38,6 +38,50 @@ class PackedHiddenExecution(PackedHiddenSnapshotSink, Protocol):
     ) -> tuple[PackedHiddenResourceBinding, ...]: ...
 
 
+def _exact_module_path_tokens(path: str) -> tuple[str | int, ...]:
+    tokens: list[str | int] = []
+    for component in path.split("."):
+        attribute, separator, indices = component.partition("[")
+        if not attribute:
+            raise RuntimeError("packed hidden module_path has an empty component")
+        tokens.append(attribute)
+        remainder = "" if not separator else "[" + indices
+        while remainder:
+            if not remainder.startswith("["):
+                raise RuntimeError("packed hidden module_path index is malformed")
+            close = remainder.find("]")
+            if close < 0:
+                raise RuntimeError("packed hidden module_path index is malformed")
+            index = remainder[1:close]
+            if not index or not index.lstrip("-").isdigit():
+                raise RuntimeError("packed hidden module_path index is malformed")
+            tokens.append(int(index))
+            remainder = remainder[close + 1 :]
+    return tuple(tokens)
+
+
+def _resolve_exact_module(
+    model: torch.nn.Module, path: str
+) -> torch.nn.Module:
+    module = model
+    for token in _exact_module_path_tokens(path):
+        match token:
+            case str() as attribute:
+                module = module.get_submodule(attribute)
+            case int() as index:
+                match module:
+                    case torch.nn.ModuleList() as indexed:
+                        module = indexed[index]
+                    case torch.nn.Sequential() as indexed:
+                        module = indexed[index]
+                    case _:
+                        raise RuntimeError(
+                            "packed hidden bracket index requires an exact "
+                            "ModuleList or Sequential container"
+                        )
+    return module
+
+
 _ForwardHook = Callable[
     [
         torch.nn.Module,
@@ -114,7 +158,7 @@ class RunnerPackedHiddenCapture:
             ]
         ] = []
         for resource in resources:
-            module = model.get_submodule(resource.module_path)
+            module = _resolve_exact_module(model, resource.module_path)
             for grouped_module, grouped_resources in grouped:
                 if grouped_module is module:
                     grouped_resources.append(resource)

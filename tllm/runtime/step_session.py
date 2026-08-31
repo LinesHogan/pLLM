@@ -22,6 +22,7 @@ from tllm import _core
 
 class StepState(Enum):
     CREATED = auto()
+    BACKEND_WARMUP = auto()
     INPUTS_READY = auto()
     FORWARD_DONE = auto()
     SAMPLING = auto()
@@ -30,7 +31,10 @@ class StepState(Enum):
 
 
 _ALLOWED_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
-    StepState.CREATED: frozenset({StepState.INPUTS_READY, StepState.FAILED}),
+    StepState.CREATED: frozenset(
+        {StepState.BACKEND_WARMUP, StepState.INPUTS_READY, StepState.FAILED}
+    ),
+    StepState.BACKEND_WARMUP: frozenset(),
     StepState.INPUTS_READY: frozenset({StepState.FORWARD_DONE, StepState.FAILED}),
     StepState.FORWARD_DONE: frozenset({StepState.SAMPLING, StepState.COMPLETED, StepState.FAILED}),
     StepState.SAMPLING: frozenset({StepState.COMPLETED, StepState.FAILED}),
