@@ -23,6 +23,33 @@ Exact recurrence is the default. Jacobi must be selected explicitly with
 metadata and has deterministic JSON and a SHA-256 semantic key. Runtime
 callables stay in the declaration's executor table and are never serialized.
 
+Packed eager inputs use nominal author descriptors rather than textual
+relations:
+
+```python
+rows = packed_request_rows()
+selection = packed_selection(state.selection(), rows=rows)
+
+@task(
+    inputs={
+        "rows": rows,
+        "source": packed_hidden(0, rows=rows),
+        "target": packed_hidden(-1, rows=rows),
+        "selection": selection,
+    },
+    effects=(read(selection),),
+)
+def train(rows, source, target, selection): ...
+```
+
+Each packed task declares exactly one `PackedRequestRowsInput`; packed hidden
+and request-selection inputs must reference that exact object. The descriptor
+may be reused by another task only when that task also declares it as its own
+rows input. `packed_hidden` accepts an index or path locator at
+`block_output`; it does not masquerade as an ordinary prefill/decode
+`HiddenInput`. These declarations sign data provenance only and expose no
+lane, priority, fusion, placement, or execution-order control.
+
 ## Middle-end contracts
 
 - `WorkloadIR` schema v4: author declarations after deterministic lowering,

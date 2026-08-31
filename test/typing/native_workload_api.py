@@ -31,16 +31,23 @@ from tllm.runtime.request_trainable_state import (
     RequestStateRuntimeService,
     RequestStateSelectionBatch,
 )
+from tllm.contracts.packed_rows import PackedPhaseRowBatch
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
     AdamWSpec,
     ConfigField,
+    PackedRequestRowsInput,
     RequestKeyField,
     RequestTrainableState,
     State,
     WorkloadConfig,
     declared_config_field,
+    packed_hidden,
+    packed_request_rows,
+    packed_selection,
+    read,
     request_key,
+    task,
     workload,
 )
 
@@ -163,3 +170,46 @@ def typed_esamp_request_loss_transition(
         workload_instance.request_distiller
     )
     return service
+
+
+class _PackedAuthorTypingWorkload(Workload[_RequestStateTypingConfig]):
+    state: RequestTrainableState[torch.nn.Linear] = State[
+        torch.nn.Linear
+    ].request_trainable(
+        key=request_key(RequestKeyField.REQUEST_ID),
+        optimizer=AdamWSpec.fixed(1e-3),
+    )
+    rows: PackedRequestRowsInput = packed_request_rows()
+    selection = packed_selection(state.selection(), rows=rows)
+
+    @state.initialize
+    def init_state(self, spec: RuntimeSpecializationSpec) -> torch.nn.Linear:
+        return torch.nn.Linear(
+            spec.hidden_size, spec.hidden_size, bias=False
+        )
+
+    @task(
+        inputs={
+            "rows": rows,
+            "source": packed_hidden(0, rows=rows),
+            "target": packed_hidden(-1, rows=rows),
+            "selection": selection,
+        },
+        effects=(read(selection),),
+    )
+    def train(
+        self,
+        rows: PackedPhaseRowBatch,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        selection: RequestStateSelectionBatch,
+    ) -> None:
+        del rows, source, target, selection
+
+
+workload(
+    _PackedAuthorTypingWorkload,
+    id="typing.packed-author",
+    config=_RequestStateTypingConfig,
+    enabled=_REQUEST_STATE_TYPING_ENABLED,
+)

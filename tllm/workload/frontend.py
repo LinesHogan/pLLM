@@ -586,15 +586,28 @@ def _state_id(state: _StateReference) -> str:
     return state.name
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class PackedRequestRowsInput:
+    """Nominal same-task anchor for one staged packed row batch."""
+
+
 @dataclass(frozen=True, slots=True)
 class StateSelectionInput(Generic[StateValueT]):
     """The exact request-state lease consumed by one task declaration."""
 
     selected_state: _StateReference
+    packed_rows: PackedRequestRowsInput | None = None
 
     def __post_init__(self) -> None:
         if self.selected_state.scope is not StateScope.REQUEST:
             raise ValueError("StateSelectionInput requires a REQUEST State")
+        match self.packed_rows:
+            case None | PackedRequestRowsInput():
+                pass
+            case _:
+                raise TypeError(
+                    "StateSelectionInput.packed_rows must be PackedRequestRowsInput"
+                )
 
     @property
     def effect_state(self) -> _StateReference:
@@ -730,6 +743,42 @@ class HiddenInput:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedHiddenInput:
+    """One packed block-output locator aligned to nominal request rows."""
+
+    layer: str
+    layer_kind: HiddenLayerKind
+    site: HiddenSite
+    rows: PackedRequestRowsInput
+    path: ConfiguredValue[str] | NoConfiguredValue = NO_CONFIGURED_VALUE
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "layer", _name(self.layer, "PackedHiddenInput.layer")
+        )
+        object.__setattr__(
+            self, "layer_kind", HiddenLayerKind(self.layer_kind)
+        )
+        object.__setattr__(self, "site", HiddenSite(self.site))
+        if self.layer_kind not in (
+            HiddenLayerKind.INDEX,
+            HiddenLayerKind.PATH,
+        ):
+            raise ValueError(
+                "packed hidden input requires an index or path layer"
+            )
+        if self.site is not HiddenSite.BLOCK_OUTPUT:
+            raise ValueError("packed hidden input requires block_output site")
+        match self.rows:
+            case PackedRequestRowsInput():
+                pass
+            case _:
+                raise TypeError(
+                    "PackedHiddenInput.rows must be PackedRequestRowsInput"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class ResultInput:
     task: str
     output: str
@@ -797,6 +846,8 @@ class HostOutputSpec(Generic[PortT_co]):
 
 InputSpec = (
     HiddenInput
+    | PackedRequestRowsInput
+    | PackedHiddenInput
     | ResultInput
     | ProvidedInput
     | StepIdInput
@@ -833,6 +884,57 @@ def hidden(
         HiddenPhase(phase),
         NO_CONFIGURED_VALUE if path is None else configured(path),
     )
+
+
+def packed_request_rows() -> PackedRequestRowsInput:
+    """Declare the one nominal packed-row anchor consumed by a task."""
+
+    return PackedRequestRowsInput()
+
+
+def packed_hidden(
+    layer: int | str,
+    site: HiddenSite | str = HiddenSite.BLOCK_OUTPUT,
+    *,
+    rows: PackedRequestRowsInput,
+    path: str | ConfigField[str] | None = None,
+) -> PackedHiddenInput:
+    match layer:
+        case bool():
+            raise TypeError("packed_hidden.layer must be int or str")
+        case int():
+            layer_kind = HiddenLayerKind.INDEX
+        case str():
+            layer_kind = HiddenLayerKind.PATH
+        case _:
+            raise TypeError("packed_hidden.layer must be int or str")
+    return PackedHiddenInput(
+        layer=str(layer),
+        layer_kind=layer_kind,
+        site=HiddenSite(site),
+        rows=rows,
+        path=(
+            NO_CONFIGURED_VALUE
+            if path is None
+            else configured(path)
+        ),
+    )
+
+
+def packed_selection(
+    selection: StateSelectionInput[StateValueT],
+    *,
+    rows: PackedRequestRowsInput,
+) -> StateSelectionInput[StateValueT]:
+    """Relate one exact request-state selection to nominal packed rows."""
+
+    if selection.packed_rows is None:
+        return StateSelectionInput(selection.selected_state, rows)
+    if selection.packed_rows is not rows:
+        raise ValueError(
+            "packed selection already references different packed request rows"
+        )
+    return selection
 
 
 def result(task_name: str, output_name: str) -> ResultInput:
@@ -1254,6 +1356,46 @@ def _mapping(value: Mapping[str, _T] | None, label: str) -> tuple[tuple[str, _T]
     return tuple(result)
 
 
+def _packed_rows_task_input(
+    task_inputs: tuple[tuple[str, InputSpec], ...],
+) -> tuple[str, PackedRequestRowsInput] | None:
+    rows_inputs: list[tuple[str, PackedRequestRowsInput]] = []
+    packed_hidden_rows: list[PackedRequestRowsInput] = []
+    selections: list[PackedRequestRowsInput | None] = []
+    for name, source in task_inputs:
+        match source:
+            case PackedRequestRowsInput():
+                rows_inputs.append((name, source))
+            case PackedHiddenInput(rows=rows):
+                packed_hidden_rows.append(rows)
+            case StateSelectionInput(packed_rows=rows):
+                selections.append(rows)
+            case _:
+                pass
+    if len(rows_inputs) > 1:
+        raise ValueError("one task may declare only one packed request rows input")
+    related_rows = (
+        *packed_hidden_rows,
+        *(rows for rows in selections if rows is not None),
+    )
+    if not rows_inputs:
+        if related_rows:
+            raise ValueError(
+                "packed inputs require their same-task packed request rows input"
+            )
+        return None
+    rows_entry = rows_inputs[0]
+    if any(rows is not rows_entry[1] for rows in related_rows):
+        raise ValueError(
+            "packed inputs must reference their same-task packed request rows input"
+        )
+    if any(rows is None for rows in selections):
+        raise ValueError(
+            "state selection in a packed task requires the same-task packed request rows"
+        )
+    return rows_entry
+
+
 @overload
 def task(function: Callable[_P, _R], /) -> Callable[_P, _R]: ...
 
@@ -1306,6 +1448,7 @@ def task(
         unknown = tuple(name for name, _ in task_inputs if name not in parameters)
         if unknown:
             raise ValueError(f"task inputs are not function parameters: {', '.join(unknown)}")
+        _packed_rows_task_input(task_inputs)
         for effect in effects:
             match effect:
                 case StateEffect(selection=selection) if selection is not None:
@@ -1410,6 +1553,7 @@ class WorkloadDefinition:
     approximation_criteria: ApproximationCriteria | None = None
     tasks: tuple[TaskDefinition, ...] = ()
     hidden_inputs: tuple[HiddenInput, ...] = ()
+    packed_hidden_inputs: tuple[PackedHiddenInput, ...] = ()
     sampler_outputs: tuple[SamplerOutput, ...] = ()
     gradient_tasks: tuple[str, ...] = ()
     sampler_inputs: tuple[ValueSourceKind, ...] = ()
@@ -1429,6 +1573,7 @@ class NativeWorkloadDefinition:
     enabled: ConfigFieldValue[bool]
     tasks: tuple[TaskDefinition, ...] = ()
     hidden_inputs: tuple[HiddenInput, ...] = ()
+    packed_hidden_inputs: tuple[PackedHiddenInput, ...] = ()
     sampler_outputs: tuple[SamplerOutput, ...] = ()
     gradient_tasks: tuple[str, ...] = ()
     sampler_inputs: tuple[ValueSourceKind, ...] = ()
@@ -1547,7 +1692,13 @@ def workload(
         states = tuple(state_list)
         author_tasks = _author_task_definitions(target)
         tasks = _expanded_task_definitions(author_tasks, states)
-        hidden_inputs, sampler_outputs, gradient_tasks, sampler_inputs = _author_metadata(tasks)
+        (
+            hidden_inputs,
+            packed_hidden_inputs,
+            sampler_outputs,
+            gradient_tasks,
+            sampler_inputs,
+        ) = _author_metadata(tasks)
         published_ports: list[StagedPort[object]] = []
         for state in states:
             if isinstance(state, PublishedModule):
@@ -1556,6 +1707,7 @@ def workload(
             definition,
             tasks=tasks,
             hidden_inputs=hidden_inputs,
+            packed_hidden_inputs=packed_hidden_inputs,
             sampler_outputs=sampler_outputs,
             gradient_tasks=gradient_tasks,
             sampler_inputs=sampler_inputs,
@@ -1686,11 +1838,13 @@ def _author_metadata(
     tasks: tuple[TaskDefinition, ...],
 ) -> tuple[
     tuple[HiddenInput, ...],
+    tuple[PackedHiddenInput, ...],
     tuple[SamplerOutput, ...],
     tuple[str, ...],
     tuple[ValueSourceKind, ...],
 ]:
     hidden_inputs: list[HiddenInput] = []
+    packed_hidden_inputs: list[PackedHiddenInput] = []
     sampler_output_declarations: list[
         tuple[SamplerOutput, ConfigPredicate | None]
     ] = []
@@ -1703,6 +1857,12 @@ def _author_metadata(
             for _parameter, source in declaration.inputs
             if isinstance(source, HiddenInput)
         )
+        for _parameter, source in declaration.inputs:
+            match source:
+                case PackedHiddenInput():
+                    packed_hidden_inputs.append(source)
+                case _:
+                    pass
         sampler_output_declarations.extend(
             (output, declaration.predicate)
             for _output_name, output in declaration.outputs
@@ -1740,6 +1900,7 @@ def _author_metadata(
         sampler_outputs = (policy,)
     return (
         tuple(hidden_inputs),
+        tuple(packed_hidden_inputs),
         sampler_outputs,
         tuple(gradient_tasks),
         tuple(dict.fromkeys(sampler_inputs)),
@@ -1871,10 +2032,63 @@ def _timing_ir(value: Timing) -> TimingIR:
     return TimingIR(value.anchor, "generate.end")
 
 
-def _input_ir(name: str, value: InputSpec) -> TaskInputIR:
+def _input_ir(
+    name: str,
+    value: InputSpec,
+    packed_rows_entry: tuple[str, PackedRequestRowsInput] | None,
+) -> TaskInputIR:
     match value:
-        case StateSelectionInput(selected_state=state):
-            return TaskInputIR(name, ValueSourceKind.STATE_SELECTION, _state_id(state))
+        case StateSelectionInput(
+            selected_state=state,
+            packed_rows=packed_rows,
+        ):
+            if packed_rows is None:
+                packed_rows_port = ""
+            elif (
+                packed_rows_entry is None
+                or packed_rows is not packed_rows_entry[1]
+            ):
+                raise ValueError(
+                    "packed selection has no same-task packed request rows input"
+                )
+            else:
+                packed_rows_port = packed_rows_entry[0]
+            return TaskInputIR(
+                name,
+                ValueSourceKind.STATE_SELECTION,
+                _state_id(state),
+                packed_rows_port=packed_rows_port,
+            )
+        case PackedRequestRowsInput():
+            if packed_rows_entry is None or value is not packed_rows_entry[1]:
+                raise ValueError(
+                    "packed rows input differs from the same-task relation"
+                )
+            return TaskInputIR(
+                name,
+                ValueSourceKind.PACKED_REQUEST_ROWS,
+                "runtime.packed_phase_rows",
+            )
+        case PackedHiddenInput(
+            layer=layer,
+            layer_kind=layer_kind,
+            site=site,
+            rows=rows,
+        ):
+            if packed_rows_entry is None or rows is not packed_rows_entry[1]:
+                raise ValueError(
+                    "packed hidden has no same-task packed request rows input"
+                )
+            return TaskInputIR(
+                name,
+                ValueSourceKind.PACKED_HIDDEN,
+                f"packed_hidden:{layer}:{site}",
+                layer=layer,
+                layer_kind=layer_kind.value,
+                site=site,
+                phase=HiddenPhase.NONE,
+                packed_rows_port=packed_rows_entry[0],
+            )
         case _:
             pass
     if isinstance(value, HiddenInput):
@@ -1946,6 +2160,7 @@ def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
         name = entry.name
         function = entry.executor
         declaration = entry.declaration
+        packed_rows_entry = _packed_rows_task_input(declaration.inputs)
         for effect in declaration.effects:
             match effect:
                 case ExternalEffect(resource_name=resource_name):
@@ -2007,7 +2222,10 @@ def _build_ir(cls: type[object], definition: _Definition) -> WorkloadIR:
             TaskIR(
                 name=name,
                 ordinal=ordinal,
-                inputs=tuple(_input_ir(param, value) for param, value in declaration.inputs),
+                inputs=tuple(
+                    _input_ir(param, value, packed_rows_entry)
+                    for param, value in declaration.inputs
+                ),
                 outputs=tuple(_output_ir(output, value) for output, value in declaration.outputs),
                 effects=tuple(effect_irs),
                 timing=_timing_ir(declaration.timing),
@@ -2210,6 +2428,8 @@ __all__ = [
     "ExternalEffect",
     "ExternImplementation",
     "Index",
+    "PackedHiddenInput",
+    "PackedRequestRowsInput",
     "RequestKey",
     "RequestTrainableState",
     "State",
@@ -2222,6 +2442,9 @@ __all__ = [
     "declare_workload",
     "definition_for_workload_class",
     "hidden",
+    "packed_hidden",
+    "packed_request_rows",
+    "packed_selection",
     "maybe_transition",
     "maybe_optimize",
     "next",
