@@ -33,12 +33,13 @@ from tllm.runtime.stable_packed_state import (
 
 
 def _tensor_only_consumer(
-    packed_source: torch.Tensor,
-    first_row_ids: torch.Tensor,
-    lease_valid_mask: torch.Tensor,
-    root_page_ids: torch.Tensor,
-    state_pool: torch.Tensor,
+    inputs: tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
+    packed_source = inputs[0]
+    lease_valid_mask = inputs[5]
+    first_row_ids = inputs[6]
+    root_page_ids = inputs[7]
+    state_pool = inputs[8]
     source_rows = packed_source.index_select(0, first_row_ids)
     state_rows = state_pool.index_select(0, root_page_ids[:, 0])
     return (
@@ -215,19 +216,16 @@ class StablePackedStateUnitTest(unittest.TestCase):
             torch.tensor(((1,), (2,), (0,))),
         )
 
-        fixed_result = _tensor_only_consumer(
-            fixed_view.packed_tensors.tensors[0],
-            fixed_view.first_row_ids,
-            fixed_view.valid_masks.leases,
-            fixed_view.version_epoch.page_ids,
-            fixed_view.version_epoch.state_operands[0],
+        fixed_projection = fixed_view.tensor_projection()
+        fragmented_projection = fragmented_view.tensor_projection()
+        self.assertEqual(
+            fixed_projection.signature,
+            fragmented_projection.signature,
         )
+        self.assertEqual(len(fixed_projection.tensors), 9)
+        fixed_result = _tensor_only_consumer(fixed_projection.tensors)
         fragmented_result = _tensor_only_consumer(
-            fragmented_view.packed_tensors.tensors[0],
-            fragmented_view.first_row_ids,
-            fragmented_view.valid_masks.leases,
-            fragmented_view.version_epoch.page_ids,
-            fragmented_view.version_epoch.state_operands[0],
+            fragmented_projection.tensors
         )
         torch.testing.assert_close(fixed_result, fragmented_result)
 

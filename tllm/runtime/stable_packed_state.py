@@ -13,9 +13,9 @@ from tllm.contracts.request_state import (
     RequestStateVersion,
 )
 from tllm.runtime.paged_state import (
+    FrozenTensorLayout,
     ImmutableStateVersionRoot,
     PagedStateVersionArena,
-    StateLayoutId,
     StateResourceId,
     StateVersionLineage,
     StateVersionRef,
@@ -86,7 +86,7 @@ class StateStabilityEpoch:
     bundle_epoch: int
     view_epoch: int
     buffer_id: int
-    state_layout_id: StateLayoutId
+    state_layout: FrozenTensorLayout
     packed_layout_id: PackedLayoutId
 
 
@@ -108,6 +108,19 @@ class StateViewCompletionFence:
 
 
 @dataclass(frozen=True, slots=True)
+class StablePackedProjectionSignature:
+    resource: StateResourceId
+    packed_layout: FrozenPackedTensorLayout
+    state_layout: FrozenTensorLayout
+
+
+@dataclass(frozen=True, slots=True)
+class StablePackedStateProjection:
+    signature: StablePackedProjectionSignature
+    tensors: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StablePackedStateView:
     packed_tensors: StablePackedTensorSet
     row_slot_ids: torch.Tensor
@@ -117,6 +130,25 @@ class StablePackedStateView:
     stability_epoch: StateStabilityEpoch
     version_epoch: PinnedStateVersionEpoch
     completion_fence: StateViewCompletionFence
+
+    def tensor_projection(self) -> StablePackedStateProjection:
+        return StablePackedStateProjection(
+            StablePackedProjectionSignature(
+                self.stability_epoch.resource,
+                self.packed_tensors.layout,
+                self.stability_epoch.state_layout,
+            ),
+            (
+                *self.packed_tensors.tensors,
+                self.row_slot_ids,
+                self.lease_slot_ids,
+                self.valid_masks.rows,
+                self.valid_masks.leases,
+                self.first_row_ids,
+                self.version_epoch.page_ids,
+                *self.version_epoch.state_operands,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,7 +295,7 @@ class StablePackedStateViewArena:
                     bundle_epoch=roots.bundle_epoch,
                     view_epoch=view_epoch,
                     buffer_id=buffer_id,
-                    state_layout_id=roots.bundle.layout.layout_id,
+                    state_layout=roots.bundle.layout,
                     packed_layout_id=layout.layout_id,
                 ),
             )
@@ -717,6 +749,8 @@ __all__ = [
     "PackedLayoutId",
     "PinnedStateVersionEpoch",
     "StablePackedStateView",
+    "StablePackedStateProjection",
+    "StablePackedProjectionSignature",
     "StablePackedStateViewArena",
     "StablePackedTensorSet",
     "StablePackedValidityMasks",
