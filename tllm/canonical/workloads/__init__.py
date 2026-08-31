@@ -17,6 +17,7 @@ from tllm.canonical.workloads.esamp_request import (
 )
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestDiagnostics,
+    ESampRequestPackedHiddenBindings,
     ESampRequestStepInput,
     ESampRequestStepResult,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "ESampRequestConfig",
     "ESampRequestDiagnostics",
     "ESampRequestExecution",
+    "ESampRequestPackedHiddenBindings",
     "ESampRequestSpecialization",
     "ESampRequestStepInput",
     "ESampRequestStepHandle",

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import torch
 
 from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
+from tllm.contracts.packed_hidden import (
+    PackedHiddenResourceBinding,
+    PackedHiddenSnapshotBatch,
+)
 from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from tllm.contracts.request_identity import (
     RequestKeyField,
@@ -86,12 +91,14 @@ class ESampRequestSpecialization:
     hidden_size: int
     tensor_dtype: TensorDType
     initialization_seed: int
+    hidden_bindings: "ESampRequestPackedHiddenBindings"
 
     def __post_init__(self) -> None:
         if (
             type(self.hidden_size) is not int
             or type(self.tensor_dtype) is not TensorDType
             or type(self.initialization_seed) is not int
+            or type(self.hidden_bindings) is not ESampRequestPackedHiddenBindings
             or self.hidden_size < 1
             or self.tensor_dtype is not TensorDType.FLOAT32
             or self.initialization_seed < 0
@@ -99,6 +106,35 @@ class ESampRequestSpecialization:
             raise ValueError(
                 "CPU ESamp specialization requires positive float32 dimensions"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ESampRequestPackedHiddenBindings:
+    source: PackedHiddenResourceBinding
+    target: PackedHiddenResourceBinding
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.source) is not PackedHiddenResourceBinding
+            or type(self.target) is not PackedHiddenResourceBinding
+            or self.source.layer_kind is not HiddenLayerKind.INDEX
+            or self.target.layer_kind is not HiddenLayerKind.INDEX
+            or self.source.site is not HiddenSite.BLOCK_OUTPUT
+            or self.target.site is not HiddenSite.BLOCK_OUTPUT
+            or self.source.locator_key == self.target.locator_key
+        ):
+            raise ValueError(
+                "ESamp packed hidden bindings require distinct indexed block outputs"
+            )
+
+    @property
+    def resources(self) -> tuple[PackedHiddenResourceBinding, ...]:
+        return tuple(
+            sorted(
+                (self.source, self.target),
+                key=lambda binding: binding.locator_key,
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,23 +171,15 @@ class ESampRequestCompileOptions:
 class ESampRequestStepInput:
     rows: PackedPhaseRowBatch
     sampler_rows: PackedSamplerRowBatch
-    source: torch.Tensor
-    target: torch.Tensor
+    hidden: PackedHiddenSnapshotBatch
 
     def __post_init__(self) -> None:
         if (
             self.sampler_rows.row_batch != self.rows
-            or self.source.ndim != 2
-            or self.target.shape != self.source.shape
-            or int(self.source.shape[0]) != self.rows.total_rows
-            or self.target.dtype is not self.source.dtype
-            or self.target.device != self.source.device
-            or self.source.device.type != "cpu"
-            or torch.is_inference(self.source)
-            or torch.is_inference(self.target)
+            or self.hidden.row_batch != self.rows
         ):
             raise ValueError(
-                "ESamp request step requires aligned ordinary CPU packed tensors"
+                "ESamp request step requires one exact packed row provenance"
             )
 
 
@@ -188,6 +216,7 @@ __all__ = [
     "ESampRequestCompileOptions",
     "ESampRequestConfig",
     "ESampRequestDiagnostics",
+    "ESampRequestPackedHiddenBindings",
     "ESampRequestSpecialization",
     "ESampRequestStepInput",
     "ESampRequestStepResult",

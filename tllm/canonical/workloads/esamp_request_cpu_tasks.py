@@ -85,6 +85,8 @@ ESampPublication = ESampPublicationPending | ESampPublished
 @dataclass(slots=True)
 class ESampCpuStepContext:
     step: ESampRequestStepInput
+    source: torch.Tensor
+    target: torch.Tensor
     selection: RequestStateSelection
     transition_lease: RequestStateTransitionLease
     prediction: ESampPrediction
@@ -113,15 +115,15 @@ class ESampCpuPredictTask:
         packed_row_indices = torch.tensor(
             tuple(row.canonical_row_index for row in context.selection.rows),
             dtype=torch.long,
-            device=context.step.source.device,
+            device=context.source.device,
         )
         row_state_indices = torch.tensor(
             tuple(row.state_index for row in context.selection.rows),
             dtype=torch.long,
-            device=context.step.source.device,
+            device=context.source.device,
         )
-        training_source = context.step.source.index_select(0, packed_row_indices)
-        training_target = context.step.target.index_select(0, packed_row_indices)
+        training_source = context.source.index_select(0, packed_row_indices)
+        training_target = context.target.index_select(0, packed_row_indices)
         state_vectors = torch.stack(
             tuple(
                 self._provider.snapshot(ref)[int(ESAMP_PARAMETER_FIELD)]

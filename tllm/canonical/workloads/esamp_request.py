@@ -271,6 +271,15 @@ class ESampRequestWorkload:
     ) -> ESampRequestExecution:
         if self.config.rank > specialization.hidden_size:
             raise ValueError("ESamp rank exceeds the specialized hidden size")
+        if (
+            int(specialization.hidden_bindings.source.layer)
+            != self.config.source_layer
+            or int(specialization.hidden_bindings.target.layer)
+            != self.config.target_layer
+        ):
+            raise ValueError(
+                "ESamp packed hidden bindings differ from semantic locators"
+            )
         graph = self.semantic_graph()
         schedule = compile_schedule(graph, options.timeline)
         validate_schedule(graph, options.timeline, schedule)

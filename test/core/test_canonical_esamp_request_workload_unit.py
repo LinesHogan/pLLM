@@ -14,11 +14,21 @@ from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions,
     ESampRequestConfig,
+    ESampRequestPackedHiddenBindings,
     ESampRequestSpecialization,
     ESampRequestStepInput,
     ESAMP_PARAMETER_FIELD,
 )
-from tllm.contracts.hidden_locator import HiddenPhase
+from tllm.contracts.hidden_locator import (
+    HiddenLayerKind,
+    HiddenPhase,
+    HiddenSite,
+)
+from tllm.contracts.packed_hidden import (
+    PackedHiddenResourceBinding,
+    PackedHiddenSnapshot,
+    PackedHiddenSnapshotBatch,
+)
 from tllm.contracts.packed_rows import (
     PackedPhaseRow,
     PackedPhaseRowBatch,
@@ -42,6 +52,20 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
         RequestIdentity("request-a", 0, 0),
         RequestIdentity("request-b", 1, 0),
     )
+    hidden_bindings = ESampRequestPackedHiddenBindings(
+        source=PackedHiddenResourceBinding(
+            "0",
+            HiddenLayerKind.INDEX,
+            HiddenSite.BLOCK_OUTPUT,
+            "model.layers[0]",
+        ),
+        target=PackedHiddenResourceBinding(
+            "-1",
+            HiddenLayerKind.INDEX,
+            HiddenSite.BLOCK_OUTPUT,
+            "model.layers[-1]",
+        ),
+    )
     workload = ESampRequestWorkload(
         ESampRequestConfig(
             rank=2,
@@ -54,6 +78,7 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
             hidden_size=4,
             tensor_dtype=TensorDType.FLOAT32,
             initialization_seed=7,
+            hidden_bindings=hidden_bindings,
         ),
         ESampRequestCompileOptions(
             timeline=SchedulerTimeline(
@@ -122,13 +147,25 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
         ((0.6, 0.0, -0.3, 0.2), (0.4, -0.2, 0.8, 0.1)),
         dtype=torch.float32,
     )
+    hidden_by_resource = {
+        hidden_bindings.source: source,
+        hidden_bindings.target: target,
+    }
     first_rows = PackedPhaseRowBatch(1, 0, 2, row_values)
     first_handle = execution.start_step(
         ESampRequestStepInput(
             first_rows,
             PackedSamplerRowBatch(first_rows, sampler_links),
-            source,
-            target,
+            PackedHiddenSnapshotBatch(
+                first_rows,
+                tuple(
+                    PackedHiddenSnapshot(
+                        resource,
+                        hidden_by_resource[resource],
+                    )
+                    for resource in hidden_bindings.resources
+                ),
+            ),
         )
     )
     execution.execute_anchor(first_handle, AnchorId(0))
@@ -160,8 +197,16 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
         ESampRequestStepInput(
             second_rows,
             PackedSamplerRowBatch(second_rows, sampler_links),
-            source,
-            target,
+            PackedHiddenSnapshotBatch(
+                second_rows,
+                tuple(
+                    PackedHiddenSnapshot(
+                        resource,
+                        hidden_by_resource[resource],
+                    )
+                    for resource in hidden_bindings.resources
+                ),
+            ),
         )
     )
     execution.execute_anchor(second_handle, AnchorId(0))
@@ -193,8 +238,16 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
         ESampRequestStepInput(
             third_rows,
             PackedSamplerRowBatch(third_rows, sampler_links),
-            source,
-            target,
+            PackedHiddenSnapshotBatch(
+                third_rows,
+                tuple(
+                    PackedHiddenSnapshot(
+                        resource,
+                        hidden_by_resource[resource],
+                    )
+                    for resource in hidden_bindings.resources
+                ),
+            ),
         )
     )
     execution.retire(identities)

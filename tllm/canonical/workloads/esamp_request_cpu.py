@@ -209,10 +209,22 @@ class ESampRequestExecution:
         return tuple(admission.ref for admission in logical.admissions)
 
     def start_step(self, step: ESampRequestStepInput) -> ESampRequestStepHandle:
+        bindings = self._specialization.hidden_bindings
+        actual_resources = tuple(
+            snapshot.resource for snapshot in step.hidden.snapshots
+        )
+        if actual_resources != bindings.resources:
+            raise ValueError(
+                "ESamp hidden snapshots differ from signed resource bindings"
+            )
+        source = step.hidden.hidden_for(bindings.source)
+        target = step.hidden.hidden_for(bindings.target)
         if (
             step.rows.plan_epoch != self._plan.plan_epoch
-            or int(step.source.shape[1]) != self._specialization.hidden_size
-            or step.source.dtype is not torch.float32
+            or int(source.shape[1]) != self._specialization.hidden_size
+            or source.dtype is not torch.float32
+            or source.device.type != "cpu"
+            or target.shape != source.shape
         ):
             raise ValueError("ESamp request step differs from specialization")
         indexed_rows = IndexedRequestIdentityBatch(
@@ -236,6 +248,8 @@ class ESampRequestExecution:
             raise
         context = ESampCpuStepContext(
             step,
+            source,
+            target,
             selection,
             transition_lease,
             ESampPredictionPending(),
