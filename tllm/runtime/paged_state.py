@@ -515,6 +515,22 @@ class PagedStateVersionArena:
                         event,
                     )
 
+    def release_completed_pin(
+        self,
+        pin: StateVersionRootPin,
+        completion: CompletionFence,
+    ) -> None:
+        """Atomically release a pin after its exact fence has completed."""
+
+        with self._lock:
+            self._require_fence_domain(completion)
+            self._active_pin(pin)
+            if pin.pin_id in self._pending_pin_releases:
+                raise RuntimeError("state root pin already has another releaser")
+            if not self._fence_complete(completion):
+                raise RuntimeError("state root completion fence is still pending")
+            self._finalize_pin_release(pin)
+
     def pin_release_complete(self, pin: StateVersionRootPin) -> bool:
         with self._lock:
             self._active_pin(pin)

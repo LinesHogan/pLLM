@@ -38,7 +38,7 @@ class StablePackedStateView:
     packed_tensors: StablePackedTensorSet
     row_slot_ids: torch.Tensor
     lease_slot_ids: torch.Tensor
-    valid_mask: torch.Tensor
+    valid_masks: StablePackedValidityMasks
     first_row_ids: torch.Tensor
     stability_epoch: StateStabilityEpoch
     version_epoch: PinnedStateVersionEpoch
@@ -54,13 +54,15 @@ workload 名称恢复字段含义。
   tensors，地址在整个 stability epoch 内保持不变。
 - `row_slot_ids` 对齐 packed rows；`lease_slot_ids` 对齐 unique leases；二者都包含
   固定 capacity 的 device tensor，而不是 capture 时读取的 Python metadata。
-- `valid_mask` 关闭 padding；`first_row_ids` 给出每个 unique lease 的 canonical
-  first row。二者与 ID tensors 同样拥有固定地址与固定签名。
+- `StablePackedValidityMasks` 分别关闭 row 与 lease padding；`first_row_ids` 给出
+  每个 unique lease 在 packed row buffer 中的 first row。它们与 ID tensors
+  同样拥有固定地址与固定签名。
 - `StateStabilityEpoch` 绑定 resource、frozen layout、producer epoch 与地址签名。
   epoch 变化意味着旧 capture artifact 不再有效，而不是运行时猜测新类型。
 - `PinnedStateVersionEpoch` 绑定每个 lease 的 slot、generation、logical version，
   以及一个 pinned immutable root。root 含 consumer 所需的 fixed-address state
-  operand/page-map tensors 与其 readiness fence。
+  operand/page-map tensors 与其 writer readiness fence；CUDA view producer 另记录
+  packed view readiness event，consumer stream 必须在读 view 前显式排序。
 - `StateViewCompletionFence` 属于本次 view lease。consumer 在实际执行 stream 上
   记录完成后，producer 才能释放 view buffer 与 root pin。
 
@@ -172,4 +174,3 @@ Rust 不读取 resident/fixed/paged、workload 名称或实现名称来决定 ca
 只保留能覆盖真实错误空间的证据：two-slot/duplicate-row/two-version/ABA 的 CPU
 oracle；一次 old-root pin 与 completion fence 阻止 reclaim 的 GPU smoke；一个
 Rust structural-fact tamper test。不得扩展成 runner、mode 或负向条件的笛卡尔积。
-
