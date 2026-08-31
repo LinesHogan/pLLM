@@ -10,6 +10,10 @@ import pytest
 from tllm import _core
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.packed_rows import (
+    PackedPhaseRowBatch,
+    PackedSamplerRowBatch,
+)
 from tllm.contracts.request_identity import RequestKeyField
 from tllm.schedule.contracts import (
     ExecutionRegion,
@@ -20,6 +24,7 @@ from tllm.schedule.contracts import (
     MemoryPlan,
     PackedHiddenResourceBinding,
     RegionEffect,
+    RegionCompilerAdapter,
     RegionImplementationKind,
     RegionInputBinding,
     RegionInputKind,
@@ -50,6 +55,14 @@ from tllm.workload.ir import (
     WorkloadIR,
 )
 from tllm.workload.lowering import lower_schedule_graph
+from tllm.workload import (
+    Between,
+    declare_workload,
+    packed_request_rows,
+    packed_sampler_rows,
+    task,
+    workload,
+)
 
 
 def _implementation() -> tuple[ImplementationIR, ...]:
@@ -571,4 +584,93 @@ def test_core_compiler_signs_v7_packed_relations_and_rejects_tamper() -> None:
             timeline.to_json(),
             options.to_json(),
             corrupted,
+        )
+
+
+def test_packed_sampler_rows_signs_same_task_relation_capability_and_eager_gate() -> None:
+    rows = packed_request_rows()
+    sampler_rows = packed_sampler_rows(rows=rows)
+
+    @workload(id="packed.sampler_rows")
+    class PackedSamplerRowsWorkload:
+        @task(
+            inputs={"rows": rows, "sampler_rows": sampler_rows},
+            timing=Between("model.execute", "step.end"),
+        )
+        def train(
+            self,
+            rows: PackedPhaseRowBatch,
+            sampler_rows: PackedSamplerRowBatch,
+        ) -> None:
+            _ = rows, sampler_rows
+
+    declaration = declare_workload(PackedSamplerRowsWorkload())
+    assert tuple(item.kind for item in declaration.ir.tasks[0].inputs) == (
+        ValueSourceKind.PACKED_REQUEST_ROWS,
+        ValueSourceKind.PACKED_SAMPLER_ROWS,
+    )
+    assert tuple(
+        item.packed_rows_port for item in declaration.ir.tasks[0].inputs
+    ) == ("", "rows")
+
+    graph = lower_schedule_graph((declaration.ir,))
+    assert graph.tasks[0].required_capabilities == (
+        BackendCapability.PACKED_PHASE_ROWS.value,
+        BackendCapability.PACKED_SAMPLER_ROWS.value,
+    )
+    timeline = MainWorkloadTimeline(
+        backend_id="test",
+        backend_version="1",
+        runner_family="mrv2",
+        graph_mode="eager",
+        anchors=(
+            TimelineAnchor(
+                "model.execute",
+                0,
+                backend_events=(BackendObservableEvent.PREPARE_INPUTS_POST,),
+            ),
+            TimelineAnchor(
+                "step.end",
+                1,
+                backend_events=(BackendObservableEvent.SAMPLE_TOKENS_POST,),
+            ),
+        ),
+        regions=(),
+        static_headroom_bytes=64,
+        capabilities=(
+            BackendCapability.PACKED_PHASE_ROWS.value,
+            BackendCapability.PACKED_SAMPLER_ROWS.value,
+        ),
+        schema_version=2,
+    )
+    decision = ScheduleDecision.from_json(
+        _core.compile_schedule(
+            graph.to_json(), timeline.to_json(), CompileOptions().to_json()
+        )
+    )
+    region = decision.execution_regions[0]
+    rows_binding = next(
+        binding
+        for binding in region.input_bindings
+        if binding.kind is RegionInputKind.PACKED_REQUEST_ROWS
+    )
+    sampler_binding = next(
+        binding
+        for binding in region.input_bindings
+        if binding.kind is RegionInputKind.PACKED_SAMPLER_ROWS
+    )
+    assert sampler_binding.source == "runtime.packed_sampler_rows"
+    assert sampler_binding.packed_rows_binding_id == rows_binding.binding_id
+    assert region.compile_safe is False
+    assert region.compile_command is not None
+    assert region.compile_command.adapter is RegionCompilerAdapter.EAGER
+
+    with pytest.raises(RuntimeError, match="runtime/packed_sampler_rows@1"):
+        _core.compile_schedule(
+            graph.to_json(),
+            replace(
+                timeline,
+                capabilities=(BackendCapability.PACKED_PHASE_ROWS.value,),
+            ).to_json(),
+            CompileOptions().to_json(),
         )

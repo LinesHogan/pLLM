@@ -137,6 +137,13 @@ def lower_schedule_graph(
                     ScheduleCapability.PACKED_PHASE_ROWS.value
                 )
             if any(
+                task_input.kind is ValueSourceKind.PACKED_SAMPLER_ROWS
+                for task_input in task.inputs
+            ):
+                common_capabilities.add(
+                    ScheduleCapability.PACKED_SAMPLER_ROWS.value
+                )
+            if any(
                 task_input.kind is ValueSourceKind.PACKED_HIDDEN
                 for task_input in task.inputs
             ):
@@ -190,6 +197,7 @@ def lower_schedule_graph(
                             task_input.kind
                             not in (
                                 ValueSourceKind.PACKED_REQUEST_ROWS,
+                                ValueSourceKind.PACKED_SAMPLER_ROWS,
                                 ValueSourceKind.PACKED_HIDDEN,
                             )
                             for task_input in task.inputs

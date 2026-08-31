@@ -172,8 +172,9 @@ same service. Native CPU execution now stages those rows and an owned snapshot
 batch under the signed plan epoch/step, resolves packed Region inputs, and
 derives request-state leases from the complete row identities. In particular,
 a decode-plan ordinal is not treated as a sampler mapping, and the current
-decode capture buffer is not reused for prompt-token rows. Explicit driver
-capture and sampler links remain required. A
+decode capture buffer is not reused for prompt-token rows. MRv1/MRv2 now stage
+explicit `logits_indices`-derived sampler-to-packed links under the same signed
+row provenance; ESamp still has to consume those links. A
 bounded retired-step high-watermark prevents a completed `(epoch, step)` from
 being staged again with different rows.
 

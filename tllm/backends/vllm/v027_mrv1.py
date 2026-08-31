@@ -316,6 +316,17 @@ def _wrapped_prepare_inputs(
         out=out,
         num_scheduled_tokens=num_scheduled_tokens,
     )
+    if (
+        packed_rows is not None
+        and packed_execution is not None
+        and packed_execution.requires_packed_sampler_rows
+    ):
+        packed_execution.stage_packed_sampler_rows(
+            _runner_adapter.mrv1_packed_sampler_row_batch(
+                row_batch=packed_rows,
+                logits_indices=view.logits_indices,
+            )
+        )
     _hooks.run_prepare_inputs_post_producers(
         core=core,
         runner=runner,
@@ -480,6 +491,7 @@ class V027MRv1Driver:
             eager_extensions=frozenset(
                 {
                     BackendCapability.PACKED_PHASE_ROWS,
+                    BackendCapability.PACKED_SAMPLER_ROWS,
                     BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT,
                 }
             ),

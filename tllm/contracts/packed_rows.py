@@ -130,8 +130,58 @@ class PackedPhaseRowBatch:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PackedSamplerRowLink:
+    """One exact sampler-row to packed-model-row relation."""
+
+    sampler_row_index: int
+    packed_row_index: int
+
+    def __post_init__(self) -> None:
+        if self.sampler_row_index < 0 or self.packed_row_index < 0:
+            raise ValueError("packed sampler row indices must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class PackedSamplerRowBatch:
+    """Ordered sampler rows whose provenance is one exact packed row batch."""
+
+    row_batch: PackedPhaseRowBatch
+    links: tuple[PackedSamplerRowLink, ...]
+
+    def __post_init__(self) -> None:
+        if tuple(link.sampler_row_index for link in self.links) != tuple(
+            range(len(self.links))
+        ):
+            raise ValueError(
+                "packed sampler links must preserve sampler row order"
+            )
+        if any(
+            link.packed_row_index >= self.row_batch.total_rows
+            for link in self.links
+        ):
+            raise ValueError("packed sampler link is outside its packed row batch")
+
+    @property
+    def plan_epoch(self) -> int:
+        return self.row_batch.plan_epoch
+
+    @property
+    def step_id(self) -> int:
+        return self.row_batch.step_id
+
+    @property
+    def identities(self) -> tuple[RequestIdentity, ...]:
+        return tuple(
+            self.row_batch.rows[link.packed_row_index].identity
+            for link in self.links
+        )
+
+
 __all__ = [
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedRowPlanInputs",
+    "PackedSamplerRowBatch",
+    "PackedSamplerRowLink",
 ]

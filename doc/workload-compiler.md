@@ -267,8 +267,11 @@ input kinds and same-task row provenance are now signed by WorkloadIR v4,
 ScheduleGraph v5, and Decision v7. `NativeWorkloadExecution` stages one exact
 row/snapshot batch, the Region resolver binds signed packed inputs, and packed
 request-state selections come only from `PackedPhaseRowBatch.identities`.
-Driver-provided packed hidden capture and sampler-row mappings still have to
-bind this batch before the native update count can include prefill.
+MRv1/MRv2 packed hidden capture and explicit `logits_indices`-derived sampler
+row links now bind that same batch. The initial link adapter transfers one
+active eager index prefix to CPU, so it is correctness evidence rather than
+aligned-throughput evidence. ESamp still has to consume the links before its
+native update count can include prefill.
 
 The matching eager packed-hidden foundation owns an arbitrary non-empty set of
 exact resource-keyed snapshots under one canonical row batch and an explicit

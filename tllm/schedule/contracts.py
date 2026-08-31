@@ -344,6 +344,7 @@ class ScheduleEffectKind(StrEnum):
 class ScheduleInputKind(StrEnum):
     HIDDEN = "hidden"
     PACKED_REQUEST_ROWS = "packed_request_rows"
+    PACKED_SAMPLER_ROWS = "packed_sampler_rows"
     PACKED_HIDDEN = "packed_hidden"
     RESULT = "result"
     PROVIDED = "provided"
@@ -359,6 +360,7 @@ class ScheduleInputKind(StrEnum):
 
 class ScheduleCapability(StrEnum):
     PACKED_PHASE_ROWS = "runtime/packed_phase_rows@1"
+    PACKED_SAMPLER_ROWS = "runtime/packed_sampler_rows@1"
     PACKED_HIDDEN_BLOCK_OUTPUT = "hidden/block_output/packed@1"
 
 
@@ -379,6 +381,7 @@ class ScheduleStateStorage(StrEnum):
 class RegionInputKind(StrEnum):
     HIDDEN = "hidden"
     PACKED_REQUEST_ROWS = "packed_request_rows"
+    PACKED_SAMPLER_ROWS = "packed_sampler_rows"
     PACKED_HIDDEN = "packed_hidden"
     PROVIDED = "provided"
     MATERIALIZED = "materialized"
@@ -594,6 +597,16 @@ class ScheduleInput:
                 raise ValueError(
                     "packed_hidden ScheduleInput requires packed_rows_port"
                 )
+        elif self.kind is ScheduleInputKind.PACKED_SAMPLER_ROWS:
+            if self.source != "runtime.packed_sampler_rows":
+                raise ValueError(
+                    "packed_sampler_rows ScheduleInput source must be "
+                    "runtime.packed_sampler_rows"
+                )
+            if not self.packed_rows_port:
+                raise ValueError(
+                    "packed_sampler_rows ScheduleInput requires packed_rows_port"
+                )
         elif self.kind is ScheduleInputKind.PACKED_REQUEST_ROWS:
             if self.source != "runtime.packed_phase_rows":
                 raise ValueError(
@@ -609,7 +622,8 @@ class ScheduleInput:
             and self.packed_rows_port
         ):
             raise ValueError(
-                "only packed_hidden or state_selection ScheduleInput may declare "
+                "only packed_hidden, packed_sampler_rows, or state_selection "
+                "ScheduleInput may declare "
                 "packed_rows_port"
             )
 
@@ -979,7 +993,16 @@ class ScheduleGraph:
                 for task_input in task.inputs
                 if task_input.kind is ScheduleInputKind.PACKED_HIDDEN
             )
-            packed_evidence = bool(packed_rows_inputs or packed_hidden_inputs) or any(
+            packed_sampler_rows_inputs = tuple(
+                task_input
+                for task_input in task.inputs
+                if task_input.kind is ScheduleInputKind.PACKED_SAMPLER_ROWS
+            )
+            packed_evidence = bool(
+                packed_rows_inputs
+                or packed_hidden_inputs
+                or packed_sampler_rows_inputs
+            ) or any(
                 task_input.packed_rows_port for task_input in task.inputs
             )
             if self.schema_version < 5 and packed_evidence:
@@ -991,9 +1014,11 @@ class ScheduleGraph:
                     raise ValueError(
                         "one ScheduleTask may declare only one packed_request_rows input"
                     )
-                if packed_hidden_inputs and not packed_rows_inputs:
+                if (
+                    packed_hidden_inputs or packed_sampler_rows_inputs
+                ) and not packed_rows_inputs:
                     raise ValueError(
-                        "packed_hidden ScheduleInput requires packed_request_rows"
+                        "packed input ScheduleInput requires packed_request_rows"
                     )
                 if (
                     any(
@@ -1016,7 +1041,10 @@ class ScheduleGraph:
                 if packed_rows_inputs:
                     packed_rows_port = packed_rows_inputs[0].name
                     for task_input in task.inputs:
-                        if task_input.kind is ScheduleInputKind.PACKED_HIDDEN and (
+                        if task_input.kind in (
+                            ScheduleInputKind.PACKED_HIDDEN,
+                            ScheduleInputKind.PACKED_SAMPLER_ROWS,
+                        ) and (
                             task_input.packed_rows_port != packed_rows_port
                         ):
                             raise ValueError(
@@ -1902,13 +1930,26 @@ class RegionInputBinding:
                 raise ValueError(
                     "packed_request_rows RegionInputBinding must not reference itself"
                 )
+        elif self.kind is RegionInputKind.PACKED_SAMPLER_ROWS:
+            if self.source != "runtime.packed_sampler_rows":
+                raise ValueError(
+                    "packed_sampler_rows RegionInputBinding source must be "
+                    "runtime.packed_sampler_rows"
+                )
+            if not self.packed_rows_binding_id:
+                raise ValueError(
+                    "packed_sampler_rows RegionInputBinding requires "
+                    "packed_rows_binding_id"
+                )
         elif (
             self.kind is not RegionInputKind.PACKED_HIDDEN
+            and self.kind is not RegionInputKind.PACKED_SAMPLER_ROWS
             and self.kind is not RegionInputKind.STATE_SELECTION
             and self.packed_rows_binding_id
         ):
             raise ValueError(
-                "only packed_hidden or state_selection RegionInputBinding may "
+                "only packed_hidden, packed_sampler_rows, or state_selection "
+                "RegionInputBinding may "
                 "declare packed_rows_binding_id"
             )
         object.__setattr__(
@@ -2208,6 +2249,7 @@ class ExecutionRegion:
         for binding in self.input_bindings:
             if binding.kind not in (
                 RegionInputKind.PACKED_HIDDEN,
+                RegionInputKind.PACKED_SAMPLER_ROWS,
                 RegionInputKind.STATE_SELECTION,
             ):
                 continue
@@ -2542,6 +2584,7 @@ class ScheduleDecision:
                 binding.kind
                 in (
                     RegionInputKind.PACKED_REQUEST_ROWS,
+                    RegionInputKind.PACKED_SAMPLER_ROWS,
                     RegionInputKind.PACKED_HIDDEN,
                 )
                 or binding.packed_rows_binding_id

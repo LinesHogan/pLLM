@@ -592,6 +592,22 @@ class PackedRequestRowsInput:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedSamplerRowsInput:
+    """Nominal sampler-row mapping aligned to one packed row batch."""
+
+    rows: PackedRequestRowsInput
+
+    def __post_init__(self) -> None:
+        match self.rows:
+            case PackedRequestRowsInput():
+                pass
+            case _:
+                raise TypeError(
+                    "PackedSamplerRowsInput.rows must be PackedRequestRowsInput"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class StateSelectionInput(Generic[StateValueT]):
     """The exact request-state lease consumed by one task declaration."""
 
@@ -847,6 +863,7 @@ class HostOutputSpec(Generic[PortT_co]):
 InputSpec = (
     HiddenInput
     | PackedRequestRowsInput
+    | PackedSamplerRowsInput
     | PackedHiddenInput
     | ResultInput
     | ProvidedInput
@@ -890,6 +907,15 @@ def packed_request_rows() -> PackedRequestRowsInput:
     """Declare the one nominal packed-row anchor consumed by a task."""
 
     return PackedRequestRowsInput()
+
+
+def packed_sampler_rows(
+    *,
+    rows: PackedRequestRowsInput,
+) -> PackedSamplerRowsInput:
+    """Declare sampler rows that are explicitly linked to packed request rows."""
+
+    return PackedSamplerRowsInput(rows)
 
 
 def packed_hidden(
@@ -1361,11 +1387,14 @@ def _packed_rows_task_input(
 ) -> tuple[str, PackedRequestRowsInput] | None:
     rows_inputs: list[tuple[str, PackedRequestRowsInput]] = []
     packed_hidden_rows: list[PackedRequestRowsInput] = []
+    packed_sampler_rows: list[PackedRequestRowsInput] = []
     selections: list[PackedRequestRowsInput | None] = []
     for name, source in task_inputs:
         match source:
             case PackedRequestRowsInput():
                 rows_inputs.append((name, source))
+            case PackedSamplerRowsInput(rows=rows):
+                packed_sampler_rows.append(rows)
             case PackedHiddenInput(rows=rows):
                 packed_hidden_rows.append(rows)
             case StateSelectionInput(packed_rows=rows):
@@ -1376,6 +1405,7 @@ def _packed_rows_task_input(
         raise ValueError("one task may declare only one packed request rows input")
     related_rows = (
         *packed_hidden_rows,
+        *packed_sampler_rows,
         *(rows for rows in selections if rows is not None),
     )
     if not rows_inputs:
@@ -2069,6 +2099,17 @@ def _input_ir(
                 ValueSourceKind.PACKED_REQUEST_ROWS,
                 "runtime.packed_phase_rows",
             )
+        case PackedSamplerRowsInput(rows=rows):
+            if packed_rows_entry is None or rows is not packed_rows_entry[1]:
+                raise ValueError(
+                    "packed sampler rows has no same-task packed request rows input"
+                )
+            return TaskInputIR(
+                name,
+                ValueSourceKind.PACKED_SAMPLER_ROWS,
+                "runtime.packed_sampler_rows",
+                packed_rows_port=packed_rows_entry[0],
+            )
         case PackedHiddenInput(
             layer=layer,
             layer_kind=layer_kind,
@@ -2430,6 +2471,7 @@ __all__ = [
     "Index",
     "PackedHiddenInput",
     "PackedRequestRowsInput",
+    "PackedSamplerRowsInput",
     "RequestKey",
     "RequestTrainableState",
     "State",
@@ -2444,6 +2486,7 @@ __all__ = [
     "hidden",
     "packed_hidden",
     "packed_request_rows",
+    "packed_sampler_rows",
     "packed_selection",
     "maybe_transition",
     "maybe_optimize",

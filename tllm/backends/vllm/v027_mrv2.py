@@ -152,6 +152,17 @@ def _wrapped_prepare_inputs(
                 graph_mode=resolve_graph_mode(runner),
                 row_batch=packed_rows,
             )
+        if (
+            packed_rows is not None
+            and packed_execution is not None
+            and packed_execution.requires_packed_sampler_rows
+        ):
+            packed_execution.stage_packed_sampler_rows(
+                _runner_adapter.mrv2_packed_sampler_row_batch(
+                    row_batch=packed_rows,
+                    input_batch=input_batch,
+                )
+            )
     _model_region.prepare_model_region_step(
         runtime=runtime,
         runner=runner,
@@ -486,6 +497,7 @@ class V027MRv2Driver:
             eager_extensions=frozenset(
                 {
                     BackendCapability.PACKED_PHASE_ROWS,
+                    BackendCapability.PACKED_SAMPLER_ROWS,
                     BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT,
                 }
             ),

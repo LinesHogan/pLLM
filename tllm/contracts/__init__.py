@@ -13,6 +13,8 @@ from tllm.contracts.packed_rows import (
     PackedPhaseRow,
     PackedPhaseRowBatch,
     PackedRowPlanInputs,
+    PackedSamplerRowBatch,
+    PackedSamplerRowLink,
 )
 from tllm.contracts.packed_hidden import (
     PackedHiddenResourceBinding,
@@ -41,6 +43,8 @@ __all__ = [
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedRowPlanInputs",
+    "PackedSamplerRowBatch",
+    "PackedSamplerRowLink",
     "PackedHiddenResourceBinding",
     "PackedHiddenSnapshot",
     "PackedHiddenSnapshotBatch",

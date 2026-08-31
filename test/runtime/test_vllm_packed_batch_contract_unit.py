@@ -5,11 +5,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tllm.backends.vllm import runner_adapter
 from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
 from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
 from tllm.contracts.packed_rows import PackedRowPlanInputs
+from tllm.runtime.packed_phase_row_staging import PackedPhaseRowStaging
 
 
 def _mrv1_batch(*, indices: dict[str, int]) -> SimpleNamespace:
@@ -128,3 +130,42 @@ def test_mrv2_rejects_mrv1_private_batch_layout() -> None:
             num_scheduled_tokens=[2, 1],
             input_batch=_mrv1_batch(indices={"request-z": 0, "request-a": 1}),
         )
+
+
+@pytest.mark.parametrize("family", ("mrv1", "mrv2"))
+def test_v027_driver_facts_preserve_explicit_sampler_to_packed_permutation(
+    family: str,
+) -> None:
+    rows = PackedPhaseRowStaging().stage(
+        7,
+        11,
+        PackedRowPlanInputs(
+            request_ids=("request-a", "request-b"),
+            scheduled_tokens=(2, 1),
+            prompt_tokens=(2, 1),
+            computed_tokens=(0, 1),
+        ),
+        prompt_indices={"request-a": 3, "request-b": 5},
+        sample_indices={},
+    )
+    logits_indices = torch.tensor((2, 0, 1), dtype=torch.long)
+    if family == "mrv1":
+        links = runner_adapter.mrv1_packed_sampler_row_batch(
+            row_batch=rows,
+            logits_indices=logits_indices[:2],
+        )
+    else:
+        links = runner_adapter.mrv2_packed_sampler_row_batch(
+            row_batch=rows,
+            input_batch=SimpleNamespace(
+                num_reqs=1,
+                logits_indices=logits_indices,
+                cu_num_logits_np=(0, 2),
+            ),
+        )
+
+    assert tuple(
+        (link.sampler_row_index, link.packed_row_index)
+        for link in links.links
+    ) == ((0, 2), (1, 0))
+    assert links.identities == (rows.rows[2].identity, rows.rows[0].identity)

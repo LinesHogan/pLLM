@@ -27,6 +27,7 @@ from tllm.contracts.packed_hidden import (
 from tllm.contracts.packed_rows import (
     PackedPhaseRowBatch,
     PackedRowPlanInputs,
+    PackedSamplerRowBatch,
 )
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
@@ -907,6 +908,13 @@ class _NoRegionValueStore:
         _ = batch
         raise RuntimeError("native execution has no signed packed-hidden input")
 
+    def stage_packed_sampler_rows(
+        self, step_id: int, batch: PackedSamplerRowBatch
+    ) -> None:
+        _ = step_id
+        _ = batch
+        raise RuntimeError("native execution has no signed packed-sampler-row input")
+
     def retire_request_states(
         self, batch: RequestFinishedBatch
     ) -> tuple[StateEffectReceipt, ...]:
@@ -919,6 +927,10 @@ class _NoRegionValueStore:
 
     @property
     def requires_packed_rows(self) -> bool:
+        return False
+
+    @property
+    def requires_packed_sampler_rows(self) -> bool:
         return False
 
     def request_state_version_report(
@@ -1685,6 +1697,24 @@ class NativeWorkloadExecution:
             self._packed_row_staged_steps.add(step_id)
             return batch
 
+    def stage_packed_sampler_rows(
+        self, batch: PackedSamplerRowBatch
+    ) -> None:
+        """Stage exact sampler-to-packed links for the prepared native step."""
+
+        with self._execution_lock:
+            if batch.plan_epoch != self.plan_epoch:
+                raise RuntimeError(
+                    "packed sampler rows belong to another native execution epoch"
+                )
+            if self._prepared_step != batch.step_id:
+                raise RuntimeError(
+                    "packed sampler rows must be staged for the prepared native step"
+                )
+            self._value_store.stage_packed_sampler_rows(
+                batch.step_id, batch
+            )
+
     def packed_rows_for_step(self, step_id: int) -> PackedPhaseRowBatch:
         """Return the canonical packed rows retained for one active step."""
 
@@ -1720,6 +1750,10 @@ class NativeWorkloadExecution:
     @property
     def requires_packed_rows(self) -> bool:
         return self._value_store.requires_packed_rows
+
+    @property
+    def requires_packed_sampler_rows(self) -> bool:
+        return self._value_store.requires_packed_sampler_rows
 
     @property
     def packed_hidden_resources(
@@ -2052,8 +2086,14 @@ class _NoPackedHiddenSnapshots:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _NoPackedSamplerRows:
+    pass
+
+
 _PackedRowsFrameValue = _NoPackedRows | PackedPhaseRowBatch
 _PackedHiddenFrameValue = _NoPackedHiddenSnapshots | PackedHiddenSnapshotBatch
+_PackedSamplerRowsFrameValue = _NoPackedSamplerRows | PackedSamplerRowBatch
 
 
 @dataclass(slots=True)
@@ -2069,6 +2109,9 @@ class _RegionStepFrame:
     packed_rows: _PackedRowsFrameValue = field(default_factory=_NoPackedRows)
     packed_hidden: _PackedHiddenFrameValue = field(
         default_factory=_NoPackedHiddenSnapshots
+    )
+    packed_sampler_rows: _PackedSamplerRowsFrameValue = field(
+        default_factory=_NoPackedSamplerRows
     )
     lock: LockType = field(default_factory=Lock)
 
@@ -2086,6 +2129,7 @@ class _RegionValueStore:
         "_ordinary_request_state_resources",
         "_packed_request_state_resources",
         "_requires_packed_rows",
+        "_requires_packed_sampler_rows",
         "_materializations",
         "_state_versions",
         "_request_state_services",
@@ -2198,6 +2242,10 @@ class _RegionValueStore:
             binding.kind is RegionInputKind.PACKED_REQUEST_ROWS
             for binding in artifact_inputs
         )
+        self._requires_packed_sampler_rows = any(
+            binding.kind is RegionInputKind.PACKED_SAMPLER_ROWS
+            for binding in artifact_inputs
+        )
         self._frames: dict[int, _RegionStepFrame] = {}
         self._frames_lock = Lock()
 
@@ -2220,6 +2268,10 @@ class _RegionValueStore:
     @property
     def requires_packed_rows(self) -> bool:
         return self._requires_packed_rows
+
+    @property
+    def requires_packed_sampler_rows(self) -> bool:
+        return self._requires_packed_sampler_rows
 
     def request_state_version_report(
         self,
@@ -2322,6 +2374,40 @@ class _RegionValueStore:
                 case PackedHiddenSnapshotBatch():
                     raise RuntimeError(
                         "packed hidden snapshots are already staged"
+                    )
+
+    def stage_packed_sampler_rows(
+        self, step_id: int, batch: PackedSamplerRowBatch
+    ) -> None:
+        """Bind one exact sampler-row link batch to staged packed rows."""
+
+        if not self._requires_packed_sampler_rows:
+            raise RuntimeError(
+                "native execution has no signed packed-sampler-row input"
+            )
+        if batch.step_id != step_id:
+            raise RuntimeError("packed sampler rows belong to another step")
+        frame = self._frame(step_id)
+        with frame.lock:
+            match frame.packed_rows:
+                case PackedPhaseRowBatch() as rows if rows is batch.row_batch:
+                    pass
+                case PackedPhaseRowBatch():
+                    raise RuntimeError(
+                        "packed sampler rows differ from the staged rows"
+                    )
+                case _NoPackedRows():
+                    raise RuntimeError(
+                        "packed rows must be staged before sampler rows"
+                    )
+            match frame.packed_sampler_rows:
+                case _NoPackedSamplerRows():
+                    frame.packed_sampler_rows = batch
+                case PackedSamplerRowBatch() as staged if staged is batch:
+                    return
+                case PackedSamplerRowBatch():
+                    raise RuntimeError(
+                        "packed sampler rows are already staged"
                     )
 
     def retire_request_states(
@@ -2551,6 +2637,24 @@ class _RegionValueStore:
         ]
         return snapshots.hidden_for(resource)
 
+    def _required_packed_sampler_rows(
+        self,
+        frame: _RegionStepFrame,
+        context: PhysicalExecutionContext,
+    ) -> PackedSamplerRowBatch:
+        rows = self._required_packed_rows(frame, context)
+        match frame.packed_sampler_rows:
+            case PackedSamplerRowBatch() as sampler_rows:
+                if sampler_rows.row_batch is not rows:
+                    raise RuntimeError(
+                        "packed sampler rows differ from executing rows"
+                    )
+                return sampler_rows
+            case _NoPackedSamplerRows():
+                raise RuntimeError(
+                    "packed sampler rows must be staged before Region execution"
+                )
+
     def resolve_inputs(
         self,
         artifact: "RegionCallableArtifact",
@@ -2599,6 +2703,10 @@ class _RegionValueStore:
                         frame,
                         context,
                         binding,
+                    )
+                elif binding.kind is RegionInputKind.PACKED_SAMPLER_ROWS:
+                    inputs[binding.binding_id] = self._required_packed_sampler_rows(
+                        frame, context
                     )
                 elif binding.kind is RegionInputKind.STATE_SELECTION:
                     service = self._request_state_services[binding.source]

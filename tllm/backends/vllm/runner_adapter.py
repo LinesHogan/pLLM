@@ -6,6 +6,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Protocol, SupportsInt
 
+import torch
+
 from tllm.backends.protocol import (
     RUNNER_BINDING_ATTR,
     RunnerBinding,
@@ -14,7 +16,12 @@ from tllm.backends.protocol import (
     runner_binding_for,
     runner_model_module,
 )
-from tllm.contracts.packed_rows import PackedRowPlanInputs
+from tllm.contracts.packed_rows import (
+    PackedPhaseRowBatch,
+    PackedRowPlanInputs,
+    PackedSamplerRowBatch,
+    PackedSamplerRowLink,
+)
 
 _BINDING_ATTR = RUNNER_BINDING_ATTR
 
@@ -102,6 +109,12 @@ class _MRV2Batch(_ActiveRequestBatch, Protocol):
 
     @property
     def num_computed_tokens_np(self) -> _IntegerColumn: ...
+
+    @property
+    def logits_indices(self) -> torch.Tensor: ...
+
+    @property
+    def cu_num_logits_np(self) -> _IntegerColumn: ...
 
 
 class _MRV1Runner(Protocol):
@@ -260,6 +273,66 @@ def mrv2_packed_row_plan_inputs(
     )
 
 
+def _packed_sampler_row_batch(
+    *,
+    row_batch: PackedPhaseRowBatch,
+    logits_indices: torch.Tensor,
+    row_count: int,
+) -> PackedSamplerRowBatch:
+    """Build correctness-only eager links from vLLM's logits-row tensor.
+
+    The active prefix is transferred once to CPU for eager correctness. This
+    helper is intentionally not throughput evidence; a later device-resident
+    path must preserve this exact link contract without host extraction.
+    """
+
+    if logits_indices.ndim != 1:
+        raise RuntimeError("vLLM logits_indices must be rank-1")
+    if row_count < 0 or row_count > int(logits_indices.numel()):
+        raise RuntimeError("vLLM sampler rows exceed logits_indices")
+    active_indices = logits_indices[:row_count].to(
+        device=torch.device("cpu"), dtype=torch.long
+    )
+    return PackedSamplerRowBatch(
+        row_batch=row_batch,
+        links=tuple(
+            PackedSamplerRowLink(
+                sampler_row_index=row_index,
+                packed_row_index=int(active_indices[row_index]),
+            )
+            for row_index in range(row_count)
+        ),
+    )
+
+
+def mrv1_packed_sampler_row_batch(
+    *,
+    row_batch: PackedPhaseRowBatch,
+    logits_indices: torch.Tensor,
+) -> PackedSamplerRowBatch:
+    """Bind every MRv1 logits/sampler row to its exact packed model row."""
+
+    return _packed_sampler_row_batch(
+        row_batch=row_batch,
+        logits_indices=logits_indices,
+        row_count=int(logits_indices.numel()),
+    )
+
+
+def mrv2_packed_sampler_row_batch(
+    *,
+    row_batch: PackedPhaseRowBatch,
+    input_batch: _MRV2Batch,
+) -> PackedSamplerRowBatch:
+    """Bind only the active MRv2 logits prefix, never static padded rows."""
+
+    return _packed_sampler_row_batch(
+        row_batch=row_batch,
+        logits_indices=input_batch.logits_indices,
+        row_count=int(input_batch.cu_num_logits_np[input_batch.num_reqs]),
+    )
+
+
 def mrv1_finished_request_ids(
     scheduler_output: _MRV1SchedulerOutput,
 ) -> tuple[str, ...]:
@@ -304,10 +377,12 @@ __all__ = [
     "ensure_runner_binding",
     "get_runner_binding",
     "mrv1_packed_row_plan_inputs",
+    "mrv1_packed_sampler_row_batch",
     "mrv1_finished_request_ids",
     "mrv1_active_request_ids",
     "mrv2_active_request_ids",
     "mrv2_packed_row_plan_inputs",
+    "mrv2_packed_sampler_row_batch",
     "runner_active_request_count",
     "runner_device",
     "runner_model_identity",

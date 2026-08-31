@@ -2142,6 +2142,7 @@ class ScheduleContractUnitTest(unittest.TestCase):
 
         packed_capabilities = {
             BackendCapability.PACKED_PHASE_ROWS.value,
+            BackendCapability.PACKED_SAMPLER_ROWS.value,
             BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT.value,
         }
         for driver in (V027MRv1Driver(), V027MRv2Driver()):

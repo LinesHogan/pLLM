@@ -34,6 +34,7 @@ class _PreparedPackedRowsExecution:
     plan_epoch: int = 17
     requires_packed_rows: bool = True
     requires_packed_hidden: bool = True
+    requires_packed_sampler_rows: bool = False
     parameter_overlays: dict[str, int] = field(default_factory=dict)
     step_ids: list[int] = field(default_factory=list)
     columns: list[PackedRowPlanInputs] = field(default_factory=list)

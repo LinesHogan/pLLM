@@ -68,7 +68,8 @@ signed packed resources rather than source/target role text. MRv1/MRv2 now
 install runner-owned eager hooks from exact signed module paths and publish the
 resource bundle before `EXECUTE_MODEL_POST`. ESamp does not yet declare these
 packed inputs, so this does not claim prefill parity, compile, or CUDA-Graph
-support.
+support. The drivers also publish explicit sampler-row links from
+`logits_indices`; ESamp has not yet switched its guidance task to them.
 
 ## Key config knobs (`ESampConsumerConfig`)
 

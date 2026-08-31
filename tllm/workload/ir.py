@@ -90,6 +90,7 @@ class ImplementationKind(StrEnum):
 class ValueSourceKind(StrEnum):
     HIDDEN = "hidden"
     PACKED_REQUEST_ROWS = "packed_request_rows"
+    PACKED_SAMPLER_ROWS = "packed_sampler_rows"
     PACKED_HIDDEN = "packed_hidden"
     RESULT = "result"
     PROVIDED = "provided"
@@ -242,6 +243,16 @@ class TaskInputIR:
                 raise ValueError(
                 "packed_hidden TaskInputIR requires packed_rows_port"
                 )
+        elif self.kind is ValueSourceKind.PACKED_SAMPLER_ROWS:
+            if self.source != "runtime.packed_sampler_rows":
+                raise ValueError(
+                    "packed_sampler_rows TaskInputIR source must be "
+                    "runtime.packed_sampler_rows"
+                )
+            if not self.packed_rows_port:
+                raise ValueError(
+                    "packed_sampler_rows TaskInputIR requires packed_rows_port"
+                )
         elif self.kind is ValueSourceKind.PACKED_REQUEST_ROWS:
             if self.source != "runtime.packed_phase_rows":
                 raise ValueError(
@@ -257,7 +268,8 @@ class TaskInputIR:
             and self.packed_rows_port
         ):
             raise ValueError(
-                "only packed_hidden or state_selection TaskInputIR may declare "
+                "only packed_hidden, packed_sampler_rows, or state_selection "
+                "TaskInputIR may declare "
                 "packed_rows_port"
             )
         if self.kind is ValueSourceKind.RESULT and not self.output:
@@ -473,6 +485,7 @@ class WorkloadIR:
             if task_input.kind
             in (
                 ValueSourceKind.PACKED_REQUEST_ROWS,
+                ValueSourceKind.PACKED_SAMPLER_ROWS,
                 ValueSourceKind.PACKED_HIDDEN,
             )
             or task_input.packed_rows_port
@@ -495,14 +508,21 @@ class WorkloadIR:
                     for task_input in task.inputs
                     if task_input.kind is ValueSourceKind.PACKED_HIDDEN
                 )
+                packed_sampler_rows_inputs = tuple(
+                    task_input
+                    for task_input in task.inputs
+                    if task_input.kind is ValueSourceKind.PACKED_SAMPLER_ROWS
+                )
                 if self.schema_version >= 4:
                     if len(packed_rows_inputs) > 1:
                         raise ValueError(
                             f"task {task.name!r} may declare only one packed_request_rows input"
                         )
-                    if packed_hidden_inputs and not packed_rows_inputs:
+                    if (
+                        packed_hidden_inputs or packed_sampler_rows_inputs
+                    ) and not packed_rows_inputs:
                         raise ValueError(
-                            f"task {task.name!r} packed_hidden input requires packed_request_rows"
+                            f"task {task.name!r} packed input requires packed_request_rows"
                         )
                     if (
                         any(
@@ -525,7 +545,10 @@ class WorkloadIR:
                     if packed_rows_inputs:
                         packed_rows_port = packed_rows_inputs[0].name
                         for task_input in task.inputs:
-                            if task_input.kind is ValueSourceKind.PACKED_HIDDEN and (
+                            if task_input.kind in (
+                                ValueSourceKind.PACKED_HIDDEN,
+                                ValueSourceKind.PACKED_SAMPLER_ROWS,
+                            ) and (
                                 task_input.packed_rows_port != packed_rows_port
                             ):
                                 raise ValueError(

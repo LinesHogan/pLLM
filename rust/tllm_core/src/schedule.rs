@@ -25,6 +25,7 @@ enum TaskImplementationKind {
 enum ScheduleInputKind {
     Hidden,
     PackedRequestRows,
+    PackedSamplerRows,
     PackedHidden,
     Result,
     StateSelection,
@@ -174,6 +175,7 @@ enum ScheduleStateStorage {
 enum RegionInputKind {
     Hidden,
     PackedRequestRows,
+    PackedSamplerRows,
     PackedHidden,
     Provided,
     Materialized,
@@ -192,6 +194,7 @@ impl RegionInputKind {
         match self {
             Self::Hidden => "hidden",
             Self::PackedRequestRows => "packed_request_rows",
+            Self::PackedSamplerRows => "packed_sampler_rows",
             Self::PackedHidden => "packed_hidden",
             Self::Provided => "provided",
             Self::Materialized => "materialized",
@@ -1733,6 +1736,7 @@ const TORCH_EXPORT_CAPABILITY: &str = "torch.export";
 const SIDE_STREAM_SAFE_CAPABILITY: &str = "runtime.side_stream_safe";
 const ASYNC_HOST_SAFE_CAPABILITY: &str = "runtime.async_host_safe";
 const PACKED_REQUEST_ROWS_CAPABILITY: &str = "runtime/packed_phase_rows@1";
+const PACKED_SAMPLER_ROWS_CAPABILITY: &str = "runtime/packed_sampler_rows@1";
 const PACKED_HIDDEN_CAPABILITY: &str = "hidden/block_output/packed@1";
 const CAPTURE_STABLE_STATE_TRANSITION: &str = "optimizer";
 
@@ -1836,6 +1840,13 @@ fn packed_input_capabilities(task: &ScheduleTask) -> BTreeSet<String> {
     if task
         .inputs
         .iter()
+        .any(|input| input.kind == ScheduleInputKind::PackedSamplerRows)
+    {
+        required.insert(PACKED_SAMPLER_ROWS_CAPABILITY.to_owned());
+    }
+    if task
+        .inputs
+        .iter()
         .any(|input| input.kind == ScheduleInputKind::PackedHidden)
     {
         required.insert(PACKED_HIDDEN_CAPABILITY.to_owned());
@@ -1861,7 +1872,9 @@ fn select_task_implementations(
             let has_packed_inputs = task.inputs.iter().any(|input| {
                 matches!(
                     input.kind,
-                    ScheduleInputKind::PackedRequestRows | ScheduleInputKind::PackedHidden
+                    ScheduleInputKind::PackedRequestRows
+                        | ScheduleInputKind::PackedSamplerRows
+                        | ScheduleInputKind::PackedHidden
                 )
             });
             let candidates = if graph.schema_version == 1 {
@@ -2033,7 +2046,9 @@ fn validate_derived_graph_semantics(graph: &ScheduleGraph) -> PyResult<()> {
         let has_packed_inputs = task.inputs.iter().any(|input| {
             matches!(
                 input.kind,
-                ScheduleInputKind::PackedRequestRows | ScheduleInputKind::PackedHidden
+                ScheduleInputKind::PackedRequestRows
+                    | ScheduleInputKind::PackedSamplerRows
+                    | ScheduleInputKind::PackedHidden
             )
         });
         let expected_capture_safe = !has_packed_inputs
@@ -2354,6 +2369,11 @@ fn validate_inputs(
             .iter()
             .filter(|input| input.kind == ScheduleInputKind::PackedHidden)
             .collect();
+        let packed_sampler_rows_inputs: Vec<&ScheduleInput> = task
+            .inputs
+            .iter()
+            .filter(|input| input.kind == ScheduleInputKind::PackedSamplerRows)
+            .collect();
         let has_packed_relation = task.inputs.iter().any(|input| {
             input
                 .packed_rows_port
@@ -2361,7 +2381,9 @@ fn validate_inputs(
                 .is_some_and(|port| !port.is_empty())
         });
         if graph.schema_version < 5
-            && (!packed_rows_inputs.is_empty() || !packed_hidden_inputs.is_empty())
+            && (!packed_rows_inputs.is_empty()
+                || !packed_hidden_inputs.is_empty()
+                || !packed_sampler_rows_inputs.is_empty())
         {
             return Err(value_error(
                 "schedule schemas before v5 forbid packed inputs",
@@ -2373,7 +2395,9 @@ fn validate_inputs(
                     "one task may declare only one packed_request_rows input",
                 ));
             }
-            if (!packed_hidden_inputs.is_empty() || has_packed_relation)
+            if (!packed_hidden_inputs.is_empty()
+                || !packed_sampler_rows_inputs.is_empty()
+                || has_packed_relation)
                 && packed_rows_inputs.is_empty()
             {
                 return Err(value_error(
@@ -2396,6 +2420,11 @@ fn validate_inputs(
                     if input.kind == ScheduleInputKind::PackedHidden && relation != rows.name {
                         return Err(value_error(
                             "packed_hidden packed_rows_port must name the task's packed_request_rows input",
+                        ));
+                    }
+                    if input.kind == ScheduleInputKind::PackedSamplerRows && relation != rows.name {
+                        return Err(value_error(
+                            "packed_sampler_rows packed_rows_port must name the task's packed_request_rows input",
                         ));
                     }
                     if input.kind == ScheduleInputKind::StateSelection && relation != rows.name {
@@ -2457,6 +2486,7 @@ fn validate_inputs(
                 ScheduleInputKind::Result
                 | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::PackedRequestRows
+                | ScheduleInputKind::PackedSamplerRows
                 | ScheduleInputKind::Provided
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
@@ -2478,6 +2508,7 @@ fn validate_inputs(
                 }
                 ScheduleInputKind::Provided
                 | ScheduleInputKind::PackedRequestRows
+                | ScheduleInputKind::PackedSamplerRows
                 | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Staged
                 | ScheduleInputKind::SamplerRequestIds
@@ -2504,6 +2535,13 @@ fn validate_inputs(
                         "packed_request_rows input requires runtime.packed_phase_rows",
                     ));
                 }
+                ScheduleInputKind::PackedSamplerRows
+                    if input.source != "runtime.packed_sampler_rows" =>
+                {
+                    return Err(value_error(
+                        "packed_sampler_rows input requires runtime.packed_sampler_rows",
+                    ));
+                }
                 _ => {}
             }
             let relation = input.packed_rows_port.as_deref().unwrap_or("");
@@ -2514,11 +2552,13 @@ fn validate_inputs(
             }
             if !matches!(
                 input.kind,
-                ScheduleInputKind::PackedHidden | ScheduleInputKind::StateSelection
+                ScheduleInputKind::PackedHidden
+                    | ScheduleInputKind::PackedSamplerRows
+                    | ScheduleInputKind::StateSelection
             ) && !relation.is_empty()
             {
                 return Err(value_error(
-                    "only packed_hidden or state_selection may declare packed_rows_port",
+                    "only packed_hidden, packed_sampler_rows, or state_selection may declare packed_rows_port",
                 ));
             }
             if input.kind == ScheduleInputKind::Hidden {
@@ -2543,6 +2583,13 @@ fn validate_inputs(
             {
                 return Err(schedule_error(
                     "packed_hidden input requires hidden/block_output/packed@1",
+                ));
+            }
+            if input.kind == ScheduleInputKind::PackedSamplerRows
+                && !capabilities.contains(PACKED_SAMPLER_ROWS_CAPABILITY)
+            {
+                return Err(schedule_error(
+                    "packed_sampler_rows input requires runtime/packed_sampler_rows@1",
                 ));
             }
         }
@@ -3383,6 +3430,7 @@ fn draft_capture_safe(
                 }
                 ScheduleInputKind::Provided
                 | ScheduleInputKind::PackedRequestRows
+                | ScheduleInputKind::PackedSamplerRows
                 | ScheduleInputKind::PackedHidden
                 | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::Staged
@@ -4774,6 +4822,7 @@ fn compile_impl(
                     let region_kind = match input.kind {
                         ScheduleInputKind::Hidden => RegionInputKind::Hidden,
                         ScheduleInputKind::PackedRequestRows => RegionInputKind::PackedRequestRows,
+                        ScheduleInputKind::PackedSamplerRows => RegionInputKind::PackedSamplerRows,
                         ScheduleInputKind::PackedHidden => RegionInputKind::PackedHidden,
                         ScheduleInputKind::StateSelection => RegionInputKind::StateSelection,
                         ScheduleInputKind::Provided => RegionInputKind::Provided,
@@ -5437,6 +5486,9 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                 || (binding.kind == RegionInputKind::PackedRequestRows
                     && (binding.source != "runtime.packed_phase_rows"
                         || !packed_rows_binding_id.is_empty()))
+                || (binding.kind == RegionInputKind::PackedSamplerRows
+                    && (binding.source != "runtime.packed_sampler_rows"
+                        || packed_rows_binding_id.is_empty()))
                 || (binding.layer_kind == HiddenLayerKind::Index && binding.layer_index.is_none())
                 || (binding.layer_kind != HiddenLayerKind::Index && binding.layer_index.is_some())
                 || (!matches!(
@@ -5447,7 +5499,9 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                     || binding.phase != HiddenPhase::None))
                 || (!matches!(
                     binding.kind,
-                    RegionInputKind::PackedHidden | RegionInputKind::StateSelection
+                    RegionInputKind::PackedHidden
+                        | RegionInputKind::PackedSamplerRows
+                        | RegionInputKind::StateSelection
                 ) && !packed_rows_binding_id.is_empty())
             {
                 return Err(schedule_error(
@@ -5483,6 +5537,8 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                 }
                 if (input.kind == ScheduleInputKind::PackedRequestRows)
                     != (binding.kind == RegionInputKind::PackedRequestRows)
+                    || (input.kind == ScheduleInputKind::PackedSamplerRows)
+                        != (binding.kind == RegionInputKind::PackedSamplerRows)
                     || (input.kind == ScheduleInputKind::PackedHidden)
                         != (binding.kind == RegionInputKind::PackedHidden)
                 {
