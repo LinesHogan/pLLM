@@ -7,6 +7,10 @@ from enum import StrEnum
 from typing import NewType
 
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.request_identity import (
+    RequestKeyField,
+    canonical_request_key_fields,
+)
 
 
 WorkloadId = NewType("WorkloadId", str)
@@ -20,6 +24,7 @@ StateResource = NewType("StateResource", str)
 
 class ExecutionKind(StrEnum):
     HOST_SERVICE = "host_service"
+    NATIVE_TASK = "native_task"
 
 
 class StateScope(StrEnum):
@@ -65,12 +70,22 @@ class PackedRowsInputSource:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedSamplerRowsInputSource:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class StateSelectionInputSource:
     resource: StateResource
+    phase: HiddenPhase
 
     def __post_init__(self) -> None:
-        if not self.resource:
-            raise ValueError("state selection requires a resource")
+        if (
+            not self.resource
+            or type(self.phase) is not HiddenPhase
+            or self.phase is HiddenPhase.NONE
+        ):
+            raise ValueError("state selection requires a resource and phase")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +102,7 @@ SemanticInputSource = (
     HiddenInputSource
     | StepIdInputSource
     | PackedRowsInputSource
+    | PackedSamplerRowsInputSource
     | StateSelectionInputSource
     | TaskResultInputSource
 )
@@ -105,6 +121,7 @@ class SemanticInput:
                 HiddenInputSource()
                 | StepIdInputSource()
                 | PackedRowsInputSource()
+                | PackedSamplerRowsInputSource()
                 | StateSelectionInputSource()
                 | TaskResultInputSource()
             ):
@@ -127,10 +144,14 @@ class SemanticOutput:
 class SemanticState:
     resource: StateResource
     scope: StateScope
+    key_fields: tuple[RequestKeyField, ...]
 
     def __post_init__(self) -> None:
+        canonical_request_key_fields(self.key_fields)
         if not self.resource or type(self.scope) is not StateScope:
-            raise ValueError("semantic state requires a resource and closed scope")
+            raise ValueError(
+                "semantic request state requires a resource and canonical key fields"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +399,7 @@ __all__ = [
     "PhysicalPlan",
     "PhysicalTask",
     "PackedRowsInputSource",
+    "PackedSamplerRowsInputSource",
     "ScheduleDecision",
     "ScheduledTask",
     "SchedulerTimeline",

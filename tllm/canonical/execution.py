@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
-from tllm.contracts.semantic_graph import ImplementationId, PhysicalPlan
+from tllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan
 
 
 InputT = TypeVar("InputT", contravariant=True)
 OutputT = TypeVar("OutputT", covariant=True)
 ExecutionInputT = TypeVar("ExecutionInputT")
 ExecutionOutputT = TypeVar("ExecutionOutputT")
+ExecutionContextT = TypeVar("ExecutionContextT")
+TaskContextT = TypeVar("TaskContextT", contravariant=True)
 
 
 class SingleTaskImplementation(Protocol[InputT, OutputT]):
@@ -19,6 +21,13 @@ class SingleTaskImplementation(Protocol[InputT, OutputT]):
     def implementation_id(self) -> ImplementationId: ...
 
     def execute(self, value: InputT) -> OutputT: ...
+
+
+class TaskGraphImplementation(Protocol[TaskContextT]):
+    @property
+    def implementation_id(self) -> ImplementationId: ...
+
+    def execute(self, context: TaskContextT) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,4 +55,148 @@ class SingleTaskExecution(Generic[ExecutionInputT, ExecutionOutputT]):
         return self.implementation.execute(value)
 
 
-__all__ = ["SingleTaskExecution", "SingleTaskImplementation"]
+@dataclass(frozen=True, slots=True)
+class TaskGraphExecution(Generic[ExecutionContextT]):
+    """Mechanically execute Rust-planned tasks by dense semantic task ID."""
+
+    plan: PhysicalPlan
+    implementations: tuple[TaskGraphImplementation[ExecutionContextT], ...]
+
+    def __post_init__(self) -> None:
+        task_ids = tuple(int(task.task_id) for task in self.plan.tasks)
+        if (
+            self.plan.fallback_count != 0
+            or len(task_ids) != len(self.implementations)
+            or tuple(sorted(task_ids)) != tuple(range(len(task_ids)))
+            or any(
+                left.anchor_id > right.anchor_id
+                for left, right in zip(
+                    self.plan.tasks,
+                    self.plan.tasks[1:],
+                )
+            )
+        ):
+            raise ValueError(
+                "task-graph execution requires a complete zero-fallback dense plan"
+            )
+        if any(
+            self.implementations[int(task.task_id)].implementation_id
+            != task.implementation_id
+            for task in self.plan.tasks
+        ):
+            raise ValueError(
+                "task-graph implementation differs from the Rust physical plan"
+            )
+
+    def start(
+        self,
+        context: ExecutionContextT,
+    ) -> "TaskGraphInvocation[ExecutionContextT]":
+        return TaskGraphInvocation(
+            self.plan.schedule_signature,
+            self.plan.plan_epoch,
+            context,
+        )
+
+    def execute_anchor(
+        self,
+        invocation: "TaskGraphInvocation[ExecutionContextT]",
+        anchor_id: AnchorId,
+    ) -> None:
+        if invocation.plan_identity != (
+            self.plan.schedule_signature,
+            self.plan.plan_epoch,
+        ):
+            raise ValueError("task invocation belongs to another physical plan")
+        invocation.execute_anchor(
+            self.plan,
+            self.implementations,
+            anchor_id,
+        )
+
+    def finish(
+        self,
+        invocation: "TaskGraphInvocation[ExecutionContextT]",
+    ) -> ExecutionContextT:
+        if invocation.plan_identity != (
+            self.plan.schedule_signature,
+            self.plan.plan_epoch,
+        ):
+            raise ValueError("task invocation belongs to another physical plan")
+        return invocation.finish(self.plan)
+
+
+class TaskGraphInvocation(Generic[ExecutionContextT]):
+    """One staged execution cursor advanced only by signed anchor events."""
+
+    __slots__ = (
+        "_schedule_signature",
+        "_plan_epoch",
+        "_context",
+        "_next_task_index",
+        "_last_anchor_id",
+        "_finished",
+    )
+
+    def __init__(
+        self,
+        schedule_signature: str,
+        plan_epoch: int,
+        context: ExecutionContextT,
+    ) -> None:
+        self._schedule_signature = schedule_signature
+        self._plan_epoch = plan_epoch
+        self._context = context
+        self._next_task_index = 0
+        self._last_anchor_id = -1
+        self._finished = False
+
+    @property
+    def plan_identity(self) -> tuple[str, int]:
+        return (self._schedule_signature, self._plan_epoch)
+
+    @property
+    def context(self) -> ExecutionContextT:
+        return self._context
+
+    @property
+    def last_anchor_id(self) -> int:
+        return self._last_anchor_id
+
+    def execute_anchor(
+        self,
+        plan: PhysicalPlan,
+        implementations: tuple[TaskGraphImplementation[ExecutionContextT], ...],
+        anchor_id: AnchorId,
+    ) -> None:
+        dense_anchor = int(anchor_id)
+        if self._finished or dense_anchor < 0 or dense_anchor < self._last_anchor_id:
+            raise RuntimeError("task invocation anchor progression is invalid")
+        if (
+            self._next_task_index < len(plan.tasks)
+            and int(plan.tasks[self._next_task_index].anchor_id) < dense_anchor
+        ):
+            raise RuntimeError("task invocation skipped a signed execution anchor")
+        while (
+            self._next_task_index < len(plan.tasks)
+            and int(plan.tasks[self._next_task_index].anchor_id) == dense_anchor
+        ):
+            task = plan.tasks[self._next_task_index]
+            implementations[int(task.task_id)].execute(self._context)
+            self._next_task_index += 1
+        self._last_anchor_id = dense_anchor
+
+    def finish(self, plan: PhysicalPlan) -> ExecutionContextT:
+        if self._finished or self._next_task_index != len(plan.tasks):
+            raise RuntimeError("task invocation has unfinished signed tasks")
+        self._finished = True
+        return self._context
+
+
+__all__ = [
+    "SingleTaskExecution",
+    "SingleTaskImplementation",
+    "TaskGraphExecution",
+    "TaskGraphImplementation",
+    "TaskGraphInvocation",
+]

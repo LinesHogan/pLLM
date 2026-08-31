@@ -32,12 +32,14 @@ pub(crate) enum InputSource {
     StepId,
     StateSelection {
         resource: String,
+        phase: HiddenPhase,
     },
     Result {
         task: String,
         output: String,
     },
     PackedRows,
+    PackedSamplerRows,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -54,6 +56,14 @@ pub(crate) enum StateScope {
     Request,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RequestKeyField {
+    RequestId,
+    PromptIdx,
+    SampleIdx,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StateEffectKind {
@@ -65,6 +75,7 @@ pub(crate) enum StateEffectKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionKind {
     HostService,
+    NativeTask,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -93,6 +104,7 @@ pub(crate) struct TypedOutput {
 pub(crate) struct SemanticState {
     pub(crate) resource: String,
     pub(crate) scope: StateScope,
+    pub(crate) key_fields: Vec<RequestKeyField>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -185,7 +197,7 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
     for input in &task.inputs {
         require_text(&input.name, "tasks.inputs.name")?;
         match &input.source {
-            InputSource::StateSelection { resource } => {
+            InputSource::StateSelection { resource, .. } => {
                 require_text(resource, "tasks.inputs.source.resource")?;
             }
             InputSource::Result { task, output } => {
@@ -194,7 +206,8 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
             }
             InputSource::Hidden { .. }
             | InputSource::StepId
-            | InputSource::PackedRows => {}
+            | InputSource::PackedRows
+            | InputSource::PackedSamplerRows => {}
         }
     }
     if task
@@ -279,6 +292,10 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     }
     for state in &graph.states {
         require_text(&state.resource, "states.resource")?;
+        if state.key_fields.is_empty() || state.key_fields.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err("request state key fields must be sorted unique".to_owned());
+        }
     }
     if graph
         .states
@@ -317,7 +334,7 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
         for input in &task.inputs {
             match &input.source {
                 InputSource::Hidden { .. } | InputSource::StepId => {}
-                InputSource::StateSelection { resource } => {
+                InputSource::StateSelection { resource, .. } => {
                     let state = graph
                         .states
                         .binary_search_by(|state| state.resource.cmp(resource))
@@ -355,7 +372,7 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
                         );
                     }
                 }
-                InputSource::PackedRows => {}
+                InputSource::PackedRows | InputSource::PackedSamplerRows => {}
             }
         }
         for effect in &task.effects {

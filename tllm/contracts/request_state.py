@@ -10,6 +10,7 @@ import torch
 from tllm.contracts.request_identity import (
     RequestIdentity,
     RequestKeyField,
+    canonical_request_key_fields,
 )
 from tllm.contracts.state_ref import LineageId, VersionId
 
@@ -29,10 +30,7 @@ class RequestStateKey:
         identity: RequestIdentity,
         fields: tuple[RequestKeyField, ...],
     ) -> "RequestStateKey":
-        if not fields:
-            raise ValueError("request state key projection requires fields")
-        if len(fields) != len(set(fields)):
-            raise ValueError("request state key fields must be unique")
+        fields = canonical_request_key_fields(fields)
         if RequestKeyField.REQUEST_ID in fields and not identity.request_id:
             raise ValueError("request_id state key requires a non-empty request id")
         if RequestKeyField.PROMPT_IDX in fields and identity.prompt_idx < 0:

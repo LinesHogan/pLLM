@@ -216,6 +216,5 @@ def test_cpu_dense_page_provider_consumes_signed_plans_and_preserves_pinned_v0()
     provider.release_pin(pinned_v0)
     with pytest.raises(RuntimeError, match="unknown or reclaimed"):
         provider.root(first_v0)
-    provider.retire(first_v1)
-    provider.retire(second_v1)
+    provider.retire_batch((first_v1, second_v1))
     assert provider.free_pages == 6

@@ -333,6 +333,22 @@ class DensePageStateProvider:
         with self._lock:
             return len(self._free_page_ids)
 
+    def new_zero_root_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Allocate one typed, unowned root image from the signed layout."""
+
+        return tuple(
+            torch.zeros(
+                field.shape,
+                dtype=pool.dtype,
+                device=self._device,
+            )
+            for field, pool in zip(
+                self._layout.fields,
+                self._pools,
+                strict=True,
+            )
+        )
+
     def admit_batch(
         self,
         admissions: tuple[DensePageAdmission, ...],
@@ -594,31 +610,41 @@ class DensePageStateProvider:
             root = self._stored_root(ref).root
             return tuple(pool[root.page_id].detach().clone() for pool in self._pools)
 
-    def retire(self, ref: StateRef) -> None:
-        """Retire an exact latest root only after all retained versions reclaim."""
+    def retire_batch(self, refs: tuple[StateRef, ...]) -> None:
+        """Atomically retire exact latest, fully unpinned lineage roots."""
 
         with self._lock:
             self._require_no_pending_transition()
             self._reclaim_unpinned_roots()
-            stored = self._stored_root(ref)
-            if (
-                ref.lineage_id not in self._latest_by_lineage
-                or self._latest_by_lineage[ref.lineage_id] != ref
-            ):
-                raise RuntimeError("dense page retirement requires the latest root")
-            if stored.pins:
-                raise RuntimeError("cannot retire a pinned dense page root")
-            if any(
-                candidate.lineage_id == ref.lineage_id and candidate != ref
-                for candidate in self._roots
-            ):
-                raise RuntimeError(
-                    "cannot retire a lineage with retained dense page roots"
-                )
-            self._roots.pop(ref)
-            self._latest_by_lineage.pop(ref.lineage_id)
-            self._admitted_lineages.remove(ref.lineage_id)
-            self._return_pages((stored.root.page_id,))
+            if not refs or len(refs) != len(set(refs)):
+                raise ValueError("dense page retirement requires unique roots")
+            lineages = tuple(ref.lineage_id for ref in refs)
+            if len(lineages) != len(set(lineages)):
+                raise ValueError("dense page retirement requires unique lineages")
+            stored_roots = tuple(self._stored_root(ref) for ref in refs)
+            for ref, stored in zip(refs, stored_roots, strict=True):
+                if (
+                    ref.lineage_id not in self._latest_by_lineage
+                    or self._latest_by_lineage[ref.lineage_id] != ref
+                ):
+                    raise RuntimeError(
+                        "dense page retirement requires the latest root"
+                    )
+                if stored.pins:
+                    raise RuntimeError("cannot retire a pinned dense page root")
+                if any(
+                    candidate.lineage_id == ref.lineage_id and candidate != ref
+                    for candidate in self._roots
+                ):
+                    raise RuntimeError(
+                        "cannot retire a lineage with retained dense page roots"
+                    )
+            page_ids = tuple(stored.root.page_id for stored in stored_roots)
+            for ref in refs:
+                self._roots.pop(ref)
+                self._latest_by_lineage.pop(ref.lineage_id)
+                self._admitted_lineages.remove(ref.lineage_id)
+            self._return_pages(page_ids)
 
     def _require_admission_ref(self, ref: StateRef) -> None:
         if (

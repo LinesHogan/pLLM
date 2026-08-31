@@ -17,6 +17,30 @@ class RequestKeyField(StrEnum):
     SAMPLE_IDX = "sample_idx"
 
 
+def canonical_request_key_fields(
+    fields: tuple[RequestKeyField, ...],
+) -> tuple[RequestKeyField, ...]:
+    """Return one exact canonical request-key declaration or reject it."""
+
+    canonical = tuple(
+        field
+        for field in (
+            RequestKeyField.REQUEST_ID,
+            RequestKeyField.PROMPT_IDX,
+            RequestKeyField.SAMPLE_IDX,
+        )
+        if field in fields
+    )
+    if (
+        type(fields) is not tuple
+        or not fields
+        or any(type(field) is not RequestKeyField for field in fields)
+        or fields != canonical
+    ):
+        raise ValueError("request key fields must be closed, sorted, and unique")
+    return fields
+
+
 @dataclass(frozen=True, slots=True)
 class RequestIdentity:
     request_id: str
