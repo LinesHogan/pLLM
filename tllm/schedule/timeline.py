@@ -78,6 +78,9 @@ def export_main_workload_timeline(
     capability_names = set(capabilities.capability_names())
     if graph_mode == "eager":
         capability_names.add("eager_only")
+        capability_names.update(
+            capability.value for capability in capabilities.eager_extensions
+        )
     capability_names.update(
         f"sampler/{stage.name.lower()}" for stage in capabilities.sampler_stages
     )

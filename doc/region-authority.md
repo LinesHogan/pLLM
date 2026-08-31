@@ -188,8 +188,10 @@ inline. Parent, worker, and local execution also compare an independent packed
 module-path manifest before binding resources. The CPU runtime resolver maps
 signed binding IDs directly to exact resource-keyed snapshots; it never reads
 ordinary residual buffers or infers roles from workload names. The service is
-still not installed in a backend hook and no CUDA Graph path is claimed;
-therefore this foundation alone changes no ESamp execution claim.
+installed as a runner-owned MRv1/MRv2 eager forward hook using exact
+`module_path` resolution. Packed capabilities are absent from non-eager
+timelines, and no CUDA Graph path is claimed; therefore this foundation alone
+changes no ESamp execution claim.
 
 A fresh release wheel imported from an isolated extraction directory and ran a
 schema-v2 `compile_schedule`/`validate_schedule` static-isl smoke. Its extension

@@ -50,6 +50,11 @@ def runner_device(runner: object) -> "torch.device":
 
 if TYPE_CHECKING:
     import torch
+    from tllm.contracts.packed_hidden import (
+        PackedHiddenResourceBinding,
+        PackedHiddenSnapshotBatch,
+    )
+    from tllm.contracts.packed_rows import PackedPhaseRowBatch
     from tllm.runtime.parameter_overlay import (
         OverlayChannel,
         DenseOperandCapture,
@@ -60,6 +65,32 @@ if TYPE_CHECKING:
         OverlayVersionStore,
     )
     from tllm.schedule import MainWorkloadTimeline
+
+
+class PackedHiddenSnapshotSink(Protocol):
+    def stage_packed_hidden_snapshots(
+        self, batch: "PackedHiddenSnapshotBatch"
+    ) -> None: ...
+
+
+class PackedHiddenCaptureBinding(Protocol):
+    @property
+    def plan_epoch(self) -> int: ...
+
+    @property
+    def resources(self) -> tuple["PackedHiddenResourceBinding", ...]: ...
+
+    def begin(self, row_batch: "PackedPhaseRowBatch") -> None: ...
+
+    def publish(
+        self, execution: PackedHiddenSnapshotSink | None = None
+    ) -> "PackedHiddenSnapshotBatch": ...
+
+    def finish(self) -> None: ...
+
+    def abort_if_active(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 class SamplerStage(Enum):
@@ -264,6 +295,7 @@ class BackendCapabilities:
     parameter_overlay: VersionedParameterOverlayCapabilities | None = None
     model_region: ModelRegionCapabilities | None = None
     extensions: frozenset[BackendCapability] = frozenset()
+    eager_extensions: frozenset[BackendCapability] = frozenset()
     hidden_locators: frozenset[HiddenLocatorCapability] = frozenset()
 
     def capability_names(self) -> frozenset[str]:
@@ -284,7 +316,6 @@ class BackendCapabilities:
             locator.value for locator in self.hidden_locators
         )
         return parameter_names | region_names | extension_names | locator_names
-
 
 class RunnerBindingDriver(Protocol):
     """Driver surface retained by a live per-runner binding."""
@@ -338,6 +369,7 @@ class RunnerBinding:
         default_factory=OverlayBackendState
     )
     typed_layer_replay_handle: TypedLayerReplayHandle | None = None
+    packed_hidden_capture: PackedHiddenCaptureBinding | None = None
     active: bool = True
 
 

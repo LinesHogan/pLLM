@@ -11,6 +11,7 @@
     "tllm/kit/workload.py",
     "tllm/backends/protocol.py",
     "tllm/backends/vllm/dense_parameter_overlay.py",
+    "tllm/backends/vllm/packed_hidden_capture.py",
     "tllm/backends/vllm/runner_adapter.py",
     "tllm/backends/vllm/typed_layer_replay.py",
     "tllm/backends/vllm/versioned_parameter_overlay.py",

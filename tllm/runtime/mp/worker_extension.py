@@ -247,6 +247,18 @@ def _decision_requires_hidden_taps(decision: "ScheduleDecision") -> bool:
     )
 
 
+def _decision_requires_packed_hidden(decision: "ScheduleDecision") -> bool:
+    """Read resource-keyed eager capture requirements from signed Regions."""
+
+    from tllm.schedule.contracts import RegionInputKind
+
+    return any(
+        binding.kind is RegionInputKind.PACKED_HIDDEN
+        for region in decision.execution_regions
+        for binding in region.input_bindings
+    )
+
+
 def _wire_sha256(value: object, label: str) -> str:
     if type(value) is not str or len(value) != 64:
         raise TypeError(f"{label} must be a lowercase SHA-256 digest")
@@ -1062,11 +1074,15 @@ class TllmWorkerExtension:
             if specs
             else None
         )
-        needs_hidden_taps = (
-            bindings is not None and _decision_requires_hidden_taps(compilation.decision)
+        needs_model_hooks = (
+            bindings is not None
+            and (
+                _decision_requires_hidden_taps(compilation.decision)
+                or _decision_requires_packed_hidden(compilation.decision)
+            )
         )
         runner = _runner_of(self)
-        if needs_hidden_taps and not _runner_has_loaded_model(runner):
+        if needs_model_hooks and not _runner_has_loaded_model(runner):
             raise RuntimeError(
                 "native hidden-input workload requires a loaded worker model"
             )
@@ -1157,6 +1173,8 @@ class TllmWorkerExtension:
                 replacement_paths != dict(staged.residual_raw_paths)
                 or _decision_requires_hidden_taps(compilation.decision)
                 != previous.requires_decode_hidden
+                or bindings.packed_hidden_resources
+                != previous.packed_hidden_resources
             )
             if topology_changed:
                 raise RuntimeError(
@@ -1250,20 +1268,27 @@ class TllmWorkerExtension:
                     core.RUNTIME.native_schedule_graph = staged.compilation.graph
                     core.RUNTIME.native_workloads_pending = True
                     core.RUNTIME.residual_raw_paths = dict(bindings.residual_paths)
-                    if _decision_requires_hidden_taps(staged.compilation.decision):
+                    requires_ordinary_hidden = _decision_requires_hidden_taps(
+                        staged.compilation.decision
+                    )
+                    requires_packed_hidden = _decision_requires_packed_hidden(
+                        staged.compilation.decision
+                    )
+                    if requires_ordinary_hidden or requires_packed_hidden:
                         runner = _runner_of(self)
                         if not _runner_has_loaded_model(runner):
                             raise RuntimeError(
                                 "native hidden-input workload requires a loaded worker model"
                             )
-                        from tllm.runtime.vllm_patch.port_runtime_hooks import (
-                            setup_runtime_hooks_transactionally,
-                        )
+                        if requires_ordinary_hidden:
+                            from tllm.runtime.vllm_patch.port_runtime_hooks import (
+                                setup_runtime_hooks_transactionally,
+                            )
 
-                        staged.hook_transaction = setup_runtime_hooks_transactionally(
-                            core=core,
-                            runner=_hook_runner(runner),
-                        )
+                            staged.hook_transaction = setup_runtime_hooks_transactionally(
+                                core=core,
+                                runner=_hook_runner(runner),
+                            )
                 if isinstance(execution, NativeWorkloadExecution):
                     if store is None or store.current is not execution:
                         raise RuntimeError("worker initial workload execution store diverged")

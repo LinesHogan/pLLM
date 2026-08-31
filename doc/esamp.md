@@ -64,10 +64,11 @@ selection only from the complete row identities. A separate eager
 `PackedHiddenSnapshotService` now owns exact full-packed resource-keyed clones
 under an explicit epoch, capacity, hidden-size, dtype, and device
 specialization. The underlying service is generic: tensors are keyed by exact
-signed packed resources rather than source/target role text. ESamp does not
-yet declare these packed inputs and the service
-is not installed in vLLM hooks, so this deliberately does not reuse decode
-buffers or claim prefill parity, compile, or CUDA-Graph support.
+signed packed resources rather than source/target role text. MRv1/MRv2 now
+install runner-owned eager hooks from exact signed module paths and publish the
+resource bundle before `EXECUTE_MODEL_POST`. ESamp does not yet declare these
+packed inputs, so this does not claim prefill parity, compile, or CUDA-Graph
+support.
 
 ## Key config knobs (`ESampConsumerConfig`)
 

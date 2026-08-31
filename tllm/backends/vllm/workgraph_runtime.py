@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -10,6 +10,9 @@ from tllm.backends.protocol import BackendCapabilities
 from tllm.runtime.graph_policy import GraphMode
 from tllm.runtime.static_resources import static_device_headroom_bytes
 from tllm.workgraph.anchors import BackendResolution
+
+if TYPE_CHECKING:
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
 
 
 def runner_static_headroom_bytes(runner: object, *, configured_budget: int) -> int:
@@ -93,13 +96,11 @@ def _runner_max_prefill_tokens(runner: object) -> int:
     )
 
 
-def cold_specialize_loaded_runtime(*, core: object, runner: object) -> None:
-    """Publish model-layout facts while still inside the vLLM quarantine."""
+def runner_runtime_specialization(
+    runner: object,
+) -> "RuntimeSpecializationSpec":
+    """Read the exact typed model facts at the external runner boundary."""
 
-    from tllm.runtime import residual_runtime
-
-    if core is not residual_runtime:
-        return
     from tllm.runtime.specialization import RuntimeSpecializationSpec
 
     model_config = runner.model_config  # type: ignore[attr-defined]
@@ -112,7 +113,7 @@ def cold_specialize_loaded_runtime(*, core: object, runner: object) -> None:
         if type(raw_layer_count) is not int or raw_layer_count < 1:
             raise RuntimeError("vLLM backend driver must report model layer count >= 1")
         model_layer_count = raw_layer_count
-    spec = RuntimeSpecializationSpec(
+    return RuntimeSpecializationSpec(
         rows=max(1, int(runner.max_num_reqs)),  # type: ignore[attr-defined]
         hidden_size=int(model_config.get_hidden_size()),
         dtype=model_config.dtype,
@@ -120,6 +121,16 @@ def cold_specialize_loaded_runtime(*, core: object, runner: object) -> None:
         model_layer_count=model_layer_count,
         max_prefill_tokens=_runner_max_prefill_tokens(runner),
     )
+
+
+def cold_specialize_loaded_runtime(*, core: object, runner: object) -> None:
+    """Publish model-layout facts while still inside the vLLM quarantine."""
+
+    from tllm.runtime import residual_runtime
+
+    if core is not residual_runtime:
+        return
+    spec = runner_runtime_specialization(runner)
     from tllm.runtime.runtime import active_runtime
 
     active_runtime().cold_specialize_workloads(spec)

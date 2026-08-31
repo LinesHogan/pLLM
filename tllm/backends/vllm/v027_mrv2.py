@@ -28,12 +28,14 @@ from tllm.backends.protocol import (
     RunnerBinding,
     SamplerStage,
     VersionedParameterOverlayCapabilities,
+    runner_model_module,
 )
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.backends.vllm import runner_adapter as _runner_adapter
 from tllm.backends.vllm import model_region as _model_region
+from tllm.backends.vllm import packed_hidden_capture as _packed_hidden_capture
 from tllm.backends.vllm import scheduler_batch_phase as _scheduler_batch_phase
 from tllm.backends.vllm import versioned_parameter_overlay as _parameter_overlay
 from tllm.backends.vllm import sampler_mrv2 as _sampler_mrv2
@@ -41,6 +43,7 @@ from tllm.backends.vllm.workgraph_runtime import (
     cold_compile_loaded_workloads,
     cold_specialize_loaded_runtime,
     record_resolved_backend,
+    runner_runtime_specialization,
     runner_tensor_parallel_size,
 )
 from tllm.runtime import active_targets
@@ -122,13 +125,33 @@ def _wrapped_prepare_inputs(
             columns=batch_columns
         )
         hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
-        _scheduler_batch_phase.stage_prepared_packed_rows(
+        _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
+            binding=binding,
+            execution=runtime.workload_execution,
+        )
+        packed_rows = _scheduler_batch_phase.stage_prepared_packed_rows(
             execution=runtime.workload_execution,
             step_id=int(runtime.event_step_id),
             columns=batch_columns,
             prompt_indices=runtime.reqid_to_promptidx,
             sample_indices=runtime.reqid_to_sampleidx,
         )
+        packed_execution = runtime.workload_execution
+        if (
+            packed_rows is not None
+            and packed_execution is not None
+            and packed_execution.requires_packed_hidden
+        ):
+            from tllm.runtime.graph_policy import resolve_graph_mode
+
+            _packed_hidden_capture.begin_runner_packed_hidden_capture(
+                binding=binding,
+                model=runner_model_module(runner),
+                execution=packed_execution,
+                specialization=runner_runtime_specialization(runner),
+                graph_mode=resolve_graph_mode(runner),
+                row_batch=packed_rows,
+            )
     _model_region.prepare_model_region_step(
         runtime=runtime,
         runner=runner,
@@ -231,6 +254,10 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     # execution and PREPARE_INPUTS_POST will silently skip it.
     cold_compile_loaded_workloads(core=core, runner=runner)
     binding = _runner_adapter.get_runner_binding(runner)
+    _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
+        binding=binding,
+        execution=runtime.workload_execution,
+    )
     overlay_controller = _parameter_overlay.maybe_bind_publisher(
         runtime=runtime,
         runner=runner,
@@ -259,10 +286,16 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     capture_attempted = False
     try:
         out = orig(runner, *args, **kwargs)
+        if session.state is not StepState.CREATED:
+            _packed_hidden_capture.publish_runner_packed_hidden_capture(
+                binding=binding,
+                execution=runtime.workload_execution,
+            )
         if overlay_controller is not None:
             capture_attempted = True
             overlay_controller.stage_dense_operand_captured()
     except Exception as exc:
+        _packed_hidden_capture.abort_runner_packed_hidden_capture(binding)
         session.fail(str(exc))
         _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
         if capture_attempted:
@@ -450,6 +483,12 @@ class V027MRv2Driver:
                     BackendCapability.TYPED_LAYER_REPLAY,
                 }
             ),
+            eager_extensions=frozenset(
+                {
+                    BackendCapability.PACKED_PHASE_ROWS,
+                    BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT,
+                }
+            ),
             hidden_locators=frozenset(
                 {HiddenLocatorCapability.BLOCK_OUTPUT_DECODE}
             ),
@@ -579,6 +618,7 @@ class V027MRv2Driver:
         setattr(cls, self._HOOK_FLAG, True)
 
     def unbind(self, binding: RunnerBinding) -> None:
+        _packed_hidden_capture.close_runner_packed_hidden_capture(binding)
         _parameter_overlay.unbind_parameter_overlays(
             runner=binding.runner,
             state=binding.parameter_overlay_state,

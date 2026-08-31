@@ -8,12 +8,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
 from tllm.backends.vllm import v027_mrv1, v027_mrv2
 from tllm.backends.vllm import scheduler_batch_phase
 from tllm import _core
 from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedRowPlanInputs
 from tllm.runtime.packed_phase_row_staging import PackedPhaseRowStaging
+from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.contracts.subscription import ConsumerSubscription
 from tllm.runtime.backend_region_binders import (
     BackendRegionBinderSlot,
@@ -31,6 +33,7 @@ class _PreparedPackedRowsExecution:
     order: list[str]
     plan_epoch: int = 17
     requires_packed_rows: bool = True
+    requires_packed_hidden: bool = True
     parameter_overlays: dict[str, int] = field(default_factory=dict)
     step_ids: list[int] = field(default_factory=list)
     columns: list[PackedRowPlanInputs] = field(default_factory=list)
@@ -99,6 +102,13 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
     order: list[str] = []
     packed_execution = _PreparedPackedRowsExecution(order)
     runtime.workload_execution = packed_execution
+    specialization = RuntimeSpecializationSpec(
+        rows=1,
+        hidden_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_prefill_tokens=4,
+    )
 
     def dispatch(**kwargs: object) -> int:
         order.append(f"dispatch:{kwargs['event'].value}")
@@ -126,6 +136,23 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
             mock.patch("tllm.runtime.request_lifecycle.observe_request_aliases"),
+            mock.patch.object(
+                v027_mrv1,
+                "runner_model_module",
+                return_value=torch.nn.Identity(),
+            ),
+            mock.patch.object(
+                v027_mrv1,
+                "runner_runtime_specialization",
+                return_value=specialization,
+            ),
+            mock.patch.object(
+                v027_mrv1._packed_hidden_capture,
+                "begin_runner_packed_hidden_capture",
+                side_effect=lambda **_kwargs: order.append(
+                    "begin:packed_hidden"
+                ),
+            ),
         ):
             core = SimpleNamespace(RUNTIME=runtime)
             v027_mrv1._wrapped_prepare_inputs(
@@ -193,6 +220,30 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
             mock.patch("tllm.runtime.request_lifecycle.observe_request_aliases"),
+            mock.patch.object(
+                v027_mrv2,
+                "runner_model_module",
+                return_value=torch.nn.Identity(),
+            ),
+            mock.patch.object(
+                v027_mrv2,
+                "runner_runtime_specialization",
+                return_value=specialization,
+            ),
+            mock.patch.object(
+                v027_mrv2._packed_hidden_capture,
+                "begin_runner_packed_hidden_capture",
+                side_effect=lambda **_kwargs: order.append(
+                    "begin:packed_hidden"
+                ),
+            ),
+            mock.patch.object(
+                v027_mrv2._packed_hidden_capture,
+                "publish_runner_packed_hidden_capture",
+                side_effect=lambda **_kwargs: order.append(
+                    "publish:packed_hidden"
+                ),
+            ),
         ):
             core = SimpleNamespace(RUNTIME=runtime)
             v027_mrv2._wrapped_execute_model(
@@ -227,10 +278,15 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             computed_tokens=(0,),
         )
     ]
-    assert order[:2] == [
+    assert order[:3] == [
         "stage:packed_rows",
+        "begin:packed_hidden",
         "dispatch:prepare_inputs.pre",
     ]
+    if driver == "mrv2":
+        assert order.index("publish:packed_hidden") < order.index(
+            "dispatch:execute_model.post"
+        )
 
 
 def test_mixed_scheduler_batch_is_rust_derived_for_the_full_mrv2_lifecycle() -> None:
@@ -369,6 +425,10 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
     """
 
     runtime = _runtime()
+    runtime.reqid_to_promptidx = {"request": 3}
+    runtime.reqid_to_sampleidx = {"request": 7}
+    order: list[str] = []
+    runtime.workload_execution = _PreparedPackedRowsExecution(order)
     runner = SimpleNamespace(
         model=SimpleNamespace(),
         input_batch=_prefill_batch_mrv1(),
@@ -379,6 +439,13 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         num_scheduled_tokens_np=[2],
     )
     events: list[tuple[BackendObservableEvent, str | None]] = []
+    specialization = RuntimeSpecializationSpec(
+        rows=1,
+        hidden_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_prefill_tokens=4,
+    )
 
     class NestedPrepareRunner:
         def __init__(self) -> None:
@@ -419,7 +486,10 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         mock.patch.object(
             v027_mrv1._common_hooks,
             "dispatch_runtime_event",
-            side_effect=lambda **kwargs: events.append((kwargs["event"], kwargs["phase"])),
+            side_effect=lambda **kwargs: (
+                order.append(f"dispatch:{kwargs['event'].value}"),
+                events.append((kwargs["event"], kwargs["phase"])),
+            ),
         ),
         mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
         mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
@@ -430,6 +500,31 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         mock.patch.object(v027_mrv1._model_region, "stage_signed_backend_region_event"),
         mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
         mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
+        mock.patch("tllm.runtime.request_lifecycle.observe_request_aliases"),
+        mock.patch.object(
+            v027_mrv1,
+            "runner_model_module",
+            return_value=torch.nn.Identity(),
+        ),
+        mock.patch.object(
+            v027_mrv1,
+            "runner_runtime_specialization",
+            return_value=specialization,
+        ),
+        mock.patch.object(
+            v027_mrv1._packed_hidden_capture,
+            "begin_runner_packed_hidden_capture",
+            side_effect=lambda **_kwargs: order.append(
+                "begin:packed_hidden"
+            ),
+        ),
+        mock.patch.object(
+            v027_mrv1._packed_hidden_capture,
+            "publish_runner_packed_hidden_capture",
+            side_effect=lambda **_kwargs: order.append(
+                "publish:packed_hidden"
+            ),
+        ),
     ):
         v027_mrv1.V027MRv1Driver().install(core=core, info=info)
         actual_runner.execute_model()
@@ -442,6 +537,9 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         BackendObservableEvent.EXECUTE_MODEL_POST,
     ]
     assert [phase for _event, phase in events] == ["prefill"] * len(events)
+    assert order.index("publish:packed_hidden") < order.index(
+        "dispatch:execute_model.post"
+    )
 
     # A later empty scheduler batch never reaches nested _prepare_inputs.
     # It must not inherit the previous step's phase or emit an execute post.

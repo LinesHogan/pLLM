@@ -1721,6 +1721,16 @@ class NativeWorkloadExecution:
     def requires_packed_rows(self) -> bool:
         return self._value_store.requires_packed_rows
 
+    @property
+    def packed_hidden_resources(
+        self,
+    ) -> tuple[PackedHiddenResourceBinding, ...]:
+        return self.compilation.options.packed_hidden_resource_manifest
+
+    @property
+    def requires_packed_hidden(self) -> bool:
+        return bool(self.packed_hidden_resources)
+
     def retire_request_states(
         self, batch: RequestFinishedBatch
     ) -> tuple[StateEffectReceipt, ...]:

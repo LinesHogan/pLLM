@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestKeyField
 from tllm.schedule import (
@@ -2134,6 +2135,31 @@ class ScheduleContractUnitTest(unittest.TestCase):
                 )
                 self.assertNotIn("layer.post", tuple(anchor.anchor_id for anchor in timeline.anchors))
                 self.assertTrue(all(region.pinned for region in timeline.regions))
+
+    def test_packed_capabilities_are_eager_only(self) -> None:
+        from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
+        from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
+
+        packed_capabilities = {
+            BackendCapability.PACKED_PHASE_ROWS.value,
+            BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT.value,
+        }
+        for driver in (V027MRv1Driver(), V027MRv2Driver()):
+            with self.subTest(driver=driver.backend_id):
+                piecewise = driver.export_main_workload_timeline(
+                    graph_mode="piecewise",
+                    static_headroom_bytes=64,
+                )
+                eager = driver.export_main_workload_timeline(
+                    graph_mode="eager",
+                    static_headroom_bytes=64,
+                )
+                self.assertTrue(
+                    packed_capabilities.isdisjoint(piecewise.capabilities)
+                )
+                self.assertTrue(
+                    packed_capabilities.issubset(eager.capabilities)
+                )
 
     def test_timeline_rejects_unpinned_or_hidden_graph_boundaries(self) -> None:
         with self.assertRaisesRegex(ValueError, "pinned"):

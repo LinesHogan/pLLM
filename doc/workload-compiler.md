@@ -279,7 +279,10 @@ invalidating an older active step.
 The schema names this service through signed packed input bindings, and an
 independent exact module-path manifest is reconstructed and compared in the
 parent, EngineCore worker, and local execution gate. The CPU resolver is wired;
-vLLM hooks are not. It is not a compile/CUDA-Graph path.
+MRv1/MRv2 eager hooks now stage the same canonical rows and publish exact
+resource-keyed snapshots before the signed model-post event. Packed
+capabilities are not advertised in piecewise/full graph modes. This is not a
+compile/CUDA-Graph path.
 
 A native ESamp Region cannot be co-installed with a legacy ESamp authority.
 During the current migration this

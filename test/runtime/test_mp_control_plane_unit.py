@@ -1650,7 +1650,10 @@ class ControlPlaneUnitTest(unittest.TestCase):
         )
         previous = NativeWorkloadExecution(
             compilation=SimpleNamespace(
-                physical=SimpleNamespace(plan_epoch=0)
+                physical=SimpleNamespace(plan_epoch=0),
+                options=SimpleNamespace(
+                    packed_hidden_resource_manifest=(),
+                ),
             ),
             executor=_Executor(),  # type: ignore[arg-type]
             completion_anchor="done",
@@ -1684,7 +1687,8 @@ class ControlPlaneUnitTest(unittest.TestCase):
             staged.bindings = SimpleNamespace(  # type: ignore[assignment]
                 residual_paths={
                     ResidualLocator(0, "block_output", "decode"): "model.layers.0"
-                }
+                },
+                packed_hidden_resources=(),
             )
             with self.assertRaisesRegex(RuntimeError, "hook topology"):
                 extension.tllm_commit_workload_decision(
@@ -1693,7 +1697,10 @@ class ControlPlaneUnitTest(unittest.TestCase):
             self.assertIs(state.workload_execution, previous)
             # Bindings alone are not a topology change.  Identical residual
             # paths and hidden-tap requirements may safely stage a new epoch.
-            staged.bindings = SimpleNamespace(residual_paths={})  # type: ignore[assignment]
+            staged.bindings = SimpleNamespace(  # type: ignore[assignment]
+                residual_paths={},
+                packed_hidden_resources=(),
+            )
             committed = extension.tllm_commit_workload_decision(
                 compilation.decision.signature, compilation.physical.plan_epoch
             )
