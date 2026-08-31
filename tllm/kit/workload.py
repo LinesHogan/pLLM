@@ -317,6 +317,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                                 module,
                                 self.config,
                                 spec.device,
+                                capture_safe=False,
                             )
 
                         request_state_services[state.name] = RequestStateRuntimeService(
@@ -338,6 +339,7 @@ class Workload(NativeWorkload, Generic[ConfigT]):
                             value,
                             self.config,
                             spec.device,
+                            capture_safe=True,
                         )
                     case PublishedModule():
                         value = state.initializer(self, spec)
@@ -809,12 +811,15 @@ def _build_optimizer(
     value: torch.nn.Module,
     config: WorkloadConfig,
     device: torch.device,
+    *,
+    capture_safe: bool,
 ) -> torch.optim.Optimizer:
     parameters = tuple(value.parameters())
     options = dict(spec.options)
     lr = _optimizer_float(options["lr"], config)
     eps = float.fromhex(options["eps"])
     betas = _optimizer_betas(options["betas"])
+    capture_optimizer = device.type == "cuda" and capture_safe
     match spec.kind:
         case "adam":
             optimizer: torch.optim.Optimizer = (
@@ -827,7 +832,7 @@ def _build_optimizer(
                     fused=True,
                     capturable=True,
                 )
-                if device.type == "cuda"
+                if capture_optimizer
                 else torch.optim.Adam(
                     parameters,
                     lr=lr,
@@ -849,7 +854,7 @@ def _build_optimizer(
                     fused=True,
                     capturable=True,
                 )
-                if device.type == "cuda"
+                if capture_optimizer
                 else torch.optim.AdamW(
                     parameters,
                     lr=lr,
@@ -862,7 +867,7 @@ def _build_optimizer(
             )
         case unsupported:
             raise ValueError(f"unsupported optimizer kind {unsupported!r}")
-    if device.type == "cuda":
+    if capture_optimizer:
         from tllm.runtime.torch_adapter import initialize_adam_capture_storage
 
         initialize_adam_capture_storage(optimizer, parameters)

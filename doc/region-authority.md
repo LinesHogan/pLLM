@@ -164,7 +164,8 @@ versions 2, empty cleanup state, and zero fallback/replay; intervention emits
 one modifier state. A corrected independent-process MRv2 differential uses
 the same short text prompts and case fingerprint. Legacy/native tokens match
 exactly with intervention off and at `beta=0.5`; counts are `4/4`, intervention
-is `1/1`, and bf16 aggregate loss differs by about `8.6e-6`. The previous
+is `1/1`, and aggregate loss is exact after the capture-disabled request
+optimizer was aligned to eager AdamW. The previous
 six-versus-four claim came from an invalid probe that stringified
 `TokensPrompt` through a text-only legacy helper and is withdrawn.
 

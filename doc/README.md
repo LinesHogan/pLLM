@@ -37,7 +37,8 @@ two requests and seven prompt rows with zero fallback. The
 latest request-scoped ESamp smoke records four losses/updates, two parent
 slots retired at version 2, one intervention state when enabled, and zero
 fallback/replay. Its corrected MRv2 legacy/native fixed-seed differential has
-exact token parity and an aggregate bf16 loss delta around `8.6e-6`. Native
+exact token and loss parity after the capture-disabled request optimizer was
+aligned to eager AdamW. Native
 ESamp exact eager Regions also passed EngineCore MP correctness on both
 runners. This is not a throughput claim. Model-backed native piecewise CUDA Graph execution,
 Recirculation capture/hook-retirement integration, and shape-miss epoch

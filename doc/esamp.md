@@ -51,7 +51,8 @@ The retained legacy and native arms in
 processes from one signed case fingerprint. On MRv2 in-process with fixed
 sampling RNG, both intervention-off and `beta=0.5` runs produced identical
 tokens, four losses/updates, one intervention state when enabled, and zero
-sampler fallback. Their bf16 aggregate losses differed by about `8.6e-6`.
+sampler fallback. Their aggregate losses match exactly after the
+capture-disabled request optimizer was aligned to eager non-fused AdamW.
 An earlier six-versus-four report was invalid: its legacy probe passed a
 `TokensPrompt` through a text-only helper, which stringified the object and
 changed the prompt/step trace. The corrected workload is decode-only on both
@@ -66,7 +67,12 @@ implementations.
 
 The two JSON documents must carry the same `case_signature`; compare their
 `output_token_ids`, `loss_count`, `loss_avg`, `update_count`, intervention, and
-fallback fields.
+fallback fields with:
+
+```bash
+.venv/bin/python test/gpu/native_esamp_request_state_smoke.py \
+  --compare legacy.json native.json
+```
 
 Native request cleanup remains the authoritative target: it retires both
 slots at version 2 and clears request mappings. The retained legacy baseline

@@ -253,8 +253,9 @@ The corrected independent-process request-state differential is numerically
 green on MRv2 eager in-process. Legacy and native use the same short text
 prompts, engine/sampling seeds, and case fingerprint; tokens match exactly both
 without intervention and at `beta=0.5`, loss/update counts are `4/4`, the
-intervention count is `1/1`, and aggregate bf16 loss differs by about
-`8.6e-6`. The superseded six-versus-four result had accidentally stringified a
+intervention count is `1/1`, and aggregate loss is exact after the
+capture-disabled request optimizer was aligned to eager AdamW. The superseded
+six-versus-four result had accidentally stringified a
 `TokensPrompt` through a text-only legacy helper and did not compare the same
 input.
 

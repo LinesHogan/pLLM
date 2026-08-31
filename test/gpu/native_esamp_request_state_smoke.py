@@ -23,11 +23,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 if TYPE_CHECKING:
     from vllm import LLM
@@ -48,6 +50,121 @@ _GENERATED_TOKENS = 3
 _DECODE_UPDATES = 2
 _REQUEST_STATE_RESOURCE = "request_distiller"
 _PROMPTS = ("Hello", "World")
+_LOSS_REL_TOL = 1e-5
+_LOSS_ABS_TOL = 1e-6
+
+
+class _DifferentialEvidenceWire(TypedDict):
+    implementation: str
+    case_signature: str
+    output_token_ids: list[list[list[int]]]
+    loss_avg: int | float
+    loss_count: int
+    update_count: int
+    intervention_state_count: int
+    post_finish_mapping_sizes: list[int]
+    sampler_fallback_count: NotRequired[int]
+    fallback_count: NotRequired[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _DifferentialEvidence:
+    implementation: Literal["legacy", "native"]
+    case_signature: str
+    output_token_ids: tuple[tuple[tuple[int, ...], ...], ...]
+    loss_avg: float
+    loss_count: int
+    update_count: int
+    intervention_state_count: int
+    fallback_count: int
+    post_finish_mapping_sizes: tuple[int, ...]
+
+    @classmethod
+    def read(cls, path: Path) -> "_DifferentialEvidence":
+        fields: _DifferentialEvidenceWire = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+        implementation = fields["implementation"]
+        case_signature = fields["case_signature"]
+        loss_avg = fields["loss_avg"]
+        loss_count = fields["loss_count"]
+        update_count = fields["update_count"]
+        intervention_count = fields["intervention_state_count"]
+        if (
+            type(implementation) is not str
+            or type(case_signature) is not str
+            or type(loss_avg) not in (int, float)
+            or type(loss_count) is not int
+            or type(update_count) is not int
+            or type(intervention_count) is not int
+        ):
+            raise TypeError(
+                f"{path} has invalid ESamp differential scalar fields"
+            )
+        tokens = cls._tokens(fields["output_token_ids"], path)
+        mappings = cls._integers(
+            fields["post_finish_mapping_sizes"],
+            f"{path}.post_finish_mapping_sizes",
+        )
+        if implementation == "legacy":
+            fallback_count = fields.get("sampler_fallback_count")
+            if type(fallback_count) is not int:
+                raise TypeError(
+                    f"{path} has no legacy sampler fallback count"
+                )
+            return cls(
+                "legacy",
+                case_signature,
+                tokens,
+                float(loss_avg),
+                loss_count,
+                update_count,
+                intervention_count,
+                fallback_count,
+                mappings,
+            )
+        if implementation == "native":
+            fallback_count = fields.get("fallback_count")
+            if type(fallback_count) is not int:
+                raise TypeError(
+                    f"{path} has no native workgraph fallback count"
+                )
+            return cls(
+                "native",
+                case_signature,
+                tokens,
+                float(loss_avg),
+                loss_count,
+                update_count,
+                intervention_count,
+                fallback_count,
+                mappings,
+            )
+        raise ValueError(f"{path} has unknown implementation {implementation!r}")
+
+    @staticmethod
+    def _integers(raw: list[int], label: str) -> tuple[int, ...]:
+        if type(raw) is not list or any(type(value) is not int for value in raw):
+            raise TypeError(f"{label} must be an integer JSON array")
+        return tuple(raw)
+
+    @classmethod
+    def _tokens(
+        cls, raw: list[list[list[int]]], path: Path
+    ) -> tuple[tuple[tuple[int, ...], ...], ...]:
+        if type(raw) is not list:
+            raise TypeError(f"{path}.output_token_ids must be a JSON array")
+        return tuple(
+            tuple(
+                cls._integers(
+                    sample,
+                    f"{path}.output_token_ids"
+                    f"[{parent_index}][{sample_index}]",
+                )
+                for sample_index, sample in enumerate(parent)
+            )
+            for parent_index, parent in enumerate(raw)
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -57,7 +174,9 @@ def _parse_args() -> argparse.Namespace:
         choices=("native", "legacy"),
         default="native",
     )
-    parser.add_argument("--runner", choices=("mrv1", "mrv2"), required=True)
+    parser.add_argument(
+        "--runner", choices=("mrv1", "mrv2"), default="mrv2"
+    )
     parser.add_argument(
         "--engine-core-mp",
         action="store_true",
@@ -71,6 +190,11 @@ def _parse_args() -> argparse.Namespace:
         help="verify version-gated typed sampler guidance after the first update",
     )
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("LEGACY_JSON", "NATIVE_JSON"),
+    )
     return parser.parse_args()
 
 
@@ -99,11 +223,71 @@ def _case_signature(args: argparse.Namespace) -> str:
             "distiller_beta": 0.5 if args.intervention else 0.0,
             "distiller_hidden_dim": 8,
             "distiller_lr": 1e-3,
+            "hidden_resources": (
+                ("index", 0, "block_output"),
+                ("index", -1, "block_output"),
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compare_results(legacy_path: Path, native_path: Path) -> int:
+    legacy = _DifferentialEvidence.read(legacy_path)
+    native = _DifferentialEvidence.read(native_path)
+    if legacy.implementation != "legacy" or native.implementation != "native":
+        raise ValueError(
+            "--compare requires legacy JSON first and native JSON second"
+        )
+    if legacy.case_signature != native.case_signature:
+        raise AssertionError("ESamp differential case signatures differ")
+    if legacy.output_token_ids != native.output_token_ids:
+        raise AssertionError("ESamp differential token outputs differ")
+    if (
+        legacy.loss_count != native.loss_count
+        or legacy.update_count != native.update_count
+        or legacy.intervention_state_count
+        != native.intervention_state_count
+    ):
+        raise AssertionError(
+            "ESamp differential count or intervention evidence differs"
+        )
+    if legacy.fallback_count != 0 or native.fallback_count != 0:
+        raise AssertionError("ESamp differential used a fallback path")
+    if not math.isclose(
+        legacy.loss_avg,
+        native.loss_avg,
+        rel_tol=_LOSS_REL_TOL,
+        abs_tol=_LOSS_ABS_TOL,
+    ):
+        raise AssertionError(
+            "ESamp differential loss exceeds its declared tolerance: "
+            f"legacy={legacy.loss_avg} native={native.loss_avg}"
+        )
+    if any(native.post_finish_mapping_sizes):
+        raise AssertionError("native request mappings were not retired")
+    _emit_summary(
+        json.dumps(
+            {
+                "case_signature": native.case_signature,
+                "token_parity": True,
+                "loss_count": native.loss_count,
+                "update_count": native.update_count,
+                "intervention_state_count": native.intervention_state_count,
+                "loss_abs_delta": abs(legacy.loss_avg - native.loss_avg),
+                "loss_rel_tolerance": _LOSS_REL_TOL,
+                "loss_abs_tolerance": _LOSS_ABS_TOL,
+                "fallback_count": 0,
+                "native_cleanup": True,
+                "legacy_cleanup_residue": legacy.post_finish_mapping_sizes,
+            },
+            sort_keys=True,
+        ),
+        "",
+    )
+    return 0
 
 
 def _signed_eager_contract(
@@ -442,6 +626,11 @@ def _run_legacy(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = _parse_args()
+    if args.compare is not None:
+        return _compare_results(
+            Path(args.compare[0]),
+            Path(args.compare[1]),
+        )
     if not 0.0 < float(args.gpu_mem) <= 1.0:
         raise ValueError("--gpu-mem must be in (0, 1]")
 

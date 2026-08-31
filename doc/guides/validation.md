@@ -30,9 +30,9 @@ Legacy ESamp and its Program baseline remain reachable until native ESamp has:
 4. throughput ratio `>= 0.98`. A result below `0.95` blocks deletion outright.
 
 The request-scoped MRv2 eager differential is now numerically green: fixed-seed
-legacy/native tokens match with intervention off/on, both execute four
-updates, intervention count is one, and aggregate bf16 loss differs by about
-`8.6e-6`. Native also proves version-2 retirement and zero cleanup residue;
+legacy/native tokens and losses match with intervention off/on, both execute
+four updates, and intervention count is one. Native also proves version-2
+retirement and zero cleanup residue;
 the retained legacy baseline has no equivalent request-finish transaction.
 
 The existing `docs/p5_paired_benchmark_report.json` measures Program against
