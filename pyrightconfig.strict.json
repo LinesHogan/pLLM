@@ -2,6 +2,7 @@
   "typeCheckingMode": "strict",
   "include": [
     "tllm/contracts",
+    "tllm/canonical",
     "tllm/ports",
     "tllm/producers",
     "tllm/core",
@@ -62,6 +63,8 @@
     "test/runtime/test_request_slot_arena_unit.py",
     "test/runtime/test_request_trainable_state_unit.py",
     "test/runtime/test_sampler_output_subset_unit.py",
+    "test/core/test_state_representation_plan_unit.py",
+    "test/core/test_canonical_dense_state_producer_unit.py",
     "test/runtime/test_runtime_typing_contracts_unit.py",
     "test/runtime/test_vllm_parameter_overlay_unit.py",
     "test/runtime/test_workload_port_transport_unit.py",

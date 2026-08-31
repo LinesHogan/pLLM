@@ -9,7 +9,8 @@ Usage (from the repo root, venv activated)::
 
 Target direction (a package may import only the packages listed in RULES)::
 
-    core ← contracts ← ports ← common
+    core ← contracts ← canonical
+                     ← ports ← common
                          ← producers ← workgraph ← runtime
     backends (contracts/ports/workgraph only; runtime types arrive via protocols)
     consumers / workflows: leaves, may import anything below
@@ -55,6 +56,9 @@ BASELINE_PATH = REPO_ROOT / "tools" / "import_layers_baseline.json"
 RULES: dict[str, frozenset[str]] = {
     "core": frozenset(),
     "contracts": frozenset({"core"}),
+    # Clean-room native core. It consumes only closed contracts and Rust FFI;
+    # legacy runtime/workload/workgraph layers must never become dependencies.
+    "canonical": frozenset({"contracts", "core"}),
     "ports": frozenset({"contracts", "core"}),
     "common": frozenset({"contracts", "ports", "core"}),
     "producers": frozenset({"contracts", "ports", "core"}),

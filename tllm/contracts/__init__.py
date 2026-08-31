@@ -36,6 +36,26 @@ from tllm.contracts.state_ref import (
     StateRef,
     VersionId,
 )
+from tllm.contracts.state_representation import (
+    StateLayoutRequirement,
+    StatePhysicalPlan,
+    StateProviderPlan,
+    StateRepresentation,
+    StateRepresentationDecision,
+    StateRepresentationRequest,
+    encode_state_provider_plans,
+)
+from tllm.contracts.tensor_layout import (
+    LayoutFieldId,
+    MutationGranularity,
+    StateTensorLayout,
+    TensorDType,
+    TensorFieldSpec,
+    TensorLayoutBinding,
+    TensorLayoutDecision,
+    TensorLayoutRequest,
+    TensorLayoutSpec,
+)
 
 __all__ = [
     "ConsumerSubscription",
@@ -62,5 +82,21 @@ __all__ = [
     "LayoutId",
     "LineageId",
     "StateRef",
+    "StateLayoutRequirement",
+    "StatePhysicalPlan",
+    "StateProviderPlan",
+    "StateRepresentation",
+    "StateRepresentationDecision",
+    "StateRepresentationRequest",
+    "encode_state_provider_plans",
+    "LayoutFieldId",
+    "MutationGranularity",
+    "StateTensorLayout",
+    "TensorDType",
+    "TensorFieldSpec",
+    "TensorLayoutBinding",
+    "TensorLayoutDecision",
+    "TensorLayoutRequest",
+    "TensorLayoutSpec",
     "VersionId",
 ]

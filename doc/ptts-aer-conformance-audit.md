@@ -6,15 +6,21 @@
 PTTS 与 AER 术语、数据结构和研究边界的权威来源。该研究文档仍是提案而非已验证
 性能结论；但工程实现不得把与其冲突的临时结构描述为 PTTS/AER 终态。
 
+2026-09-01 起，本审计同时冻结实施边界：PTTS canonical kernel 与 signed
+boundary 收口后，不再向旧 frontend/runtime/WorkGraph 回填。新 Python 核心位于
+`tllm/canonical/`，Rust 核心位于 `rust/tllm_core/src/canonical/`；新旧共存
+只允许发生在最外层 routing boundary。
+
 ## 总结
 
 当前代码具有一个有效的最小 immutable-root prototype：固定地址 tensor pools、
 page-id root、source-to-distinct-target COW、exact root pin、readiness/completion
 fence、old-root reclaim，以及 tensor-only stable projection 都有 CPU/GPU 证据。
 
-它尚不是研究文档定义的 PTTS canonical core。arena-local logical
-identity 已经不再依赖 physical slot，但 LayoutId/LineageId 的 graph、epoch 和
-MP 作用域、public semantic API、容量证明、layout 泛化与 transport 仍未闭合。AER 的
+它尚不是研究文档定义的完整 PTTS canonical core。arena-local logical
+identity、frozen typed TensorLayout interning、provider-local capacity proof、atomic publication
+和 Rust-signed representation boundary 已落地；LineageId 的 epoch/MP 作用域、完整
+PTTS runtime/transport 和跨 workload 泛化仍未闭合。AER 的
 `SemanticGraph`、dense typed IDs、derived `GraphIndex`、incremental
 `RegionSummary` 与 partition+placement oracle 尚未实现。
 
@@ -51,12 +57,20 @@ StateRef(LayoutId, LineageId, VersionId)
 `LineageId` 和 `VersionId`，`StateSlotRef` 只保留 allocator/ABA 证明。同一 slot
 reuse 会获得新 lineage，exact V0 pin 在 publish V1 后仍可验证并阻止 retire。
 
-这只是 **arena-local identity prototype**，还不能称为完整 PTTS identity：
+这仍是 **arena-local identity prototype**，但 canonical LayoutId 已不再依赖 graph
+state ordinal：
 
-- Rust 目前按一个 composed `ScheduleGraph` 的 state declaration 顺序签发 dense
-  `LayoutId`。它保证同一 graph 内唯一，但尚未基于 frozen tensor fields、shape、
-  dtype、alignment 与 mutation granularity 进行 layout interning；因此它是临时的
-  declaration-layout ID，不是已经完成泛化的 TensorLayout identity。
+- `tllm/canonical/tensor_layout.py` 与 Rust `canonical/tensor_layout.rs` 使用 closed
+  dtype/mutation enums、namespace、dense field IDs、shape、alignment 和 mutation
+  granularity 形成 frozen descriptor。Rust 按 canonical descriptor JSON 排序签发 dense
+  `LayoutId`；相同 descriptor 跨 resource 共享 ID，resource/graph 顺序不参与
+  layout identity。
+- dense `LayoutId` 只在 decision 携带的 `layout_namespace` catalog digest 内解释。
+  catalog 增删 descriptor 可改变 ordinal，但必须同时改变 namespace；因此完整
+  cold identity 是 `(layout_namespace, LayoutId, layout_digest)`。`StateRef` 只允许在
+  一个 namespace-owned arena/physical plan 内解释，不得跨 namespace 裸比较 ID。
+- 旧 runtime 的 graph-state-order interner 只冻结为待删旧栈接线，不再代表
+  canonical PTTS LayoutId，也不再扩展。
 - coordinator 与 worker 现在都从已验证的同一 graph 派生相同 binding，但 PTTS
   root/page/pin/receipt 尚未进入 signed MP wire；`LineageId` 仍由每个
   `RequestSlotArena` 本地签发。
@@ -78,6 +92,28 @@ request scope、typed layout family、read/transition/publication、consistency�
 mutation granularity 与 cold facts。fixed/page/overlay/resident 只能由 Rust/backend
 作为 signed physical solution 选择。`FixedBatchedSlotAdapter` 可保留为 physical
 provider，但不能继续拥有 public semantic variant。
+
+新 canonical boundary 已经绕开这些旧类型：`StateRepresentationRequest` 将
+representation-neutral layout requirement 与 physical provider candidates 作为独立 cold
+facts 交给 Rust；Rust 只按 capability coverage、`reserved_bytes` 和稳定 provider ID
+选择并签名 `StateRepresentationDecision`。`StatePhysicalPlan` 只保留原 decision
+tuple 和 signature；projection 前必须再通过 Rust exact recomputation，不重新选择。
+provider 构造同时验证 request digest、decision digest、完整 plan tuple 和 reserved
+bytes。worker reconstruction 必须证明 local catalog 与
+parent-signed request catalog 完全相同，不得 fallback。该新 boundary 不导入旧
+runtime/workload/workgraph，provider facts 也没有进入旧 `ScheduleGraph`。
+此处“signed”表示 Rust 重算并校验的 proof-carrying SHA-256 decision digest，不是
+带密钥的身份认证；parent/worker 来源和 quorum 仍由后续 closed MP control plane 负责。
+
+旧公共 API 现在冻结不动；不再就地 internalize 或建立新桥接，而是在对应
+workload 切换到 clean-room 新核心时直接删除。
+
+最小真实 producer 证据使用 clean-room CPU dense-page provider 的 weight、bias、
+AdamW `step/exp_avg/exp_avg_sq` 和 gradient 六个 typed pools。Rust tensor interner
+签发 layout namespace/ID，representation planner 签名 dense provider，经 Rust 验证的
+physical projection 驱动真实 admission、AdamW update、pin、atomic publication 和 reclaim。
+provider 明确只证明 CPU，不伪装 GPU/capture/fence 支持。这是 kernel/signed-boundary
+证据，不是 ESamp 公共入口已切换的声明。
 
 ### P0：provider-local capacity entitlement 已落地，signed authority 未闭合
 
@@ -109,14 +145,12 @@ pins。compute 提交前 abort 回收整个 staged batch，不发布半个 selec
 CUDA 失败继续 fail-stop，不伪造回滚。single-root wrapper 已删除。physical
 commit 后 logical commit 若失败，仍双向 poison，不从 physical latest 反推逻辑状态。
 
-### P1：typed layout 仍是最小子集
+### P1：typed layout cold core 已落地，dynamic family 仍未完成
 
-物理 `FrozenTensorLayout` 已有 dense field IDs、shape 与 dtype，但这些事实尚未进入
-Rust layout interner 的 semantic/cold input；仍缺：
+canonical Rust interner 已签名 namespace、dense field IDs、frozen shape、closed dtype、
+alignment 与 mutation/page granularity。仍缺：
 
-- `ShapeExpr`/layout family；
-- alignment；
-- mutation/page granularity；
+- `ShapeExpr`/variable layout family；
 - page family/size class；
 - variable-rank/layer epoch replacement contract。
 
@@ -165,13 +199,13 @@ page allocation/version lifecycle。
 1. [arena-local 已落地] typed LayoutId / LineageId / VersionId / StateRef
 2. [已落地] RequestSlotArena lease 同时携带 logical lineage 与 physical SlotRef
 3. [已落地] root arena 改用 StateRef，补 ABA 与 old-version pin oracle
-4. 冻结 TensorLayout-based LayoutId namespace、epoch 边界和 MP lineage issuance witness
+4. [已落地] frozen TensorLayout-based LayoutId/namespace 与 closed codec
 5. [provider-local 已落地] admission entitlement + atomic multi-root publication
-6. internalize FIXED_BATCHED，physical representation 进入 signed solution
-7. 补 layout alignment/mutation granularity 与 PTTS metrics
-8. [projection ABI 已落地] 在前述 P0 门禁后再完成 Rust capture predicate
-9. 再接 ESamp read-only capture；training loss/optimizer 保持 eager
-10. PTTS MP wire 与第二、第三、第四个真实 producer
+6. [已落地] 独立 Rust-signed representation decision / physical projection / worker proof
+7. [已落地] 真实 fixed request-state producer 闭合 layout → plan → PTTS lifecycle
+8. 冻结旧栈 PTTS 接线，不再就地 internalize FIXED_BATCHED
+9. 在 `tllm/canonical` / Rust `canonical` 建立新 SemanticGraph/scheduler/runtime
+10. 按 simple → ESamp → GTTA/FTTT 纵向切换，每次立即删除旧 workload
 ```
 
 AER 独立按以下门序推进：

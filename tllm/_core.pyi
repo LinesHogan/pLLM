@@ -684,6 +684,31 @@ def compile_execution_plan(
 
 def compile_schedule(graph: str, timeline: str, options: str) -> str: ...
 def validate_schedule(graph: str, timeline: str, options: str, decision: str) -> None: ...
+def compile_state_representation_plan(request_json: str) -> str: ...
+def validate_state_representation_plan(
+    request_json: str,
+    decision_json: str,
+) -> None: ...
+def validate_state_representation_reconstruction(
+    request_json: str,
+    decision_json: str,
+    local_candidates_json: str,
+) -> None: ...
+def lower_canonical_state_physical_plan(
+    request_json: str,
+    decision_json: str,
+    plan_epoch: int,
+) -> str: ...
+def validate_canonical_state_physical_plan(
+    request_json: str,
+    decision_json: str,
+    physical_json: str,
+) -> None: ...
+def intern_canonical_tensor_layouts(request_json: str) -> str: ...
+def validate_canonical_tensor_layouts(
+    request_json: str,
+    decision_json: str,
+) -> None: ...
 def validate_workload_compilation_wire(
     cache_key: str,
     graph_json: str,

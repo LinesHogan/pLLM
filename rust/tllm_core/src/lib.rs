@@ -4,6 +4,7 @@
 
 use pyo3::prelude::*;
 
+mod canonical;
 mod decode_localization;
 mod execution_plan;
 mod placement;
@@ -17,6 +18,8 @@ mod workload_frontend;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    canonical::state_representation::register(m)?;
+    canonical::tensor_layout::register(m)?;
     decode_localization::register(m)?;
     sampler_plan::register(m)?;
     shape_specialization::register(m)?;
