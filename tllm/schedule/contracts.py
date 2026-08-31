@@ -578,7 +578,8 @@ class ScheduleInput:
         elif self.kind is ScheduleInputKind.PACKED_HIDDEN:
             if (
                 not self.layer
-                or self.layer_kind is HiddenLayerKind.NONE
+                or self.layer_kind
+                not in (HiddenLayerKind.INDEX, HiddenLayerKind.PATH)
                 or self.site is not HiddenSite.BLOCK_OUTPUT
             ):
                 raise ValueError(
@@ -1534,11 +1535,77 @@ class ResidualResourceBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedHiddenResourceBinding:
+    """One signed backend module for a packed block-output locator."""
+
+    layer: str
+    layer_kind: HiddenLayerKind
+    site: HiddenSite
+    module_path: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "layer",
+            _name(self.layer, "PackedHiddenResourceBinding.layer"),
+        )
+        object.__setattr__(
+            self,
+            "layer_kind",
+            HiddenLayerKind(self.layer_kind),
+        )
+        object.__setattr__(self, "site", HiddenSite(self.site))
+        if self.layer_kind not in (
+            HiddenLayerKind.INDEX,
+            HiddenLayerKind.PATH,
+        ):
+            raise ValueError(
+                "PackedHiddenResourceBinding.layer_kind must be index or path"
+            )
+        if self.site is not HiddenSite.BLOCK_OUTPUT:
+            raise ValueError(
+                "PackedHiddenResourceBinding.site must be block_output"
+            )
+        if self.layer_kind is HiddenLayerKind.INDEX:
+            try:
+                layer_index = int(self.layer)
+            except ValueError as error:
+                raise ValueError(
+                    "PackedHiddenResourceBinding INDEX layer must be a canonical "
+                    "signed integer"
+                ) from error
+            if (
+                str(layer_index) != self.layer
+                or layer_index < -(1 << 63)
+                or layer_index >= (1 << 63)
+            ):
+                raise ValueError(
+                    "PackedHiddenResourceBinding INDEX layer must be a canonical "
+                    "signed 64-bit integer"
+                )
+        object.__setattr__(
+            self,
+            "module_path",
+            _name(
+                self.module_path,
+                "PackedHiddenResourceBinding.module_path",
+            ),
+        )
+
+    @property
+    def locator_key(self) -> tuple[str, str, str]:
+        return (self.layer, self.layer_kind.value, self.site.value)
+
+
+@dataclass(frozen=True, slots=True)
 class CompileOptions:
     memory_budget_bytes: int = 0
     allow_serial_fallback: bool = True
     shape_specialization: tuple[tuple[str, str], ...] = ()
     residual_resource_manifest: tuple[ResidualResourceBinding, ...] = ()
+    packed_hidden_resource_manifest: tuple[
+        PackedHiddenResourceBinding, ...
+    ] = ()
     # Opaque to Python after construction. Rust parses and compares this
     # closed JSON manifest before local worker resources are bound.
     static_binding_manifest: str = "[]"
@@ -1549,7 +1616,7 @@ class CompileOptions:
     # stream-safe pure or ordered-transition Regions and signs every wait;
     # workload declarations never choose a lane or placement.
     allow_side_stream: bool = True
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "memory_budget_bytes", _bytes(self.memory_budget_bytes, "CompileOptions.memory_budget_bytes"))
@@ -1592,6 +1659,17 @@ class CompileOptions:
             raise ValueError(
                 "CompileOptions.residual_resource_manifest must have sorted unique locators"
             )
+        packed_locator_keys = tuple(
+            binding.locator_key
+            for binding in self.packed_hidden_resource_manifest
+        )
+        if tuple(sorted(packed_locator_keys)) != packed_locator_keys or len(
+            set(packed_locator_keys)
+        ) != len(packed_locator_keys):
+            raise ValueError(
+                "CompileOptions.packed_hidden_resource_manifest must have "
+                "sorted unique locators"
+            )
         if not isinstance(self.static_binding_manifest, str):
             raise TypeError("CompileOptions.static_binding_manifest must be str")
         if not isinstance(self.compiler_fingerprint, str):
@@ -1616,8 +1694,13 @@ class CompileOptions:
             )
         if not isinstance(self.allow_side_stream, bool):
             raise TypeError("CompileOptions.allow_side_stream must be bool")
-        if self.schema_version != 1:
+        if self.schema_version not in (1, 2):
             raise ValueError("unsupported CompileOptions schema version")
+        if self.schema_version == 1 and self.packed_hidden_resource_manifest:
+            raise ValueError(
+                "CompileOptions schema v1 requires an empty "
+                "packed_hidden_resource_manifest"
+            )
 
     def to_json(self) -> str:
         return canonical_json(self)
@@ -1625,6 +1708,15 @@ class CompileOptions:
     @classmethod
     def from_json(cls, payload: str) -> "CompileOptions":
         raw = json.loads(payload)
+        schema_version = raw.get("schema_version", 2)
+        if (
+            schema_version == 2
+            and "packed_hidden_resource_manifest" not in raw
+        ):
+            raise ValueError(
+                "CompileOptions schema v2 requires an explicit "
+                "packed_hidden_resource_manifest"
+            )
         raw["shape_specialization"] = tuple(
             (str(key), str(value))
             for key, value in raw.get("shape_specialization", ())
@@ -1637,6 +1729,15 @@ class CompileOptions:
                 module_path=binding["module_path"],
             )
             for binding in raw.get("residual_resource_manifest", ())
+        )
+        raw["packed_hidden_resource_manifest"] = tuple(
+            PackedHiddenResourceBinding(
+                layer=binding["layer"],
+                layer_kind=HiddenLayerKind(binding["layer_kind"]),
+                site=HiddenSite(binding["site"]),
+                module_path=binding["module_path"],
+            )
+            for binding in raw.get("packed_hidden_resource_manifest", ())
         )
         return cls(**raw)
 
@@ -1831,7 +1932,8 @@ class RegionInputBinding:
         elif self.kind is RegionInputKind.PACKED_HIDDEN:
             if (
                 not self.layer
-                or self.layer_kind is HiddenLayerKind.NONE
+                or self.layer_kind
+                not in (HiddenLayerKind.INDEX, HiddenLayerKind.PATH)
                 or self.site is not HiddenSite.BLOCK_OUTPUT
             ):
                 raise ValueError(
@@ -3597,6 +3699,7 @@ __all__ = [
     "MemoryAllocation",
     "MemoryPlan",
     "MaterializedValue",
+    "PackedHiddenResourceBinding",
     "RegionInputBinding",
     "RegionInputKind",
     "RegionImplementationKind",

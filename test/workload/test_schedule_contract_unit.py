@@ -1684,11 +1684,11 @@ class ScheduleContractUnitTest(unittest.TestCase):
             ))
         self.assertEqual(
             decision.signature,
-            "58e541987147b5cdb533a9800f2ba21dee0e7707ae9bb7e5cafdcf1ec4a3d137",
+            "9a26c9fd7a24c2e0b66be9438c86fc6e98ebf2b68964b7855c342192cf978b7b",
         )
         self.assertEqual(
             decision.execution_regions[0].artifact_key,
-            "5db675cd0818d6f80ed38c455391508e8e9d6a3e3f741494f97805e6ffaea34b",
+            "e30457bac62bcedfec9051849b2f9e0490fd56c8d74d22069462f9cac38b6ae5",
         )
 
     def test_schema_v7_complex_region_signature_golden(self) -> None:

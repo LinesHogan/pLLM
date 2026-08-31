@@ -601,6 +601,43 @@ impl ResidualResourceBinding {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PackedHiddenResourceBinding {
+    layer: String,
+    layer_kind: HiddenLayerKind,
+    site: HiddenSite,
+    module_path: String,
+}
+
+fn packed_hidden_locator_key(
+    layer: &str,
+    layer_kind: HiddenLayerKind,
+    site: HiddenSite,
+) -> PyResult<(&str, &'static str, &'static str)> {
+    if layer.is_empty()
+        || !matches!(layer_kind, HiddenLayerKind::Index | HiddenLayerKind::Path)
+        || site != HiddenSite::BlockOutput
+    {
+        return Err(value_error(
+            "packed hidden resource locator requires a non-empty INDEX or PATH layer and block_output site",
+        ));
+    }
+    if layer_kind == HiddenLayerKind::Index {
+        let index = layer.parse::<i64>().map_err(|_| {
+            value_error(
+                "packed hidden resource INDEX layer must be a canonical signed 64-bit integer",
+            )
+        })?;
+        if index.to_string() != layer {
+            return Err(value_error(
+                "packed hidden resource INDEX layer must be a canonical signed 64-bit integer",
+            ));
+        }
+    }
+    Ok((layer, layer_kind.as_wire(), site.as_wire()))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CompileOptions {
@@ -610,6 +647,8 @@ struct CompileOptions {
     shape_specialization: Vec<(String, String)>,
     #[serde(default)]
     residual_resource_manifest: Vec<ResidualResourceBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packed_hidden_resource_manifest: Option<Vec<PackedHiddenResourceBinding>>,
     #[serde(default = "default_static_binding_manifest")]
     static_binding_manifest: String,
     #[serde(default)]
@@ -1022,8 +1061,23 @@ fn validate_static_backend_binding_manifest(
 /// any Python resource callback, so malformed signed options cannot allocate
 /// local state before the compiler rejects them.
 fn validate_compile_options_preflight(options: &CompileOptions) -> PyResult<()> {
-    if options.schema_version != 1 {
+    if !matches!(options.schema_version, 1 | 2) {
         return Err(value_error("unsupported schedule schema version"));
+    }
+    if options.schema_version == 1
+        && options
+            .packed_hidden_resource_manifest
+            .as_ref()
+            .is_some_and(|manifest| !manifest.is_empty())
+    {
+        return Err(value_error(
+            "CompileOptions schema v1 requires an empty packed_hidden_resource_manifest",
+        ));
+    }
+    if options.schema_version == 2 && options.packed_hidden_resource_manifest.is_none() {
+        return Err(value_error(
+            "CompileOptions schema v2 requires an explicit packed_hidden_resource_manifest",
+        ));
     }
     validate_static_backend_binding_manifest(options)?;
     if !matches!(options.compile_policy.as_str(), "torch_compile" | "eager")
@@ -1078,6 +1132,28 @@ fn validate_compile_options_preflight(options: &CompileOptions) -> PyResult<()> 
     if locator_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(value_error(
             "residual resource manifest requires sorted unique locators",
+        ));
+    }
+    let packed_manifest = options
+        .packed_hidden_resource_manifest
+        .as_deref()
+        .unwrap_or(&[]);
+    let mut packed_locator_keys = Vec::with_capacity(packed_manifest.len());
+    for binding in packed_manifest {
+        let key = packed_hidden_locator_key(&binding.layer, binding.layer_kind, binding.site)?;
+        if binding.module_path.is_empty() {
+            return Err(value_error(
+                "packed hidden resource manifest entries require a non-empty module_path",
+            ));
+        }
+        packed_locator_keys.push(key);
+    }
+    if packed_locator_keys
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(value_error(
+            "packed hidden resource manifest requires sorted unique locators",
         ));
     }
     Ok(())
@@ -2082,6 +2158,57 @@ fn validate_residual_resource_manifest(
     Ok(())
 }
 
+/// Require a distinct backend module binding for every packed hidden locator.
+/// Ordinary hidden inputs remain exclusively covered by the residual manifest.
+fn validate_packed_hidden_resource_manifest(
+    graph: &ScheduleGraph,
+    manifest: &[PackedHiddenResourceBinding],
+) -> PyResult<()> {
+    let mut supplied = BTreeMap::<(&str, &'static str, &'static str), &str>::new();
+    let mut previous: Option<(&str, &'static str, &'static str)> = None;
+    for binding in manifest {
+        let key = packed_hidden_locator_key(&binding.layer, binding.layer_kind, binding.site)?;
+        if binding.module_path.is_empty() {
+            return Err(value_error(
+                "packed hidden resource manifest entries require a non-empty module_path",
+            ));
+        }
+        if previous.is_some_and(|prior| prior >= key)
+            || supplied.insert(key, &binding.module_path).is_some()
+        {
+            return Err(value_error(
+                "packed hidden resource manifest requires sorted unique locators",
+            ));
+        }
+        previous = Some(key);
+    }
+
+    let mut required = BTreeSet::<(&str, &'static str, &'static str)>::new();
+    for task in &graph.tasks {
+        for input in &task.inputs {
+            if input.kind != ScheduleInputKind::PackedHidden {
+                continue;
+            }
+            required.insert(packed_hidden_locator_key(
+                &input.layer,
+                input.layer_kind,
+                input.site,
+            )?);
+        }
+    }
+
+    let supplied_keys: BTreeSet<(&str, &'static str, &'static str)> =
+        supplied.keys().copied().collect();
+    let missing: Vec<_> = required.difference(&supplied_keys).collect();
+    let unexpected: Vec<_> = supplied_keys.difference(&required).collect();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        return Err(schedule_error(format!(
+            "packed hidden resource manifest coverage mismatch: missing={missing:?}, unexpected={unexpected:?}",
+        )));
+    }
+    Ok(())
+}
+
 fn validate_inputs(
     graph: &ScheduleGraph,
     timeline: &Timeline,
@@ -2316,7 +2443,10 @@ fn validate_inputs(
                 }
                 ScheduleInputKind::PackedHidden
                     if input.layer.is_empty()
-                        || input.layer_kind == HiddenLayerKind::None
+                        || !matches!(
+                            input.layer_kind,
+                            HiddenLayerKind::Index | HiddenLayerKind::Path
+                        )
                         || input.site != HiddenSite::BlockOutput
                         || input.phase != HiddenPhase::None =>
                 {
@@ -2573,6 +2703,13 @@ fn validate_inputs(
     // Validate resource coverage only after every indexed locator has passed
     // the backend-capability gate, preserving the more specific diagnostic.
     validate_residual_resource_manifest(graph, &options.residual_resource_manifest)?;
+    validate_packed_hidden_resource_manifest(
+        graph,
+        options
+            .packed_hidden_resource_manifest
+            .as_deref()
+            .unwrap_or(&[]),
+    )?;
     for edge in &graph.edges {
         if !task_index.contains_key(&edge.source) || !task_index.contains_key(&edge.target) {
             return Err(value_error("schedule edge references an unknown task"));
@@ -5291,8 +5428,10 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                         || binding.site == HiddenSite::None
                         || binding.phase == HiddenPhase::None))
                 || (binding.kind == RegionInputKind::PackedHidden
-                    && (binding.layer_kind == HiddenLayerKind::None
-                        || binding.site != HiddenSite::BlockOutput
+                    && (!matches!(
+                        binding.layer_kind,
+                        HiddenLayerKind::Index | HiddenLayerKind::Path
+                    ) || binding.site != HiddenSite::BlockOutput
                         || binding.phase != HiddenPhase::None
                         || packed_rows_binding_id.is_empty()))
                 || (binding.kind == RegionInputKind::PackedRequestRows
@@ -6329,12 +6468,12 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         apply_region_shape_specializations_wire, compile_schedule, digest, is_lowercase_sha256,
-        normalize_runtime_specialization_options_wire, validate_runtime_specialization_facts,
-        validate_schedule, workload_compilation_wire_cache_key, AsyncBatchCaptureMode,
-        CompileOptions, Decision, ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind,
-        RegionCaptureMode, RegionFallbackPolicy, RegionHostSubmission, RegionInputBinding,
-        RegionInputKind, RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleGraph,
-        ScheduleInput,
+        normalize_runtime_specialization_options_wire, validate_compile_options_preflight,
+        validate_runtime_specialization_facts, validate_schedule,
+        workload_compilation_wire_cache_key, AsyncBatchCaptureMode, CompileOptions, Decision,
+        ExecutionRegion, HiddenPhase, HiddenSite, HostCommandKind, RegionCaptureMode,
+        RegionFallbackPolicy, RegionHostSubmission, RegionInputBinding, RegionInputKind,
+        RegionOutputKind, RegionStreamClass, ScheduleEffectKind, ScheduleGraph, ScheduleInput,
     };
     use isl_rs::{Context, ScheduleConstraints, UnionAccessInfo, UnionMap, UnionSet};
 
@@ -6479,11 +6618,71 @@ mod tests {
     }
 
     #[test]
+    fn compile_options_v2_requires_an_explicit_closed_packed_hidden_manifest() {
+        pyo3::prepare_freethreaded_python();
+        let legacy: CompileOptions = serde_json::from_str(
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":1}"#,
+        )
+        .unwrap();
+        validate_compile_options_preflight(&legacy).unwrap();
+        assert!(legacy.packed_hidden_resource_manifest.is_none());
+
+        let legacy_empty: CompileOptions = serde_json::from_str(
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[],"schema_version":1}"#,
+        )
+        .unwrap();
+        validate_compile_options_preflight(&legacy_empty).unwrap();
+
+        let legacy_nonempty: CompileOptions = serde_json::from_str(
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[{"layer":"0","layer_kind":"index","site":"block_output","module_path":"model.layers.0"}],"schema_version":1}"#,
+        )
+        .unwrap();
+        assert!(validate_compile_options_preflight(&legacy_nonempty)
+            .unwrap_err()
+            .to_string()
+            .contains("schema v1 requires an empty"));
+
+        let missing_v2: CompileOptions = serde_json::from_str(
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"schema_version":2}"#,
+        )
+        .unwrap();
+        assert!(validate_compile_options_preflight(&missing_v2)
+            .unwrap_err()
+            .to_string()
+            .contains("schema v2 requires an explicit"));
+
+        let empty_v2: CompileOptions = serde_json::from_str(
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[],"schema_version":2}"#,
+        )
+        .unwrap();
+        validate_compile_options_preflight(&empty_v2).unwrap();
+
+        let duplicate: CompileOptions = serde_json::from_str(
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[{"layer":"0","layer_kind":"index","site":"block_output","module_path":"model.layers.0"},{"layer":"0","layer_kind":"index","site":"block_output","module_path":"model.layers.0"}],"schema_version":2}"#,
+        )
+        .unwrap();
+        assert!(validate_compile_options_preflight(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("sorted unique locators"));
+
+        for bad in [
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[{"layer":"00","layer_kind":"index","site":"block_output","module_path":"model.layers.0"}],"schema_version":2}"#,
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[{"layer":"0","layer_kind":"wildcard","site":"block_output","module_path":"model.layers.0"}],"schema_version":2}"#,
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[{"layer":"0","layer_kind":"index","site":"post","module_path":"model.layers.0"}],"schema_version":2}"#,
+            r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"packed_hidden_resource_manifest":[{"layer":"0","layer_kind":"index","site":"block_output","module_path":""}],"schema_version":2}"#,
+        ] {
+            let options: CompileOptions = serde_json::from_str(bad).unwrap();
+            assert!(validate_compile_options_preflight(&options).is_err());
+        }
+    }
+
+    #[test]
     fn schema_v5_packed_inputs_sign_one_row_binding_and_force_eager_inline() {
         pyo3::prepare_freethreaded_python();
         let graph = r#"{"workload_key":"packed","tasks":[{"task_id":"train","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["test:packed@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe","torch.export"]],"required_capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights","selection_port":"selection"}],"inputs":[{"name":"rows","kind":"packed_request_rows","source":"runtime.packed_phase_rows","packed_rows_port":""},{"name":"source","kind":"packed_hidden","source":"source","layer":"0","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"target","kind":"packed_hidden","source":"target","layer":"-1","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"selection","kind":"state_selection","source":"weights","packed_rows_port":"rows"}]}],"edges":[],"values":[],"states":[{"resource":"weights","scope":"request","request_key":["request_id"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":5,"workload_approximations":[]}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.post","execute_model.post"]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"schema_version":2}"#;
-        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"schema_version":1}"#;
+        let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"packed_hidden_resource_manifest":[{"layer":"-1","layer_kind":"index","site":"block_output","module_path":"model.layers.-1"},{"layer":"0","layer_kind":"index","site":"block_output","module_path":"model.layers.0"}],"schema_version":2}"#;
 
         let compiled = compile_schedule(graph, timeline, options).unwrap();
         let decision: Decision = serde_json::from_str(&compiled).unwrap();
@@ -6560,6 +6759,48 @@ mod tests {
         );
         let error = compile_schedule(&mixed_hidden, timeline, options).unwrap_err();
         assert!(error.to_string().contains("ordinary hidden"));
+
+        let mut missing_manifest: serde_json::Value = serde_json::from_str(options).unwrap();
+        missing_manifest["packed_hidden_resource_manifest"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let error = compile_schedule(graph, timeline, &missing_manifest.to_string()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("packed hidden resource manifest coverage mismatch: missing="));
+
+        let mut unexpected_manifest: serde_json::Value = serde_json::from_str(options).unwrap();
+        unexpected_manifest["packed_hidden_resource_manifest"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "layer": "source",
+                "layer_kind": "path",
+                "site": "block_output",
+                "module_path": "model.layers.1",
+            }));
+        let error =
+            compile_schedule(graph, timeline, &unexpected_manifest.to_string()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("packed hidden resource manifest coverage mismatch: missing=[]"));
+        assert!(error.to_string().contains("unexpected="));
+
+        let mut path_graph: serde_json::Value = serde_json::from_str(graph).unwrap();
+        path_graph["tasks"][0]["inputs"][1]["layer"] = serde_json::json!("source");
+        path_graph["tasks"][0]["inputs"][1]["layer_kind"] = serde_json::json!("path");
+        let mut path_options: serde_json::Value = serde_json::from_str(options).unwrap();
+        path_options["packed_hidden_resource_manifest"][1]["layer"] = serde_json::json!("source");
+        path_options["packed_hidden_resource_manifest"][1]["layer_kind"] =
+            serde_json::json!("path");
+        compile_schedule(&path_graph.to_string(), timeline, &path_options.to_string()).unwrap();
+
+        let residual_only = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"residual_resource_manifest":[{"layer_index":-1,"site":"block_output","phase":"decode","module_path":"model.layers.-1"},{"layer_index":0,"site":"block_output","phase":"decode","module_path":"model.layers.0"}],"packed_hidden_resource_manifest":[],"schema_version":2}"#;
+        let error = compile_schedule(graph, timeline, residual_only).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("residual resource manifest coverage mismatch"));
     }
 
     #[test]

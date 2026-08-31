@@ -18,11 +18,13 @@ from tllm.schedule.contracts import (
     MainWorkloadTimeline,
     HiddenLayerKind as ScheduleHiddenLayerKind,
     MemoryPlan,
+    PackedHiddenResourceBinding,
     RegionEffect,
     RegionImplementationKind,
     RegionInputBinding,
     RegionInputKind,
     RegionPort,
+    ResidualResourceBinding,
     RegionTaskInvocation,
     RegionTaskPortBinding,
     ScheduleDecision,
@@ -468,7 +470,22 @@ def test_core_compiler_signs_v7_packed_relations_and_rejects_tamper() -> None:
         ),
         schema_version=2,
     )
-    options = CompileOptions()
+    options = CompileOptions(
+        packed_hidden_resource_manifest=(
+            PackedHiddenResourceBinding(
+                layer="-1",
+                layer_kind=ScheduleHiddenLayerKind.INDEX,
+                site=HiddenSite.BLOCK_OUTPUT,
+                module_path="model.layers.-1",
+            ),
+            PackedHiddenResourceBinding(
+                layer="0",
+                layer_kind=ScheduleHiddenLayerKind.INDEX,
+                site=HiddenSite.BLOCK_OUTPUT,
+                module_path="model.layers.0",
+            ),
+        )
+    )
     compiled = _core.compile_schedule(
         graph.to_json(), timeline.to_json(), options.to_json()
     )
@@ -486,6 +503,60 @@ def test_core_compiler_signs_v7_packed_relations_and_rejects_tamper() -> None:
         if binding.kind
         in (RegionInputKind.PACKED_HIDDEN, RegionInputKind.STATE_SELECTION)
     )
+
+    with pytest.raises(RuntimeError, match="packed hidden resource manifest coverage"):
+        _core.compile_schedule(
+            graph.to_json(),
+            timeline.to_json(),
+            replace(
+                options,
+                packed_hidden_resource_manifest=(
+                    options.packed_hidden_resource_manifest[0],
+                ),
+            ).to_json(),
+        )
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        _core.compile_schedule(
+            graph.to_json(),
+            timeline.to_json(),
+            replace(
+                options,
+                packed_hidden_resource_manifest=(
+                    *options.packed_hidden_resource_manifest,
+                    PackedHiddenResourceBinding(
+                        layer="source",
+                        layer_kind=ScheduleHiddenLayerKind.PATH,
+                        site=HiddenSite.BLOCK_OUTPUT,
+                        module_path="model.layers.1",
+                    ),
+                ),
+            ).to_json(),
+        )
+
+    with pytest.raises(RuntimeError, match="residual resource manifest coverage"):
+        _core.compile_schedule(
+            graph.to_json(),
+            timeline.to_json(),
+            replace(
+                options,
+                residual_resource_manifest=(
+                    ResidualResourceBinding(
+                        layer_index=-1,
+                        site=HiddenSite.BLOCK_OUTPUT,
+                        phase=HiddenPhase.DECODE,
+                        module_path="model.layers.-1",
+                    ),
+                    ResidualResourceBinding(
+                        layer_index=0,
+                        site=HiddenSite.BLOCK_OUTPUT,
+                        phase=HiddenPhase.DECODE,
+                        module_path="model.layers.0",
+                    ),
+                ),
+                packed_hidden_resource_manifest=(),
+            ).to_json(),
+        )
 
     tampered = json.loads(compiled)
     tampered["execution_regions"][0]["input_bindings"][1][
