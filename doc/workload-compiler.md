@@ -249,12 +249,14 @@ version 2, empty live mappings, and zero fallback/replay in every cell. The
 intervention matrix observed one modifier state after the first native update
 and none for version-zero rows.
 
-Legacy differential evidence is still red: legacy per-request execution also
-trains its prefill step (six updates and two intervention states in the aligned
-three-token probe), while native request state currently receives decode rows
-only (four updates and one intervention state). Fixed-seed native and legacy
-tokens also differ before intervention. These are correctness/lifecycle
-capability results, not parity, throughput, or CUDA Graph claims.
+The corrected independent-process request-state differential is numerically
+green on MRv2 eager in-process. Legacy and native use the same short text
+prompts, engine/sampling seeds, and case fingerprint; tokens match exactly both
+without intervention and at `beta=0.5`, loss/update counts are `4/4`, the
+intervention count is `1/1`, and aggregate bf16 loss differs by about
+`8.6e-6`. The superseded six-versus-four result had accidentally stringified a
+`TokensPrompt` through a text-only legacy helper and did not compare the same
+input.
 
 The prefill follow-up now has a neutral CPU-executable foundation:
 `PackedRowPlanInputs` lives in the contracts layer, and
@@ -266,12 +268,14 @@ prevent `(epoch, step)` ABA reuse without retaining unbounded history. Packed
 input kinds and same-task row provenance are now signed by WorkloadIR v4,
 ScheduleGraph v5, and Decision v7. `NativeWorkloadExecution` stages one exact
 row/snapshot batch, the Region resolver binds signed packed inputs, and packed
-request-state selections come only from `PackedPhaseRowBatch.identities`.
+request-state selections come only from the signed row phase of a
+`PackedPhaseRowBatch`, retaining each selected row's original packed index.
 MRv1/MRv2 packed hidden capture and explicit `logits_indices`-derived sampler
-row links now bind that same batch. The initial link adapter transfers one
+row links now bind that same batch, and ESamp consumes them directly. The
+initial link adapter transfers one
 active eager index prefix to CPU, so it is correctness evidence rather than
-aligned-throughput evidence. ESamp still has to consume the links before its
-native update count can include prefill.
+aligned-throughput evidence. ESamp remains decode-only; non-empty prefill rows
+do not admit or update request state.
 
 The matching eager packed-hidden foundation owns an arbitrary non-empty set of
 exact resource-keyed snapshots under one canonical row batch and an explicit

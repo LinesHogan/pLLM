@@ -104,6 +104,7 @@ def _packed_inputs() -> tuple[TaskInputIR, ...]:
             "selection",
             ValueSourceKind.STATE_SELECTION,
             "weights",
+            phase=HiddenPhase.DECODE,
             packed_rows_port="rows",
         ),
     )
@@ -209,7 +210,11 @@ def test_workload_v4_rejects_ambiguous_or_mixed_packed_inputs() -> None:
         replace(task.inputs[0], source="arbitrary")
     with pytest.raises(ValueError, match="must not declare packed_rows_port"):
         replace(task.inputs[0], packed_rows_port="rows")
-    unbound_selection = replace(task.inputs[-1], packed_rows_port="")
+    unbound_selection = replace(
+        task.inputs[-1],
+        phase=HiddenPhase.NONE,
+        packed_rows_port="",
+    )
     with pytest.raises(ValueError, match="state_selection.*packed_rows_port"):
         replace(
             workload,
@@ -249,6 +254,22 @@ def test_workload_v4_rejects_ambiguous_or_mixed_packed_inputs() -> None:
     with pytest.raises(ValueError, match="schema v3"):
         replace(workload, schema_version=3)
 
+    prefill_task = replace(
+        task,
+        name="prefill-train",
+        ordinal=1,
+        inputs=(
+            *task.inputs[:-1],
+            replace(task.inputs[-1], phase=HiddenPhase.PREFILL),
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot mix row phases"):
+        replace(
+            workload,
+            tasks=(task, prefill_task),
+            schedule=("train", "prefill-train"),
+        )
+
 
 def test_lowering_emits_graph_v5_and_preserves_packed_port_relation() -> None:
     graph = lower_schedule_graph((_packed_workload(),))
@@ -272,6 +293,7 @@ def test_lowering_emits_graph_v5_and_preserves_packed_port_relation() -> None:
         "rows",
     )
     assert task.inputs[-1].source == "weights"
+    assert task.inputs[-1].phase is HiddenPhase.DECODE
     assert graph == type(graph).from_json(graph.to_json())
 
 
@@ -318,6 +340,7 @@ def _packed_region() -> ExecutionRegion:
                 kind=RegionInputKind.STATE_SELECTION,
                 source="weights",
                 consumers=(RegionPort("train", "selection"),),
+                phase=HiddenPhase.DECODE,
                 packed_rows_binding_id="rows-binding",
             ),
         ),
@@ -394,7 +417,9 @@ def test_decision_v7_signs_and_tamper_checks_packed_binding_relation() -> None:
         )
 
     unbound_selection = replace(
-        region.input_bindings[-1], packed_rows_binding_id=""
+        region.input_bindings[-1],
+        phase=HiddenPhase.NONE,
+        packed_rows_binding_id="",
     )
     with pytest.raises(ValueError, match="same-task packed rows"):
         replace(

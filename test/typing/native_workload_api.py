@@ -31,6 +31,7 @@ from tllm.runtime.request_trainable_state import (
     RequestStateRuntimeService,
     RequestStateSelectionBatch,
 )
+from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.packed_rows import PackedPhaseRowBatch
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.workload import (
@@ -180,7 +181,9 @@ class _PackedAuthorTypingWorkload(Workload[_RequestStateTypingConfig]):
         optimizer=AdamWSpec.fixed(1e-3),
     )
     rows: PackedRequestRowsInput = packed_request_rows()
-    selection = packed_selection(state.selection(), rows=rows)
+    selection = packed_selection(
+        state.selection(), rows=rows, phase=HiddenPhase.DECODE
+    )
 
     @state.initialize
     def init_state(self, spec: RuntimeSpecializationSpec) -> torch.nn.Linear:

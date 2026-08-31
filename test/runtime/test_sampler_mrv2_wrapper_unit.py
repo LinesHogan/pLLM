@@ -24,6 +24,11 @@ from tllm.backends.vllm import sampler_mrv2
 from tllm.runtime.residual_runtime import SamplerPrecomputeState
 from tllm.runtime.sampler_bridge.provider import SamplerInterventionStage
 from tllm.runtime.sampler_bridge.types import CandidateModifierState
+from tllm.runtime.step_session import (
+    StepSession,
+    StepState,
+    set_step_session,
+)
 
 
 def _runtime(**kwargs: Any) -> Any:
@@ -39,6 +44,14 @@ def _runtime(**kwargs: Any) -> Any:
     kwargs.setdefault("event_step_id", 11)
     kwargs.setdefault("sampler_precompute", SamplerPrecomputeState())
     return SimpleNamespace(**kwargs)
+
+
+def _signed_runner() -> SimpleNamespace:
+    runner = SimpleNamespace(model=torch.nn.Identity())
+    session = StepSession(step_id=11, backend_id="test-mrv2")
+    session.transition(StepState.INPUTS_READY)
+    set_step_session(runner, session)
+    return runner
 
 
 class _FakeSamplerStates:
@@ -99,7 +112,7 @@ def _pre_filter_state(*, raw: torch.Tensor, reweighted: torch.Tensor) -> Candida
 class Mrv2SamplerWrapperOrderTest(unittest.TestCase):
     def _wrapper(self, *, runtime: Any, provider: Any, sampler: Any) -> Any:
         runtime.consumer = SimpleNamespace(sampler_modifier_provider=lambda: provider)
-        runner = SimpleNamespace(model=object())
+        runner = _signed_runner()
         orig_sample = mock.Mock(return_value=("orig-sampled", "orig-processed"))
         return (
             sampler_mrv2.make_mrv2_sample_wrapper(
@@ -142,6 +155,47 @@ class Mrv2SamplerWrapperOrderTest(unittest.TestCase):
         self.assertEqual(order, ["dispatch", "provider"])
         orig_sample.assert_called_once()
         self.assertEqual(sampled, "orig-sampled")
+
+    def test_backend_only_sampler_states_never_consume_native_guidance(self) -> None:
+        for session_state in (
+            None,
+            StepState.CREATED,
+            StepState.BACKEND_WARMUP,
+        ):
+            with self.subTest(session_state=session_state):
+                provider = SimpleNamespace(
+                    is_active=lambda: True,
+                    prepare_step=mock.Mock(),
+                )
+                runtime = _runtime()
+                runtime.consumer = SimpleNamespace(
+                    sampler_modifier_provider=lambda: provider
+                )
+                runner = SimpleNamespace(model=torch.nn.Identity())
+                if session_state is not None:
+                    session = StepSession(
+                        step_id=11, backend_id="test-mrv2"
+                    )
+                    if session_state is StepState.BACKEND_WARMUP:
+                        session.transition(StepState.BACKEND_WARMUP)
+                    set_step_session(runner, session)
+                original = mock.Mock(
+                    return_value=("orig-sampled", "orig-processed")
+                )
+                wrapped = sampler_mrv2.make_mrv2_sample_wrapper(
+                    sampler=_FakeSampler(),
+                    runtime=runtime,
+                    runner=runner,
+                    orig_sample=original,
+                )
+                with mock.patch.object(
+                    sampler_mrv2, "dispatch_sampler_pre_draw"
+                ) as dispatch:
+                    sampled, _ = wrapped(*self._args())
+                self.assertEqual(sampled, "orig-sampled")
+                original.assert_called_once()
+                provider.prepare_step.assert_not_called()
+                dispatch.assert_not_called()
 
     def _args(self) -> tuple[Any, ...]:
         return (
@@ -194,7 +248,7 @@ class Mrv2SamplerPipelineReorderTest(unittest.TestCase):
         wrapped = sampler_mrv2.make_mrv2_sample_wrapper(
             sampler=sampler,
             runtime=runtime,
-            runner=SimpleNamespace(model=object()),
+            runner=_signed_runner(),
             orig_sample=mock.Mock(),
         )
 
@@ -224,7 +278,7 @@ class Mrv2SamplerPipelineReorderTest(unittest.TestCase):
         runtime = _runtime()
         runtime.consumer = SimpleNamespace(sampler_modifier_provider=lambda: provider)
         sampler = _FakeSampler(temperature=temperature, min_p=min_p)
-        runner = SimpleNamespace(model=object())
+        runner = _signed_runner()
         wrapped = sampler_mrv2.make_mrv2_sample_wrapper(
             sampler=sampler,
             runtime=runtime,

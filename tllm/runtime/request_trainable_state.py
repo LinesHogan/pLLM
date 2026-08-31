@@ -92,6 +92,13 @@ class RequestStateLease:
 class RequestStateSelectionRow:
     identity: RequestIdentity
     lease: RequestStateLease
+    canonical_row_index: int
+
+    def __post_init__(self) -> None:
+        if self.canonical_row_index < 0:
+            raise ValueError(
+                "request-state selection row index must be non-negative"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +149,46 @@ class RequestIdentityBatch:
             raise ValueError(
                 "request identity batch requires fully resolved identities"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedRequestIdentityRow:
+    """One identity projected from its canonical source tensor row."""
+
+    canonical_row_index: int
+    identity: RequestIdentity
+
+    def __post_init__(self) -> None:
+        if self.canonical_row_index < 0:
+            raise ValueError(
+                "indexed request identity row must be non-negative"
+            )
+        if (
+            not self.identity.request_id
+            or self.identity.prompt_idx < 0
+            or self.identity.sample_idx < 0
+        ):
+            raise ValueError(
+                "indexed request identity requires a fully resolved identity"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedRequestIdentityBatch:
+    """A phase projection retaining exact rows in a larger tensor batch."""
+
+    rows: tuple[IndexedRequestIdentityRow, ...]
+
+    def __post_init__(self) -> None:
+        indices = tuple(row.canonical_row_index for row in self.rows)
+        if indices != tuple(sorted(set(indices))):
+            raise ValueError(
+                "indexed request identity rows must be strictly increasing"
+            )
+
+    @property
+    def identities(self) -> tuple[RequestIdentity, ...]:
+        return tuple(row.identity for row in self.rows)
 
 
 class StateEffectOperation(StrEnum):
@@ -590,8 +637,30 @@ class RequestTrainableStateStore(Generic[ModuleT]):
     def acquire(
         self, identities: tuple[RequestIdentity, ...]
     ) -> RequestStateAcquisition:
+        return self._acquire(
+            identities,
+            tuple(range(len(identities))),
+        )
+
+    def acquire_indexed(
+        self, batch: IndexedRequestIdentityBatch
+    ) -> RequestStateAcquisition:
+        return self._acquire(
+            batch.identities,
+            tuple(row.canonical_row_index for row in batch.rows),
+        )
+
+    def _acquire(
+        self,
+        identities: tuple[RequestIdentity, ...],
+        canonical_row_indices: tuple[int, ...],
+    ) -> RequestStateAcquisition:
         if not identities:
             raise ValueError("request state selection requires identities")
+        if len(canonical_row_indices) != len(identities):
+            raise ValueError(
+                "request state canonical rows must align with identities"
+            )
         keys = tuple(
             RequestStateKey.project(identity, self._key_fields)
             for identity in identities
@@ -742,8 +811,17 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 )
                 lease_by_key = {lease.key: lease for lease in leases}
                 rows = tuple(
-                    RequestStateSelectionRow(identity, lease_by_key[key])
-                    for identity, key in zip(identities, keys, strict=True)
+                    RequestStateSelectionRow(
+                        identity,
+                        lease_by_key[key],
+                        canonical_row_index,
+                    )
+                    for identity, key, canonical_row_index in zip(
+                        identities,
+                        keys,
+                        canonical_row_indices,
+                        strict=True,
+                    )
                 )
                 selection_id = self._next_selection_id
                 self._next_selection_id += 1
@@ -795,8 +873,8 @@ class RequestTrainableStateStore(Generic[ModuleT]):
                 strict=True,
             ):
                 positions = [
-                    position
-                    for position, row in enumerate(selection.rows)
+                    row.canonical_row_index
+                    for row in selection.rows
                     if row.lease == lease
                 ]
                 groups.append(
@@ -1129,7 +1207,7 @@ class RequestTrainableStateStore(Generic[ModuleT]):
 
 @dataclass(slots=True)
 class _StagedRequestStateStep:
-    identities: RequestIdentityBatch
+    identities: RequestIdentityBatch | IndexedRequestIdentityBatch
     selection: RequestStateSelectionBatch | None = None
 
 
@@ -1245,6 +1323,22 @@ class RequestStateRuntimeService(Generic[ModuleT]):
     def stage_identities(self, step_id: int, batch: RequestIdentityBatch) -> None:
         """Stage one immutable identity batch before any Region resolves it."""
 
+        self._stage_identity_batch(step_id, batch)
+
+    def stage_indexed_identities(
+        self, step_id: int, batch: IndexedRequestIdentityBatch
+    ) -> None:
+        """Stage a canonical-row projection before any Region resolves it."""
+
+        self._stage_identity_batch(step_id, batch)
+
+    def _stage_identity_batch(
+        self,
+        step_id: int,
+        batch: RequestIdentityBatch | IndexedRequestIdentityBatch,
+    ) -> None:
+        """Install one closed ordinary or indexed identity variant."""
+
         if step_id < 0:
             raise ValueError("request-state step id must be non-negative")
         with self._lock:
@@ -1270,7 +1364,11 @@ class RequestStateRuntimeService(Generic[ModuleT]):
                 ) from exc
             if staged.selection is not None:
                 return staged.selection
-            acquired = self._store.acquire(staged.identities.identities)
+            match staged.identities:
+                case RequestIdentityBatch(identities=identities):
+                    acquired = self._store.acquire(identities)
+                case IndexedRequestIdentityBatch() as indexed:
+                    acquired = self._store.acquire_indexed(indexed)
             self._validate_admission(acquired)
             self._store.consume_receipt(acquired.admission)
             staged.selection = acquired.selection
@@ -1613,6 +1711,8 @@ __all__ = [
     "RequestStateAcquisition",
     "RequestStateAsyncPin",
     "RequestStateEffectAudit",
+    "IndexedRequestIdentityBatch",
+    "IndexedRequestIdentityRow",
     "RequestIdentityBatch",
     "RequestStateKey",
     "RequestStateLease",

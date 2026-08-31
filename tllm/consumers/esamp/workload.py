@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from tllm.consumers.esamp.model import LowRankGatedResidualModel
+from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.packed_rows import (
     PackedPhaseRowBatch,
     PackedSamplerRowBatch,
@@ -100,7 +101,9 @@ class ESampWorkload(Workload[ESampConfig]):
     request_rows = packed_request_rows()
     request_sampler_rows = packed_sampler_rows(rows=request_rows)
     request_distiller_selection = packed_selection(
-        request_distiller.selection(), rows=request_rows
+        request_distiller.selection(),
+        rows=request_rows,
+        phase=HiddenPhase.DECODE,
     )
 
     def __init__(self, config: ESampConfig) -> None:
@@ -275,10 +278,18 @@ class ESampWorkload(Workload[ESampConfig]):
             for group in groups
             if group.before_version > 0
         }
+        lease_by_packed_row = {
+            row.canonical_row_index: row.lease
+            for row in selection.rows
+        }
         affected_row_ids = tuple(
             link.sampler_row_index
             for link in sampler_rows.links
-            if selection.rows[link.packed_row_index].lease in active_leases
+            if (
+                link.packed_row_index in lease_by_packed_row
+                and lease_by_packed_row[link.packed_row_index]
+                in active_leases
+            )
         )
         with torch.no_grad():
             predictions_by_sampler_row = source.new_empty(
@@ -290,8 +301,11 @@ class ESampWorkload(Workload[ESampConfig]):
                 sampler_row_ids = tuple(
                     link.sampler_row_index
                     for link in sampler_rows.links
-                    if selection.rows[link.packed_row_index].lease
-                    == group.lease
+                    if (
+                        link.packed_row_index in lease_by_packed_row
+                        and lease_by_packed_row[link.packed_row_index]
+                        == group.lease
+                    )
                 )
                 if not sampler_row_ids:
                     continue

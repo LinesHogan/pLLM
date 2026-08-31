@@ -584,6 +584,22 @@ class ScheduleInput:
                 )
             if self.phase is not HiddenPhase.NONE:
                 raise ValueError("packed_hidden ScheduleInput requires phase NONE")
+        elif self.kind is ScheduleInputKind.STATE_SELECTION:
+            if (
+                self.layer_kind is not HiddenLayerKind.NONE
+                or self.site is not HiddenSite.NONE
+                or (
+                    bool(self.packed_rows_port)
+                    != (
+                        self.phase
+                        in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+                    )
+                )
+            ):
+                raise ValueError(
+                    "packed state_selection ScheduleInput requires exactly one "
+                    "prefill/decode phase"
+                )
         elif self.layer_kind is not HiddenLayerKind.NONE:
             raise ValueError("only hidden ScheduleInput may declare layer_kind")
         elif self.site is not HiddenSite.NONE or self.phase is not HiddenPhase.NONE:
@@ -982,6 +998,7 @@ class ScheduleGraph:
                 "ScheduleGraph schema before v3 cannot carry stable state-storage evidence"
             )
         state_by_resource = {state.resource: state for state in self.states}
+        packed_state_phases: dict[str, HiddenPhase] = {}
         for task in self.tasks:
             packed_rows_inputs = tuple(
                 task_input
@@ -1063,6 +1080,18 @@ class ScheduleGraph:
                 for task_input in task.inputs
                 if task_input.kind is ScheduleInputKind.STATE_SELECTION
             }
+            for selection in selection_inputs.values():
+                if not selection.packed_rows_port:
+                    continue
+                if (
+                    selection.source in packed_state_phases
+                    and packed_state_phases[selection.source]
+                    is not selection.phase
+                ):
+                    raise ValueError(
+                        "one packed request state cannot mix row phases"
+                    )
+                packed_state_phases[selection.source] = selection.phase
             request_effect_resources: set[str] = set()
             if self.schema_version < 4 and selection_inputs:
                 raise ValueError(
@@ -1905,6 +1934,22 @@ class RegionInputBinding:
             if not self.packed_rows_binding_id:
                 raise ValueError(
                     "packed_hidden RegionInputBinding requires packed_rows_binding_id"
+                )
+        elif self.kind is RegionInputKind.STATE_SELECTION:
+            if (
+                self.layer_kind is not HiddenLayerKind.NONE
+                or self.site is not HiddenSite.NONE
+                or (
+                    bool(self.packed_rows_binding_id)
+                    != (
+                        self.phase
+                        in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+                    )
+                )
+            ):
+                raise ValueError(
+                    "packed state_selection RegionInputBinding requires exactly "
+                    "one prefill/decode phase"
                 )
         elif self.layer_kind is not HiddenLayerKind.NONE:
             raise ValueError("only hidden RegionInputBinding may declare layer_kind")

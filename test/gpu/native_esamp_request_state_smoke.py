@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU smoke for eager native ESamp request-scoped state.
+"""GPU acceptance and retained-legacy differential for ESamp request state.
 
 One invocation covers one of the four required topology cells:
 
@@ -7,9 +7,9 @@ One invocation covers one of the four required topology cells:
 
 The workload is intentionally small but not synthetic: two public parent
 requests use ``SamplingParams(n=2)`` so vLLM creates parallel child samples.
-Each child emits three tokens. Native packed rows train once on prefill and
-twice on decode, while all parallel children share their parent slot. After
-the public call returns,
+Each child emits three tokens: the initial sampled token comes from prefill,
+then two decode steps train while all parallel children share their parent
+slot. After the public call returns,
 the closed worker-status DTO proves both live slots and request-id mappings
 were retired while retaining a bounded immutable retirement receipt.
 
@@ -21,10 +21,12 @@ fallback as evidence of success.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -44,12 +46,17 @@ _PARENTS = 2
 _PARALLEL_SAMPLES = 2
 _GENERATED_TOKENS = 3
 _DECODE_UPDATES = 2
-_TOTAL_UPDATES = 1 + _DECODE_UPDATES
 _REQUEST_STATE_RESOURCE = "request_distiller"
+_PROMPTS = ("Hello", "World")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--implementation",
+        choices=("native", "legacy"),
+        default="native",
+    )
     parser.add_argument("--runner", choices=("mrv1", "mrv2"), required=True)
     parser.add_argument(
         "--engine-core-mp",
@@ -63,7 +70,40 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="verify version-gated typed sampler guidance after the first update",
     )
+    parser.add_argument("--out", default="")
     return parser.parse_args()
+
+
+def _emit_summary(serialized: str, output_path: str) -> None:
+    print(serialized)
+    if output_path:
+        Path(output_path).write_text(serialized + "\n", encoding="utf-8")
+
+
+def _case_signature(args: argparse.Namespace) -> str:
+    payload = json.dumps(
+        {
+            "model": str(args.model_name),
+            "runner": str(args.runner),
+            "engine_core_mp": bool(args.engine_core_mp),
+            "prompts": _PROMPTS,
+            "parents": _PARENTS,
+            "parallel_samples": _PARALLEL_SAMPLES,
+            "generated_tokens": _GENERATED_TOKENS,
+            "engine_seed": 1234,
+            "sampling_seed": 7,
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "top_k": 32,
+            "intervention": bool(args.intervention),
+            "distiller_beta": 0.5 if args.intervention else 0.0,
+            "distiller_hidden_dim": 8,
+            "distiller_lr": 1e-3,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _signed_eager_contract(
@@ -182,9 +222,9 @@ def _typed_retirement_audit(
                 "worker request-state retirement violates the native parent-key "
                 f"contract: {entry!r}"
             )
-        if entry.after_version != _TOTAL_UPDATES:
+        if entry.after_version != _DECODE_UPDATES:
             raise AssertionError(
-                "each parent slot must retire at its packed prefill/decode version: "
+                "each parent slot must retire at its final decode version: "
                 f"{entry!r}"
             )
     return tuple(
@@ -208,7 +248,7 @@ def _assert_post_finish_statuses(
     if not statuses:
         raise AssertionError(f"post-cleanup workload status is empty: {statuses!r}")
     canonical: tuple["WorkerRequestStateRetirementStatus", ...] | None = None
-    expected_loss_updates = _PARENTS * _TOTAL_UPDATES
+    expected_loss_updates = _PARENTS * _DECODE_UPDATES
     for status in statuses:
         if status["signature"] != signature or status["plan_epoch"] != plan_epoch:
             raise AssertionError(f"worker changed signed plan identity: {status!r}")
@@ -271,6 +311,135 @@ def _retirement_json(
     ]
 
 
+def _run_legacy(args: argparse.Namespace) -> int:
+    """Run the retained prompt-keyed baseline in this independent process."""
+
+    from vllm import SamplingParams
+
+    from tllm.runtime import residual_runtime as core
+    from tllm.runtime.mp.control import ControlPlane
+    from tllm.util.tools import shutdown_llm_instance
+    from tllm.workflows.esamp_support import (
+        configure_esamp_runtime,
+        run_generate_with_request_mapping,
+    )
+
+    configure_esamp_runtime(
+        implementation="legacy",
+        per_request_models=True,
+        enable_esamp_training=True,
+        enable_distiller_intervention=bool(args.intervention),
+        distiller_beta=0.5 if args.intervention else 0.0,
+        distiller_hidden_dim=8,
+        distiller_lr=1e-3,
+    )
+    llm: "LLM | None" = None
+    try:
+        llm = core.make_llm(
+            model_name=str(args.model_name),
+            dtype="bfloat16",
+            gpu_memory_utilization=float(args.gpu_mem),
+            max_model_len=64,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+            seed=1234,
+            max_num_seqs=_PARENTS * _PARALLEL_SAMPLES,
+            max_num_batched_tokens=16,
+        )
+        params = SamplingParams(
+            n=_PARALLEL_SAMPLES,
+            temperature=0.8,
+            top_p=0.95,
+            top_k=32,
+            seed=7,
+            max_tokens=_GENERATED_TOKENS,
+            ignore_eos=True,
+        )
+        outputs = run_generate_with_request_mapping(
+            llm,
+            _PROMPTS,
+            params,
+            request_prompt_indices=tuple(range(_PARENTS)),
+            use_tqdm=False,
+            dispatch_post_generate=False,
+        )
+        core.synchronize_esamp()
+        output_token_ids = _assert_outputs(outputs)
+        training = core.read_and_reset_esamp_stats(sync=True)
+        per_request = core.read_and_reset_esamp_per_request_stats(sync=True)
+        timing = core.read_and_reset_distiller_timing_stats(sync=True)
+        expected_updates = _PARENTS * _DECODE_UPDATES
+        if training.loss_count != expected_updates:
+            raise AssertionError(
+                "legacy request baseline did not train every decode step: "
+                f"{training!r}"
+            )
+        per_request_loss_counts = {
+            str(prompt_idx): stats.loss_count
+            for prompt_idx, stats in sorted(per_request.items())
+        }
+        if tuple(per_request_loss_counts.values()) != (
+            _DECODE_UPDATES,
+        ) * _PARENTS:
+            raise AssertionError(
+                "legacy prompt-keyed updates differ from the request case: "
+                f"{per_request_loss_counts!r}"
+            )
+        intervention_count = int(timing.intervention_state_count)
+        expected_interventions = (
+            _DECODE_UPDATES - 1 if args.intervention else 0
+        )
+        if intervention_count != expected_interventions:
+            raise AssertionError(
+                "legacy guidance did not follow decode-only timing: "
+                f"expected={expected_interventions} "
+                f"actual={intervention_count}"
+            )
+        if timing.fallback_count != 0:
+            raise AssertionError(
+                f"legacy sampler used fallback work: {timing!r}"
+            )
+        plane = ControlPlane.try_bind(llm)
+        mapping_sizes = (
+            ()
+            if plane is None
+            else tuple(
+                reply["mapping_size"]
+                for reply in plane.ping(timeout=60.0)
+            )
+        )
+        _emit_summary(
+            json.dumps(
+                {
+                    "implementation": "legacy",
+                    "case_signature": _case_signature(args),
+                    "runner": args.runner,
+                    "engine_core_mp": bool(args.engine_core_mp),
+                    "parents": _PARENTS,
+                    "parallel_samples": _PARALLEL_SAMPLES,
+                    "generated_tokens": _GENERATED_TOKENS,
+                    "decode_updates": _DECODE_UPDATES,
+                    "intervention": bool(args.intervention),
+                    "intervention_state_count": intervention_count,
+                    "loss_avg": training.loss_avg,
+                    "loss_count": training.loss_count,
+                    "output_token_ids": output_token_ids,
+                    "update_count": expected_updates,
+                    "sampler_fallback_count": timing.fallback_count,
+                    "per_request_loss_counts": per_request_loss_counts,
+                    "post_finish_mapping_sizes": mapping_sizes,
+                },
+                sort_keys=True,
+            ),
+            str(args.out),
+        )
+        return 0
+    finally:
+        if llm is not None:
+            shutdown_llm_instance(llm, cooldown_s=1.0)
+        core.clear_dispatch_consumers()
+
+
 def main() -> int:
     args = _parse_args()
     if not 0.0 < float(args.gpu_mem) <= 1.0:
@@ -282,8 +451,10 @@ def main() -> int:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+    if args.implementation == "legacy":
+        return _run_legacy(args)
+
     from vllm import SamplingParams
-    from vllm.inputs import TokensPrompt
 
     from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
     from tllm.runtime import residual_runtime as core
@@ -332,15 +503,11 @@ def main() -> int:
             max_tokens=_GENERATED_TOKENS,
             ignore_eos=True,
         )
-        prompts = tuple(
-            TokensPrompt(prompt_token_ids=[10 + index, 20 + index, 30 + index])
-            for index in range(_PARENTS)
-        )
         # Do not expand prompts manually: n=2 must exercise vLLM's parent /
         # child grammar and its EngineCore suffix aliases where applicable.
         outputs = runtime.generate_requests(
             llm,
-            prompts,
+            _PROMPTS,
             params,
             prompt_indices=tuple(range(_PARENTS)),
         )
@@ -367,7 +534,7 @@ def main() -> int:
             artifacts=artifacts,
         )
         training = core.read_and_reset_esamp_stats(sync=True)
-        if training.loss_count != _PARENTS * _TOTAL_UPDATES:
+        if training.loss_count != _PARENTS * _DECODE_UPDATES:
             raise AssertionError(
                 "parent did not report all request-state losses: "
                 f"{training!r}"
@@ -375,7 +542,7 @@ def main() -> int:
         timing = core.read_and_reset_distiller_timing_stats(sync=True)
         intervention_count = int(timing.intervention_state_count)
         expected_interventions = (
-            _TOTAL_UPDATES - 1 if args.intervention else 0
+            _DECODE_UPDATES - 1 if args.intervention else 0
         )
         if intervention_count != expected_interventions:
             raise AssertionError(
@@ -400,9 +567,11 @@ def main() -> int:
                 "finished native request mappings remained live: "
                 f"{post_mapping_sizes!r}"
             )
-        print(
+        _emit_summary(
             json.dumps(
                 {
+                    "implementation": "native",
+                    "case_signature": _case_signature(args),
                     "runner": args.runner,
                     "engine_core_mp": bool(args.engine_core_mp),
                     "graph_mode": compilation.timeline.graph_mode,
@@ -417,12 +586,12 @@ def main() -> int:
                     "parallel_samples": _PARALLEL_SAMPLES,
                     "generated_tokens": _GENERATED_TOKENS,
                     "decode_updates": _DECODE_UPDATES,
-                    "total_updates_per_parent": _TOTAL_UPDATES,
                     "intervention": bool(args.intervention),
                     "intervention_state_count": intervention_count,
+                    "loss_avg": training.loss_avg,
                     "loss_count": training.loss_count,
                     "output_token_ids": output_token_ids,
-                    "update_count": _PARENTS * _TOTAL_UPDATES,
+                    "update_count": _PARENTS * _DECODE_UPDATES,
                     "request_state_retirements": _retirement_json(retirement_audit),
                     "execute_count": physical_stats.execute_count,
                     "eager_count": physical_stats.eager_count,
@@ -432,7 +601,8 @@ def main() -> int:
                     "post_finish_request_state_versions": 0,
                 },
                 sort_keys=True,
-            )
+            ),
+            str(args.out),
         )
         return 0
     finally:

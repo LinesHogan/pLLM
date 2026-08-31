@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import pytest
 import torch
 
-from tllm.contracts.hidden_locator import HiddenSite
+from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import (
     PackedHiddenSnapshot,
     PackedHiddenSnapshotBatch,
@@ -179,6 +179,7 @@ def _packed_artifact(
             kind=RegionInputKind.STATE_SELECTION,
             source="weights",
             consumers=(RegionPort("train", "selection"),),
+            phase=HiddenPhase.DECODE,
             packed_rows_binding_id="rows",
         ),
     )
@@ -323,11 +324,16 @@ def test_packed_inputs_resolve_one_epoch_step_and_complete_row_identity() -> Non
     assert result.rows is rows
     torch.testing.assert_close(result.layer_zero, zero_hidden)
     torch.testing.assert_close(result.layer_minus_one, minus_one_hidden)
-    assert tuple(row.identity for row in result.selection.rows) == rows.identities
+    assert tuple(row.identity for row in result.selection.rows) == tuple(
+        row.identity for row in rows.decode_rows
+    )
+    assert tuple(
+        row.canonical_row_index for row in result.selection.rows
+    ) == (2,)
     assert (len(rows.prefill_rows), len(rows.decode_rows)) == (2, 1)
-    assert len(result.selection.rows) == 3
-    assert len(result.selection.leases) == 2
-    assert tuple(version.version for version in service.versions()) == (0, 0)
+    assert len(result.selection.rows) == 1
+    assert len(result.selection.leases) == 1
+    assert tuple(version.version for version in service.versions()) == (0,)
     store.finish_step(7)
 
 
@@ -453,7 +459,7 @@ def test_packed_inputs_reject_missing_or_mismatched_runtime_provenance() -> None
     store.finish_step(7)
 
 
-def test_empty_packed_rows_are_the_only_skipped_selection_batch() -> None:
+def test_nonempty_prefill_rows_skip_decode_selection_without_admission() -> None:
     artifact = _packed_artifact([])
     service = _request_state_service()
     store = _value_store(artifact, service)
@@ -462,7 +468,7 @@ def test_empty_packed_rows_are_the_only_skipped_selection_batch() -> None:
         7,
         PackedRowPlanInputs(
             request_ids=("request-a",),
-            scheduled_tokens=(0,),
+            scheduled_tokens=(1,),
             prompt_tokens=(1,),
             computed_tokens=(0,),
         ),
@@ -472,7 +478,7 @@ def test_empty_packed_rows_are_the_only_skipped_selection_batch() -> None:
     snapshots = _snapshot_batch(
         rows,
         _packed_resources(),
-        (torch.empty((0, 2)), torch.empty((0, 2))),
+        (torch.zeros((1, 2)), torch.ones((1, 2))),
     )
 
     store.prepare_step(7)
@@ -481,6 +487,7 @@ def test_empty_packed_rows_are_the_only_skipped_selection_batch() -> None:
     inputs = store.resolve_inputs(artifact, _context())
 
     assert inputs["rows"] is rows
+    assert len(rows.prefill_rows) == 1
     assert inputs["selection"] is SKIPPED
     assert service.versions() == ()
     store.finish_step(7)

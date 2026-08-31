@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from tllm.backends.protocol import runner_model_module
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 from tllm.runtime.sampler_bridge.provider import validate_prepared_intervention
+from tllm.runtime.step_session import StepState, get_step_session
 from tllm.runtime.vllm_patch.sampler_patch import (
     _notify_after_sample,
     _resolve_provider,
@@ -466,6 +467,20 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
     ) -> tuple[torch.Tensor, torch.Tensor]:
         provider = _resolve_provider(runtime)
         if provider is None or not provider.is_active():
+            return orig_sample(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                pos,
+                input_ids,
+                expanded_local_pos,
+                return_logprobs=return_logprobs,
+            )
+        session = get_step_session(runner)
+        if session is None or session.state in (
+            StepState.CREATED,
+            StepState.BACKEND_WARMUP,
+        ):
             return orig_sample(
                 logits,
                 expanded_idx_mapping,

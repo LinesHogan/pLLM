@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.packed_rows import PackedPhaseRowBatch
 from tllm.runtime.request_trainable_state import (
     RequestStateSelectionBatch,
@@ -40,7 +41,9 @@ def test_packed_author_inputs_lower_nominal_same_task_relations() -> None:
             key=request_key(RequestKeyField.REQUEST_ID),
             optimizer=AdamWSpec.fixed(1e-3),
         )
-        selection = packed_selection(weights.selection(), rows=rows)
+        selection = packed_selection(
+            weights.selection(), rows=rows, phase=HiddenPhase.DECODE
+        )
 
         @task(
             inputs={
@@ -87,6 +90,7 @@ def test_packed_author_inputs_lower_nominal_same_task_relations() -> None:
     assert task_ir.inputs[1].layer_kind == HiddenLayerKind.INDEX.value
     assert task_ir.inputs[1].site.value == "block_output"
     assert task_ir.inputs[1].phase.value == ""
+    assert task_ir.inputs[-1].phase is HiddenPhase.DECODE
     assert task_ir.effects[0].selection_port == "selection"
 
     definition = definition_for_workload_class(PackedAuthor)
@@ -110,7 +114,7 @@ def test_packed_author_descriptors_are_nominal_public_types() -> None:
         optimizer=AdamWSpec.fixed(1e-3),
     )
     selection: StateSelectionInput[torch.nn.Linear] = packed_selection(
-        state.selection(), rows=rows
+        state.selection(), rows=rows, phase=HiddenPhase.DECODE
     )
 
     assert hidden.rows is rows
@@ -166,11 +170,15 @@ def test_packed_selection_effect_requires_exact_related_selection() -> None:
         optimizer=AdamWSpec.fixed(1e-3),
     )
     ordinary = state.selection()
-    packed = packed_selection(ordinary, rows=rows)
+    packed = packed_selection(
+        ordinary, rows=rows, phase=HiddenPhase.DECODE
+    )
     other_rows = packed_request_rows()
 
     with pytest.raises(ValueError, match="different packed request rows"):
-        packed_selection(packed, rows=other_rows)
+        packed_selection(
+            packed, rows=other_rows, phase=HiddenPhase.DECODE
+        )
 
     with pytest.raises(ValueError, match="exact selection input"):
         @task(
@@ -183,7 +191,9 @@ def test_packed_selection_effect_requires_exact_related_selection() -> None:
         ) -> None:
             _ = rows, selection
 
-    foreign_selection = packed_selection(ordinary, rows=other_rows)
+    foreign_selection = packed_selection(
+        ordinary, rows=other_rows, phase=HiddenPhase.DECODE
+    )
     with pytest.raises(ValueError, match="same-task packed request rows"):
         @task(
             inputs={"rows": rows, "selection": foreign_selection},

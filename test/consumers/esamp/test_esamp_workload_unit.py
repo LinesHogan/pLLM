@@ -33,6 +33,8 @@ from tllm.contracts.request_identity import (
     RequestKeyField,
 )
 from tllm.runtime.request_trainable_state import (
+    IndexedRequestIdentityBatch,
+    IndexedRequestIdentityRow,
     RequestIdentityBatch,
     RequestStateSelectionBatch,
     RequestStateRuntimeService,
@@ -515,7 +517,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
         service.retire_requests(RequestFinishedBatch(identities))
         self.assertEqual(service.versions(), ())
 
-    def test_request_guidance_maps_sampler_links_while_training_all_packed_rows(self) -> None:
+    def test_request_guidance_maps_links_while_training_signed_decode_rows(self) -> None:
         workload = _request_workload(
             intervention=True,
             distiller_beta=0.5,
@@ -544,10 +546,14 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             ],
             dtype=torch.float32,
         )
-        identities = (parent_a, parent_b)
-        service.stage_identities(21, RequestIdentityBatch(identities))
+        service.stage_indexed_identities(
+            21,
+            IndexedRequestIdentityBatch(
+                (IndexedRequestIdentityRow(0, parent_a),)
+            ),
+        )
         selection = service.selection_for_step(21)
-        self.assertEqual(selection.before_versions, (1, 0))
+        self.assertEqual(selection.before_versions, (1,))
         rows = PackedPhaseRowBatch(
             plan_epoch=1,
             step_id=21,
@@ -558,18 +564,18 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
                     request_ordinal=0,
                     raw_request_id="parent-a",
                     token_offset=0,
-                    phase=HiddenPhase.PREFILL,
+                    phase=HiddenPhase.DECODE,
                     identity=parent_a,
-                    decode_plan_ordinal=None,
+                    decode_plan_ordinal=0,
                 ),
                 PackedPhaseRow(
                     packed_row_index=1,
                     request_ordinal=1,
                     raw_request_id="parent-b",
                     token_offset=0,
-                    phase=HiddenPhase.DECODE,
+                    phase=HiddenPhase.PREFILL,
                     identity=parent_b,
-                    decode_plan_ordinal=0,
+                    decode_plan_ordinal=None,
                 ),
             ),
         )
@@ -606,7 +612,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
             rows, training_source, training_target, selection
         )
         service.after(loss_read)
-        self.assertEqual(len(loss_batch.losses), 2)
+        self.assertEqual(len(loss_batch.losses), 1)
         transition = service.before(
             StateEffectOperation.TRANSITION, selection, 21
         )
@@ -617,7 +623,7 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
                 version.key.request_id: version.version
                 for version in service.versions()
             },
-            {"parent-a": 2, "parent-b": 1},
+            {"parent-a": 2},
         )
         service.finish_step(21)
 

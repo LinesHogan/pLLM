@@ -152,17 +152,21 @@ The signed request Regions remain explicitly capture-disabled. This is
 request-state correctness and lifecycle evidence, not model-bank,
 sampler-intervention, CUDA Graph, distributed, or throughput evidence.
 
-The next request-state tranche added a generic compact sampler-output payload
-and frozen selection before-versions. Full step identity stays typed and
-tamper-evident, while only positive-version request groups become affected
-sampler rows; no ESamp callback or scheduling lane was introduced. The same
-four eager GPU cells each reported one modifier state after the first native
-update, four losses/updates, final parent versions 2, empty cleanup state, and
-zero fallback/replay. A legacy differential probe remains intentionally red:
-legacy also trains prefill and reported six updates/two modifier states, while
-native request state currently receives decode identities only; fixed-seed
-token parity is also unresolved. Prefill staging and sampler parity remain
-blocking evidence, so this tranche does not authorize legacy deletion.
+The next request-state tranches added generic compact sampler output, explicit
+sampler-to-packed links, and signed phase projection for packed state
+selection. Full step identity stays typed and tamper-evident; only decode rows
+enter the request-state lease, while their original packed indices address the
+full hidden tensors. Non-empty pure-prefill batches skip the stateful Region.
+No ESamp callback, lane, priority, fusion, or order policy was introduced.
+
+The four native eager topology cells report four losses/updates, final parent
+versions 2, empty cleanup state, and zero fallback/replay; intervention emits
+one modifier state. A corrected independent-process MRv2 differential uses
+the same short text prompts and case fingerprint. Legacy/native tokens match
+exactly with intervention off and at `beta=0.5`; counts are `4/4`, intervention
+is `1/1`, and bf16 aggregate loss differs by about `8.6e-6`. The previous
+six-versus-four claim came from an invalid probe that stringified
+`TokensPrompt` through a text-only legacy helper and is withdrawn.
 
 The first prefill foundation moves the four scheduler columns into a neutral
 typed contract and feeds them through the existing Rust packed-row planner.
@@ -174,7 +178,7 @@ derives request-state leases from the complete row identities. In particular,
 a decode-plan ordinal is not treated as a sampler mapping, and the current
 decode capture buffer is not reused for prompt-token rows. MRv1/MRv2 now stage
 explicit `logits_indices`-derived sampler-to-packed links under the same signed
-row provenance; ESamp still has to consume those links. A
+row provenance; ESamp consumes those links through its signed request tasks. A
 bounded retired-step high-watermark prevents a completed `(epoch, step)` from
 being staged again with different rows.
 

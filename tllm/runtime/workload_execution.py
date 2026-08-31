@@ -100,6 +100,8 @@ from tllm.runtime.workload_bindings import (
     SamplerRuntimeBinding,
 )
 from tllm.runtime.request_trainable_state import (
+    IndexedRequestIdentityBatch,
+    IndexedRequestIdentityRow,
     RequestIdentityBatch,
     RequestStateEffectAudit,
     RequestStateSelectionBatch,
@@ -2146,6 +2148,7 @@ class _RegionValueStore:
         "_packed_hidden_resources_by_binding",
         "_ordinary_request_state_resources",
         "_packed_request_state_resources",
+        "_packed_request_state_phases",
         "_requires_packed_rows",
         "_requires_packed_sampler_rows",
         "_materializations",
@@ -2226,12 +2229,30 @@ class _RegionValueStore:
                 for binding in packed_hidden_inputs
             }
         )
-        packed_request_state_resources = {
-            binding.source
-            for binding in artifact_inputs
-            if binding.kind is RegionInputKind.STATE_SELECTION
-            and binding.packed_rows_binding_id
-        }
+        packed_request_state_phases: dict[str, HiddenPhase] = {}
+        for binding in artifact_inputs:
+            if (
+                binding.kind is not RegionInputKind.STATE_SELECTION
+                or not binding.packed_rows_binding_id
+            ):
+                continue
+            if binding.phase not in (
+                HiddenPhase.PREFILL,
+                HiddenPhase.DECODE,
+            ):
+                raise RuntimeError(
+                    "packed request-state selection has no signed row phase"
+                )
+            if (
+                binding.source in packed_request_state_phases
+                and packed_request_state_phases[binding.source]
+                is not binding.phase
+            ):
+                raise RuntimeError(
+                    "one packed request-state resource cannot mix row phases"
+                )
+            packed_request_state_phases[binding.source] = binding.phase
+        packed_request_state_resources = set(packed_request_state_phases)
         ordinary_request_state_resources = {
             binding.source
             for binding in artifact_inputs
@@ -2255,6 +2276,9 @@ class _RegionValueStore:
         )
         self._packed_request_state_resources = tuple(
             sorted(packed_request_state_resources)
+        )
+        self._packed_request_state_phases = MappingProxyType(
+            dict(sorted(packed_request_state_phases.items()))
         )
         self._requires_packed_rows = any(
             binding.kind is RegionInputKind.PACKED_REQUEST_ROWS
@@ -2350,10 +2374,28 @@ class _RegionValueStore:
                     raise RuntimeError(
                         "packed row batch differs from the staged step"
                     )
-            identities = RequestIdentityBatch(batch.identities)
-            for resource in self._packed_request_state_resources:
-                self._request_state_services[resource].stage_identities(
-                    step_id, identities
+            phases = tuple(
+                dict.fromkeys(self._packed_request_state_phases.values())
+            )
+            indexed_by_phase = {
+                phase: IndexedRequestIdentityBatch(
+                    tuple(
+                        IndexedRequestIdentityRow(
+                            row.packed_row_index,
+                            row.identity,
+                        )
+                        for row in batch.rows
+                        if row.phase is phase
+                    )
+                )
+                for phase in phases
+            }
+            for resource, phase in self._packed_request_state_phases.items():
+                self._request_state_services[
+                    resource
+                ].stage_indexed_identities(
+                    step_id,
+                    indexed_by_phase[phase],
                 )
 
     def stage_packed_hidden_snapshots(

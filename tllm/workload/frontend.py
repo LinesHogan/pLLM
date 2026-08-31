@@ -613,13 +613,28 @@ class StateSelectionInput(Generic[StateValueT]):
 
     selected_state: _StateReference
     packed_rows: PackedRequestRowsInput | None = None
+    packed_phase: HiddenPhase = HiddenPhase.NONE
 
     def __post_init__(self) -> None:
         if self.selected_state.scope is not StateScope.REQUEST:
             raise ValueError("StateSelectionInput requires a REQUEST State")
+        object.__setattr__(
+            self, "packed_phase", HiddenPhase(self.packed_phase)
+        )
         match self.packed_rows:
-            case None | PackedRequestRowsInput():
-                pass
+            case None:
+                if self.packed_phase is not HiddenPhase.NONE:
+                    raise ValueError(
+                        "ordinary state selection requires packed_phase NONE"
+                    )
+            case PackedRequestRowsInput():
+                if self.packed_phase not in (
+                    HiddenPhase.PREFILL,
+                    HiddenPhase.DECODE,
+                ):
+                    raise ValueError(
+                        "packed state selection requires a prefill or decode phase"
+                    )
             case _:
                 raise TypeError(
                     "StateSelectionInput.packed_rows must be PackedRequestRowsInput"
@@ -951,14 +966,19 @@ def packed_selection(
     selection: StateSelectionInput[StateValueT],
     *,
     rows: PackedRequestRowsInput,
+    phase: HiddenPhase,
 ) -> StateSelectionInput[StateValueT]:
-    """Relate one exact request-state selection to nominal packed rows."""
+    """Project one request-state selection from a signed packed row phase."""
 
     if selection.packed_rows is None:
-        return StateSelectionInput(selection.selected_state, rows)
+        return StateSelectionInput(selection.selected_state, rows, phase)
     if selection.packed_rows is not rows:
         raise ValueError(
             "packed selection already references different packed request rows"
+        )
+    if selection.packed_phase is not phase:
+        raise ValueError(
+            "packed selection already references a different packed row phase"
         )
     return selection
 
@@ -2071,6 +2091,7 @@ def _input_ir(
         case StateSelectionInput(
             selected_state=state,
             packed_rows=packed_rows,
+            packed_phase=packed_phase,
         ):
             if packed_rows is None:
                 packed_rows_port = ""
@@ -2087,6 +2108,7 @@ def _input_ir(
                 name,
                 ValueSourceKind.STATE_SELECTION,
                 _state_id(state),
+                phase=packed_phase,
                 packed_rows_port=packed_rows_port,
             )
         case PackedRequestRowsInput():

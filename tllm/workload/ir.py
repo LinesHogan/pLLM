@@ -234,6 +234,22 @@ class TaskInputIR:
                 )
             if self.phase is not HiddenPhase.NONE:
                 raise ValueError("packed_hidden TaskInputIR requires phase NONE")
+        elif self.kind is ValueSourceKind.STATE_SELECTION:
+            if (
+                self.layer_kind
+                or self.site is not HiddenSite.NONE
+                or (
+                    bool(self.packed_rows_port)
+                    != (
+                        self.phase
+                        in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+                    )
+                )
+            ):
+                raise ValueError(
+                    "packed state_selection TaskInputIR requires exactly one "
+                    "prefill/decode phase"
+                )
         elif self.layer_kind:
             raise ValueError("only hidden TaskInputIR may declare layer_kind")
         elif self.site is not HiddenSite.NONE or self.phase is not HiddenPhase.NONE:
@@ -496,6 +512,7 @@ class WorkloadIR:
             )
         if self.schema_version >= 3:
             state_by_name = {state.name: state for state in self.states}
+            packed_state_phases: dict[str, HiddenPhase] = {}
             for task in self.tasks:
                 inputs_by_name = {task_input.name: task_input for task_input in task.inputs}
                 packed_rows_inputs = tuple(
@@ -574,6 +591,18 @@ class WorkloadIR:
                         raise ValueError(
                             f"task {task.name!r} selection input requires REQUEST state {task_input.source!r}"
                         )
+                    if task_input.packed_rows_port:
+                        if (
+                            task_input.source in packed_state_phases
+                            and packed_state_phases[task_input.source]
+                            is not task_input.phase
+                        ):
+                            raise ValueError(
+                                "one packed request state cannot mix row phases"
+                            )
+                        packed_state_phases[
+                            task_input.source
+                        ] = task_input.phase
                     matching_effects = tuple(
                         effect
                         for effect in task.effects

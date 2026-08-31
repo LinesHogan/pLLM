@@ -34,11 +34,12 @@ With `torch==2.13.0+cu129` and `vllm==0.27.1`, GPU correctness covers exact
 eager in-process native Dummy, native Recirculation, and native ESamp on
 MRv1/MRv2. Recirculation also passed EngineCore MP on both runners, replaying
 two requests and seven prompt rows with zero fallback. The
-latest ESamp short smoke recorded six losses, six updates, state version six,
-and zero fallbacks. Native ESamp exact eager Regions also passed EngineCore MP
-correctness on both runners: loss, update, state-version, and intervention
-counters were nonzero, with zero fallbacks and zero replays. This is not a
-throughput claim. Model-backed native piecewise CUDA Graph execution,
+latest request-scoped ESamp smoke records four losses/updates, two parent
+slots retired at version 2, one intervention state when enabled, and zero
+fallback/replay. Its corrected MRv2 legacy/native fixed-seed differential has
+exact token parity and an aggregate bf16 loss delta around `8.6e-6`. Native
+ESamp exact eager Regions also passed EngineCore MP correctness on both
+runners. This is not a throughput claim. Model-backed native piecewise CUDA Graph execution,
 Recirculation capture/hook-retirement integration, and shape-miss epoch
 switching are not yet claims.
 

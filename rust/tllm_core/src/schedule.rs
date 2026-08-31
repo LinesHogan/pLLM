@@ -2328,6 +2328,7 @@ fn validate_inputs(
         }
     }
     let mut task_index = HashMap::new();
+    let mut packed_state_phases: HashMap<&str, HiddenPhase> = HashMap::new();
     for (index, task) in graph.tasks.iter().enumerate() {
         if task.task_id.is_empty() || task.implementation_ids.is_empty() {
             return Err(value_error(
@@ -2483,8 +2484,23 @@ fn validate_inputs(
                         "packed_hidden schedule input requires a block-output locator with phase NONE",
                     ));
                 }
+                ScheduleInputKind::StateSelection
+                    if input.layer_kind != HiddenLayerKind::None
+                        || input.site != HiddenSite::None
+                        || (input
+                            .packed_rows_port
+                            .as_deref()
+                            .is_some_and(|port| !port.is_empty())
+                            != matches!(
+                                input.phase,
+                                HiddenPhase::Prefill | HiddenPhase::Decode
+                            )) =>
+                {
+                    return Err(value_error(
+                        "packed state_selection requires exactly one prefill/decode phase",
+                    ));
+                }
                 ScheduleInputKind::Result
-                | ScheduleInputKind::StateSelection
                 | ScheduleInputKind::PackedRequestRows
                 | ScheduleInputKind::PackedSamplerRows
                 | ScheduleInputKind::Provided
@@ -2560,6 +2576,17 @@ fn validate_inputs(
                 return Err(value_error(
                     "only packed_hidden, packed_sampler_rows, or state_selection may declare packed_rows_port",
                 ));
+            }
+            if input.kind == ScheduleInputKind::StateSelection && !relation.is_empty() {
+                if packed_state_phases
+                    .get(input.source.as_str())
+                    .is_some_and(|phase| *phase != input.phase)
+                {
+                    return Err(value_error(
+                        "one packed request state cannot mix row phases",
+                    ));
+                }
+                packed_state_phases.insert(input.source.as_str(), input.phase);
             }
             if input.kind == ScheduleInputKind::Hidden {
                 let capability = hidden_locator_capability(input.site, input.phase)
@@ -5489,11 +5516,21 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                 || (binding.kind == RegionInputKind::PackedSamplerRows
                     && (binding.source != "runtime.packed_sampler_rows"
                         || packed_rows_binding_id.is_empty()))
+                || (binding.kind == RegionInputKind::StateSelection
+                    && (binding.layer_kind != HiddenLayerKind::None
+                        || binding.site != HiddenSite::None
+                        || (packed_rows_binding_id.is_empty()
+                            == matches!(
+                                binding.phase,
+                                HiddenPhase::Prefill | HiddenPhase::Decode
+                            ))))
                 || (binding.layer_kind == HiddenLayerKind::Index && binding.layer_index.is_none())
                 || (binding.layer_kind != HiddenLayerKind::Index && binding.layer_index.is_some())
                 || (!matches!(
                     binding.kind,
-                    RegionInputKind::Hidden | RegionInputKind::PackedHidden
+                    RegionInputKind::Hidden
+                        | RegionInputKind::PackedHidden
+                        | RegionInputKind::StateSelection
                 ) && (binding.layer_kind != HiddenLayerKind::None
                     || binding.site != HiddenSite::None
                     || binding.phase != HiddenPhase::None))
@@ -5529,7 +5566,7 @@ fn validate_schedule(graph: &str, timeline: &str, options: &str, decision: &str)
                 if (input.kind == ScheduleInputKind::StateSelection)
                     != (binding.kind == RegionInputKind::StateSelection)
                     || (input.kind == ScheduleInputKind::StateSelection
-                        && input.source != binding.source)
+                        && (input.source != binding.source || input.phase != binding.phase))
                 {
                     return Err(schedule_error(
                         "ExecutionRegion state selection binding disagrees with its task input",
@@ -6756,7 +6793,7 @@ mod tests {
     #[test]
     fn schema_v5_packed_inputs_sign_one_row_binding_and_force_eager_inline() {
         pyo3::prepare_freethreaded_python();
-        let graph = r#"{"workload_key":"packed","tasks":[{"task_id":"train","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["test:packed@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe","torch.export"]],"required_capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights","selection_port":"selection"}],"inputs":[{"name":"rows","kind":"packed_request_rows","source":"runtime.packed_phase_rows","packed_rows_port":""},{"name":"source","kind":"packed_hidden","source":"source","layer":"0","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"target","kind":"packed_hidden","source":"target","layer":"-1","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"selection","kind":"state_selection","source":"weights","packed_rows_port":"rows"}]}],"edges":[],"values":[],"states":[{"resource":"weights","scope":"request","request_key":["request_id"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":5,"workload_approximations":[]}"#;
+        let graph = r#"{"workload_key":"packed","tasks":[{"task_id":"train","timing":{"after":"model.execute","before":"step.end"},"temporary_bytes":0,"implementation_ids":["test:packed@1"],"implementation_kinds":["captured"],"implementation_capabilities":[["runtime.async_host_safe","runtime.side_stream_safe","torch.export"]],"required_capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"capture_safe":false,"effects":[{"kind":"state_read","resource":"weights","selection_port":"selection"}],"inputs":[{"name":"rows","kind":"packed_request_rows","source":"runtime.packed_phase_rows","packed_rows_port":""},{"name":"source","kind":"packed_hidden","source":"source","layer":"0","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"target","kind":"packed_hidden","source":"target","layer":"-1","layer_kind":"index","site":"block_output","phase":"","packed_rows_port":"rows"},{"name":"selection","kind":"state_selection","source":"weights","phase":"decode","packed_rows_port":"rows"}]}],"edges":[],"values":[],"states":[{"resource":"weights","scope":"request","request_key":["request_id"],"storage":"dynamic","transition":"optimizer"}],"persistent_state_bytes":0,"schema_version":5,"workload_approximations":[]}"#;
         let timeline = r#"{"backend_id":"test","backend_version":"1","runner_family":"mrv2","graph_mode":"eager","anchors":[{"anchor_id":"model.execute","ordinal":0,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["prepare_inputs.post","execute_model.post"]},{"anchor_id":"step.end","ordinal":1,"observable":true,"graph_boundary":true,"visible_values":[],"backend_events":["sample_tokens.post"]}],"regions":[],"static_headroom_bytes":64,"capabilities":["hidden/block_output/packed@1","runtime/packed_phase_rows@1"],"schema_version":2}"#;
         let options = r#"{"memory_budget_bytes":64,"allow_serial_fallback":true,"allow_side_stream":true,"packed_hidden_resource_manifest":[{"layer":"-1","layer_kind":"index","site":"block_output","module_path":"model.layers.-1"},{"layer":"0","layer_kind":"index","site":"block_output","module_path":"model.layers.0"}],"schema_version":2}"#;
 
@@ -6790,6 +6827,12 @@ mod tests {
                 Some(rows.binding_id.clone())
             );
         }
+        let selection = region
+            .input_bindings
+            .iter()
+            .find(|binding| binding.kind == RegionInputKind::StateSelection)
+            .unwrap();
+        assert_eq!(selection.phase, HiddenPhase::Decode);
         validate_schedule(graph, timeline, options, &compiled).unwrap();
 
         let missing_capability = timeline.replace(
@@ -6821,8 +6864,8 @@ mod tests {
         assert!(error.to_string().contains("one packed_request_rows"));
 
         let missing_selection_relation = graph.replace(
-            "{\"name\":\"selection\",\"kind\":\"state_selection\",\"source\":\"weights\",\"packed_rows_port\":\"rows\"}",
-            "{\"name\":\"selection\",\"kind\":\"state_selection\",\"source\":\"weights\",\"packed_rows_port\":\"\"}",
+            "{\"name\":\"selection\",\"kind\":\"state_selection\",\"source\":\"weights\",\"phase\":\"decode\",\"packed_rows_port\":\"rows\"}",
+            "{\"name\":\"selection\",\"kind\":\"state_selection\",\"source\":\"weights\",\"phase\":\"\",\"packed_rows_port\":\"\"}",
         );
         let error = compile_schedule(&missing_selection_relation, timeline, options).unwrap_err();
         assert!(error

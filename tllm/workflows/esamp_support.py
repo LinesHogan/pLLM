@@ -4,16 +4,26 @@
 from __future__ import annotations
 
 import time
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
+from tllm.consumers.esamp.config import (
+    ESampConsumerConfig,
+    normalize_adaptation_stream_mode,
+    normalize_model_bank_forward_backend,
+)
+from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.program_consumer import ESampProgramConsumer
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
 from tllm.ports.base import RowSelection
 from tllm.runtime import residual_runtime as runtime
 from tllm.runtime.vllm_patch import capture_runner as _capture_runner
+from tllm.runtime.sampler_bridge.types import normalize_sampler_backend
+
+if TYPE_CHECKING:
+    from vllm import LLM, SamplingParams
+    from vllm.outputs import RequestOutput
 
 
 def configure_esamp_runtime(
@@ -67,16 +77,22 @@ def configure_esamp_runtime(
         model_bank_use_output_layernorm=bool(model_bank_use_output_layernorm),
         model_bank_initializer=model_bank_initializer,
         model_bank_train_cudagraph=bool(model_bank_train_cudagraph),
-        model_bank_forward_backend=str(model_bank_forward_backend).strip() or "torch",
+        model_bank_forward_backend=normalize_model_bank_forward_backend(
+            model_bank_forward_backend
+        ),
         adaptation_pipeline_slots=max(1, int(adaptation_pipeline_slots)),
-        adaptation_stream_mode=str(adaptation_stream_mode).strip() or "dual",
+        adaptation_stream_mode=normalize_adaptation_stream_mode(
+            adaptation_stream_mode
+        ),
         adaptation_stream_priority=int(adaptation_stream_priority),
         trace_per_request_losses=bool(trace_per_request_losses),
         trace_interval=max(1, int(trace_interval)),
         trace_max_points=max(0, int(trace_max_points)),
         enable_distiller_intervention=bool(enable_distiller_intervention),
         distiller_beta=float(distiller_beta),
-        distiller_sampler_backend=str(distiller_sampler_backend).strip() or "post_filter_exact",
+        distiller_sampler_backend=normalize_sampler_backend(
+            distiller_sampler_backend
+        ),
         compact_capture_lane=bool(compact_capture_lane),
     )
     if config.implementation == "native":
@@ -114,14 +130,14 @@ def configure_esamp_runtime(
 
 
 def run_generate_with_request_mapping(
-    llm: object,
+    llm: "LLM",
     prompts: Sequence[str],
-    params: Sequence[object],
+    params: "SamplingParams | Sequence[SamplingParams]",
     request_prompt_indices: Sequence[int] | None = None,
     request_sample_indices: Sequence[int] | None = None,
     use_tqdm: bool | None = None,
     dispatch_post_generate: bool = True,
-) -> object:
+) -> list["RequestOutput"]:
     return _capture_runner.run_generate_with_request_mapping(
         runtime=runtime.RUNTIME,
         llm=llm,
@@ -136,7 +152,7 @@ def run_generate_with_request_mapping(
 
 def run_esamp_throughput_case(
     *,
-    llm: object,
+    llm: "LLM",
     prompts: list[str],
     max_new_tokens: int,
     warmup_rounds: int,

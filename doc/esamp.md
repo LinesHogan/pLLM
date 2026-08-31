@@ -42,34 +42,48 @@ The request-scoped path passed MRv1/MRv2 × in-process/EngineCore-MP eager GPU
 correctness with two parents, two children per parent, and two decode updates:
 every cell reported four losses and four updates, retired two parent slots at
 version 2, cleared live slots and request mappings, and kept fallback/replay at
-zero. With intervention enabled, every cell produced exactly one modifier
-state across two native decode updates: the version-zero step was excluded and
-the next step consumed compact typed guidance.
+zero. With intervention enabled, each request case produced exactly one
+modifier state: prefill and the first version-zero decode step cannot consume
+guidance, while the final decode step consumes version-one guidance.
 
-This is not full legacy parity. A same-setting legacy probe also trained on
-prefill and reported six parent updates plus two modifier states, while the
-current native request path reported four updates plus one. Fixed-seed token
-outputs also remain different between the legacy and native sampler paths even
-with intervention disabled. Typed prefill identity/hidden staging and sampler
-token parity therefore remain deletion blockers. The signed request-state
-Regions are explicitly capture-ineligible, so these results are not CUDA Graph
-or throughput evidence. Program and legacy remain migration/benchmark paths
-until the complete deletion gate passes.
+The retained legacy and native arms in
+`test/gpu/native_esamp_request_state_smoke.py` now run in independent
+processes from one signed case fingerprint. On MRv2 in-process with fixed
+sampling RNG, both intervention-off and `beta=0.5` runs produced identical
+tokens, four losses/updates, one intervention state when enabled, and zero
+sampler fallback. Their bf16 aggregate losses differed by about `8.6e-6`.
+An earlier six-versus-four report was invalid: its legacy probe passed a
+`TokensPrompt` through a text-only helper, which stringified the object and
+changed the prompt/step trace. The corrected workload is decode-only on both
+implementations.
 
-The neutral `PackedPhaseRowStaging` contract now preserves Rust-planned
-prefill/decode rows and stable parent identities across MRv1/MRv2. The native
-CPU execution boundary now accepts the exact epoch/step rows and owned hidden
-snapshot batch, resolves signed packed inputs, and derives request-state
-selection only from the complete row identities. A separate eager
-`PackedHiddenSnapshotService` now owns exact full-packed resource-keyed clones
-under an explicit epoch, capacity, hidden-size, dtype, and device
-specialization. The underlying service is generic: tensors are keyed by exact
-signed packed resources rather than source/target role text. MRv1/MRv2 now
-install runner-owned eager hooks from exact signed module paths and publish the
-resource bundle before `EXECUTE_MODEL_POST`. ESamp does not yet declare these
-packed inputs, so this does not claim prefill parity, compile, or CUDA-Graph
-support. The drivers also publish explicit sampler-row links from
-`logits_indices`; ESamp has not yet switched its guidance task to them.
+```bash
+.venv/bin/python test/gpu/native_esamp_request_state_smoke.py \
+  --implementation legacy --runner mrv2 --intervention --out legacy.json
+.venv/bin/python test/gpu/native_esamp_request_state_smoke.py \
+  --implementation native --runner mrv2 --intervention --out native.json
+```
+
+The two JSON documents must carry the same `case_signature`; compare their
+`output_token_ids`, `loss_count`, `loss_avg`, `update_count`, intervention, and
+fallback fields.
+
+Native request cleanup remains the authoritative target: it retires both
+slots at version 2 and clears request mappings. The retained legacy baseline
+has no equivalent request-finish transaction and reports its two prompt-keyed
+trainers/mappings as still live. This legacy lifetime limitation is recorded,
+not copied into native. Program and legacy remain present because model-bank,
+compact-capture, CUDA Graph, aligned throughput, and the rest of the deletion
+gate are still open.
+
+The neutral packed-row contract preserves Rust-planned prefill/decode rows,
+stable parent identities, resource-keyed hidden snapshots, and explicit
+`logits_indices` sampler links across MRv1/MRv2. ESamp consumes those signed
+inputs directly. Its request-state selection additionally signs
+`phase=decode`; the runtime projects only decode identities while retaining
+their original packed tensor indices. A non-empty pure-prefill batch therefore
+skips the stateful Region without admitting or updating a slot. This is a
+generic packed state-selection facility, not an ESamp scheduling rule.
 
 ## Key config knobs (`ESampConsumerConfig`)
 
