@@ -17,6 +17,7 @@ from tllm.runtime.paged_state import (
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
+    StateCapacityEntitlement,
     StateResourceId,
     TensorFieldId,
 )
@@ -73,7 +74,11 @@ def main() -> int:
         VersionId(1),
     )
     bundle = PageBundle(state_layout, capacity=2, device=device)
-    roots = PagedStateVersionArena(bundle, bundle_epoch=5)
+    roots = PagedStateVersionArena(
+        bundle,
+        bundle_epoch=5,
+        capacity_entitlement=StateCapacityEntitlement(1, 2),
+    )
     packed_layout = FrozenPackedTensorLayout(
         PackedLayoutId(12),
         row_capacity=1,
@@ -97,13 +102,14 @@ def main() -> int:
     writer = torch.cuda.Stream(device=device)
     reader = torch.cuda.Stream(device=device)
 
-    root_admission = roots.prepare_admission(version_zero)
+    root_admission_batch = roots.prepare_admission_batch((version_zero,))
+    (root_admission,) = root_admission_batch.writes
     root_zero_ready = torch.cuda.Event()
     with torch.no_grad(), torch.cuda.stream(writer):
         root_admission.target_pages[0][0].fill_(3.0)
         root_zero_ready.record(writer)
-    roots.publish(
-        root_admission,
+    roots.publish_batch(
+        root_admission_batch,
         CudaCompletionFence(root_zero_ready),
     )
     packed_source = torch.full(
@@ -119,11 +125,12 @@ def main() -> int:
         writer,
     )
 
-    transition = roots.prepare_transition_cuda(
-        version_zero,
-        version_one,
+    transition_batch = roots.prepare_transition_batch_cuda(
+        (version_zero,),
+        (version_one,),
         writer,
     )
+    (transition,) = transition_batch.writes
     root_one_ready = torch.cuda.Event()
     with torch.no_grad(), torch.cuda.stream(writer):
         transition.target_pages[0][0].copy_(
@@ -131,8 +138,8 @@ def main() -> int:
         )
         transition.target_pages[0][0].add_(1.0)
         root_one_ready.record(writer)
-    roots.publish(
-        transition,
+    roots.publish_batch(
+        transition_batch,
         CudaCompletionFence(root_one_ready),
     )
 

@@ -35,8 +35,9 @@ MP 或 legacy deletion gate 已完成。
 - `StablePackedStateView` 将 packed fields、row/lease IDs、masks、first-row、
   page IDs 与 state operands 展开为唯一 canonical tensor tuple，不携带 module、
   selection 或 representation tag。
-- fixed `2 × logical_capacity` headroom 位于 physical adapter 内，没有进入 workload
-  config、lane、priority 或 scheduler policy。
+- fixed provider 以 `StateCapacityEntitlement(max_admitted_lineages=N,
+  max_live_versions_per_lineage=3)` cold-allocate `3 × logical_capacity` tensor pools；
+  该数值没有进入 workload config、lane、priority 或 scheduler policy。
 
 ### P0：arena-local StateRef 已落地，全局作用域未闭合
 
@@ -78,27 +79,35 @@ mutation granularity 与 cold facts。fixed/page/overlay/resident 只能由 Rust
 作为 signed physical solution 选择。`FixedBatchedSlotAdapter` 可保留为 physical
 provider，但不能继续拥有 public semantic variant。
 
-### P0：容量只做到明确失败，尚未 admission-time 可证明
+### P0：provider-local capacity entitlement 已落地，signed authority 未闭合
 
-`2 × logical_capacity` 能保证正常 lifecycle 中每个 current root 有一次 next-root
-空间；它不能证明任意长期 old-root pin/version fanout 都不会在 transition 时耗尽。
+当前 `PagedStateVersionArena` 在 cold construction 时验证：
 
-必须选择并签名一种明确契约：
+```text
+bundle pages
+>= max_admitted_lineages
+ * max_live_versions_per_lineage
+ * root_page_count
+```
 
-1. admission 预留 version/fanout entitlement，后续合法 transition 不再因 page
-   capacity 失败；或
-2. 研究文档明确放宽为 transition-time typed capacity result。
+admission 一次性占用 lineage entitlement，transition reserve 逐 lineage 计数 live
+roots；只要生命周期不超过已声明的 version bound，就不会再遇到随机
+global page exhaustion。fixed provider 的 `3` 表示 current + one retained historical
+root + one target credit；保留两个不同 old versions 后再 transition 会以明确
+entitlement violation 拒绝，释放一个 pin 后可继续。
 
-在权威文档未改变前，工程按方案 1 实现，不把当前 2× headroom 宣称为完整容量
-证明。不得 eviction、LRU 或 legacy fallback。
+尚未闭合的是 authority：该 entitlement 当前是 fixed physical provider 的 cold
+capability，还未进入 Rust-signed representation solution。在此之前不宣称一般
+PTTS capacity 已完成，也不得加入 eviction、LRU 或 legacy fallback。
 
-### P0：multi-root publication 还不是一个物理原子事务
+### P0：physical atomic multi-root publication 已落地
 
-一个 selection 的多个 slot 当前逐 root publish，再一次性 commit logical transition。
-中途失败会 fail-stop，因此不会继续错误执行，但尚未达到同一 receipt 对应的 atomic
-multi-root publication。需要 batch root transaction：先 reserve/compute 全部 target，
-record fence，再在一个 root-arena commit 中发布全部 refs；logical commit 失败仍
-双向 poison。
+admission 与 transition 现在都是 batch-only API：先验证全部 refs/entitlement，
+一次 reserve 全部 target pages，compute 完成后记录同一 completion fence，再在
+一个 root-arena lock 内同时更新 roots、latest map、page ownership 和 writer
+pins。compute 提交前 abort 回收整个 staged batch，不发布半个 selection；已提交
+CUDA 失败继续 fail-stop，不伪造回滚。single-root wrapper 已删除。physical
+commit 后 logical commit 若失败，仍双向 poison，不从 physical latest 反推逻辑状态。
 
 ### P1：typed layout 仍是最小子集
 
@@ -157,7 +166,7 @@ page allocation/version lifecycle。
 2. [已落地] RequestSlotArena lease 同时携带 logical lineage 与 physical SlotRef
 3. [已落地] root arena 改用 StateRef，补 ABA 与 old-version pin oracle
 4. 冻结 TensorLayout-based LayoutId namespace、epoch 边界和 MP lineage issuance witness
-5. admission capacity entitlement + atomic multi-root publication
+5. [provider-local 已落地] admission entitlement + atomic multi-root publication
 6. internalize FIXED_BATCHED，physical representation 进入 signed solution
 7. 补 layout alignment/mutation granularity 与 PTTS metrics
 8. [projection ABI 已落地] 在前述 P0 门禁后再完成 Rust capture predicate

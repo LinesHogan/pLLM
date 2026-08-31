@@ -62,6 +62,24 @@ class FrozenTensorLayout:
             raise ValueError("state tensor field ids must be dense and ordered")
 
 
+@dataclass(frozen=True, slots=True)
+class StateCapacityEntitlement:
+    """Admission-time bound on logical lineages and concurrent versions."""
+
+    max_admitted_lineages: int
+    max_live_versions_per_lineage: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.max_admitted_lineages < 1
+            or self.max_live_versions_per_lineage < 2
+        ):
+            raise ValueError(
+                "state capacity entitlement requires positive lineages and "
+                "at least current-plus-target version capacity"
+            )
+
+
 PageTensorRows = tuple[tuple[torch.Tensor, ...], ...]
 
 
@@ -210,6 +228,21 @@ PageWrite = AdmissionPageWrite | TransitionPageWrite
 
 
 @dataclass(frozen=True, slots=True)
+class AdmissionPageBatch:
+    transaction_id: int
+    writes: tuple[AdmissionPageWrite, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionPageBatch:
+    transaction_id: int
+    writes: tuple[TransitionPageWrite, ...]
+
+
+PageWriteBatch = AdmissionPageBatch | TransitionPageBatch
+
+
+@dataclass(frozen=True, slots=True)
 class _FreePage:
     pass
 
@@ -239,16 +272,18 @@ class _NoPendingWrite:
 
 
 @dataclass(frozen=True, slots=True)
-class _PendingAdmission:
-    write: AdmissionPageWrite
+class _PendingAdmissionBatch:
+    batch: AdmissionPageBatch
 
 
 @dataclass(frozen=True, slots=True)
-class _PendingTransition:
-    write: TransitionPageWrite
+class _PendingTransitionBatch:
+    batch: TransitionPageBatch
 
 
-_PendingWrite = _NoPendingWrite | _PendingAdmission | _PendingTransition
+_PendingWrite = (
+    _NoPendingWrite | _PendingAdmissionBatch | _PendingTransitionBatch
+)
 _NO_PENDING_WRITE = _NoPendingWrite()
 
 
@@ -276,6 +311,8 @@ class PagedStateVersionArena:
     __slots__ = (
         "_bundle",
         "_bundle_epoch",
+        "_capacity_entitlement",
+        "_entitled_lineages",
         "_page_owners",
         "_roots",
         "_latest_published_root",
@@ -290,12 +327,29 @@ class PagedStateVersionArena:
         "_lock",
     )
 
-    def __init__(self, bundle: PageBundle, *, bundle_epoch: int) -> None:
+    def __init__(
+        self,
+        bundle: PageBundle,
+        *,
+        bundle_epoch: int,
+        capacity_entitlement: StateCapacityEntitlement,
+    ) -> None:
         if bundle_epoch < 1:
             raise ValueError("page bundle epoch must be positive")
+        required_pages = (
+            capacity_entitlement.max_admitted_lineages
+            * capacity_entitlement.max_live_versions_per_lineage
+            * bundle.layout.root_page_count
+        )
+        if bundle.capacity < required_pages:
+            raise ValueError(
+                "page bundle cannot satisfy its admission capacity entitlement"
+            )
         bundle.require_stable()
         self._bundle = bundle
         self._bundle_epoch = bundle_epoch
+        self._capacity_entitlement = capacity_entitlement
+        self._entitled_lineages: set[LineageId] = set()
         self._page_owners: list[_PageOwner] = [
             _FreePage() for _ in range(bundle.capacity)
         ]
@@ -324,6 +378,10 @@ class PagedStateVersionArena:
         return self._bundle_epoch
 
     @property
+    def capacity_entitlement(self) -> StateCapacityEntitlement:
+        return self._capacity_entitlement
+
+    @property
     def free_pages(self) -> int:
         with self._lock:
             self._require_live()
@@ -340,149 +398,213 @@ class PagedStateVersionArena:
         with self._lock:
             self._poisoned = True
 
-    def prepare_admission(
+    def prepare_admission_batch(
         self,
-        target: StateRef,
-    ) -> AdmissionPageWrite:
+        targets: tuple[StateRef, ...],
+    ) -> AdmissionPageBatch:
         with self._lock:
             self._require_no_pending_write()
             self._collect_completed_locked()
+            if not targets or len(targets) != len(set(targets)):
+                raise ValueError(
+                    "state admission batch requires unique version references"
+                )
+            lineages = tuple(target.lineage_id for target in targets)
+            if len(lineages) != len(set(lineages)):
+                raise ValueError(
+                    "state admission batch requires unique lineages"
+                )
+            for target in targets:
+                if target.layout_id != self._bundle.layout.layout_id:
+                    raise ValueError(
+                        "admission state root belongs to another layout"
+                    )
+                if target.version_id != VersionId(0):
+                    raise ValueError(
+                        "admission state roots must begin at version zero"
+                    )
+                if (
+                    target.lineage_id in self._entitled_lineages
+                    or target.lineage_id in self._latest_published_root
+                    or target in self._roots
+                ):
+                    raise RuntimeError("state lineage is already admitted")
             if (
-                target.layout_id != self._bundle.layout.layout_id
-                or target.version_id != VersionId(0)
+                len(self._entitled_lineages) + len(lineages)
+                > self._capacity_entitlement.max_admitted_lineages
             ):
-                raise ValueError("admission state root must begin at version zero")
-            if (
-                target.lineage_id in self._latest_published_root
-                or target in self._roots
-            ):
-                raise RuntimeError("state lineage is already admitted")
+                raise RuntimeError("state admission lineage entitlement is exhausted")
             transaction_id = self._next_transaction_id
-            target_page_ids = self._reserve_pages(transaction_id)
-            write = AdmissionPageWrite(
+            page_sets = self._reserve_page_sets(
                 transaction_id,
-                target,
-                target_page_ids,
-                _producer_page_rows(self._bundle, target_page_ids),
+                len(targets),
             )
-            self._pending_write = _PendingAdmission(write)
+            writes = tuple(
+                AdmissionPageWrite(
+                    transaction_id,
+                    target,
+                    page_ids,
+                    _producer_page_rows(self._bundle, page_ids),
+                )
+                for target, page_ids in zip(targets, page_sets, strict=True)
+            )
+            batch = AdmissionPageBatch(transaction_id, writes)
+            self._pending_write = _PendingAdmissionBatch(batch)
             self._next_transaction_id += 1
-            return write
+            return batch
 
-    def prepare_transition_synchronous(
+    def prepare_transition_batch_synchronous(
         self,
-        source: StateRef,
-        target: StateRef,
-    ) -> TransitionPageWrite:
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+    ) -> TransitionPageBatch:
         with self._lock:
             self._require_cpu()
-            write = self._reserve_transition(source, target)
-            match self._stored_root(source).root.readiness:
-                case NoCompletionFence():
-                    return write
-                case CudaCompletionFence():
-                    raise RuntimeError("CPU state root has a CUDA readiness event")
+            stored_roots = self._validate_transition_batch(sources, targets)
+            for stored in stored_roots:
+                match stored.root.readiness:
+                    case NoCompletionFence():
+                        pass
+                    case CudaCompletionFence():
+                        raise RuntimeError(
+                            "CPU state root has a CUDA readiness event"
+                        )
+            return self._reserve_transition_batch(
+                sources,
+                targets,
+                stored_roots,
+            )
 
-    def prepare_transition_cuda(
+    def prepare_transition_batch_cuda(
         self,
-        source: StateRef,
-        target: StateRef,
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
         stream: torch.cuda.Stream,
-    ) -> TransitionPageWrite:
+    ) -> TransitionPageBatch:
         with self._lock:
             self._require_cuda_stream(stream)
-            write = self._reserve_transition(source, target)
-            match self._stored_root(source).root.readiness:
-                case CudaCompletionFence(event=event):
-                    stream.wait_event(event)
-                    return write
-                case NoCompletionFence():
-                    raise RuntimeError("CUDA state root has no readiness event")
+            stored_roots = self._validate_transition_batch(sources, targets)
+            for stored in stored_roots:
+                match stored.root.readiness:
+                    case CudaCompletionFence(event=event):
+                        stream.wait_event(event)
+                    case NoCompletionFence():
+                        raise RuntimeError(
+                            "CUDA state root has no readiness event"
+                        )
+            return self._reserve_transition_batch(
+                sources,
+                targets,
+                stored_roots,
+            )
 
-    def publish(
+    def publish_batch(
         self,
-        write: PageWrite,
+        batch: PageWriteBatch,
         readiness: CompletionFence,
-    ) -> ImmutableStateVersionRoot:
+    ) -> tuple[ImmutableStateVersionRoot, ...]:
         with self._lock:
             self._require_fence_domain(readiness)
-            match self._pending_write, write:
+            match self._pending_write, batch:
                 case (
-                    _PendingAdmission(write=issued),
-                    AdmissionPageWrite(),
-                ) if issued is write:
+                    _PendingAdmissionBatch(batch=issued),
+                    AdmissionPageBatch(),
+                ) if issued is batch:
                     pass
                 case (
-                    _PendingTransition(write=issued),
-                    TransitionPageWrite(),
-                ) if issued is write:
+                    _PendingTransitionBatch(batch=issued),
+                    TransitionPageBatch(),
+                ) if issued is batch:
                     pass
                 case _:
-                    raise RuntimeError("page write is not the pending transaction")
+                    raise RuntimeError(
+                        "page write batch is not the pending transaction"
+                    )
             self._bundle.require_stable()
-            target, target_page_ids = self._write_target(write)
-            for page_id in target_page_ids:
-                match self._page_owners[page_id]:
-                    case _StagedPage(transaction_id=transaction_id) if (
-                        transaction_id == write.transaction_id
-                    ):
-                        pass
-                    case _:
-                        raise RuntimeError("page write lost one of its target pages")
-            root = ImmutableStateVersionRoot(
-                root_id=self._next_root_id,
-                ref=target,
-                bundle_epoch=self._bundle_epoch,
-                page_ids=target_page_ids,
-                readiness=readiness,
+            for write in batch.writes:
+                _target, target_page_ids = self._write_target(write)
+                for page_id in target_page_ids:
+                    match self._page_owners[page_id]:
+                        case _StagedPage(transaction_id=transaction_id) if (
+                            transaction_id == batch.transaction_id
+                        ):
+                            pass
+                        case _:
+                            raise RuntimeError(
+                                "page write batch lost one of its target pages"
+                            )
+            roots = tuple(
+                ImmutableStateVersionRoot(
+                    root_id=self._next_root_id + offset,
+                    ref=target,
+                    bundle_epoch=self._bundle_epoch,
+                    page_ids=target_page_ids,
+                    readiness=readiness,
+                )
+                for offset, write in enumerate(batch.writes)
+                for target, target_page_ids in (self._write_target(write),)
             )
-            self._roots[target] = _StoredRoot(root)
-            self._latest_published_root[target.lineage_id] = target
-            for page_id in target_page_ids:
-                self._page_owners[page_id] = _RootPage(target)
-            match write, readiness:
-                case AdmissionPageWrite(), NoCompletionFence():
+            match batch:
+                case AdmissionPageBatch():
+                    self._entitled_lineages.update(
+                        root.ref.lineage_id for root in roots
+                    )
+                case TransitionPageBatch():
                     pass
-                case AdmissionPageWrite(), CudaCompletionFence():
+            for root in roots:
+                self._roots[root.ref] = _StoredRoot(root)
+                self._latest_published_root[root.ref.lineage_id] = root.ref
+                for page_id in root.page_ids:
+                    self._page_owners[page_id] = _RootPage(root.ref)
+            match batch, readiness:
+                case AdmissionPageBatch(), NoCompletionFence() | CudaCompletionFence():
                     pass
-                case TransitionPageWrite(source=source), NoCompletionFence():
-                    self._stored_root(source).pins -= 1
-                case TransitionPageWrite(source=source), CudaCompletionFence(event=event):
-                    self._pending_transition_releases.append(
-                        _PendingTransitionRelease(source, event)
+                case TransitionPageBatch(writes=writes), NoCompletionFence():
+                    for write in writes:
+                        self._stored_root(write.source).pins -= 1
+                case TransitionPageBatch(writes=writes), CudaCompletionFence(event=event):
+                    self._pending_transition_releases.extend(
+                        _PendingTransitionRelease(write.source, event)
+                        for write in writes
                     )
             self._pending_write = _NO_PENDING_WRITE
-            self._next_root_id += 1
+            self._next_root_id += len(roots)
             self._collect_completed_locked()
-            return root
+            return roots
 
-    def abort_unsubmitted(self, write: PageWrite) -> None:
-        """Discard a reserved write before its producer submits device work."""
+    def abort_unsubmitted_batch(self, batch: PageWriteBatch) -> None:
+        """Discard an entire reserved batch before producer submission."""
 
         with self._lock:
             self._require_live()
-            match self._pending_write, write:
+            match self._pending_write, batch:
                 case (
-                    _PendingAdmission(write=issued),
-                    AdmissionPageWrite(),
-                ) if issued is write:
+                    _PendingAdmissionBatch(batch=issued),
+                    AdmissionPageBatch(),
+                ) if issued is batch:
                     pass
                 case (
-                    _PendingTransition(write=issued),
-                    TransitionPageWrite(),
-                ) if issued is write:
-                    self._stored_root(write.source).pins -= 1
+                    _PendingTransitionBatch(batch=issued),
+                    TransitionPageBatch(writes=writes),
+                ) if issued is batch:
+                    for write in writes:
+                        self._stored_root(write.source).pins -= 1
                 case _:
-                    raise RuntimeError("page write is not the pending transaction")
-            _target, target_page_ids = self._write_target(write)
-            for page_id in target_page_ids:
-                match self._page_owners[page_id]:
-                    case _StagedPage(transaction_id=transaction_id) if (
-                        transaction_id == write.transaction_id
-                    ):
-                        self._page_owners[page_id] = _FreePage()
-                    case _:
-                        raise RuntimeError("aborted write lost one of its pages")
+                    raise RuntimeError(
+                        "page write batch is not the pending transaction"
+                    )
+            for write in batch.writes:
+                _target, target_page_ids = self._write_target(write)
+                for page_id in target_page_ids:
+                    match self._page_owners[page_id]:
+                        case _StagedPage(transaction_id=transaction_id) if (
+                            transaction_id == batch.transaction_id
+                        ):
+                            self._page_owners[page_id] = _FreePage()
+                        case _:
+                            raise RuntimeError(
+                                "aborted batch lost one of its target pages"
+                            )
             self._pending_write = _NO_PENDING_WRITE
             self._collect_unpinned_roots()
 
@@ -599,50 +721,116 @@ class PagedStateVersionArena:
                 raise RuntimeError("cannot retire a pinned state root")
             if not self._fence_complete(stored.root.readiness):
                 raise RuntimeError("cannot retire a root before its writer completes")
+            if any(
+                candidate.lineage_id == ref.lineage_id and candidate != ref
+                for candidate in self._roots
+            ):
+                raise RuntimeError(
+                    "cannot retire a lineage with retained version roots"
+                )
             self._latest_published_root.pop(ref.lineage_id)
             self._roots.pop(ref)
+            self._entitled_lineages.remove(ref.lineage_id)
             self._free_root_pages(stored.root)
 
-    def _reserve_transition(
+    def _validate_transition_batch(
         self,
-        source: StateRef,
-        target: StateRef,
-    ) -> TransitionPageWrite:
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+    ) -> tuple[_StoredRoot, ...]:
         self._require_no_pending_write()
         self._collect_completed_locked()
         if (
-            target.layout_id != source.layout_id
-            or target.lineage_id != source.lineage_id
-            or int(target.version_id) != int(source.version_id) + 1
+            not sources
+            or len(sources) != len(targets)
+            or len(sources) != len(set(sources))
+            or len(targets) != len(set(targets))
         ):
-            raise ValueError("transition target must be the next lineage version")
-        if source.lineage_id not in self._latest_published_root:
-            raise RuntimeError("state transition lineage is not admitted")
-        if (
-            self._latest_published_root[source.lineage_id] != source
-            or target in self._roots
-        ):
-            raise RuntimeError("state transition source is not the latest root")
-        stored = self._stored_root(source)
-        transaction_id = self._next_transaction_id
-        target_page_ids = self._reserve_pages(transaction_id)
-        write = TransitionPageWrite(
-            transaction_id,
-            source,
-            target,
-            stored.root.page_ids,
-            target_page_ids,
-            _producer_page_rows(self._bundle, stored.root.page_ids),
-            _producer_page_rows(self._bundle, target_page_ids),
-        )
-        stored.pins += 1
-        self._pending_write = _PendingTransition(write)
-        self._next_transaction_id += 1
-        return write
+            raise ValueError(
+                "state transition batch requires aligned unique references"
+            )
+        lineages = tuple(source.lineage_id for source in sources)
+        if len(lineages) != len(set(lineages)):
+            raise ValueError(
+                "state transition batch requires unique lineages"
+            )
+        stored_roots: list[_StoredRoot] = []
+        for source, target in zip(sources, targets, strict=True):
+            if (
+                target.layout_id != source.layout_id
+                or target.lineage_id != source.lineage_id
+                or int(target.version_id) != int(source.version_id) + 1
+            ):
+                raise ValueError(
+                    "transition targets must be the next lineage versions"
+                )
+            if source.lineage_id not in self._entitled_lineages:
+                raise RuntimeError("state transition lineage is not admitted")
+            if (
+                self._latest_published_root[source.lineage_id] != source
+                or target in self._roots
+            ):
+                raise RuntimeError(
+                    "state transition sources must be the latest roots"
+                )
+            live_versions = sum(
+                candidate.lineage_id == source.lineage_id
+                for candidate in self._roots
+            )
+            if (
+                live_versions + 1
+                > self._capacity_entitlement.max_live_versions_per_lineage
+            ):
+                raise RuntimeError(
+                    "state lineage version entitlement is exhausted"
+                )
+            stored_roots.append(self._stored_root(source))
+        return tuple(stored_roots)
 
-    def _reserve_pages(self, transaction_id: int) -> tuple[int, ...]:
+    def _reserve_transition_batch(
+        self,
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+        stored_roots: tuple[_StoredRoot, ...],
+    ) -> TransitionPageBatch:
+        transaction_id = self._next_transaction_id
+        page_sets = self._reserve_page_sets(
+            transaction_id,
+            len(targets),
+        )
+        writes = tuple(
+            TransitionPageWrite(
+                transaction_id,
+                source,
+                target,
+                stored.root.page_ids,
+                target_page_ids,
+                _producer_page_rows(self._bundle, stored.root.page_ids),
+                _producer_page_rows(self._bundle, target_page_ids),
+            )
+            for source, target, stored, target_page_ids in zip(
+                sources,
+                targets,
+                stored_roots,
+                page_sets,
+                strict=True,
+            )
+        )
+        for stored in stored_roots:
+            stored.pins += 1
+        batch = TransitionPageBatch(transaction_id, writes)
+        self._pending_write = _PendingTransitionBatch(batch)
+        self._next_transaction_id += 1
+        return batch
+
+    def _reserve_page_sets(
+        self,
+        transaction_id: int,
+        root_count: int,
+    ) -> tuple[tuple[int, ...], ...]:
         selected: list[int] = []
-        required = self._bundle.layout.root_page_count
+        pages_per_root = self._bundle.layout.root_page_count
+        required = root_count * pages_per_root
         for page_id, owner in enumerate(self._page_owners):
             match owner:
                 case _FreePage():
@@ -652,11 +840,15 @@ class PagedStateVersionArena:
                 case _StagedPage() | _RootPage():
                     pass
         if len(selected) != required:
-            raise RuntimeError("paged state capacity is exhausted by live roots")
-        page_ids = tuple(selected)
-        for page_id in page_ids:
+            raise AssertionError(
+                "state capacity entitlement lost its reserved physical pages"
+            )
+        for page_id in selected:
             self._page_owners[page_id] = _StagedPage(transaction_id)
-        return page_ids
+        return tuple(
+            tuple(selected[offset : offset + pages_per_root])
+            for offset in range(0, required, pages_per_root)
+        )
 
     @staticmethod
     def _write_target(
@@ -756,7 +948,7 @@ class PagedStateVersionArena:
         match self._pending_write:
             case _NoPendingWrite():
                 return
-            case _PendingAdmission() | _PendingTransition():
+            case _PendingAdmissionBatch() | _PendingTransitionBatch():
                 raise RuntimeError("paged state already has a pending write")
 
     def _require_fence_domain(self, fence: CompletionFence) -> None:
@@ -817,15 +1009,19 @@ def _producer_page_rows(
 
 
 __all__ = [
+    "AdmissionPageBatch",
     "AdmissionPageWrite",
     "FrozenTensorField",
     "FrozenTensorLayout",
     "ImmutableStateVersionRoot",
     "PageBundle",
     "PagedStateVersionArena",
+    "PageWriteBatch",
     "PageWrite",
+    "StateCapacityEntitlement",
     "StateResourceId",
     "StateVersionRootPin",
     "TensorFieldId",
+    "TransitionPageBatch",
     "TransitionPageWrite",
 ]

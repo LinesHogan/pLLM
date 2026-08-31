@@ -22,6 +22,7 @@ from tllm.runtime.fixed_batched_slot_adapter import (
     FixedBatchedSlotModule,
 )
 from tllm.runtime.paged_state import (
+    StateCapacityEntitlement,
     StateResourceId,
     StateVersionRootPin,
     TensorFieldId,
@@ -94,6 +95,10 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
         eps=1e-6,
         weight_decay=0.02,
     )
+    assert adapter.version_roots.capacity_entitlement == (
+        StateCapacityEntitlement(3, 3)
+    )
+    assert adapter.version_roots.bundle.capacity == 9
     arena = RequestSlotArena(
         resource="state",
         key_fields=(RequestKeyField.REQUEST_ID,),
@@ -109,6 +114,18 @@ def test_fixed_batched_adamw_matches_independent_slots_and_aba_reset() -> None:
     adapter.commit_admission(admission, preparation)
     acquired = arena.commit_admission(admission)
     arena.consume_receipt(acquired.admission)
+
+    free_pages = adapter.version_roots.free_pages
+    existing_plan = arena.plan_admission((first,), (0,))
+    assert existing_plan.admissions == ()
+    adapter.commit_admission(
+        existing_plan,
+        adapter.prepare_admission(existing_plan),
+    )
+    existing = arena.commit_admission(existing_plan)
+    arena.consume_receipt(existing.admission)
+    arena.release_selection(existing.selection)
+    assert adapter.version_roots.free_pages == free_pages
 
     baseline_weights = tuple(
         torch.nn.Parameter(initial_weight[slot_id].clone())

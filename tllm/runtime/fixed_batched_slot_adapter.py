@@ -15,14 +15,17 @@ from tllm.contracts.request_state import (
 )
 from tllm.contracts.state_ref import LayoutId, StateRef, VersionId
 from tllm.runtime.paged_state import (
+    AdmissionPageBatch,
     AdmissionPageWrite,
     FrozenTensorField,
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
+    StateCapacityEntitlement,
     StateResourceId,
     StateVersionRootPin,
     TensorFieldId,
+    TransitionPageBatch,
     TransitionPageWrite,
 )
 from tllm.runtime.request_slot_adapter import (
@@ -64,10 +67,21 @@ BankT = TypeVar("BankT", bound=torch.nn.Module)
 
 
 @dataclass(frozen=True, slots=True)
-class FixedBatchedAdmissionPreparation:
+class _ExistingFixedBatchedAdmission:
     transaction_id: int
     slot_ids: tuple[int, ...]
-    refs: tuple[StateRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _NewFixedBatchedAdmission:
+    transaction_id: int
+    slot_ids: tuple[int, ...]
+    batch: AdmissionPageBatch
+
+
+FixedBatchedAdmissionPreparation = (
+    _ExistingFixedBatchedAdmission | _NewFixedBatchedAdmission
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +310,14 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         initial_buffers = tuple(
             buffer.detach().clone() for buffer in initial_layout.slot_buffers
         )
-        physical_capacity = logical_capacity * 2
+        capacity_entitlement = StateCapacityEntitlement(
+            max_admitted_lineages=logical_capacity,
+            max_live_versions_per_lineage=3,
+        )
+        physical_capacity = (
+            capacity_entitlement.max_admitted_lineages
+            * capacity_entitlement.max_live_versions_per_lineage
+        )
         physical_parameters = tuple(
             torch.nn.Parameter(
                 torch.zeros(
@@ -383,6 +404,7 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         self._roots = PagedStateVersionArena(
             PageBundle.from_pools(tensor_layout, pools),
             bundle_epoch=epoch,
+            capacity_entitlement=capacity_entitlement,
         )
         self._read_pins: dict[int, list[StateVersionRootPin]] = {}
 
@@ -409,10 +431,6 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         slot_ids = tuple(admission.slot.slot_id for admission in plan.admissions)
         if any(slot_id >= self._logical_capacity for slot_id in slot_ids):
             raise RuntimeError("fixed batched admission exceeds logical capacity")
-        self._roots.collect_completed()
-        required_pages = len(plan.admissions)
-        if self._roots.free_pages < required_pages:
-            raise RuntimeError("fixed batched root capacity is exhausted")
         refs = tuple(
             StateRef(
                 self._roots.bundle.layout.layout_id,
@@ -421,11 +439,13 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
             )
             for admission in plan.admissions
         )
-        return FixedBatchedAdmissionPreparation(
-            plan.transaction_id,
-            slot_ids,
-            refs,
-        )
+        if not refs:
+            return _ExistingFixedBatchedAdmission(
+                plan.transaction_id,
+                slot_ids,
+            )
+        batch = self._roots.prepare_admission_batch(refs)
+        return _NewFixedBatchedAdmission(plan.transaction_id, slot_ids, batch)
 
     def commit_admission(
         self,
@@ -442,17 +462,34 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
             )
             for admission in plan.admissions
         )
-        if (
-            preparation.transaction_id != plan.transaction_id
-            or preparation.slot_ids != slot_ids
-            or preparation.refs != refs
-        ):
-            raise RuntimeError("fixed batched admission differs from its plan")
+        match preparation:
+            case _ExistingFixedBatchedAdmission() if (
+                not refs
+                and preparation.transaction_id == plan.transaction_id
+                and preparation.slot_ids == slot_ids
+            ):
+                return
+            case _NewFixedBatchedAdmission(batch=batch) if (
+                preparation.transaction_id == plan.transaction_id
+                and preparation.slot_ids == slot_ids
+                and tuple(write.target for write in batch.writes) == refs
+            ):
+                pass
+            case _:
+                raise RuntimeError(
+                    "fixed batched admission differs from its plan"
+                )
         try:
-            for slot_id, ref in zip(slot_ids, refs, strict=True):
-                write = self._roots.prepare_admission(ref)
+            for slot_id, write in zip(
+                slot_ids,
+                batch.writes,
+                strict=True,
+            ):
                 self._initialize_page(write, slot_id)
-                self._roots.publish(write, self._record_readiness())
+            self._roots.publish_batch(
+                batch,
+                self._record_readiness(),
+            )
         except Exception:
             self.poison()
             raise
@@ -531,9 +568,6 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         if any(loss.numel() != 1 for loss in losses):
             raise ValueError("fixed batched transition losses must be scalar")
         self._validate_layout()
-        self._roots.collect_completed()
-        if self._roots.free_pages < len(plan.transitions):
-            raise RuntimeError("fixed batched root capacity is exhausted")
         source_refs = tuple(
             StateRef(
                 self._roots.bundle.layout.layout_id,
@@ -554,21 +588,20 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
                 strict=True,
             )
         )
-        source_pin = self._pin_roots(source_refs)
+        transition_batch = self._prepare_transition_batch(
+            source_refs,
+            target_refs,
+        )
         try:
             self._optimizer.zero_grad()
             with torch.inference_mode(False), torch.enable_grad():
                 torch.autograd.backward(losses)
-            for source, target, root in zip(
-                source_refs,
-                target_refs,
-                source_pin.roots,
-                strict=True,
-            ):
-                write = self._prepare_transition(source, target)
-                self._update_page(write, root.page_ids[0])
-                self._roots.publish(write, self._record_readiness())
-            self._release_pin_after_current_work(source_pin)
+            for write in transition_batch.writes:
+                self._update_page(write, write.source_page_ids[0])
+            self._roots.publish_batch(
+                transition_batch,
+                self._record_readiness(),
+            )
             if self.device.type == "cpu":
                 self.complete_reads_synchronous(plan.selection)
         except Exception:
@@ -605,6 +638,7 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         self._roots = PagedStateVersionArena(
             self._roots.bundle,
             bundle_epoch=epoch,
+            capacity_entitlement=self._roots.capacity_entitlement,
         )
         self._epoch = epoch
 
@@ -644,16 +678,19 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
             torch.cuda.current_stream(self.device),
         )
 
-    def _prepare_transition(
+    def _prepare_transition_batch(
         self,
-        source: StateRef,
-        target: StateRef,
-    ) -> TransitionPageWrite:
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+    ) -> TransitionPageBatch:
         if self.device.type == "cpu":
-            return self._roots.prepare_transition_synchronous(source, target)
-        return self._roots.prepare_transition_cuda(
-            source,
-            target,
+            return self._roots.prepare_transition_batch_synchronous(
+                sources,
+                targets,
+            )
+        return self._roots.prepare_transition_batch_cuda(
+            sources,
+            targets,
             torch.cuda.current_stream(self.device),
         )
 
@@ -663,12 +700,6 @@ class FixedBatchedSlotAdapter(RequestSlotAdapter, Generic[BankT]):
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self.device))
         return CudaCompletionFence(event)
-
-    def _release_pin_after_current_work(
-        self,
-        pin: StateVersionRootPin,
-    ) -> None:
-        self._roots.release_pin(pin, self._record_readiness())
 
     def _initialize_page(
         self,

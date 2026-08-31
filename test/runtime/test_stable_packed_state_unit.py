@@ -16,6 +16,7 @@ from tllm.runtime.paged_state import (
     FrozenTensorLayout,
     PageBundle,
     PagedStateVersionArena,
+    StateCapacityEntitlement,
     StateResourceId,
     TensorFieldId,
 )
@@ -79,18 +80,20 @@ class StablePackedStateUnitTest(unittest.TestCase):
         fixed_roots = PagedStateVersionArena(
             PageBundle(
                 state_layout,
-                capacity=3,
-                device=torch.device("cpu"),
-            ),
-            bundle_epoch=3,
-        )
-        fragmented_roots = PagedStateVersionArena(
-            PageBundle(
-                state_layout,
                 capacity=4,
                 device=torch.device("cpu"),
             ),
             bundle_epoch=3,
+            capacity_entitlement=StateCapacityEntitlement(2, 2),
+        )
+        fragmented_roots = PagedStateVersionArena(
+            PageBundle(
+                state_layout,
+                capacity=6,
+                device=torch.device("cpu"),
+            ),
+            bundle_epoch=3,
+            capacity_entitlement=StateCapacityEntitlement(3, 2),
         )
         refs = tuple(
             StateRef(
@@ -104,26 +107,27 @@ class StablePackedStateUnitTest(unittest.TestCase):
                 strict=True,
             )
         )
-        for index, ref in enumerate(refs):
-            fixed_write = fixed_roots.prepare_admission(ref)
+        fixed_admission = fixed_roots.prepare_admission_batch(refs)
+        for index, fixed_write in enumerate(fixed_admission.writes):
             fixed_write.target_pages[0][0].fill_(float(index + 1))
-            fixed_roots.publish(fixed_write, NoCompletionFence())
+        fixed_roots.publish_batch(fixed_admission, NoCompletionFence())
 
         dummy_ref = StateRef(
             state_layout.layout_id,
             LineageId(999),
             VersionId(0),
         )
-        dummy_write = fragmented_roots.prepare_admission(dummy_ref)
+        dummy_admission = fragmented_roots.prepare_admission_batch((dummy_ref,))
+        (dummy_write,) = dummy_admission.writes
         dummy_write.target_pages[0][0].fill_(99.0)
-        fragmented_roots.publish(dummy_write, NoCompletionFence())
-        for index, ref in enumerate(refs):
-            fragmented_write = fragmented_roots.prepare_admission(ref)
+        fragmented_roots.publish_batch(dummy_admission, NoCompletionFence())
+        fragmented_admission = fragmented_roots.prepare_admission_batch(refs)
+        for index, fragmented_write in enumerate(fragmented_admission.writes):
             fragmented_write.target_pages[0][0].fill_(float(index + 1))
-            fragmented_roots.publish(
-                fragmented_write,
-                NoCompletionFence(),
-            )
+        fragmented_roots.publish_batch(
+            fragmented_admission,
+            NoCompletionFence(),
+        )
 
         packed_layout = FrozenPackedTensorLayout(
             PackedLayoutId(8),
