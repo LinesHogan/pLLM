@@ -361,6 +361,7 @@ class ESampRequestWorkload:
                     layout_digest=binding.layout_digest,
                     max_admitted_lineages=options.max_admitted_lineages,
                     required_capabilities=(
+                        "device/cpu@1",
                         "optimizer/adamw@1",
                         "state/exact_versions@1",
                     ),

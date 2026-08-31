@@ -18,6 +18,7 @@ from tllm.canonical.tensor_layout import (
 )
 from tllm.contracts.state_ref import LayoutId
 from tllm.contracts.state_representation import (
+    StateDeviceKind,
     StateLayoutRequirement,
     StateProviderPlan,
     StateRepresentation,
@@ -106,6 +107,8 @@ def test_rust_selects_state_provider_and_physical_plan_only_projects() -> None:
         resource="weights",
         provider_id="a.resident@1",
         representation=StateRepresentation.RESIDENT_MODULE,
+        device_kind=StateDeviceKind.CPU,
+        device_ordinal=0,
         layout_id=requirement.layout_id,
         layout_namespace=requirement.layout_namespace,
         layout_digest=requirement.layout_digest,
@@ -120,6 +123,8 @@ def test_rust_selects_state_provider_and_physical_plan_only_projects() -> None:
         resource="weights",
         provider_id="z.dense@1",
         representation=StateRepresentation.DENSE_PAGE_ARENA,
+        device_kind=StateDeviceKind.CUDA,
+        device_ordinal=0,
         layout_id=requirement.layout_id,
         layout_namespace=requirement.layout_namespace,
         layout_digest=requirement.layout_digest,

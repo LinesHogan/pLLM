@@ -23,6 +23,7 @@ from tllm.canonical.tensor_layout import (
 )
 from tllm.contracts.state_ref import LineageId, StateRef, VersionId
 from tllm.contracts.state_representation import (
+    StateDeviceKind,
     StateLayoutRequirement,
     StateProviderPlan,
     StateRepresentation,
@@ -101,6 +102,8 @@ def test_cpu_dense_page_provider_consumes_signed_plans_and_preserves_pinned_v0()
         resource="state",
         provider_id="test.dense_cpu@1",
         representation=StateRepresentation.DENSE_PAGE_ARENA,
+        device_kind=StateDeviceKind.CPU,
+        device_ordinal=0,
         layout_id=binding.layout_id,
         layout_namespace=binding.layout_namespace,
         layout_digest=binding.layout_digest,
@@ -109,7 +112,7 @@ def test_cpu_dense_page_provider_consumes_signed_plans_and_preserves_pinned_v0()
         root_page_count=1,
         reserved_bytes=144,
         capture_stable=False,
-        capabilities=("optimizer/adamw@1",),
+        capabilities=("device/cpu@1", "optimizer/adamw@1"),
     )
     representation_request = StateRepresentationRequest(
         memory_budget_bytes=144,
@@ -120,7 +123,7 @@ def test_cpu_dense_page_provider_consumes_signed_plans_and_preserves_pinned_v0()
                 layout_namespace=binding.layout_namespace,
                 layout_digest=binding.layout_digest,
                 max_admitted_lineages=2,
-                required_capabilities=("optimizer/adamw@1",),
+                required_capabilities=("device/cpu@1", "optimizer/adamw@1"),
             ),
         ),
         candidates=(candidate,),

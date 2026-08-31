@@ -24,11 +24,20 @@ enum StateRepresentation {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StateDeviceKind {
+    Cpu,
+    Cuda,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct StateProviderPlan {
     resource: String,
     provider_id: String,
     representation: StateRepresentation,
+    device_kind: StateDeviceKind,
+    device_ordinal: u64,
     layout_id: u64,
     layout_digest: String,
     layout_namespace: String,
@@ -150,6 +159,9 @@ fn validate_candidate(candidate: &StateProviderPlan) -> Result<(), String> {
     require_text(&candidate.provider_id, "candidates.provider_id")?;
     require_digest(&candidate.layout_digest, "candidates.layout_digest")?;
     require_digest(&candidate.layout_namespace, "candidates.layout_namespace")?;
+    if candidate.device_kind == StateDeviceKind::Cpu && candidate.device_ordinal != 0 {
+        return Err("CPU state provider device ordinal must be zero".to_owned());
+    }
     if candidate.max_admitted_lineages == 0
         || candidate.max_live_versions_per_lineage == 0
         || candidate.root_page_count == 0
@@ -521,7 +533,7 @@ mod tests {
 
     fn request_json() -> String {
         format!(
-            r#"{{"memory_budget_bytes":24,"states":[{{"resource":"request_state","layout_id":7,"layout_digest":"{A}","layout_namespace":"{C}","max_admitted_lineages":2,"required_capabilities":["optimizer"]}}],"candidates":[{{"resource":"request_state","provider_id":"dense","representation":"dense_page_arena","layout_id":7,"layout_digest":"{A}","layout_namespace":"{C}","max_admitted_lineages":2,"max_live_versions_per_lineage":3,"root_page_count":1,"reserved_bytes":16,"capture_stable":true,"capabilities":["optimizer"]}},{{"resource":"request_state","provider_id":"resident","representation":"resident_module","layout_id":7,"layout_digest":"{A}","layout_namespace":"{C}","max_admitted_lineages":2,"max_live_versions_per_lineage":1,"root_page_count":1,"reserved_bytes":8,"capture_stable":false,"capabilities":["optimizer"]}}],"schema_version":1}}"#
+            r#"{{"memory_budget_bytes":24,"states":[{{"resource":"request_state","layout_id":7,"layout_digest":"{A}","layout_namespace":"{C}","max_admitted_lineages":2,"required_capabilities":["optimizer"]}}],"candidates":[{{"resource":"request_state","provider_id":"dense","representation":"dense_page_arena","device_kind":"cuda","device_ordinal":0,"layout_id":7,"layout_digest":"{A}","layout_namespace":"{C}","max_admitted_lineages":2,"max_live_versions_per_lineage":3,"root_page_count":1,"reserved_bytes":16,"capture_stable":true,"capabilities":["optimizer"]}},{{"resource":"request_state","provider_id":"resident","representation":"resident_module","device_kind":"cpu","device_ordinal":0,"layout_id":7,"layout_digest":"{A}","layout_namespace":"{C}","max_admitted_lineages":2,"max_live_versions_per_lineage":1,"root_page_count":1,"reserved_bytes":8,"capture_stable":false,"capabilities":["optimizer"]}}],"schema_version":1}}"#
         )
     }
 

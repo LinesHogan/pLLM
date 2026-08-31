@@ -10,7 +10,11 @@ from tllm.canonical.ptts.dense_page import (
     DensePageTransitionBatch,
     DensePageVersionPin,
 )
-from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.canonical.ptts.dense_page_planning import (
+    DensePageCpuProviderFacts,
+    DensePageCudaProviderFacts,
+    DensePageProviderFacts,
+)
 from tllm.canonical.ptts.request_state import (
     RequestStateDirectory,
     RequestStateSelection,
@@ -22,6 +26,8 @@ __all__ = [
     "DensePageAdamWConfig",
     "DensePageAdamWFieldBinding",
     "DensePageCpuProviderFacts",
+    "DensePageCudaProviderFacts",
+    "DensePageProviderFacts",
     "DensePageRoot",
     "DensePageStateProvider",
     "DensePageTransition",

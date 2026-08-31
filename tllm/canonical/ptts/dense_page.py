@@ -16,6 +16,7 @@ from tllm.canonical.state_representation import (
 from tllm.canonical.tensor_layout import validate_tensor_layouts
 from tllm.contracts.state_ref import LineageId, StateRef, VersionId
 from tllm.contracts.state_representation import (
+    StateDeviceKind,
     StateLayoutRequirement,
     StatePhysicalPlan,
     StateProviderPlan,
@@ -266,7 +267,9 @@ class DensePageStateProvider:
         if selected.representation is not StateRepresentation.DENSE_PAGE_ARENA:
             raise RuntimeError("signed state representation is not dense_page_arena")
         if (
-            selected.layout_id != layout_binding.layout_id
+            selected.device_kind is not StateDeviceKind.CPU
+            or selected.device_ordinal != 0
+            or selected.layout_id != layout_binding.layout_id
             or selected.layout_namespace != layout_binding.layout_namespace
             or selected.layout_digest != layout_binding.layout_digest
             or selected.max_admitted_lineages

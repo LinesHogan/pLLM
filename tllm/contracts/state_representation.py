@@ -19,6 +19,11 @@ class StateRepresentation(StrEnum):
     EXTERNAL_HANDLE = "external_handle"
 
 
+class StateDeviceKind(StrEnum):
+    CPU = "cpu"
+    CUDA = "cuda"
+
+
 @dataclass(frozen=True, slots=True)
 class StateProviderPlan:
     """One physical candidate, or the identical Rust-selected plan."""
@@ -26,6 +31,8 @@ class StateProviderPlan:
     resource: str
     provider_id: str
     representation: StateRepresentation
+    device_kind: StateDeviceKind
+    device_ordinal: int
     layout_id: LayoutId
     layout_namespace: str
     layout_digest: str
@@ -37,7 +44,17 @@ class StateProviderPlan:
     capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.resource or not self.provider_id:
+        if (
+            not self.resource
+            or not self.provider_id
+            or type(self.device_kind) is not StateDeviceKind
+            or type(self.device_ordinal) is not int
+            or self.device_ordinal < 0
+            or (
+                self.device_kind is StateDeviceKind.CPU
+                and self.device_ordinal != 0
+            )
+        ):
             raise ValueError("state provider plan requires resource and provider IDs")
         if int(self.layout_id) < 0:
             raise ValueError("state provider layout ID must be non-negative")
@@ -190,6 +207,8 @@ def encode_state_provider_plans(plans: tuple[StateProviderPlan, ...]) -> str:
                 "resource": plan.resource,
                 "provider_id": plan.provider_id,
                 "representation": plan.representation.value,
+                "device_kind": plan.device_kind.value,
+                "device_ordinal": plan.device_ordinal,
                 "layout_id": int(plan.layout_id),
                 "layout_namespace": plan.layout_namespace,
                 "layout_digest": plan.layout_digest,
@@ -212,6 +231,7 @@ def encode_state_provider_plans(plans: tuple[StateProviderPlan, ...]) -> str:
 
 
 __all__ = [
+    "StateDeviceKind",
     "StateLayoutRequirement",
     "StatePhysicalPlan",
     "StateProviderPlan",

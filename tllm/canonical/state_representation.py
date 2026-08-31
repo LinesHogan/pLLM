@@ -9,6 +9,7 @@ from tllm import _core
 from tllm.contracts.state_ref import LayoutId
 from tllm.contracts.state_representation import (
     StatePhysicalPlan,
+    StateDeviceKind,
     StateProviderPlan,
     StateRepresentation,
     StateRepresentationDecision,
@@ -30,6 +31,8 @@ class _ProviderWire(TypedDict):
     resource: str
     provider_id: str
     representation: str
+    device_kind: str
+    device_ordinal: int
     layout_id: int
     layout_namespace: str
     layout_digest: str
@@ -53,6 +56,8 @@ def _provider_wire(plan: StateProviderPlan) -> _ProviderWire:
         resource=plan.resource,
         provider_id=plan.provider_id,
         representation=plan.representation.value,
+        device_kind=plan.device_kind.value,
+        device_ordinal=plan.device_ordinal,
         layout_id=int(plan.layout_id),
         layout_namespace=plan.layout_namespace,
         layout_digest=plan.layout_digest,
@@ -99,6 +104,8 @@ def _provider_from_boundary(raw: object, label: str) -> StateProviderPlan:
         "resource",
         "provider_id",
         "representation",
+        "device_kind",
+        "device_ordinal",
         "layout_id",
         "layout_namespace",
         "layout_digest",
@@ -114,6 +121,8 @@ def _provider_from_boundary(raw: object, label: str) -> StateProviderPlan:
     resource = fields["resource"]
     provider_id = fields["provider_id"]
     representation = fields["representation"]
+    device_kind = fields["device_kind"]
+    device_ordinal = fields["device_ordinal"]
     layout_id = fields["layout_id"]
     layout_namespace = fields["layout_namespace"]
     layout_digest = fields["layout_digest"]
@@ -130,6 +139,8 @@ def _provider_from_boundary(raw: object, label: str) -> StateProviderPlan:
         type(resource) is not str
         or type(provider_id) is not str
         or type(representation) is not str
+        or type(device_kind) is not str
+        or type(device_ordinal) is not int
         or type(layout_id) is not int
         or type(layout_namespace) is not str
         or type(layout_digest) is not str
@@ -148,6 +159,8 @@ def _provider_from_boundary(raw: object, label: str) -> StateProviderPlan:
         resource=resource,
         provider_id=provider_id,
         representation=StateRepresentation(representation),
+        device_kind=StateDeviceKind(device_kind),
+        device_ordinal=device_ordinal,
         layout_id=LayoutId(layout_id),
         layout_namespace=layout_namespace,
         layout_digest=layout_digest,
