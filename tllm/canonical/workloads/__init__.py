@@ -1,5 +1,6 @@
 """Workloads implemented only on the clean-room canonical core."""
 
+from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.dummy import (
     DummyConfig,
     DummyExported,
@@ -27,6 +28,7 @@ from tllm.canonical.workloads.esamp_request_types import (
 )
 
 __all__ = [
+    "CanonicalWorkload",
     "DummyConfig",
     "DummyExported",
     "DummySkipped",

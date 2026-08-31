@@ -727,6 +727,34 @@ def validate_canonical_physical_plan(
     decision_json: str,
     physical_json: str,
 ) -> None: ...
+
+def compile_backend_attachment(
+    inputs_json: str,
+) -> str: ...
+
+def validate_backend_attachment(
+    inputs_json: str,
+    decision_json: str,
+) -> None: ...
+
+def lower_backend_attachment(
+    inputs_json: str,
+    decision_json: str,
+) -> str: ...
+
+def validate_backend_attachment_physical(
+    inputs_json: str,
+    decision_json: str,
+    physical_json: str,
+) -> None: ...
+
+def validate_backend_attachment_reconstruction(
+    inputs_json: str,
+    decision_json: str,
+    physical_json: str,
+    local_inputs_json: str,
+    local_physical_json: str,
+) -> None: ...
 def validate_workload_compilation_wire(
     cache_key: str,
     graph_json: str,

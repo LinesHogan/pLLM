@@ -26,6 +26,7 @@ from tllm.canonical.workloads.esamp_request_cpu import (
     ESampRequestExecution as ESampRequestCpuExecution,
     ESampRequestStepHandle as ESampRequestCpuStepHandle,
 )
+from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.esamp_request_cuda import (
     ESampRequestCudaExecution,
     ESampRequestCudaStepHandle,
@@ -98,7 +99,7 @@ ESampRequestStepHandle = (
 )
 
 
-class ESampRequestWorkload:
+class ESampRequestWorkload(CanonicalWorkload):
     """Declare ESamp math/dataflow; Rust owns scheduling and representation."""
 
     __slots__ = ("config",)

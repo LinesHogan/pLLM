@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ScheduledTask {
+pub(crate) struct ScheduledTask {
     task_id: u32,
     task_symbol: String,
     implementation_id: String,
@@ -21,7 +21,7 @@ struct ScheduledTask {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ScheduleDecision {
+pub(crate) struct ScheduleDecision {
     graph_digest: String,
     timeline_digest: String,
     tasks: Vec<ScheduledTask>,
@@ -32,31 +32,31 @@ struct ScheduleDecision {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct PhysicalTask {
-    task_id: u32,
-    implementation_id: String,
-    anchor_id: u32,
+pub(crate) struct PhysicalTask {
+    pub(crate) task_id: u32,
+    pub(crate) implementation_id: String,
+    pub(crate) anchor_id: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct PhysicalPlan {
-    plan_epoch: u64,
-    schedule_signature: String,
-    tasks: Vec<PhysicalTask>,
-    fallback_count: u64,
-    schema_version: u64,
+pub(crate) struct PhysicalPlan {
+    pub(crate) plan_epoch: u64,
+    pub(crate) schedule_signature: String,
+    pub(crate) tasks: Vec<PhysicalTask>,
+    pub(crate) fallback_count: u64,
+    pub(crate) schema_version: u64,
 }
 
 fn error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
-fn decode_decision(payload: &str) -> Result<ScheduleDecision, String> {
+pub(crate) fn decode_decision(payload: &str) -> Result<ScheduleDecision, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid ScheduleDecision: {source}"))
 }
 
-fn decode_physical(payload: &str) -> Result<PhysicalPlan, String> {
+pub(crate) fn decode_physical(payload: &str) -> Result<PhysicalPlan, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid PhysicalPlan: {source}"))
 }
 
@@ -266,7 +266,7 @@ fn validate_physical_shape(physical: &PhysicalPlan) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_physical(
+pub(crate) fn validate_physical(
     graph: &SemanticGraph,
     timeline: &Timeline,
     decision: &ScheduleDecision,

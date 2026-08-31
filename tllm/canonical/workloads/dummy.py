@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.execution import SingleTaskExecution
 from tllm.canonical.scheduler import (
     compile_schedule,
@@ -115,7 +116,7 @@ class _DummyCpuExport:
         )
 
 
-class DummyWorkload:
+class DummyWorkload(CanonicalWorkload):
     """Public Dummy workload backed only by the canonical core."""
 
     __slots__ = ("config", "_implementation")

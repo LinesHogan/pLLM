@@ -512,8 +512,18 @@ def validate_physical_plan(
     )
 
 
+encode_semantic_graph = _graph_json
+encode_scheduler_timeline = _timeline_json
+encode_schedule_decision = _decision_json
+encode_schedule_physical_plan = _physical_json
+
+
 __all__ = [
     "compile_schedule",
+    "encode_schedule_decision",
+    "encode_schedule_physical_plan",
+    "encode_scheduler_timeline",
+    "encode_semantic_graph",
     "lower_physical_plan",
     "validate_physical_plan",
     "validate_schedule",

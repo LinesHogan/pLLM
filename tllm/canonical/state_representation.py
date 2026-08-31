@@ -347,8 +347,16 @@ def validate_state_physical_plan(
     )
 
 
+encode_state_representation_request = _request_json
+encode_state_representation_decision = _decision_json
+encode_state_physical_plan = _physical_json
+
+
 __all__ = [
     "compile_state_representation",
+    "encode_state_physical_plan",
+    "encode_state_representation_decision",
+    "encode_state_representation_request",
     "lower_state_physical_plan",
     "validate_state_physical_plan",
     "validate_state_representation",

@@ -25,19 +25,19 @@ enum StateRepresentation {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum StateDeviceKind {
+pub(crate) enum StateDeviceKind {
     Cpu,
     Cuda,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StateProviderPlan {
-    resource: String,
+pub(crate) struct StateProviderPlan {
+    pub(crate) resource: String,
     provider_id: String,
     representation: StateRepresentation,
-    device_kind: StateDeviceKind,
-    device_ordinal: u64,
+    pub(crate) device_kind: StateDeviceKind,
+    pub(crate) device_ordinal: u64,
     layout_id: u64,
     layout_digest: String,
     layout_namespace: String,
@@ -62,7 +62,7 @@ struct StateLayoutRequirement {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StateRepresentationRequest {
+pub(crate) struct StateRepresentationRequest {
     memory_budget_bytes: u64,
     states: Vec<StateLayoutRequirement>,
     candidates: Vec<StateProviderPlan>,
@@ -71,7 +71,7 @@ struct StateRepresentationRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StateRepresentationDecision {
+pub(crate) struct StateRepresentationDecision {
     request_digest: String,
     plans: Vec<StateProviderPlan>,
     reserved_bytes: u64,
@@ -81,25 +81,25 @@ struct StateRepresentationDecision {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StatePhysicalPlan {
-    plan_epoch: u64,
-    request_digest: String,
-    representation_signature: String,
-    representations: Vec<StateProviderPlan>,
-    reserved_bytes: u64,
-    schema_version: u64,
+pub(crate) struct StatePhysicalPlan {
+    pub(crate) plan_epoch: u64,
+    pub(crate) request_digest: String,
+    pub(crate) representation_signature: String,
+    pub(crate) representations: Vec<StateProviderPlan>,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) schema_version: u64,
 }
 
 fn error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
-fn decode_request(payload: &str) -> Result<StateRepresentationRequest, String> {
+pub(crate) fn decode_request(payload: &str) -> Result<StateRepresentationRequest, String> {
     serde_json::from_str(payload)
         .map_err(|source| format!("invalid StateRepresentationRequest: {source}"))
 }
 
-fn decode_decision(payload: &str) -> Result<StateRepresentationDecision, String> {
+pub(crate) fn decode_decision(payload: &str) -> Result<StateRepresentationDecision, String> {
     serde_json::from_str(payload)
         .map_err(|source| format!("invalid StateRepresentationDecision: {source}"))
 }
@@ -109,7 +109,7 @@ fn decode_candidates(payload: &str) -> Result<Vec<StateProviderPlan>, String> {
         .map_err(|source| format!("invalid local state provider candidates: {source}"))
 }
 
-fn decode_physical_plan(payload: &str) -> Result<StatePhysicalPlan, String> {
+pub(crate) fn decode_physical_plan(payload: &str) -> Result<StatePhysicalPlan, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid StatePhysicalPlan: {source}"))
 }
 
@@ -411,7 +411,7 @@ fn validate_physical_plan_shape(plan: &StatePhysicalPlan) -> Result<(), String> 
     Ok(())
 }
 
-fn validate_physical_plan(
+pub(crate) fn validate_physical_plan(
     request: &StateRepresentationRequest,
     decision: &StateRepresentationDecision,
     physical: &StatePhysicalPlan,
