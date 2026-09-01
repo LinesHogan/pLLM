@@ -19,6 +19,11 @@ from tllm.canonical.ptts.publication import (
     RequestStatePublicationCoordinator,
     RequestStatePublicationReceipt,
 )
+from tllm.canonical.ptts.cuda_publication import (
+    CudaRequestStatePublicationCoordinator,
+    CudaRequestStatePreparedPublication,
+    CudaRequestStatePublicationReceipt,
+)
 from tllm.canonical.ptts.dense_page_cuda import CudaDensePageStateProvider
 from tllm.canonical.ptts.dense_page_cuda_types import (
     CudaDensePageAdmission,
@@ -51,6 +56,9 @@ __all__ = [
     "RequestStatePublicationCoordinator",
     "RequestStatePublicationReceipt",
     "CudaDensePageAdmission",
+    "CudaRequestStatePublicationCoordinator",
+    "CudaRequestStatePreparedPublication",
+    "CudaRequestStatePublicationReceipt",
     "CudaDensePageInitialRoot",
     "CudaDensePageGradientBatch",
     "CudaDensePagePreparedAdmission",

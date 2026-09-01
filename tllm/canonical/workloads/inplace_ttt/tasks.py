@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from tllm.canonical.kernels.dense_fast_weight import (
     transition_dense_fast_weight,
 )
@@ -94,7 +96,13 @@ class InPlaceTTTStepContext:
 
 
 class InPlaceTTTTransitionTask:
-    __slots__ = ("_config", "_directory", "_layout", "_provider")
+    __slots__ = (
+        "_config",
+        "_directory",
+        "_layout",
+        "_provider",
+        "_publication",
+    )
 
     def __init__(
         self,
@@ -102,11 +110,13 @@ class InPlaceTTTTransitionTask:
         layout: InPlaceTTTStateLayout,
         directory: RequestStateDirectory,
         provider: DensePageStateProvider,
+        publication: RequestStatePublicationCoordinator,
     ) -> None:
         self._config = config
         self._layout = layout
         self._directory = directory
         self._provider = provider
+        self._publication = publication
 
     @property
     def implementation_id(self) -> ImplementationId:
@@ -115,10 +125,62 @@ class InPlaceTTTTransitionTask:
     def execute(self, context: InPlaceTTTStepContext) -> None:
         (source_ref,) = context.selection.refs
         source_root = self._provider.snapshot(source_ref)
+        if not any(
+            self._config.updates(operand.phase) for operand in context.step.operands
+        ):
+            _target_root, results, _weight_changed = self._compute(
+                context,
+                source_root,
+            )
+            context.transition = InPlaceTTTNoTransition(results)
+            return
+        logical = self._directory.prepare_transition(
+            context.selection,
+            context.transition_lease,
+        )
+        try:
+            physical = self._provider.prepare_transition_batch(
+                logical.before_refs,
+                logical.after_refs,
+            )
+        except Exception:
+            self._directory.abort_transition(logical)
+            raise
+        try:
+            target_root, results, weight_changed = self._compute(
+                context,
+                source_root,
+            )
+        except Exception:
+            self._publication.abort(logical, physical)
+            raise
+        try:
+            self._provider.compute_full_root_transition(
+                physical,
+                (target_root,),
+            )
+        except Exception:
+            self._directory.abort_transition(logical)
+            raise
+        context.transition = InPlaceTTTPreparedTransition(
+            logical,
+            physical,
+            results,
+            weight_changed,
+        )
+
+    def _compute(
+        self,
+        context: InPlaceTTTStepContext,
+        source_root: tuple[torch.Tensor, ...],
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        tuple[InPlaceTTTTargetResult, ...],
+        bool,
+    ]:
         target_root = list(source_root)
         results: list[InPlaceTTTTargetResult] = []
         weight_changed = False
-        state_changed = False
         for operand in context.step.operands:
             fields = self._layout.fields_for(operand.target)
             delta = source_root[int(fields.delta_weight)]
@@ -140,7 +202,6 @@ class InPlaceTTTTransitionTask:
                 next_tail_length = source_root[int(fields.tail_length)].clone()
                 next_tail_length.fill_(transition.tail_length)
                 target_root[int(fields.tail_length)] = next_tail_length
-                state_changed = True
                 if transition.update_count:
                     weight_changed = True
                 results.append(
@@ -163,35 +224,7 @@ class InPlaceTTTTransitionTask:
                         int(source_root[int(fields.tail_length)].item()),
                     )
                 )
-        if not state_changed:
-            context.transition = InPlaceTTTNoTransition(tuple(results))
-            return
-        logical = self._directory.prepare_transition(
-            context.selection,
-            context.transition_lease,
-        )
-        try:
-            physical = self._provider.prepare_transition_batch(
-                logical.before_refs,
-                logical.after_refs,
-            )
-        except Exception:
-            self._directory.abort_transition(logical)
-            raise
-        try:
-            self._provider.compute_full_root_transition(
-                physical,
-                (tuple(target_root),),
-            )
-        except Exception:
-            self._directory.abort_transition(logical)
-            raise
-        context.transition = InPlaceTTTPreparedTransition(
-            logical,
-            physical,
-            tuple(results),
-            weight_changed,
-        )
+        return tuple(target_root), tuple(results), weight_changed
 
 
 class InPlaceTTTPublishTask:

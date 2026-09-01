@@ -13,6 +13,10 @@ from tllm.canonical.ptts.dense_page_cuda_types import (
     CudaDensePageAdmission,
     CudaDensePageInitialRoot,
 )
+from tllm.canonical.ptts.dense_page_cuda_transition import (
+    copy_cuda_full_root_transition_targets,
+    validate_cuda_full_root_transition_targets,
+)
 from tllm.canonical.ptts.dense_page_validation import DensePageSignedSpec
 from tllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 
@@ -165,6 +169,34 @@ class CudaDensePagePools:
                     strict=True,
                 ):
                     pool[page_id].copy_(initial)
+
+    def require_full_root_transition(
+        self,
+        target_page_ids: tuple[int, ...],
+        target_tensors: tuple[tuple[torch.Tensor, ...], ...],
+    ) -> None:
+        validate_cuda_full_root_transition_targets(
+            target_page_ids=target_page_ids,
+            target_tensors=target_tensors,
+            layout=self._layout,
+            pools=self._pools,
+            device=self._device,
+        )
+
+    def submit_full_root_transition(
+        self,
+        *,
+        target_page_ids: tuple[int, ...],
+        target_tensors: tuple[tuple[torch.Tensor, ...], ...],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        self._require_stream(stream)
+        copy_cuda_full_root_transition_targets(
+            target_page_ids=target_page_ids,
+            target_tensors=target_tensors,
+            pools=self._pools,
+            stream=stream,
+        )
 
     def require_adamw(
         self,

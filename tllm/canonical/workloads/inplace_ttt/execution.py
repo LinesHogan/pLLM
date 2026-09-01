@@ -33,6 +33,7 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTSpecialization,
     InPlaceTTTStepInput,
     InPlaceTTTStepResult,
+    validate_inplace_ttt_step,
 )
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
 from tllm.contracts.request_identity import RequestIdentity
@@ -116,7 +117,13 @@ class InPlaceTTTExecution:
             plan_bundle.schedule_physical,
             (
                 InPlaceTTTPublishTask(layout, publication),
-                InPlaceTTTTransitionTask(config, layout, directory, provider),
+                InPlaceTTTTransitionTask(
+                    config,
+                    layout,
+                    directory,
+                    provider,
+                    publication,
+                ),
             ),
         )
         self._update_count = 0
@@ -167,7 +174,7 @@ class InPlaceTTTExecution:
             return self._step(step)
 
     def _step(self, step: InPlaceTTTStepInput) -> InPlaceTTTStepResult:
-        self._validate_step(step)
+        validate_inplace_ttt_step(step, self._specialization)
         selection = self._directory.select(
             IndexedRequestIdentityBatch(
                 (IndexedRequestIdentityRow(0, step.identity),)
@@ -245,35 +252,7 @@ class InPlaceTTTExecution:
                 self._trained_rows,
                 self.state_plan,
                 self.plan.fallback_count,
+                0,
             )
-
-    def _validate_step(self, step: InPlaceTTTStepInput) -> None:
-        specialization_by_target = {
-            target.target: target for target in self._specialization.targets
-        }
-        for operand in step.operands:
-            try:
-                target = specialization_by_target[operand.target]
-            except KeyError as exc:
-                raise ValueError("operand target is outside specialization") from exc
-            if (
-                operand.hidden.ndim != 2
-                or operand.desired.ndim != 2
-                or operand.base_weight.ndim != 2
-                or tuple(operand.hidden.shape[1:]) != (target.input_size,)
-                or tuple(operand.desired.shape)
-                != (int(operand.hidden.shape[0]), target.output_size)
-                or tuple(operand.base_weight.shape)
-                != (target.output_size, target.input_size)
-                or operand.hidden.dtype is not operand.desired.dtype
-                or operand.hidden.dtype is not operand.base_weight.dtype
-                or operand.hidden.dtype is not self._specialization.torch_dtype
-                or int(operand.hidden.shape[0]) < 1
-                or operand.hidden.device != self._specialization.device
-                or operand.desired.device != self._specialization.device
-                or operand.base_weight.device != self._specialization.device
-            ):
-                raise ValueError("operand tensors differ from specialization")
-
 
 __all__ = ["InPlaceTTTExecution"]

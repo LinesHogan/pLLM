@@ -8,7 +8,8 @@ from hashlib import sha256
 
 import torch
 
-from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.canonical.cuda_stream import CudaStreamReadiness
+from tllm.canonical.ptts.dense_page_planning import DensePageProviderFacts
 from tllm.contracts.parameter_overlay import (
     ParameterOverlayPublication,
     ParameterTarget,
@@ -16,7 +17,7 @@ from tllm.contracts.parameter_overlay import (
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.semantic_graph import SchedulerTimeline
 from tllm.contracts.state_ref import StateRef
-from tllm.contracts.state_representation import StatePhysicalPlan
+from tllm.contracts.state_representation import StateDeviceKind, StatePhysicalPlan
 from tllm.contracts.tensor_layout import TensorDType
 
 
@@ -93,8 +94,15 @@ class InPlaceTTTSpecialization:
             not self.targets
             or tuple(sorted(target_ids)) != target_ids
             or len(target_ids) != len(set(target_ids))
-            or self.tensor_dtype not in (TensorDType.FLOAT32, TensorDType.FLOAT64)
-            or self.device.type != "cpu"
+            or self.tensor_dtype
+            not in (
+                TensorDType.FLOAT16,
+                TensorDType.BFLOAT16,
+                TensorDType.FLOAT32,
+                TensorDType.FLOAT64,
+            )
+            or self.device.type not in ("cpu", "cuda")
+            or (self.device.type == "cpu" and self.device != torch.device("cpu"))
         ):
             raise ValueError("canonical In-Place-TTT currently requires CPU floats")
 
@@ -122,6 +130,10 @@ class InPlaceTTTSpecialization:
     @property
     def torch_dtype(self) -> torch.dtype:
         match self.tensor_dtype:
+            case TensorDType.FLOAT16:
+                return torch.float16
+            case TensorDType.BFLOAT16:
+                return torch.bfloat16
             case TensorDType.FLOAT32:
                 return torch.float32
             case TensorDType.FLOAT64:
@@ -129,11 +141,23 @@ class InPlaceTTTSpecialization:
             case _:
                 raise AssertionError("In-Place-TTT specialization lost its dtype")
 
+    @property
+    def device_kind(self) -> StateDeviceKind:
+        return (
+            StateDeviceKind.CPU
+            if self.device.type == "cpu"
+            else StateDeviceKind.CUDA
+        )
+
+    @property
+    def device_ordinal(self) -> int:
+        return 0 if self.device.type == "cpu" else int(self.device.index)
+
 
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTCompileOptions:
     timeline: SchedulerTimeline
-    providers: tuple[DensePageCpuProviderFacts, ...]
+    providers: tuple[DensePageProviderFacts, ...]
     max_admitted_lineages: int
     state_memory_budget_bytes: int
     plan_epoch: int = 1
@@ -175,6 +199,82 @@ class InPlaceTTTStepInput:
             raise ValueError("In-Place-TTT operands must be sorted and unique")
 
 
+class CudaInPlaceTTTStepInput:
+    """One typed operand batch plus its CUDA producer readiness."""
+
+    __slots__ = ("_readiness", "step")
+
+    def __init__(
+        self,
+        step: InPlaceTTTStepInput,
+        readiness: CudaStreamReadiness,
+    ) -> None:
+        self.step = step
+        self._readiness = readiness
+
+    @classmethod
+    def assert_produced_on(
+        cls,
+        step: InPlaceTTTStepInput,
+        producer_stream: torch.cuda.Stream,
+    ) -> "CudaInPlaceTTTStepInput":
+        return cls(step, CudaStreamReadiness(producer_stream))
+
+    def order_on(self, consumer_stream: torch.cuda.Stream) -> None:
+        self._readiness.order_on(consumer_stream)
+
+
+@dataclass(frozen=True, slots=True)
+class InPlaceTTTPinnedDelta:
+    target: ParameterTarget
+    ref: StateRef
+    tensor: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class InPlaceTTTCudaStepHandle:
+    handle_id: int
+    identity: RequestIdentity
+    ref: StateRef
+    deltas: tuple[InPlaceTTTPinnedDelta, ...]
+
+    def __post_init__(self) -> None:
+        if self.handle_id < 1:
+            raise ValueError("CUDA In-Place-TTT handle requires an ID")
+
+
+def validate_inplace_ttt_step(
+    step: InPlaceTTTStepInput,
+    specialization: InPlaceTTTSpecialization,
+) -> None:
+    specialization_by_target = {
+        target.target: target for target in specialization.targets
+    }
+    for operand in step.operands:
+        try:
+            target = specialization_by_target[operand.target]
+        except KeyError as exc:
+            raise ValueError("operand target is outside specialization") from exc
+        if (
+            operand.hidden.ndim != 2
+            or operand.desired.ndim != 2
+            or operand.base_weight.ndim != 2
+            or tuple(operand.hidden.shape[1:]) != (target.input_size,)
+            or tuple(operand.desired.shape)
+            != (int(operand.hidden.shape[0]), target.output_size)
+            or tuple(operand.base_weight.shape)
+            != (target.output_size, target.input_size)
+            or operand.hidden.dtype is not operand.desired.dtype
+            or operand.hidden.dtype is not operand.base_weight.dtype
+            or operand.hidden.dtype is not specialization.torch_dtype
+            or int(operand.hidden.shape[0]) < 1
+            or operand.hidden.device != specialization.device
+            or operand.desired.device != specialization.device
+            or operand.base_weight.device != specialization.device
+        ):
+            raise ValueError("operand tensors differ from specialization")
+
+
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTTargetResult:
     target: ParameterTarget
@@ -205,18 +305,23 @@ class InPlaceTTTDiagnostics:
     trained_rows: int
     state_plan: StatePhysicalPlan
     fallback_count: int
+    pending_state_releases: int
 
 
 __all__ = [
+    "CudaInPlaceTTTStepInput",
     "InPlaceTTTCleanupReceipt",
     "InPlaceTTTCompileOptions",
     "InPlaceTTTConfig",
     "InPlaceTTTDiagnostics",
     "InPlaceTTTOperandPair",
+    "InPlaceTTTPinnedDelta",
     "InPlaceTTTPhase",
     "InPlaceTTTSpecialization",
     "InPlaceTTTStepInput",
+    "InPlaceTTTCudaStepHandle",
     "InPlaceTTTStepResult",
     "InPlaceTTTTargetResult",
     "InPlaceTTTTargetSpecialization",
+    "validate_inplace_ttt_step",
 ]

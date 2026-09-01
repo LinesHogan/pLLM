@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tllm.canonical.ptts.dense_page import DensePageStateProvider
+from tllm.canonical.ptts.dense_page_cuda import CudaDensePageStateProvider
+from tllm.canonical.ptts.cuda_publication import (
+    CudaRequestStatePublicationCoordinator,
+)
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.canonical.ptts.publication import RequestStatePublicationCoordinator
 from tllm.canonical.scheduler import compile_schedule, lower_physical_plan
@@ -20,6 +24,13 @@ from tllm.canonical.tensor_layout import (
 )
 from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.inplace_ttt.execution import InPlaceTTTExecution
+from tllm.canonical.workloads.inplace_ttt.cuda_execution import (
+    InPlaceTTTCudaExecution,
+)
+from tllm.canonical.workloads.inplace_ttt.cuda_tasks import (
+    INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION,
+    INPLACE_TTT_CUDA_TRANSITION_IMPLEMENTATION,
+)
 from tllm.canonical.workloads.inplace_ttt.layout import (
     InPlaceTTTStateLayout,
     build_inplace_ttt_state_layout,
@@ -74,7 +85,7 @@ _TRANSITION_TASK = TaskSymbol("transition")
 
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTCompilation:
-    execution: InPlaceTTTExecution
+    execution: InPlaceTTTExecution | InPlaceTTTCudaExecution
     plan_bundle: CanonicalPlanBundle
     state_layout: InPlaceTTTStateLayout
     execution_parameters_digest: str
@@ -126,6 +137,14 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                     ),
                     implementations=(
                         TaskImplementationSpec(
+                            INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            (
+                                "state/fenced_reclaim@1",
+                                "transition/full_root@1",
+                            ),
+                        ),
+                        TaskImplementationSpec(
                             INPLACE_TTT_PUBLISH_IMPLEMENTATION,
                             ExecutionKind.NATIVE_TASK,
                             ("transition/full_root@1",),
@@ -165,6 +184,15 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                             ExecutionKind.NATIVE_TASK,
                             (
                                 "compute/cpu@1",
+                                "transition/full_root@1",
+                            ),
+                        ),
+                        TaskImplementationSpec(
+                            INPLACE_TTT_CUDA_TRANSITION_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            (
+                                "compute/cuda@1",
+                                "state/fenced_reclaim@1",
                                 "transition/full_root@1",
                             ),
                         ),
@@ -229,6 +257,20 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             )
             for provider in options.providers
         )
+        match specialization.device_kind:
+            case StateDeviceKind.CPU:
+                required_capabilities = (
+                    "device/cpu@1",
+                    "state/exact_versions@1",
+                    "transition/full_root@1",
+                )
+            case StateDeviceKind.CUDA:
+                required_capabilities = (
+                    "device/cuda@1",
+                    "state/exact_versions@1",
+                    "state/fenced_reclaim@1",
+                    "transition/full_root@1",
+                )
         representation_request = StateRepresentationRequest(
             memory_budget_bytes=options.state_memory_budget_bytes,
             states=(
@@ -238,11 +280,7 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                     layout_namespace=layout_binding.layout_namespace,
                     layout_digest=layout_binding.layout_digest,
                     max_admitted_lineages=options.max_admitted_lineages,
-                    required_capabilities=(
-                        "device/cpu@1",
-                        "state/exact_versions@1",
-                        "transition/full_root@1",
-                    ),
+                    required_capabilities=required_capabilities,
                 ),
             ),
             candidates=candidates,
@@ -260,17 +298,11 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             plan_epoch=options.plan_epoch,
         )
         (selected_provider,) = representation.plans
-        if selected_provider.device_kind is not StateDeviceKind.CPU:
-            raise RuntimeError("In-Place-TTT CPU execution received another provider")
-        provider = DensePageStateProvider(
-            tensor_layout_request=layout_request,
-            tensor_layout_decision=layout_decision,
-            representation_request=representation_request,
-            representation_decision=representation,
-            physical_plan=state_physical,
-            local_candidates=candidates,
-            resource=str(_FAST_WEIGHT_STATE),
-        )
+        if (
+            selected_provider.device_kind is not specialization.device_kind
+            or selected_provider.device_ordinal != specialization.device_ordinal
+        ):
+            raise RuntimeError("Rust-selected state placement differs from device")
         directory = RequestStateDirectory(
             layout_binding.layout_id,
             (
@@ -279,7 +311,6 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                 RequestKeyField.SAMPLE_IDX,
             ),
         )
-        publication = RequestStatePublicationCoordinator(directory, provider)
         plan_bundle = CanonicalPlanBundle(
             graph,
             options.timeline,
@@ -289,15 +320,56 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             representation,
             state_physical,
         )
-        execution = InPlaceTTTExecution(
-            self.config,
-            specialization,
-            plan_bundle,
-            state_layout,
-            provider,
-            directory,
-            publication,
-        )
+        match selected_provider.device_kind:
+            case StateDeviceKind.CPU:
+                cpu_provider = DensePageStateProvider(
+                    tensor_layout_request=layout_request,
+                    tensor_layout_decision=layout_decision,
+                    representation_request=representation_request,
+                    representation_decision=representation,
+                    physical_plan=state_physical,
+                    local_candidates=candidates,
+                    resource=str(_FAST_WEIGHT_STATE),
+                )
+                cpu_publication = RequestStatePublicationCoordinator(
+                    directory,
+                    cpu_provider,
+                )
+                execution: InPlaceTTTExecution | InPlaceTTTCudaExecution = (
+                    InPlaceTTTExecution(
+                        self.config,
+                        specialization,
+                        plan_bundle,
+                        state_layout,
+                        cpu_provider,
+                        directory,
+                        cpu_publication,
+                    )
+                )
+            case StateDeviceKind.CUDA:
+                cuda_provider = CudaDensePageStateProvider(
+                    tensor_layout_request=layout_request,
+                    tensor_layout_decision=layout_decision,
+                    representation_request=representation_request,
+                    representation_decision=representation,
+                    physical_plan=state_physical,
+                    local_candidates=candidates,
+                    resource=str(_FAST_WEIGHT_STATE),
+                    device_ordinal=selected_provider.device_ordinal,
+                )
+                cuda_publication = CudaRequestStatePublicationCoordinator(
+                    directory,
+                    cuda_provider,
+                )
+                execution = InPlaceTTTCudaExecution(
+                    self.config,
+                    specialization,
+                    plan_bundle,
+                    state_layout,
+                    cuda_provider,
+                    directory,
+                    cuda_publication,
+                )
         return InPlaceTTTCompilation(
             execution,
             plan_bundle,

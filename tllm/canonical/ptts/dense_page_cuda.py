@@ -381,6 +381,64 @@ class CudaDensePageStateProvider:
             self._poison()
             raise
 
+    def validate_full_root_transition(
+        self,
+        transition: CudaDensePageTransition,
+        sources: tuple[StateRef, ...],
+        targets: tuple[StateRef, ...],
+        target_tensors: tuple[tuple[torch.Tensor, ...], ...],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Prevalidate one unsubmitted full-root COW publication."""
+
+        with self._lock:
+            self._require_stream(stream)
+            state = self._prepared_transition(transition)
+            if stream.cuda_stream != state.stream.cuda_stream:
+                raise RuntimeError(
+                    "CUDA transition submission uses another prepared stream"
+                )
+            if state.batch.sources != sources or state.batch.targets != targets:
+                raise ValueError("CUDA transition differs from logical root versions")
+            self._pools.require_full_root_transition(
+                state.batch.target_page_ids,
+                target_tensors,
+            )
+
+    def submit_full_root_transition(
+        self,
+        transition: CudaDensePageTransition,
+        target_tensors: tuple[tuple[torch.Tensor, ...], ...],
+        stream: torch.cuda.Stream,
+    ) -> CudaDensePagePublication:
+        """Copy full private roots, fence them, then atomically publish."""
+
+        with self._lock:
+            self._require_stream(stream)
+            state = self._prepared_transition(transition)
+            if stream.cuda_stream != state.stream.cuda_stream:
+                raise RuntimeError(
+                    "CUDA transition submission uses another prepared stream"
+                )
+            self._pools.require_full_root_transition(
+                state.batch.target_page_ids,
+                target_tensors,
+            )
+            self._ledger.mark_submitted(state.batch)
+            try:
+                self._pools.submit_full_root_transition(
+                    target_page_ids=state.batch.target_page_ids,
+                    target_tensors=target_tensors,
+                    stream=stream,
+                )
+                readiness = self._record_readiness(stream)
+                roots = self._ledger.publish_batch(state.batch, readiness)
+                self._prepared_transitions.pop(transition.transaction_id)
+                return CudaDensePagePublication(tuple(root.ref for root in roots))
+            except Exception:
+                self._poison()
+                raise
+
     def abort_unsubmitted_transition(
         self,
         transition: CudaDensePageTransition,

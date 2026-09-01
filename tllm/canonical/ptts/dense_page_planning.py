@@ -104,6 +104,7 @@ class DensePageCudaProviderFacts:
                 "optimizer/adamw@1",
                 "state/exact_versions@1",
                 "state/fenced_reclaim@1",
+                "transition/full_root@1",
             ),
         )
 
