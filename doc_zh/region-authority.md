@@ -124,7 +124,8 @@ fallback 为零。本次冻结按要求没有运行吞吐 benchmark。
 | canonical FTTT host application | 当前单进程 CPU/CUDA workload authority |
 | 旧 FTTT `Workload` + `TllmRuntime` | 仅作 backend/MP quarantine；待 typed MP 替换后删除 |
 | canonical GTTA host application | 唯一 GTTA authority；旧 workload/runtime 实现已删除 |
-| Override、TTRL、TLM、In-Place-TTT | native workload authority；无 legacy consumer 或 Program 实现 |
+| canonical In-Place-TTT + signed overlay attachment | 唯一 In-Place authority；旧 workload/runtime 实现已删除 |
+| Override、TTRL、TLM | native workload authority；无 legacy consumer 或 Program 实现 |
 | consumer stream/event/plan store/recurrence scheduler/shadow snapshot | legacy detail，不得成为 Region physical authority |
 | vLLM model 专用 adapter | backend quarantine，只暴露 typed capability/binder contract |
 

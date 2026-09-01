@@ -15,7 +15,6 @@ from tllm.common.dataclass_json import dataclass_from_dict, dataclass_to_jsonabl
 from tllm.common.state import ensure_v1_env
 from tllm.consumers.esamp.config import ESampConsumerConfig
 from tllm.consumers.esamp.initializers.svd import SVDModelBankInitializerConfig
-from tllm.consumers.inplace_ttt.workload import InPlaceTTTConfig
 from tllm.consumers import registry as consumer_registry
 from tllm.runtime import residual_runtime
 from tllm.runtime.mp import bootstrap
@@ -50,13 +49,6 @@ class DataclassJsonUnitTest(unittest.TestCase):
         self.assertEqual(rebuilt.model_bank_initializer, config.model_bank_initializer)
         self.assertEqual(rebuilt.adaptation_stream_mode, "serial")
         self.assertAlmostEqual(rebuilt.distiller_beta, 0.5)
-
-    def test_tuple_literal_field_round_trips(self) -> None:
-        config = InPlaceTTTConfig(layers=(0, -1))
-        data = config.to_wire()
-        self.assertEqual(data["layers"], (0, -1))
-        rebuilt = InPlaceTTTConfig.from_wire(data)
-        self.assertEqual(rebuilt.layers, (0, -1))
 
     def test_unsafe_values_raise_at_capture_time(self) -> None:
         with self.assertRaises(TypeError):

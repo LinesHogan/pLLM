@@ -328,8 +328,9 @@ TP/PP/DP, normal hook retirement, and general model-family support remain
 outside its verified boundary. The old standalone and vLLM-specific workload classes,
 legacy Rust planner, and model-region adapter have been removed.
 
-FTTT, GTTA, In-Place-TTT, TLM, TTRL, ReFT, OverRIDE, Recirculation, and ESamp
-have native workload definitions. Only ESamp retains explicitly named
+FTTT, GTTA, TLM, TTRL, ReFT, OverRIDE, Recirculation, and ESamp have native
+workload definitions; In-Place-TTT has moved to the clean-room canonical PTTS
+and signed overlay path. Only ESamp retains explicitly named
 legacy/Program benchmark baselines while its final parity and throughput gate
 remains open.
 

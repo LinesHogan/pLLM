@@ -173,8 +173,9 @@ capture、decode recurrence、speculative decoding、TP/PP/DP、正常 hook reti
 model-family 支持仍在已验证边界之外。旧 standalone/vLLM 专用 workload class、legacy Rust
 planner 与 model-region adapter 已删除。
 
-FTTT、GTTA、In-Place-TTT、TLM、TTRL、ReFT、OverRIDE、Recirculation 与 ESamp 都已有
-native workload definition。只有 ESamp 在最终 parity/吞吐门禁关闭前保留显式命名的
+FTTT、GTTA、TLM、TTRL、ReFT、OverRIDE、Recirculation 与 ESamp 都已有 native
+workload definition；In-Place-TTT 已迁移到 clean-room canonical PTTS 与 signed overlay
+路径。只有 ESamp 在最终 parity/吞吐门禁关闭前保留显式命名的
 legacy/Program benchmark baseline。
 
 public Dummy 入口现已切换到 clean-room CPU vertical workload。它的 SemanticGraph、Rust

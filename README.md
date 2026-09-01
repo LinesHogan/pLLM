@@ -238,7 +238,8 @@ throughput.
   while update, query and publication run from one Rust-signed graph over
   instance-owned state.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
-- Native exact In-Place-TTT with request-scoped immutable overlays — see [Native In-Place TTT](doc/inplace-ttt.md).
+- Canonical exact In-Place-TTT with request-scoped PTTS roots and signed
+  immutable overlays — see [Canonical In-Place TTT](doc/inplace-ttt.md).
 - Experimental prefill recurrences such as Recirculation through the eager
   model-region/KV materializer. This path is ongoing and is not yet covered by
   the CUDA Graph performance claims above.

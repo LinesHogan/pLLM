@@ -91,13 +91,17 @@ def _make_canonical_llm(
     """The sole dynamic coexistence boundary; canonical internals stay closed."""
 
     from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
+    from tllm.canonical.workloads.inplace_ttt import InPlaceTTTWorkload
+    from tllm.canonical_runtime.parameter_overlay_llm import (
+        create_canonical_parameter_overlay_llm,
+    )
     from tllm.canonical_runtime.runtime import (
         CanonicalVllmConfig,
         create_canonical_esamp_llm,
     )
 
-    if len(workloads) != 1 or type(workloads[0]) is not ESampRequestWorkload:
-        raise TypeError("canonical vLLM currently supports one ESamp request workload")
+    if len(workloads) != 1:
+        raise TypeError("canonical vLLM currently supports one workload")
     workload = workloads[0]
     if args or set(kwargs) != {"canonical_config"}:
         raise TypeError(
@@ -106,7 +110,13 @@ def _make_canonical_llm(
     config = kwargs["canonical_config"]
     if type(config) is not CanonicalVllmConfig:
         raise TypeError("canonical_config must be an exact CanonicalVllmConfig")
-    return create_canonical_esamp_llm(workload, config)
+    match workload:
+        case ESampRequestWorkload():
+            return create_canonical_esamp_llm(workload, config)
+        case InPlaceTTTWorkload():
+            return create_canonical_parameter_overlay_llm(workload, config)
+        case _:
+            raise TypeError("canonical workload has no vLLM deployment")
 
 
 def register_consumer(consumer: BaseConsumer) -> None:

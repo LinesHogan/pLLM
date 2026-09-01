@@ -289,6 +289,15 @@ state snapshot; abort requeues the exact batch at the FIFO front. The old
 deleted after the boundary oracle passed. No CUDA, vLLM or MP facade was added
 to this CPU-only host-service slice.
 
+Canonical In-Place-TTT now keeps all configured dense target deltas and tails
+in request-scoped PTTS roots. Rust signs the transition/publish tasks and the
+complete parameter-overlay attachment; the eager MRv2 adapter consumes only
+its signed field/task/stage bindings and never owns versions or workload
+ordering. CPU/CUDA oracles and one two-request Qwen2 runtime proof passed before
+the old `tllm.consumers.inplace_ttt` authority was removed. MRv1, MP, TP/PP>1,
+quantized targets, speculation and CUDA Graph remain unsupported rather than
+falling back to that old stack.
+
 ## Part II: Legacy Inventory
 
 | Surface | Permitted role until migrated |
@@ -299,7 +308,8 @@ to this CPU-only host-service slice.
 | Canonical FTTT host application | Current single-process CPU/CUDA workload authority |
 | Old FTTT `Workload` + `TllmRuntime` | Backend/MP quarantine only; pending typed MP replacement and deletion |
 | Canonical GTTA host application | Sole GTTA authority; old workload/runtime implementation deleted |
-| Override, TTRL, TLM, In-Place-TTT | Native workload authority; no legacy consumer or Program implementation |
+| Canonical In-Place-TTT + signed overlay attachment | Sole In-Place authority; old workload/runtime implementation deleted |
+| Override, TTRL, TLM | Native workload authority; no legacy consumer or Program implementation |
 | Consumer streams/events/plan stores/recurrence schedulers/shadow snapshots | Legacy detail; never Region physical authority |
 | vLLM model-specific adapters | Backend quarantine exposing typed capability/binder contracts only |
 

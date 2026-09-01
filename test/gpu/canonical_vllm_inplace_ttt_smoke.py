@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tllm
 from vllm import SamplingParams
 
 from tllm.canonical.workloads.inplace_ttt import (
@@ -9,7 +10,7 @@ from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTWorkload,
 )
 from tllm.canonical_runtime.parameter_overlay_llm import (
-    create_canonical_parameter_overlay_llm,
+    CanonicalParameterOverlayLlm,
 )
 from tllm.canonical_runtime.runtime import CanonicalVllmConfig, CanonicalVllmDType
 from tllm.contracts.parameter_overlay import (
@@ -35,9 +36,9 @@ def main() -> int:
             update_decode=False,
         )
     )
-    handle = create_canonical_parameter_overlay_llm(
-        workload,
-        CanonicalVllmConfig(
+    routed = tllm.make_llm(
+        workloads=(workload,),
+        canonical_config=CanonicalVllmConfig(
             model="Qwen/Qwen2.5-0.5B-Instruct",
             dtype=CanonicalVllmDType.BFLOAT16,
             max_model_len=64,
@@ -47,6 +48,11 @@ def main() -> int:
             seed=7,
         ),
     )
+    match routed:
+        case CanonicalParameterOverlayLlm() as handle:
+            pass
+        case _:
+            raise RuntimeError("public make_llm did not route parameter overlay")
     try:
         outputs = handle.generate(
             ["The sky is", "Water freezes at"],

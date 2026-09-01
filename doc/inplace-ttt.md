@@ -1,58 +1,67 @@
-# Native In-Place TTT
+# Canonical In-Place TTT
 
-The built-in In-Place-TTT implementation is a typed native workload. It no
-longer uses `BaseConsumer`, `ModuleWeightView`, or the process-global
-`runtime.fast_weight` stack.
+In-Place-TTT now runs only on the clean-room canonical core. Its workload
+declares typed targets, chunk math, request state, effects, and timing; Rust
+selects the implementation and signs schedule, PTTS representation, and the
+parameter-overlay attachment.
 
 ```python
-from tllm.consumers.inplace_ttt import InPlaceTTTConfig, InPlaceTTTWorkload
-from tllm.runtime import TllmRuntime
-
-workload = InPlaceTTTWorkload(
-    InPlaceTTTConfig(
-        layers=(0,),
-        chunk_size=4096,
-        learning_rate=1e-3,
-        update_prefill=True,
-        update_decode=False,
-    )
+import tllm
+from tllm.canonical.workloads.inplace_ttt import (
+    InPlaceTTTConfig, InPlaceTTTWorkload,
 )
-runtime = TllmRuntime(workloads=(workload,))
+from tllm.canonical_runtime.runtime import CanonicalVllmConfig, CanonicalVllmDType
+from tllm.contracts.parameter_overlay import (
+    ParameterModuleKind, ParameterRole, ParameterTarget,
+)
+
+workload = InPlaceTTTWorkload(InPlaceTTTConfig(
+    targets=(ParameterTarget(
+        0,
+        ParameterModuleKind.MLP,
+        ParameterRole.DOWN_PROJECTION_WEIGHT,
+    ),),
+    chunk_size=4096,
+    learning_rate=1e-3,
+    update_prefill=True,
+    update_decode=False,
+))
+llm = tllm.make_llm(
+    workloads=(workload,),
+    canonical_config=CanonicalVllmConfig(
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        dtype=CanonicalVllmDType.BFLOAT16,
+        max_model_len=512,
+        max_num_seqs=8,
+        max_num_batched_tokens=512,
+        gpu_memory_utilization=0.8,
+    ),
+)
 ```
 
-The signed graph owns exact chunk math, request/sample/layer state, tail
-carry, version publication, and request cleanup. Full chunks produce output
-with the current effective `down_proj` weight and then apply
-`W += lr * target.T @ hidden`; the remaining rows are carried to the next
-invocation. Decode updates are a semantic config choice, not a scheduling
-policy.
+Each request owns one `StateRef(LayoutId, LineageId, VersionId)` root containing
+all configured targets' delta weights and fixed tail buffers. Full chunks emit
+with the current effective weight and then apply
+`delta += lr * target.T @ hidden`; incomplete rows remain in the immutable next
+root. A tail-only transition advances PTTS state but does not fabricate a
+parameter publication. When a weight changes, one atomic publication exposes
+all target field bindings as `DENSE_ADD`.
 
-Published weights use the shared `OverlayVersionStore`: multi-tensor
-publication is transactional, payloads are privately owned, request leases
-are stable, old unpinned versions are collected, and finish events release
-both tail state and leases. Physical placement, streams, fusion, and overlap
-remain Rust scheduler decisions.
+The eager MRv2 adapter never mutates model parameters and owns no version table.
+It pins exact PTTS roots, adds `F.linear(hidden, delta)` only to signed packed
+rows, captures the real MLP/down-projection operand pair, runs one batched
+signed transition/publication, and releases the old pin through the sampler
+completion fence. Request finish retires roots only after pin and writer fences
+complete.
 
-Current validation includes exact CPU tensor parity, multi-step tail state,
-immutable multi-layer version publication, request cleanup, mixed
-prefill/decode row assignment, generate-end signed cleanup, and real
-eager-GPU dense application in all four MRv1/MRv2 × in-process/EngineCore-MP
-cells. The GPU smoke is
-`test/gpu/native_inplace_ttt_workload_smoke.py`; it requires nonzero native
-update and dense-apply counts, real captured training rows, and zero request
-state after the public generate boundary. The
-worker-local typed producer captures the real MLP input, activated
-down-projection input, base weight, and Rust-derived request/phase rows; one
-bundle is staged before `execute_model.post`, while selection and update math
-remain native tasks.
-TP>1, PP>1, quantized targets, and CUDA Graph currently fail closed; native
-support for those modes and official-checkpoint parity must not be inferred
-from the eager evidence.
+Current real-runtime evidence is Qwen2, vLLM 0.27.1 MRv2, eager in-process,
+TP1/PP1/DP1, non-speculative decode. One two-request run observed six updates,
+six trained rows, eight dense-apply rows (two from versions above V0), zero
+active roots, zero pending releases, and zero fallback. MRv1, EngineCore-MP,
+TP/PP>1, quantized targets, speculative decode, and CUDA Graph are not claimed;
+backend adapters remain separate from workload scheduling.
 
-The current producer is deliberately deferred at model-step granularity: a
-model call observes one previously published weight, then publishes the next
-version for a later model step. It does not claim parity with an upstream
-implementation that updates after each chunk and uses the new weight for a
-later chunk inside the same long prefill. That synchronous behavior requires
-signed layer/chunk subregions rather than update logic hidden in the backend
-wrapper.
+Publication is deliberately model-step-granular: a model call pins one version
+and publishes its successor for a later call. Updating between chunks inside a
+single long prefill would require signed layer/chunk subregions and is not hidden
+inside the adapter.
