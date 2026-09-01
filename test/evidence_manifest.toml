@@ -1,0 +1,213 @@
+schema_version = 1
+target_count = 39
+maximum_count = 50
+
+[[evidence]]
+id = 1
+name = "layout_and_dense_ids_are_canonical_and_tamper_evident"
+group = "rust"
+
+[[evidence]]
+id = 2
+name = "semantic_graph_closed_codec_rejects_schema_drift"
+group = "rust"
+
+[[evidence]]
+id = 3
+name = "scheduler_matches_exhaustive_small_dag_oracle"
+group = "rust"
+
+[[evidence]]
+id = 4
+name = "aer_matches_bruteforce_partition_oracle"
+group = "rust"
+
+[[evidence]]
+id = 5
+name = "representation_selection_and_capacity_are_signed_once"
+group = "rust"
+
+[[evidence]]
+id = 6
+name = "physical_plan_is_mechanical_and_reconstruction_is_exact"
+group = "rust"
+
+[[evidence]]
+id = 7
+name = "versioned_state_hazards_and_timing_match_oracle"
+group = "rust"
+
+[[evidence]]
+id = 8
+name = "distributed_placement_transfer_matches_small_topology_oracle"
+group = "rust"
+
+[[evidence]]
+id = 9
+name = "cpu_request_ptts_admit_cow_publish_pin_retire"
+group = "ptts"
+
+[[evidence]]
+id = 10
+name = "multi_lineage_admission_and_publication_roll_back_atomically"
+group = "ptts"
+
+[[evidence]]
+id = 11
+name = "global_multifactor_adamw_matches_oracle_and_publishes_one_version"
+group = "ptts"
+
+[[evidence]]
+id = 12
+name = "generation_receipt_blocks_aba_and_double_settlement"
+group = "ptts"
+
+[[evidence]]
+id = 13
+name = "cuda_ptts_waits_for_exact_fence_before_reclaim"
+group = "ptts"
+requires_gpu = true
+
+[[evidence]]
+id = 14
+name = "cuda_graph_pagebundle_keeps_stable_addresses_across_versions"
+group = "ptts"
+requires_gpu = true
+
+[[evidence]]
+id = 15
+name = "signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper"
+group = "boundary"
+
+[[evidence]]
+id = 16
+name = "closed_mp_codec_round_trips_registered_payload_and_shared_tensors"
+group = "boundary"
+requires_mp = true
+
+[[evidence]]
+id = 17
+name = "mp_transaction_commit_abort_and_quorum_failure_are_atomic"
+group = "boundary"
+requires_mp = true
+
+[[evidence]]
+id = 18
+name = "worker_reconstructs_exact_signed_plan_and_rejects_local_drift"
+group = "boundary"
+requires_mp = true
+
+[[evidence]]
+id = 19
+name = "typed_host_transaction_abort_requeue_and_postpublish_settlement"
+group = "boundary"
+
+[[evidence]]
+id = 20
+name = "dummy_runs_graph_sign_plan_execute"
+group = "workload"
+
+[[evidence]]
+id = 21
+name = "fttt_matches_edit_oracle_and_settles_judge_retry"
+group = "workload"
+
+[[evidence]]
+id = 22
+name = "gtta_updates_environment_and_rolls_back_fifo"
+group = "workload"
+
+[[evidence]]
+id = 23
+name = "inplace_ttt_matches_multitarget_oracle_and_cleans_versions"
+group = "workload"
+
+[[evidence]]
+id = 24
+name = "tlm_matches_objective_online_offline_graph_and_qv_publication"
+group = "workload"
+
+[[evidence]]
+id = 25
+name = "esamp_predicts_before_training_and_isolates_request_versions"
+group = "workload"
+
+[[evidence]]
+id = 26
+name = "reft_matches_loreft_math_and_publish_skip_semantics"
+group = "workload"
+
+[[evidence]]
+id = 27
+name = "recirculation_selects_rows_and_replays_typed_effect"
+group = "workload"
+
+[[evidence]]
+id = 28
+name = "override_matches_reweight_adam_and_final_noop"
+group = "workload"
+
+[[evidence]]
+id = 29
+name = "ttrl_matches_reward_update_retry_and_control_quorum"
+group = "workload"
+
+[[evidence]]
+id = 30
+name = "public_mrv2_esamp_trains_pins_sampler_and_cleans_request"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 31
+name = "mrv1_adapter_captures_exact_rows_and_sampler_links"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 32
+name = "public_vllm_dense_overlay_pins_two_request_versions"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 33
+name = "public_vllm_low_rank_overlay_pins_and_releases_global_version"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 34
+name = "public_vllm_reft_applies_activation_patch"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 35
+name = "public_vllm_recirculation_replays_signed_layer_rows"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 36
+name = "enginecore_mp_executes_closed_plan_and_returns_quorum"
+group = "runtime"
+requires_gpu = true
+requires_mp = true
+
+[[evidence]]
+id = 37
+name = "cuda_graph_replay_preserves_training_and_zero_fallback"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 38
+name = "fttt_cuda_host_receipt_crosses_stream_boundary"
+group = "runtime"
+requires_gpu = true
+
+[[evidence]]
+id = 39
+name = "isolated_wheel_imports_and_executes_rust_codec"
+group = "release"
