@@ -75,6 +75,7 @@ pub(crate) enum RequestKeyField {
 pub(crate) enum StateEffectKind {
     Read,
     Transition,
+    TransitionMaybe,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

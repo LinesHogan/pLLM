@@ -44,6 +44,7 @@ class SemanticOutputKind(StrEnum):
 class StateEffectKind(StrEnum):
     READ = "read"
     TRANSITION = "transition"
+    TRANSITION_MAYBE = "transition_maybe"
 
 
 @dataclass(frozen=True, slots=True)
