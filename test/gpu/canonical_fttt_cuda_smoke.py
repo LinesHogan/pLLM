@@ -5,27 +5,18 @@ from __future__ import annotations
 import torch
 
 from tllm.canonical.workloads.fttt import (
-    FTTTCompileOptions,
     FTTTCompletion,
     FTTTCompletionBatch,
     FTTTConfig,
-    FTTTExecuted,
-    FTTTFeedbackService,
     FTTTFinishReason,
     FTTTInstanceKey,
     FTTTJudgeResult,
     FTTTJudgeService,
     FTTTRetryAction,
-    FTTTSession,
     FTTTSpecialization,
-    FTTTWorkload,
+    create_fttt_application,
 )
 from tllm.contracts.request_identity import RequestIdentity
-from tllm.contracts.semantic_graph import (
-    AnchorSymbol,
-    SchedulerTimeline,
-    TimelineAnchor,
-)
 from tllm.contracts.tensor_layout import TensorDType
 
 
@@ -54,29 +45,16 @@ def main() -> int:
         feedback_feature_size=3,
         max_retries=2,
     )
-    workload = FTTTWorkload(config)
-    compiled = workload.compile(
+    application = create_fttt_application(
+        config,
         FTTTSpecialization(
             hidden_size=4,
             tensor_dtype=TensorDType.FLOAT32,
             device=device,
             initialization_seed=7,
         ),
-        FTTTCompileOptions(
-            SchedulerTimeline(
-                anchors=(
-                    TimelineAnchor(AnchorSymbol("token.commit"), 0),
-                    TimelineAnchor(AnchorSymbol("host.feedback.ready"), 1),
-                    TimelineAnchor(AnchorSymbol("step.end"), 2),
-                    TimelineAnchor(AnchorSymbol("next.prepare"), 3),
-                ),
-                capabilities=("compute/cuda@1", "host/service@1"),
-            )
-        ),
+        _CudaNegativeJudge(),
     )
-    execution = compiled.execution
-    service = FTTTFeedbackService(config, _CudaNegativeJudge())
-    session = FTTTSession(service, execution)
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
     completion = FTTTCompletion(
         identity,
@@ -94,20 +72,13 @@ def main() -> int:
             device=device,
             dtype=torch.float32,
         ).reshape(1, 4)
-    if not service.enqueue_cuda(
-        FTTTCompletionBatch((completion,)),
-        hidden_rows,
-        producer_stream,
-    ):
-        raise RuntimeError("negative CUDA feedback did not enqueue training")
     with torch.cuda.stream(consumer_stream):
-        polled = session.run_next()
-    match polled:
-        case FTTTExecuted(result=result):
-            pass
-        case _:
-            raise RuntimeError("canonical FTTT CUDA transaction did not execute")
-    diagnostics = execution.diagnostics()
+        result = application.submit_cuda(
+            FTTTCompletionBatch((completion,)),
+            hidden_rows,
+            producer_stream,
+        )
+    diagnostics = application.diagnostics()
     if (
         result.edit_delta.device != device
         or result.edit_delta.shape != (1, 4)
@@ -116,7 +87,9 @@ def main() -> int:
         or result.update_count != 1
         or result.state_version != 1
         or result.intent.retry_controls[0].action is not FTTTRetryAction.RETRY
-        or service.instance_state(FTTTInstanceKey("cuda-feedback-0", 0)).adapter_version
+        or application.instance_state(
+            FTTTInstanceKey("cuda-feedback-0", 0)
+        ).adapter_version
         != 1
         or diagnostics.loss_count != 1
         or diagnostics.update_count != 1

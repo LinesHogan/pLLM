@@ -117,8 +117,8 @@ class FTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_LOSS_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("host.feedback.ready"),
-                        AnchorSymbol("step.end"),
+                        AnchorSymbol("host.input.ready"),
+                        AnchorSymbol("host.compute.end"),
                     ),
                     inputs=(
                         SemanticInput(
@@ -153,8 +153,8 @@ class FTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_OPTIMIZE_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("host.feedback.ready"),
-                        AnchorSymbol("step.end"),
+                        AnchorSymbol("host.input.ready"),
+                        AnchorSymbol("host.compute.end"),
                     ),
                     inputs=(
                         SemanticInput(
@@ -194,8 +194,8 @@ class FTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_PREDICT_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("step.end"),
-                        AnchorSymbol("next.prepare"),
+                        AnchorSymbol("host.compute.end"),
+                        AnchorSymbol("host.output.publish"),
                     ),
                     inputs=(
                         SemanticInput(
@@ -231,8 +231,8 @@ class FTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_PREPARE_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("host.feedback.ready"),
-                        AnchorSymbol("step.end"),
+                        AnchorSymbol("host.input.ready"),
+                        AnchorSymbol("host.compute.end"),
                     ),
                     inputs=(
                         SemanticInput(
@@ -267,8 +267,8 @@ class FTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_PUBLISH_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("step.end"),
-                        AnchorSymbol("next.prepare"),
+                        AnchorSymbol("host.output.publish"),
+                        AnchorSymbol("host.next"),
                     ),
                     inputs=(
                         SemanticInput(

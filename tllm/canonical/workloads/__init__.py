@@ -28,6 +28,7 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestStepResult,
 )
 from tllm.canonical.workloads.fttt import (
+    FTTTApplication,
     FTTTCompileOptions,
     FTTTCompletion,
     FTTTCompletionBatch,
@@ -41,6 +42,7 @@ from tllm.canonical.workloads.fttt import (
     FTTTJudgeService,
     FTTTSpecialization,
     FTTTWorkload,
+    create_fttt_application,
 )
 
 __all__ = [
@@ -66,6 +68,7 @@ __all__ = [
     "ESampRequestStepResult",
     "ESampRequestWorkload",
     "FTTTCompileOptions",
+    "FTTTApplication",
     "FTTTCompletion",
     "FTTTCompletionBatch",
     "FTTTConfig",
@@ -78,4 +81,5 @@ __all__ = [
     "FTTTJudgeService",
     "FTTTSpecialization",
     "FTTTWorkload",
+    "create_fttt_application",
 ]

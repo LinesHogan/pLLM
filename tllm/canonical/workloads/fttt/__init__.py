@@ -1,5 +1,9 @@
 """Canonical FTTT workload and typed host-service boundary."""
 
+from tllm.canonical.workloads.fttt.application import (
+    FTTTApplication,
+    create_fttt_application,
+)
 from tllm.canonical.workloads.fttt.execution import (
     FTTTDiagnostics,
     FTTTExecution,
@@ -42,6 +46,7 @@ from tllm.canonical.workloads.fttt.workload import (
 )
 
 __all__ = [
+    "FTTTApplication",
     "FTTTBarrierState",
     "FTTTClosedLoopIntent",
     "FTTTCompilation",
@@ -72,4 +77,5 @@ __all__ = [
     "FTTTSpecialization",
     "FTTTSession",
     "FTTTWorkload",
+    "create_fttt_application",
 ]

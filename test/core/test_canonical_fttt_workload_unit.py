@@ -8,6 +8,7 @@ from math import sqrt
 import pytest
 import torch
 
+from tllm.canonical.host_runtime import CanonicalHostRuntimeFacts
 from tllm.canonical.workloads.fttt import (
     FTTTBarrierState,
     FTTTCompileOptions,
@@ -31,10 +32,7 @@ from tllm.canonical.workloads.fttt.math import edit_inputs, target_delta
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.semantic_graph import (
     AnchorId,
-    AnchorSymbol,
-    SchedulerTimeline,
     StateScope,
-    TimelineAnchor,
 )
 from tllm.contracts.tensor_layout import TensorDType
 
@@ -82,20 +80,18 @@ def test_fttt_runs_signed_edit_and_settles_typed_retry_lifecycle() -> None:
     compiled = workload.compile(
         specialization,
         FTTTCompileOptions(
-            SchedulerTimeline(
-                anchors=(
-                    TimelineAnchor(AnchorSymbol("token.commit"), 0),
-                    TimelineAnchor(AnchorSymbol("host.feedback.ready"), 1),
-                    TimelineAnchor(AnchorSymbol("step.end"), 2),
-                    TimelineAnchor(AnchorSymbol("next.prepare"), 3),
-                ),
-                capabilities=("compute/cpu@1", "host/service@1"),
-            )
+            CanonicalHostRuntimeFacts(torch.device("cpu")).timeline()
         ),
     )
     execution = compiled.execution
     assert execution.plan.fallback_count == 0
     assert len(execution.plan.tasks) == 5
+    scheduled_anchors = {
+        task.task_symbol: task.anchor_symbol
+        for task in compiled.schedule_bundle.schedule_decision.tasks
+    }
+    assert scheduled_anchors["predict"] == "host.compute.end"
+    assert scheduled_anchors["publish"] == "host.output.publish"
     with pytest.raises(ValueError, match="differ from placement"):
         workload.compile(
             specialization,
