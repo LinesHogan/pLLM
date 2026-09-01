@@ -11,6 +11,7 @@ import torch
 from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.canonical.ptts.dense_page_planning import DensePageProviderFacts
 from tllm.contracts.parameter_overlay import (
+    ParameterOverlayPinnedTensor,
     ParameterOverlayPublication,
     ParameterTarget,
 )
@@ -199,44 +200,47 @@ class InPlaceTTTStepInput:
             raise ValueError("In-Place-TTT operands must be sorted and unique")
 
 
-class CudaInPlaceTTTStepInput:
+@dataclass(frozen=True, slots=True)
+class InPlaceTTTStepBatch:
+    entries: tuple[InPlaceTTTStepInput, ...]
+
+    def __post_init__(self) -> None:
+        identities = tuple(entry.identity for entry in self.entries)
+        if not identities or len(identities) != len(set(identities)):
+            raise ValueError("In-Place-TTT step batch requires unique requests")
+
+
+class CudaInPlaceTTTStepBatchInput:
     """One typed operand batch plus its CUDA producer readiness."""
 
-    __slots__ = ("_readiness", "step")
+    __slots__ = ("_readiness", "batch")
 
     def __init__(
         self,
-        step: InPlaceTTTStepInput,
+        batch: InPlaceTTTStepBatch,
         readiness: CudaStreamReadiness,
     ) -> None:
-        self.step = step
+        self.batch = batch
         self._readiness = readiness
 
     @classmethod
     def assert_produced_on(
         cls,
-        step: InPlaceTTTStepInput,
+        batch: InPlaceTTTStepBatch,
         producer_stream: torch.cuda.Stream,
-    ) -> "CudaInPlaceTTTStepInput":
-        return cls(step, CudaStreamReadiness(producer_stream))
+    ) -> "CudaInPlaceTTTStepBatchInput":
+        return cls(batch, CudaStreamReadiness(producer_stream))
 
     def order_on(self, consumer_stream: torch.cuda.Stream) -> None:
         self._readiness.order_on(consumer_stream)
 
 
 @dataclass(frozen=True, slots=True)
-class InPlaceTTTPinnedDelta:
-    target: ParameterTarget
-    ref: StateRef
-    tensor: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
 class InPlaceTTTCudaStepHandle:
     handle_id: int
-    identity: RequestIdentity
-    ref: StateRef
-    deltas: tuple[InPlaceTTTPinnedDelta, ...]
+    identities: tuple[RequestIdentity, ...]
+    refs: tuple[StateRef, ...]
+    deltas: tuple[ParameterOverlayPinnedTensor, ...]
 
     def __post_init__(self) -> None:
         if self.handle_id < 1:
@@ -294,6 +298,11 @@ class InPlaceTTTStepResult:
 
 
 @dataclass(frozen=True, slots=True)
+class InPlaceTTTStepBatchResult:
+    entries: tuple[InPlaceTTTStepResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class InPlaceTTTCleanupReceipt:
     retired: tuple[StateRef, ...]
 
@@ -309,16 +318,17 @@ class InPlaceTTTDiagnostics:
 
 
 __all__ = [
-    "CudaInPlaceTTTStepInput",
+    "CudaInPlaceTTTStepBatchInput",
     "InPlaceTTTCleanupReceipt",
     "InPlaceTTTCompileOptions",
     "InPlaceTTTConfig",
     "InPlaceTTTDiagnostics",
     "InPlaceTTTOperandPair",
-    "InPlaceTTTPinnedDelta",
     "InPlaceTTTPhase",
     "InPlaceTTTSpecialization",
     "InPlaceTTTStepInput",
+    "InPlaceTTTStepBatch",
+    "InPlaceTTTStepBatchResult",
     "InPlaceTTTCudaStepHandle",
     "InPlaceTTTStepResult",
     "InPlaceTTTTargetResult",

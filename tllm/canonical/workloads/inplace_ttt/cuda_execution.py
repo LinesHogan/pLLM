@@ -39,23 +39,28 @@ from tllm.canonical.workloads.inplace_ttt.cuda_tasks import (
 )
 from tllm.canonical.workloads.inplace_ttt.layout import InPlaceTTTStateLayout
 from tllm.canonical.workloads.inplace_ttt.types import (
-    CudaInPlaceTTTStepInput,
+    CudaInPlaceTTTStepBatchInput,
     InPlaceTTTCleanupReceipt,
     InPlaceTTTConfig,
     InPlaceTTTCudaStepHandle,
     InPlaceTTTDiagnostics,
-    InPlaceTTTPinnedDelta,
     InPlaceTTTSpecialization,
-    InPlaceTTTStepResult,
+    InPlaceTTTStepBatchResult,
     validate_inplace_ttt_step,
 )
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
+from tllm.contracts.parameter_overlay import ParameterOverlayPinnedTensor
+from tllm.contracts.parameter_overlay_attachment import (
+    ParameterOverlayAttachmentBinding,
+    ParameterOverlayTaskBinding,
+    ParameterOverlayTaskRole,
+)
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_state import (
     IndexedRequestIdentityBatch,
     IndexedRequestIdentityRow,
 )
-from tllm.contracts.semantic_graph import ImplementationId, PhysicalPlan
+from tllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan
 from tllm.contracts.state_ref import StateRef
 from tllm.contracts.state_representation import StateDeviceKind, StatePhysicalPlan
 
@@ -67,12 +72,12 @@ class _AwaitingCapture:
 
 @dataclass(frozen=True, slots=True)
 class _Executed:
-    result: InPlaceTTTStepResult
+    result: InPlaceTTTStepBatchResult
 
 
 @dataclass(frozen=True, slots=True)
 class _SamplerReleased:
-    result: InPlaceTTTStepResult
+    result: InPlaceTTTStepBatchResult
     release: CudaDensePageRelease
 
 
@@ -99,6 +104,7 @@ class _ActiveCudaStep:
     transition_lease: RequestStateTransitionLease
     state_pin: CudaDensePageVersionPin
     stream: torch.cuda.Stream
+    last_attachment_anchor_id: int
     state: _CudaStepState
 
 
@@ -245,17 +251,32 @@ class InPlaceTTTCudaExecution:
             self._directory.commit_admission(logical)
             return tuple(admission.ref for admission in logical.admissions)
 
-    def begin_step(
+    def begin_batch(
         self,
-        identity: RequestIdentity,
+        identities: tuple[RequestIdentity, ...],
         stream: torch.cuda.Stream,
+        bindings: tuple[ParameterOverlayAttachmentBinding, ...],
+        pin_anchor_id: AnchorId,
     ) -> InPlaceTTTCudaStepHandle:
         with self._lock:
             self._require_live()
             self._collect_completed()
+            if (
+                tuple(binding.target for binding in bindings)
+                != self._config.targets
+                or any(
+                    binding.field_id
+                    != self._layout.fields_for(binding.target).delta_weight
+                    for binding in bindings
+                )
+            ):
+                raise ValueError("signed overlay bindings differ from state layout")
             selection = self._directory.select(
                 IndexedRequestIdentityBatch(
-                    (IndexedRequestIdentityRow(0, identity),)
+                    tuple(
+                        IndexedRequestIdentityRow(index, identity)
+                        for index, identity in enumerate(identities)
+                    )
                 )
             )
             transition_lease = self._directory.acquire_transition_lease(selection)
@@ -265,18 +286,21 @@ class InPlaceTTTCudaExecution:
                 self._directory.release_transition_lease(transition_lease)
                 raise
             try:
-                (ref,) = selection.refs
-                deltas = tuple(
-                    InPlaceTTTPinnedDelta(
-                        fields.target,
-                        ref,
+                field_rows = tuple(
+                    (
+                        binding,
                         self._provider.pinned_field_rows(
                             state_pin,
-                            fields.delta_weight,
+                            binding.field_id,
                             stream,
-                        )[0],
+                        ),
                     )
-                    for fields in self._layout.targets
+                    for binding in bindings
+                )
+                deltas = tuple(
+                    ParameterOverlayPinnedTensor(binding.target, ref, rows[index])
+                    for binding, rows in field_rows
+                    for index, ref in enumerate(selection.refs)
                 )
             except Exception:
                 release = self._provider.release_pin(state_pin, stream)
@@ -285,8 +309,8 @@ class InPlaceTTTCudaExecution:
                 raise
             token = InPlaceTTTCudaStepHandle(
                 self._next_handle_id,
-                identity,
-                ref,
+                identities,
+                selection.refs,
                 deltas,
             )
             self._next_handle_id += 1
@@ -296,6 +320,7 @@ class InPlaceTTTCudaExecution:
                 transition_lease,
                 state_pin,
                 stream,
+                int(pin_anchor_id),
                 _AwaitingCapture(),
             )
             return token
@@ -303,7 +328,9 @@ class InPlaceTTTCudaExecution:
     def submit_captured(
         self,
         handle: InPlaceTTTCudaStepHandle,
-        captured: CudaInPlaceTTTStepInput,
+        captured: CudaInPlaceTTTStepBatchInput,
+        transition_task: ParameterOverlayTaskBinding,
+        publish_task: ParameterOverlayTaskBinding,
     ) -> None:
         with self._lock:
             self._require_live()
@@ -313,13 +340,41 @@ class InPlaceTTTCudaExecution:
                     pass
                 case _Executed() | _SamplerReleased():
                     raise RuntimeError("CUDA operands were already submitted")
-            step = captured.step
-            if step.identity != handle.identity:
-                raise ValueError("CUDA captured operands belong to another request")
-            validate_inplace_ttt_step(step, self._specialization)
-            captured.order_on(active.stream)
+            try:
+                if (
+                    transition_task.role
+                    is not ParameterOverlayTaskRole.TRANSITION
+                    or publish_task.role is not ParameterOverlayTaskRole.PUBLISH
+                    or transition_task.anchor_id > publish_task.anchor_id
+                    or int(transition_task.anchor_id)
+                    < active.last_attachment_anchor_id
+                ):
+                    raise ValueError("signed overlay task order is invalid")
+                physical_by_id = {
+                    task.task_id: task for task in self.plan.tasks
+                }
+                for binding in (transition_task, publish_task):
+                    physical = physical_by_id[binding.task_id]
+                    if (
+                        physical.implementation_id != binding.implementation_id
+                        or physical.anchor_id != binding.anchor_id
+                    ):
+                        raise ValueError(
+                            "signed overlay task differs from physical plan"
+                        )
+                batch = captured.batch
+                if tuple(entry.identity for entry in batch.entries) != handle.identities:
+                    raise ValueError(
+                        "CUDA captured operands belong to another request"
+                    )
+                for entry in batch.entries:
+                    validate_inplace_ttt_step(entry, self._specialization)
+                captured.order_on(active.stream)
+            except Exception:
+                self._fail_step(active)
+                raise
             context = CudaInPlaceTTTStepContext(
-                step,
+                batch,
                 active.selection,
                 active.transition_lease,
                 active.state_pin,
@@ -329,10 +384,14 @@ class InPlaceTTTCudaExecution:
             )
             invocation = self._runner.start(context)
             try:
-                for anchor_id in tuple(
-                    dict.fromkeys(task.anchor_id for task in self.plan.tasks)
-                ):
-                    self._runner.execute_anchor(invocation, anchor_id)
+                self._runner.execute_anchor(
+                    invocation,
+                    transition_task.anchor_id,
+                )
+                self._runner.execute_anchor(
+                    invocation,
+                    publish_task.anchor_id,
+                )
                 completed = self._runner.finish(invocation)
             except Exception:
                 match context.transition, context.publication:
@@ -354,6 +413,9 @@ class InPlaceTTTCudaExecution:
                 raise
             match completed.publication:
                 case CudaInPlaceTTTPublished(result=result):
+                    active.last_attachment_anchor_id = int(
+                        publish_task.anchor_id
+                    )
                     active.state = _Executed(result)
                 case CudaInPlaceTTTPublicationPending():
                     self._fail_step(active)
@@ -363,6 +425,7 @@ class InPlaceTTTCudaExecution:
         self,
         handle: InPlaceTTTCudaStepHandle,
         sampler_stream: torch.cuda.Stream,
+        release_anchor_id: AnchorId,
     ) -> None:
         with self._lock:
             self._require_live()
@@ -374,15 +437,18 @@ class InPlaceTTTCudaExecution:
                     raise RuntimeError("sampler completed before CUDA transition")
                 case _SamplerReleased():
                     raise RuntimeError("sampler completion is already recorded")
+            if int(release_anchor_id) < active.last_attachment_anchor_id:
+                raise ValueError("signed release anchor precedes publication")
             if sampler_stream.cuda_stream != active.stream.cuda_stream:
                 CudaStreamReadiness(sampler_stream).order_on(active.stream)
             release = self._provider.release_pin(active.state_pin, active.stream)
+            active.last_attachment_anchor_id = int(release_anchor_id)
             active.state = _SamplerReleased(result, release)
 
     def finish_step(
         self,
         handle: InPlaceTTTCudaStepHandle,
-    ) -> InPlaceTTTStepResult:
+    ) -> InPlaceTTTStepBatchResult:
         with self._lock:
             self._require_live()
             active = self._active_step(handle)
@@ -395,10 +461,14 @@ class InPlaceTTTCudaExecution:
             self._pending_releases.append(release)
             self._active.pop(handle.handle_id)
             self._update_count += sum(
-                target.update_count for target in result.targets
+                target.update_count
+                for entry in result.entries
+                for target in entry.targets
             )
             self._trained_rows += sum(
-                target.trained_rows for target in result.targets
+                target.trained_rows
+                for entry in result.entries
+                for target in entry.targets
             )
             return result
 
@@ -410,9 +480,12 @@ class InPlaceTTTCudaExecution:
     def retire(
         self,
         identities: tuple[RequestIdentity, ...],
+        finish_anchor_id: AnchorId,
     ) -> InPlaceTTTCleanupReceipt:
         with self._lock:
             self._require_live()
+            if int(finish_anchor_id) < 0:
+                raise ValueError("signed finish anchor is invalid")
             self._collect_completed()
             for release in self._pending_releases:
                 self._provider.wait_release(release)

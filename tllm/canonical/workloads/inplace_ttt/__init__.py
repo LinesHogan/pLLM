@@ -9,7 +9,7 @@ from tllm.canonical.workloads.inplace_ttt.cuda_execution import (
     InPlaceTTTCudaExecution,
 )
 from tllm.canonical.workloads.inplace_ttt.types import (
-    CudaInPlaceTTTStepInput,
+    CudaInPlaceTTTStepBatchInput,
     InPlaceTTTCleanupReceipt,
     InPlaceTTTCompileOptions,
     InPlaceTTTConfig,
@@ -17,9 +17,10 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTCudaStepHandle,
     InPlaceTTTOperandPair,
     InPlaceTTTPhase,
-    InPlaceTTTPinnedDelta,
     InPlaceTTTSpecialization,
     InPlaceTTTStepInput,
+    InPlaceTTTStepBatch,
+    InPlaceTTTStepBatchResult,
     InPlaceTTTStepResult,
     InPlaceTTTTargetResult,
     InPlaceTTTTargetSpecialization,
@@ -30,7 +31,7 @@ from tllm.canonical.workloads.inplace_ttt.workload import (
 )
 
 __all__ = [
-    "CudaInPlaceTTTStepInput",
+    "CudaInPlaceTTTStepBatchInput",
     "InPlaceTTTApplication",
     "InPlaceTTTCleanupReceipt",
     "InPlaceTTTCompilation",
@@ -42,9 +43,10 @@ __all__ = [
     "InPlaceTTTExecution",
     "InPlaceTTTOperandPair",
     "InPlaceTTTPhase",
-    "InPlaceTTTPinnedDelta",
     "InPlaceTTTSpecialization",
     "InPlaceTTTStepInput",
+    "InPlaceTTTStepBatch",
+    "InPlaceTTTStepBatchResult",
     "InPlaceTTTStepResult",
     "InPlaceTTTTargetResult",
     "InPlaceTTTTargetSpecialization",

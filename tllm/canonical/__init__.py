@@ -1,6 +1,16 @@
 """Clean-room native core; legacy execution stacks are forbidden dependencies."""
 
 from tllm.canonical.host_runtime import CanonicalHostRuntimeFacts
+from tllm.canonical.parameter_overlay_runtime import (
+    CanonicalParameterOverlayRuntimeFacts,
+)
+from tllm.canonical.parameter_overlay_plan import ParameterOverlayRuntimePlan
+from tllm.canonical.parameter_overlay_attachment import (
+    compile_parameter_overlay_attachment,
+    lower_parameter_overlay_attachment,
+    validate_parameter_overlay_attachment,
+    validate_parameter_overlay_attachment_reconstruction,
+)
 from tllm.canonical.backend_attachment import (
     compile_backend_attachment,
     lower_backend_attachment,
@@ -23,6 +33,12 @@ from tllm.canonical.tensor_layout import (
 __all__ = [
     "compile_backend_attachment",
     "CanonicalHostRuntimeFacts",
+    "CanonicalParameterOverlayRuntimeFacts",
+    "ParameterOverlayRuntimePlan",
+    "compile_parameter_overlay_attachment",
+    "lower_parameter_overlay_attachment",
+    "validate_parameter_overlay_attachment",
+    "validate_parameter_overlay_attachment_reconstruction",
     "compile_state_representation",
     "lower_backend_attachment",
     "lower_state_physical_plan",

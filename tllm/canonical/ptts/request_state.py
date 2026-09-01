@@ -299,6 +299,18 @@ class RequestStateDirectory:
         selection: RequestStateSelection,
         lease: RequestStateTransitionLease,
     ) -> RequestStateTransitionBatch:
+        return self.prepare_transition_subset(
+            selection,
+            lease,
+            tuple(range(len(selection.keys))),
+        )
+
+    def prepare_transition_subset(
+        self,
+        selection: RequestStateSelection,
+        lease: RequestStateTransitionLease,
+        state_indices: tuple[int, ...],
+    ) -> RequestStateTransitionBatch:
         with self._lock:
             self._require_no_pending()
             self._require_transition_lease(lease)
@@ -307,24 +319,26 @@ class RequestStateDirectory:
                     "request-state transition uses another leased selection"
                 )
             self._require_latest_selection(selection)
+            if (
+                not state_indices
+                or state_indices != tuple(sorted(set(state_indices)))
+                or any(index < 0 or index >= len(selection.keys) for index in state_indices)
+            ):
+                raise ValueError("request-state transition subset is not canonical")
             batch = RequestStateTransitionBatch(
                 self._take_operation_id(),
                 selection.selection_id,
                 tuple(
                     RequestStateTransition(
-                        key,
-                        ref,
+                        selection.keys[index],
+                        selection.refs[index],
                         StateRef(
-                            ref.layout_id,
-                            ref.lineage_id,
-                            VersionId(int(ref.version_id) + 1),
+                            selection.refs[index].layout_id,
+                            selection.refs[index].lineage_id,
+                            VersionId(int(selection.refs[index].version_id) + 1),
                         ),
                     )
-                    for key, ref in zip(
-                        selection.keys,
-                        selection.refs,
-                        strict=True,
-                    )
+                    for index in state_indices
                 ),
             )
             self._pending = _PendingTransition(batch)

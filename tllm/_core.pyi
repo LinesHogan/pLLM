@@ -755,6 +755,17 @@ def validate_backend_attachment_reconstruction(
     local_inputs_json: str,
     local_physical_json: str,
 ) -> None: ...
+
+def compile_parameter_overlay_attachment(inputs_json: str) -> str: ...
+def validate_parameter_overlay_attachment(inputs_json: str, decision_json: str) -> None: ...
+def lower_parameter_overlay_attachment(inputs_json: str, decision_json: str) -> str: ...
+def validate_parameter_overlay_attachment_reconstruction(
+    inputs_json: str,
+    decision_json: str,
+    physical_json: str,
+    local_inputs_json: str,
+    local_physical_json: str,
+) -> None: ...
 def validate_workload_compilation_wire(
     cache_key: str,
     graph_json: str,

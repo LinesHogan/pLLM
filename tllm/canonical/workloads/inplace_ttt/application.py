@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import torch
 
-from tllm.canonical.host_runtime import CanonicalHostRuntimeFacts
+from tllm.canonical.parameter_overlay_runtime import (
+    CanonicalParameterOverlayRuntimeFacts,
+)
 from tllm.canonical.ptts.dense_page_planning import (
     DensePageCpuProviderFacts,
     DensePageCudaProviderFacts,
@@ -14,19 +16,28 @@ from tllm.canonical.workloads.inplace_ttt.cuda_execution import (
 )
 from tllm.canonical.workloads.inplace_ttt.execution import InPlaceTTTExecution
 from tllm.canonical.workloads.inplace_ttt.types import (
-    CudaInPlaceTTTStepInput,
+    CudaInPlaceTTTStepBatchInput,
     InPlaceTTTCleanupReceipt,
     InPlaceTTTCompileOptions,
     InPlaceTTTConfig,
     InPlaceTTTDiagnostics,
     InPlaceTTTSpecialization,
     InPlaceTTTStepInput,
+    InPlaceTTTStepBatch,
+    InPlaceTTTStepBatchResult,
     InPlaceTTTCudaStepHandle,
     InPlaceTTTStepResult,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
     InPlaceTTTCompilation,
     InPlaceTTTWorkload,
+)
+from tllm.canonical.parameter_overlay_plan import (
+    ParameterOverlayRuntimePlan,
+)
+from tllm.contracts.parameter_overlay_attachment import (
+    ParameterOverlayStage,
+    ParameterOverlayTaskRole,
 )
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.state_ref import StateRef
@@ -73,31 +84,40 @@ class InPlaceTTTApplication:
             case InPlaceTTTCudaExecution():
                 raise RuntimeError("CUDA application uses staged step methods")
 
-    def begin_cuda_step(
+    def begin_cuda_batch(
         self,
-        identity: RequestIdentity,
+        identities: tuple[RequestIdentity, ...],
         stream: torch.cuda.Stream,
+        runtime_plan: ParameterOverlayRuntimePlan,
     ) -> InPlaceTTTCudaStepHandle:
         match self._compilation.execution:
             case InPlaceTTTCudaExecution() as execution:
-                return execution.begin_step(identity, stream)
+                return execution.begin_batch(
+                    identities,
+                    stream,
+                    runtime_plan.bindings,
+                    runtime_plan.stage(ParameterOverlayStage.PIN).anchor_id,
+                )
             case InPlaceTTTExecution():
                 raise RuntimeError("CPU application has no CUDA step")
 
     def submit_cuda(
         self,
         handle: InPlaceTTTCudaStepHandle,
-        step: InPlaceTTTStepInput,
+        batch: InPlaceTTTStepBatch,
         producer_stream: torch.cuda.Stream,
+        runtime_plan: ParameterOverlayRuntimePlan,
     ) -> None:
         match self._compilation.execution:
             case InPlaceTTTCudaExecution() as execution:
                 execution.submit_captured(
                     handle,
-                    CudaInPlaceTTTStepInput.assert_produced_on(
-                        step,
+                    CudaInPlaceTTTStepBatchInput.assert_produced_on(
+                        batch,
                         producer_stream,
                     ),
+                    runtime_plan.task(ParameterOverlayTaskRole.TRANSITION),
+                    runtime_plan.task(ParameterOverlayTaskRole.PUBLISH),
                 )
             case InPlaceTTTExecution():
                 raise RuntimeError("CPU application does not accept CUDA operands")
@@ -106,17 +126,24 @@ class InPlaceTTTApplication:
         self,
         handle: InPlaceTTTCudaStepHandle,
         sampler_stream: torch.cuda.Stream,
+        runtime_plan: ParameterOverlayRuntimePlan,
     ) -> None:
         match self._compilation.execution:
             case InPlaceTTTCudaExecution() as execution:
-                execution.complete_sampler(handle, sampler_stream)
+                execution.complete_sampler(
+                    handle,
+                    sampler_stream,
+                    runtime_plan.stage(
+                        ParameterOverlayStage.RELEASE
+                    ).anchor_id,
+                )
             case InPlaceTTTExecution():
                 raise RuntimeError("CPU application has no CUDA sampler")
 
     def finish_cuda_step(
         self,
         handle: InPlaceTTTCudaStepHandle,
-    ) -> InPlaceTTTStepResult:
+    ) -> InPlaceTTTStepBatchResult:
         match self._compilation.execution:
             case InPlaceTTTCudaExecution() as execution:
                 return execution.finish_step(handle)
@@ -127,7 +154,27 @@ class InPlaceTTTApplication:
         self,
         identities: tuple[RequestIdentity, ...],
     ) -> InPlaceTTTCleanupReceipt:
-        return self._compilation.execution.retire(identities)
+        match self._compilation.execution:
+            case InPlaceTTTExecution() as execution:
+                return execution.retire(identities)
+            case InPlaceTTTCudaExecution():
+                raise RuntimeError("CUDA cleanup requires its signed runtime plan")
+
+    def finish_cuda(
+        self,
+        identities: tuple[RequestIdentity, ...],
+        runtime_plan: ParameterOverlayRuntimePlan,
+    ) -> InPlaceTTTCleanupReceipt:
+        match self._compilation.execution:
+            case InPlaceTTTCudaExecution() as execution:
+                return execution.retire(
+                    identities,
+                    runtime_plan.stage(
+                        ParameterOverlayStage.FINISH
+                    ).anchor_id,
+                )
+            case InPlaceTTTExecution():
+                raise RuntimeError("CPU application has no CUDA cleanup")
 
     def diagnostics(self) -> InPlaceTTTDiagnostics:
         return self._compilation.execution.diagnostics()
@@ -141,7 +188,10 @@ def create_inplace_ttt_application(
     state_memory_budget_bytes: int,
     plan_epoch: int = 1,
 ) -> InPlaceTTTApplication:
-    facts = CanonicalHostRuntimeFacts(specialization.device, plan_epoch)
+    facts = CanonicalParameterOverlayRuntimeFacts(
+        specialization.device,
+        plan_epoch,
+    )
     match specialization.device_kind:
         case StateDeviceKind.CPU:
             providers: tuple[

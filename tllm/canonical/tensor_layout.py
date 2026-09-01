@@ -179,4 +179,17 @@ def validate_tensor_layouts(
     )
 
 
-__all__ = ["intern_tensor_layouts", "validate_tensor_layouts"]
+def encode_tensor_layout_request(request: TensorLayoutRequest) -> str:
+    return _request_json(request)
+
+
+def encode_tensor_layout_decision(decision: TensorLayoutDecision) -> str:
+    return _decision_json(decision)
+
+
+__all__ = [
+    "encode_tensor_layout_decision",
+    "encode_tensor_layout_request",
+    "intern_tensor_layouts",
+    "validate_tensor_layouts",
+]

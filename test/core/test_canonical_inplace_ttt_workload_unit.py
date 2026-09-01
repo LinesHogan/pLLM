@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from test.core.oracles.inplace_ttt import oracle_exact_step
-from tllm.canonical.host_runtime import CanonicalHostRuntimeFacts
+from tllm.canonical.parameter_overlay_runtime import (
+    CanonicalParameterOverlayRuntimeFacts,
+)
 from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
 from tllm.canonical.scheduler import validate_physical_plan
 from tllm.canonical.workloads.inplace_ttt import (
@@ -58,9 +60,9 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
         torch.device("cpu"),
     )
     workload = InPlaceTTTWorkload(config)
-    timeline = CanonicalHostRuntimeFacts(torch.device("cpu")).timeline(
-        ("transition/full_root@1",)
-    )
+    timeline = CanonicalParameterOverlayRuntimeFacts(
+        torch.device("cpu")
+    ).timeline(("transition/full_root@1",))
     compiled = workload.compile(
         specialization,
         InPlaceTTTCompileOptions(

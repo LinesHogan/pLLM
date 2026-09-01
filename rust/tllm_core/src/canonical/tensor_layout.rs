@@ -14,7 +14,7 @@ use std::fmt::Write;
 const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum TensorDType {
+pub(crate) enum TensorDType {
     #[serde(rename = "bool")]
     Bool,
     #[serde(rename = "uint8")]
@@ -35,7 +35,7 @@ enum TensorDType {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum MutationGranularity {
+pub(crate) enum MutationGranularity {
     WholeTensor,
     Row,
     Page,
@@ -43,8 +43,8 @@ enum MutationGranularity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TensorFieldSpec {
-    field_id: u64,
+pub(crate) struct TensorFieldSpec {
+    pub(crate) field_id: u64,
     shape: Vec<u64>,
     dtype: TensorDType,
     alignment_bytes: u64,
@@ -53,40 +53,40 @@ struct TensorFieldSpec {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TensorLayoutSpec {
-    namespace: String,
-    fields: Vec<TensorFieldSpec>,
+pub(crate) struct TensorLayoutSpec {
+    pub(crate) namespace: String,
+    pub(crate) fields: Vec<TensorFieldSpec>,
     schema_version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StateTensorLayout {
-    resource: String,
-    layout: TensorLayoutSpec,
+pub(crate) struct StateTensorLayout {
+    pub(crate) resource: String,
+    pub(crate) layout: TensorLayoutSpec,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TensorLayoutRequest {
-    layouts: Vec<StateTensorLayout>,
+pub(crate) struct TensorLayoutRequest {
+    pub(crate) layouts: Vec<StateTensorLayout>,
     schema_version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TensorLayoutBinding {
-    resource: String,
-    layout_id: u32,
-    layout_digest: String,
-    layout_namespace: String,
+pub(crate) struct TensorLayoutBinding {
+    pub(crate) resource: String,
+    pub(crate) layout_id: u32,
+    pub(crate) layout_digest: String,
+    pub(crate) layout_namespace: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TensorLayoutDecision {
+pub(crate) struct TensorLayoutDecision {
     request_digest: String,
-    bindings: Vec<TensorLayoutBinding>,
+    pub(crate) bindings: Vec<TensorLayoutBinding>,
     layout_namespace: String,
     signature: String,
     schema_version: u64,
@@ -288,7 +288,7 @@ fn validate_decision_shape(decision: &TensorLayoutDecision) -> Result<(), String
     Ok(())
 }
 
-fn validate_decision(
+pub(crate) fn validate_decision(
     request: &TensorLayoutRequest,
     decision: &TensorLayoutDecision,
 ) -> Result<(), String> {

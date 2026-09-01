@@ -75,7 +75,11 @@ from tllm.contracts.state_representation import (
     StateLayoutRequirement,
     StateRepresentationRequest,
 )
-from tllm.contracts.tensor_layout import StateTensorLayout, TensorLayoutRequest
+from tllm.contracts.tensor_layout import (
+    StateTensorLayout,
+    TensorLayoutDecision,
+    TensorLayoutRequest,
+)
 
 
 _FAST_WEIGHT_STATE = StateResource("dense_fast_weights")
@@ -88,6 +92,8 @@ class InPlaceTTTCompilation:
     execution: InPlaceTTTExecution | InPlaceTTTCudaExecution
     plan_bundle: CanonicalPlanBundle
     state_layout: InPlaceTTTStateLayout
+    tensor_layout_request: TensorLayoutRequest
+    tensor_layout_decision: TensorLayoutDecision
     execution_parameters_digest: str
 
     def __post_init__(self) -> None:
@@ -117,8 +123,8 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_PUBLISH_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("host.output.publish"),
-                        AnchorSymbol("host.next"),
+                        AnchorSymbol("state.publish"),
+                        AnchorSymbol("next.prepare"),
                     ),
                     inputs=(
                         SemanticInput(
@@ -157,8 +163,8 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                 SemanticTask(
                     symbol=_TRANSITION_TASK,
                     timing=TimingConstraint(
-                        AnchorSymbol("host.input.ready"),
-                        AnchorSymbol("host.output.publish"),
+                        AnchorSymbol("model.execute"),
+                        AnchorSymbol("state.publish"),
                     ),
                     inputs=(
                         SemanticInput(
@@ -374,6 +380,8 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             execution,
             plan_bundle,
             state_layout,
+            layout_request,
+            layout_decision,
             execution_parameters_digest,
         )
 
