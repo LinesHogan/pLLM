@@ -227,8 +227,8 @@ throughput.
 
 ## What You Can Build
 
-- Test-time training algorithms that learn during generation. Native FTTT uses
-  `FTTTConfig` + `FTTTWorkload`; its typed feedback service stages one
+- Test-time training algorithms that learn from typed host feedback. Canonical
+  FTTT uses `FTTTConfig` + `create_fttt_application`; its typed service owns one
   transaction while selection, loss, Adam, edit prediction, and closed-loop
   publication remain signed tasks. TLM uses a full HF/PEFT side model because
   its official-family update trains internal `q_proj/v_proj` LoRA rather than
@@ -240,30 +240,37 @@ throughput.
   the CUDA Graph performance claims above.
 - Activation / hidden-state export and editing pipelines; runtime analysis of LLM internals.
 
-The public FTTT construction follows the same native workload entry point as
-the other migrated workloads:
+The public FTTT construction is a clean-room typed host application; it does
+not import `TllmRuntime`, staged ports, or the old workload DSL:
 
 ```python
-from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
-from tllm.runtime import TllmRuntime
+import torch
+from tllm.canonical.workloads.fttt import (
+    FTTTConfig, FTTTDefaultJudge, FTTTSpecialization,
+    create_fttt_application,
+)
+from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-workload = FTTTWorkload(config)
-runtime = TllmRuntime(workloads=(workload,))
-feedback = FTTTFeedbackService(config)
+fttt = create_fttt_application(
+    config,
+    FTTTSpecialization(
+        hidden_size=896,
+        tensor_dtype=TensorDType.FLOAT32,
+        device=torch.device("cpu"),
+        initialization_seed=0,
+    ),
+    FTTTDefaultJudge(),
+)
 ```
 
-After the service has received a typed generation trace and its matching
-hidden rows, `feedback.stage_next(runtime)` atomically stages the pair and
-returns an `FTTTFeedbackTransaction`. A successful `commit()` acknowledges
-exactly the closed-loop intent published by signed execution. Before signed
-consumption, an exception or uncommitted context cancels the staged receipt
-and rolls back dependent queue projections. After consumption, a matching
-published intent is settled even when user code raises; consumption without a
-matching publication fail-stops the runtime because tensor state is no longer
-reversible. FTTT declares dependencies, effects, and semantic timing windows
-only. The generic Rust scheduler chooses Region formation, placement, and
-overlap; there is no FTTT-specific lane, priority, or fusion policy.
+`submit_cpu(...)` and `submit_cuda(..., producer_stream)` accept closed
+completion batches plus owned hidden rows and return one typed result containing
+the edit delta, reward/retry/barrier intent, loss and adapter version. The generic
+Rust scheduler chooses the CPU/CUDA implementation and signed host anchors;
+there is no FTTT-specific lane, priority, fusion, or ordering policy. The old
+`tllm.consumers.fttt` + `TllmRuntime` route remains quarantined only until its
+EngineCore-MP compatibility evidence is replaced in the clean core.
 
 ## Installation
 

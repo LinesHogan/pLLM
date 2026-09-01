@@ -98,26 +98,29 @@ The shipped compatibility version (`tllm/consumers/esamp/program.py`) is the
 same shape with a gated residual model and a separate `predict` flow. This is
 an ESamp migration baseline, not a pattern followed by native FTTT.
 
-Native FTTT has a formal `WorkloadConfig` + `Workload` entry point:
+Canonical FTTT has a strict host-application entry point:
 
 ```python
-from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
-from tllm.runtime import TllmRuntime
+import torch
+from tllm.canonical.workloads.fttt import (
+    FTTTConfig, FTTTDefaultJudge, FTTTSpecialization,
+    create_fttt_application,
+)
+from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-workload = FTTTWorkload(config)
-runtime = TllmRuntime(workloads=(workload,))
-feedback = FTTTFeedbackService(config)
+fttt = create_fttt_application(
+    config,
+    FTTTSpecialization(896, TensorDType.FLOAT32, torch.device("cpu"), 0),
+    FTTTDefaultJudge(),
+)
 ```
 
-The feedback service converts judging and queue state into a typed transaction
-and atomically stages the matching plan and hidden rows. Selection, feature
-construction, loss, Adam, edit prediction, and publication execute as native
-signed tasks; `commit()` acknowledges the exact published reward, retry,
-barrier, and adapter-version intent. FTTT declares only dependencies, effects,
-and semantic timing. The generic Rust scheduler chooses physical Region
-formation, placement, and overlap, with no FTTT-specific lane, priority, or
-fusion policy.
+The application converts typed completions and hidden rows into an atomic host
+transaction. Selection, features, loss, Adam, edit prediction, and publication
+execute as Rust-signed tasks. The same graph exposes CPU/CUDA candidates and the
+generic scheduler chooses from runtime capabilities; FTTT declares no lane,
+priority, fusion, provider, or execution order.
 
 ## Run it
 

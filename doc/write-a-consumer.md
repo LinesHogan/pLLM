@@ -2,13 +2,10 @@
 
 ## Native workload first
 
-For new code, write a `tllm.workload` declaration using `@workload`, `@task`,
-typed values, effects, timing windows, and optional affine domains/accesses.
-Rust then creates and signs `ExecutionRegion`s; Python has no authority to
-split them, pick their order, infer capture behavior, or add per-task stream
-placement. `RegionCaptureMode` is a Rust-signed closed enum, and only explicit
-cross-Region dependencies may create fences/events. See
-[the workload compiler guide](workload-compiler.md) for the contract.
+For new code, target the clean-room canonical graph and closed typed values.
+Rust signs dense task IDs, implementation choice and legal host anchors; Python
+execution only projects that physical plan. Do not introduce lanes, priorities,
+provider choices, callback bags, or old `Workload` lowering.
 
 ### FTTT: a typed host-service boundary
 
@@ -16,30 +13,31 @@ FTTT illustrates how host work remains explicit without regaining workload
 authority:
 
 ```python
-from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
-from tllm.runtime import TllmRuntime
+import torch
+from tllm.canonical.workloads.fttt import (
+    FTTTConfig, FTTTDefaultJudge, FTTTSpecialization,
+    create_fttt_application,
+)
+from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-workload = FTTTWorkload(config)
-runtime = TllmRuntime(workloads=(workload,))
-feedback = FTTTFeedbackService(config)
+fttt = create_fttt_application(
+    config,
+    FTTTSpecialization(896, TensorDType.FLOAT32, torch.device("cpu"), 0),
+    FTTTDefaultJudge(),
+)
 ```
 
-The service judges completed trajectories, owns the bounded feedback queue,
-and produces an `FTTTFeedbackTransaction`. `stage_next(runtime)` atomically
-stages a typed plan with its hidden rows. Selection, feature construction,
-loss, Adam, edit prediction, state-version reads, and closed-loop publication
-are native signed tasks. `commit()` accepts only the intent published for that
-transaction and acknowledges lifecycle state exactly once; abort discards the
-dependent projection only while its staged inputs are still pending. Once the
-signed graph consumes those inputs, a matching published intent is settled
-even if user code raises. Consumption without a matching publication
-fail-stops the runtime; optimizer state is never presented as rolled back.
+The application owns the judge service, bounded queue, signed execution and
+receipt settlement. `submit_cpu`/`submit_cuda` take closed typed completion
+batches and owned hidden rows. Selection, feature construction, loss, Adam,
+edit prediction, state versioning, reward/retry/barrier output and settlement
+are one exact transaction; CUDA producer/consumer ordering is event-backed.
 
 None of those semantics select a physical schedule. FTTT declares dependencies,
-effects, and legal timing windows; the generic Rust scheduler automatically
-chooses Region formation, placement, and overlap. Workloads do not declare
-lanes, priorities, or fusion strategies.
+effects and legal host windows; the generic Rust scheduler selects CPU/CUDA
+implementations and anchors. Workloads do not declare lanes, priorities,
+providers, fusion strategies or execution order.
 
 The rest of this page describes the retained Program/`BaseConsumer` API for
 legacy adapters. It is useful while a workload has not completed native

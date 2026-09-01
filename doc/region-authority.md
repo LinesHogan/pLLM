@@ -273,13 +273,13 @@ the emitted retry request, but uses a deterministic test verifier and staged
 hidden rows; it is correctness evidence for the native closed-loop contract,
 not a claim that this side reward head is an official policy-GRPO trainer.
 
-Staged-port lifecycle/status/resolution enums and the closed `SKIPPED` marker
-now live in `tllm.contracts.workload_ports`; workload storage, runtime
-execution, kit services, and FTTT all import the same canonical objects from
-the neutral layer. The obsolete workload-owned marker module was removed.
-The import-layer gate is back to module/local `0/0`, snapshots its exact and
-sanctioned edges, rejects unreviewed rule drift during ordinary checks, and
-refuses a rebase that would increase violations.
+Canonical FTTT now consumes a schema-bound host transaction directly, keeps
+its adapter in instance-owned state, and runs prepare/loss/Adam/predict/publish
+from one Rust-signed CPU/CUDA graph. Its public application owns receipt and
+lifecycle settlement; the older staged-port/TllmRuntime route is quarantined
+only for its not-yet-replaced EngineCore-MP compatibility evidence. The
+import-layer gate remains at module/local `0/0` and rejects unreviewed rule
+drift.
 
 ## Part II: Legacy Inventory
 
@@ -288,7 +288,9 @@ refuses a rebase that would increase violations.
 | `tllm.program` `@flow` / `@extern` | Compatibility declaration/lowering lane |
 | `tllm.consumers.*` | Complete workload adapter or benchmark baseline |
 | Legacy ESamp program/hand-tuned training | Explicit migration and paired-benchmark baseline |
-| Override, TTRL, FTTT, TLM, In-Place-TTT, GTTA | Native workload authority; no legacy consumer or Program implementation |
+| Canonical FTTT host application | Current single-process CPU/CUDA workload authority |
+| Old FTTT `Workload` + `TllmRuntime` | Backend/MP quarantine only; pending typed MP replacement and deletion |
+| Override, TTRL, TLM, In-Place-TTT, GTTA | Native workload authority; no legacy consumer or Program implementation |
 | Consumer streams/events/plan stores/recurrence schedulers/shadow snapshots | Legacy detail; never Region physical authority |
 | vLLM model-specific adapters | Backend quarantine exposing typed capability/binder contracts only |
 
