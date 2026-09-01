@@ -95,6 +95,70 @@ class InPlaceTTTStepContext:
     publication: InPlaceTTTPublicationState
 
 
+@dataclass(frozen=True, slots=True)
+class InPlaceTTTComputedTransition:
+    target_root: tuple[torch.Tensor, ...]
+    targets: tuple[InPlaceTTTTargetResult, ...]
+    weight_changed: bool
+
+
+def compute_inplace_ttt_transition(
+    config: InPlaceTTTConfig,
+    layout: InPlaceTTTStateLayout,
+    step: InPlaceTTTStepInput,
+    source_root: tuple[torch.Tensor, ...],
+) -> InPlaceTTTComputedTransition:
+    """Shared CPU/CUDA tensor transition; providers own storage mechanics."""
+
+    target_root = list(source_root)
+    results: list[InPlaceTTTTargetResult] = []
+    weight_changed = False
+    for operand in step.operands:
+        fields = layout.fields_for(operand.target)
+        delta = source_root[int(fields.delta_weight)]
+        if config.updates(operand.phase):
+            transition = transition_dense_fast_weight(
+                base_weight=operand.base_weight,
+                delta_weight=delta,
+                tail_input=source_root[int(fields.tail_input)],
+                tail_target=source_root[int(fields.tail_target)],
+                tail_length=int(source_root[int(fields.tail_length)].item()),
+                hidden=operand.hidden,
+                target=operand.desired,
+                chunk_size=config.chunk_size,
+                learning_rate=config.learning_rate,
+            )
+            target_root[int(fields.delta_weight)] = transition.delta_weight
+            target_root[int(fields.tail_input)] = transition.tail_input
+            target_root[int(fields.tail_target)] = transition.tail_target
+            next_tail_length = source_root[int(fields.tail_length)].clone()
+            next_tail_length.fill_(transition.tail_length)
+            target_root[int(fields.tail_length)] = next_tail_length
+            weight_changed = weight_changed or bool(transition.update_count)
+            results.append(
+                InPlaceTTTTargetResult(
+                    operand.target,
+                    transition.output,
+                    transition.update_count,
+                    transition.trained_rows,
+                    transition.tail_length,
+                )
+            )
+        else:
+            results.append(
+                InPlaceTTTTargetResult(
+                    operand.target,
+                    operand.hidden @ (operand.base_weight + delta).transpose(0, 1),
+                    0,
+                    0,
+                    int(source_root[int(fields.tail_length)].item()),
+                )
+            )
+    return InPlaceTTTComputedTransition(
+        tuple(target_root), tuple(results), weight_changed
+    )
+
+
 class InPlaceTTTTransitionTask:
     __slots__ = (
         "_config",
@@ -128,11 +192,13 @@ class InPlaceTTTTransitionTask:
         if not any(
             self._config.updates(operand.phase) for operand in context.step.operands
         ):
-            _target_root, results, _weight_changed = self._compute(
-                context,
+            computed = compute_inplace_ttt_transition(
+                self._config,
+                self._layout,
+                context.step,
                 source_root,
             )
-            context.transition = InPlaceTTTNoTransition(results)
+            context.transition = InPlaceTTTNoTransition(computed.targets)
             return
         logical = self._directory.prepare_transition(
             context.selection,
@@ -147,8 +213,10 @@ class InPlaceTTTTransitionTask:
             self._directory.abort_transition(logical)
             raise
         try:
-            target_root, results, weight_changed = self._compute(
-                context,
+            computed = compute_inplace_ttt_transition(
+                self._config,
+                self._layout,
+                context.step,
                 source_root,
             )
         except Exception:
@@ -157,7 +225,7 @@ class InPlaceTTTTransitionTask:
         try:
             self._provider.compute_full_root_transition(
                 physical,
-                (target_root,),
+                (computed.target_root,),
             )
         except Exception:
             self._directory.abort_transition(logical)
@@ -165,66 +233,9 @@ class InPlaceTTTTransitionTask:
         context.transition = InPlaceTTTPreparedTransition(
             logical,
             physical,
-            results,
-            weight_changed,
+            computed.targets,
+            computed.weight_changed,
         )
-
-    def _compute(
-        self,
-        context: InPlaceTTTStepContext,
-        source_root: tuple[torch.Tensor, ...],
-    ) -> tuple[
-        tuple[torch.Tensor, ...],
-        tuple[InPlaceTTTTargetResult, ...],
-        bool,
-    ]:
-        target_root = list(source_root)
-        results: list[InPlaceTTTTargetResult] = []
-        weight_changed = False
-        for operand in context.step.operands:
-            fields = self._layout.fields_for(operand.target)
-            delta = source_root[int(fields.delta_weight)]
-            if self._config.updates(operand.phase):
-                transition = transition_dense_fast_weight(
-                    base_weight=operand.base_weight,
-                    delta_weight=delta,
-                    tail_input=source_root[int(fields.tail_input)],
-                    tail_target=source_root[int(fields.tail_target)],
-                    tail_length=int(source_root[int(fields.tail_length)].item()),
-                    hidden=operand.hidden,
-                    target=operand.desired,
-                    chunk_size=self._config.chunk_size,
-                    learning_rate=self._config.learning_rate,
-                )
-                target_root[int(fields.delta_weight)] = transition.delta_weight
-                target_root[int(fields.tail_input)] = transition.tail_input
-                target_root[int(fields.tail_target)] = transition.tail_target
-                next_tail_length = source_root[int(fields.tail_length)].clone()
-                next_tail_length.fill_(transition.tail_length)
-                target_root[int(fields.tail_length)] = next_tail_length
-                if transition.update_count:
-                    weight_changed = True
-                results.append(
-                    InPlaceTTTTargetResult(
-                        operand.target,
-                        transition.output,
-                        transition.update_count,
-                        transition.trained_rows,
-                        transition.tail_length,
-                    )
-                )
-            else:
-                results.append(
-                    InPlaceTTTTargetResult(
-                        operand.target,
-                        operand.hidden
-                        @ (operand.base_weight + delta).transpose(0, 1),
-                        0,
-                        0,
-                        int(source_root[int(fields.tail_length)].item()),
-                    )
-                )
-        return tuple(target_root), tuple(results), weight_changed
 
 
 class InPlaceTTTPublishTask:
@@ -290,6 +301,7 @@ class InPlaceTTTPublishTask:
 __all__ = [
     "INPLACE_TTT_PUBLISH_IMPLEMENTATION",
     "INPLACE_TTT_TRANSITION_IMPLEMENTATION",
+    "InPlaceTTTComputedTransition",
     "InPlaceTTTCommittedTransition",
     "InPlaceTTTNoTransition",
     "InPlaceTTTPreparedTransition",
@@ -299,4 +311,5 @@ __all__ = [
     "InPlaceTTTStepContext",
     "InPlaceTTTTransitionPending",
     "InPlaceTTTTransitionTask",
+    "compute_inplace_ttt_transition",
 ]

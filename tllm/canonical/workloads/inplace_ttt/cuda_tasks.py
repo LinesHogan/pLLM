@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import torch
 
-from tllm.canonical.kernels.dense_fast_weight import transition_dense_fast_weight
 from tllm.canonical.ptts.cuda_publication import (
     CudaRequestStatePreparedPublication,
     CudaRequestStatePublicationCoordinator,
@@ -24,13 +23,15 @@ from tllm.canonical.ptts.request_state import (
     RequestStateTransitionLease,
 )
 from tllm.canonical.workloads.inplace_ttt.layout import InPlaceTTTStateLayout
+from tllm.canonical.workloads.inplace_ttt.tasks import (
+    InPlaceTTTComputedTransition,
+    compute_inplace_ttt_transition,
+)
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTConfig,
     InPlaceTTTStepBatch,
     InPlaceTTTStepBatchResult,
-    InPlaceTTTStepInput,
     InPlaceTTTStepResult,
-    InPlaceTTTTargetResult,
 )
 from tllm.contracts.parameter_overlay import ParameterOverlayPublication
 from tllm.contracts.semantic_graph import ImplementationId
@@ -42,13 +43,6 @@ INPLACE_TTT_CUDA_TRANSITION_IMPLEMENTATION = ImplementationId(
 INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION = ImplementationId(
     "canonical.state:cuda_publish_parameter_overlay@1"
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _ComputedEntry:
-    state_index: int
-    targets: tuple[InPlaceTTTTargetResult, ...]
-    weight_changed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +60,7 @@ class CudaInPlaceTTTPreparedTransition:
     logical: RequestStateTransitionBatch
     physical: CudaDensePageTransition
     target_roots: tuple[tuple[torch.Tensor, ...], ...]
-    entries: tuple[_ComputedEntry, ...]
+    entries: tuple[InPlaceTTTComputedTransition, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,15 +148,16 @@ class CudaInPlaceTTTTransitionTask:
             if any(self._config.updates(operand.phase) for operand in entry.operands)
         )
         if not changed_indices:
-            entries = tuple(
-                self._compute_entry(
-                    index,
-                    entry,
-                    source_roots[index],
-                    context.stream,
-                )[0]
-                for index, entry in enumerate(context.batch.entries)
-            )
+            with torch.cuda.stream(context.stream):
+                entries = tuple(
+                    compute_inplace_ttt_transition(
+                        self._config,
+                        self._layout,
+                        entry,
+                        source_roots[index],
+                    )
+                    for index, entry in enumerate(context.batch.entries)
+                )
             context.transition = CudaInPlaceTTTNoTransition(
                 InPlaceTTTStepBatchResult(
                     tuple(
@@ -195,85 +190,24 @@ class CudaInPlaceTTTTransitionTask:
             self._directory.abort_transition(logical)
             raise
         try:
-            computed_with_roots = tuple(
-                self._compute_entry(
-                    index,
-                    entry,
-                    source_roots[index],
-                    context.stream,
+            with torch.cuda.stream(context.stream):
+                computed = tuple(
+                    compute_inplace_ttt_transition(
+                        self._config,
+                        self._layout,
+                        entry,
+                        source_roots[index],
+                    )
+                    for index, entry in enumerate(context.batch.entries)
                 )
-                for index, entry in enumerate(context.batch.entries)
-            )
         except Exception:
             self._publication.abort_reservation(logical, physical)
             raise
-        computed = tuple(item[0] for item in computed_with_roots)
-        roots_by_index = {
-            item[0].state_index: item[1] for item in computed_with_roots
-        }
         context.transition = CudaInPlaceTTTPreparedTransition(
             logical,
             physical,
-            tuple(roots_by_index[index] for index in changed_indices),
+            tuple(computed[index].target_root for index in changed_indices),
             computed,
-        )
-
-    def _compute_entry(
-        self,
-        state_index: int,
-        entry: InPlaceTTTStepInput,
-        source_root: tuple[torch.Tensor, ...],
-        stream: torch.cuda.Stream,
-    ) -> tuple[_ComputedEntry, tuple[torch.Tensor, ...]]:
-        target_root = list(source_root)
-        results: list[InPlaceTTTTargetResult] = []
-        weight_changed = False
-        with torch.cuda.stream(stream):
-            for operand in entry.operands:
-                fields = self._layout.fields_for(operand.target)
-                delta = source_root[int(fields.delta_weight)]
-                if self._config.updates(operand.phase):
-                    transition = transition_dense_fast_weight(
-                        base_weight=operand.base_weight,
-                        delta_weight=delta,
-                        tail_input=source_root[int(fields.tail_input)],
-                        tail_target=source_root[int(fields.tail_target)],
-                        tail_length=int(source_root[int(fields.tail_length)].item()),
-                        hidden=operand.hidden,
-                        target=operand.desired,
-                        chunk_size=self._config.chunk_size,
-                        learning_rate=self._config.learning_rate,
-                    )
-                    target_root[int(fields.delta_weight)] = transition.delta_weight
-                    target_root[int(fields.tail_input)] = transition.tail_input
-                    target_root[int(fields.tail_target)] = transition.tail_target
-                    tail_length = source_root[int(fields.tail_length)].clone()
-                    tail_length.fill_(transition.tail_length)
-                    target_root[int(fields.tail_length)] = tail_length
-                    weight_changed = weight_changed or bool(transition.update_count)
-                    results.append(
-                        InPlaceTTTTargetResult(
-                            operand.target,
-                            transition.output,
-                            transition.update_count,
-                            transition.trained_rows,
-                            transition.tail_length,
-                        )
-                    )
-                else:
-                    results.append(
-                        InPlaceTTTTargetResult(
-                            operand.target,
-                            operand.hidden
-                            @ (operand.base_weight + delta).transpose(0, 1),
-                            0,
-                            0,
-                            int(source_root[int(fields.tail_length)].item()),
-                        )
-                    )
-        return (
-            _ComputedEntry(state_index, tuple(results), weight_changed),
-            tuple(target_root),
         )
 
 
