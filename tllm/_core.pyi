@@ -801,6 +801,7 @@ def normalize_runtime_specialization_options(
     options_json: str,
     facts_json: str,
 ) -> str: ...
+def intern_state_layout_ids(graph_json: str) -> str: ...
 def apply_region_shape_specializations(
     cache_key: str,
     graph_json: str,

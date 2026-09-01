@@ -47,7 +47,6 @@ WORKLOAD_SURFACE = tuple(
 AUTHOR_SURFACE = (*WORKLOAD_SURFACE,
     Path("tllm/kit/backend.py"),
     Path("tllm/kit/workload.py"),
-    Path("tllm/consumers/dummy/workload.py"),
     Path("tllm/consumers/esamp/workload.py"),
     Path("tllm/consumers/fttt/feedback.py"),
     Path("tllm/consumers/fttt/workload.py"),
