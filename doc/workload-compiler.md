@@ -302,7 +302,7 @@ A native ESamp Region cannot be co-installed with a legacy ESamp authority.
 During the current migration this
 isolation is runtime-wide: a runtime with any native Region declaration also
 rejects every legacy dispatch consumer, including an apparently unrelated
-GTTA/TTRL sidecar. Legacy consumers do not yet declare signed ownership of
+TTRL sidecar. Legacy consumers do not yet declare signed ownership of
 anchors, residual paths, state resources, and sampler hooks, so the runtime
 cannot prove that two execution authorities are disjoint. The restriction may
 be narrowed only after an explicit, decision-signed authority/ownership key is

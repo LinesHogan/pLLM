@@ -281,6 +281,14 @@ only for its not-yet-replaced EngineCore-MP compatibility evidence. The
 import-layer gate remains at module/local `0/0` and rejects unreviewed rule
 drift.
 
+Canonical GTTA now keeps its bounded environment FIFO as a typed CPU host
+service and executes update/query/publication through one Rust-signed graph over
+instance-owned dynamics state. Settlement is atomic across the host receipt and
+state snapshot; abort requeues the exact batch at the FIFO front. The old
+`tllm.consumers.gtta` workload and its residual-runtime structural tests were
+deleted after the boundary oracle passed. No CUDA, vLLM or MP facade was added
+to this CPU-only host-service slice.
+
 ## Part II: Legacy Inventory
 
 | Surface | Permitted role until migrated |
@@ -290,7 +298,8 @@ drift.
 | Legacy ESamp program/hand-tuned training | Explicit migration and paired-benchmark baseline |
 | Canonical FTTT host application | Current single-process CPU/CUDA workload authority |
 | Old FTTT `Workload` + `TllmRuntime` | Backend/MP quarantine only; pending typed MP replacement and deletion |
-| Override, TTRL, TLM, In-Place-TTT, GTTA | Native workload authority; no legacy consumer or Program implementation |
+| Canonical GTTA host application | Sole GTTA authority; old workload/runtime implementation deleted |
+| Override, TTRL, TLM, In-Place-TTT | Native workload authority; no legacy consumer or Program implementation |
 | Consumer streams/events/plan stores/recurrence schedulers/shadow snapshots | Legacy detail; never Region physical authority |
 | vLLM model-specific adapters | Backend quarantine exposing typed capability/binder contracts only |
 

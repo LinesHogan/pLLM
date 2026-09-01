@@ -122,6 +122,35 @@ execute as Rust-signed tasks. The same graph exposes CPU/CUDA candidates and the
 generic scheduler chooses from runtime capabilities; FTTT declares no lane,
 priority, fusion, provider, or execution order.
 
+Canonical GTTA keeps environment I/O outside GPU state while signing all
+stateful computation:
+
+```python
+from tllm.canonical.workloads.gtta import (
+    GTTAConfig, GTTAPromptPosition, GTTAQuery, TrajectoryFeedback,
+    create_gtta_application,
+)
+
+gtta = create_gtta_application(GTTAConfig(score_momentum=0.25))
+gtta.observe(TrajectoryFeedback(
+    task_id="maps", action="open directions",
+    previous_observation="map results", next_observation="directions panel",
+    environmental_dynamics="", reward=1.0,
+))
+result = gtta.query(GTTAQuery(
+    prompt_idx=0, task_id="maps",
+    candidate_actions=("clear", "open directions"),
+    observation="map results", state_signature="", action="",
+    max_records=4, position=GTTAPromptPosition.PREFIX,
+))
+```
+
+The typed service owns the bounded FIFO; the Rust-selected CPU tasks perform
+sequential EMA update, query and publication. Receipt settlement makes abort
+requeue the batch in FIFO order, and an empty batch leaves the instance version
+unchanged. The old `tllm.consumers.gtta`/`TllmRuntime` implementation has been
+deleted rather than retained as a second authority.
+
 ## Run it
 
 ```python

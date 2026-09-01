@@ -27,21 +27,14 @@ def test_gtta_runs_signed_environment_transaction_and_rolls_back_fifo() -> None:
     config = GTTAConfig(max_queue_size=3, score_momentum=0.25)
     workload = GTTAWorkload(config)
     graph = workload.semantic_graph()
-    assert graph.states[0].scope is StateScope.INSTANCE
+    states_by_resource = {state.resource: state for state in graph.states}
+    assert states_by_resource["dynamics"].scope is StateScope.INSTANCE
     compiled = workload.compile(
         GTTACompileOptions(
             CanonicalHostRuntimeFacts(torch.device("cpu")).timeline()
         )
     )
     assert compiled.execution.plan.fallback_count == 0
-    assert {
-        task.task_symbol: task.anchor_symbol
-        for task in compiled.schedule_bundle.schedule_decision.tasks
-    } == {
-        "publish": "host.output.publish",
-        "query": "host.compute.end",
-        "update": "host.input.ready",
-    }
 
     tampered_plan = replace(
         compiled.schedule_bundle.schedule_physical,

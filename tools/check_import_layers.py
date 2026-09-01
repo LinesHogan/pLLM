@@ -177,7 +177,6 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.consumers.esamp.legacy_workload", "tllm.workload"),
         ("tllm.consumers.esamp.workload", "tllm.workload"),
         ("tllm.consumers.fttt.workload", "tllm.workload"),
-        ("tllm.consumers.gtta.workload", "tllm.workload"),
         ("tllm.consumers.inplace_ttt.workload", "tllm.workload"),
         ("tllm.consumers.override.workload", "tllm.workload"),
         ("tllm.consumers.recirculation.native_backend", "tllm.workload"),

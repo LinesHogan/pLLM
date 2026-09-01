@@ -233,6 +233,10 @@ throughput.
   publication remain signed tasks. TLM uses a full HF/PEFT side model because
   its official-family update trains internal `q_proj/v_proj` LoRA rather than
   a hidden-to-logits surrogate.
+- Environment-driven adaptation. Canonical GTTA uses
+  `create_gtta_application`; the environment remains a typed CPU host service,
+  while update, query and publication run from one Rust-signed graph over
+  instance-owned state.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
 - Native exact In-Place-TTT with request-scoped immutable overlays — see [Native In-Place TTT](doc/inplace-ttt.md).
 - Experimental prefill recurrences such as Recirculation through the eager
@@ -272,6 +276,40 @@ there is no FTTT-specific lane, priority, fusion, or ordering policy. The old
 `tllm.consumers.fttt` + `TllmRuntime` route remains quarantined only until its
 EngineCore-MP compatibility evidence is replaced in the clean core.
 
+GTTA is also a clean-room application and does not require a model runtime:
+
+```python
+from tllm.canonical.workloads.gtta import (
+    GTTAConfig, GTTAPromptPosition, GTTAQuery, TrajectoryFeedback,
+    create_gtta_application,
+)
+
+gtta = create_gtta_application(GTTAConfig(score_momentum=0.25))
+gtta.observe(TrajectoryFeedback(
+    task_id="maps",
+    action="open directions",
+    previous_observation="map results",
+    next_observation="directions panel",
+    environmental_dynamics="directions became available",
+    reward=1.0,
+))
+result = gtta.query(GTTAQuery(
+    prompt_idx=0,
+    task_id="maps",
+    candidate_actions=("clear", "open directions"),
+    observation="map results",
+    state_signature="",
+    action="",
+    max_records=4,
+    position=GTTAPromptPosition.PREFIX,
+))
+```
+
+The bounded FIFO and instance-state transition settle atomically. Empty update
+batches do not advance the version, and abort returns the active batch to the
+front in its original order. The retired `tllm.consumers.gtta` path is not kept
+as a compatibility authority.
+
 ## Installation
 
 ```bash
@@ -304,10 +342,10 @@ tLLM is a test-time intervention layer for vLLM. The name is a recursive-style a
 
 > I have a test-time training algorithm. How do I implement it with tLLM?
 
-Define a `WorkloadConfig` and `Workload` with typed ports, state, effects, and
-semantic timing windows, then install it with
-`TllmRuntime(workloads=(workload,))` — see
-[write a consumer](doc/write-a-consumer.md). Keep judging, environment I/O,
+Define a canonical `SemanticGraph` with typed values, state effects and semantic
+timing windows, then expose it through a typed application or the canonical
+model routing boundary — see [write a consumer](doc/write-a-consumer.md). Keep
+judging, environment I/O,
 and similar host work behind explicit typed services, while schedulable tensor
 work stays in signed tasks. The generic Rust scheduler derives physical
 placement and overlap; a workload must not choose its own lanes, priorities,

@@ -152,7 +152,7 @@ prefill batch 不 admission、不更新。sampler bridge 只消费同一步、id
 selection 和非 `post_filter_exact` sampler backend。native ESamp Region 不能与
 legacy ESamp authority 共存。当前迁移期该隔离是 runtime-wide 的：只要 runtime 含有任一
 native Region declaration，所有 legacy dispatch consumer（即使表面上是无关的
-GTTA/TTRL sidecar）都会被拒绝。legacy consumer 尚未声明并签名其 anchor、residual
+TTRL sidecar）都会被拒绝。legacy consumer 尚未声明并签名其 anchor、residual
 path、state resource 与 sampler hook 的 ownership，runtime 无法证明两套 execution
 authority 不相交。只有 native 与 legacy contract 都引入显式且 decision-signed 的
 authority/ownership key 后，才能将此限制缩小。
