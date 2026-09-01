@@ -8,6 +8,7 @@ from hashlib import sha256
 
 import torch
 
+from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.tensor_layout import TensorDType
 
@@ -108,11 +109,11 @@ class FTTTSpecialization:
             or type(self.tensor_dtype) is not TensorDType
             or self.tensor_dtype is not TensorDType.FLOAT32
             or type(self.device) is not torch.device
-            or self.device.type != "cpu"
+            or self.device.type not in ("cpu", "cuda")
             or type(self.initialization_seed) is not int
             or self.initialization_seed < 0
         ):
-            raise ValueError("the first canonical FTTT slice requires CPU float32")
+            raise ValueError("canonical FTTT requires CPU/CUDA float32 specialization")
 
     def execution_parameters_digest(self, config: FTTTConfig) -> str:
         if type(config) is not FTTTConfig:
@@ -122,7 +123,7 @@ class FTTTSpecialization:
             config.execution_parameters_digest(),
             f"hidden_size={self.hidden_size}",
             f"tensor_dtype={self.tensor_dtype.value}",
-            "device=cpu",
+            f"device={self.device}",
             f"initialization_seed={self.initialization_seed}",
         )
         return sha256("\x00".join(fields).encode("ascii")).hexdigest()
@@ -312,18 +313,55 @@ class FTTTTrainingPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class FTTTCpuReadiness:
+    """Closed marker for one owned CPU host submission."""
+
+
+class FTTTCudaReadiness:
+    """Opaque producer readiness for one owned CUDA host submission."""
+
+    __slots__ = ("_readiness",)
+
+    def __init__(self, producer_stream: torch.cuda.Stream) -> None:
+        if type(producer_stream) is not torch.cuda.Stream:
+            raise TypeError("FTTT CUDA readiness requires an owning producer stream")
+        self._readiness = CudaStreamReadiness(producer_stream)
+
+    def order_on(self, consumer_stream: torch.cuda.Stream) -> None:
+        self._readiness.order_on(consumer_stream)
+
+
+FTTTHostReadiness = FTTTCpuReadiness | FTTTCudaReadiness
+
+
+@dataclass(frozen=True, slots=True)
 class FTTTHostTransaction:
     hidden_rows: torch.Tensor
     plan: FTTTTrainingPlan
+    readiness: FTTTHostReadiness
 
     def __post_init__(self) -> None:
+        if type(self.plan) is not FTTTTrainingPlan:
+            raise TypeError("FTTT host transaction requires an exact training plan")
         if (
             type(self.hidden_rows) is not torch.Tensor
             or self.hidden_rows.ndim != 2
             or int(self.hidden_rows.shape[0]) != len(self.plan.intent.transitions)
-            or type(self.plan) is not FTTTTrainingPlan
+            or self.hidden_rows.dtype is not torch.float32
+            or torch.is_inference(self.hidden_rows)
+            or type(self.readiness)
+            not in (FTTTCpuReadiness, FTTTCudaReadiness)
         ):
             raise ValueError("FTTT host transaction is not tensor-aligned")
+        match self.readiness:
+            case FTTTCpuReadiness():
+                if self.hidden_rows.device.type != "cpu":
+                    raise ValueError("CPU FTTT readiness requires CPU hidden rows")
+            case FTTTCudaReadiness():
+                if self.hidden_rows.device.type != "cuda":
+                    raise ValueError("CUDA FTTT readiness requires CUDA hidden rows")
+            case _:
+                raise TypeError("FTTT host transaction readiness is not closed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,8 +379,11 @@ __all__ = [
     "FTTTCompletionBatch",
     "FTTTConfig",
     "FTTTControlReason",
+    "FTTTCpuReadiness",
+    "FTTTCudaReadiness",
     "FTTTFeedbackRecord",
     "FTTTFinishReason",
+    "FTTTHostReadiness",
     "FTTTHostTransaction",
     "FTTTInstanceKey",
     "FTTTInstanceState",

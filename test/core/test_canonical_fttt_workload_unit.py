@@ -96,6 +96,16 @@ def test_fttt_runs_signed_edit_and_settles_typed_retry_lifecycle() -> None:
     execution = compiled.execution
     assert execution.plan.fallback_count == 0
     assert len(execution.plan.tasks) == 5
+    with pytest.raises(ValueError, match="differ from placement"):
+        workload.compile(
+            specialization,
+            FTTTCompileOptions(
+                replace(
+                    compiled.schedule_bundle.timeline,
+                    capabilities=("compute/cuda@1", "host/service@1"),
+                )
+            ),
+        )
     tampered_physical = replace(
         compiled.schedule_bundle.schedule_physical,
         tasks=(

@@ -83,6 +83,7 @@
     "test/gpu/paged_state_fence_smoke.py",
     "test/gpu/native_esamp_request_state_smoke.py",
     "test/gpu/canonical_vllm_esamp_smoke.py",
+    "test/gpu/canonical_fttt_cuda_smoke.py",
     "test/gpu/native_override_workload_smoke.py",
     "test/gpu/native_recirculation_workload_smoke.py",
     "test/gpu/native_ttrl_workload_smoke.py"

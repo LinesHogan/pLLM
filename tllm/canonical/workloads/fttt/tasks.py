@@ -23,6 +23,16 @@ FTTT_LOSS_IMPLEMENTATION = ImplementationId("canonical.fttt:cpu_loss@1")
 FTTT_OPTIMIZE_IMPLEMENTATION = ImplementationId("canonical.fttt:cpu_adam@1")
 FTTT_PREDICT_IMPLEMENTATION = ImplementationId("canonical.fttt:cpu_predict@1")
 FTTT_PUBLISH_IMPLEMENTATION = ImplementationId("canonical.fttt:cpu_publish@1")
+FTTT_CUDA_PREPARE_IMPLEMENTATION = ImplementationId(
+    "canonical.fttt:cuda_prepare@1"
+)
+FTTT_CUDA_LOSS_IMPLEMENTATION = ImplementationId("canonical.fttt:cuda_loss@1")
+FTTT_CUDA_OPTIMIZE_IMPLEMENTATION = ImplementationId(
+    "canonical.fttt:cuda_adam@1"
+)
+FTTT_CUDA_PREDICT_IMPLEMENTATION = ImplementationId(
+    "canonical.fttt:cuda_predict@1"
+)
 
 
 @dataclass(slots=True)
@@ -41,7 +51,7 @@ class FTTTEditState:
             self.down.ndim != 2
             or self.up.ndim != 2
             or int(self.down.shape[0]) != int(self.up.shape[1])
-            or self.down.device.type != "cpu"
+            or self.down.device.type not in ("cpu", "cuda")
             or self.up.device != self.down.device
             or self.down.dtype is not torch.float32
             or self.up.dtype is not self.down.dtype
@@ -64,7 +74,7 @@ def initialize_edit_state(
     input_size = (
         specialization.hidden_size + config.feedback_feature_size + 1
     )
-    generator = torch.Generator(device="cpu")
+    generator = torch.Generator(device=specialization.device)
     generator.manual_seed(specialization.initialization_seed)
     down = torch.empty(
         (config.rank, input_size),
@@ -192,14 +202,24 @@ class FTTTStepContext:
 
 
 class FTTTPrepareTask:
-    __slots__ = ("_config",)
+    __slots__ = ("_config", "_implementation_id")
 
-    def __init__(self, config: FTTTConfig) -> None:
+    def __init__(
+        self,
+        config: FTTTConfig,
+        implementation_id: ImplementationId,
+    ) -> None:
+        if implementation_id not in (
+            FTTT_PREPARE_IMPLEMENTATION,
+            FTTT_CUDA_PREPARE_IMPLEMENTATION,
+        ):
+            raise ValueError("FTTT prepare implementation is not closed")
         self._config = config
+        self._implementation_id = implementation_id
 
     @property
     def implementation_id(self) -> ImplementationId:
-        return FTTT_PREPARE_IMPLEMENTATION
+        return self._implementation_id
 
     def execute(self, context: FTTTStepContext) -> None:
         plan = context.transaction.plan
@@ -207,7 +227,11 @@ class FTTTPrepareTask:
         if plan.selected_rows:
             selected = hidden_rows.detach().index_select(
                 0,
-                torch.tensor(plan.selected_rows, dtype=torch.long),
+                torch.tensor(
+                    plan.selected_rows,
+                    dtype=torch.long,
+                    device=hidden_rows.device,
+                ),
             )
             edit_input = edit_inputs(
                 selected,
@@ -230,11 +254,19 @@ class FTTTPrepareTask:
 
 
 class FTTTLossTask:
-    __slots__ = ()
+    __slots__ = ("_implementation_id",)
+
+    def __init__(self, implementation_id: ImplementationId) -> None:
+        if implementation_id not in (
+            FTTT_LOSS_IMPLEMENTATION,
+            FTTT_CUDA_LOSS_IMPLEMENTATION,
+        ):
+            raise ValueError("FTTT loss implementation is not closed")
+        self._implementation_id = implementation_id
 
     @property
     def implementation_id(self) -> ImplementationId:
-        return FTTT_LOSS_IMPLEMENTATION
+        return self._implementation_id
 
     def execute(self, context: FTTTStepContext) -> None:
         match context.prepared:
@@ -259,14 +291,24 @@ class FTTTLossTask:
 
 
 class FTTTOptimizeTask:
-    __slots__ = ("_config",)
+    __slots__ = ("_config", "_implementation_id")
 
-    def __init__(self, config: FTTTConfig) -> None:
+    def __init__(
+        self,
+        config: FTTTConfig,
+        implementation_id: ImplementationId,
+    ) -> None:
+        if implementation_id not in (
+            FTTT_OPTIMIZE_IMPLEMENTATION,
+            FTTT_CUDA_OPTIMIZE_IMPLEMENTATION,
+        ):
+            raise ValueError("FTTT optimizer implementation is not closed")
         self._config = config
+        self._implementation_id = implementation_id
 
     @property
     def implementation_id(self) -> ImplementationId:
-        return FTTT_OPTIMIZE_IMPLEMENTATION
+        return self._implementation_id
 
     def execute(self, context: FTTTStepContext) -> None:
         match context.gradients:
@@ -320,11 +362,19 @@ class FTTTOptimizeTask:
 
 
 class FTTTPredictTask:
-    __slots__ = ()
+    __slots__ = ("_implementation_id",)
+
+    def __init__(self, implementation_id: ImplementationId) -> None:
+        if implementation_id not in (
+            FTTT_PREDICT_IMPLEMENTATION,
+            FTTT_CUDA_PREDICT_IMPLEMENTATION,
+        ):
+            raise ValueError("FTTT predict implementation is not closed")
+        self._implementation_id = implementation_id
 
     @property
     def implementation_id(self) -> ImplementationId:
-        return FTTT_PREDICT_IMPLEMENTATION
+        return self._implementation_id
 
     def execute(self, context: FTTTStepContext) -> None:
         match context.optimization:
@@ -366,6 +416,10 @@ class FTTTPublishTask:
 
 __all__ = [
     "FTTTEditState",
+    "FTTT_CUDA_LOSS_IMPLEMENTATION",
+    "FTTT_CUDA_OPTIMIZE_IMPLEMENTATION",
+    "FTTT_CUDA_PREDICT_IMPLEMENTATION",
+    "FTTT_CUDA_PREPARE_IMPLEMENTATION",
     "FTTTLossPending",
     "FTTTNotUpdated",
     "FTTTOptimizationPending",

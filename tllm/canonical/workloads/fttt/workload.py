@@ -11,6 +11,10 @@ from tllm.canonical.scheduler import (
 from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.fttt.execution import FTTTExecution
 from tllm.canonical.workloads.fttt.tasks import (
+    FTTT_CUDA_LOSS_IMPLEMENTATION,
+    FTTT_CUDA_OPTIMIZE_IMPLEMENTATION,
+    FTTT_CUDA_PREDICT_IMPLEMENTATION,
+    FTTT_CUDA_PREPARE_IMPLEMENTATION,
     FTTT_LOSS_IMPLEMENTATION,
     FTTT_OPTIMIZE_IMPLEMENTATION,
     FTTT_PREDICT_IMPLEMENTATION,
@@ -105,6 +109,7 @@ class FTTTWorkload(CanonicalWorkload):
 
     def semantic_graph(self) -> SemanticGraph:
         cpu = ("compute/cpu@1",)
+        cuda = ("compute/cuda@1",)
         host = ("host/service@1",)
         return SemanticGraph(
             workload_id=WorkloadId("fttt.feedback"),
@@ -136,6 +141,11 @@ class FTTTWorkload(CanonicalWorkload):
                             FTTT_LOSS_IMPLEMENTATION,
                             ExecutionKind.NATIVE_TASK,
                             cpu,
+                        ),
+                        TaskImplementationSpec(
+                            FTTT_CUDA_LOSS_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda,
                         ),
                     ),
                     effects=(SemanticEffect(_EDIT_STATE, StateEffectKind.READ),),
@@ -171,6 +181,11 @@ class FTTTWorkload(CanonicalWorkload):
                             ExecutionKind.NATIVE_TASK,
                             cpu,
                         ),
+                        TaskImplementationSpec(
+                            FTTT_CUDA_OPTIMIZE_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda,
+                        ),
                     ),
                     effects=(
                         SemanticEffect(_EDIT_STATE, StateEffectKind.TRANSITION),
@@ -205,6 +220,11 @@ class FTTTWorkload(CanonicalWorkload):
                             ExecutionKind.NATIVE_TASK,
                             cpu,
                         ),
+                        TaskImplementationSpec(
+                            FTTT_CUDA_PREDICT_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda,
+                        ),
                     ),
                     effects=(SemanticEffect(_EDIT_STATE, StateEffectKind.READ),),
                 ),
@@ -236,6 +256,11 @@ class FTTTWorkload(CanonicalWorkload):
                             FTTT_PREPARE_IMPLEMENTATION,
                             ExecutionKind.NATIVE_TASK,
                             cpu,
+                        ),
+                        TaskImplementationSpec(
+                            FTTT_CUDA_PREPARE_IMPLEMENTATION,
+                            ExecutionKind.NATIVE_TASK,
+                            cuda,
                         ),
                     ),
                 ),

@@ -20,6 +20,8 @@ from tllm.canonical.workloads.fttt.types import (
     FTTTCompletionBatch,
     FTTTConfig,
     FTTTControlReason,
+    FTTTCpuReadiness,
+    FTTTCudaReadiness,
     FTTTFeedbackRecord,
     FTTTHostTransaction,
     FTTTInstanceKey,
@@ -141,10 +143,58 @@ class FTTTFeedbackService:
             or type(hidden_rows) is not torch.Tensor
             or hidden_rows.ndim != 2
             or int(hidden_rows.shape[0]) != len(completions.entries)
+            or hidden_rows.device.type != "cpu"
+            or hidden_rows.dtype is not torch.float32
         ):
-            raise ValueError("FTTT host input requires one hidden row per completion")
+            raise ValueError(
+                "FTTT CPU host input requires one float32 CPU row per completion"
+            )
         with torch.inference_mode(False):
             owned_hidden_rows = hidden_rows.detach().clone()
+        if (
+            torch.is_inference(owned_hidden_rows)
+        ):
+            raise RuntimeError("FTTT CPU host submission did not create an owned tensor")
+        return self._enqueue_owned(
+            completions,
+            owned_hidden_rows,
+            FTTTCpuReadiness(),
+        )
+
+    def enqueue_cuda(
+        self,
+        completions: FTTTCompletionBatch,
+        hidden_rows: torch.Tensor,
+        producer_stream: torch.cuda.Stream,
+    ) -> bool:
+        if (
+            type(completions) is not FTTTCompletionBatch
+            or type(hidden_rows) is not torch.Tensor
+            or hidden_rows.ndim != 2
+            or int(hidden_rows.shape[0]) != len(completions.entries)
+            or hidden_rows.device.type != "cuda"
+            or hidden_rows.dtype is not torch.float32
+            or type(producer_stream) is not torch.cuda.Stream
+            or producer_stream.device != hidden_rows.device
+        ):
+            raise ValueError(
+                "FTTT CUDA host input requires one float32 row and its producer stream"
+            )
+        with torch.cuda.stream(producer_stream), torch.inference_mode(False):
+            owned_hidden_rows = hidden_rows.detach().clone()
+            readiness = FTTTCudaReadiness(producer_stream)
+        if (
+            torch.is_inference(owned_hidden_rows)
+        ):
+            raise RuntimeError("FTTT CUDA host submission did not create an owned tensor")
+        return self._enqueue_owned(completions, owned_hidden_rows, readiness)
+
+    def _enqueue_owned(
+        self,
+        completions: FTTTCompletionBatch,
+        owned_hidden_rows: torch.Tensor,
+        readiness: FTTTCpuReadiness | FTTTCudaReadiness,
+    ) -> bool:
         outcomes: list[FTTTRewardOutcome] = []
         retry_controls: list[FTTTRetryControl] = []
         barriers: list[FTTTUpdateBarrier] = []
@@ -262,6 +312,7 @@ class FTTTFeedbackService:
         transaction = FTTTHostTransaction(
             owned_hidden_rows,
             FTTTTrainingPlan(tuple(selected_rows), intent),
+            readiness,
         )
         self._queue.append(transaction)
         self._projected_instances = projected_instances

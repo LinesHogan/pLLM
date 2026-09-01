@@ -63,8 +63,10 @@ class FTTTSession:
         try:
             self._service.commit(receipt)
         except Exception:
-            self._execution.abort(receipt)
-            self._service.abort(transaction.plan.intent.transaction_id)
+            try:
+                self._execution.abort(receipt)
+            finally:
+                self._service.abort(transaction.plan.intent.transaction_id)
             raise
         return FTTTExecuted(receipt.result)
 
