@@ -36,6 +36,11 @@ class OperandCaptureKind(StrEnum):
     MLP_DOWN_PROJECTION_PAIR = "mlp_down_projection_pair"
 
 
+class ParameterOverlayScope(StrEnum):
+    REQUEST = "request"
+    GLOBAL = "global"
+
+
 class ParameterOverlayStage(StrEnum):
     PIN = "pin"
     APPLY = "apply"
@@ -61,14 +66,18 @@ def _digest(value: str) -> bool:
 class ParameterOverlayAttachmentBinding:
     target: ParameterTarget
     operator: ParameterOverlayOperator
-    field_id: LayoutFieldId
+    fields: tuple[LayoutFieldId, ...]
 
     def __post_init__(self) -> None:
+        expected_fields = (
+            1 if self.operator is ParameterOverlayOperator.DENSE_ADD else 2
+        )
         if (
-            self.operator is not ParameterOverlayOperator.DENSE_ADD
-            or int(self.field_id) < 0
+            len(self.fields) != expected_fields
+            or len(self.fields) != len(set(self.fields))
+            or any(int(field) < 0 for field in self.fields)
         ):
-            raise ValueError("attachment binding must be a dense-add layout field")
+            raise ValueError("attachment fields differ from overlay operator")
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -138,6 +147,7 @@ class ParameterOverlayAttachmentCandidate:
     backend_abi_digest: str
     runner_fingerprint: str
     model_fingerprint: str
+    scope: ParameterOverlayScope
     bindings: tuple[ParameterOverlayAttachmentBinding, ...]
     operand_capture: OperandCaptureKind
     stage_anchors: tuple[ParameterOverlayStageAnchor, ...]
@@ -171,6 +181,7 @@ class ParameterOverlayAttachmentRequest:
     runner_fingerprint: str
     model_fingerprint: str
     state_resource: str
+    scope: ParameterOverlayScope
     request_key_fields: tuple[RequestKeyField, ...]
     bindings: tuple[ParameterOverlayAttachmentBinding, ...]
     operand_capture: OperandCaptureKind
@@ -202,7 +213,10 @@ class ParameterOverlayAttachmentRequest:
             )
         ):
             raise ValueError("parameter-overlay request is invalid")
-        canonical_request_key_fields(self.request_key_fields)
+        if self.scope is ParameterOverlayScope.REQUEST:
+            canonical_request_key_fields(self.request_key_fields)
+        elif self.request_key_fields:
+            raise ValueError("global overlay state cannot declare request keys")
         _validate_bindings(self.bindings)
         _validate_stages(self.stage_anchors)
         _validate_tasks(self.task_bindings)
@@ -257,6 +271,7 @@ class ParameterOverlayAttachmentPhysicalPlan:
     attachment_signature: str
     schedule_signature: str
     state_representation_signature: str
+    scope: ParameterOverlayScope
     bindings: tuple[ParameterOverlayAttachmentBinding, ...]
     stage_anchors: tuple[ParameterOverlayStageAnchor, ...]
     task_bindings: tuple[ParameterOverlayTaskBinding, ...]
@@ -286,6 +301,7 @@ class ParameterOverlayAttachmentPhysicalPlan:
 
 __all__ = [
     "OperandCaptureKind",
+    "ParameterOverlayScope",
     "ParameterOverlayAttachmentBinding",
     "ParameterOverlayAttachmentCandidate",
     "ParameterOverlayAttachmentDecision",

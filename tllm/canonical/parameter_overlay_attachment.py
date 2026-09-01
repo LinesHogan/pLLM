@@ -36,6 +36,7 @@ from tllm.contracts.parameter_overlay_attachment import (
     ParameterOverlayAttachmentRequest,
     ParameterOverlayStage,
     ParameterOverlayStageAnchor,
+    ParameterOverlayScope,
     ParameterOverlayTaskBinding,
     ParameterOverlayTaskRole,
 )
@@ -53,7 +54,7 @@ class _BindingWire(TypedDict):
     module: str
     role: str
     operator: str
-    field_id: int
+    field_ids: list[int]
 
 
 class _StageWire(TypedDict):
@@ -82,7 +83,7 @@ def _bindings(
             module=item.target.module.value,
             role=item.target.role.value,
             operator=item.operator.value,
-            field_id=int(item.field_id),
+            field_ids=[int(field) for field in item.fields],
         )
         for item in values
     ]
@@ -118,6 +119,7 @@ def _request(request: ParameterOverlayAttachmentRequest) -> dict[str, object]:
         "runner_fingerprint": request.runner_fingerprint,
         "model_fingerprint": request.model_fingerprint,
         "state_resource": request.state_resource,
+        "scope": request.scope.value,
         "request_key_fields": [field.value for field in request.request_key_fields],
         "bindings": _bindings(request.bindings),
         "operand_capture": request.operand_capture.value,
@@ -139,6 +141,7 @@ def _candidate(candidate: ParameterOverlayAttachmentCandidate) -> dict[str, obje
         "backend_abi_digest": candidate.backend_abi_digest,
         "runner_fingerprint": candidate.runner_fingerprint,
         "model_fingerprint": candidate.model_fingerprint,
+        "scope": candidate.scope.value,
         "bindings": _bindings(candidate.bindings),
         "operand_capture": candidate.operand_capture.value,
         "stage_anchors": _stages(candidate.stage_anchors),
@@ -195,21 +198,24 @@ def _bindings_from(
         if type(item) is not dict:
             raise TypeError(f"attachment bindings[{position}] must be an object")
         fields = cast(dict[object, object], item)
-        if set(fields) != {"layer", "module", "role", "operator", "field_id"}:
+        if set(fields) != {"layer", "module", "role", "operator", "field_ids"}:
             raise ValueError(f"attachment bindings[{position}] has wrong fields")
         layer = fields["layer"]
         module = fields["module"]
         role = fields["role"]
         operator = fields["operator"]
-        field_id = fields["field_id"]
+        field_ids = fields["field_ids"]
         if (
             type(layer) is not int
             or type(module) is not str
             or type(role) is not str
             or type(operator) is not str
-            or type(field_id) is not int
         ):
             raise TypeError(f"attachment bindings[{position}] has invalid types")
+        if type(field_ids) is not list or any(
+            type(field) is not int for field in cast(list[object], field_ids)
+        ):
+            raise TypeError(f"attachment bindings[{position}] has invalid fields")
         parsed.append(
             ParameterOverlayAttachmentBinding(
                 ParameterTarget(
@@ -218,7 +224,10 @@ def _bindings_from(
                     ParameterRole(role),
                 ),
                 ParameterOverlayOperator(operator),
-                LayoutFieldId(field_id),
+                tuple(
+                    LayoutFieldId(field)
+                    for field in cast(list[int], field_ids)
+                ),
             )
         )
     return tuple(parsed)
@@ -327,6 +336,7 @@ def _physical_from(payload: str) -> ParameterOverlayAttachmentPhysicalPlan:
         "attachment_signature",
         "schedule_signature",
         "state_representation_signature",
+        "scope",
         "bindings",
         "stage_anchors",
         "task_bindings",
@@ -339,6 +349,7 @@ def _physical_from(payload: str) -> ParameterOverlayAttachmentPhysicalPlan:
     attachment_signature = raw["attachment_signature"]
     schedule_signature = raw["schedule_signature"]
     state_signature = raw["state_representation_signature"]
+    scope = raw["scope"]
     bundle_signature = raw["bundle_signature"]
     schema_version = raw["schema_version"]
     if (
@@ -347,6 +358,7 @@ def _physical_from(payload: str) -> ParameterOverlayAttachmentPhysicalPlan:
         or type(attachment_signature) is not str
         or type(schedule_signature) is not str
         or type(state_signature) is not str
+        or type(scope) is not str
         or type(bundle_signature) is not str
         or type(schema_version) is not int
     ):
@@ -357,6 +369,7 @@ def _physical_from(payload: str) -> ParameterOverlayAttachmentPhysicalPlan:
         attachment_signature,
         schedule_signature,
         state_signature,
+        ParameterOverlayScope(scope),
         _bindings_from(raw["bindings"]),
         _stages_from(raw["stage_anchors"]),
         _tasks_from(raw["task_bindings"]),
@@ -375,6 +388,7 @@ def _physical_json(value: ParameterOverlayAttachmentPhysicalPlan) -> str:
             "state_representation_signature": (
                 value.state_representation_signature
             ),
+            "scope": value.scope.value,
             "bindings": _bindings(value.bindings),
             "stage_anchors": _stages(value.stage_anchors),
             "task_bindings": _tasks(value.task_bindings),

@@ -54,6 +54,14 @@ fn candidate(value: &Candidate) -> bool {
         && digest(&value.runner_fingerprint)
         && digest(&value.model_fingerprint)
         && ordered(&value.bindings)
+        && value.bindings.iter().all(|binding| {
+            let expected = match binding.operator {
+                ParameterOverlayOperator::DenseAdd => 1,
+                ParameterOverlayOperator::LowRankAdd => 2,
+            };
+            binding.field_ids.len() == expected
+                && binding.field_ids.windows(2).all(|pair| pair[0] < pair[1])
+        })
         && stages(&value.stage_anchors)
         && tasks(&value.task_bindings)
         && ordered(&value.capabilities)
@@ -110,7 +118,15 @@ pub(crate) fn validate(inputs: &Inputs) -> Result<(), String> {
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
         .map(|index| &inputs.graph.states[index])
         .map_err(|_| "parameter-overlay state resource is absent".to_owned())?;
-    if state.scope != StateScope::Request || state.key_fields != request.request_key_fields {
+    let scope_matches = match request.scope {
+        ParameterOverlayScope::Request => {
+            state.scope == StateScope::Request && state.key_fields == request.request_key_fields
+        }
+        ParameterOverlayScope::Global => {
+            state.scope == StateScope::Instance && request.request_key_fields.is_empty()
+        }
+    };
+    if !scope_matches {
         return Err("parameter-overlay request state differs from graph".to_owned());
     }
     let provider = inputs
@@ -137,7 +153,8 @@ pub(crate) fn validate(inputs: &Inputs) -> Result<(), String> {
         || request
             .bindings
             .iter()
-            .any(|value| value.field_id as usize >= layout.layout.fields.len())
+            .flat_map(|value| value.field_ids.iter())
+            .any(|field_id| *field_id as usize >= layout.layout.fields.len())
     {
         return Err("parameter-overlay bindings differ from frozen tensor layout".to_owned());
     }
@@ -207,6 +224,7 @@ pub(crate) fn validate(inputs: &Inputs) -> Result<(), String> {
                 && value.backend_abi_digest == request.backend_abi_digest
                 && value.runner_fingerprint == request.runner_fingerprint
                 && value.model_fingerprint == request.model_fingerprint
+                && value.scope == request.scope
                 && value.bindings == request.bindings
                 && value.operand_capture == request.operand_capture
                 && value.stage_anchors == request.stage_anchors
@@ -230,6 +248,7 @@ pub(crate) fn selected(inputs: &Inputs) -> Result<&Candidate, String> {
                 && value.backend_abi_digest == request.backend_abi_digest
                 && value.runner_fingerprint == request.runner_fingerprint
                 && value.model_fingerprint == request.model_fingerprint
+                && value.scope == request.scope
                 && value.bindings == request.bindings
                 && value.operand_capture == request.operand_capture
                 && value.stage_anchors == request.stage_anchors

@@ -265,8 +265,8 @@ class InPlaceTTTCudaExecution:
                 tuple(binding.target for binding in bindings)
                 != self._config.targets
                 or any(
-                    binding.field_id
-                    != self._layout.fields_for(binding.target).delta_weight
+                    binding.fields
+                    != (self._layout.fields_for(binding.target).delta_weight,)
                     for binding in bindings
                 )
             ):
@@ -291,7 +291,7 @@ class InPlaceTTTCudaExecution:
                         binding,
                         self._provider.pinned_field_rows(
                             state_pin,
-                            binding.field_id,
+                            binding.fields[0],
                             stream,
                         ),
                     )

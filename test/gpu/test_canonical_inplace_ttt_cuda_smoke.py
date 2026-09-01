@@ -81,7 +81,7 @@ def test_cuda_inplace_ttt_keeps_exact_pin_through_version_publication() -> None:
         ParameterOverlayAttachmentBinding(
             binding.target,
             binding.operator,
-            binding.fields[0],
+            binding.fields,
         )
         for binding in compiled.state_layout.overlay_bindings
     )

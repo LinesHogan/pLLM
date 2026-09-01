@@ -35,6 +35,7 @@ pub(crate) fn lower(inputs: &Inputs, decision: &Decision) -> Result<Physical, St
         attachment_signature: decision.signature.clone(),
         schedule_signature: request.schedule_signature.clone(),
         state_representation_signature: request.state_representation_signature.clone(),
+        scope: request.scope.clone(),
         bindings: request.bindings.clone(),
         stage_anchors: request.stage_anchors.clone(),
         task_bindings: request.task_bindings.clone(),

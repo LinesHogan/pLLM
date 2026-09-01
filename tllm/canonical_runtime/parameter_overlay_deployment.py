@@ -42,6 +42,7 @@ from tllm.contracts.parameter_overlay_attachment import (
     ParameterOverlayAttachmentRequest,
     ParameterOverlayStage,
     ParameterOverlayStageAnchor,
+    ParameterOverlayScope,
     ParameterOverlayTaskBinding,
     ParameterOverlayTaskRole,
 )
@@ -242,7 +243,7 @@ def compile_parameter_overlay_vllm_deployment(
                 ParameterOverlayAttachmentBinding(
                     binding.target,
                     binding.operator,
-                    binding.fields[0],
+                    binding.fields,
                 )
                 for binding in compilation.state_layout.overlay_bindings
             )
@@ -290,6 +291,7 @@ def compile_parameter_overlay_vllm_deployment(
         runner_fingerprint,
         model_fingerprint,
         "dense_fast_weights",
+        ParameterOverlayScope.REQUEST,
         (
             RequestKeyField.REQUEST_ID,
             RequestKeyField.PROMPT_IDX,
@@ -311,6 +313,7 @@ def compile_parameter_overlay_vllm_deployment(
         backend_abi_digest,
         runner_fingerprint,
         model_fingerprint,
+        ParameterOverlayScope.REQUEST,
         bindings,
         OperandCaptureKind.MLP_DOWN_PROJECTION_PAIR,
         stage_anchors,

@@ -48,6 +48,7 @@ from tllm.contracts.parameter_overlay_attachment import (
     ParameterOverlayAttachmentRequest,
     ParameterOverlayStage,
     ParameterOverlayStageAnchor,
+    ParameterOverlayScope,
     ParameterOverlayTaskBinding,
     ParameterOverlayTaskRole,
 )
@@ -125,6 +126,7 @@ __all__ = [
     "ParameterOverlayAttachmentRequest",
     "ParameterOverlayStage",
     "ParameterOverlayStageAnchor",
+    "ParameterOverlayScope",
     "ParameterOverlayTaskBinding",
     "ParameterOverlayTaskRole",
     "RowBatchMeta",

@@ -26,6 +26,13 @@ pub(crate) enum ParameterRole {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ParameterOverlayOperator {
     DenseAdd,
+    LowRankAdd,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParameterOverlayScope {
+    Request,
+    Global,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -57,7 +64,7 @@ pub(crate) struct Binding {
     pub(crate) module: ParameterModuleKind,
     pub(crate) role: ParameterRole,
     pub(crate) operator: ParameterOverlayOperator,
-    pub(crate) field_id: u32,
+    pub(crate) field_ids: Vec<u32>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +89,7 @@ pub(crate) struct Candidate {
     pub(crate) backend_abi_digest: String,
     pub(crate) runner_fingerprint: String,
     pub(crate) model_fingerprint: String,
+    pub(crate) scope: ParameterOverlayScope,
     pub(crate) bindings: Vec<Binding>,
     pub(crate) operand_capture: OperandCaptureKind,
     pub(crate) stage_anchors: Vec<StageAnchor>,
@@ -96,6 +104,7 @@ pub(crate) struct Request {
     pub(crate) runner_fingerprint: String,
     pub(crate) model_fingerprint: String,
     pub(crate) state_resource: String,
+    pub(crate) scope: ParameterOverlayScope,
     pub(crate) request_key_fields: Vec<RequestKeyField>,
     pub(crate) bindings: Vec<Binding>,
     pub(crate) operand_capture: OperandCaptureKind,
@@ -139,6 +148,7 @@ pub(crate) struct Physical {
     pub(crate) attachment_signature: String,
     pub(crate) schedule_signature: String,
     pub(crate) state_representation_signature: String,
+    pub(crate) scope: ParameterOverlayScope,
     pub(crate) bindings: Vec<Binding>,
     pub(crate) stage_anchors: Vec<StageAnchor>,
     pub(crate) task_bindings: Vec<TaskBinding>,

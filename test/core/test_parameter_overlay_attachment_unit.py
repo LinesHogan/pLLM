@@ -36,6 +36,7 @@ from tllm.contracts.parameter_overlay_attachment import (
     ParameterOverlayAttachmentRequest,
     ParameterOverlayStage,
     ParameterOverlayStageAnchor,
+    ParameterOverlayScope,
     ParameterOverlayTaskBinding,
     ParameterOverlayTaskRole,
 )
@@ -75,7 +76,7 @@ def test_parameter_overlay_attachment_rejects_field_and_task_tampering() -> None
         ParameterOverlayAttachmentBinding(
             binding.target,
             binding.operator,
-            binding.fields[0],
+            binding.fields,
         )
         for binding in compiled.state_layout.overlay_bindings
     )
@@ -125,6 +126,7 @@ def test_parameter_overlay_attachment_rejects_field_and_task_tampering() -> None
         digest,
         digest,
         "dense_fast_weights",
+        ParameterOverlayScope.REQUEST,
         (
             RequestKeyField.REQUEST_ID,
             RequestKeyField.PROMPT_IDX,
@@ -146,6 +148,7 @@ def test_parameter_overlay_attachment_rejects_field_and_task_tampering() -> None
         digest,
         digest,
         digest,
+        ParameterOverlayScope.REQUEST,
         bindings,
         OperandCaptureKind.MLP_DOWN_PROJECTION_PAIR,
         stage_anchors,
@@ -175,7 +178,7 @@ def test_parameter_overlay_attachment_rejects_field_and_task_tampering() -> None
         attachment,
     )
 
-    invalid_binding = replace(bindings[0], field_id=LayoutFieldId(999))
+    invalid_binding = replace(bindings[0], fields=(LayoutFieldId(999),))
     invalid_fields = replace(
         inputs,
         request=replace(request, bindings=(invalid_binding,)),

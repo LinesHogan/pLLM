@@ -19,6 +19,12 @@ from tllm.canonical.ptts.publication import (
     RequestStatePublicationCoordinator,
     RequestStatePublicationReceipt,
 )
+from tllm.canonical.ptts.global_state import (
+    GlobalStateAdmission,
+    GlobalStateTransition,
+    GlobalVersionDirectory,
+    GlobalVersionLease,
+)
 from tllm.canonical.ptts.cuda_publication import (
     CudaRequestStatePublicationCoordinator,
     CudaRequestStatePreparedPublication,
@@ -55,6 +61,10 @@ __all__ = [
     "DensePageVersionPin",
     "RequestStatePublicationCoordinator",
     "RequestStatePublicationReceipt",
+    "GlobalStateAdmission",
+    "GlobalStateTransition",
+    "GlobalVersionDirectory",
+    "GlobalVersionLease",
     "CudaDensePageAdmission",
     "CudaRequestStatePublicationCoordinator",
     "CudaRequestStatePreparedPublication",
