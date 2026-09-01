@@ -9,6 +9,11 @@ from tllm.canonical.kernels.dense_fast_weight import (
     DenseFastWeightTransition,
     transition_dense_fast_weight,
 )
+from tllm.canonical.kernels.tlm_objective import (
+    TLMObjectiveResult,
+    shifted_sentence_cross_entropy,
+    tlm_weighted_selection_objective,
+)
 
 __all__ = [
     "LowRankGatedLayout",
@@ -16,4 +21,7 @@ __all__ = [
     "low_rank_gated_forward",
     "DenseFastWeightTransition",
     "transition_dense_fast_weight",
+    "TLMObjectiveResult",
+    "shifted_sentence_cross_entropy",
+    "tlm_weighted_selection_objective",
 ]
