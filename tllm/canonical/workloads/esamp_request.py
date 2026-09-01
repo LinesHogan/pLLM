@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout
 from tllm.canonical.ptts import CudaDensePageStateProvider
 from tllm.canonical.ptts.dense_page import DensePageStateProvider
 from tllm.canonical.ptts.request_state import RequestStateDirectory
+from tllm.canonical.request_sampler_attachment import (
+    RequestSamplerAttachmentSpec,
+)
 from tllm.canonical.scheduler import (
     compile_schedule,
     lower_physical_plan,
@@ -48,6 +53,7 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESAMP_STEP_FIELD,
 )
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.canonical_compilation import CanonicalPlanBundle
 from tllm.contracts.semantic_graph import (
     AnchorId,
     AnchorSymbol,
@@ -97,6 +103,33 @@ ESampRequestExecution = ESampRequestCpuExecution | ESampRequestCudaExecution
 ESampRequestStepHandle = (
     ESampRequestCpuStepHandle | ESampRequestCudaStepHandle
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ESampRequestCompilation:
+    """One executable ESamp specialization and its complete signed plan bundle."""
+
+    execution: ESampRequestExecution
+    plan_bundle: CanonicalPlanBundle
+    execution_parameters_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.execution)
+            not in (ESampRequestCpuExecution, ESampRequestCudaExecution)
+            or type(self.plan_bundle) is not CanonicalPlanBundle
+            or self.execution.plan is not self.plan_bundle.schedule_physical
+            or self.execution.state_plan is not self.plan_bundle.state_physical
+            or type(self.execution_parameters_digest) is not str
+            or len(self.execution_parameters_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.execution_parameters_digest
+            )
+            or self.execution.execution_parameters_digest
+            != self.execution_parameters_digest
+        ):
+            raise TypeError("ESamp compilation requires exact execution and plan bundle")
 
 
 class ESampRequestWorkload(CanonicalWorkload):
@@ -299,11 +332,26 @@ class ESampRequestWorkload(CanonicalWorkload):
             ),
         )
 
+    def request_sampler_attachment_spec(
+        self,
+        execution_parameters_digest: str,
+    ) -> RequestSamplerAttachmentSpec:
+        """Expose semantic roles; Rust still owns task and provider selection."""
+
+        return RequestSamplerAttachmentSpec(
+            compute_task=_PREDICT_TASK,
+            transition_task=_TRAIN_TASK,
+            sampler_anchor=AnchorSymbol("sampler.pre_draw"),
+            state_resource=_STATE_RESOURCE,
+            request_key_fields=self.config.key_fields,
+            execution_parameters_digest=execution_parameters_digest,
+        )
+
     def compile(
         self,
         specialization: ESampRequestSpecialization,
         options: ESampRequestCompileOptions,
-    ) -> ESampRequestExecution:
+    ) -> ESampRequestCompilation:
         if self.config.rank > specialization.hidden_size:
             raise ValueError("ESamp rank exceeds the specialized hidden size")
         if (
@@ -445,6 +493,16 @@ class ESampRequestWorkload(CanonicalWorkload):
             binding.layout_id,
             self.config.key_fields,
         )
+        plan_bundle = CanonicalPlanBundle(
+            semantic_graph=graph,
+            timeline=options.timeline,
+            schedule_decision=schedule,
+            schedule_physical=physical,
+            state_request=representation_request,
+            state_decision=representation,
+            state_physical=state_physical,
+        )
+        execution: ESampRequestExecution
         match selected_provider.device_kind:
             case StateDeviceKind.CPU:
                 provider = DensePageStateProvider(
@@ -456,7 +514,7 @@ class ESampRequestWorkload(CanonicalWorkload):
                     local_candidates=candidates,
                     resource=str(_STATE_RESOURCE),
                 )
-                return ESampRequestCpuExecution(
+                execution = ESampRequestCpuExecution(
                     config=self.config,
                     specialization=specialization,
                     plan=physical,
@@ -477,7 +535,7 @@ class ESampRequestWorkload(CanonicalWorkload):
                     resource=str(_STATE_RESOURCE),
                     device_ordinal=selected_provider.device_ordinal,
                 )
-                return ESampRequestCudaExecution(
+                execution = ESampRequestCudaExecution(
                     config=self.config,
                     specialization=specialization,
                     plan=physical,
@@ -487,10 +545,16 @@ class ESampRequestWorkload(CanonicalWorkload):
                     directory=directory,
                     sampler_completion_anchor_id=sampler_anchor_ids[0],
                 )
+        return ESampRequestCompilation(
+            execution,
+            plan_bundle,
+            execution.execution_parameters_digest,
+        )
 
 
 __all__ = [
     "ESampRequestCompileOptions",
+    "ESampRequestCompilation",
     "ESampRequestConfig",
     "ESampRequestCpuExecution",
     "ESampRequestCpuStepHandle",

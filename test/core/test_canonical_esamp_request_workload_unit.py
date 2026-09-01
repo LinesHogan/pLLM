@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -76,7 +78,7 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
             intervention_beta=0.2,
         )
     )
-    execution = workload.compile(
+    compiled = workload.compile(
         ESampRequestSpecialization(
             hidden_size=4,
             tensor_dtype=TensorDType.FLOAT32,
@@ -108,6 +110,9 @@ def test_esamp_request_executes_rust_ordered_ptts_version_lifecycle() -> None:
             state_memory_budget_bytes=state_budget_bytes,
         ),
     )
+    execution = compiled.execution
+    with pytest.raises(TypeError, match="exact execution"):
+        replace(compiled, execution_parameters_digest="0" * 64)
     assert tuple(int(task.task_id) for task in execution.plan.tasks) == (1, 0, 2)
     assert execution.plan.fallback_count == 0
     assert 0 < execution.state_plan.reserved_bytes <= state_budget_bytes

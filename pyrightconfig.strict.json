@@ -3,6 +3,8 @@
   "include": [
     "tllm/contracts",
     "tllm/canonical",
+    "tllm/canonical_vllm",
+    "tllm/canonical_runtime",
     "tllm/ports",
     "tllm/producers",
     "tllm/core",
@@ -80,6 +82,7 @@
     "test/gpu/fixed_batched_paged_state_smoke.py",
     "test/gpu/paged_state_fence_smoke.py",
     "test/gpu/native_esamp_request_state_smoke.py",
+    "test/gpu/canonical_vllm_esamp_smoke.py",
     "test/gpu/native_override_workload_smoke.py",
     "test/gpu/native_recirculation_workload_smoke.py",
     "test/gpu/native_ttrl_workload_smoke.py"
@@ -87,6 +90,7 @@
   "exclude": ["**/__pycache__"],
   "reportMissingImports": true,
   "reportMissingTypeStubs": false,
+  "stubPath": "typings/vllm027",
   "reportUnnecessaryIsInstance": "error",
   "reportUnnecessaryComparison": "error",
   "reportUnnecessaryCast": "error",

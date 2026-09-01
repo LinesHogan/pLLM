@@ -59,6 +59,14 @@ RULES: dict[str, frozenset[str]] = {
     # Clean-room native core. It consumes only closed contracts and Rust FFI;
     # legacy runtime/workload/workgraph layers must never become dependencies.
     "canonical": frozenset({"contracts", "core"}),
+    # Clean in-process vLLM attachment.  It may consume signed canonical
+    # plans/contracts and Rust FFI, but never the legacy runtime/backends.
+    "canonical_vllm": frozenset({"canonical", "contracts", "core"}),
+    # Outermost clean-room composition root.  Coexistence with the old stack
+    # is permitted only in the package facade, never as an internal import.
+    "canonical_runtime": frozenset(
+        {"canonical_vllm", "canonical", "contracts", "core"}
+    ),
     "ports": frozenset({"contracts", "core"}),
     "common": frozenset({"contracts", "ports", "core"}),
     "producers": frozenset({"contracts", "ports", "core"}),

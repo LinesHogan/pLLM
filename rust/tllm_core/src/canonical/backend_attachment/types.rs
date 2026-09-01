@@ -182,6 +182,7 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) schedule_signature: String,
     pub(crate) state_request_digest: String,
     pub(crate) state_representation_signature: String,
+    pub(crate) execution_parameters_digest: String,
     pub(crate) capabilities: Vec<String>,
     pub(crate) schema_version: u64,
 }

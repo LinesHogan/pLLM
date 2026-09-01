@@ -59,6 +59,10 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
             &request.state_representation_signature,
             "state_representation_signature",
         ),
+        (
+            &request.execution_parameters_digest,
+            "execution_parameters_digest",
+        ),
     ] {
         require_digest(value, label)?;
     }

@@ -10,6 +10,7 @@ from tllm.canonical.workloads.dummy import (
 )
 from tllm.canonical.workloads.esamp_request import (
     ESampRequestCompileOptions,
+    ESampRequestCompilation,
     ESampRequestConfig,
     ESampRequestCpuExecution,
     ESampRequestCpuStepHandle,
@@ -35,6 +36,7 @@ __all__ = [
     "DummyStep",
     "DummyWorkload",
     "ESampRequestCompileOptions",
+    "ESampRequestCompilation",
     "ESampRequestConfig",
     "ESampRequestCpuExecution",
     "ESampRequestCpuStepHandle",

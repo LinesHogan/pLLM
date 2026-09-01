@@ -206,6 +206,7 @@ class BackendAttachmentRequest:
     schedule_signature: str
     state_request_digest: str
     state_representation_signature: str
+    execution_parameters_digest: str
     capabilities: tuple[str, ...]
     schema_version: int = 1
 
@@ -217,6 +218,7 @@ class BackendAttachmentRequest:
             self.schedule_signature,
             self.state_request_digest,
             self.state_representation_signature,
+            self.execution_parameters_digest,
         )
         if any(type(value) is not str for value in digest_values):
             raise TypeError("attachment digests must be exact strings")

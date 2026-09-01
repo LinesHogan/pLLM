@@ -159,6 +159,18 @@ class ESampRequestExecution:
         return self._state_plan
 
     @property
+    def config(self) -> ESampRequestConfig:
+        return self._config
+
+    @property
+    def specialization(self) -> ESampRequestSpecialization:
+        return self._specialization
+
+    @property
+    def execution_parameters_digest(self) -> str:
+        return self._specialization.execution_parameters_digest(self._config)
+
+    @property
     def free_state_pages(self) -> int:
         return self._provider.free_pages
 

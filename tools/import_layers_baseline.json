@@ -12,6 +12,17 @@
       "contracts",
       "core"
     ],
+    "canonical_runtime": [
+      "canonical",
+      "canonical_vllm",
+      "contracts",
+      "core"
+    ],
+    "canonical_vllm": [
+      "canonical",
+      "contracts",
+      "core"
+    ],
     "common": [
       "contracts",
       "core",

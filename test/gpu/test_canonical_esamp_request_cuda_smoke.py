@@ -108,7 +108,7 @@ def test_cuda_esamp_request_runs_packed_guidance_and_versioned_training() -> Non
             state_memory_budget_bytes=4000,
         ),
     )
-    match compiled:
+    match compiled.execution:
         case ESampRequestCudaExecution() as execution:
             pass
         case _:

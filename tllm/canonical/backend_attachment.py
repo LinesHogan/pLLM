@@ -74,6 +74,7 @@ class _RequestWire(TypedDict):
     schedule_signature: str
     state_request_digest: str
     state_representation_signature: str
+    execution_parameters_digest: str
     capabilities: list[str]
     schema_version: int
 
@@ -152,6 +153,7 @@ def _request_json(request: BackendAttachmentRequest) -> str:
         schedule_signature=request.schedule_signature,
         state_request_digest=request.state_request_digest,
         state_representation_signature=request.state_representation_signature,
+        execution_parameters_digest=request.execution_parameters_digest,
         capabilities=list(request.capabilities),
         schema_version=request.schema_version,
     )

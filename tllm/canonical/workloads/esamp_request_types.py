@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 
 import torch
 
@@ -100,6 +101,26 @@ class ESampRequestConfig:
         ):
             raise ValueError("ESamp request configuration is invalid")
 
+    def execution_parameters_digest(self) -> str:
+        """Bind every mathematical parameter into the signed execution identity."""
+
+        fields = (
+            "canonical.esamp_request.parameters@1",
+            f"rank={self.rank}",
+            f"source_layer={self.source_layer}",
+            f"target_layer={self.target_layer}",
+            f"output_layernorm={int(self.output_layernorm)}",
+            f"intervention={int(self.intervention)}",
+            f"intervention_beta={self.intervention_beta.hex()}",
+            f"learning_rate={self.learning_rate.hex()}",
+            f"beta_one={self.betas[0].hex()}",
+            f"beta_two={self.betas[1].hex()}",
+            f"eps={self.eps.hex()}",
+            f"weight_decay={self.weight_decay.hex()}",
+            "key_fields=" + ",".join(field.value for field in self.key_fields),
+        )
+        return sha256("\x00".join(fields).encode("ascii")).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class ESampRequestSpecialization:
@@ -130,6 +151,32 @@ class ESampRequestSpecialization:
             raise ValueError(
                 "CPU ESamp specialization requires positive float32 dimensions"
             )
+
+    def execution_parameters_digest(self, config: ESampRequestConfig) -> str:
+        """Bind specialization facts and mathematical config into one identity."""
+
+        if type(config) is not ESampRequestConfig:
+            raise TypeError("ESamp execution identity requires exact config")
+        source = self.hidden_bindings.source
+        target = self.hidden_bindings.target
+        fields = (
+            "canonical.esamp_request.execution@1",
+            config.execution_parameters_digest(),
+            f"hidden_size={self.hidden_size}",
+            f"tensor_dtype={self.tensor_dtype.value}",
+            f"initialization_seed={self.initialization_seed}",
+            f"device_kind={self.device_kind.value}",
+            f"device_ordinal={self.device_ordinal}",
+            f"source_layer={source.layer}",
+            f"source_layer_kind={source.layer_kind.value}",
+            f"source_site={source.site.value}",
+            f"source_module_path={source.module_path}",
+            f"target_layer={target.layer}",
+            f"target_layer_kind={target.layer_kind.value}",
+            f"target_site={target.site.value}",
+            f"target_module_path={target.module_path}",
+        )
+        return sha256("\x00".join(fields).encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

@@ -323,6 +323,7 @@ def test_rust_signs_full_backend_attachment_bundle() -> None:
         schedule_signature=schedule_physical.schedule_signature,
         state_request_digest=state_physical.request_digest,
         state_representation_signature=state_physical.representation_signature,
+        execution_parameters_digest="d" * 64,
         capabilities=capabilities,
     )
     inputs = BackendAttachmentCompilerInputs(
