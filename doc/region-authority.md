@@ -305,8 +305,8 @@ falling back to that old stack.
 | `tllm.program` `@flow` / `@extern` | Compatibility declaration/lowering lane |
 | `tllm.consumers.*` | Complete workload adapter or benchmark baseline |
 | Legacy ESamp program/hand-tuned training | Explicit migration and paired-benchmark baseline |
-| Canonical FTTT host application | Current single-process CPU/CUDA workload authority |
-| Old FTTT `Workload` + `TllmRuntime` | Backend/MP quarantine only; pending typed MP replacement and deletion |
+| Canonical FTTT host transaction | Sole single-process CPU/CUDA workload authority |
+| Old FTTT `Workload` + `TllmRuntime` | Deleted after canonical CPU/CUDA receipt evidence; no quarantine or compatibility authority remains |
 | Canonical GTTA host application | Sole GTTA authority; old workload/runtime implementation deleted |
 | Canonical In-Place-TTT + signed overlay attachment | Sole In-Place authority; old workload/runtime implementation deleted |
 | Override, TTRL, TLM | Native workload authority; no legacy consumer or Program implementation |

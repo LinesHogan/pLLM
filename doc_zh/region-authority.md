@@ -121,8 +121,8 @@ fallback 为零。本次冻结按要求没有运行吞吐 benchmark。
 | `tllm.program` `@flow` / `@extern` | 兼容 declaration/lowering lane |
 | `tllm.consumers.*` | 完整 workload adapter 或 benchmark baseline |
 | legacy ESamp program/手工训练 | 显式迁移与 paired-benchmark baseline |
-| canonical FTTT host application | 当前单进程 CPU/CUDA workload authority |
-| 旧 FTTT `Workload` + `TllmRuntime` | 仅作 backend/MP quarantine；待 typed MP 替换后删除 |
+| canonical FTTT host transaction | 唯一单进程 CPU/CUDA workload authority |
+| 旧 FTTT `Workload` + `TllmRuntime` | canonical CPU/CUDA receipt 证据完成后已删除；不再保留 quarantine 或兼容 authority |
 | canonical GTTA host application | 唯一 GTTA authority；旧 workload/runtime 实现已删除 |
 | canonical In-Place-TTT + signed overlay attachment | 唯一 In-Place authority；旧 workload/runtime 实现已删除 |
 | Override、TTRL、TLM | native workload authority；无 legacy consumer 或 Program 实现 |

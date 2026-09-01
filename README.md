@@ -228,15 +228,15 @@ throughput.
 ## What You Can Build
 
 - Test-time training algorithms that learn from typed host feedback. Canonical
-  FTTT uses `FTTTConfig` + `create_fttt_application`; its typed service owns one
-  transaction while selection, loss, Adam, edit prediction, and closed-loop
-  publication remain signed tasks. TLM uses a full HF/PEFT side model because
-  its official-family update trains internal `q_proj/v_proj` LoRA rather than
-  a hidden-to-logits surrogate.
+  FTTT uses `FTTTWorkload` + `HostTransactionCoordinator`; its typed service
+  owns one transaction while selection, loss, Adam, edit prediction, and
+  closed-loop publication remain signed tasks. TLM uses a full HF/PEFT side
+  model because its official-family update trains internal `q_proj/v_proj`
+  LoRA rather than a hidden-to-logits surrogate.
 - Environment-driven adaptation. Canonical GTTA uses
-  `create_gtta_application`; the environment remains a typed CPU host service,
-  while update, query and publication run from one Rust-signed graph over
-  instance-owned state.
+  `GTTAWorkload` + `HostTransactionCoordinator`; the environment remains a
+  typed CPU host service, while update, query and publication run from one
+  Rust-signed graph over instance-owned state.
 - Candidate-level sampler guidance, such as ESamp distiller intervention.
 - Canonical exact In-Place-TTT with request-scoped PTTS roots and signed
   immutable overlays — see [Canonical In-Place TTT](doc/inplace-ttt.md).
@@ -245,48 +245,67 @@ throughput.
   the CUDA Graph performance claims above.
 - Activation / hidden-state export and editing pipelines; runtime analysis of LLM internals.
 
-The public FTTT construction is a clean-room typed host application; it does
+The public FTTT construction is a clean-room typed host transaction; it does
 not import `TllmRuntime`, staged ports, or the old workload DSL:
 
 ```python
 import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+    NO_HOST_REQUEST,
+)
 from tllm.canonical.workloads.fttt import (
-    FTTTConfig, FTTTDefaultJudge, FTTTSpecialization,
-    create_fttt_application,
+    FTTTCompileOptions, FTTTConfig, FTTTDefaultJudge,
+    FTTTFeedbackService, FTTTSpecialization, FTTTWorkload,
 )
 from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-fttt = create_fttt_application(
-    config,
+device = torch.device("cpu")
+compiled = FTTTWorkload(config).compile(
     FTTTSpecialization(
         hidden_size=896,
         tensor_dtype=TensorDType.FLOAT32,
-        device=torch.device("cpu"),
+        device=device,
         initialization_seed=0,
     ),
-    FTTTDefaultJudge(),
+    FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
 )
+feedback = FTTTFeedbackService(config, FTTTDefaultJudge())
+fttt = HostTransactionCoordinator(feedback, compiled.execution)
 ```
 
-`submit_cpu(...)` and `submit_cuda(..., producer_stream)` accept closed
-completion batches plus owned hidden rows and return one typed result containing
-the edit delta, reward/retry/barrier intent, loss and adapter version. The generic
+Enqueue a closed completion batch plus owned hidden rows on `feedback`, then
+call `fttt.run(NO_HOST_REQUEST)` to receive one typed result containing the
+edit delta, reward/retry/barrier intent, loss and adapter version. The generic
 Rust scheduler chooses the CPU/CUDA implementation and signed host anchors;
 there is no FTTT-specific lane, priority, fusion, or ordering policy. The old
-`tllm.consumers.fttt` + `TllmRuntime` route remains quarantined only until its
-EngineCore-MP compatibility evidence is replaced in the clean core.
+`tllm.consumers.fttt` + `TllmRuntime` authority is retired and has no
+compatibility route.
 
-GTTA is also a clean-room application and does not require a model runtime:
+GTTA uses the same host transaction coordinator and does not require a model
+runtime:
 
 ```python
-from tllm.canonical.workloads.gtta import (
-    GTTAConfig, GTTAPromptPosition, GTTAQuery, TrajectoryFeedback,
-    create_gtta_application,
+import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
 )
+from tllm.canonical.workloads.gtta import (
+    GTTACompileOptions, GTTAConfig, GTTAHostRequest, GTTAPromptPosition,
+    GTTAQuery, GTTAWorkload, TrajectoryFeedback,
+)
+from tllm.canonical.workloads.gtta.environment import GTTAEnvironmentService
 
-gtta = create_gtta_application(GTTAConfig(score_momentum=0.25))
-gtta.observe(TrajectoryFeedback(
+config = GTTAConfig(score_momentum=0.25)
+compiled = GTTAWorkload(config).compile(GTTACompileOptions(
+    CanonicalHostRuntimeFacts(torch.device("cpu")).timeline()
+))
+environment = GTTAEnvironmentService(config)
+gtta = HostTransactionCoordinator(environment, compiled.execution)
+environment.enqueue_feedback(TrajectoryFeedback(
     task_id="maps",
     action="open directions",
     previous_observation="map results",
@@ -294,7 +313,7 @@ gtta.observe(TrajectoryFeedback(
     environmental_dynamics="directions became available",
     reward=1.0,
 ))
-result = gtta.query(GTTAQuery(
+result = gtta.run(GTTAHostRequest(GTTAQuery(
     prompt_idx=0,
     task_id="maps",
     candidate_actions=("clear", "open directions"),
@@ -303,7 +322,7 @@ result = gtta.query(GTTAQuery(
     action="",
     max_records=4,
     position=GTTAPromptPosition.PREFIX,
-))
+)))
 ```
 
 The bounded FIFO and instance-state transition settle atomically. Empty update

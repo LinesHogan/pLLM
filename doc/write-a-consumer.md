@@ -14,25 +14,33 @@ authority:
 
 ```python
 import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+)
 from tllm.canonical.workloads.fttt import (
-    FTTTConfig, FTTTDefaultJudge, FTTTSpecialization,
-    create_fttt_application,
+    FTTTCompileOptions, FTTTConfig, FTTTDefaultJudge,
+    FTTTFeedbackService, FTTTSpecialization, FTTTWorkload,
 )
 from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-fttt = create_fttt_application(
-    config,
-    FTTTSpecialization(896, TensorDType.FLOAT32, torch.device("cpu"), 0),
-    FTTTDefaultJudge(),
+device = torch.device("cpu")
+compiled = FTTTWorkload(config).compile(
+    FTTTSpecialization(896, TensorDType.FLOAT32, device, 0),
+    FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
 )
+feedback = FTTTFeedbackService(config, FTTTDefaultJudge())
+fttt = HostTransactionCoordinator(feedback, compiled.execution)
 ```
 
-The application owns the judge service, bounded queue, signed execution and
-receipt settlement. `submit_cpu`/`submit_cuda` take closed typed completion
-batches and owned hidden rows. Selection, feature construction, loss, Adam,
-edit prediction, state versioning, reward/retry/barrier output and settlement
-are one exact transaction; CUDA producer/consumer ordering is event-backed.
+The feedback service owns the judge and bounded queue; the coordinator binds it
+to signed execution and receipt settlement. `enqueue`/`enqueue_cuda` take
+closed typed completion batches and owned hidden rows, then `run` executes one
+exact transaction. Selection, feature construction, loss, Adam, edit
+prediction, state versioning, reward/retry/barrier output and settlement remain
+atomic; CUDA producer/consumer ordering is event-backed. The retired
+`tllm.consumers.fttt` / `TllmRuntime` route has no compatibility wrapper.
 
 None of those semantics select a physical schedule. FTTT declares dependencies,
 effects and legal host windows; the generic Rust scheduler selects CPU/CUDA

@@ -16,13 +16,28 @@ the AER/PTTS research note, which is not an implementation artifact.
 
 All Python commands use `/workspace/pllm/.venv/bin/python`.
 
+## Current checkpoint
+
+| Fact | Value | Cumulative change from `12551b8` | Change in FTTT cutover |
+| --- | ---: | ---: | ---: |
+| Production/support source | 131,973 lines | -1,237 lines | -912 lines |
+| Pytest collection | 1,333 items | -16 items | -16 items |
+
+The FTTT authority-retirement slice added no counted source. It deleted 909
+production lines from `tllm/consumers/fttt` and three counted support lines
+from static gates, for `+0 / -912 / net -912` under `SOURCE_LOC`. It also
+deleted 1,026 test lines from the superseded unit and GPU smoke; evidence 21
+and 38 remain as the canonical CPU and CUDA survivors. Documentation and JSON
+config changes are excluded from `SOURCE_LOC` and are not used to offset these
+deletions.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
 | A — ledger and survivor extraction | — | — | — | — | active |
-| B — canonical vertical compression | — | — | — | — | pending |
-| C — workload cutovers | — | — | — | — | pending |
+| B — canonical vertical compression | 249 | 574 | 0 | -325 | active |
+| C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | — | — | — | — | pending |
 | E — legacy authority removal | — | — | — | — | pending |
 | F — AER/PTTS final core | — | — | — | — | pending |
@@ -50,7 +65,7 @@ Moves are recorded separately and never counted as deletion.
 | Workload | Unique content to retain | Old owner removal gate | Evidence IDs |
 | --- | --- | --- | --- |
 | Dummy | minimum graph/sign/plan/execute declaration | generic public factory | 20 |
-| FTTT | edit math, judge, feedback retry | host transaction and receipt cutover | 21, 38 |
+| FTTT | edit math, judge, feedback retry | legacy owner removed; canonical host transaction and receipt only | 21, 38 survivors |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
 | In-Place-TTT | dense fast-weight math and layout | generic request PTTS/overlay | 23, 32 |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |

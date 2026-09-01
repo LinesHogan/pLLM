@@ -98,51 +98,70 @@ The shipped compatibility version (`tllm/consumers/esamp/program.py`) is the
 same shape with a gated residual model and a separate `predict` flow. This is
 an ESamp migration baseline, not a pattern followed by native FTTT.
 
-Canonical FTTT has a strict host-application entry point:
+Canonical FTTT has a strict host-transaction entry point:
 
 ```python
 import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+)
 from tllm.canonical.workloads.fttt import (
-    FTTTConfig, FTTTDefaultJudge, FTTTSpecialization,
-    create_fttt_application,
+    FTTTCompileOptions, FTTTConfig, FTTTDefaultJudge,
+    FTTTFeedbackService, FTTTSpecialization, FTTTWorkload,
 )
 from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-fttt = create_fttt_application(
-    config,
-    FTTTSpecialization(896, TensorDType.FLOAT32, torch.device("cpu"), 0),
-    FTTTDefaultJudge(),
+device = torch.device("cpu")
+compiled = FTTTWorkload(config).compile(
+    FTTTSpecialization(896, TensorDType.FLOAT32, device, 0),
+    FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
 )
+feedback = FTTTFeedbackService(config, FTTTDefaultJudge())
+fttt = HostTransactionCoordinator(feedback, compiled.execution)
 ```
 
-The application converts typed completions and hidden rows into an atomic host
-transaction. Selection, features, loss, Adam, edit prediction, and publication
-execute as Rust-signed tasks. The same graph exposes CPU/CUDA candidates and the
-generic scheduler chooses from runtime capabilities; FTTT declares no lane,
-priority, fusion, provider, or execution order.
+The feedback service converts typed completions and hidden rows into an atomic
+host transaction, and the coordinator owns execution plus receipt settlement.
+Selection, features, loss, Adam, edit prediction, and publication execute as
+Rust-signed tasks. The same graph exposes CPU/CUDA candidates and the generic
+scheduler chooses from runtime capabilities; FTTT declares no lane, priority,
+fusion, provider, or execution order. The old `tllm.consumers.fttt` /
+`TllmRuntime` route is retired with no compatibility wrapper.
 
 Canonical GTTA keeps environment I/O outside GPU state while signing all
 stateful computation:
 
 ```python
-from tllm.canonical.workloads.gtta import (
-    GTTAConfig, GTTAPromptPosition, GTTAQuery, TrajectoryFeedback,
-    create_gtta_application,
+import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
 )
+from tllm.canonical.workloads.gtta import (
+    GTTACompileOptions, GTTAConfig, GTTAHostRequest, GTTAPromptPosition,
+    GTTAQuery, GTTAWorkload, TrajectoryFeedback,
+)
+from tllm.canonical.workloads.gtta.environment import GTTAEnvironmentService
 
-gtta = create_gtta_application(GTTAConfig(score_momentum=0.25))
-gtta.observe(TrajectoryFeedback(
+config = GTTAConfig(score_momentum=0.25)
+compiled = GTTAWorkload(config).compile(GTTACompileOptions(
+    CanonicalHostRuntimeFacts(torch.device("cpu")).timeline()
+))
+environment = GTTAEnvironmentService(config)
+gtta = HostTransactionCoordinator(environment, compiled.execution)
+environment.enqueue_feedback(TrajectoryFeedback(
     task_id="maps", action="open directions",
     previous_observation="map results", next_observation="directions panel",
     environmental_dynamics="", reward=1.0,
 ))
-result = gtta.query(GTTAQuery(
+result = gtta.run(GTTAHostRequest(GTTAQuery(
     prompt_idx=0, task_id="maps",
     candidate_actions=("clear", "open directions"),
     observation="map results", state_signature="", action="",
     max_records=4, position=GTTAPromptPosition.PREFIX,
-))
+)))
 ```
 
 The typed service owns the bounded FIFO; the Rust-selected CPU tasks perform

@@ -79,23 +79,35 @@ class ESampProgram(torch.nn.Module):
 仓库内置的兼容版本（`tllm/consumers/esamp/program.py`）形状相同，只是换成 gated
 residual 模型并多一个 `predict` flow。这是 ESamp 迁移基线，不是 native FTTT 遵循的模式。
 
-Native FTTT 有正式的 `WorkloadConfig` + `Workload` 入口：
+Canonical FTTT 使用严格类型的 host transaction 入口：
 
 ```python
-from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
-from tllm.runtime import TllmRuntime
+import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+)
+from tllm.canonical.workloads.fttt import (
+    FTTTCompileOptions, FTTTConfig, FTTTDefaultJudge,
+    FTTTFeedbackService, FTTTSpecialization, FTTTWorkload,
+)
+from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-workload = FTTTWorkload(config)
-runtime = TllmRuntime(workloads=(workload,))
-feedback = FTTTFeedbackService(config)
+device = torch.device("cpu")
+compiled = FTTTWorkload(config).compile(
+    FTTTSpecialization(896, TensorDType.FLOAT32, device, 0),
+    FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
+)
+feedback = FTTTFeedbackService(config, FTTTDefaultJudge())
+fttt = HostTransactionCoordinator(feedback, compiled.execution)
 ```
 
-feedback service 将 judge 与队列状态转换成 typed transaction，并原子地 stage 配对的
-plan 与 hidden rows。选择、特征构造、loss、Adam、edit prediction 和 publication 都作为
-native signed tasks 执行；`commit()` 只确认该次签名执行发布的 reward、retry、barrier 与
-adapter-version intent。FTTT 只声明依赖、effect 和语义 timing；物理 Region 划分、放置与
-重叠由通用 Rust scheduler 自动选择，不存在 FTTT 专属 lane、priority 或 fusion 策略。
+feedback service 将 judge 与队列状态转换成 typed transaction；coordinator 负责签名执行与
+receipt settlement。选择、特征构造、loss、Adam、edit prediction 和 publication 都作为
+signed tasks 执行。FTTT 只声明依赖、effect 和语义 timing；物理 Region 划分、放置与重叠
+由通用 Rust scheduler 自动选择，不存在 FTTT 专属 lane、priority 或 fusion 策略。旧
+`tllm.consumers.fttt` / `TllmRuntime` 路径已经退役，不提供兼容 wrapper。
 
 ## 运行
 

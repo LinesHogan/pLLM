@@ -13,23 +13,33 @@
 FTTT 展示了 host work 如何保持显式，同时不重新取得 workload authority：
 
 ```python
-from tllm.consumers.fttt import FTTTConfig, FTTTFeedbackService, FTTTWorkload
-from tllm.runtime import TllmRuntime
+import torch
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+)
+from tllm.canonical.workloads.fttt import (
+    FTTTCompileOptions, FTTTConfig, FTTTDefaultJudge,
+    FTTTFeedbackService, FTTTSpecialization, FTTTWorkload,
+)
+from tllm.contracts.tensor_layout import TensorDType
 
 config = FTTTConfig(rank=16, learning_rate=1e-3, max_retries=2)
-workload = FTTTWorkload(config)
-runtime = TllmRuntime(workloads=(workload,))
-feedback = FTTTFeedbackService(config)
+device = torch.device("cpu")
+compiled = FTTTWorkload(config).compile(
+    FTTTSpecialization(896, TensorDType.FLOAT32, device, 0),
+    FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
+)
+feedback = FTTTFeedbackService(config, FTTTDefaultJudge())
+fttt = HostTransactionCoordinator(feedback, compiled.execution)
 ```
 
-service 负责 judge 已完成的 trajectory、持有有界 feedback queue，并产出
-`FTTTFeedbackTransaction`。`stage_next(runtime)` 原子地 stage typed plan 与对应 hidden
-rows。选择、特征构造、loss、Adam、edit prediction、state-version 读取和 closed-loop
-publication 都是 native signed tasks。`commit()` 只接受该 transaction 对应的 published
-intent，并且只确认一次 lifecycle state。只有 staged inputs 尚未消费时，abort 才会取消
-receipt 并回滚依赖它的 projected state。
-一旦 signed graph 已消费 inputs，即使用户代码抛出异常，也会结算匹配的 published intent；
-若已经消费却没有匹配 publication，runtime 会 fail-stop，绝不伪装 optimizer state 已回滚。
+service 负责 judge 已完成的 trajectory、持有有界 feedback queue，并产出 typed host
+transaction；coordinator 将它绑定到签名 execution 与 receipt settlement。`enqueue` /
+`enqueue_cuda` 接收 completion batch 和自有 hidden rows，`run` 执行一个原子 transaction。
+选择、特征构造、loss、Adam、edit prediction、state-version 读取和 closed-loop publication
+都是 signed tasks；CUDA producer/consumer 顺序由 event 保证。旧 `tllm.consumers.fttt` /
+`TllmRuntime` 路径已经退役，不提供兼容 wrapper。
 
 这些语义都不选择物理调度。FTTT 只声明依赖、effect 和合法 timing window；通用 Rust
 scheduler 自动选择 Region 划分、放置与重叠。workload 不声明 lane、priority 或 fusion
