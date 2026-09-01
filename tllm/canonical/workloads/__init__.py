@@ -28,7 +28,6 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestStepResult,
 )
 from tllm.canonical.workloads.fttt import (
-    FTTTApplication,
     FTTTCompileOptions,
     FTTTCompletion,
     FTTTCompletionBatch,
@@ -42,14 +41,13 @@ from tllm.canonical.workloads.fttt import (
     FTTTJudgeService,
     FTTTSpecialization,
     FTTTWorkload,
-    create_fttt_application,
 )
 from tllm.canonical.workloads.gtta import (
     DynamicsEvent,
-    GTTAApplication,
     GTTACompilation,
     GTTACompileOptions,
     GTTAConfig,
+    GTTAHostRequest,
     GTTADiagnostics,
     GTTAExecution,
     GTTAExecutionReceipt,
@@ -62,7 +60,6 @@ from tllm.canonical.workloads.gtta import (
     PromptContext,
     TrajectoryFeedback,
     canonical_state_signature,
-    create_gtta_application,
 )
 from tllm.canonical.workloads.inplace_ttt import (
     CudaInPlaceTTTStepBatchInput,
@@ -111,7 +108,6 @@ __all__ = [
     "ESampRequestStepResult",
     "ESampRequestWorkload",
     "FTTTCompileOptions",
-    "FTTTApplication",
     "FTTTCompletion",
     "FTTTCompletionBatch",
     "FTTTConfig",
@@ -125,10 +121,10 @@ __all__ = [
     "FTTTSpecialization",
     "FTTTWorkload",
     "DynamicsEvent",
-    "GTTAApplication",
     "GTTACompilation",
     "GTTACompileOptions",
     "GTTAConfig",
+    "GTTAHostRequest",
     "GTTADiagnostics",
     "GTTAExecution",
     "GTTAExecutionReceipt",
@@ -141,8 +137,6 @@ __all__ = [
     "PromptContext",
     "TrajectoryFeedback",
     "canonical_state_signature",
-    "create_fttt_application",
-    "create_gtta_application",
     "InPlaceTTTApplication",
     "CudaInPlaceTTTStepBatchInput",
     "InPlaceTTTCleanupReceipt",

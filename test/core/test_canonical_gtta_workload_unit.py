@@ -7,19 +7,22 @@ from dataclasses import replace
 import pytest
 import torch
 
-from tllm.canonical.host_runtime import CanonicalHostRuntimeFacts
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+)
 from tllm.canonical.workloads.gtta import (
     GTTACompileOptions,
     GTTAConfig,
     GTTADiagnostics,
     GTTAExecution,
+    GTTAHostRequest,
     GTTAPromptPosition,
     GTTAQuery,
     GTTAWorkload,
     TrajectoryFeedback,
 )
 from tllm.canonical.workloads.gtta.environment import GTTAEnvironmentService
-from tllm.canonical.workloads.gtta.session import GTTASession
 from tllm.contracts.semantic_graph import AnchorId, StateScope
 
 
@@ -95,21 +98,6 @@ def test_gtta_runs_signed_environment_transaction_and_rolls_back_fifo() -> None:
     )
     assert environment.dropped_trajectories == 1
 
-    interrupted = environment.begin(2)
-    assert tuple(event.reward for event in interrupted.trajectories.entries) == (
-        1.0,
-        0.5,
-    )
-    environment.abort(interrupted.transaction_id)
-    restored = environment.begin(0)
-    assert tuple(event.reward for event in restored.trajectories.entries) == (
-        1.0,
-        0.5,
-        -0.25,
-    )
-    environment.abort(restored.transaction_id)
-
-    session = GTTASession(environment, compiled.execution)
     query = GTTAQuery(
         prompt_idx=4,
         task_id="maps",
@@ -120,7 +108,23 @@ def test_gtta_runs_signed_environment_transaction_and_rolls_back_fifo() -> None:
         max_records=0,
         position=GTTAPromptPosition.SUFFIX,
     )
-    result = session.query(query, 0)
+    interrupted = environment.begin(GTTAHostRequest(query, 2))
+    assert tuple(event.reward for event in interrupted.trajectories.entries) == (
+        1.0,
+        0.5,
+    )
+    environment.abort(interrupted)
+    restored = environment.begin(GTTAHostRequest(query))
+    assert tuple(event.reward for event in restored.trajectories.entries) == (
+        1.0,
+        0.5,
+        -0.25,
+    )
+    environment.abort(restored)
+
+    coordinator = HostTransactionCoordinator(environment, compiled.execution)
+    result = coordinator.run(GTTAHostRequest(query))
+    assert result is not None
     assert result.update.processed == 3
     assert result.update.state_version == 1
     assert result.query.ranked_actions == (
@@ -149,7 +153,8 @@ def test_gtta_runs_signed_environment_transaction_and_rolls_back_fifo() -> None:
         )
     )
 
-    empty = session.query(query, 0)
+    empty = coordinator.run(GTTAHostRequest(query))
+    assert empty is not None
     assert empty.update.processed == 0
     assert empty.update.state_version == 1
     assert compiled.execution.diagnostics() == GTTADiagnostics(2, 3, 1, 0)

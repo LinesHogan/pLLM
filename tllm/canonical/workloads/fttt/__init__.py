@@ -1,9 +1,5 @@
 """Canonical FTTT workload and typed host-service boundary."""
 
-from tllm.canonical.workloads.fttt.application import (
-    FTTTApplication,
-    create_fttt_application,
-)
 from tllm.canonical.workloads.fttt.execution import (
     FTTTDiagnostics,
     FTTTExecution,
@@ -14,11 +10,6 @@ from tllm.canonical.workloads.fttt.host_service import FTTTFeedbackService
 from tllm.canonical.workloads.fttt.judge import (
     FTTTDefaultJudge,
     FTTTJudgeService,
-)
-from tllm.canonical.workloads.fttt.session import (
-    FTTTExecuted,
-    FTTTNoExecution,
-    FTTTSession,
 )
 from tllm.canonical.workloads.fttt.types import (
     FTTTBarrierState,
@@ -35,7 +26,6 @@ from tllm.canonical.workloads.fttt.types import (
     FTTTInstanceKey,
     FTTTInstanceState,
     FTTTJudgeResult,
-    FTTTNoTransaction,
     FTTTRetryAction,
     FTTTSpecialization,
 )
@@ -46,7 +36,6 @@ from tllm.canonical.workloads.fttt.workload import (
 )
 
 __all__ = [
-    "FTTTApplication",
     "FTTTBarrierState",
     "FTTTClosedLoopIntent",
     "FTTTCompilation",
@@ -62,7 +51,6 @@ __all__ = [
     "FTTTExecution",
     "FTTTExecutionReceipt",
     "FTTTExecutionResult",
-    "FTTTExecuted",
     "FTTTFeedbackService",
     "FTTTFinishReason",
     "FTTTHostReadiness",
@@ -71,11 +59,7 @@ __all__ = [
     "FTTTInstanceState",
     "FTTTJudgeResult",
     "FTTTJudgeService",
-    "FTTTNoTransaction",
-    "FTTTNoExecution",
     "FTTTRetryAction",
     "FTTTSpecialization",
-    "FTTTSession",
     "FTTTWorkload",
-    "create_fttt_application",
 ]

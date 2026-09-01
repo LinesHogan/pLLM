@@ -411,6 +411,10 @@ class FTTTExecution:
         self._update_count += receipt.result.update_count
         self._transaction_state = _Ready()
 
+    def result(self, receipt: FTTTExecutionReceipt) -> FTTTExecutionResult:
+        self.validate_receipt(receipt)
+        return receipt.result
+
     def validate_receipt(self, receipt: FTTTExecutionReceipt) -> None:
         match self._transaction_state:
             case _Pending(receipt=issued) if issued is receipt:

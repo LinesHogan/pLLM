@@ -364,14 +364,6 @@ class FTTTHostTransaction:
                 raise TypeError("FTTT host transaction readiness is not closed")
 
 
-@dataclass(frozen=True, slots=True)
-class FTTTNoTransaction:
-    pass
-
-
-FTTTServicePoll = FTTTHostTransaction | FTTTNoTransaction
-
-
 __all__ = [
     "FTTTBarrierState",
     "FTTTClosedLoopIntent",
@@ -389,11 +381,9 @@ __all__ = [
     "FTTTInstanceState",
     "FTTTJudgeResult",
     "FTTTLifecycleTransition",
-    "FTTTNoTransaction",
     "FTTTRewardOutcome",
     "FTTTRetryAction",
     "FTTTRetryControl",
-    "FTTTServicePoll",
     "FTTTSpecialization",
     "FTTTTrainingPlan",
     "FTTTUpdateBarrier",

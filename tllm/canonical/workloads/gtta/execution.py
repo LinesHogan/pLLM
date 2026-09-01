@@ -26,7 +26,6 @@ from tllm.canonical.workloads.gtta.tasks import (
 from tllm.canonical.workloads.gtta.types import (
     GTTAConfig,
     GTTAHostTransaction,
-    GTTAQuery,
     GTTAQueryResult,
     GTTAUpdateReceipt,
 )
@@ -156,7 +155,6 @@ class GTTAExecution:
     def execute(
         self,
         transaction: GTTAHostTransaction,
-        query: GTTAQuery,
     ) -> GTTAExecutionReceipt:
         match self._transaction_state:
             case _Ready():
@@ -166,7 +164,7 @@ class GTTAExecution:
         snapshot = self._dynamics.snapshot()
         context = GTTAStepContext(
             transaction,
-            query,
+            transaction.query,
             self._dynamics,
             GTTAUpdatePending(),
             GTTAQueryPending(),
@@ -213,6 +211,10 @@ class GTTAExecution:
         self._transaction_count += 1
         self._processed_trajectory_count += receipt.result.update.processed
         self._transaction_state = _Ready()
+
+    def result(self, receipt: GTTAExecutionReceipt) -> GTTAExecutionResult:
+        self.validate_receipt(receipt)
+        return receipt.result
 
     def abort(self, receipt: GTTAExecutionReceipt) -> None:
         match self._transaction_state:

@@ -1,9 +1,5 @@
 """Canonical GTTA typed host-service workload."""
 
-from tllm.canonical.workloads.gtta.application import (
-    GTTAApplication,
-    create_gtta_application,
-)
 from tllm.canonical.workloads.gtta.execution import (
     GTTADiagnostics,
     GTTAExecution,
@@ -13,6 +9,7 @@ from tllm.canonical.workloads.gtta.execution import (
 from tllm.canonical.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
+    GTTAHostRequest,
     GTTAPromptPosition,
     GTTAQuery,
     GTTAQueryResult,
@@ -29,10 +26,10 @@ from tllm.canonical.workloads.gtta.workload import (
 
 __all__ = [
     "DynamicsEvent",
-    "GTTAApplication",
     "GTTACompilation",
     "GTTACompileOptions",
     "GTTAConfig",
+    "GTTAHostRequest",
     "GTTADiagnostics",
     "GTTAExecution",
     "GTTAExecutionReceipt",
@@ -45,5 +42,4 @@ __all__ = [
     "PromptContext",
     "TrajectoryFeedback",
     "canonical_state_signature",
-    "create_gtta_application",
 ]

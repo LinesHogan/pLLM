@@ -10,9 +10,9 @@ import re
 import torch
 
 from tllm.canonical.workloads.fttt.execution import (
-    FTTTExecution,
     FTTTExecutionReceipt,
 )
+from tllm.canonical.host_runtime import NoHostRequest
 from tllm.canonical.workloads.fttt.judge import FTTTJudgeService
 from tllm.canonical.workloads.fttt.types import (
     FTTTBarrierState,
@@ -28,11 +28,9 @@ from tllm.canonical.workloads.fttt.types import (
     FTTTInstanceState,
     FTTTJudgeResult,
     FTTTLifecycleTransition,
-    FTTTNoTransaction,
     FTTTRewardOutcome,
     FTTTRetryAction,
     FTTTRetryControl,
-    FTTTServicePoll,
     FTTTTrainingPlan,
     FTTTUpdateBarrier,
 )
@@ -62,19 +60,6 @@ class _ActiveTransaction:
 _ActiveState = _NoActiveTransaction | _ActiveTransaction
 
 
-@dataclass(frozen=True, slots=True)
-class _UnboundExecution:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class _BoundExecution:
-    execution: FTTTExecution
-
-
-_ExecutionBinding = _UnboundExecution | _BoundExecution
-
-
 class FTTTFeedbackService:
     """Own judge I/O, bounded queue, and lifecycle settlement only."""
 
@@ -82,7 +67,6 @@ class FTTTFeedbackService:
         "_active",
         "_config",
         "_dropped_feedback",
-        "_execution_binding",
         "_instances",
         "_judge",
         "_next_transaction_id",
@@ -100,7 +84,6 @@ class FTTTFeedbackService:
         self._projected_instances: dict[FTTTInstanceKey, FTTTInstanceState] = {}
         self._queue: deque[FTTTHostTransaction] = deque()
         self._active: _ActiveState = _NoActiveTransaction()
-        self._execution_binding: _ExecutionBinding = _UnboundExecution()
         self._next_transaction_id = 1
         self._queued_feedback = 0
         self._dropped_feedback = 0
@@ -123,15 +106,6 @@ class FTTTFeedbackService:
 
     def instance_state(self, key: FTTTInstanceKey) -> FTTTInstanceState:
         return self._instances.get(key, FTTTInstanceState())
-
-    def bind_execution(self, execution: FTTTExecution) -> None:
-        if type(execution) is not FTTTExecution or execution.config != self._config:
-            raise TypeError("FTTT service requires one exact execution binding")
-        match self._execution_binding:
-            case _UnboundExecution():
-                self._execution_binding = _BoundExecution(execution)
-            case _BoundExecution():
-                raise RuntimeError("FTTT service execution is already bound")
 
     def enqueue(
         self,
@@ -321,19 +295,15 @@ class FTTTFeedbackService:
         self._queued_feedback += len(records)
         return bool(records)
 
-    def poll(self) -> FTTTServicePoll:
-        match self._execution_binding:
-            case _BoundExecution():
-                pass
-            case _UnboundExecution():
-                raise RuntimeError("FTTT service must bind execution before polling")
+    def begin(self, request: NoHostRequest) -> FTTTHostTransaction | None:
+        del request
         match self._active:
             case _NoActiveTransaction():
                 pass
             case _ActiveTransaction():
                 raise RuntimeError("active FTTT transaction is unresolved")
         if not self._queue:
-            return FTTTNoTransaction()
+            return None
         transaction = self._queue.popleft()
         self._queued_feedback -= len(transaction.plan.intent.feedback_records)
         self._active = _ActiveTransaction(transaction)
@@ -341,24 +311,19 @@ class FTTTFeedbackService:
 
     def commit(
         self,
+        transaction: FTTTHostTransaction,
         receipt: FTTTExecutionReceipt,
     ) -> None:
         if type(receipt) is not FTTTExecutionReceipt:
             raise TypeError("FTTT settlement requires the exact execution receipt")
-        match self._execution_binding:
-            case _BoundExecution(execution=execution):
-                pass
-            case _UnboundExecution():
-                raise RuntimeError("FTTT service has no bound execution")
-        execution.validate_receipt(receipt)
         intent = receipt.result.intent
         match self._active:
-            case _ActiveTransaction(transaction=transaction):
+            case _ActiveTransaction(transaction=active) if active is transaction:
                 pass
-            case _NoActiveTransaction():
+            case _NoActiveTransaction() | _ActiveTransaction():
                 raise RuntimeError("FTTT service has no active transaction")
         expected = replace(
-            transaction.plan.intent,
+            active.plan.intent,
             adapter_version=intent.adapter_version,
         )
         if intent != expected:
@@ -384,13 +349,10 @@ class FTTTFeedbackService:
         self._active = _NoActiveTransaction()
         if not self._queue:
             self._projected_instances = dict(settled)
-        execution.commit(receipt)
 
-    def abort(self, transaction_id: int) -> None:
+    def abort(self, transaction: FTTTHostTransaction) -> None:
         match self._active:
-            case _ActiveTransaction(transaction=transaction) if (
-                transaction.plan.intent.transaction_id == transaction_id
-            ):
+            case _ActiveTransaction(transaction=active) if active is transaction:
                 pass
             case _NoActiveTransaction() | _ActiveTransaction():
                 raise RuntimeError("FTTT abort does not match active transaction")

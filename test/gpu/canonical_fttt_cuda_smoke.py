@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import torch
 
+from tllm.canonical.host_runtime import (
+    CanonicalHostRuntimeFacts,
+    HostTransactionCoordinator,
+    NO_HOST_REQUEST,
+)
 from tllm.canonical.workloads.fttt import (
+    FTTTCompileOptions,
     FTTTCompletion,
     FTTTCompletionBatch,
     FTTTConfig,
@@ -14,7 +20,8 @@ from tllm.canonical.workloads.fttt import (
     FTTTJudgeService,
     FTTTRetryAction,
     FTTTSpecialization,
-    create_fttt_application,
+    FTTTFeedbackService,
+    FTTTWorkload,
 )
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.tensor_layout import TensorDType
@@ -45,16 +52,19 @@ def main() -> int:
         feedback_feature_size=3,
         max_retries=2,
     )
-    application = create_fttt_application(
-        config,
-        FTTTSpecialization(
-            hidden_size=4,
-            tensor_dtype=TensorDType.FLOAT32,
-            device=device,
-            initialization_seed=7,
-        ),
-        _CudaNegativeJudge(),
+    specialization = FTTTSpecialization(
+        hidden_size=4,
+        tensor_dtype=TensorDType.FLOAT32,
+        device=device,
+        initialization_seed=7,
     )
+    workload = FTTTWorkload(config)
+    compiled = workload.compile(
+        specialization,
+        FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
+    )
+    service = FTTTFeedbackService(config, _CudaNegativeJudge())
+    coordinator = HostTransactionCoordinator(service, compiled.execution)
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
     completion = FTTTCompletion(
         identity,
@@ -73,12 +83,13 @@ def main() -> int:
             dtype=torch.float32,
         ).reshape(1, 4)
     with torch.cuda.stream(consumer_stream):
-        result = application.submit_cuda(
-            FTTTCompletionBatch((completion,)),
-            hidden_rows,
-            producer_stream,
+        service.enqueue_cuda(
+            FTTTCompletionBatch((completion,)), hidden_rows, producer_stream
         )
-    diagnostics = application.diagnostics()
+        result = coordinator.run(NO_HOST_REQUEST)
+    if result is None:
+        raise RuntimeError("canonical FTTT did not execute its queued transaction")
+    diagnostics = compiled.execution.diagnostics()
     if (
         result.edit_delta.device != device
         or result.edit_delta.shape != (1, 4)
@@ -87,7 +98,7 @@ def main() -> int:
         or result.update_count != 1
         or result.state_version != 1
         or result.intent.retry_controls[0].action is not FTTTRetryAction.RETRY
-        or application.instance_state(
+        or service.instance_state(
             FTTTInstanceKey("cuda-feedback-0", 0)
         ).adapter_version
         != 1

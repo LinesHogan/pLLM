@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tllm.canonical.workloads.gtta.execution import GTTAExecutionReceipt
 
 from tllm.canonical.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
+    GTTAHostRequest,
     GTTAHostTransaction,
     GTTATrajectoryBatch,
     TrajectoryFeedback,
@@ -75,43 +80,49 @@ class GTTAEnvironmentService:
         self._queue.append(event)
         return True
 
-    def begin(self, limit: int) -> GTTAHostTransaction:
+    def begin(self, request: GTTAHostRequest) -> GTTAHostTransaction:
         match self._active:
             case _NoActiveTransaction():
                 pass
             case GTTAHostTransaction():
                 raise RuntimeError("GTTA active transaction is unresolved")
-        count = len(self._queue) if limit <= 0 else min(limit, len(self._queue))
+        count = (
+            len(self._queue)
+            if request.limit == 0
+            else min(request.limit, len(self._queue))
+        )
         transaction = GTTAHostTransaction(
             self._next_transaction_id,
             GTTATrajectoryBatch(
                 tuple(self._queue.popleft() for _ in range(count))
             ),
+            request.query,
         )
         self._next_transaction_id += 1
         self._active = transaction
         return transaction
 
-    def commit(self, transaction_id: int) -> int:
-        transaction = self._active_transaction(transaction_id)
+    def commit(
+        self,
+        transaction: GTTAHostTransaction,
+        receipt: GTTAExecutionReceipt,
+    ) -> None:
+        del receipt
+        self._active_transaction(transaction)
         self._active = _NoActiveTransaction()
-        return transaction.transaction_id
 
-    def abort(self, transaction_id: int) -> int:
-        transaction = self._active_transaction(transaction_id)
+    def abort(self, transaction: GTTAHostTransaction) -> None:
+        self._active_transaction(transaction)
         for event in reversed(transaction.trajectories.entries):
             self._queue.appendleft(event)
         self._active = _NoActiveTransaction()
-        return transaction.transaction_id
 
-    def _active_transaction(self, transaction_id: int) -> GTTAHostTransaction:
-        if transaction_id < 1:
-            raise ValueError("GTTA transaction ID must be positive")
+    def _active_transaction(
+        self, transaction: GTTAHostTransaction
+    ) -> GTTAHostTransaction:
         match self._active:
-            case GTTAHostTransaction() as transaction if (
-                transaction.transaction_id == transaction_id
-            ):
-                return transaction
+            case GTTAHostTransaction() as active if active is transaction:
+                return active
             case _NoActiveTransaction() | GTTAHostTransaction():
                 raise RuntimeError("GTTA transaction does not match the active batch")
 

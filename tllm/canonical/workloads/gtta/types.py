@@ -118,9 +118,20 @@ class GTTAQueryResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GTTAHostRequest:
+    query: GTTAQuery
+    limit: int = 0
+
+    def __post_init__(self) -> None:
+        if self.limit < 0:
+            raise ValueError("GTTA host request limit must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class GTTAHostTransaction:
     transaction_id: int
     trajectories: GTTATrajectoryBatch
+    query: GTTAQuery
 
     def __post_init__(self) -> None:
         if self.transaction_id < 1:
@@ -130,6 +141,7 @@ class GTTAHostTransaction:
 __all__ = [
     "DynamicsEvent",
     "GTTAConfig",
+    "GTTAHostRequest",
     "GTTAHostTransaction",
     "GTTAPromptPosition",
     "GTTAQuery",
