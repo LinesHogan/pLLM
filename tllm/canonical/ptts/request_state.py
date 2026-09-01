@@ -337,6 +337,15 @@ class RequestStateDirectory:
                 self._latest[transition.key] = transition.after
             self._pending = _NO_PENDING_OPERATION
 
+    def validate_transition_publication(
+        self,
+        batch: RequestStateTransitionBatch,
+    ) -> None:
+        """Prevalidate the logical half of a no-fail publication commit."""
+
+        with self._lock:
+            self._require_transition(batch)
+
     def abort_transition(self, batch: RequestStateTransitionBatch) -> None:
         with self._lock:
             self._require_transition(batch)

@@ -15,6 +15,10 @@ from tllm.canonical.ptts.dense_page_planning import (
     DensePageCudaProviderFacts,
     DensePageProviderFacts,
 )
+from tllm.canonical.ptts.publication import (
+    RequestStatePublicationCoordinator,
+    RequestStatePublicationReceipt,
+)
 from tllm.canonical.ptts.dense_page_cuda import CudaDensePageStateProvider
 from tllm.canonical.ptts.dense_page_cuda_types import (
     CudaDensePageAdmission,
@@ -44,6 +48,8 @@ __all__ = [
     "DensePageTransition",
     "DensePageTransitionBatch",
     "DensePageVersionPin",
+    "RequestStatePublicationCoordinator",
+    "RequestStatePublicationReceipt",
     "CudaDensePageAdmission",
     "CudaDensePageInitialRoot",
     "CudaDensePageGradientBatch",

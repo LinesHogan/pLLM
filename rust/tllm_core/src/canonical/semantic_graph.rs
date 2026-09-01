@@ -76,6 +76,7 @@ pub(crate) enum StateEffectKind {
     Read,
     Transition,
     TransitionMaybe,
+    Publish,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

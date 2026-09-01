@@ -15,6 +15,9 @@ from tllm.canonical.ptts.dense_page_adamw import (
 from tllm.canonical.ptts.dense_page_validation import (
     validate_dense_page_provider,
 )
+from tllm.canonical.ptts.dense_page_transition import (
+    copy_full_root_transition_targets,
+)
 from tllm.contracts.state_ref import LineageId, StateRef, VersionId
 from tllm.contracts.state_representation import (
     StateDeviceKind,
@@ -456,6 +459,28 @@ class DensePageStateProvider:
                 raise
             self._pending_transition = _ComputedTransitionBatch(reserved)
 
+    def compute_full_root_transition(
+        self,
+        batch: DensePageTransitionBatch,
+        target_tensors: tuple[tuple[torch.Tensor, ...], ...],
+    ) -> None:
+        """Write complete private COW roots before their atomic publication."""
+
+        with self._lock:
+            reserved = self._reserved_transition(batch)
+            try:
+                copy_full_root_transition_targets(
+                    target_page_ids=reserved.target_page_ids,
+                    target_tensors=target_tensors,
+                    layout=self._layout,
+                    pools=self._pools,
+                    device=self._device,
+                )
+            except Exception:
+                self._rollback_reserved_transition(reserved)
+                raise
+            self._pending_transition = _ComputedTransitionBatch(reserved)
+
     def publish_transition_batch(
         self,
         batch: DensePageTransitionBatch,
@@ -480,6 +505,15 @@ class DensePageStateProvider:
             self._pending_transition = _NO_PENDING_TRANSITION
             self._reclaim_unpinned_roots()
             return roots
+
+    def validate_transition_publication(
+        self,
+        batch: DensePageTransitionBatch,
+    ) -> None:
+        """Prevalidate the physical half of a no-fail publication commit."""
+
+        with self._lock:
+            self._computed_transition(batch)
 
     def abort_transition_batch(self, batch: DensePageTransitionBatch) -> None:
         """Discard all reserved CPU targets before they are published."""

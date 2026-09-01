@@ -56,6 +56,7 @@ class DensePageCpuProviderFacts:
                 "device/cpu@1",
                 "optimizer/adamw@1",
                 "state/exact_versions@1",
+                "transition/full_root@1",
             ),
         )
 

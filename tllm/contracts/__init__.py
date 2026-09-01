@@ -26,6 +26,14 @@ from tllm.contracts.packed_hidden import (
     PackedHiddenSnapshotBatch,
     PackedHiddenSnapshotSpecialization,
 )
+from tllm.contracts.parameter_overlay import (
+    ParameterModuleKind,
+    ParameterOverlayFieldBinding,
+    ParameterOverlayOperator,
+    ParameterOverlayPublication,
+    ParameterRole,
+    ParameterTarget,
+)
 from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
@@ -81,6 +89,12 @@ __all__ = [
     "PackedHiddenSnapshot",
     "PackedHiddenSnapshotBatch",
     "PackedHiddenSnapshotSpecialization",
+    "ParameterModuleKind",
+    "ParameterOverlayFieldBinding",
+    "ParameterOverlayOperator",
+    "ParameterOverlayPublication",
+    "ParameterRole",
+    "ParameterTarget",
     "RowBatchMeta",
     "RuntimeContext",
     "RegionShapeSpecializationInput",

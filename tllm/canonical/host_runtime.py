@@ -27,7 +27,10 @@ class CanonicalHostRuntimeFacts:
         ):
             raise ValueError("canonical host runtime facts are not closed")
 
-    def timeline(self) -> SchedulerTimeline:
+    def timeline(
+        self,
+        extra_capabilities: tuple[str, ...] = (),
+    ) -> SchedulerTimeline:
         compute_capability = (
             "compute/cpu@1"
             if self.device.type == "cpu"
@@ -40,7 +43,15 @@ class CanonicalHostRuntimeFacts:
                 TimelineAnchor(AnchorSymbol("host.output.publish"), 2),
                 TimelineAnchor(AnchorSymbol("host.next"), 3),
             ),
-            capabilities=(compute_capability, "host/service@1"),
+            capabilities=tuple(
+                sorted(
+                    (
+                        compute_capability,
+                        "host/service@1",
+                        *extra_capabilities,
+                    )
+                )
+            ),
         )
 
 

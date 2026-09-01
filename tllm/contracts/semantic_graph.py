@@ -45,6 +45,7 @@ class StateEffectKind(StrEnum):
     READ = "read"
     TRANSITION = "transition"
     TRANSITION_MAYBE = "transition_maybe"
+    PUBLISH = "publish"
 
 
 @dataclass(frozen=True, slots=True)
