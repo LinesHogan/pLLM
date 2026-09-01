@@ -10,6 +10,7 @@ from tllm.contracts.semantic_graph import (
     AnchorId,
     AnchorSymbol,
     HiddenInputSource,
+    HostServiceInputSource,
     ImplementationId,
     PhysicalPlan,
     PhysicalTask,
@@ -51,6 +52,13 @@ class _PackedSamplerRowsSourceWire(TypedDict):
     kind: Literal["packed_sampler_rows"]
 
 
+class _HostServiceSourceWire(TypedDict):
+    kind: Literal["host_service"]
+    service: str
+    port: str
+    schema: str
+
+
 class _StateSelectionSourceWire(TypedDict):
     kind: Literal["state_selection"]
     resource: str
@@ -68,6 +76,7 @@ _InputSourceWire = (
     | _StepIdSourceWire
     | _PackedRowsSourceWire
     | _PackedSamplerRowsSourceWire
+    | _HostServiceSourceWire
     | _StateSelectionSourceWire
     | _TaskResultSourceWire
 )
@@ -81,6 +90,7 @@ class _InputWire(TypedDict):
 class _OutputWire(TypedDict):
     name: str
     kind: str
+    schema: str
 
 
 class _ImplementationWire(TypedDict):
@@ -117,6 +127,7 @@ class _StateWire(TypedDict):
 class _GraphWire(TypedDict):
     workload_id: str
     tasks: list[_TaskWire]
+    execution_parameters_digest: str
     states: list[_StateWire]
     edges: list[_EdgeWire]
     schema_version: int
@@ -174,6 +185,22 @@ def _graph_json(graph: SemanticGraph) -> str:
                             ),
                         )
                     )
+                case HostServiceInputSource(
+                    service=service,
+                    port=port,
+                    schema=schema,
+                ):
+                    inputs.append(
+                        _InputWire(
+                            name=task_input.name,
+                            source=_HostServiceSourceWire(
+                                kind="host_service",
+                                service=str(service),
+                                port=str(port),
+                                schema=str(schema),
+                            ),
+                        )
+                    )
                 case StateSelectionInputSource(
                     resource=resource,
                     phase=phase,
@@ -208,7 +235,11 @@ def _graph_json(graph: SemanticGraph) -> str:
                 ),
                 inputs=inputs,
                 outputs=[
-                    _OutputWire(name=output.name, kind=output.kind.value)
+                    _OutputWire(
+                        name=output.name,
+                        kind=output.kind.value,
+                        schema=str(output.schema),
+                    )
                     for output in task.outputs
                 ],
                 implementations=[
@@ -233,6 +264,7 @@ def _graph_json(graph: SemanticGraph) -> str:
     wire = _GraphWire(
         workload_id=str(graph.workload_id),
         tasks=tasks,
+        execution_parameters_digest=graph.execution_parameters_digest,
         states=[
             _StateWire(
                 resource=str(state.resource),

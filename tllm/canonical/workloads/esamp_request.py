@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout
 from tllm.canonical.ptts import CudaDensePageStateProvider
@@ -127,6 +127,8 @@ class ESampRequestCompilation:
                 for character in self.execution_parameters_digest
             )
             or self.execution.execution_parameters_digest
+            != self.execution_parameters_digest
+            or self.plan_bundle.semantic_graph.execution_parameters_digest
             != self.execution_parameters_digest
         ):
             raise TypeError("ESamp compilation requires exact execution and plan bundle")
@@ -330,6 +332,7 @@ class ESampRequestWorkload(CanonicalWorkload):
                 SemanticEdge(_LOSS_TASK, _TRAIN_TASK),
                 SemanticEdge(_PREDICT_TASK, _LOSS_TASK),
             ),
+            execution_parameters_digest=self.config.execution_parameters_digest(),
         )
 
     def request_sampler_attachment_spec(
@@ -363,7 +366,13 @@ class ESampRequestWorkload(CanonicalWorkload):
             raise ValueError(
                 "ESamp packed hidden bindings differ from semantic locators"
             )
-        graph = self.semantic_graph()
+        execution_parameters_digest = specialization.execution_parameters_digest(
+            self.config
+        )
+        graph = replace(
+            self.semantic_graph(),
+            execution_parameters_digest=execution_parameters_digest,
+        )
         schedule = compile_schedule(graph, options.timeline)
         validate_schedule(graph, options.timeline, schedule)
         physical = lower_physical_plan(
@@ -548,7 +557,7 @@ class ESampRequestWorkload(CanonicalWorkload):
         return ESampRequestCompilation(
             execution,
             plan_bundle,
-            execution.execution_parameters_digest,
+            execution_parameters_digest,
         )
 
 

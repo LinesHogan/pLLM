@@ -372,6 +372,7 @@ fn validate_cross_binding(
     }
     if request.plan_epoch != schedule.plan_epoch
         || request.plan_epoch != state.plan_epoch
+        || request.execution_parameters_digest != graph.execution_parameters_digest
         || request.schedule_signature != schedule.schedule_signature
         || request.state_request_digest != state.request_digest
         || request.state_representation_signature != state.representation_signature

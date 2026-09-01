@@ -20,6 +20,9 @@ AnchorSymbol = NewType("AnchorSymbol", str)
 TaskId = NewType("TaskId", int)
 AnchorId = NewType("AnchorId", int)
 StateResource = NewType("StateResource", str)
+HostServiceId = NewType("HostServiceId", str)
+HostServicePort = NewType("HostServicePort", str)
+HostPayloadSchemaId = NewType("HostPayloadSchemaId", str)
 
 
 class ExecutionKind(StrEnum):
@@ -29,6 +32,7 @@ class ExecutionKind(StrEnum):
 
 class StateScope(StrEnum):
     REQUEST = "request"
+    INSTANCE = "instance"
 
 
 class SemanticOutputKind(StrEnum):
@@ -75,6 +79,24 @@ class PackedSamplerRowsInputSource:
 
 
 @dataclass(frozen=True, slots=True)
+class HostServiceInputSource:
+    service: HostServiceId
+    port: HostServicePort
+    schema: HostPayloadSchemaId
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.service) is not str
+            or not self.service
+            or type(self.port) is not str
+            or not self.port
+            or type(self.schema) is not str
+            or not self.schema
+        ):
+            raise ValueError("host-service input requires closed service and port IDs")
+
+
+@dataclass(frozen=True, slots=True)
 class StateSelectionInputSource:
     resource: StateResource
     phase: HiddenPhase
@@ -103,6 +125,7 @@ SemanticInputSource = (
     | StepIdInputSource
     | PackedRowsInputSource
     | PackedSamplerRowsInputSource
+    | HostServiceInputSource
     | StateSelectionInputSource
     | TaskResultInputSource
 )
@@ -122,6 +145,7 @@ class SemanticInput:
                 | StepIdInputSource()
                 | PackedRowsInputSource()
                 | PackedSamplerRowsInputSource()
+                | HostServiceInputSource()
                 | StateSelectionInputSource()
                 | TaskResultInputSource()
             ):
@@ -134,9 +158,22 @@ class SemanticInput:
 class SemanticOutput:
     name: str
     kind: SemanticOutputKind = SemanticOutputKind.HOST
+    schema: HostPayloadSchemaId = HostPayloadSchemaId("")
 
     def __post_init__(self) -> None:
-        if not self.name or type(self.kind) is not SemanticOutputKind:
+        if (
+            not self.name
+            or type(self.kind) is not SemanticOutputKind
+            or type(self.schema) is not str
+            or (
+                self.kind is SemanticOutputKind.HOST
+                and not self.schema
+            )
+            or (
+                self.kind is not SemanticOutputKind.HOST
+                and bool(self.schema)
+            )
+        ):
             raise ValueError("semantic output requires a name and closed kind")
 
 
@@ -147,10 +184,17 @@ class SemanticState:
     key_fields: tuple[RequestKeyField, ...]
 
     def __post_init__(self) -> None:
-        canonical_request_key_fields(self.key_fields)
-        if not self.resource or type(self.scope) is not StateScope:
+        if type(self.scope) is not StateScope:
+            raise ValueError("semantic state requires a closed scope")
+        match self.scope:
+            case StateScope.REQUEST:
+                canonical_request_key_fields(self.key_fields)
+            case StateScope.INSTANCE:
+                if type(self.key_fields) is not tuple or self.key_fields:
+                    raise ValueError("instance state cannot declare request keys")
+        if not self.resource:
             raise ValueError(
-                "semantic request state requires a resource and canonical key fields"
+                "semantic state requires a resource and scope-compatible keys"
             )
 
 
@@ -242,6 +286,7 @@ class SemanticEdge:
 class SemanticGraph:
     workload_id: WorkloadId
     tasks: tuple[SemanticTask, ...]
+    execution_parameters_digest: str
     states: tuple[SemanticState, ...] = ()
     edges: tuple[SemanticEdge, ...] = ()
     schema_version: int = 1
@@ -253,6 +298,12 @@ class SemanticGraph:
         if (
             not self.workload_id
             or not symbols
+            or type(self.execution_parameters_digest) is not str
+            or len(self.execution_parameters_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.execution_parameters_digest
+            )
             or tuple(sorted(symbols)) != symbols
             or len(set(symbols)) != len(symbols)
             or tuple(sorted(resources)) != resources
@@ -395,6 +446,10 @@ __all__ = [
     "AnchorSymbol",
     "ExecutionKind",
     "HiddenInputSource",
+    "HostServiceId",
+    "HostServiceInputSource",
+    "HostServicePort",
+    "HostPayloadSchemaId",
     "ImplementationId",
     "PhysicalPlan",
     "PhysicalTask",

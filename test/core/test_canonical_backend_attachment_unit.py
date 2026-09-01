@@ -83,6 +83,7 @@ def test_rust_signs_full_backend_attachment_bundle() -> None:
     train_implementation = ImplementationId("canonical.test:cuda_train@1")
     graph = SemanticGraph(
         workload_id=WorkloadId("test.attachment"),
+        execution_parameters_digest="d" * 64,
         tasks=(
             SemanticTask(
                 symbol=TaskSymbol("predict"),

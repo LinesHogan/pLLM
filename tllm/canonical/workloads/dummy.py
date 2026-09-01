@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 
 import torch
 
@@ -18,6 +19,7 @@ from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.semantic_graph import (
     AnchorSymbol,
     ExecutionKind,
+    HostPayloadSchemaId,
     HiddenInputSource,
     ImplementationId,
     SchedulerTimeline,
@@ -51,6 +53,17 @@ class DummyConfig:
             or self.export_max_cols < 1
         ):
             raise ValueError("dummy export bounds and stride must be positive")
+
+    def execution_parameters_digest(self) -> str:
+        fields = (
+            "canonical.dummy.execution@1",
+            f"enabled={int(self.enabled)}",
+            f"export_every_n_steps={self.export_every_n_steps}",
+            f"export_max_rows={self.export_max_rows}",
+            f"export_max_cols={self.export_max_cols}",
+            f"layer={self.layer}",
+        )
+        return sha256("\x00".join(fields).encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +159,12 @@ class DummyWorkload(CanonicalWorkload):
                         ),
                         SemanticInput("step_id", StepIdInputSource()),
                     ),
-                    outputs=(SemanticOutput("export"),),
+                    outputs=(
+                        SemanticOutput(
+                            "export",
+                            schema=HostPayloadSchemaId("canonical.dummy.export@1"),
+                        ),
+                    ),
                     implementations=(
                         TaskImplementationSpec(
                             implementation_id=_DUMMY_IMPLEMENTATION,
@@ -156,6 +174,7 @@ class DummyWorkload(CanonicalWorkload):
                     ),
                 ),
             ),
+            execution_parameters_digest=self.config.execution_parameters_digest(),
         )
 
     def compile(

@@ -30,6 +30,11 @@ pub(crate) enum InputSource {
         phase: HiddenPhase,
     },
     StepId,
+    HostService {
+        service: String,
+        port: String,
+        schema: String,
+    },
     StateSelection {
         resource: String,
         phase: HiddenPhase,
@@ -54,6 +59,7 @@ pub(crate) enum OutputKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StateScope {
     Request,
+    Instance,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -97,6 +103,7 @@ pub(crate) struct TypedInput {
 pub(crate) struct TypedOutput {
     pub(crate) name: String,
     pub(crate) kind: OutputKind,
+    pub(crate) schema: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -145,6 +152,7 @@ pub(crate) struct SemanticEdge {
 pub(crate) struct SemanticGraph {
     pub(crate) workload_id: String,
     pub(crate) tasks: Vec<SemanticTask>,
+    pub(crate) execution_parameters_digest: String,
     pub(crate) edges: Vec<SemanticEdge>,
     pub(crate) states: Vec<SemanticState>,
     pub(crate) schema_version: u64,
@@ -204,6 +212,15 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
                 require_text(task, "tasks.inputs.source.task")?;
                 require_text(output, "tasks.inputs.source.output")?;
             }
+            InputSource::HostService {
+                service,
+                port,
+                schema,
+            } => {
+                require_text(service, "tasks.inputs.source.service")?;
+                require_text(port, "tasks.inputs.source.port")?;
+                require_text(schema, "tasks.inputs.source.schema")?;
+            }
             InputSource::Hidden { .. }
             | InputSource::StepId
             | InputSource::PackedRows
@@ -222,6 +239,14 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
     }
     for output in &task.outputs {
         require_text(&output.name, "tasks.outputs.name")?;
+        match output.kind {
+            OutputKind::Host => require_text(&output.schema, "tasks.outputs.schema")?,
+            OutputKind::Temporary | OutputKind::Sampler => {
+                if !output.schema.is_empty() {
+                    return Err("non-host task output cannot declare a host schema".to_owned());
+                }
+            }
+        }
     }
     if task
         .outputs
@@ -277,6 +302,14 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
         ));
     }
     require_text(&graph.workload_id, "workload_id")?;
+    if graph.execution_parameters_digest.len() != 64
+        || !graph
+            .execution_parameters_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("execution_parameters_digest must be lowercase SHA-256".to_owned());
+    }
     if graph.tasks.is_empty() {
         return Err("semantic graph requires at least one task".to_owned());
     }
@@ -292,9 +325,19 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     }
     for state in &graph.states {
         require_text(&state.resource, "states.resource")?;
-        if state.key_fields.is_empty() || state.key_fields.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err("request state key fields must be sorted unique".to_owned());
+        match state.scope {
+            StateScope::Request => {
+                if state.key_fields.is_empty()
+                    || state.key_fields.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err("request state key fields must be sorted unique".to_owned());
+                }
+            }
+            StateScope::Instance => {
+                if !state.key_fields.is_empty() {
+                    return Err("instance state cannot declare request keys".to_owned());
+                }
+            }
         }
     }
     if graph
@@ -333,7 +376,9 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     for task in &graph.tasks {
         for input in &task.inputs {
             match &input.source {
-                InputSource::Hidden { .. } | InputSource::StepId => {}
+                InputSource::Hidden { .. }
+                | InputSource::StepId
+                | InputSource::HostService { .. } => {}
                 InputSource::StateSelection { resource, .. } => {
                     let state = graph
                         .states
@@ -376,13 +421,12 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
             }
         }
         for effect in &task.effects {
-            let state = graph
+            if graph
                 .states
                 .binary_search_by(|state| state.resource.cmp(&effect.resource))
-                .map(|index| &graph.states[index])
-                .map_err(|_| "state effect references an unknown state resource".to_owned())?;
-            if state.scope != StateScope::Request {
-                return Err("state effect must reference request state".to_owned());
+                .is_err()
+            {
+                return Err("state effect references an unknown state resource".to_owned());
             }
         }
     }

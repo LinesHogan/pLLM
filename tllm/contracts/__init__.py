@@ -2,7 +2,10 @@
 """Producer-consumer data contracts."""
 
 from tllm.contracts.backend_capability import BackendCapability
-from tllm.contracts.canonical_compilation import CanonicalPlanBundle
+from tllm.contracts.canonical_compilation import (
+    CanonicalPlanBundle,
+    CanonicalScheduleBundle,
+)
 from tllm.contracts.hidden_batch import HiddenBatch
 from tllm.contracts.hidden_locator import (
     HiddenLayerKind,
@@ -62,6 +65,7 @@ __all__ = [
     "ConsumerSubscription",
     "BackendCapability",
     "CanonicalPlanBundle",
+    "CanonicalScheduleBundle",
     "DeviceTensorLease",
     "HiddenBatch",
     "HiddenLayerKind",
