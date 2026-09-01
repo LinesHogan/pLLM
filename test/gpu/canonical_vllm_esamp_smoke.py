@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import tllm
 from vllm import SamplingParams
 
 from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
 from tllm.canonical.workloads.esamp_request_types import ESampRequestConfig
 from tllm.canonical_runtime.runtime import (
+    CanonicalEsampLlm,
     CanonicalVllmConfig,
     CanonicalVllmDType,
-    create_canonical_esamp_llm,
 )
 
 
@@ -23,9 +24,9 @@ def main() -> int:
             intervention_beta=0.2,
         )
     )
-    handle = create_canonical_esamp_llm(
-        workload,
-        CanonicalVllmConfig(
+    routed = tllm.make_llm(
+        workloads=(workload,),
+        canonical_config=CanonicalVllmConfig(
             model="Qwen/Qwen2.5-0.5B-Instruct",
             dtype=CanonicalVllmDType.BFLOAT16,
             max_model_len=64,
@@ -35,6 +36,11 @@ def main() -> int:
             seed=7,
         ),
     )
+    match routed:
+        case CanonicalEsampLlm() as handle:
+            pass
+        case _:
+            raise RuntimeError("public make_llm did not select canonical runtime")
     try:
         outputs = handle.generate(
             ["The sky is"],

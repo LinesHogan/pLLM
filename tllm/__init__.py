@@ -1,8 +1,8 @@
-"""Public tLLM API.
+"""Public tLLM API and the sole clean-room/legacy routing boundary.
 
-The module-level functions are a thin backward-compatible façade over the
-process-wide default :class:`tllm.runtime.runtime.TllmRuntime`. New code
-should create an explicit runtime instance:
+Nominal clean-room workloads are routed before the legacy runtime is imported.
+All other module-level calls remain a backward-compatible façade over the
+process-wide default :class:`tllm.runtime.runtime.TllmRuntime`:
 
     runtime = TllmRuntime(consumers=[...])
     llm = runtime.make_llm(...)
@@ -25,9 +25,28 @@ if TYPE_CHECKING:
 
 
 def make_llm(*args: object, **kwargs: object) -> object:
+    workloads = kwargs.pop("workloads", None)
+    workload_items: tuple[object, ...] = ()
+    if workloads is not None:
+        if not isinstance(workloads, (tuple, list)):
+            raise TypeError("make_llm.workloads must be a tuple or list")
+        workload_items = tuple(workloads)
+        if workload_items:
+            from tllm.canonical.workloads.base import CanonicalWorkload
+
+            canonical = tuple(
+                isinstance(workload, CanonicalWorkload)
+                for workload in workload_items
+            )
+            if any(canonical):
+                if not all(canonical):
+                    raise TypeError(
+                        "canonical and legacy workloads cannot share one runtime"
+                    )
+                return _make_canonical_llm(args, kwargs, workload_items)
+
     from tllm.runtime.runtime import TllmRuntime, default_runtime
 
-    workloads = kwargs.pop("workloads", None)
     runtime_option_names = (
         "workload_memory_budget_bytes",
         "workload_allow_serial_fallback",
@@ -38,8 +57,6 @@ def make_llm(*args: object, **kwargs: object) -> object:
         name: kwargs.pop(name) for name in runtime_option_names if name in kwargs
     }
     if workloads is not None:
-        if not isinstance(workloads, (tuple, list)):
-            raise TypeError("make_llm.workloads must be a tuple or list")
         memory_budget = runtime_options.get("workload_memory_budget_bytes", 0)
         allow_serial = runtime_options.get("workload_allow_serial_fallback", True)
         persistent_state = runtime_options.get("workload_persistent_state_bytes", 0)
@@ -55,7 +72,7 @@ def make_llm(*args: object, **kwargs: object) -> object:
         ):
             raise TypeError("workload_decision_cache_directory must be str or None")
         return TllmRuntime(
-            workloads=tuple(workloads),
+            workloads=workload_items,
             workload_memory_budget_bytes=memory_budget,
             workload_allow_serial_fallback=allow_serial,
             workload_persistent_state_bytes=persistent_state,
@@ -64,6 +81,32 @@ def make_llm(*args: object, **kwargs: object) -> object:
     if runtime_options:
         raise TypeError("workload compiler options require make_llm(workloads=...)")
     return default_runtime().make_llm(*args, **kwargs)
+
+
+def _make_canonical_llm(
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    workloads: tuple[object, ...],
+) -> object:
+    """The sole dynamic coexistence boundary; canonical internals stay closed."""
+
+    from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
+    from tllm.canonical_runtime.runtime import (
+        CanonicalVllmConfig,
+        create_canonical_esamp_llm,
+    )
+
+    if len(workloads) != 1 or type(workloads[0]) is not ESampRequestWorkload:
+        raise TypeError("canonical vLLM currently supports one ESamp request workload")
+    workload = workloads[0]
+    if args or set(kwargs) != {"canonical_config"}:
+        raise TypeError(
+            "canonical make_llm requires only canonical_config=CanonicalVllmConfig(...)"
+        )
+    config = kwargs["canonical_config"]
+    if type(config) is not CanonicalVllmConfig:
+        raise TypeError("canonical_config must be an exact CanonicalVllmConfig")
+    return create_canonical_esamp_llm(workload, config)
 
 
 def register_consumer(consumer: BaseConsumer) -> None:
