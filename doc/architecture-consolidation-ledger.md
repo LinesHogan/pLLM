@@ -20,8 +20,8 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `18e1686` | — | after `e03816d` |
-| Counted production/support source | 91,026 lines | -42,184 lines | -300 lines |
+| Commit | `8a790ba` | — | after `e03816d` |
+| Counted production/support source | 88,486 lines | -44,724 lines | -2,840 lines |
 | Pytest collection | 1 item | -1,348 items | -10 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -181,15 +181,28 @@ remain outside pytest.  Grep for `tllm.consumers.dummy`, `test/core`,
 examples.  Under `SOURCE_LOC`, this checkpoint is
 `+1 / -12 / net -11`; `SOURCE_LOC` is now 91,026.
 
+The producer and placement planner deletion in `8a790ba` removed the retired
+producer package, runtime producer executor, Python execution/placement planner
+wrappers, the Rust `execution_plan` and `placement` FFI modules, and their
+remaining `_core.pyi`/`tllm.core` exports.  The vLLM hooks now prepare only
+native decode metadata; the old execute-model producer dispatch hook and its
+empty replacement were deleted rather than left as a no-op compatibility seam.
+The import-layer rules no longer contain a producer layer.  Grep for
+`tllm.producers`, `ProducerRegistry`, `producer_executor`,
+`runtime.placement`, `runtime.execution_plan`, `compile_execution_plan` and
+`compile_placement_schedule` is empty across production, tests, tools,
+examples and typing configs.  Under `SOURCE_LOC`, this checkpoint is
+`+19 / -2,559 / net -2,540`; `SOURCE_LOC` is now 88,486.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | 1 | 4,609 | 0 | -4,608 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
+| A — ledger and survivor extraction | 0 | 2,827 | 0 | -2,827 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 345 | 32,277 | 988 | -31,932 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
+| E — legacy authority removal | 364 | 34,836 | 988 | -34,472 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain, producer/placement planners, dummy consumer re-export and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
