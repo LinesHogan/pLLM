@@ -51,8 +51,6 @@
     "test/core/test_state_representation_plan_unit.py",
     "test/core/test_canonical_dense_state_producer_unit.py",
     "test/core/test_canonical_dummy_workload_unit.py",
-    "test/consumers/override/test_override_workload_unit.py",
-    "test/consumers/ttrl/test_ttrl_workload_unit.py",
     "test/gpu/canonical_vllm_esamp_smoke.py",
     "test/gpu/canonical_fttt_cuda_smoke.py"
   ],
