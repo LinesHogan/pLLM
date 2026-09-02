@@ -20,9 +20,9 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since FTTT checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `3c91d04` | — | after `753bdfd` |
-| Production/support source | 126,745 lines | -6,465 lines | -5,228 lines |
-| Pytest collection | 1,295 items | -54 items | -38 items |
+| Commit | `3c6ba2c` | — | after `753bdfd` |
+| Production/support source | 126,458 lines | -6,752 lines | -5,515 lines |
+| Pytest collection | 1,285 items | -64 items | -48 items |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -32,22 +32,31 @@ and 38 remain as the canonical CPU and CUDA survivors. Documentation and JSON
 config changes are excluded from `SOURCE_LOC` and are not used to offset these
 deletions.
 
-The backend import-frontier cleanup in `d59920f` removed the deprecated
-`tllm/backends/vllm/typed_recurrence.py` re-export and its region-authority gate
-entries.  It also removed orphan `tools/getattr_probe_baseline.json`, which was
-a static-gate artifact with no live consumer.  Counted source changed by
-`+0 / -21 / net -21`; the JSON deletion is excluded from `SOURCE_LOC` and does
-not change `TEST_COUNT`.  This is recorded as narrow frontier cleanup, not as
-completion of the Tranche D backend seam rewrite.
+The backend import-frontier cleanups in `d59920f` and `3c6ba2c` removed the
+deprecated `tllm/backends/vllm/typed_recurrence.py` re-export, its
+region-authority gate entries, the old-runtime `packed_hidden_snapshot` module
+and three vLLM packed-hidden old-stack imports.  The packed-hidden buffer is now
+private to the runner-owned vLLM capture seam; signed public DTOs remain in
+`tllm.contracts.packed_hidden`.  These commits also removed orphan
+`tools/getattr_probe_baseline.json`, which was a static-gate artifact with no
+live consumer.  Counted source changed by `+176 / -205 / net -29`; the JSON
+deletion is excluded from `SOURCE_LOC`, and the packed-hidden internal service
+test deletion reduced pytest collection by 10 items.  This is recorded as
+narrow frontier cleanup, not as completion of the Tranche D backend seam
+rewrite.
 
 The canonical vertical-compression checkpoint now includes `753bdfd`
 (`+3,868 / -8,972 / net -5,104` under `SOURCE_LOC`) and `a822028`
 (`+296 / -398 / net -102`) on top of the previous Tranche B ledger entry
 (`+249 / -574 / net -325`).  The `b122512` plus `b66448c` route/typing gate
 repair contributes only `+5 / -6 / net -1` under `SOURCE_LOC`; it is recorded
-as public boundary cleanup, not a separate architecture deletion.  Current
-`SOURCE_LOC` was recalculated at `d59920f` with the transparent command from
-the plan and matches the cumulative delta: `133,210 - 6,465 = 126,745`.
+as public boundary cleanup, not a separate architecture deletion.  The
+`41ad50b` re-export cleanup removed the unused
+`tllm/canonical/workloads/__init__.py` and `tllm/contracts/__init__.py` export
+catalogs for `+0 / -279 / net -279`; callers import concrete submodules
+directly.  Current `SOURCE_LOC` was recalculated at `3c6ba2c` with the
+transparent command from the plan and matches the cumulative delta:
+`133,210 - 6,752 = 126,458`.
 
 Tranche A static meta-test cleanup deleted 19 pytest items from import-layer,
 region-authority, native import-boundary and getattr-baseline wrappers.  These
@@ -65,10 +74,10 @@ cleanup, GPU or survivor evidence.
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | — | — | — | — | active: static/decorative test cleanup; pytest collection -54 |
-| B — canonical vertical compression | 4,418 | 9,950 | 0 | -5,532 | active: canonical runtime attachments, ESamp task merge and boundary gate repair |
+| A — ledger and survivor extraction | — | — | — | — | active: static/decorative test cleanup; A-owned pytest items -30 |
+| B — canonical vertical compression | 4,418 | 10,229 | 0 | -5,811 | active: canonical runtime attachments, ESamp task merge, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
-| D — backend quarantine and closed MP | 0 | 21 | 0 | -21 | active: backend import frontier cleanup; seam rewrite still pending |
+| D — backend quarantine and closed MP | 176 | 205 | 0 | -29 | active: backend import frontier cleanup; seam rewrite still pending |
 | E — legacy authority removal | — | — | — | — | pending |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
