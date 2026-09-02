@@ -18,11 +18,14 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 ## Current checkpoint
 
-| Fact | Value | Cumulative change from `12551b8` | Change since FTTT checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `99f7067` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `99f7067` | — | after `753bdfd` |
-| Production/support source | 126,412 lines | -6,798 lines | -5,561 lines |
-| Pytest collection | 1,285 items | -64 items | -48 items |
+| Commit | `71afa2e` | — | after `99f7067` |
+| Counted production/support source | 123,247 lines | -9,963 lines | -3,165 lines |
+| Pytest collection | 25 items | -1,324 items | -1,260 items |
+| Rust tests | 3 items | -51 items | -51 items |
+| Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
+| Visible `TEST_COUNT` | 32 items | now below the 50-item ceiling | — |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -56,9 +59,17 @@ as public boundary cleanup, not a separate architecture deletion.  The
 `41ad50b` re-export cleanup removed the unused
 `tllm/canonical/workloads/__init__.py` and `tllm/contracts/__init__.py` export
 catalogs for `+0 / -279 / net -279`; callers import concrete submodules
-directly.  Current `SOURCE_LOC` was recalculated at `99f7067` with the
-transparent command from the plan and matches the cumulative delta:
-`133,210 - 6,798 = 126,412`.
+directly.  `SOURCE_LOC` was recalculated at `99f7067` with the transparent
+command from the plan and matched the cumulative delta:
+`133,210 - 6,798 = 126,412`.  Subsequent counted source deletion totals
+`-3,165`: `3de5390` moved backend observable events to the backend protocol
+seam for `+23 / -25 / net -2`, `19e3531` removed duplicated Python attachment
+validation for `+0 / -201 / net -201`, `5adf50c` removed the vLLM WorkGraph
+cold handoff for `+65 / -220 / net -155`, and `71afa2e` deleted Rust inline
+test modules for `+0 / -2,807 / net -2,807`.  The new current `SOURCE_LOC`
+is `123,247`.  The Rust inline test deletion is counted by the plan's
+file-based `SOURCE_LOC` command but is recorded here as test evidence cleanup,
+not production behavior removal.
 
 Tranche A static meta-test cleanup deleted 19 pytest items from import-layer,
 region-authority, native import-boundary and getattr-baseline wrappers.  These
@@ -72,14 +83,27 @@ compatibility matrices, registry/plugin shells, enum/catalog mappings and
 facade identity.  They did not contain numerical, state, loss/update, version,
 cleanup, GPU or survivor evidence.
 
+The survivor-evidence collapse in `bda926d` and `71afa2e` deleted the old
+WorkGraph, Program, runtime, workload, validator-matrix, decorative consumer,
+orphan oracle-helper and non-survivor GPU smoke tests.  The commit deliberately
+removed old native GPU scripts that imported `tllm.consumers` or old runtime
+instead of treating renamed scripts as free tests.  It also pruned Rust tests
+to the three canonical core bases explicitly named by section 5.3.  After the
+collapse, full pytest collection is 25 items, `cargo test -- --list` reports
+3 items, and the only standalone correctness smokes left under `test/gpu/` are
+the four canonical/public survivor bases:
+`canonical_esamp_cuda_graph_replay_smoke.py`, `canonical_fttt_cuda_smoke.py`,
+`canonical_vllm_esamp_smoke.py`, and
+`canonical_vllm_inplace_ttt_smoke.py`.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | — | — | — | — | active: static/decorative test cleanup; A-owned pytest items -30 |
-| B — canonical vertical compression | 4,418 | 10,229 | 0 | -5,811 | active: canonical runtime attachments, ESamp task merge, boundary gate repair and re-export cleanup |
+| A — ledger and survivor extraction | 0 | 2,807 | 0 | -2,807 | active: survivor collapse done; pytest 25, Rust 3, standalone smokes 4 |
+| B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
-| D — backend quarantine and closed MP | 187 | 262 | 0 | -75 | active: backend import frontier cleanup; seam rewrite still pending |
+| D — backend quarantine and closed MP | 275 | 507 | 0 | -232 | active: backend event seam and vLLM WorkGraph cold handoff removed; seam rewrite still pending |
 | E — legacy authority removal | — | — | — | — | pending |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
