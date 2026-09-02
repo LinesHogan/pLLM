@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any
 
 import torch
 
@@ -71,10 +70,10 @@ class StepSession:
     backend_id: str
 
     request_ids: tuple[str, ...] = ()
-    request_index: dict[str, int] = field(default_factory=dict)
+    request_index: dict[str, int] = field(default_factory=lambda: dict[str, int]())
     sample_index: torch.Tensor | None = None
 
-    num_scheduled_tokens: Any = None
+    num_scheduled_tokens: object | None = None
     # PyO3 SchedulerBatchPhase derived from vLLM scheduler columns. It stays
     # opaque here so runtime code cannot reinterpret scheduler semantics.
     batch_phase: _core.SchedulerBatchPhase | None = None
@@ -90,9 +89,8 @@ class StepSession:
     # Strict per-logits-row mapping under speculative decoding (empty when
     # no request produced more than one logits row this step).
     spec_rows: tuple[SpecRowMapping, ...] = ()
-    # Effective CUDA-graph mode of the runner for this step, resolved via
-    # tllm.runtime.graph_policy (None when not yet resolved).
-    graph_mode: Any = None
+    # Effective CUDA-graph mode of the runner for this step.
+    graph_mode: object | None = None
 
     state: StepState = StepState.CREATED
     error: str = ""
@@ -113,10 +111,10 @@ class StepSession:
         self.state = StepState.FAILED
 
 
-def get_step_session(runner: Any) -> StepSession | None:
+def get_step_session(runner: object) -> StepSession | None:
     session = getattr(runner, "_tllm_step_session", None)
     return session if isinstance(session, StepSession) else None
 
 
-def set_step_session(runner: Any, session: StepSession | None) -> None:
+def set_step_session(runner: object, session: StepSession | None) -> None:
     setattr(runner, "_tllm_step_session", session)

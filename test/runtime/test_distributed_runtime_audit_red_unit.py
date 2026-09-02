@@ -18,7 +18,7 @@ import torch
 
 from tllm import _core
 from tllm.backends.vllm import v027_mrv1, v027_mrv2
-from tllm.runtime.step_session import StepSession, set_step_session
+from tllm.backends.vllm._step_session import StepSession, set_step_session
 from tllm.runtime import active_targets, residual_runtime
 from tllm.runtime.scheduling import collective as collective_runtime
 from tllm.runtime.state import ResidualRuntimeState
@@ -532,7 +532,6 @@ class Phase4VllmLifecycleAuditRedTest(unittest.TestCase):
                 side_effect=run_prepare_post_producers,
             ),
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
-            mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
             mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
         ):

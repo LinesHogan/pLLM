@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from tllm.backends.protocol import runner_model_module
 from tllm.runtime.sampler_bridge.types import CandidateModifierState, SamplerStepView
 from tllm.runtime.sampler_bridge.provider import validate_prepared_intervention
-from tllm.runtime.step_session import StepState, get_step_session
+from tllm.backends.vllm._step_session import StepState, get_step_session
 from tllm.runtime.vllm_patch.sampler_patch import (
     _notify_after_sample,
     _resolve_provider,

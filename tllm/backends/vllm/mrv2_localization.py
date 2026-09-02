@@ -43,7 +43,7 @@ def prepare_decode_localization_mrv2(*, core: Any, runner: Any, input_batch: Any
     the first-row-per-request view; the full mapping is attached to the
     StepSession by the driver for spec-decode-aware consumers.
     """
-    from tllm.runtime.step_session import SpecRowMapping
+    from tllm.backends.vllm._step_session import SpecRowMapping
 
     runtime = core.RUNTIME
     if input_batch is None:

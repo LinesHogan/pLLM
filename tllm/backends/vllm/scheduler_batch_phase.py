@@ -7,7 +7,7 @@ from typing import Protocol
 
 from tllm import _core
 from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedRowPlanInputs
-from tllm.runtime.step_session import StepSession
+from tllm.backends.vllm._step_session import StepSession
 
 
 class PreparedPackedRowsExecution(Protocol):

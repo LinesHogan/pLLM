@@ -128,7 +128,6 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv1._common_hooks, "dispatch_runtime_event", side_effect=dispatch),
             mock.patch.object(v027_mrv1._hooks, "setup_runtime_hooks_if_active"),
             mock.patch.object(v027_mrv1._hooks, "run_prepare_inputs_post_producers"),
-            mock.patch.object(v027_mrv1._model_region, "prepare_model_region_step"),
             mock.patch.object(
                 v027_mrv1._model_region,
                 "stage_signed_backend_region_event",
@@ -207,7 +206,6 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
             mock.patch.object(v027_mrv2._hooks, "run_prepare_inputs_post_producers"),
             mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
             mock.patch.object(v027_mrv2._hooks, "maybe_launch_post_logits_decode_work"),
-            mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
             mock.patch.object(
                 v027_mrv2._model_region,
                 "stage_signed_backend_region_event",
@@ -324,7 +322,6 @@ def test_mixed_scheduler_batch_is_rust_derived_for_the_full_mrv2_lifecycle() -> 
         mock.patch.object(v027_mrv2._hooks, "run_prepare_inputs_post_producers"),
         mock.patch.object(v027_mrv2._hooks, "run_execute_model_post_producers"),
         mock.patch.object(v027_mrv2._hooks, "maybe_launch_post_logits_decode_work"),
-        mock.patch.object(v027_mrv2._model_region, "prepare_model_region_step"),
         mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
         mock.patch.object(v027_mrv2, "_decode_localization_from_mrv2", return_value=()),
     ):
@@ -497,7 +494,6 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
         mock.patch.object(v027_mrv1._hooks, "run_execute_model_post_producers"),
         mock.patch.object(v027_mrv1._hooks, "maybe_launch_post_logits_decode_work"),
         mock.patch.object(v027_mrv1._hooks._hidden_bridge, "dispatch_deferred_layer_batches"),
-        mock.patch.object(v027_mrv1._model_region, "prepare_model_region_step"),
         mock.patch.object(v027_mrv1._model_region, "stage_signed_backend_region_event"),
         mock.patch.object(v027_mrv1._sampler_patch, "maybe_prepare_sampler_decode_step"),
         mock.patch.object(v027_mrv1._ADAPTER, "unpack_prepare_inputs_output", return_value=view),
@@ -635,7 +631,7 @@ def test_signed_prepare_post_binder_stages_after_pre_and_prepare_producers(
             ),
             mock.patch.object(v027_mrv2._sampler_patch, "maybe_prepare_sampler_decode_step"),
         ):
-            from tllm.runtime.step_session import StepSession, set_step_session
+            from tllm.backends.vllm._step_session import StepSession, set_step_session
 
             set_step_session(runner, StepSession(step_id=1, backend_id=driver))
             v027_mrv2._wrapped_prepare_inputs(

@@ -69,19 +69,6 @@ def stage_signed_backend_region_event(
     return True
 
 
-def prepare_model_region_step(
-    *,
-    runtime: object,
-    runner: object,
-    num_scheduled_tokens: object | None,
-    input_batch: object | None = None,
-) -> object | None:
-    """Compatibility entry point; native stages only at their signed event."""
-
-    del runtime, runner, num_scheduled_tokens, input_batch
-    return None
-
-
 def abort_model_region_step(runtime: object, step_id: int) -> bool:
     execution = getattr(runtime, "workload_execution", None)
     if execution is not None:
@@ -96,6 +83,5 @@ def abort_model_region_step(runtime: object, step_id: int) -> bool:
 
 __all__ = [
     "abort_model_region_step",
-    "prepare_model_region_step",
     "stage_signed_backend_region_event",
 ]

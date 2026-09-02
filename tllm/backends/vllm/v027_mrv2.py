@@ -47,7 +47,7 @@ from tllm.backends.vllm.workgraph_runtime import (
     runner_tensor_parallel_size,
 )
 from tllm.runtime import active_targets
-from tllm.runtime.step_session import (
+from tllm.backends.vllm._step_session import (
     StepSession,
     StepState,
     get_step_session,
@@ -123,14 +123,6 @@ def _wrapped_prepare_inputs(
             )
 
     if not has_active_targets:
-        _model_region.prepare_model_region_step(
-            runtime=runtime,
-            runner=runner,
-            num_scheduled_tokens=getattr(
-                input_batch, "num_scheduled_tokens", None
-            ),
-            input_batch=input_batch,
-        )
         return input_batch
 
     # InputBatch is the first point where all three scheduler columns are
@@ -178,12 +170,6 @@ def _wrapped_prepare_inputs(
                 input_batch=input_batch,
             )
         )
-    _model_region.prepare_model_region_step(
-        runtime=runtime,
-        runner=runner,
-        num_scheduled_tokens=getattr(input_batch, "num_scheduled_tokens", None),
-        input_batch=input_batch,
-    )
     session = get_step_session(runner)
     if session is None or session.state is not StepState.CREATED:
         raise RuntimeError(

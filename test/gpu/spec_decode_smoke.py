@@ -29,7 +29,7 @@ def main() -> int:
 
     from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
     from tllm.runtime import residual_runtime as core
-    from tllm.runtime.step_session import get_step_session
+    from tllm.backends.vllm._step_session import get_step_session
     from tllm.util.tools import build_prompt_batch, shutdown_llm_instance
 
     seen_spec_rows = []

@@ -24,7 +24,7 @@ from tllm.backends.vllm import sampler_mrv2
 from tllm.runtime.residual_runtime import SamplerPrecomputeState
 from tllm.runtime.sampler_bridge.provider import SamplerInterventionStage
 from tllm.runtime.sampler_bridge.types import CandidateModifierState
-from tllm.runtime.step_session import (
+from tllm.backends.vllm._step_session import (
     StepSession,
     StepState,
     set_step_session,

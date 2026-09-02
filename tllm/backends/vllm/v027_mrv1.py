@@ -49,7 +49,7 @@ from tllm.backends.vllm.workgraph_runtime import (
     runner_tensor_parallel_size,
 )
 from tllm.runtime import active_targets
-from tllm.runtime.step_session import (
+from tllm.backends.vllm._step_session import (
     StepSession,
     StepState,
     get_step_session,
@@ -112,7 +112,7 @@ def _build_spec_rows_mrv1(*, core: Any, view: Any, session: StepSession) -> tupl
         or max(num_draft) == 0
     ):
         return ()
-    from tllm.runtime.step_session import SpecRowMapping
+    from tllm.backends.vllm._step_session import SpecRowMapping
 
     rows: list = []
     logit_row = 0
@@ -223,17 +223,6 @@ def _wrapped_prepare_inputs(
         overlay_controller.apply_mrv1_input_batch(runner.input_batch)
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, scheduler_output, num_scheduled_tokens)
-        view = _ADAPTER.unpack_prepare_inputs_output(
-            runner=runner,
-            scheduler_output=scheduler_output,
-            out=out,
-            num_scheduled_tokens=num_scheduled_tokens,
-        )
-        _model_region.prepare_model_region_step(
-            runtime=runtime,
-            runner=runner,
-            num_scheduled_tokens=view.num_scheduled_tokens_np,
-        )
         return out
 
     active_driver = driver or V027MRv1Driver()
@@ -342,11 +331,6 @@ def _wrapped_prepare_inputs(
             out=out,
             prepare_inputs_view=view,
         ),
-    )
-    _model_region.prepare_model_region_step(
-        runtime=runtime,
-        runner=runner,
-        num_scheduled_tokens=view.num_scheduled_tokens_np,
     )
     try:
         _sampler_patch.maybe_prepare_sampler_decode_step(runtime=runtime, runner=runner)

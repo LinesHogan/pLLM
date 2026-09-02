@@ -132,7 +132,7 @@ class SpecRowMappingUnitTest(unittest.TestCase):
             _build_spec_rows_mrv1,
             _restore_first_row_localization_mrv1,
         )
-        from tllm.runtime.step_session import StepSession
+        from tllm.backends.vllm._step_session import StepSession
 
         parent_id = "parent_with_underscores"
         child_ids = (
