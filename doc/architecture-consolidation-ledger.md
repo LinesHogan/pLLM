@@ -22,7 +22,7 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 | --- | ---: | ---: | ---: |
 | Commit | `a822028` | — | after `753bdfd` |
 | Production/support source | 126,767 lines | -6,443 lines | -5,206 lines |
-| Pytest collection | 1,325 items | -24 items | -8 items |
+| Pytest collection | 1,306 items | -43 items | -27 items |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -39,11 +39,17 @@ The canonical vertical-compression checkpoint now includes `753bdfd`
 `a822028` with the transparent command from the plan and matches the cumulative
 delta: `133,210 - 6,443 = 126,767`.
 
+Tranche A static meta-test cleanup deleted 19 pytest items from import-layer,
+region-authority, native import-boundary and getattr-baseline wrappers.  These
+were pytest shells around static gates or import discipline, not numerical,
+state, runtime, loss/update/version or cleanup oracles.  The corresponding
+static gates remain directly executable and do not count as behavioral evidence.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | — | — | — | — | active |
+| A — ledger and survivor extraction | — | — | — | — | active: static meta-test cleanup |
 | B — canonical vertical compression | 4,413 | 9,944 | 0 | -5,531 | active: canonical runtime attachments and ESamp task merge |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | — | — | — | — | pending |
