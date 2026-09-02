@@ -47,19 +47,15 @@ from tllm.canonical.tensor_layout import (
     validate_tensor_layouts,
 )
 from tllm.canonical.workloads.base import CanonicalWorkload
-from tllm.canonical.workloads.esamp_request_cpu_tasks import (
+from tllm.canonical.workloads.esamp_request_task_common import (
     ESampCpuLossTask,
     ESampCpuPredictTask,
     ESampCpuStepContext,
     ESampCpuTrainTask,
-)
-from tllm.canonical.workloads.esamp_request_cuda_tasks import (
     ESampCudaLossTask,
     ESampCudaPredictTask,
     ESampCudaStepContext,
     ESampCudaTrainTask,
-)
-from tllm.canonical.workloads.esamp_request_task_common import (
     ESampOptimizationPending,
     ESampOptimized,
     ESampPredicted,
@@ -776,11 +772,11 @@ class CanonicalRequestSamplerCudaExecution:
                 target,
                 selection,
                 transition_lease,
-                state_pin,
-                stream,
                 ESampPredictionPending(),
                 ESampOptimizationPending(),
                 ESampPublicationPending(),
+                state_pin,
+                stream,
             )
             handle = CanonicalRequestCudaStepHandle(self._next_handle_id)
             self._next_handle_id += 1
