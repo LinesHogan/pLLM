@@ -28,7 +28,6 @@
       "core",
       "kit",
       "ports",
-      "producers",
       "runtime",
       "workgraph"
     ],
@@ -48,17 +47,11 @@
       "contracts",
       "core"
     ],
-    "producers": [
-      "contracts",
-      "core",
-      "ports"
-    ],
     "runtime": [
       "common",
       "contracts",
       "core",
       "ports",
-      "producers",
       "workgraph"
     ],
     "schedule": [],
@@ -67,8 +60,7 @@
     "workgraph": [
       "contracts",
       "core",
-      "ports",
-      "producers"
+      "ports"
     ],
     "workload": [],
     "exact_module_edges": [
@@ -121,7 +113,6 @@
     ],
     "sanctioned_edges": [
       "consumers -> tllm.backends.protocol",
-      "producers -> tllm.backends.protocol",
       "runtime -> tllm.backends.protocol",
       "workgraph -> tllm.backends.protocol"
     ]

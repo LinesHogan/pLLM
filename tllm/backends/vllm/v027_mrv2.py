@@ -191,7 +191,7 @@ def _wrapped_prepare_inputs(
             input_batch=input_batch,
         )
 
-    _hooks.run_prepare_inputs_post_producers(
+    _hooks.prepare_native_decode_metadata(
         core=core,
         runner=runner,
         localize_decode=_localize_decode,
@@ -210,7 +210,7 @@ def _wrapped_prepare_inputs(
         session.transition(StepState.INPUTS_READY)
         # MRv2 prepares its InputBatch inside execute_model.  Keep the typed
         # lifecycle ordered as PREPARE_INPUTS_PRE -> POST -> EXECUTE_MODEL_PRE
-        # around that construction and its post-prepare producers.
+        # around that construction and its post-prepare native metadata.
         _model_region.stage_signed_backend_region_event(
             event=BackendObservableEvent.PREPARE_INPUTS_POST,
             runtime=runtime,
@@ -316,11 +316,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
 
     if not bool(getattr(getattr(runner, "model", None), "_tllm_compute_logits_wrapped", False)):
         _hooks.maybe_launch_post_logits_decode_work(core=core, runner=runner)
-    _hooks.run_execute_model_post_producers(
-        core=core,
-        runner=runner,
-        publish_decode=lambda: 0,
-    )
     _model_region.stage_signed_backend_region_event(
         event=BackendObservableEvent.EXECUTE_MODEL_POST,
         runtime=runtime,

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Residual-runtime configuration and per-process state.
 
-This module owns the shared mutable state object (``RUNTIME``) that hooks,
-producers, and consumers read during a step. It deliberately contains no
+This module owns the shared mutable state object (``RUNTIME``) that hooks
+read during a step. It deliberately contains no
 hook installation, dispatch, or lifecycle logic — see
 ``tllm.runtime.lifecycle`` and ``tllm.runtime.residual_runtime`` for those.
 """
@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Dict, Optional
 import torch
 
 from tllm.ports.residual_stream import ResidualLocator
-from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.request_lifecycle import RequestLifecycleLedger
@@ -34,7 +33,6 @@ if TYPE_CHECKING:
         NativeWorkloadExecution,
         NativeWorkloadExecutionStore,
     )
-    from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.torch_adapter import CudaLongHostStaging
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
 
@@ -107,7 +105,6 @@ class ResidualRuntimeState:
     path_hotspot_cpu_ms: dict[str, float] = field(default_factory=dict)
     path_hotspot_counts: dict[str, int] = field(default_factory=dict)
 
-    execution_plan: Optional[ExecutionPlan] = None
     physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
     physical_prepared_step_id: int = -1
     # Immutable new-middle-end output activated by the native physical executor.
@@ -117,7 +114,6 @@ class ResidualRuntimeState:
     native_workloads_pending: bool = False
     native_schedule_graph: Optional["ScheduleGraph"] = None
     native_hidden_path_aliases: dict[str, str] = field(default_factory=dict)
-    producer_executor: Optional["ProducerExecutor"] = None
     placement_stats: PlacementStats = field(default_factory=PlacementStats)
     reward_outcome_store: RewardOutcomeStore = field(default_factory=RewardOutcomeStore)
     retry_control_store: RetryControlStore = field(default_factory=RetryControlStore)

@@ -11,7 +11,7 @@ Target direction (a package may import only the packages listed in RULES)::
 
     core ← contracts ← canonical
                      ← ports ← common
-                         ← producers ← workgraph ← runtime
+                         ← workgraph ← runtime
     backends (contracts/ports/workgraph only; runtime types arrive via protocols)
     consumers / workflows: leaves, may import anything below
 
@@ -64,9 +64,8 @@ RULES: dict[str, frozenset[str]] = {
     "canonical_vllm": frozenset({"canonical", "contracts", "core"}),
     "ports": frozenset({"contracts", "core"}),
     "common": frozenset({"contracts", "ports", "core"}),
-    "producers": frozenset({"contracts", "ports", "core"}),
-    "workgraph": frozenset({"contracts", "ports", "producers", "core"}),
-    "runtime": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
+    "workgraph": frozenset({"contracts", "ports", "core"}),
+    "runtime": frozenset({"contracts", "ports", "common", "workgraph", "core"}),
     # The workload frontend and schedule middle-end communicate only through
     # the source-module-specific bridges below.  Neither package gets a broad
     # cross-package allowance: that would hide an import cycle or permit the
@@ -83,7 +82,7 @@ RULES: dict[str, frozenset[str]] = {
     "kit": frozenset({"contracts", "common", "ports", "runtime", "workload", "core"}),
     "consumers": frozenset(
         {
-            "contracts", "ports", "common", "producers", "workgraph",
+            "contracts", "ports", "common", "workgraph",
             "runtime", "kit", "core",
         }
     ),
@@ -97,7 +96,6 @@ RULES: dict[str, frozenset[str]] = {
 SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("runtime", "tllm.backends.protocol"),
-        ("producers", "tllm.backends.protocol"),
         ("workgraph", "tllm.backends.protocol"),
         # Consumer binders reach concrete backend drivers only through the
         # protocol seam (runner binding -> driver), never via driver modules.

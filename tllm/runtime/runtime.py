@@ -28,7 +28,6 @@ from typing_extensions import TypeVar as TypeVarWithDefault
 import warnings
 from uuid import uuid4
 
-from tllm.producers.base import ProducerDescriptor
 from tllm.workload import (
     NativeWorkloadDefinition,
     WorkloadAuthority,
@@ -723,7 +722,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self,
         *,
         backend: str = "auto",
-        producers: Sequence[ProducerDescriptor] = (),
         workloads: Sequence[ConfiguredWorkloadT] = (),
         workload_memory_budget_bytes: int = 0,
         workload_allow_serial_fallback: bool = True,
@@ -736,7 +734,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 f"backend={backend!r}: only 'auto' is supported; backend selection "
                 "is structural (tllm.backends)"
             )
-        self.producers: tuple[ProducerDescriptor, ...] = tuple(producers)
         self._workloads: tuple[ConfiguredWorkloadT, ...] = tuple(workloads)
         self._workloads_by_type: dict[type[object], object] = {
             type(workload): workload for workload in self._workloads

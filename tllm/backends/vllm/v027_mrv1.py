@@ -309,7 +309,7 @@ def _wrapped_prepare_inputs(
                 logits_indices=view.logits_indices,
             )
         )
-    _hooks.run_prepare_inputs_post_producers(
+    _hooks.prepare_native_decode_metadata(
         core=core,
         runner=runner,
         localize_decode=lambda: _hooks.prepare_decode_localization(

@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Formal CUDA-graph policy for hook-driven producer/consumer work.
+"""Formal CUDA-graph mode detection for hook-driven native work.
 
 Python hooks run at *capture* time, not replay time; anything that must
 execute per step under a replayed graph has to operate on address-stable
-persistent buffers and be declared ``GraphSafety.CAPTURE_SAFE`` (or
-``REPLAY_STATEFUL``). This module lifts the previous ad-hoc
+persistent buffers. This module lifts the previous ad-hoc
 ``_runner_uses_compilation_or_cudagraph`` check into an explicit contract:
 
 * resolve the runner's effective :class:`GraphMode`;
-* decide whether consumers may launch from hooks in that mode;
-* validate a compiled execution plan against the mode at startup.
+* decide whether native work may launch from hooks in that mode.
 """
 
 from __future__ import annotations
@@ -17,9 +15,6 @@ from __future__ import annotations
 from enum import Enum, auto
 import os
 from typing import Any
-
-from tllm.backends.protocol import GraphSafety
-
 
 class GraphMode(Enum):
     EAGER = auto()
@@ -82,32 +77,3 @@ def resolve_graph_mode(runner: Any) -> GraphMode:
             level = 0
         return GraphMode.PIECEWISE if level > 0 else GraphMode.EAGER
     return GraphMode.PIECEWISE
-
-
-
-_SAFETY_RANK = {
-    GraphSafety.EAGER_ONLY: 0,
-    GraphSafety.CAPTURE_SAFE: 1,
-    GraphSafety.REPLAY_STATEFUL: 2,
-}
-
-_MODE_REQUIREMENT = {
-    GraphMode.EAGER: GraphSafety.EAGER_ONLY,
-    GraphMode.PIECEWISE: GraphSafety.CAPTURE_SAFE,
-    GraphMode.FULL: GraphSafety.REPLAY_STATEFUL,
-}
-
-
-def assert_plan_graph_compatible(plan: Any, mode: GraphMode) -> None:
-    """Fail fast if any planned producer is unsafe for the runner's mode."""
-    required = _MODE_REQUIREMENT[mode]
-    for planned in getattr(plan, "producers", ()) or ():
-        safety = planned.entry.producer.graph_safety
-        if isinstance(safety, str):
-            safety = GraphSafety(safety)
-        if _SAFETY_RANK[safety] < _SAFETY_RANK[required]:
-            raise GraphPolicyError(
-                f"producer {planned.entry.producer_id!r} is {safety.name} but the "
-                f"runner is in {mode.name} mode which requires {required.name}. "
-                "Use enforce_eager or a capture-safe producer."
-            )

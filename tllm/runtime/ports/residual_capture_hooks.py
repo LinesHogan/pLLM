@@ -19,12 +19,6 @@ from tllm.runtime.vllm_patch import compilation as _compilation
 from tllm.runtime.stats import PlacementStats
 
 
-class ProducerExecutorLike(Protocol):
-    capture_resident_producer_ids: tuple[str, ...]
-
-    def run_layer_post(self, ctx: object) -> None: ...
-
-
 class ResidualCaptureRuntimeLike(Protocol):
     decode_row_idx: torch.Tensor | None
     decode_valid_mask: torch.Tensor | None
@@ -36,7 +30,6 @@ class ResidualCaptureRuntimeLike(Protocol):
     launch_consumer_from_hooks: bool
     source_resolved_path: str
     target_resolved_path: str
-    producer_executor: ProducerExecutorLike | None
     capture_full_residual_rows: bool
     placement_stats: PlacementStats
     workload_execution: object | None
@@ -133,13 +126,8 @@ def install_layer_forward_taps(
     handles: dict[str, TapHandle] = {}
     from tllm.runtime.graph_policy import GraphMode, resolve_graph_mode
 
-    executor = core.RUNTIME.producer_executor
-    capture_ids = () if executor is None else executor.capture_resident_producer_ids
     capture_resident = (
-        (
-            "tllm.residual.decode" in capture_ids
-            or capture_native_hidden
-        )
+        capture_native_hidden
         and resolve_graph_mode(runner) != GraphMode.EAGER
     )
     capture_full = bool(core.RUNTIME.capture_full_residual_rows)
@@ -195,19 +183,7 @@ def install_layer_forward_taps(
             write_leases = core.RUNTIME.write_leases
             if write_leases:
                 _residual_write.apply_pending_writes(write_leases, __path, tensor)
-            executor = core.RUNTIME.producer_executor
-            if executor is not None:
-                from tllm.runtime.producer_executor import LayerPostContext
-
-                executor.run_layer_post(
-                    LayerPostContext(
-                        runtime=core.RUNTIME,
-                        runner=runner,
-                        layer_path=__path,
-                        hidden=tensor,
-                    )
-                )
-            elif active_targets.runtime_requires_decode_hidden(
+            if active_targets.runtime_requires_decode_hidden(
                 cast(active_targets.RuntimeWithTargets, core.RUNTIME)
             ):
                 materialize_decode_residual(

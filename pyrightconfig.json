@@ -8,7 +8,6 @@
     "tllm/canonical_vllm",
     "tllm/contracts",
     "tllm/ports",
-    "tllm/producers",
     "tllm/core",
     "tllm/workgraph",
     "**/__pycache__"

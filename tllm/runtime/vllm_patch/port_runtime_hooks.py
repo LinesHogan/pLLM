@@ -539,54 +539,21 @@ def prepare_decode_localization(
     )
 
 
-def run_prepare_inputs_post_producers(
+def prepare_native_decode_metadata(
     *,
     core: DecodeHookCoreLike,
     runner: RunnerLike,
     localize_decode: Callable[[], object],
 ) -> None:
-    """Run compiler-selected prepare producers in DAG order."""
-    executor = getattr(core.RUNTIME, "producer_executor", None)
-    if executor is not None:
-        from tllm.runtime.producer_executor import PrepareInputsPostContext
-
-        executor.run_prepare_inputs_post(
-            PrepareInputsPostContext(
-                runner=runner,
-                localize_decode=localize_decode,
-                runtime=core.RUNTIME,
-            )
-        )
-    elif (
+    """Prepare native runtime decode metadata after vLLM input assembly."""
+    if (
         core.RUNTIME.workload_execution is not None
         and core.RUNTIME.workload_execution.requires_request_identities
     ):
         localize_decode()
     elif active_targets.runtime_requires_decode_hidden(core.RUNTIME):
         localize_decode()
-    elif not hasattr(core.RUNTIME, "producer_executor"):
-        localize_decode()
 
-def run_execute_model_post_producers(
-    *,
-    core: PortDispatchCoreLike,
-    runner: RunnerLike,
-    publish_decode: object,
-) -> None:
-    """Run compiler-selected execute-model producers in DAG order."""
-    executor = getattr(core.RUNTIME, "producer_executor", None)
-    if executor is not None:
-        from tllm.runtime.producer_executor import ExecuteModelPostContext
-
-        executor.run_execute_model_post(
-            ExecuteModelPostContext(
-                runner=runner,
-                publish_decode=publish_decode,  # type: ignore[arg-type]
-                runtime=core.RUNTIME,
-            )
-        )
-    elif not hasattr(core.RUNTIME, "producer_executor"):
-        publish_decode()  # type: ignore[operator]
 def maybe_launch_post_logits_decode_work(*, core: Any, runner: Any) -> None:
     runtime = core.RUNTIME
     precompute = runtime.sampler_precompute
@@ -780,7 +747,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
             out=out,
         )
         t2 = time.perf_counter() if trace_hotspots else 0.0
-        run_prepare_inputs_post_producers(
+        prepare_native_decode_metadata(
             core=core,
             runner=runner,
             localize_decode=lambda: prepare_decode_localization(
@@ -848,15 +815,6 @@ def wrapped_execute_model(
         maybe_launch_post_logits_decode_work(core=core, runner=runner)
     t2 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.post_logits_cpu", t1, t2)
-    run_execute_model_post_producers(
-        core=core,
-        runner=runner,
-        publish_decode=lambda: 0,
-    )
-    t3 = time.perf_counter() if trace_hotspots else 0.0
-    record_path_hotspot_cpu(core, "execute_model.dispatch_bundles_cpu", t2, t3)
-    t4 = time.perf_counter() if trace_hotspots else 0.0
-    record_path_hotspot_cpu(core, "execute_model.deferred_layers_cpu", t3, t4)
     if before_runtime_event is not None:
         before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_POST)
     _common_hooks.dispatch_runtime_event(

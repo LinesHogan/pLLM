@@ -5,7 +5,6 @@
     "tllm/canonical",
     "tllm/canonical_vllm",
     "tllm/ports",
-    "tllm/producers",
     "tllm/core",
     "tllm/workgraph",
     "tllm/workload",
