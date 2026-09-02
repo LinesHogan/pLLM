@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Protocol, SupportsInt
+from typing import TYPE_CHECKING, Protocol, SupportsInt
 
 import torch
 
@@ -24,6 +24,9 @@ from tllm.contracts.packed_rows import (
 )
 
 _BINDING_ATTR = RUNNER_BINDING_ATTR
+
+if TYPE_CHECKING:
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
 
 
 def ensure_runner_binding(
@@ -66,6 +69,65 @@ def runner_tensor_parallel_size(runner: object) -> int:
         vllm_config = getattr(runner, "vllm_config", None)
         parallel_config = getattr(vllm_config, "parallel_config", None)
     return int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+
+
+def _runner_max_prefill_tokens(runner: object) -> int:
+    for name in ("max_num_tokens", "max_num_batched_tokens"):
+        try:
+            value = getattr(runner, name)
+        except AttributeError:
+            continue
+        if type(value) is not int or value < 1:
+            raise RuntimeError(
+                f"vLLM runner {name} must be an exact positive integer for "
+                "runtime specialization"
+            )
+        return value
+    raise RuntimeError(
+        "vLLM runner must expose max_num_tokens or max_num_batched_tokens "
+        "for runtime specialization"
+    )
+
+
+class _RuntimeSpecializationModelConfig(Protocol):
+    @property
+    def dtype(self) -> torch.dtype: ...
+
+    def get_hidden_size(self) -> int: ...
+
+
+class _RuntimeSpecializationRunner(Protocol):
+    @property
+    def model_config(self) -> _RuntimeSpecializationModelConfig: ...
+
+    @property
+    def max_num_reqs(self) -> int: ...
+
+    @property
+    def device(self) -> torch.device: ...
+
+
+def runner_runtime_specialization(
+    runner: _RuntimeSpecializationRunner,
+) -> "RuntimeSpecializationSpec":
+    from tllm.runtime.specialization import RuntimeSpecializationSpec
+
+    model_config = runner.model_config
+    binding = runner_binding_for(runner)
+    model_layer_count: int | None = None
+    if binding is not None:
+        raw_layer_count = binding.driver.runner_model_layer_count(runner)
+        if type(raw_layer_count) is not int or raw_layer_count < 1:
+            raise RuntimeError("vLLM backend driver must report model layer count >= 1")
+        model_layer_count = raw_layer_count
+    return RuntimeSpecializationSpec(
+        rows=max(1, int(runner.max_num_reqs)),
+        hidden_size=int(model_config.get_hidden_size()),
+        dtype=model_config.dtype,
+        device=runner.device,
+        model_layer_count=model_layer_count,
+        max_prefill_tokens=_runner_max_prefill_tokens(runner),
+    )
 
 
 def runner_active_request_count(runner: object) -> int:

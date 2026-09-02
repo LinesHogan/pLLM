@@ -39,13 +39,6 @@ from tllm.backends.vllm import packed_hidden_capture as _packed_hidden_capture
 from tllm.backends.vllm import scheduler_batch_phase as _scheduler_batch_phase
 from tllm.backends.vllm import versioned_parameter_overlay as _parameter_overlay
 from tllm.backends.vllm import sampler_mrv2 as _sampler_mrv2
-from tllm.backends.vllm.workgraph_runtime import (
-    cold_compile_loaded_workloads,
-    cold_specialize_loaded_runtime,
-    record_resolved_backend,
-    runner_runtime_specialization,
-    runner_tensor_parallel_size,
-)
 from tllm.runtime import active_targets
 from tllm.backends.vllm._step_session import (
     StepSession,
@@ -82,7 +75,6 @@ def _wrapped_prepare_inputs(
     driver: Any | None = None,
 ) -> Any:
     runtime = core.RUNTIME
-    cold_compile_loaded_workloads(core=core, runner=runner)
     binding = _runner_adapter.get_runner_binding(runner)
     overlay_controller = _parameter_overlay.maybe_bind_publisher(
         runtime=runtime,
@@ -155,7 +147,7 @@ def _wrapped_prepare_inputs(
             binding=binding,
             model=runner_model_module(runner),
             execution=packed_execution,
-            specialization=runner_runtime_specialization(runner),
+            specialization=_runner_adapter.runner_runtime_specialization(runner),
             graph_mode=resolve_graph_mode(runner),
             row_batch=packed_rows,
         )
@@ -259,10 +251,6 @@ def _wrapped_prepare_inputs(
 
 def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, orig: Any) -> Any:
     runtime = core.RUNTIME
-    # Publish a cold-compiled native epoch before opening its first logical
-    # step. Otherwise prepare_inputs can stage a Region on an unprepared
-    # execution and PREPARE_INPUTS_POST will silently skip it.
-    cold_compile_loaded_workloads(core=core, runner=runner)
     binding = _runner_adapter.get_runner_binding(runner)
     _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
         binding=binding,
@@ -429,21 +417,9 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
 def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, orig: Any) -> Any:
     runtime = core.RUNTIME
 
-    def _record_workgraph_resolution() -> None:
-        from tllm.runtime.graph_policy import resolve_graph_mode
-
-        record_resolved_backend(
-            core=core,
-            capabilities=V027MRv2Driver().capabilities(),
-            graph_mode=resolve_graph_mode(runner),
-            tp_size=runner_tensor_parallel_size(runner),
-        )
-        cold_specialize_loaded_runtime(core=core, runner=runner)
-
     if not active_targets.runtime_has_active_targets(runtime):
         out = orig(runner, *args, **kwargs)
         _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
-        _record_workgraph_resolution()
         return out
     _common_hooks.dispatch_legacy_runtime_event(
         runtime=runtime,
@@ -456,7 +432,6 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
     out = orig(runner, *args, **kwargs)
     _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
     _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
-    _record_workgraph_resolution()
     _common_hooks.dispatch_legacy_runtime_event(
         runtime=runtime,
         runner=runner,

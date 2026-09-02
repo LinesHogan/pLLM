@@ -38,7 +38,6 @@ AUTHORITY_FILES = (
     Path("tllm/backends/vllm/model_region.py"),
     Path("tllm/backends/vllm/sampler_mrv1.py"),
     Path("tllm/backends/vllm/sampler_mrv2.py"),
-    Path("tllm/backends/vllm/workgraph_runtime.py"),
     Path("tllm/runtime/vllm_patch/sampler_patch.py"),
 )
 
@@ -89,7 +88,6 @@ PHYSICAL_FILES = frozenset(
         Path("tllm/runtime/typed_recurrence.py"),
         Path("tllm/backends/timeline.py"),
         Path("tllm/backends/vllm/model_region.py"),
-        Path("tllm/backends/vllm/workgraph_runtime.py"),
     }
 )
 

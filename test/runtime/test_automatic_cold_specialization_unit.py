@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from tllm.backends.protocol import BackendCapabilities, GraphSafety, SamplerStage
+from tllm.backends.vllm import runner_adapter
 from tllm.backends.vllm import v027_mrv2
 from tllm.consumers.base import BaseConsumer
 from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
@@ -118,58 +119,6 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
 
         self.assertIs(consumer.seen, spec)
 
-    def test_mrv2_load_model_builds_spec_from_model_config_and_publishes_cold_path(self) -> None:
-        state = ResidualRuntimeState()
-        model_config = mock.Mock()
-        model_config.get_hidden_size.return_value = 8
-        model_config.dtype = torch.float16
-        runner = SimpleNamespace(
-            model_config=model_config,
-            max_num_reqs=6,
-            max_num_tokens=32,
-            device=torch.device("cpu"),
-            enforce_eager=True,
-            sampler=None,
-        )
-        orig = mock.Mock(return_value="loaded")
-        runtime_owner = mock.Mock()
-
-        with (
-            mock.patch.object(residual_runtime, "RUNTIME", state),
-            mock.patch.object(v027_mrv2.active_targets, "runtime_has_active_targets", return_value=False),
-            mock.patch.object(v027_mrv2._sampler_mrv2, "bind_runner_sampler_mrv2"),
-            mock.patch.object(v027_mrv2, "record_resolved_backend") as record_resolution,
-            mock.patch("tllm.runtime.runtime.active_runtime", return_value=runtime_owner),
-            mock.patch(
-                "tllm.runtime.residual_runtime.cold_specialize_workgraph",
-                create=True,
-            ) as publish,
-        ):
-            result = v027_mrv2._wrapped_load_model(
-                core=residual_runtime,
-                runner=runner,
-                args=(),
-                kwargs={},
-                orig=orig,
-            )
-
-        self.assertEqual(result, "loaded")
-        model_config.get_hidden_size.assert_called_once_with()
-        record_resolution.assert_called_once()
-        publish.assert_called_once()
-        published = publish.call_args.args[0] if publish.call_args.args else publish.call_args.kwargs["spec"]
-        runtime_owner.cold_specialize_workloads.assert_called_once_with(published)
-        self.assertEqual(
-            published,
-            RuntimeSpecializationSpec(
-                rows=6,
-                hidden_size=8,
-                dtype=torch.float16,
-                device=torch.device("cpu"),
-                max_prefill_tokens=32,
-            ),
-        )
-
     def test_vllm_cold_specialization_rejects_missing_prefill_capacity(self) -> None:
         runner = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -181,10 +130,7 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "max_num_tokens"):
-            v027_mrv2.cold_specialize_loaded_runtime(
-                core=residual_runtime,
-                runner=runner,
-            )
+            runner_adapter.runner_runtime_specialization(runner)
 
     def test_enabled_esamp_is_cold_specialized_and_physically_staged_before_first_token(self) -> None:
         consumer = ESampConsumer(ESampConsumerConfig(graph_scratch_rows=4), engine=mock.Mock())

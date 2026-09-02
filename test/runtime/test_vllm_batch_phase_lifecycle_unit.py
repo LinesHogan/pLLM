@@ -142,7 +142,7 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
                 return_value=torch.nn.Identity(),
             ),
             mock.patch.object(
-                v027_mrv1,
+                v027_mrv1._runner_adapter,
                 "runner_runtime_specialization",
                 return_value=specialization,
             ),
@@ -225,7 +225,7 @@ def test_prefill_phase_is_rust_derived_for_entire_hook_lifecycle(
                 return_value=torch.nn.Identity(),
             ),
             mock.patch.object(
-                v027_mrv2,
+                v027_mrv2._runner_adapter,
                 "runner_runtime_specialization",
                 return_value=specialization,
             ),
@@ -504,7 +504,7 @@ def test_mrv1_execute_model_creates_rust_phase_inside_nested_prepare_inputs() ->
             return_value=torch.nn.Identity(),
         ),
         mock.patch.object(
-            v027_mrv1,
+            v027_mrv1._runner_adapter,
             "runner_runtime_specialization",
             return_value=specialization,
         ),

@@ -41,13 +41,6 @@ from tllm.backends.vllm import packed_hidden_capture as _packed_hidden_capture
 from tllm.backends.vllm import scheduler_batch_phase as _scheduler_batch_phase
 from tllm.backends.vllm import versioned_parameter_overlay as _parameter_overlay
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
-from tllm.backends.vllm.workgraph_runtime import (
-    cold_compile_loaded_workloads,
-    cold_specialize_loaded_runtime,
-    record_resolved_backend,
-    runner_runtime_specialization,
-    runner_tensor_parallel_size,
-)
 from tllm.runtime import active_targets
 from tllm.backends.vllm._step_session import (
     StepSession,
@@ -193,7 +186,6 @@ def _wrapped_prepare_inputs(
     driver: Any | None = None,
 ) -> Any:
     runtime = core.RUNTIME
-    cold_compile_loaded_workloads(core=core, runner=runner)
     if num_scheduled_tokens is None:
         raise UnsupportedBackendError(
             "vLLM 0.25+ MRv1 _prepare_inputs requires num_scheduled_tokens; "
@@ -279,7 +271,7 @@ def _wrapped_prepare_inputs(
             binding=binding,
             model=runner_model_module(runner),
             execution=packed_execution,
-            specialization=runner_runtime_specialization(runner),
+            specialization=_runner_adapter.runner_runtime_specialization(runner),
             graph_mode=resolve_graph_mode(runner),
             row_batch=packed_rows,
         )
@@ -591,15 +583,6 @@ class V027MRv1Driver:
                 runner=runner,
                 state=binding.parameter_overlay_state,
             )
-            from tllm.runtime.graph_policy import resolve_graph_mode
-
-            record_resolved_backend(
-                core=core,
-                capabilities=self.capabilities(),
-                graph_mode=resolve_graph_mode(runner),
-                tp_size=runner_tensor_parallel_size(runner),
-            )
-            cold_specialize_loaded_runtime(core=core, runner=runner)
             return out
 
         def _prepare_inputs(runner: Any, scheduler_output: Any, num_scheduled_tokens: Any = None) -> Any:
