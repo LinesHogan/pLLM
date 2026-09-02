@@ -94,17 +94,9 @@ def _make_canonical_llm(
         CanonicalVllmConfig,
         create_canonical_vllm_llm,
     )
-    from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
-    from tllm.canonical.workloads.inplace_ttt import InPlaceTTTWorkload
-
     if len(workloads) != 1:
         raise TypeError("canonical vLLM currently supports one workload")
     workload = workloads[0]
-    if not isinstance(workload, (ESampRequestWorkload, InPlaceTTTWorkload)):
-        raise TypeError(
-            "canonical vLLM currently supports ESampRequestWorkload "
-            "or InPlaceTTTWorkload"
-        )
     if args or set(kwargs) != {"canonical_config"}:
         raise TypeError(
             "canonical make_llm requires only canonical_config=CanonicalVllmConfig(...)"

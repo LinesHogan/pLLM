@@ -1038,12 +1038,12 @@ class CanonicalVllmLlm:
 
 
 def create_canonical_vllm_llm(
-    workload: ESampRequestWorkload | InPlaceTTTWorkload,
+    workload: object,
     config: CanonicalVllmConfig,
 ) -> CanonicalVllmLlm:
     if (
         type(config) is not CanonicalVllmConfig
-        or type(workload) not in (ESampRequestWorkload, InPlaceTTTWorkload)
+        or not isinstance(workload, (ESampRequestWorkload, InPlaceTTTWorkload))
     ):
         raise TypeError("canonical vLLM construction requires exact inputs")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
