@@ -20,8 +20,8 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `8a790ba` | — | after `e03816d` |
-| Counted production/support source | 88,486 lines | -44,724 lines | -2,840 lines |
+| Commit | `76a0cf9` | — | after `e03816d` |
+| Counted production/support source | 82,591 lines | -50,619 lines | -8,735 lines |
 | Pytest collection | 1 item | -1,348 items | -10 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -194,15 +194,33 @@ The import-layer rules no longer contain a producer layer.  Grep for
 examples and typing configs.  Under `SOURCE_LOC`, this checkpoint is
 `+19 / -2,559 / net -2,540`; `SOURCE_LOC` is now 88,486.
 
+The consumer and kit deletion in `b3af0d4` removed the tracked `tllm/consumers`
+and `tllm/kit` packages, including the old ESamp/TLM/ReFT/Recirculation/
+OverRIDE/TTRL workload class hierarchy, compatibility export catalogs, old
+ReFT vLLM patch, shared alignment helpers and authoring-kit wrappers.  The
+remaining public/runtime tree no longer imports `tllm.consumers` or `tllm.kit`;
+survivor workload semantics must be rebuilt as compact canonical workload
+owners and public-path evidence, not restored under the deleted packages.
+Under `SOURCE_LOC`, this checkpoint is `+0 / -5,732 / net -5,732`;
+`SOURCE_LOC` is now 82,754.
+
+The gate cleanup in `76a0cf9` removed the deleted consumers/kit layer rules,
+strict typing includes, old consumer warning allowances and the recirculation
+consumer-specific region-authority visitor.  Static gates now fail on new
+warnings without preserving deleted consumer baselines, and the region gate
+tracks 16 live production files instead of missing retired files.  Basic typing
+baseline is rebased to 108 errors.  Under `SOURCE_LOC`, this checkpoint is
+`+7 / -170 / net -163`; `SOURCE_LOC` is now 82,591.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | 0 | 2,827 | 0 | -2,827 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
+| A — ledger and survivor extraction | 7 | 2,997 | 0 | -2,990 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 364 | 34,836 | 988 | -34,472 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain, producer/placement planners, dummy consumer re-export and recurrence FFI shim removed |
+| E — legacy authority removal | 364 | 40,568 | 988 | -40,204 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
@@ -220,9 +238,10 @@ Moves are recorded separately and never counted as deletion.
 | `tllm/workgraph` | deleted in `3da233b` | finite recurrence declarations moved | `tllm.contracts.recurrence` |
 | `tllm/program` | deleted in `3da233b` | none | canonical descriptors/workloads |
 | `tllm/schedule`, `tllm/workload` | delete remaining old authority in E/F | independent math/loaders only | canonical descriptors/workloads |
-| `tllm/consumers` | delete by workload in C/E | math, loaders, judge, environment | one canonical workload owner each |
-| `tllm/kit`, `tllm/ports` | delete in E | none after typed execution cutover | canonical contracts |
-| Rust non-canonical graph/schedule | prune in E/F | WorkGraph removed; remaining schedule/recurrence are pending audit | `rust/tllm_core/src/canonical` |
+| `tllm/consumers` | deleted in `b3af0d4` | survivor semantics to be rebuilt only in canonical owners | one canonical workload owner each |
+| `tllm/kit` | deleted in `b3af0d4` | none after typed execution cutover | canonical public factories |
+| `tllm/ports` | delete in E/F | none after typed execution cutover | canonical contracts |
+| Rust non-canonical graph/schedule | prune in E/F | WorkGraph, execution_plan and placement removed; remaining schedule/recurrence are pending audit | `rust/tllm_core/src/canonical` |
 | provisional `canonical/ptts/dense_page*` | replace in F | lifecycle invariants and CUDA kernels | PageBundle/generational arena |
 
 ## Workload cutover manifest
