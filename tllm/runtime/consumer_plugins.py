@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""Consumer plugin mechanism: typed specs, name registry, spec rebuild.
-
-Every consumer package exposes a ``register.py`` with a ``PLUGIN``
-(:class:`ConsumerPluginSpec`); this module maps names to those plugins so a
-consumer can be instantiated by name — from benchmarks and serving entry
-points, from the control plane, and from the cross-process bootstrap, which
-rebuilds consumers in the EngineCore child from JSON-safe specs.
-
-Builtin plugins are loaded by module path (no static import: consumers are
-leaves above the runtime); external plugins arrive via the
-``tllm.consumer_plugins`` entry-point group or ``register_consumer_plugin``.
-
-``tllm.consumers.registry`` / ``tllm.consumers.plugin`` re-export this
-surface for existing callers.
-"""
+"""Consumer plugin mechanism: typed specs, name registry, spec rebuild."""
 
 from __future__ import annotations
 
@@ -69,12 +55,7 @@ class _PluginModule(Protocol):
     PLUGIN: object
 
 
-_BUILTIN_PLUGIN_MODULES = {
-    name: f"tllm.consumers.{name}.register"
-    for name in (
-        "esamp",
-    )
-}
+_BUILTIN_PLUGIN_MODULES: dict[str, str] = {}
 _CONSUMER_PLUGINS: dict[str, ConsumerPluginSpec[Any, Any]] = {}
 _ENTRY_POINTS: dict[str, metadata.EntryPoint] | None = None
 

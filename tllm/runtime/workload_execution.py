@@ -169,7 +169,7 @@ if TYPE_CHECKING:
     from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
     from tllm.runtime.state import ResidualRuntimeState
     from tllm.runtime.workload_plugins import StaticBackendBindingEntry
-    from tllm.schedule import WorkloadCompilation
+    from tllm.schedule.coordinator import WorkloadCompilation
     from tllm.workload.frontend import WorkloadDeclaration
     from tllm.workload.region_compiler import RegionCallableArtifact
     from tllm.workload.region_compiler import TensorRegionCallable

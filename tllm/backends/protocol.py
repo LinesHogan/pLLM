@@ -76,7 +76,7 @@ if TYPE_CHECKING:
         OverlayVersionRef,
         OverlayVersionStore,
     )
-    from tllm.schedule import MainWorkloadTimeline
+    from tllm.schedule.contracts import MainWorkloadTimeline
 
 
 class PackedHiddenSnapshotSink(Protocol):

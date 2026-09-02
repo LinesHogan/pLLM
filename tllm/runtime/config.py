@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Shared runtime vocabulary, decoupled from any specific algorithm.
-
-ESamp-specific settings (layers, distiller dims/lr, model bank, intervention
-beta/backend) live in ``tllm.consumers.esamp.config.ESampConsumerConfig`` —
-not here.
-"""
+"""Shared runtime vocabulary, decoupled from any specific algorithm."""
 
 from __future__ import annotations
 

@@ -209,7 +209,7 @@ def publish_workload_compilation(
     """Publish an immutable result and activate only fully bound native plans."""
 
     if compilation is not None:
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
 
         if not isinstance(compilation, WorkloadCompilation):
             raise TypeError("workload compilation must be WorkloadCompilation or None")
@@ -393,7 +393,7 @@ def configure_runtime(
 
     Consumer-algorithm settings (distiller dims/lr/beta, model bank policy,
     training toggles, tracing) are NOT accepted here — they belong to each
-    consumer's own config (e.g. ``ESampConsumerConfig``), applied via the
+    consumer's own config, applied via the
     consumer's support workflow.
     """
     cfg = RUNTIME.config

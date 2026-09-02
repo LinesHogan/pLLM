@@ -93,9 +93,8 @@ if TYPE_CHECKING:
     from tllm.workload.staging import StagedPort
     from tllm.workload.frontend import PublishedModule
     from tllm.workload.host import HostOutput
-    from tllm.schedule import (
-        CompileOptions,
-        MainWorkloadTimeline,
+    from tllm.schedule.contracts import CompileOptions, MainWorkloadTimeline
+    from tllm.schedule.coordinator import (
         WorkloadCompilation,
         WorkloadCompilerCoordinator,
     )
@@ -747,7 +746,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._consumers: list[BaseConsumer[object]] = list(consumers)
         self._unadapted_workload_ids: list[str] = []
         self._native_workload_resources: dict[int, WorkloadRuntimeBinding] = {}
-        from tllm.schedule import CompileOptions
+        from tllm.schedule.contracts import CompileOptions
 
         self._workload_compile_options = CompileOptions(
             memory_budget_bytes=workload_memory_budget_bytes,
@@ -765,7 +764,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             workload_worker_specs
         )
         self._workload_compiler: "WorkloadCompilerCoordinator | None" = None
-        from tllm.schedule import PlanEpochAllocator
+        from tllm.schedule.coordinator import PlanEpochAllocator
 
         self._workload_epoch_allocator = PlanEpochAllocator()
         self._workload_compilation: WorkloadCompilation | None = None
@@ -1202,7 +1201,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         )
         import json
         from tllm import _core
-        from tllm.schedule import CompileOptions
+        from tllm.schedule.contracts import CompileOptions
         facts_json = json.dumps(
             {
                 "device": str(spec.device),
@@ -1257,7 +1256,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             raise RuntimeError(
                 "cannot rebuild a workload epoch with unresolved staged ports"
             )
-        from tllm.schedule import WorkloadCompilerCoordinator
+        from tllm.schedule.coordinator import WorkloadCompilerCoordinator
         from tllm.workload import declare_workload
 
         declarations = tuple(
@@ -1471,7 +1470,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         import json
 
         from tllm import _core
-        from tllm.schedule import CompileOptions
+        from tllm.schedule.contracts import CompileOptions
 
         requests_json = json.dumps(
             [request.to_wire() for request in typed_requests],
@@ -1926,7 +1925,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             )
         import json
 
-        from tllm.schedule import MainWorkloadTimeline
+        from tllm.schedule.contracts import MainWorkloadTimeline
 
         self.drain_pending_workload_finalizations()
         if self._pending_workload_finalizations:
@@ -1957,7 +1956,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 "workload compiler currently requires exactly one TP=1 worker timeline"
             )
         from tllm import _core
-        from tllm.schedule import CompileOptions
+        from tllm.schedule.contracts import CompileOptions
 
         timeline_payloads: list[Mapping[str, object]] = []
         normalized_options_json: list[str] = []

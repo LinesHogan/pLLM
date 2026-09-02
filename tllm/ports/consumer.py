@@ -2,8 +2,7 @@
 """Public consumer base class and fusion-group handle.
 
 Canonical home of ``BaseConsumer`` and ``FusionGroupHandle``. They are port
-contracts for runtime-owned consumer dispatch; ``tllm.consumers.base``
-re-exports them."""
+contracts for runtime-owned consumer dispatch."""
 
 from __future__ import annotations
 

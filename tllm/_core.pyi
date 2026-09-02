@@ -179,19 +179,6 @@ class PlacementSchedule:
     fusion_groups: list[list[str]]
     fusion_rejections: list[tuple[str, str]]
 
-class CompiledRecurrenceSchedule:
-    groups: list[list[str]]
-    execution_order: list[str]
-    kind: str
-    fusion_rejections: list[tuple[str, str, str]]
-
-def compile_recurrence_schedule(
-    ops: Sequence[object],
-    edges: Sequence[object],
-    internalized_edges: Sequence[str] | None = None,
-    max_rows: int = 2,
-) -> CompiledRecurrenceSchedule: ...
-
 class OperandKind:
     Seed: OperandKind
     RegionValue: OperandKind

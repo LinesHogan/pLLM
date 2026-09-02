@@ -1268,7 +1268,7 @@ class ControlPlane:
         reconstruction_specs: Iterable[Any] = (),
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
         from tllm.runtime.workload_plugins import WorkloadWorkerSpec
 
         if not isinstance(compilation, WorkloadCompilation):
@@ -1308,7 +1308,7 @@ class ControlPlane:
         reconstruction agrees with the parent-signed decision.  Callers must
         validate every reply before calling :meth:`commit_workload_compilation`.
         """
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
         from tllm.runtime.workload_plugins import WorkloadWorkerSpec
 
         if not isinstance(compilation, WorkloadCompilation):
@@ -1342,7 +1342,7 @@ class ControlPlane:
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Publish a previously prepared signed Region plan on every worker."""
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
 
         if not isinstance(compilation, WorkloadCompilation):
             raise TypeError("compilation must be WorkloadCompilation")
@@ -1370,7 +1370,7 @@ class ControlPlane:
         safe-point promotion.
         """
 
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
 
         if not isinstance(compilation, WorkloadCompilation):
             raise TypeError("compilation must be WorkloadCompilation")
@@ -1396,7 +1396,7 @@ class ControlPlane:
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Discard or roll back a prepared Region epoch on every worker."""
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
 
         if not isinstance(compilation, WorkloadCompilation):
             raise TypeError("compilation must be WorkloadCompilation")
@@ -1418,7 +1418,7 @@ class ControlPlane:
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Release retained prior epochs after a successful global commit."""
-        from tllm.schedule import WorkloadCompilation
+        from tllm.schedule.coordinator import WorkloadCompilation
 
         if not isinstance(compilation, WorkloadCompilation):
             raise TypeError("compilation must be WorkloadCompilation")

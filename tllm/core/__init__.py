@@ -15,7 +15,6 @@ from __future__ import annotations
 try:
     from tllm._core import (  # noqa: F401
         CompiledPlan,
-        CompiledRecurrenceSchedule,
         PlacementSchedule,
         PackedPrefillRowPlan,
         PrefillRowSpan,
@@ -24,7 +23,6 @@ try:
         RowPartition,
         SamplerPlan,
         compile_execution_plan,
-        compile_recurrence_schedule,
         compile_placement_schedule,
         localize_decode_positions,
         localize_decode_rows,
@@ -42,7 +40,6 @@ except ImportError as exc:  # pragma: no cover - build guard
 
 __all__ = [
     "CompiledPlan",
-    "CompiledRecurrenceSchedule",
     "PlacementSchedule",
     "PackedPrefillRowPlan",
     "PrefillRowSpan",
@@ -51,7 +48,6 @@ __all__ = [
     "RowPartition",
     "SamplerPlan",
     "compile_execution_plan",
-    "compile_recurrence_schedule",
     "compile_placement_schedule",
     "localize_decode_positions",
     "localize_decode_rows",

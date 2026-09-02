@@ -60,7 +60,7 @@ def tllm_general_plugin() -> None:
         print(
             f"tllm bootstrap: consumer(s) {list(spec.skipped_consumers)} have no registered "
             "builder and are LOST in this spawn-built child process; register them via "
-            "tllm.consumers.registry to make them reconstructable",
+            "tllm.runtime.consumer_plugins to make them reconstructable",
             file=sys.stderr,
         )
     apply_bootstrap_spec(spec)

@@ -271,27 +271,22 @@ def compile_recurrence(
         if requirements.prefer_ordered_row_fusion
         else None
     )
-    internalized = () if fusion is None else tuple(fusion.internalized_edges)
-    max_rows = 2 if fusion is None else int(fusion.max_rows)
-    from tllm import _core
-
     try:
-        rust = _core.compile_recurrence_schedule(
-            compiled_graph.ops,
-            compiled_graph.edges,
-            internalized,
-            max_rows,
+        schedule = (
+            compile_serial_schedule(compiled_graph)
+            if fusion is None
+            else compile_wavefront_schedule(
+                compiled_graph,
+                OrderedRowFusionCapability(
+                    internalized_edges=frozenset(
+                        DependenceKind(edge) for edge in fusion.internalized_edges
+                    ),
+                    max_rows=fusion.max_rows,
+                ),
+            )
         )
-    except (RuntimeError, ValueError) as exc:
+    except ValueError as exc:
         raise RecurrenceAdmissionError(str(exc)) from exc
-    schedule = RecurrenceSchedule(
-        groups=tuple(tuple(str(op_id) for op_id in group) for group in rust.groups),
-        kind=str(rust.kind),
-        fusion_rejections=tuple(
-            (str(source), str(target), str(reason))
-            for source, target, reason in rust.fusion_rejections
-        ),
-    )
     return CompiledRecurrence(
         graph=compiled_graph,
         schedule=schedule,

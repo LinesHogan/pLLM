@@ -7,8 +7,7 @@ process-wide default :class:`tllm.runtime.runtime.TllmRuntime`:
     runtime = TllmRuntime(consumers=[...])
     llm = runtime.make_llm(...)
 
-The legacy/runtime names (:class:`BaseConsumer`, :class:`TllmRuntime`,
-``default_runtime``) load lazily via
+The legacy/runtime names (:class:`TllmRuntime`, ``default_runtime``) load lazily via
 PEP 562 so that importing a native-stack subpackage (``tllm.workload``,
 ``tllm.schedule``) never pulls the runtime into a compiler-only process.  They
 are gone at legacy retirement.
@@ -19,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tllm.consumers.base import BaseConsumer
+    from tllm.ports.consumer import BaseConsumer
     from tllm.runtime.runtime import TllmRuntime, default_runtime
 
 
@@ -106,7 +105,7 @@ def _make_canonical_llm(
     return create_canonical_vllm_llm(workload, config)
 
 
-def register_consumer(consumer: BaseConsumer) -> None:
+def register_consumer(consumer: "BaseConsumer[object]") -> None:
     from tllm.runtime.runtime import default_runtime
 
     default_runtime().register_consumer(consumer)
@@ -119,10 +118,6 @@ def clear_consumers() -> None:
 
 
 def __getattr__(name: str) -> object:
-    if name == "BaseConsumer":
-        from tllm.consumers.base import BaseConsumer
-
-        return BaseConsumer
     if name in ("TllmRuntime", "default_runtime"):
         from tllm.runtime import runtime as _runtime
 
@@ -131,7 +126,6 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
-    "BaseConsumer",
     "TllmRuntime",
     "clear_consumers",
     "default_runtime",

@@ -21,7 +21,7 @@ from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
 
 if TYPE_CHECKING:
-    from tllm.schedule import ScheduleGraph
+    from tllm.schedule.contracts import ScheduleGraph
     from tllm.runtime.torch_adapter import CudaLongHostStaging
 
 

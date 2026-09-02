@@ -71,7 +71,6 @@ _RECURRENCE_HOT_FUNCTIONS = frozenset(
 
 _RECURRENCE_COMPILE_CALLS = frozenset(
     {
-        "compile_recurrence_schedule",
         "compile_typed_recurrence_plan",
         "compile_typed_recurrence_plan_json",
         "compile_typed_recurrence_stage_artifact",

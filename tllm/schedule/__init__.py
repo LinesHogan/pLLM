@@ -7,8 +7,6 @@ never pulls the legacy workgraph frontend (a ``tllm.schedule.physical``
 dependency, gone at legacy retirement) into a compiler-only process.
 """
 
-from typing import TYPE_CHECKING, Any
-
 from tllm.schedule.contracts import (
     AffineRegionSchedule,
     AsyncBatchCaptureMode,
@@ -71,49 +69,6 @@ from tllm.schedule.contracts import (
     TimelineAnchor,
 )
 
-if TYPE_CHECKING:
-    from tllm.schedule.compiler import compile_schedule, validate_schedule
-    from tllm.schedule.coordinator import (
-        WorkloadCompilation,
-        WorkloadCompilerCoordinator,
-        WorkloadDecisionCacheError,
-        PlanEpochAllocator,
-        install_workload_compilation,
-        workload_compilation_cache_key,
-    )
-    from tllm.schedule.physical import (
-        executor_key_for_implementation,
-        executor_key_for_region,
-        lower_physical_flow_plan,
-    )
-
-
-def __getattr__(name: str) -> Any:
-    if name in {"compile_schedule", "validate_schedule"}:
-        from tllm.schedule import compiler
-
-        return getattr(compiler, name)
-    if name in {
-        "executor_key_for_implementation",
-        "executor_key_for_region",
-        "lower_physical_flow_plan",
-    }:
-        from tllm.schedule import physical
-
-        return getattr(physical, name)
-    if name in {
-        "WorkloadCompilation",
-        "WorkloadCompilerCoordinator",
-        "WorkloadDecisionCacheError",
-        "PlanEpochAllocator",
-        "install_workload_compilation",
-        "workload_compilation_cache_key",
-    }:
-        from tllm.schedule import coordinator
-
-        return getattr(coordinator, name)
-    raise AttributeError(f"module 'tllm.schedule' has no attribute {name!r}")
-
 __all__ = [
     "AffineRegionSchedule",
     "AsyncBatchCaptureMode",
@@ -174,15 +129,4 @@ __all__ = [
     "TaskPlacement",
     "TaskTiming",
     "TimelineAnchor",
-    "WorkloadCompilation",
-    "WorkloadCompilerCoordinator",
-    "WorkloadDecisionCacheError",
-    "PlanEpochAllocator",
-    "compile_schedule",
-    "executor_key_for_implementation",
-    "executor_key_for_region",
-    "install_workload_compilation",
-    "lower_physical_flow_plan",
-    "validate_schedule",
-    "workload_compilation_cache_key",
 ]

@@ -5,5 +5,5 @@ Composition root for cross-process bootstrap: this package is the ONE place
 in ``tllm/runtime`` that may import the consumer registry, because wiring the
 consumer side into the child process is precisely its job. Everything else in
 ``tllm/runtime`` keeps the runtime→consumers boundary (only
-``tllm.consumers.base`` is allowed).
+``tllm.ports.consumer`` is allowed).
 """

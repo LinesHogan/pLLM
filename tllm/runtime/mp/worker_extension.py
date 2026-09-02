@@ -42,8 +42,9 @@ if TYPE_CHECKING:
         WorkloadExecutionBindings,
     )
     from tllm.runtime.vllm_patch.port_runtime_hooks import RuntimeHookTransaction
-    from tllm.schedule import ScheduleGraph, WorkloadCompilation
     from tllm.schedule.contracts import ScheduleDecision
+    from tllm.schedule.contracts import ScheduleGraph
+    from tllm.schedule.coordinator import WorkloadCompilation
 
 
 class _WorkerView(Protocol):
@@ -1029,7 +1030,7 @@ class TllmWorkerExtension:
 
         from tllm.runtime import residual_runtime as core
         from tllm.runtime.workload_execution import build_native_workload_execution
-        from tllm.schedule import install_workload_compilation
+        from tllm.schedule.coordinator import install_workload_compilation
         from tllm.runtime.workload_plugins import (
             WorkloadWorkerSpec,
             reconstruct_worker_bindings,

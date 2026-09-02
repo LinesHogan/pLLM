@@ -32,7 +32,8 @@ from tllm.runtime.stats import PlacementStats
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
 
 if TYPE_CHECKING:
-    from tllm.schedule import ScheduleGraph, WorkloadCompilation
+    from tllm.schedule.contracts import ScheduleGraph
+    from tllm.schedule.coordinator import WorkloadCompilation
     from tllm.runtime.workload_execution import (
         NativeWorkloadExecution,
         NativeWorkloadExecutionStore,

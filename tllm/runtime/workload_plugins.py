@@ -32,10 +32,8 @@ if TYPE_CHECKING:
     from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
     from tllm.runtime.specialization import RuntimeSpecializationSpec
     from tllm.runtime.workload_execution import WorkloadExecutionBindings
-    from tllm.schedule import (
-        ResidualResourceBinding,
-        WorkloadCompilation,
-    )
+    from tllm.schedule.contracts import ResidualResourceBinding
+    from tllm.schedule.coordinator import WorkloadCompilation
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +163,7 @@ def residual_resource_manifest_from_paths(
 ) -> tuple["ResidualResourceBinding", ...]:
     """Mechanically encode INDEX hidden locators as signed resource bindings."""
 
-    from tllm.schedule import HiddenPhase, HiddenSite, ResidualResourceBinding
+    from tllm.schedule.contracts import HiddenPhase, HiddenSite, ResidualResourceBinding
 
     entries: list[ResidualResourceBinding] = []
     for locator, module_path in paths.items():
