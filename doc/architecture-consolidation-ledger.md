@@ -20,12 +20,12 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `e47fbaf` | — | after `e03816d` |
-| Counted production/support source | 91,037 lines | -42,173 lines | -289 lines |
-| Pytest collection | 9 items | -1,340 items | -2 items |
+| Commit | `18e1686` | — | after `e03816d` |
+| Counted production/support source | 91,026 lines | -42,184 lines | -300 lines |
+| Pytest collection | 1 item | -1,348 items | -10 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 16 items | now below the 50-item ceiling | -2 items |
+| Visible `TEST_COUNT` | 8 items | now below the 50-item ceiling | -10 items |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -168,15 +168,28 @@ test names, old typing fixture, `dispatch_legacy_runtime_event` and
 `build_runtime_context` is empty.  Under `SOURCE_LOC`, this checkpoint is
 `+11 / -300 / net -289`; `SOURCE_LOC` is now 91,037.
 
+The coupled core-unit evidence prune in `18e1686` deleted the remaining
+`test/core` pytest files and the `tllm.consumers.dummy` compatibility
+re-export.  The deleted Python unit tests were tied to provisional DTO shapes,
+fixture construction and internal workload class paths; their successor
+evidence must be rebuilt only as compact public-path survivor checks named in
+section 5.3, not restored as per-module unit coverage.  Pytest collection is
+now the single CUDA dense-page survivor base; the four standalone GPU smokes
+remain outside pytest.  Grep for `tllm.consumers.dummy`, `test/core`,
+`test_canonical`, `BaseConsumer`, `DispatchPlan` and
+`dispatch_legacy_runtime_event` is empty across production, tests, tools and
+examples.  Under `SOURCE_LOC`, this checkpoint is
+`+1 / -12 / net -11`; `SOURCE_LOC` is now 91,026.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | 0 | 2,827 | 0 | -2,827 | active: stale consumer/duplicate tests pruned; pytest 9, Rust 3, standalone smokes 4 |
+| A — ledger and survivor extraction | 1 | 4,609 | 0 | -4,608 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 344 | 32,265 | 988 | -31,921 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain and recurrence FFI shim removed |
+| E — legacy authority removal | 345 | 32,277 | 988 | -31,932 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
