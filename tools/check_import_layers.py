@@ -13,7 +13,7 @@ Target direction (a package may import only the packages listed in RULES)::
                      ← ports ← common
                          ← workgraph ← runtime
     backends (contracts/ports/workgraph only; runtime types arrive via protocols)
-    consumers / workflows: leaves, may import anything below
+    workflows: leaf entry points, may import anything below
 
 The workload compiler has two deliberately narrow bridges, declared in
 ``EXACT_MODULE_EDGES`` rather than at package scope:
@@ -76,16 +76,6 @@ RULES: dict[str, frozenset[str]] = {
     # but the runtime must never import a concrete driver (only the pure
     # protocol module, via SANCTIONED_EDGES).
     "backends": frozenset({"contracts", "ports", "workgraph", "runtime", "core"}),
-    # Author-facing ergonomics kit: composes the public DSL facade, the
-    # runtime plugin contracts, and common codecs.  Nothing below imports it,
-    # so it can never become a hidden dependency of the compiler or runtime.
-    "kit": frozenset({"contracts", "common", "ports", "runtime", "workload", "core"}),
-    "consumers": frozenset(
-        {
-            "contracts", "ports", "common", "workgraph",
-            "runtime", "kit", "core",
-        }
-    ),
     "workflows": None,  # leaf entry points: may import anything
     # Script helpers used by workflows/starter/gpu scripts.
     "util": None,
@@ -97,9 +87,6 @@ SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("runtime", "tllm.backends.protocol"),
         ("workgraph", "tllm.backends.protocol"),
-        # Consumer binders reach concrete backend drivers only through the
-        # protocol seam (runner binding -> driver), never via driver modules.
-        ("consumers", "tllm.backends.protocol"),
     }
 )
 
@@ -161,14 +148,6 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.runtime.runtime", "tllm.schedule.contracts"),
         ("tllm.runtime.runtime", "tllm.schedule.coordinator"),
         ("tllm.runtime.runtime", "tllm.workload"),
-        # Leaf workload implementations may use only the public DSL facade.
-        ("tllm.consumers.esamp.workload", "tllm.workload"),
-        ("tllm.consumers.override.workload", "tllm.workload"),
-        ("tllm.consumers.recirculation.native_backend", "tllm.workload"),
-        ("tllm.consumers.recirculation.workload", "tllm.workload"),
-        ("tllm.consumers.reft.workload", "tllm.workload"),
-        ("tllm.consumers.ttrl.workload", "tllm.workload"),
-        ("tllm.consumers.tlm.workload", "tllm.workload"),
     }
 )
 

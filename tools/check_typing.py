@@ -43,17 +43,8 @@ WORKLOAD_SURFACE = tuple(
     path.relative_to(REPO_ROOT)
     for path in sorted((REPO_ROOT / "tllm" / "workload").glob("*.py"))
 )
-AUTHOR_SURFACE = (*WORKLOAD_SURFACE,
-    Path("tllm/kit/backend.py"),
-    Path("tllm/kit/workload.py"),
-    Path("tllm/consumers/esamp/workload.py"),
-    Path("tllm/consumers/override/workload.py"),
-    Path("tllm/consumers/reft/workload.py"),
-    Path("tllm/consumers/ttrl/workload.py"),
-    Path("tllm/consumers/tlm/workload.py"),
-    Path("tllm/consumers/recirculation/workload.py"),
-    Path("tllm/consumers/recirculation/stage_definition.py"),
-    Path("tllm/consumers/recirculation/stage_binding.py"),
+AUTHOR_SURFACE = (
+    *WORKLOAD_SURFACE,
     Path("tllm/backends/vllm/packed_hidden_capture.py"),
     Path("tllm/backends/vllm/typed_layer_replay.py"),
     Path("tllm/runtime/backend_region_binders.py"),
@@ -148,13 +139,9 @@ DYNAMIC_BOUNDARY_ALLOWLIST = frozenset(
     }
 )
 
-# Basic-tier warnings are not mixed into the historical error baseline. These
-# two exact legacy categories are separately only-decrease; new files/rules or
-# a larger count fail. ``--rebase`` deliberately cannot update this map.
-BASIC_WARNING_BASELINE = {
-    ("tllm/consumers/_common/bundle_inputs.py", "reportInvalidTypeVarUse"): 1,
-    ("tllm/consumers/esamp/__init__.py", "reportUnsupportedDunderAll"): 9,
-}
+# Basic-tier warnings are not mixed into the historical error baseline. New
+# warnings fail; ``--rebase`` deliberately cannot add warning allowances.
+BASIC_WARNING_BASELINE: dict[tuple[str, str], int] = {}
 
 
 class _TypingRuleVisitor(ast.NodeVisitor):

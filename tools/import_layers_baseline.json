@@ -22,27 +22,10 @@
       "core",
       "ports"
     ],
-    "consumers": [
-      "common",
-      "contracts",
-      "core",
-      "kit",
-      "ports",
-      "runtime",
-      "workgraph"
-    ],
     "contracts": [
       "core"
     ],
     "core": [],
-    "kit": [
-      "common",
-      "contracts",
-      "core",
-      "ports",
-      "runtime",
-      "workload"
-    ],
     "ports": [
       "contracts",
       "core"
@@ -65,13 +48,6 @@
     "workload": [],
     "exact_module_edges": [
       "tllm.backends.timeline -> tllm.schedule.timeline",
-      "tllm.consumers.esamp.workload -> tllm.workload",
-      "tllm.consumers.override.workload -> tllm.workload",
-      "tllm.consumers.recirculation.native_backend -> tllm.workload",
-      "tllm.consumers.recirculation.workload -> tllm.workload",
-      "tllm.consumers.reft.workload -> tllm.workload",
-      "tllm.consumers.tlm.workload -> tllm.workload",
-      "tllm.consumers.ttrl.workload -> tllm.workload",
       "tllm.runtime.mp.control -> tllm.schedule.coordinator",
       "tllm.runtime.mp.worker_extension -> tllm.schedule.contracts",
       "tllm.runtime.mp.worker_extension -> tllm.schedule.coordinator",
@@ -112,7 +88,6 @@
       "tllm.workload.staging -> tllm.contracts.workload_ports"
     ],
     "sanctioned_edges": [
-      "consumers -> tllm.backends.protocol",
       "runtime -> tllm.backends.protocol",
       "workgraph -> tllm.backends.protocol"
     ]

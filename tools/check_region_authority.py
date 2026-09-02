@@ -13,7 +13,6 @@ Usage: ``.venv/bin/python tools/check_region_authority.py``.
 
 from __future__ import annotations
 
-import ast
 import re
 import sys
 from dataclasses import dataclass
@@ -49,34 +48,6 @@ NATIVE_BINDING_FILES = (
     Path("tllm/runtime/mp/worker_extension.py"),
     Path("tllm/runtime/workload_plugins.py"),
     Path("tllm/backends/vllm/typed_layer_replay.py"),
-)
-
-# Workload names are expected in these native implementations, so they use a
-# narrower AST gate. Cold declaration code may ask Rust to compile an artifact;
-# execution, backend staging, and worker reconstruction may only load or bind
-# an artifact that is already signed.
-RECURRENCE_AUTHORITY_FILES = (
-    Path("tllm/consumers/recirculation/native_backend.py"),
-    Path("tllm/consumers/recirculation/workload.py"),
-)
-
-_RECURRENCE_HOT_FUNCTIONS = frozenset(
-    {
-        "_stage_typed_recirculation",
-        "replay",
-        "bind_prefill",
-        "reconstruct",
-    }
-)
-
-_RECURRENCE_COMPILE_CALLS = frozenset(
-    {
-        "compile_typed_recurrence_plan",
-        "compile_typed_recurrence_plan_json",
-        "compile_typed_recurrence_stage_artifact",
-        "compile_typed_recurrence_stage_artifact_json",
-        "compile_typed_recurrence_stage_artifact_bundle_json",
-    }
 )
 
 PHYSICAL_FILES = frozenset(
@@ -205,94 +176,6 @@ def _line_violations(path: Path, source: str) -> list[Violation]:
     return violations
 
 
-def _call_leaf(call: ast.Call) -> str:
-    function = call.func
-    if isinstance(function, ast.Name):
-        return function.id
-    if isinstance(function, ast.Attribute):
-        return function.attr
-    return ""
-
-
-def _recurrence_hot_path_violations(path: Path, source: str) -> list[Violation]:
-    """Reject recurrence compilation or artifact parsing on native hot paths."""
-
-    try:
-        tree = ast.parse(source, filename=str(path))
-    except SyntaxError as exc:
-        return [
-            Violation(
-                path,
-                exc.lineno or 0,
-                "production recurrence authority file does not parse",
-                exc.msg,
-            )
-        ]
-
-    violations: list[Violation] = []
-
-    class Visitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self.functions: list[str] = []
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self.functions.append(node.name)
-            self.generic_visit(node)
-            self.functions.pop()
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Call(self, node: ast.Call) -> None:
-            current = self.functions[-1] if self.functions else ""
-            leaf = _call_leaf(node)
-            if current in _RECURRENCE_HOT_FUNCTIONS and (
-                leaf in _RECURRENCE_COMPILE_CALLS
-                or leaf
-                in {
-                    "build_recirculation_graph",
-                    "build_stage_definitions",
-                    "compile",
-                    "_stage_artifact_spec",
-                    "_bound_stage_facts",
-                    "bind_typed_recurrence_stage",
-                }
-            ):
-                violations.append(
-                    Violation(
-                        path,
-                        node.lineno,
-                        "native recurrence hot path may not compile or rebuild an artifact",
-                        ast.get_source_segment(source, node) or leaf,
-                    )
-                )
-            if current in _RECURRENCE_HOT_FUNCTIONS and leaf in {"loads", "from_wire"}:
-                violations.append(
-                    Violation(
-                        path,
-                        node.lineno,
-                        "native recurrence hot path may not parse an artifact bundle",
-                        ast.get_source_segment(source, node) or leaf,
-                    )
-                )
-            self.generic_visit(node)
-
-        def visit_Attribute(self, node: ast.Attribute) -> None:
-            current = self.functions[-1] if self.functions else ""
-            if current in _RECURRENCE_HOT_FUNCTIONS and node.attr == "phases":
-                violations.append(
-                    Violation(
-                        path,
-                        node.lineno,
-                        "native recurrence hot path may not infer admission from row phases",
-                        ast.get_source_segment(source, node) or node.attr,
-                    )
-                )
-            self.generic_visit(node)
-
-    Visitor().visit(tree)
-    return violations
-
-
 def _native_binding_violations(path: Path, source: str) -> list[Violation]:
     """Apply physical no-redecision checks to native worker/backend binders."""
 
@@ -333,18 +216,6 @@ def collect(root: Path = REPO_ROOT) -> list[Violation]:
             continue
         violations.extend(
             _line_violations(relative_path, path.read_text(encoding="utf-8")))
-    for relative_path in RECURRENCE_AUTHORITY_FILES:
-        path = root / relative_path
-        if not path.is_file():
-            violations.append(
-                Violation(relative_path, 0, "authority file is missing", "")
-            )
-            continue
-        violations.extend(
-            _recurrence_hot_path_violations(
-                relative_path, path.read_text(encoding="utf-8")
-            )
-        )
     for relative_path in NATIVE_BINDING_FILES:
         path = root / relative_path
         if not path.is_file():
@@ -366,7 +237,7 @@ def main() -> int:
         print(
             "OK Region authority gate "
             "("
-            f"{len(AUTHORITY_FILES) + len(RECURRENCE_AUTHORITY_FILES) + len(NATIVE_BINDING_FILES)} "
+            f"{len(AUTHORITY_FILES) + len(NATIVE_BINDING_FILES)} "
             "production files)"
         )
         return 0
