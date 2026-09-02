@@ -20,9 +20,9 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since FTTT checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `d59920f` | — | after `753bdfd` |
+| Commit | `3c91d04` | — | after `753bdfd` |
 | Production/support source | 126,745 lines | -6,465 lines | -5,228 lines |
-| Pytest collection | 1,306 items | -43 items | -27 items |
+| Pytest collection | 1,295 items | -54 items | -38 items |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -54,12 +54,18 @@ region-authority, native import-boundary and getattr-baseline wrappers.  These
 were pytest shells around static gates or import discipline, not numerical,
 state, runtime, loss/update/version or cleanup oracles.  The corresponding
 static gates remain directly executable and do not count as behavioral evidence.
+The follow-up decorative legacy test cleanup in `3c91d04` deleted five more
+test files and reduced pytest collection by 11 items, from 1,306 to 1,295.  The
+deleted files covered import-boundary subprocess checks, MRv1/MRv2 shadow
+compatibility matrices, registry/plugin shells, enum/catalog mappings and
+facade identity.  They did not contain numerical, state, loss/update, version,
+cleanup, GPU or survivor evidence.
 
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | — | — | — | — | active: static meta-test cleanup |
+| A — ledger and survivor extraction | — | — | — | — | active: static/decorative test cleanup; pytest collection -54 |
 | B — canonical vertical compression | 4,418 | 9,950 | 0 | -5,532 | active: canonical runtime attachments, ESamp task merge and boundary gate repair |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 0 | 21 | 0 | -21 | active: backend import frontier cleanup; seam rewrite still pending |
