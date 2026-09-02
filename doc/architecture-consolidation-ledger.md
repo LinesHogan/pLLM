@@ -20,8 +20,8 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `71afa2e` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `7b01440` | — | after `71afa2e` |
-| Counted production/support source | 96,589 lines | -36,621 lines | -26,658 lines |
+| Commit | `0fde70c` | — | after `71afa2e` |
+| Counted production/support source | 93,803 lines | -39,407 lines | -29,444 lines |
 | Pytest collection | 11 items | -1,338 items | -1,274 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -125,6 +125,21 @@ protected by old consumer-path tests; when their production owners are cut over,
 their survivor evidence must be added as compact canonical workload oracles,
 not restored as `test/consumers` compatibility tests.
 
+The consumer-compat and recurrence-shim prune in `0fde70c` removed ESamp's
+old `BaseConsumer`/Program runtime island, deleted the consumer
+base/plugin/registry re-export modules, removed the compatibility-only Rust
+`compile_recurrence_schedule` FFI and `CompiledRecurrenceSchedule` stub, and
+closed the `tllm.schedule` top-level coordinator/compiler re-export door.
+Runtime schedule bridges now point at the actual owner modules and the
+import-layer baseline records those exact bridges instead of allowing the
+root facade.  Under `SOURCE_LOC`, this checkpoint is
+`+63 / -2,849 / net -2,786`; `SOURCE_LOC` is now 93,803.  Probe imports for
+`tllm.consumers.base`, `tllm.consumers.registry`,
+`tllm.consumers.plugin`, `tllm.consumers.esamp.config`,
+`tllm.consumers.esamp.engine`,
+`tllm.consumers.esamp.sampler_provider` and
+`tllm.consumers.esamp.initializers` all return `None`.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -133,7 +148,7 @@ not restored as `test/consumers` compatibility tests.
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 275 | 507 | 0 | -232 | active: backend event seam and vLLM WorkGraph cold handoff removed; seam rewrite still pending |
-| E — legacy authority removal | 201 | 26,859 | 988 | -26,658 | active: Program and old WorkGraph packages removed; runtime shadow/deferred/adaptive/distributed residuals pruned |
+| E — legacy authority removal | 264 | 29,708 | 988 | -29,444 | active: Program, old WorkGraph, consumer compat island and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
