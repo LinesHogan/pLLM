@@ -35,6 +35,7 @@ class AttachmentTopology(StrEnum):
 
 class AttachmentKind(StrEnum):
     REQUEST_SAMPLER_TRAINING = "request_sampler_training"
+    DENSE_PARAMETER_OVERLAY = "dense_parameter_overlay"
 
 
 class AttachmentGraphMode(StrEnum):
@@ -49,6 +50,16 @@ class AttachmentCleanupStage(StrEnum):
     REQUEST_FINISH = "request_finish"
 
 
+class AttachmentOverlayStage(StrEnum):
+    PIN = "pin"
+    APPLY = "apply"
+    CAPTURE = "capture"
+    TRANSITION = "transition"
+    PUBLISH = "publish"
+    RELEASE = "release"
+    FINISH = "finish"
+
+
 class StreamDependency(StrEnum):
     HIDDEN_PRODUCER_TO_COMPUTE = "hidden_producer_to_compute"
     COMPUTE_TO_SAMPLER = "compute_to_sampler"
@@ -59,6 +70,7 @@ class StreamDependency(StrEnum):
 class AttachmentTaskRole(StrEnum):
     COMPUTE = "compute"
     TRANSITION = "transition"
+    PUBLISH = "publish"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +109,23 @@ class AttachmentTaskBinding:
             or int(self.anchor_id) < 0
         ):
             raise ValueError("attachment task binding is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentOverlayStageAnchor:
+    stage: AttachmentOverlayStage
+    anchor_id: AnchorId
+    anchor_symbol: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.stage) is not AttachmentOverlayStage
+            or type(self.anchor_id) is not int
+            or int(self.anchor_id) < 0
+            or type(self.anchor_symbol) is not str
+            or not self.anchor_symbol
+        ):
+            raise ValueError("attachment overlay stage anchor is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +191,6 @@ class BackendPlacementProbe:
                 type(resource) is not AttachmentHiddenResource
                 for resource in self.hidden_resources
             )
-            or not self.hidden_resources
             or tuple(sorted(resource_keys)) != resource_keys
             or len(set(resource_keys)) != len(resource_keys)
             or type(self.capabilities) is not tuple
@@ -208,6 +236,8 @@ class BackendAttachmentRequest:
     state_representation_signature: str
     execution_parameters_digest: str
     capabilities: tuple[str, ...]
+    overlay_field_ids: tuple[int, ...] = ()
+    overlay_stage_anchors: tuple[AttachmentOverlayStageAnchor, ...] = ()
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -242,6 +272,7 @@ class BackendAttachmentRequest:
             if dependency in self.stream_dependencies
         )
         binding_roles = tuple(binding.role for binding in self.task_bindings)
+        overlay_stages = tuple(stage.stage for stage in self.overlay_stage_anchors)
         if (
             type(self.adapter_id) is not str
             or not self.adapter_id
@@ -261,16 +292,27 @@ class BackendAttachmentRequest:
                 type(resource) is not AttachmentHiddenResource
                 for resource in self.hidden_resources
             )
-            or not self.hidden_resources
             or tuple(sorted(resource_keys)) != resource_keys
             or len(set(resource_keys)) != len(resource_keys)
+            or (
+                self.attachment_kind is AttachmentKind.REQUEST_SAMPLER_TRAINING
+                and not self.hidden_resources
+            )
             or type(self.task_bindings) is not tuple
             or any(
                 type(binding) is not AttachmentTaskBinding
                 for binding in self.task_bindings
             )
-            or binding_roles
-            != (AttachmentTaskRole.COMPUTE, AttachmentTaskRole.TRANSITION)
+            or (
+                self.attachment_kind is AttachmentKind.REQUEST_SAMPLER_TRAINING
+                and binding_roles
+                != (AttachmentTaskRole.COMPUTE, AttachmentTaskRole.TRANSITION)
+            )
+            or (
+                self.attachment_kind is AttachmentKind.DENSE_PARAMETER_OVERLAY
+                and binding_roles
+                != (AttachmentTaskRole.TRANSITION, AttachmentTaskRole.PUBLISH)
+            )
             or type(self.sampler_anchor_id) is not int
             or int(self.sampler_anchor_id) < 0
             or type(self.sampler_anchor_symbol) is not str
@@ -309,6 +351,34 @@ class BackendAttachmentRequest:
             or tuple(sorted(self.capabilities)) != self.capabilities
             or len(set(self.capabilities)) != len(self.capabilities)
             or any(not capability for capability in self.capabilities)
+            or type(self.overlay_field_ids) is not tuple
+            or any(type(field_id) is not int or field_id < 0 for field_id in self.overlay_field_ids)
+            or len(self.overlay_field_ids) != len(set(self.overlay_field_ids))
+            or type(self.overlay_stage_anchors) is not tuple
+            or any(
+                type(stage) is not AttachmentOverlayStageAnchor
+                for stage in self.overlay_stage_anchors
+            )
+            or (
+                self.attachment_kind is AttachmentKind.REQUEST_SAMPLER_TRAINING
+                and (self.overlay_field_ids or self.overlay_stage_anchors)
+            )
+            or (
+                self.attachment_kind is AttachmentKind.DENSE_PARAMETER_OVERLAY
+                and (
+                    not self.overlay_field_ids
+                    or overlay_stages
+                    != (
+                        AttachmentOverlayStage.PIN,
+                        AttachmentOverlayStage.APPLY,
+                        AttachmentOverlayStage.CAPTURE,
+                        AttachmentOverlayStage.TRANSITION,
+                        AttachmentOverlayStage.PUBLISH,
+                        AttachmentOverlayStage.RELEASE,
+                        AttachmentOverlayStage.FINISH,
+                    )
+                )
+            )
             or type(self.schema_version) is not int
             or self.schema_version != 1
         ):
@@ -412,6 +482,8 @@ __all__ = [
     "AttachmentGraphMode",
     "AttachmentKind",
     "AttachmentHiddenResource",
+    "AttachmentOverlayStage",
+    "AttachmentOverlayStageAnchor",
     "AttachmentSamplerStage",
     "AttachmentTaskBinding",
     "AttachmentTaskRole",

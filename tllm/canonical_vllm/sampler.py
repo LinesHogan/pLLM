@@ -38,10 +38,7 @@ class SignedPostFilterGuidance:
 
     def __post_init__(self) -> None:
         if (
-            type(self.guidance) is not PackedSamplerGuidanceBatch
-            or type(self.beta) is not float
-            or self.beta < 0.0
-            or type(self.pred_dense_logits) is not torch.Tensor
+            self.beta < 0.0
             or self.pred_dense_logits.ndim != 2
             or int(self.pred_dense_logits.shape[0])
             != len(self.guidance.affected_row_ids)
@@ -120,8 +117,6 @@ class CanonicalVllm027PostFilterSampler(Sampler):
     def begin_guidance(self, guidance: SignedPostFilterGuidance) -> None:
         """Open one signed guidance transaction before the vLLM draw."""
 
-        if type(guidance) is not SignedPostFilterGuidance:
-            raise TypeError("canonical sampler requires signed post-filter guidance")
         match self._active_guidance:
             case _NoActiveGuidance():
                 self._active_guidance = _PreparedGuidance(guidance)

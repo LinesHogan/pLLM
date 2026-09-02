@@ -5,7 +5,6 @@
     "tllm/runtime/vllm_patch",
     "tllm/backends",
     "tllm/canonical",
-    "tllm/canonical_runtime",
     "tllm/canonical_vllm",
     "tllm/contracts",
     "tllm/ports",

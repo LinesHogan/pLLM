@@ -20,7 +20,6 @@ from tllm.ports.address import port_address_desc
 from tllm.ports.base import PortKind
 from tllm.ports.residual_stream import ResidualLocator, ResidualStream
 from tllm.runtime import residual_runtime as esamp_runtime
-from tllm.workflows import esamp_support
 from tllm.workgraph.frontend import (
     CaptureStatus,
     CapturedFlow,
@@ -394,15 +393,27 @@ class ESampConsumerContractUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "row count"):
             consumer.consume_bundle(bundle, ctx)
 
-    def test_configure_esamp_runtime_installs_esamp_consumer(self) -> None:
-        esamp_support.configure_esamp_runtime(
+    def test_direct_runtime_installs_esamp_consumer(self) -> None:
+        consumer = ESampConsumer(
+            ESampConsumerConfig(
+                graph_scratch_rows=64,
+                source_layer_path="model.model.layers[0]",
+                target_layer_path="model.model.layers[-1]",
+                enable_esamp_training=True,
+                distiller_hidden_dim=128,
+                distiller_lr=1e-3,
+            )
+        )
+        esamp_runtime.set_runtime_consumer(consumer)
+        esamp_runtime.configure_runtime(
             graph_scratch_rows=64,
-            tap_layer_paths=["model.model.layers[0]", "model.model.layers[-1]"],
+            tap_layer_paths=("model.model.layers[0]", "model.model.layers[-1]"),
             source_layer_path="model.model.layers[0]",
             target_layer_path="model.model.layers[-1]",
-            enable_esamp_training=True,
-            distiller_hidden_dim=128,
-            distiller_lr=1e-3,
+            adaptation_pipeline_slots=4,
+            adaptation_stream_mode="dual",
+            adaptation_stream_priority=0,
+            compact_capture_lane=False,
         )
         self.assertIsInstance(esamp_runtime.RUNTIME.consumer, ESampConsumer)
         self.assertIsNotNone(esamp_runtime.RUNTIME.dispatch_plan)
@@ -416,10 +427,6 @@ class ESampConsumerContractUnitTest(unittest.TestCase):
         targets = esamp_runtime.RUNTIME.dispatch_plan.flow_targets()
         self.assertTrue(targets)
         self.assertIs(targets[0].consumer, esamp_runtime.RUNTIME.consumer)
-
-    def test_configure_esamp_runtime_never_routes_native_to_legacy(self) -> None:
-        with self.assertRaisesRegex(ValueError, "cannot install a native"):
-            esamp_support.configure_esamp_runtime(implementation="native")
 
 
 if __name__ == "__main__":

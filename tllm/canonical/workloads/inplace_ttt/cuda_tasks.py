@@ -25,15 +25,14 @@ from tllm.canonical.ptts.request_state import (
 from tllm.canonical.workloads.inplace_ttt.layout import InPlaceTTTStateLayout
 from tllm.canonical.workloads.inplace_ttt.tasks import (
     InPlaceTTTComputedTransition,
+    build_inplace_ttt_step_result,
     compute_inplace_ttt_transition,
 )
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTConfig,
     InPlaceTTTStepBatch,
     InPlaceTTTStepBatchResult,
-    InPlaceTTTStepResult,
 )
-from tllm.contracts.parameter_overlay import ParameterOverlayPublication
 from tllm.contracts.semantic_graph import ImplementationId
 
 
@@ -161,12 +160,13 @@ class CudaInPlaceTTTTransitionTask:
             context.transition = CudaInPlaceTTTNoTransition(
                 InPlaceTTTStepBatchResult(
                     tuple(
-                        InPlaceTTTStepResult(
-                            entry.identity,
+                        build_inplace_ttt_step_result(
+                            entry,
                             context.selection.refs[index],
                             context.selection.refs[index],
                             computed.targets,
-                            None,
+                            self._layout.overlay_bindings,
+                            weight_changed=False,
                         )
                         for index, (entry, computed) in enumerate(
                             zip(context.batch.entries, entries, strict=True)
@@ -240,28 +240,24 @@ class CudaInPlaceTTTPublishTask:
                     transition.before: transition.after
                     for transition in logical.transitions
                 }
-                results = tuple(
-                    InPlaceTTTStepResult(
-                        entry.identity,
-                        context.selection.refs[index],
-                        after_by_before.get(
+                result = InPlaceTTTStepBatchResult(
+                    tuple(
+                        build_inplace_ttt_step_result(
+                            entry,
                             context.selection.refs[index],
-                            context.selection.refs[index],
-                        ),
-                        computed.targets,
-                        ParameterOverlayPublication(
-                            entry.identity,
-                            after_by_before[context.selection.refs[index]],
+                            after_by_before.get(
+                                context.selection.refs[index],
+                                context.selection.refs[index],
+                            ),
+                            computed.targets,
                             self._layout.overlay_bindings,
+                            weight_changed=computed.weight_changed,
                         )
-                        if computed.weight_changed
-                        else None,
-                    )
-                    for index, (entry, computed) in enumerate(
-                        zip(context.batch.entries, entries, strict=True)
+                        for index, (entry, computed) in enumerate(
+                            zip(context.batch.entries, entries, strict=True)
+                        )
                     )
                 )
-                result = InPlaceTTTStepBatchResult(results)
                 prepared = self._publication.prepare_full_root(
                     logical,
                     physical,

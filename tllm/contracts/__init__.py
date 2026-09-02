@@ -38,20 +38,6 @@ from tllm.contracts.parameter_overlay import (
     ParameterRole,
     ParameterTarget,
 )
-from tllm.contracts.parameter_overlay_attachment import (
-    OperandCaptureKind,
-    ParameterOverlayAttachmentBinding,
-    ParameterOverlayAttachmentCandidate,
-    ParameterOverlayAttachmentDecision,
-    ParameterOverlayAttachmentInputs,
-    ParameterOverlayAttachmentPhysicalPlan,
-    ParameterOverlayAttachmentRequest,
-    ParameterOverlayStage,
-    ParameterOverlayStageAnchor,
-    ParameterOverlayScope,
-    ParameterOverlayTaskBinding,
-    ParameterOverlayTaskRole,
-)
 from tllm.contracts.gpu_stage import DeviceTensorLease
 from tllm.contracts.request_meta_view import RowBatchMeta
 from tllm.contracts.runtime_context import RuntimeContext
@@ -117,18 +103,6 @@ __all__ = [
     "ParameterOverlayStepPlan",
     "ParameterRole",
     "ParameterTarget",
-    "OperandCaptureKind",
-    "ParameterOverlayAttachmentBinding",
-    "ParameterOverlayAttachmentCandidate",
-    "ParameterOverlayAttachmentDecision",
-    "ParameterOverlayAttachmentInputs",
-    "ParameterOverlayAttachmentPhysicalPlan",
-    "ParameterOverlayAttachmentRequest",
-    "ParameterOverlayStage",
-    "ParameterOverlayStageAnchor",
-    "ParameterOverlayScope",
-    "ParameterOverlayTaskBinding",
-    "ParameterOverlayTaskRole",
     "RowBatchMeta",
     "RuntimeContext",
     "RegionShapeSpecializationInput",

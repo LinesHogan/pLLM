@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import tllm
 from vllm import SamplingParams
 
@@ -9,10 +14,14 @@ from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTConfig,
     InPlaceTTTWorkload,
 )
-from tllm.canonical_runtime.parameter_overlay_llm import (
-    CanonicalParameterOverlayLlm,
+from tllm.canonical_vllm.runtime import (
+    CanonicalVllmConfig,
+    CanonicalVllmDType,
+    CanonicalVllmLlm,
 )
-from tllm.canonical_runtime.runtime import CanonicalVllmConfig, CanonicalVllmDType
+from tllm.canonical.workloads.inplace_ttt.workload import (
+    CanonicalDenseOverlayCudaExecution,
+)
 from tllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterRole,
@@ -49,7 +58,7 @@ def main() -> int:
         ),
     )
     match routed:
-        case CanonicalParameterOverlayLlm() as handle:
+        case CanonicalVllmLlm() as handle:
             pass
         case _:
             raise RuntimeError("public make_llm did not route parameter overlay")
@@ -63,7 +72,10 @@ def main() -> int:
                 ignore_eos=True,
             ),
         )
-        diagnostics = handle.deployment.execution.diagnostics()
+        execution = handle.deployment.execution
+        if not isinstance(execution, CanonicalDenseOverlayCudaExecution):
+            raise RuntimeError("canonical vLLM routed to the wrong execution")
+        diagnostics = execution.diagnostics()
         if (
             any(not output.outputs[0].text for output in outputs)
             or diagnostics.update_count < 1

@@ -1,4 +1,4 @@
-"""Workload-independent runtime timeline for versioned parameter overlays."""
+"""Workload-neutral canonical runtime facts for in-process request lifecycles."""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ from tllm.contracts.semantic_graph import (
 
 
 @dataclass(frozen=True, slots=True)
-class CanonicalParameterOverlayRuntimeFacts:
+class CanonicalRuntimeFacts:
     device: torch.device
     plan_epoch: int = 1
 
     def __post_init__(self) -> None:
         if self.device.type not in ("cpu", "cuda") or self.plan_epoch < 1:
-            raise ValueError("parameter-overlay runtime facts are invalid")
+            raise ValueError("canonical runtime facts are invalid")
 
     def timeline(
         self,
@@ -46,4 +46,4 @@ class CanonicalParameterOverlayRuntimeFacts:
         )
 
 
-__all__ = ["CanonicalParameterOverlayRuntimeFacts"]
+__all__ = ["CanonicalRuntimeFacts"]

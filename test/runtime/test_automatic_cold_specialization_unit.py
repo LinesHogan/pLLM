@@ -132,12 +132,14 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
             sampler=None,
         )
         orig = mock.Mock(return_value="loaded")
+        runtime_owner = mock.Mock()
 
         with (
             mock.patch.object(residual_runtime, "RUNTIME", state),
             mock.patch.object(v027_mrv2.active_targets, "runtime_has_active_targets", return_value=False),
             mock.patch.object(v027_mrv2._sampler_mrv2, "bind_runner_sampler_mrv2"),
             mock.patch.object(v027_mrv2, "record_resolved_backend") as record_resolution,
+            mock.patch("tllm.runtime.runtime.active_runtime", return_value=runtime_owner),
             mock.patch(
                 "tllm.runtime.residual_runtime.cold_specialize_workgraph",
                 create=True,
@@ -156,6 +158,7 @@ class AutomaticColdSpecializationTest(unittest.TestCase):
         record_resolution.assert_called_once()
         publish.assert_called_once()
         published = publish.call_args.args[0] if publish.call_args.args else publish.call_args.kwargs["spec"]
+        runtime_owner.cold_specialize_workloads.assert_called_once_with(published)
         self.assertEqual(
             published,
             RuntimeSpecializationSpec(

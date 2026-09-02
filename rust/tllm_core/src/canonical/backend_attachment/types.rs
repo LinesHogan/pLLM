@@ -20,6 +20,7 @@ pub(crate) enum AttachmentTopology {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AttachmentKind {
     RequestSamplerTraining,
+    DenseParameterOverlay,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -42,6 +43,18 @@ pub(crate) enum AttachmentCleanupStage {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum AttachmentOverlayStage {
+    Pin,
+    Apply,
+    Capture,
+    Transition,
+    Publish,
+    Release,
+    Finish,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum StreamDependency {
     HiddenProducerToCompute,
     ComputeToSampler,
@@ -54,6 +67,7 @@ pub(crate) enum StreamDependency {
 pub(crate) enum AttachmentTaskRole {
     Compute,
     Transition,
+    Publish,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -114,6 +128,14 @@ pub(crate) struct AttachmentTaskBinding {
     pub(crate) task_id: u32,
     pub(crate) implementation_id: String,
     pub(crate) anchor_id: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttachmentOverlayStageAnchor {
+    pub(crate) stage: AttachmentOverlayStage,
+    pub(crate) anchor_id: u32,
+    pub(crate) anchor_symbol: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -184,6 +206,8 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) state_representation_signature: String,
     pub(crate) execution_parameters_digest: String,
     pub(crate) capabilities: Vec<String>,
+    pub(crate) overlay_field_ids: Vec<u32>,
+    pub(crate) overlay_stage_anchors: Vec<AttachmentOverlayStageAnchor>,
     pub(crate) schema_version: u64,
 }
 

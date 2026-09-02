@@ -78,14 +78,9 @@ class Vllm027EagerPackedHiddenCapture:
                 "canonical hidden capture requires vLLM 0.27.1 exactly"
             )
         if (
-            type(source) is not PackedHiddenResourceBinding
-            or type(target) is not PackedHiddenResourceBinding
-            or source.locator_key == target.locator_key
-            or type(plan_epoch) is not int
+            source.locator_key == target.locator_key
             or plan_epoch < 1
-            or type(max_packed_rows) is not int
             or max_packed_rows < 1
-            or type(hidden_size) is not int
             or hidden_size < 1
         ):
             raise ValueError("signed hidden capture specialization is invalid")
@@ -141,8 +136,6 @@ class Vllm027EagerPackedHiddenCapture:
         """Open one exact packed step before the model forward begins."""
 
         self._require_eager()
-        if type(row_batch) is not PackedPhaseRowBatch:
-            raise TypeError("hidden capture requires an exact packed row batch")
         with self._lock:
             self._require_open()
             if (

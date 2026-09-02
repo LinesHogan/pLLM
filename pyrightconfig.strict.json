@@ -4,7 +4,6 @@
     "tllm/contracts",
     "tllm/canonical",
     "tllm/canonical_vllm",
-    "tllm/canonical_runtime",
     "tllm/ports",
     "tllm/producers",
     "tllm/core",

@@ -121,10 +121,11 @@ llm = make_llm(model_name="Qwen/Qwen2.5-7B-Instruct", dtype="bfloat16")
 outputs = llm.generate(prompts, SamplingParams(max_tokens=64, temperature=0.8, n=8))
 ```
 
-或跑 starter 脚本（Qwen2.5-7B，16 路并行回答，打印 loss 与干预计数器）：
+ESamp 的 GPU 证据使用 canonical 验证场景：
 
 ```bash
-python starter.py --max-new-tokens 32
+.venv/bin/python tools/verification/automated_tests.py \
+  --scenario cuda_graph_replay_preserves_training_and_zero_fallback
 ```
 
 ## Legacy 编译器从这 40 行里推导出了什么

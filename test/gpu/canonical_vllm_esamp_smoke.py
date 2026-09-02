@@ -2,16 +2,35 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import tllm
 from vllm import SamplingParams
 
-from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
+from tllm.canonical.workloads.esamp_request import (
+    CanonicalRequestSamplerCudaExecution,
+    ESampRequestWorkload,
+)
 from tllm.canonical.workloads.esamp_request_types import ESampRequestConfig
-from tllm.canonical_runtime.runtime import (
-    CanonicalEsampLlm,
+from tllm.canonical_vllm.runtime import (
     CanonicalVllmConfig,
     CanonicalVllmDType,
+    CanonicalVllmLlm,
 )
+
+
+def _require_esamp_execution(
+    handle: CanonicalVllmLlm,
+) -> CanonicalRequestSamplerCudaExecution:
+    execution = handle.deployment.execution
+    if type(handle.deployment.workload) is not ESampRequestWorkload:
+        raise RuntimeError("canonical vLLM smoke did not receive an ESamp deployment")
+    if type(execution) is not CanonicalRequestSamplerCudaExecution:
+        raise RuntimeError("canonical vLLM smoke did not receive ESamp CUDA execution")
+    return execution
 
 
 def main() -> int:
@@ -37,7 +56,7 @@ def main() -> int:
         ),
     )
     match routed:
-        case CanonicalEsampLlm() as handle:
+        case CanonicalVllmLlm() as handle:
             pass
         case _:
             raise RuntimeError("public make_llm did not select canonical runtime")
@@ -51,7 +70,8 @@ def main() -> int:
                 ignore_eos=True,
             ),
         )
-        diagnostics = handle.deployment.execution.diagnostics()
+        execution = _require_esamp_execution(handle)
+        diagnostics = execution.diagnostics()
         if (
             not outputs[0].outputs[0].text
             or diagnostics.loss_count != 2
@@ -59,7 +79,7 @@ def main() -> int:
             or diagnostics.completed_sampler_pins != 2
             or diagnostics.active_lineages != 0
             or diagnostics.pending_state_releases != 0
-            or handle.deployment.execution.plan.fallback_count != 0
+            or execution.plan.fallback_count != 0
         ):
             raise RuntimeError("canonical MRv2 ESamp lifecycle evidence is incomplete")
         print(
@@ -68,7 +88,7 @@ def main() -> int:
                 "loss_count": diagnostics.loss_count,
                 "update_count": diagnostics.update_count,
                 "active_lineages": diagnostics.active_lineages,
-                "fallback_count": handle.deployment.execution.plan.fallback_count,
+                "fallback_count": execution.plan.fallback_count,
                 "attachment": (
                     handle.deployment.attachment.physical.bundle_signature[:12]
                 ),

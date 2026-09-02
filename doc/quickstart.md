@@ -182,11 +182,11 @@ llm = make_llm(model_name="Qwen/Qwen2.5-7B-Instruct", dtype="bfloat16")
 outputs = llm.generate(prompts, SamplingParams(max_tokens=64, temperature=0.8, n=8))
 ```
 
-Or the starter script (Qwen2.5-7B, 16 parallel answers, prints loss and
-intervention counters):
+For ESamp GPU evidence, run the canonical verification scenario:
 
 ```bash
-python starter.py --max-new-tokens 32
+.venv/bin/python tools/verification/automated_tests.py \
+  --scenario cuda_graph_replay_preserves_training_and_zero_fallback
 ```
 
 ## What the legacy compiler did with your 40 lines

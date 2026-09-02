@@ -587,30 +587,6 @@ class WorkloadDslUnitTest(unittest.TestCase):
         self.assertEqual(tuple(edge.kind.value for edge in ir.edges), ("data", "effect"))
         self.assertEqual(tuple(task.task_id for task in graph.tasks), ("predict", "update"))
 
-    def test_legacy_esamp_keeps_its_adapter(self) -> None:
-        from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
-        from tllm.runtime.runtime import TllmRuntime
-
-        esamp = build_esamp_workload(ESampConsumerConfig(implementation="legacy"))
-        esamp_runtime = TllmRuntime(workloads=(esamp,))
-
-        self.assertEqual(len(esamp_runtime.consumers), 1)
-        esamp_ir = declare_workload(esamp).ir
-        self.assertEqual(esamp_ir.workload_id, "esamp")
-        self.assertEqual(esamp_ir.schedule, ("predict_and_loss", "update"))
-        self.assertEqual(esamp_ir.states[0].request_key, ())
-
-        per_request_esamp = build_esamp_workload(
-            ESampConsumerConfig(
-                implementation="legacy",
-                per_request_models=True,
-            )
-        )
-        self.assertEqual(
-            declare_workload(per_request_esamp).ir.states[0].request_key,
-            (RequestKeyField.PROMPT_IDX,),
-        )
-
     def test_step_id_is_a_typed_input_not_a_reserved_provider_name(self) -> None:
         @workload(id="typed.step")
         class TypedStep:

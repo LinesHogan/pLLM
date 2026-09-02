@@ -45,6 +45,12 @@ class _TaskBindingWire(TypedDict):
     anchor_id: int
 
 
+class _OverlayStageWire(TypedDict):
+    stage: str
+    anchor_id: int
+    anchor_symbol: str
+
+
 class _RequestWire(TypedDict):
     adapter_id: str
     attachment_kind: str
@@ -76,6 +82,8 @@ class _RequestWire(TypedDict):
     state_representation_signature: str
     execution_parameters_digest: str
     capabilities: list[str]
+    overlay_field_ids: list[int]
+    overlay_stage_anchors: list[_OverlayStageWire]
     schema_version: int
 
 
@@ -155,6 +163,15 @@ def _request_json(request: BackendAttachmentRequest) -> str:
         state_representation_signature=request.state_representation_signature,
         execution_parameters_digest=request.execution_parameters_digest,
         capabilities=list(request.capabilities),
+        overlay_field_ids=list(request.overlay_field_ids),
+        overlay_stage_anchors=[
+            _OverlayStageWire(
+                stage=stage.stage.value,
+                anchor_id=int(stage.anchor_id),
+                anchor_symbol=stage.anchor_symbol,
+            )
+            for stage in request.overlay_stage_anchors
+        ],
         schema_version=request.schema_version,
     )
     return json.dumps(wire, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -184,6 +201,18 @@ def _probe_json(probe: BackendPlacementProbe) -> str:
 
 def _decoded_json(payload: str) -> object:
     return cast(object, json.loads(payload))
+
+
+def _boundary_fields(
+    payload: str, expected: set[str], label: str
+) -> dict[object, object]:
+    decoded = _decoded_json(payload)
+    if type(decoded) is not dict:
+        raise TypeError(f"{label} must be an object")
+    fields = cast(dict[object, object], decoded)
+    if set(fields) != expected:
+        raise ValueError(f"{label} has the wrong fields")
+    return fields
 
 
 def _inputs_json(inputs: BackendAttachmentCompilerInputs) -> str:
@@ -224,12 +253,11 @@ def _decision_json(decision: BackendAttachmentDecision) -> str:
 
 
 def _decision_from_boundary(payload: str) -> BackendAttachmentDecision:
-    decoded = _decoded_json(payload)
-    if type(decoded) is not dict:
-        raise TypeError("backend attachment decision must be an object")
-    fields = cast(dict[object, object], decoded)
-    if set(fields) != {"request_digest", "signature", "schema_version"}:
-        raise ValueError("backend attachment decision has the wrong fields")
+    fields = _boundary_fields(
+        payload,
+        {"request_digest", "signature", "schema_version"},
+        "backend attachment decision",
+    )
     request_digest = fields["request_digest"]
     signature = fields["signature"]
     schema_version = fields["schema_version"]
@@ -263,25 +291,23 @@ def _physical_json(physical: BackendAttachmentPhysicalPlan) -> str:
 
 
 def _physical_from_boundary(payload: str) -> BackendAttachmentPhysicalPlan:
-    decoded = _decoded_json(payload)
-    if type(decoded) is not dict:
-        raise TypeError("physical backend attachment must be an object")
-    fields = cast(dict[object, object], decoded)
-    expected = {
-        "plan_epoch",
-        "adapter_id",
-        "attachment_signature",
-        "schedule_signature",
-        "state_representation_signature",
-        "device_kind",
-        "device_ordinal",
-        "topology",
-        "graph_mode",
-        "bundle_signature",
-        "schema_version",
-    }
-    if set(fields) != expected:
-        raise ValueError("physical backend attachment has the wrong fields")
+    fields = _boundary_fields(
+        payload,
+        {
+            "plan_epoch",
+            "adapter_id",
+            "attachment_signature",
+            "schedule_signature",
+            "state_representation_signature",
+            "device_kind",
+            "device_ordinal",
+            "topology",
+            "graph_mode",
+            "bundle_signature",
+            "schema_version",
+        },
+        "physical backend attachment",
+    )
     plan_epoch = fields["plan_epoch"]
     adapter_id = fields["adapter_id"]
     attachment_signature = fields["attachment_signature"]

@@ -62,11 +62,6 @@ RULES: dict[str, frozenset[str]] = {
     # Clean in-process vLLM attachment.  It may consume signed canonical
     # plans/contracts and Rust FFI, but never the legacy runtime/backends.
     "canonical_vllm": frozenset({"canonical", "contracts", "core"}),
-    # Outermost clean-room composition root.  Coexistence with the old stack
-    # is permitted only in the package facade, never as an internal import.
-    "canonical_runtime": frozenset(
-        {"canonical_vllm", "canonical", "contracts", "core"}
-    ),
     "ports": frozenset({"contracts", "core"}),
     "common": frozenset({"contracts", "ports", "core"}),
     "producers": frozenset({"contracts", "ports", "core"}),
@@ -174,7 +169,6 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         # Public migration routing boundary; the deleted Dummy implementation
         # cannot be imported back into the clean-room core.
         ("tllm.consumers.dummy", "tllm.canonical.workloads.dummy"),
-        ("tllm.consumers.esamp.legacy_workload", "tllm.workload"),
         ("tllm.consumers.esamp.workload", "tllm.workload"),
         ("tllm.consumers.override.workload", "tllm.workload"),
         ("tllm.consumers.recirculation.native_backend", "tllm.workload"),

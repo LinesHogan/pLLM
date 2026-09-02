@@ -1,0 +1,204 @@
+"""Shared ESamp request task contracts and math helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from tllm.canonical.cuda_stream import CudaStreamReadiness
+from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout, low_rank_gated_forward
+from tllm.canonical.ptts import CudaDensePageGradientBatch, CudaDensePagePublication
+from tllm.canonical.ptts.dense_page import (
+    DensePageAdamWConfig,
+    DensePageAdamWFieldBinding,
+)
+from tllm.canonical.ptts.request_state import RequestStateSelection
+from tllm.canonical.workloads.esamp_request_types import (
+    ESampRequestConfig,
+    ESampRequestStepInput,
+    ESAMP_EXP_AVG_FIELD,
+    ESAMP_EXP_AVG_SQ_FIELD,
+    ESAMP_GRADIENT_FIELD,
+    ESAMP_PARAMETER_FIELD,
+    ESAMP_STEP_FIELD,
+)
+from tllm.contracts.sampler import PackedSamplerGuidanceBatch
+from tllm.contracts.state_ref import StateRef
+
+
+@dataclass(frozen=True, slots=True)
+class ESampPredictionPending:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ESampPredicted:
+    guidance: PackedSamplerGuidanceBatch
+    training_source: torch.Tensor
+    training_target: torch.Tensor
+    state_vectors: torch.Tensor
+    row_state_indices: torch.Tensor
+    readiness: CudaStreamReadiness | None = None
+
+
+ESampPrediction = ESampPredictionPending | ESampPredicted
+
+
+@dataclass(frozen=True, slots=True)
+class ESampOptimizationPending:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ESampOptimized:
+    losses: tuple[torch.Tensor, ...]
+    gradients: tuple[torch.Tensor, ...] | CudaDensePageGradientBatch
+
+
+ESampOptimization = ESampOptimizationPending | ESampOptimized
+
+
+@dataclass(frozen=True, slots=True)
+class ESampPublicationPending:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ESampPublished:
+    before_refs: tuple[StateRef, ...]
+    after_refs: tuple[StateRef, ...]
+    publication: CudaDensePagePublication | None = None
+
+
+ESampPublication = ESampPublicationPending | ESampPublished
+
+
+def esamp_adamw_field_binding() -> DensePageAdamWFieldBinding:
+    return DensePageAdamWFieldBinding(
+        ESAMP_PARAMETER_FIELD,
+        ESAMP_GRADIENT_FIELD,
+        ESAMP_STEP_FIELD,
+        ESAMP_EXP_AVG_FIELD,
+        ESAMP_EXP_AVG_SQ_FIELD,
+    )
+
+
+def esamp_adamw_config(config: ESampRequestConfig) -> DensePageAdamWConfig:
+    return DensePageAdamWConfig(
+        config.learning_rate, config.betas, config.eps, config.weight_decay
+    )
+
+
+def selected_training_tensors(
+    selection: RequestStateSelection,
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    packed_row_indices = torch.tensor(
+        tuple(row.canonical_row_index for row in selection.rows),
+        dtype=torch.long,
+        device=source.device,
+    )
+    row_state_indices = torch.tensor(
+        tuple(row.state_index for row in selection.rows),
+        dtype=torch.long,
+        device=source.device,
+    )
+    return (
+        source.index_select(0, packed_row_indices),
+        target.index_select(0, packed_row_indices),
+        row_state_indices,
+    )
+
+
+def build_prediction(
+    *,
+    config: ESampRequestConfig,
+    step: ESampRequestStepInput,
+    selection: RequestStateSelection,
+    training_source: torch.Tensor,
+    training_target: torch.Tensor,
+    state_vectors: torch.Tensor,
+    row_state_indices: torch.Tensor,
+    layout: LowRankGatedLayout,
+    readiness: CudaStreamReadiness | None = None,
+) -> ESampPredicted:
+    local_row_by_packed = {
+        row.canonical_row_index: position
+        for position, row in enumerate(selection.rows)
+    }
+    affected_row_ids: list[int] = []
+    prediction_positions: list[int] = []
+    if config.intervention:
+        for link in step.sampler_rows.links:
+            if link.packed_row_index not in local_row_by_packed:
+                continue
+            local_position = local_row_by_packed[link.packed_row_index]
+            selected_row = selection.rows[local_position]
+            selected_ref = selection.refs[selected_row.state_index]
+            if int(selected_ref.version_id) > 0:
+                affected_row_ids.append(link.sampler_row_index)
+                prediction_positions.append(local_position)
+    if prediction_positions:
+        all_predictions = low_rank_gated_forward(
+            training_source, state_vectors, row_state_indices, layout
+        )
+        pred_hidden = all_predictions.index_select(
+            0,
+            torch.tensor(
+                tuple(prediction_positions),
+                dtype=torch.long,
+                device=all_predictions.device,
+            ),
+        )
+    else:
+        pred_hidden = training_source.new_empty((0, layout.hidden_size))
+    return ESampPredicted(
+        PackedSamplerGuidanceBatch(
+            step.sampler_rows,
+            pred_hidden,
+            tuple(affected_row_ids),
+        ),
+        training_source,
+        training_target,
+        state_vectors,
+        row_state_indices,
+        readiness,
+    )
+
+
+def compute_low_rank_losses_and_gradients(
+    predicted: ESampPredicted,
+    layout: LowRankGatedLayout,
+    *,
+    clone_outputs: bool,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    parameters = predicted.state_vectors.detach().requires_grad_(True)
+    prediction = low_rank_gated_forward(
+        predicted.training_source, parameters, predicted.row_state_indices, layout
+    )
+    row_losses = (
+        prediction.float() - predicted.training_target.float()
+    ).square().mean(dim=1)
+    state_count = int(parameters.shape[0])
+    loss_sums = torch.zeros(
+        (state_count,),
+        dtype=row_losses.dtype,
+        device=row_losses.device,
+    ).index_add(0, predicted.row_state_indices, row_losses)
+    loss_counts = torch.zeros_like(loss_sums).index_add(
+        0,
+        predicted.row_state_indices,
+        torch.ones_like(row_losses),
+    )
+    losses = loss_sums / loss_counts
+    (gradient,) = torch.autograd.grad(losses.sum(), parameters)
+    if clone_outputs:
+        return (
+            tuple(loss.detach().clone() for loss in losses),
+            tuple(gradient[index].detach().clone() for index in range(state_count)),
+        )
+    return tuple(loss.detach() for loss in losses), tuple(
+        gradient[index].detach() for index in range(state_count)
+    )

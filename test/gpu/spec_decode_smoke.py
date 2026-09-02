@@ -27,9 +27,9 @@ def main() -> int:
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.runner == "mrv2" else "0"
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
-    from tllm.runtime.step_session import StepSession, get_step_session
+    from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
     from tllm.runtime import residual_runtime as core
-    from tllm.workflows import esamp_support as esamp_workflow_support
+    from tllm.runtime.step_session import get_step_session
     from tllm.util.tools import build_prompt_batch, shutdown_llm_instance
 
     seen_spec_rows = []
@@ -51,9 +51,27 @@ def main() -> int:
             if session.graph_mode is not None:
                 seen_graph_modes.add(str(session.graph_mode))
 
-    esamp_workflow_support.configure_esamp_runtime(
+    core.clear_dispatch_consumers()
+    core.set_runtime_consumer(
+        ESampConsumer(
+            ESampConsumerConfig(
+                graph_scratch_rows=64,
+                enable_esamp_training=True,
+            )
+        )
+    )
+    core.configure_runtime(
         graph_scratch_rows=64,
-        enable_esamp_training=True,
+        tap_layer_paths=(
+            "model.model.layers[0].input_layernorm",
+            "model.model.layers[-1].input_layernorm",
+        ),
+        source_layer_path="model.model.layers[0].input_layernorm",
+        target_layer_path="model.model.layers[-1].input_layernorm",
+        adaptation_pipeline_slots=4,
+        adaptation_stream_mode="dual",
+        adaptation_stream_priority=0,
+        compact_capture_lane=False,
     )
     core.register_dispatch_consumer(SpecProbe())
 

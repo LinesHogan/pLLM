@@ -30,7 +30,11 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTStepResult,
     InPlaceTTTTargetResult,
 )
-from tllm.contracts.parameter_overlay import ParameterOverlayPublication
+from tllm.contracts.parameter_overlay import (
+    ParameterOverlayFieldBinding,
+    ParameterOverlayPublication,
+)
+from tllm.contracts.state_ref import StateRef
 from tllm.contracts.semantic_graph import ImplementationId
 
 
@@ -100,6 +104,30 @@ class InPlaceTTTComputedTransition:
     target_root: tuple[torch.Tensor, ...]
     targets: tuple[InPlaceTTTTargetResult, ...]
     weight_changed: bool
+
+
+def build_inplace_ttt_step_result(
+    step: InPlaceTTTStepInput,
+    before_ref: StateRef,
+    after_ref: StateRef,
+    targets: tuple[InPlaceTTTTargetResult, ...],
+    overlay_bindings: tuple[ParameterOverlayFieldBinding, ...],
+    *,
+    weight_changed: bool,
+) -> InPlaceTTTStepResult:
+    return InPlaceTTTStepResult(
+        step.identity,
+        before_ref,
+        after_ref,
+        targets,
+        ParameterOverlayPublication(
+            step.identity,
+            after_ref,
+            overlay_bindings,
+        )
+        if weight_changed
+        else None,
+    )
 
 
 def compute_inplace_ttt_transition(
@@ -258,12 +286,13 @@ class InPlaceTTTPublishTask:
         match context.transition:
             case InPlaceTTTNoTransition(targets=targets):
                 context.publication = InPlaceTTTPublished(
-                    InPlaceTTTStepResult(
-                        context.step.identity,
+                    build_inplace_ttt_step_result(
+                        context.step,
                         before_ref,
                         before_ref,
                         targets,
-                        None,
+                        self._layout.overlay_bindings,
+                        weight_changed=False,
                     )
                 )
             case InPlaceTTTPreparedTransition(
@@ -273,21 +302,13 @@ class InPlaceTTTPublishTask:
                 weight_changed=weight_changed,
             ):
                 (after_ref,) = logical.after_refs
-                publication = (
-                    None
-                    if not weight_changed
-                    else ParameterOverlayPublication(
-                        context.step.identity,
-                        after_ref,
-                        self._layout.overlay_bindings,
-                    )
-                )
-                result = InPlaceTTTStepResult(
-                    context.step.identity,
+                result = build_inplace_ttt_step_result(
+                    context.step,
                     before_ref,
                     after_ref,
                     targets,
-                    publication,
+                    self._layout.overlay_bindings,
+                    weight_changed=weight_changed,
                 )
                 receipt = self._publication.publish(logical, physical)
                 context.transition = InPlaceTTTCommittedTransition(receipt)
@@ -311,5 +332,6 @@ __all__ = [
     "InPlaceTTTStepContext",
     "InPlaceTTTTransitionPending",
     "InPlaceTTTTransitionTask",
+    "build_inplace_ttt_step_result",
     "compute_inplace_ttt_transition",
 ]

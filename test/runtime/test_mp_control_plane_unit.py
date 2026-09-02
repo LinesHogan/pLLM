@@ -742,7 +742,7 @@ class ControlPlaneUnitTest(unittest.TestCase):
         finally:
             residual_runtime.RUNTIME.placement_stats = saved
 
-    def test_parent_rejects_legacy_workload_without_an_immutable_worker_spec(self) -> None:
+    def test_parent_rejects_legacy_declaration_without_an_immutable_worker_spec(self) -> None:
         from tllm.backends.vllm.v027_mrv2 import V027MRv2Driver
         from tllm.runtime.graph_policy import GraphMode
         from tllm.runtime.runtime import TllmRuntime

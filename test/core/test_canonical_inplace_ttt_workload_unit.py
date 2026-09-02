@@ -8,13 +8,10 @@ import pytest
 import torch
 
 from test.core.oracles.inplace_ttt import oracle_exact_step
-from tllm.canonical.parameter_overlay_runtime import (
-    CanonicalParameterOverlayRuntimeFacts,
-)
+from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
 from tllm.canonical.scheduler import validate_physical_plan
 from tllm.canonical.workloads.inplace_ttt import (
-    InPlaceTTTApplication,
     InPlaceTTTCompileOptions,
     InPlaceTTTConfig,
     InPlaceTTTOperandPair,
@@ -30,7 +27,7 @@ from tllm.contracts.parameter_overlay import (
     ParameterTarget,
 )
 from tllm.contracts.request_identity import RequestIdentity
-from tllm.contracts.semantic_graph import AnchorId, StateScope
+from tllm.contracts.semantic_graph import AnchorId, StateResource, StateScope
 from tllm.contracts.tensor_layout import TensorDType
 
 
@@ -60,7 +57,7 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
         torch.device("cpu"),
     )
     workload = InPlaceTTTWorkload(config)
-    timeline = CanonicalParameterOverlayRuntimeFacts(
+    timeline = CanonicalRuntimeFacts(
         torch.device("cpu")
     ).timeline(("transition/full_root@1",))
     compiled = workload.compile(
@@ -73,7 +70,7 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
         ),
     )
     states = {state.resource: state for state in compiled.plan_bundle.semantic_graph.states}
-    assert states["dense_fast_weights"].scope is StateScope.REQUEST
+    assert states[StateResource("dense_fast_weights")].scope is StateScope.REQUEST
     assert compiled.execution.plan.fallback_count == 0
     tampered = replace(
         compiled.plan_bundle.schedule_physical,
@@ -96,13 +93,13 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
             tampered,
         )
 
-    application = InPlaceTTTApplication(workload, compiled)
     first_identity = RequestIdentity("same", 0, 0)
     second_identity = RequestIdentity("same", 0, 1)
-    first_ref, second_ref = application.admit((first_identity, second_identity))
+    execution = compiled.execution
+    first_ref, second_ref = execution.admit((first_identity, second_identity))
     assert int(first_ref.version_id) == 0
     with pytest.raises(RuntimeError, match="entitlement"):
-        application.admit((RequestIdentity("overflow", 1, 0),))
+        execution.admit((RequestIdentity("overflow", 1, 0),))
 
     base_weights = (
         torch.tensor(
@@ -129,7 +126,7 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
         )
         for desired, base in zip(first_desired, base_weights, strict=True)
     )
-    first = application.step(
+    first = execution.step(
         InPlaceTTTStepInput(
             first_identity,
             tuple(
@@ -180,7 +177,7 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
             strict=True,
         )
     )
-    second = application.step(
+    second = execution.step(
         InPlaceTTTStepInput(
             first_identity,
             tuple(
@@ -224,7 +221,7 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
         )
 
     decode_hidden = torch.tensor(((0.4, -0.2, 0.1),), dtype=torch.float64)
-    decode = application.step(
+    decode = execution.step(
         InPlaceTTTStepInput(
             second_identity,
             (
@@ -246,9 +243,9 @@ def test_inplace_ttt_publishes_one_atomic_multitarget_ptts_version() -> None:
         decode_hidden @ base_weights[0].transpose(0, 1),
     )
 
-    cleanup = application.finish((first_identity, second_identity))
+    cleanup = execution.retire((first_identity, second_identity))
     assert cleanup.retired == (second.after_ref, second_ref)
-    diagnostics = application.diagnostics()
+    diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == 0
     assert diagnostics.update_count == 2
     assert diagnostics.trained_rows == 4

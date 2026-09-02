@@ -22,15 +22,33 @@ def main() -> int:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
 
     import tllm
+    from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
     from tllm.runtime import residual_runtime as core
     from tllm.util.tools import shutdown_llm_instance
-    from tllm.workflows.esamp_support import configure_esamp_runtime
 
-    configure_esamp_runtime(
+    core.clear_dispatch_consumers()
+    core.set_runtime_consumer(
+        ESampConsumer(
+            ESampConsumerConfig(
+                graph_scratch_rows=8,
+                distiller_hidden_dim=64,
+                enable_esamp_training=False,
+                adaptation_stream_mode="serial",
+            )
+        )
+    )
+    core.configure_runtime(
         graph_scratch_rows=8,
-        distiller_hidden_dim=64,
-        enable_esamp_training=False,
+        tap_layer_paths=(
+            "model.model.layers[0].input_layernorm",
+            "model.model.layers[-1].input_layernorm",
+        ),
+        source_layer_path="model.model.layers[0].input_layernorm",
+        target_layer_path="model.model.layers[-1].input_layernorm",
+        adaptation_pipeline_slots=4,
         adaptation_stream_mode="serial",
+        adaptation_stream_priority=0,
+        compact_capture_lane=False,
     )
     llm = tllm.make_llm(
         model_name=MODEL,

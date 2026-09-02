@@ -1,13 +1,5 @@
 """Canonical In-Place-TTT over request-scoped PTTS roots."""
 
-from tllm.canonical.workloads.inplace_ttt.application import (
-    InPlaceTTTApplication,
-    create_inplace_ttt_application,
-)
-from tllm.canonical.workloads.inplace_ttt.execution import InPlaceTTTExecution
-from tllm.canonical.workloads.inplace_ttt.cuda_execution import (
-    InPlaceTTTCudaExecution,
-)
 from tllm.canonical.workloads.inplace_ttt.types import (
     CudaInPlaceTTTStepBatchInput,
     InPlaceTTTCleanupReceipt,
@@ -26,21 +18,21 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTTargetSpecialization,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
+    CanonicalDenseOverlayCudaExecution,
+    CanonicalDenseOverlayExecution,
     InPlaceTTTCompilation,
     InPlaceTTTWorkload,
 )
-
 __all__ = [
+    "CanonicalDenseOverlayCudaExecution",
+    "CanonicalDenseOverlayExecution",
     "CudaInPlaceTTTStepBatchInput",
-    "InPlaceTTTApplication",
     "InPlaceTTTCleanupReceipt",
     "InPlaceTTTCompilation",
     "InPlaceTTTCompileOptions",
     "InPlaceTTTConfig",
     "InPlaceTTTDiagnostics",
-    "InPlaceTTTCudaExecution",
     "InPlaceTTTCudaStepHandle",
-    "InPlaceTTTExecution",
     "InPlaceTTTOperandPair",
     "InPlaceTTTPhase",
     "InPlaceTTTSpecialization",
@@ -51,5 +43,4 @@ __all__ = [
     "InPlaceTTTTargetResult",
     "InPlaceTTTTargetSpecialization",
     "InPlaceTTTWorkload",
-    "create_inplace_ttt_application",
 ]

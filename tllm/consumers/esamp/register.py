@@ -7,16 +7,16 @@ from tllm.consumers.esamp.config import BaseESampConsumer, ESampConsumerConfig
 from tllm.consumers.esamp.consumer import ESampConsumer
 from tllm.consumers.esamp.program_consumer import ESampProgramConsumer
 from tllm.consumers.plugin import ConsumerPluginSpec
-from tllm.ports.consumer import BaseConsumer
 
 
-def _build_esamp(config: ESampConsumerConfig) -> BaseConsumer:
+def _build_esamp(config: ESampConsumerConfig) -> BaseESampConsumer:
     if str(config.implementation) == "program":
         return ESampProgramConsumer(config)
     if str(config.implementation) == "native":
         raise ValueError(
-            "implementation='native' is a native @workload; use "
-            "build_esamp_workload(config) with TllmRuntime(workloads=...)"
+            "implementation='native' is a native @workload; construct "
+            "ESampWorkload(ESampConfig(...)) and pass it to "
+            "TllmRuntime(workloads=...)"
         )
     return ESampConsumer(config)
 
@@ -26,9 +26,11 @@ CONSUMER_TYPE = PLUGIN.consumer_type
 CONFIG_TYPE = PLUGIN.config_type
 
 
-def build(config: ESampConsumerConfig | None = None) -> BaseConsumer:
+def build(config: ESampConsumerConfig | None = None) -> BaseESampConsumer:
     return PLUGIN.build(config)
 
 
-def activate(config: ESampConsumerConfig | None = None, *, primary: bool = False) -> BaseConsumer:
+def activate(
+    config: ESampConsumerConfig | None = None, *, primary: bool = False
+) -> BaseESampConsumer:
     return PLUGIN.activate(config, primary=primary)

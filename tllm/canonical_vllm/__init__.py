@@ -22,9 +22,18 @@ from tllm.canonical_vllm.dense_overlay import (
     VllmDenseAddTargetSpec,
     inspect_dense_add_targets,
 )
+from tllm.canonical_vllm.runtime import (
+    CanonicalVllmConfig,
+    CanonicalVllmDType,
+    CanonicalVllmLlm,
+    create_canonical_vllm_llm,
+)
 
 __all__ = [
     "CanonicalVllm027PostFilterSampler",
+    "CanonicalVllmConfig",
+    "CanonicalVllmDType",
+    "CanonicalVllmLlm",
     "Mrv2PackedStepRows",
     "Mrv2RequestIdBatch",
     "Mrv2RequestIdBinding",
@@ -35,4 +44,5 @@ __all__ = [
     "inspect_dense_add_targets",
     "Vllm027EagerPackedHiddenCapture",
     "Vllm027Mrv2PackedRowCodec",
+    "create_canonical_vllm_llm",
 ]

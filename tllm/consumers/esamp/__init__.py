@@ -3,7 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from tllm.consumers.esamp.config import ESampConsumerConfig
+    from tllm.consumers.esamp.consumer import ESampConsumer
+    from tllm.consumers.esamp.program import ESampProgram
+    from tllm.consumers.esamp.program_consumer import ESampProgramConsumer
+    from tllm.consumers.esamp.register import activate
+    from tllm.consumers.esamp.sampler_provider import ESampSamplerModifierProvider
+    from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
 
 __all__ = [
     "ESampConsumer",
@@ -13,7 +22,6 @@ __all__ = [
     "ESampProgramConsumer",
     "ESampConfig",
     "ESampSamplerModifierProvider",
-    "build_esamp_workload",
     "ESampWorkload",
 ]
 
@@ -25,7 +33,6 @@ _MODULE_BY_NAME = {
     "ESampProgramConsumer": "tllm.consumers.esamp.program_consumer",
     "ESampConfig": "tllm.consumers.esamp.workload",
     "ESampSamplerModifierProvider": "tllm.consumers.esamp.sampler_provider",
-    "build_esamp_workload": "tllm.consumers.esamp.legacy_workload",
     "ESampWorkload": "tllm.consumers.esamp.workload",
 }
 

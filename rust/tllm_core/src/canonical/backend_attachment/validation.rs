@@ -10,9 +10,9 @@ use super::super::state_representation::{
     validate_physical_plan as validate_state_physical, StateDeviceKind, StatePhysicalPlan,
 };
 use super::types::{
-    AttachmentCompilerInputs, AttachmentKind, AttachmentTaskBinding, AttachmentTaskRole,
-    BackendAttachmentRequest, BackendPlacementProbe, HiddenBinding, HiddenLayerKind, HiddenPhase,
-    HiddenSite, RequestKeyField, StreamDependency, SCHEMA_VERSION,
+    AttachmentCompilerInputs, AttachmentKind, AttachmentOverlayStage, AttachmentTaskBinding,
+    AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe, HiddenBinding,
+    HiddenLayerKind, HiddenPhase, HiddenSite, RequestKeyField, StreamDependency, SCHEMA_VERSION,
 };
 
 pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -78,7 +78,9 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
     {
         return Err("attachment topology or capacity facts are unsupported".to_owned());
     }
-    if request.hidden_resources.is_empty() {
+    if request.attachment_kind == AttachmentKind::RequestSamplerTraining
+        && request.hidden_resources.is_empty()
+    {
         return Err("attachment requires hidden resources".to_owned());
     }
     for resource in &request.hidden_resources {
@@ -101,12 +103,25 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
         return Err("hidden resources must be sorted unique".to_owned());
     }
     require_text(&request.sampler_anchor_symbol, "sampler_anchor_symbol")?;
-    if request.task_bindings.len() != 2
-        || request.task_bindings[0].role != AttachmentTaskRole::Compute
-        || request.task_bindings[1].role != AttachmentTaskRole::Transition
-        || request.task_bindings[0].task_id == request.task_bindings[1].task_id
-    {
-        return Err("attachment task bindings must be compute then transition".to_owned());
+    match request.attachment_kind {
+        AttachmentKind::RequestSamplerTraining => {
+            if request.task_bindings.len() != 2
+                || request.task_bindings[0].role != AttachmentTaskRole::Compute
+                || request.task_bindings[1].role != AttachmentTaskRole::Transition
+                || request.task_bindings[0].task_id == request.task_bindings[1].task_id
+            {
+                return Err("sampler attachment tasks must be compute then transition".to_owned());
+            }
+        }
+        AttachmentKind::DenseParameterOverlay => {
+            if request.task_bindings.len() != 2
+                || request.task_bindings[0].role != AttachmentTaskRole::Transition
+                || request.task_bindings[1].role != AttachmentTaskRole::Publish
+                || request.task_bindings[0].task_id == request.task_bindings[1].task_id
+            {
+                return Err("dense overlay attachment tasks must be transition then publish".to_owned());
+            }
+        }
     }
     for binding in &request.task_bindings {
         require_text(
@@ -124,6 +139,9 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
     }
     match request.attachment_kind {
         AttachmentKind::RequestSamplerTraining => {
+            if !request.overlay_field_ids.is_empty() || !request.overlay_stage_anchors.is_empty() {
+                return Err("request sampler attachment cannot bind overlay fields".to_owned());
+            }
             if request.stream_dependencies
                 != vec![
                     StreamDependency::HiddenProducerToCompute,
@@ -136,6 +154,34 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
                     "request sampler training attachment requires all stream dependencies"
                         .to_owned(),
                 );
+            }
+        }
+        AttachmentKind::DenseParameterOverlay => {
+            if request.overlay_field_ids.is_empty()
+                || request.overlay_field_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err("dense overlay attachment requires sorted unique fields".to_owned());
+            }
+            let stages = request
+                .overlay_stage_anchors
+                .iter()
+                .map(|stage| &stage.stage)
+                .collect::<Vec<_>>();
+            if stages
+                != vec![
+                    &AttachmentOverlayStage::Pin,
+                    &AttachmentOverlayStage::Apply,
+                    &AttachmentOverlayStage::Capture,
+                    &AttachmentOverlayStage::Transition,
+                    &AttachmentOverlayStage::Publish,
+                    &AttachmentOverlayStage::Release,
+                    &AttachmentOverlayStage::Finish,
+                ]
+            {
+                return Err("dense overlay attachment stages are not closed".to_owned());
+            }
+            for stage in &request.overlay_stage_anchors {
+                require_text(&stage.anchor_symbol, "overlay_stage_anchors.anchor_symbol")?;
             }
         }
     }
@@ -165,7 +211,6 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
         || probe.pipeline_parallel_size != 1
         || probe.hidden_size == 0
         || probe.max_packed_rows == 0
-        || probe.hidden_resources.is_empty()
     {
         return Err("backend placement probe topology is unsupported".to_owned());
     }
@@ -340,6 +385,42 @@ fn validate_request_sampler_training_graph(
     Ok(())
 }
 
+fn validate_dense_parameter_overlay_graph(
+    request: &BackendAttachmentRequest,
+    graph: &SemanticGraph,
+) -> Result<(), String> {
+    let state = graph
+        .states
+        .binary_search_by(|state| state.resource.cmp(&request.state_resource))
+        .map(|index| &graph.states[index])
+        .map_err(|_| "dense overlay state resource is absent from the semantic graph".to_owned())?;
+    if state.scope != StateScope::Request
+        || !request_key_fields_match(&state.key_fields, &request.request_key_fields)
+    {
+        return Err("dense overlay state differs from semantic graph state".to_owned());
+    }
+    let transition = task_for_dense_id(graph, &request.task_bindings[0])?;
+    if !transition.effects.iter().any(|effect| {
+        effect.resource == request.state_resource
+            && matches!(
+                effect.kind,
+                StateEffectKind::Transition | StateEffectKind::TransitionMaybe
+            )
+    }) {
+        return Err("dense overlay transition task is missing transition semantics".to_owned());
+    }
+    let publish = task_for_dense_id(graph, &request.task_bindings[1])?;
+    if !publish.effects.iter().any(|effect| {
+        effect.resource == request.state_resource && effect.kind == StateEffectKind::Publish
+    }) {
+        return Err("dense overlay publish task is missing publish semantics".to_owned());
+    }
+    if request.task_bindings[0].anchor_id > request.task_bindings[1].anchor_id {
+        return Err("dense overlay task anchors are out of order".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_cross_binding(
     request: &BackendAttachmentRequest,
     probe: &BackendPlacementProbe,
@@ -401,6 +482,9 @@ fn validate_cross_binding(
         AttachmentKind::RequestSamplerTraining => {
             validate_request_sampler_training_graph(request, graph)?;
         }
+        AttachmentKind::DenseParameterOverlay => {
+            validate_dense_parameter_overlay_graph(request, graph)?;
+        }
     }
     let provider = state
         .representations
@@ -421,6 +505,15 @@ fn validate_cross_binding(
     {
         return Err("attachment sampler anchor differs from timeline".to_owned());
     }
+    for stage in &request.overlay_stage_anchors {
+        let anchor = timeline
+            .anchors
+            .get(stage.anchor_id as usize)
+            .ok_or_else(|| "dense overlay stage anchor is outside the timeline".to_owned())?;
+        if anchor.ordinal != stage.anchor_id as u64 || anchor.symbol != stage.anchor_symbol {
+            return Err("dense overlay stage anchor differs from timeline".to_owned());
+        }
+    }
     for binding in &request.task_bindings {
         let task = schedule
             .tasks
@@ -433,12 +526,23 @@ fn validate_cross_binding(
             return Err("attachment task binding differs from physical plan".to_owned());
         }
     }
-    let compute = &request.task_bindings[0];
-    let transition = &request.task_bindings[1];
-    if compute.anchor_id >= request.sampler_anchor_id
-        || transition.anchor_id <= request.sampler_anchor_id
-    {
-        return Err("attachment task anchors violate sampler timing".to_owned());
+    match request.attachment_kind {
+        AttachmentKind::RequestSamplerTraining => {
+            let compute = &request.task_bindings[0];
+            let transition = &request.task_bindings[1];
+            if compute.anchor_id >= request.sampler_anchor_id
+                || transition.anchor_id <= request.sampler_anchor_id
+            {
+                return Err("attachment task anchors violate sampler timing".to_owned());
+            }
+        }
+        AttachmentKind::DenseParameterOverlay => {
+            let transition = &request.task_bindings[0];
+            let publish = &request.task_bindings[1];
+            if transition.anchor_id > publish.anchor_id {
+                return Err("dense overlay task anchors violate publication timing".to_owned());
+            }
+        }
     }
     Ok(())
 }

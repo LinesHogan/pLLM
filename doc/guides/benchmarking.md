@@ -18,11 +18,10 @@ are not an interchangeable runtime baseline.
   `/workspace/pllm/.venv/bin/python` or EngineCore worker before trusting a
   later OOM. Never terminate unrelated GPU processes.
 
-## Aligned ESamp workload
+## Aligned ESamp Workload
 
-The maintained legacy/Program experiment is
-`tllm.workflows.benchmarks.per_request_esamp_benchmark`. A comparable 0.5B
-shape uses:
+Use `test/gpu/esamp_ratio_benchmark.py` for the maintained raw/capture-only/
+legacy/native ESamp ratio harness. A comparable 0.5B shape uses:
 
 ```text
 model=Qwen/Qwen2.5-0.5B-Instruct

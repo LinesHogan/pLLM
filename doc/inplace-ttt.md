@@ -10,7 +10,7 @@ import tllm
 from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTConfig, InPlaceTTTWorkload,
 )
-from tllm.canonical_runtime.runtime import CanonicalVllmConfig, CanonicalVllmDType
+from tllm.canonical_vllm.runtime import CanonicalVllmConfig, CanonicalVllmDType
 from tllm.contracts.parameter_overlay import (
     ParameterModuleKind, ParameterRole, ParameterTarget,
 )

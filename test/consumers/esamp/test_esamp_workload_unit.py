@@ -20,10 +20,6 @@ from tllm.contracts.packed_rows import (
     PackedSamplerRowLink,
 )
 from tllm.ports.sampler import PackedSamplerGuidanceBatch
-from tllm.consumers.esamp.initializers.svd import (
-    SVDModelBankInitializerConfig,
-)
-from tllm.consumers.esamp.legacy_workload import build_esamp_workload
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.backends.vllm.v027_mrv1 import V027MRv1Driver
@@ -295,21 +291,14 @@ class ESampRequestWorkloadUnitTest(unittest.TestCase):
     def test_native_model_bank_uses_one_fixed_service_and_compat_capacity(
         self,
     ) -> None:
-        dispatched = build_esamp_workload(
-            ESampConsumerConfig(
-                implementation="native",
-                per_request_models=True,
-                per_request_model_bank=True,
-                model_bank_slots=2,
-                model_bank_rank=2,
+        workload = ESampWorkload(
+            ESampConfig(
+                state_mode="model_bank",
+                request_capacity=2,
+                distiller_hidden_dim=2,
                 distiller_lr=1e-2,
             )
         )
-        match dispatched:
-            case ESampWorkload() as workload:
-                pass
-            case _:
-                raise AssertionError("native model bank did not build a workload")
         self.assertEqual(workload.config.state_mode, "model_bank")
         self.assertEqual(workload.config.request_capacity, 2)
         declaration = declare_workload(workload)
@@ -890,67 +879,18 @@ class ESampRegionUnitTest(unittest.TestCase):
                 )
                 self.assertIs(submit.async_capture_mode, expected_optimizer)
 
-    def test_native_dispatch_rejects_every_legacy_only_option(self) -> None:
-        cases: tuple[tuple[dict[str, object], str], ...] = (
-            ({"consumer_id": "custom"}, "consumer_id"),
-            ({"graph_scratch_rows": 8}, "graph_scratch_rows"),
-            ({"enable_workgraph_execution": False}, "enable_workgraph_execution"),
-            ({"model_bank_slots": 2}, "model_bank_slots"),
-            ({"model_bank_flush_interval": 2}, "model_bank_flush_interval"),
-            (
-                {"model_bank_initializer": SVDModelBankInitializerConfig()},
-                "model_bank_initializer",
-            ),
-            ({"model_bank_train_cudagraph": True}, "model_bank_train_cudagraph"),
-            ({"model_bank_forward_backend": "triton"}, "model_bank_forward_backend"),
-            ({"adaptation_pipeline_slots": 2}, "adaptation_pipeline_slots"),
-            ({"adaptation_stream_mode": "single"}, "adaptation_stream_mode"),
-            ({"adaptation_stream_priority": 1}, "adaptation_stream_priority"),
-            ({"trace_per_request_losses": True}, "trace_per_request_losses"),
-            ({"trace_interval": 2}, "trace_interval"),
-            ({"trace_max_points": 2}, "trace_max_points"),
-            ({"compact_capture_lane": True}, "compact_capture_lane"),
-            ({"distiller_sampler_backend": "pre_filter_dense"}, "distiller_sampler_backend"),
-            (
-                {
-                    "per_request_models": True,
-                    "training_row_selection": "first_per_prompt",
-                },
-                "training_row_selection",
-            ),
-        )
-        for overrides, option in cases:
-            with self.subTest(option=option):
-                config = ESampConsumerConfig(
-                    implementation="native", **overrides
-                )
-                with self.assertRaisesRegex(ValueError, option):
-                    build_esamp_workload(config)
-
-    def test_native_dispatch_preserves_explicit_training_row_selection(self) -> None:
-        workload = build_esamp_workload(
-            ESampConsumerConfig(
-                implementation="native",
+    def test_native_workload_preserves_explicit_training_row_selection(self) -> None:
+        workload = ESampWorkload(
+            ESampConfig(
                 training_row_selection="first_per_prompt",
             )
         )
-        self.assertIsInstance(workload, ESampWorkload)
-        assert isinstance(workload, ESampWorkload)
         self.assertEqual(
             workload.config.training_row_selection,
             "first_per_prompt",
         )
 
-    def test_native_dispatch_selects_eager_request_state_mode(self) -> None:
-        dispatched = build_esamp_workload(
-            ESampConsumerConfig(
-                implementation="native",
-                per_request_models=True,
-                enable_distiller_intervention=True,
-                distiller_beta=0.5,
-            )
-        )
-        self.assertIs(type(dispatched), ESampWorkload)
+    def test_native_workload_selects_eager_request_state_mode(self) -> None:
         workload = ESampWorkload(
             ESampConfig(
                 state_mode="per_request",

@@ -337,11 +337,14 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-minimal.txt
 pip install -e ".[vllm027]"
-
-python starter.py --max-new-tokens 32
 ```
 
-The starter runs ESamp with `Qwen/Qwen2.5-7B-Instruct`, generates 16 answers in parallel, and prints runtime adaptation statistics. It defaults to `--seed-mode shared`, which keeps the FlashInfer sampler backend available; use `--seed-mode per-request` if independent `seed + i` request streams matter more.
+For ESamp GPU evidence, use the canonical verification scenario:
+
+```bash
+.venv/bin/python tools/verification/automated_tests.py \
+  --scenario cuda_graph_replay_preserves_training_and_zero_fallback
+```
 
 ## Documentation
 

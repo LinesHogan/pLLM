@@ -528,23 +528,42 @@ def run(args: argparse.Namespace) -> None:
         # keep-mask kernel (README's "triton kernel" arm).
         os.environ["TLLM_ENABLE_EXACT_CANDIDATE_SAMPLING"] = "1"
         os.environ["TLLM_ENABLE_TRITON_MINP_KEEP_MASK"] = "1"
+        from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
         from tllm.runtime import residual_runtime as core
-        from tllm.workflows import esamp_support as esamp_workflow_support
+        from tllm.runtime.vllm_patch.capture_runner import run_generate_with_request_mapping
 
         graph_scratch_rows = max(64, BATCH * N_SAMPLES)
-        esamp_workflow_support.configure_esamp_runtime(
+        core.clear_dispatch_consumers()
+        core.set_runtime_consumer(
+            ESampConsumer(
+                ESampConsumerConfig(
+                    graph_scratch_rows=graph_scratch_rows,
+                    enable_esamp_training=True,
+                    per_request_models=False,
+                    per_request_model_bank=False,
+                    training_row_selection="first_per_prompt",
+                    model_bank_slots=BATCH,
+                    model_bank_train_cudagraph=True,
+                    enable_distiller_intervention=(
+                        args.mode == "tllm" and not args.no_intervention
+                    ),
+                    distiller_beta=0.5,
+                    distiller_sampler_backend="post_filter_exact",
+                )
+            )
+        )
+        core.configure_runtime(
             graph_scratch_rows=graph_scratch_rows,
-            enable_esamp_training=True,
-            per_request_models=False,
-            per_request_model_bank=False,
-            training_row_selection="first_per_prompt",
-            model_bank_slots=BATCH,
-            model_bank_train_cudagraph=True,
-            enable_distiller_intervention=(
-                args.mode == "tllm" and not args.no_intervention
+            tap_layer_paths=(
+                "model.model.layers[0].input_layernorm",
+                "model.model.layers[-1].input_layernorm",
             ),
-            distiller_beta=0.5,
-            distiller_sampler_backend="post_filter_exact",
+            source_layer_path="model.model.layers[0].input_layernorm",
+            target_layer_path="model.model.layers[-1].input_layernorm",
+            adaptation_pipeline_slots=4,
+            adaptation_stream_mode="dual",
+            adaptation_stream_priority=0,
+            compact_capture_lane=False,
         )
         llm = core.make_llm(
             model_name=args.model,
@@ -567,10 +586,11 @@ def run(args: argparse.Namespace) -> None:
             core.synchronize_esamp()
 
         def generate_once():
-            return esamp_workflow_support.run_generate_with_request_mapping(
-                llm,
-                prompts,
-                params,
+            return run_generate_with_request_mapping(
+                runtime=core.RUNTIME,
+                llm=llm,
+                prompts=prompts,
+                params=params,
                 request_prompt_indices=tuple(range(len(prompts))),
                 use_tqdm=False,
                 dispatch_post_generate=False,

@@ -19,10 +19,10 @@ ESamp (*Large Language Models Explore by Latent Distilling*) is tLLM's reference
 Select via config:
 
 ```python
-from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
+from tllm.consumers.esamp import ESampConfig, ESampWorkload
 from tllm.runtime import TllmRuntime
 
-workload = build_esamp_workload(ESampConsumerConfig(implementation="native"))
+workload = ESampWorkload(ESampConfig())
 runtime = TllmRuntime(workloads=(workload,))
 ```
 
@@ -127,14 +127,10 @@ generic packed state-selection facility, not an ESamp scheduling rule.
 ## Benchmark
 
 ```bash
-python -m tllm.workflows.benchmarks.per_request_esamp_benchmark \
-  --case-filter single_on --implementation program \
-  --benchmark-batch-size 8 --sampling-n 16 \
-  --benchmark-max-new-tokens 256 --max-model-len 512 \
-  --enable-distiller-intervention --emit-json-summary
+python test/gpu/esamp_ratio_benchmark.py run --mode native --runner mrv2 --out native.json
 ```
 
-The summary reports output tok/s **and** functional counters (`loss_count`, `distiller_intervention_state_count`, fallback counts). Treat any throughput number with zero training or zero interventions as a broken run, not a fast one.
+The ratio harness reports output tok/s **and** functional counters (`loss_count`, intervention counts, fallback counts). Treat any throughput number with zero training or zero interventions as a broken run, not a fast one.
 Use the exact alignment and memory preconditions in
 [`guides/benchmarking.md`](guides/benchmarking.md), and do not retire either
 baseline before the gate in [`guides/validation.md`](guides/validation.md).

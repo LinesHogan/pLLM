@@ -39,12 +39,7 @@ class Mrv2RequestIdBinding:
     identity: RequestIdentity
 
     def __post_init__(self) -> None:
-        if (
-            type(self.raw_request_id) is not str
-            or not self.raw_request_id
-            or type(self.identity) is not RequestIdentity
-            or self.identity.sample_idx != 0
-        ):
+        if not self.raw_request_id or self.identity.sample_idx != 0:
             raise ValueError(
                 "MRv2 packed rows require an exact n=1 request-id binding"
             )
@@ -57,11 +52,7 @@ class Mrv2RequestIdBatch:
     bindings: tuple[Mrv2RequestIdBinding, ...]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.bindings) is not tuple
-            or not self.bindings
-            or any(type(binding) is not Mrv2RequestIdBinding for binding in self.bindings)
-        ):
+        if not self.bindings:
             raise ValueError(
                 "MRv2 request-id batch must contain unique exact bindings"
             )
@@ -90,11 +81,7 @@ class Mrv2PackedStepRows:
     sampler_rows: PackedSamplerRowBatch
 
     def __post_init__(self) -> None:
-        if (
-            type(self.phase_rows) is not PackedPhaseRowBatch
-            or type(self.sampler_rows) is not PackedSamplerRowBatch
-            or self.sampler_rows.row_batch is not self.phase_rows
-        ):
+        if self.sampler_rows.row_batch is not self.phase_rows:
             raise ValueError(
                 "MRv2 packed step rows must retain one exact row provenance"
             )
@@ -113,7 +100,7 @@ class Vllm027Mrv2PackedRowCodec:
     __slots__ = ("_plan_epoch",)
 
     def __init__(self, *, plan_epoch: int) -> None:
-        if type(plan_epoch) is not int or plan_epoch < 1:
+        if plan_epoch < 1:
             raise ValueError("MRv2 packed-row plan epoch must be positive")
         if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
             raise RuntimeError(
@@ -267,8 +254,6 @@ class Vllm027Mrv2PackedRowCodec:
     ) -> None:
         if (
             type(input_batch) is not InputBatch
-            or type(request_ids) is not Mrv2RequestIdBatch
-            or type(step_id) is not int
             or step_id < 0
         ):
             raise TypeError("MRv2 packed rows require concrete signed inputs")

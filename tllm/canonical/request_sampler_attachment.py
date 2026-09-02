@@ -22,10 +22,7 @@ from tllm.contracts.backend_attachment import (
     StreamDependency,
 )
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
-from tllm.contracts.request_identity import (
-    RequestKeyField,
-    canonical_request_key_fields,
-)
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.contracts.semantic_graph import (
     AnchorId,
     AnchorSymbol,
@@ -45,27 +42,6 @@ class RequestSamplerAttachmentSpec:
     request_key_fields: tuple[RequestKeyField, ...]
     execution_parameters_digest: str
 
-    def __post_init__(self) -> None:
-        canonical_request_key_fields(self.request_key_fields)
-        if (
-            type(self.compute_task) is not str
-            or not self.compute_task
-            or type(self.transition_task) is not str
-            or not self.transition_task
-            or self.compute_task == self.transition_task
-            or type(self.sampler_anchor) is not str
-            or not self.sampler_anchor
-            or type(self.state_resource) is not str
-            or not self.state_resource
-            or type(self.execution_parameters_digest) is not str
-            or len(self.execution_parameters_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.execution_parameters_digest
-            )
-        ):
-            raise ValueError("request-sampler attachment spec is not closed")
-
 
 @dataclass(frozen=True, slots=True)
 class SignedBackendAttachment:
@@ -75,13 +51,31 @@ class SignedBackendAttachment:
     decision: BackendAttachmentDecision
     physical: BackendAttachmentPhysicalPlan
 
-    def __post_init__(self) -> None:
-        if (
-            type(self.inputs) is not BackendAttachmentCompilerInputs
-            or type(self.decision) is not BackendAttachmentDecision
-            or type(self.physical) is not BackendAttachmentPhysicalPlan
-        ):
-            raise TypeError("signed backend attachment requires exact artifacts")
+
+def bind_attachment_tasks(
+    plan_bundle: CanonicalPlanBundle,
+    roles: tuple[tuple[AttachmentTaskRole, TaskSymbol], ...],
+) -> tuple[AttachmentTaskBinding, ...]:
+    physical_by_id = {task.task_id: task for task in plan_bundle.schedule_physical.tasks}
+    bindings: list[AttachmentTaskBinding] = []
+    for role, symbol in roles:
+        scheduled = tuple(
+            task
+            for task in plan_bundle.schedule_decision.tasks
+            if task.task_symbol == symbol
+        )
+        if len(scheduled) != 1 or scheduled[0].task_id not in physical_by_id:
+            raise ValueError("attachment task role does not resolve uniquely")
+        physical = physical_by_id[scheduled[0].task_id]
+        bindings.append(
+            AttachmentTaskBinding(
+                role,
+                physical.task_id,
+                physical.implementation_id,
+                physical.anchor_id,
+            )
+        )
+    return tuple(bindings)
 
 
 def compile_request_sampler_attachment(
@@ -91,46 +85,13 @@ def compile_request_sampler_attachment(
 ) -> SignedBackendAttachment:
     """Mechanically bind semantic task roles to already-signed physical tasks."""
 
-    if (
-        type(plan_bundle) is not CanonicalPlanBundle
-        or type(probe) is not BackendPlacementProbe
-        or type(spec) is not RequestSamplerAttachmentSpec
-    ):
-        raise TypeError("request-sampler lowering requires exact compiler facts")
-
-    compute_scheduled = tuple(
-        task
-        for task in plan_bundle.schedule_decision.tasks
-        if task.task_symbol == spec.compute_task
-    )
-    transition_scheduled = tuple(
-        task
-        for task in plan_bundle.schedule_decision.tasks
-        if task.task_symbol == spec.transition_task
-    )
     sampler_anchors = tuple(
         anchor
         for anchor in plan_bundle.timeline.anchors
         if anchor.symbol == spec.sampler_anchor
     )
-    if (
-        len(compute_scheduled) != 1
-        or len(transition_scheduled) != 1
-        or len(sampler_anchors) != 1
-    ):
+    if len(sampler_anchors) != 1:
         raise ValueError("request-sampler roles do not resolve uniquely")
-    compute_physical = tuple(
-        task
-        for task in plan_bundle.schedule_physical.tasks
-        if task.task_id == compute_scheduled[0].task_id
-    )
-    transition_physical = tuple(
-        task
-        for task in plan_bundle.schedule_physical.tasks
-        if task.task_id == transition_scheduled[0].task_id
-    )
-    if len(compute_physical) != 1 or len(transition_physical) != 1:
-        raise ValueError("request-sampler tasks are absent from the physical plan")
 
     request = BackendAttachmentRequest(
         adapter_id=probe.adapter_id,
@@ -149,18 +110,11 @@ def compile_request_sampler_attachment(
         max_packed_rows=probe.max_packed_rows,
         packed_row_schema_version=1,
         hidden_resources=probe.hidden_resources,
-        task_bindings=(
-            AttachmentTaskBinding(
-                AttachmentTaskRole.COMPUTE,
-                compute_physical[0].task_id,
-                compute_physical[0].implementation_id,
-                compute_physical[0].anchor_id,
-            ),
-            AttachmentTaskBinding(
-                AttachmentTaskRole.TRANSITION,
-                transition_physical[0].task_id,
-                transition_physical[0].implementation_id,
-                transition_physical[0].anchor_id,
+        task_bindings=bind_attachment_tasks(
+            plan_bundle,
+            (
+                (AttachmentTaskRole.COMPUTE, spec.compute_task),
+                (AttachmentTaskRole.TRANSITION, spec.transition_task),
             ),
         ),
         sampler_anchor_id=AnchorId(sampler_anchors[0].ordinal),
@@ -203,5 +157,6 @@ def compile_request_sampler_attachment(
 __all__ = [
     "RequestSamplerAttachmentSpec",
     "SignedBackendAttachment",
+    "bind_attachment_tasks",
     "compile_request_sampler_attachment",
 ]

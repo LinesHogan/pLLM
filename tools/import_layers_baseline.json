@@ -12,12 +12,6 @@
       "contracts",
       "core"
     ],
-    "canonical_runtime": [
-      "canonical",
-      "canonical_vllm",
-      "contracts",
-      "core"
-    ],
     "canonical_vllm": [
       "canonical",
       "contracts",
@@ -89,7 +83,6 @@
     "exact_module_edges": [
       "tllm.backends.timeline -> tllm.schedule.timeline",
       "tllm.consumers.dummy -> tllm.canonical.workloads.dummy",
-      "tllm.consumers.esamp.legacy_workload -> tllm.workload",
       "tllm.consumers.esamp.workload -> tllm.workload",
       "tllm.consumers.override.workload -> tllm.workload",
       "tllm.consumers.recirculation.native_backend -> tllm.workload",

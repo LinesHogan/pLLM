@@ -19,10 +19,10 @@ ESamp（*Large Language Models Explore by Latent Distilling*）是 tLLM 的参�
 配置选择：
 
 ```python
-from tllm.consumers.esamp import ESampConsumerConfig, build_esamp_workload
+from tllm.consumers.esamp import ESampConfig, ESampWorkload
 from tllm.runtime import TllmRuntime
 
-workload = build_esamp_workload(ESampConsumerConfig(implementation="native"))
+workload = ESampWorkload(ESampConfig())
 runtime = TllmRuntime(workloads=(workload,))
 ```
 
@@ -41,17 +41,14 @@ intervention parity。model-bank、compact capture lane、`first_per_prompt` req
 - `distiller_sampler_backend`：候选过滤后端（默认 `post_filter_exact`）。
 - `model_bank_train_cudagraph`（仅 legacy）：legacy 引擎的整步 CUDA Graph；不适用于 native eager workload 路径。
 
-## Benchmark
+## 验证
 
 ```bash
-python -m tllm.workflows.benchmarks.per_request_esamp_benchmark \
-  --case-filter single_on --implementation program \
-  --benchmark-batch-size 8 --sampling-n 16 \
-  --benchmark-max-new-tokens 256 --max-model-len 512 \
-  --enable-distiller-intervention --emit-json-summary
+.venv/bin/python tools/verification/automated_tests.py \
+  --scenario cuda_graph_replay_preserves_training_and_zero_fallback
 ```
 
-摘要在输出 tok/s **之外**还报告功能计数（`loss_count`、`distiller_intervention_state_count`、fallback 计数）。任何训练数或干预数为零的吞吐数字都应视为坏掉的运行，而不是快的运行。
+该 canonical-only 场景检查 CUDA Graph replay 下训练仍然发生，且 fallback 计数为零。任何训练数为零或 fallback 非零的结果都应视为坏掉的运行。
 
 ## 实测数字
 

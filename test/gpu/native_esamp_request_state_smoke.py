@@ -500,22 +500,38 @@ def _run_legacy(args: argparse.Namespace) -> int:
 
     from vllm import SamplingParams
 
+    from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig
     from tllm.runtime import residual_runtime as core
     from tllm.runtime.mp.control import ControlPlane
+    from tllm.runtime.vllm_patch.capture_runner import run_generate_with_request_mapping
     from tllm.util.tools import shutdown_llm_instance
-    from tllm.workflows.esamp_support import (
-        configure_esamp_runtime,
-        run_generate_with_request_mapping,
-    )
 
-    configure_esamp_runtime(
-        implementation="legacy",
-        per_request_models=True,
-        enable_esamp_training=True,
-        enable_distiller_intervention=bool(args.intervention),
-        distiller_beta=0.5 if args.intervention else 0.0,
-        distiller_hidden_dim=8,
-        distiller_lr=1e-3,
+    core.clear_dispatch_consumers()
+    core.set_runtime_consumer(
+        ESampConsumer(
+            ESampConsumerConfig(
+                implementation="legacy",
+                per_request_models=True,
+                enable_esamp_training=True,
+                enable_distiller_intervention=bool(args.intervention),
+                distiller_beta=0.5 if args.intervention else 0.0,
+                distiller_hidden_dim=8,
+                distiller_lr=1e-3,
+            )
+        )
+    )
+    core.configure_runtime(
+        graph_scratch_rows=64,
+        tap_layer_paths=(
+            "model.model.layers[0].input_layernorm",
+            "model.model.layers[-1].input_layernorm",
+        ),
+        source_layer_path="model.model.layers[0].input_layernorm",
+        target_layer_path="model.model.layers[-1].input_layernorm",
+        adaptation_pipeline_slots=4,
+        adaptation_stream_mode="dual",
+        adaptation_stream_priority=0,
+        compact_capture_lane=False,
     )
     llm: "LLM | None" = None
     try:
@@ -544,9 +560,10 @@ def _run_legacy(args: argparse.Namespace) -> int:
             ignore_eos=True,
         )
         outputs = run_generate_with_request_mapping(
-            llm,
-            _PROMPTS,
-            params,
+            runtime=core.RUNTIME,
+            llm=llm,
+            prompts=_PROMPTS,
+            params=params,
             request_prompt_indices=tuple(range(_PARENTS)),
             use_tqdm=False,
             dispatch_post_generate=False,

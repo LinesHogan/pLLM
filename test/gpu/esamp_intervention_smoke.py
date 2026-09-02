@@ -12,8 +12,8 @@ from __future__ import annotations
 import argparse
 import json
 
+from tllm.consumers.esamp import ESampConsumer, ESampConsumerConfig, ESampProgramConsumer
 from tllm.runtime import residual_runtime as core
-from tllm.workflows import esamp_support as esamp_workflow_support
 from tllm.util.tools import build_prompt_batch, read_prompts, shutdown_llm_instance
 
 
@@ -39,13 +39,32 @@ def main() -> int:
         int(args.batch_size),
     )
 
-    esamp_workflow_support.configure_esamp_runtime(
+    config = ESampConsumerConfig(
         implementation=str(args.implementation),
         graph_scratch_rows=max(64, len(prompts)),
         enable_esamp_training=True,
         enable_distiller_intervention=True,
         distiller_beta=float(args.beta),
         distiller_sampler_backend=str(args.sampler_backend),
+    )
+    core.clear_dispatch_consumers()
+    core.set_runtime_consumer(
+        ESampProgramConsumer(config)
+        if config.implementation == "program"
+        else ESampConsumer(config)
+    )
+    core.configure_runtime(
+        graph_scratch_rows=max(64, len(prompts)),
+        tap_layer_paths=(
+            "model.model.layers[0].input_layernorm",
+            "model.model.layers[-1].input_layernorm",
+        ),
+        source_layer_path="model.model.layers[0].input_layernorm",
+        target_layer_path="model.model.layers[-1].input_layernorm",
+        adaptation_pipeline_slots=4,
+        adaptation_stream_mode="dual",
+        adaptation_stream_priority=0,
+        compact_capture_lane=False,
     )
 
     llm = core.make_llm(
