@@ -12,7 +12,7 @@ through to a "future versions probably look the same" branch.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum, StrEnum, auto
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
@@ -22,6 +22,18 @@ from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.typed_replay import TypedLayerReplayHandle
+
+
+class BackendObservableEvent(StrEnum):
+    """Closed backend hook events admitted by a signed timeline."""
+
+    PREPARE_INPUTS_PRE = "prepare_inputs.pre"
+    PREPARE_INPUTS_POST = "prepare_inputs.post"
+    EXECUTE_MODEL_PRE = "execute_model.pre"
+    EXECUTE_MODEL_POST = "execute_model.post"
+    SAMPLE_TOKENS_PRE = "sample_tokens.pre"
+    SAMPLER_PRE_DRAW = "sampler.pre_draw"
+    SAMPLE_TOKENS_POST = "sample_tokens.post"
 
 
 def runner_model_module(runner: object) -> "torch.nn.Module":

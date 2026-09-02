@@ -22,9 +22,9 @@ from tllm.runtime.workload_execution import (
     StateVersionBinding,
     WorkloadExecutionBindings,
 )
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import (
     AsyncBatchCaptureMode,
-    BackendObservableEvent,
     CompileOptions,
     HostCommandKind,
     MainWorkloadTimeline,

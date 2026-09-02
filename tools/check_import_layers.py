@@ -139,6 +139,7 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.schedule.coordinator", "tllm.workload.frontend"),
         ("tllm.schedule.coordinator", "tllm.workload.lowering"),
         ("tllm.schedule.physical", "tllm.contracts.physical_plan"),
+        ("tllm.schedule.contracts", "tllm.backends.protocol"),
         ("tllm.schedule.timeline", "tllm.backends.protocol"),
         # Backends export the typed main-workload timeline, but never import
         # the coordinator or workload executors.

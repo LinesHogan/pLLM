@@ -7,12 +7,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestKeyField
 from tllm.schedule import (
     AsyncBatchCaptureMode,
-    BackendObservableEvent,
     CompileOptions,
     ExecutionRegion,
     HiddenPhase,

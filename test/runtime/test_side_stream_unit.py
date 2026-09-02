@@ -4,10 +4,10 @@ import unittest
 
 import torch
 
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.workload_execution import _plan_resources
 from tllm.runtime.request_trainable_state import RequestStateSelectionBatch
 from tllm.schedule import (
-    BackendObservableEvent,
     CompileOptions,
     MainWorkloadTimeline,
     TimelineAnchor,

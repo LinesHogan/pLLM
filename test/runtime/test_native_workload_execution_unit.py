@@ -76,8 +76,8 @@ from tllm.workload.region_compiler import (
     RegionCallableArtifact,
     materialize_region_artifacts,
 )
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import (
-    BackendObservableEvent,
     CompileOptions,
     HiddenLayerKind,
     MainWorkloadTimeline,

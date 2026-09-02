@@ -24,7 +24,7 @@ from tllm.runtime.backend_region_binders import (
 )
 from tllm.runtime.dispatch_plan import DispatchPlan, DispatchTarget
 from tllm.runtime.vllm_patch import common_hooks
-from tllm.runtime.workload_execution import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import BackendRegionBinderStage
 
 

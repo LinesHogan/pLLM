@@ -34,8 +34,8 @@ from tllm.runtime.sampler_bridge.types import CandidateModifierState
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.workload_execution import WorkloadExecutionBindings
 from tllm.runtime.workload_bindings import RuntimeOutputBinding, RuntimePortRegistry
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import (
-    BackendObservableEvent,
     CompileOptions,
     MainWorkloadTimeline,
     TimelineAnchor,

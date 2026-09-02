@@ -23,8 +23,8 @@ from tllm.runtime.workload_plugins import (
     static_backend_binding_manifest_wire,
 )
 from tllm.runtime.workload_bindings import BackendRuntimeBinding, WorkloadRuntimeBinding
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import (
-    BackendObservableEvent,
     CompileOptions,
     WorkloadCompilerCoordinator,
 )

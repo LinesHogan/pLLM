@@ -8,6 +8,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, StrEnum
 from typing import Mapping
 
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.request_identity import RequestKeyField
@@ -318,18 +319,6 @@ class ScheduleEdgeKind(StrEnum):
     EFFECT = "effect"
     CONTROL = "control"
     ANCHOR = "anchor"
-
-
-class BackendObservableEvent(StrEnum):
-    """Closed backend hook events admitted by a signed timeline."""
-
-    PREPARE_INPUTS_PRE = "prepare_inputs.pre"
-    PREPARE_INPUTS_POST = "prepare_inputs.post"
-    EXECUTE_MODEL_PRE = "execute_model.pre"
-    EXECUTE_MODEL_POST = "execute_model.post"
-    SAMPLE_TOKENS_PRE = "sample_tokens.pre"
-    SAMPLER_PRE_DRAW = "sampler.pre_draw"
-    SAMPLE_TOKENS_POST = "sample_tokens.post"
 
 
 class ScheduleEffectKind(StrEnum):
@@ -3705,7 +3694,6 @@ class ScheduleDecision:
 __all__ = [
     "AffineRegionSchedule",
     "AsyncBatchCaptureMode",
-    "BackendObservableEvent",
     "BackendRegionBinderStage",
     "CompileOptions",
     "CostBreakdown",

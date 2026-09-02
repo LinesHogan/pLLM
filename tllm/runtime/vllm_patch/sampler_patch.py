@@ -7,9 +7,9 @@ from typing import Any
 
 import torch
 
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.instrumentation import maybe_record_function
 from tllm.runtime.sampler_bridge.min_p import apply_min_p
-from tllm.runtime.workload_execution import BackendObservableEvent
 
 _PATCH_INSTALLED = False
 _ORIG_VLLM_SAMPLER_SAMPLE = None

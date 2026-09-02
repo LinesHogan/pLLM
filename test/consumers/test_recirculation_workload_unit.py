@@ -43,7 +43,8 @@ from tllm.runtime.workload_bindings import (
     LocalRuntimeServices,
     WorkerRuntimeBinding,
 )
-from tllm.schedule import BackendObservableEvent, RegionImplementationKind
+from tllm.backends.protocol import BackendObservableEvent
+from tllm.schedule import RegionImplementationKind
 from tllm.consumers.recirculation import native_backend
 from tllm.consumers.recirculation import stage_definition
 

@@ -59,7 +59,7 @@ from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 from tllm.runtime.vllm_patch import sampler_patch as _sampler_patch
 from tllm.runtime.vllm_patch.adapters.v027 import V027PrepareInputsAdapter
-from tllm.runtime.workload_execution import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 
 _ADAPTER = V027PrepareInputsAdapter()
 

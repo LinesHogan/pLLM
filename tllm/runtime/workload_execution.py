@@ -137,9 +137,9 @@ from tllm.contracts.physical_plan import (
     PhysicalNodePlan,
     StreamClass,
 )
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.workload.region_compiler import compare_region_outputs
 from tllm.schedule.contracts import (
-    BackendObservableEvent,
     AsyncBatchCaptureMode,
     BackendRegionBinderStage,
     ExecutionRegion,

@@ -23,7 +23,7 @@ from tllm.runtime import active_targets, residual_runtime
 from tllm.runtime.scheduling import collective as collective_runtime
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks
-from tllm.schedule.contracts import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.vllm_patch import port_runtime_hooks
 from tllm.workgraph import placement
 from tllm.workgraph.distributed import (

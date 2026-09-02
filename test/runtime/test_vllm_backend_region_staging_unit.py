@@ -14,7 +14,7 @@ from tllm.runtime.backend_region_binders import (
     BackendRegionStageContext,
     BackendRegionStagerRegistry,
 )
-from tllm.runtime.workload_execution import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import BackendRegionBinderStage
 
 

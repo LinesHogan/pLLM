@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from tllm.backends.protocol import BackendCapabilities
+from tllm.backends.protocol import BackendCapabilities, BackendObservableEvent
 from tllm.schedule.contracts import (
-    BackendObservableEvent,
     MainWorkloadRegion,
     MainWorkloadTimeline,
     TimelineAnchor,

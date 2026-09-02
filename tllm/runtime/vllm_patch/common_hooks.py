@@ -10,11 +10,11 @@ import torch
 from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.hidden_batch import HiddenBatch
 from tllm.contracts.runtime_context import RunnerLike, RuntimeContext
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.consumer_compat import dispatch_consumer_event
 from tllm.runtime.scheduling.deferred import DeferredWorkQueue
 from tllm.runtime.vllm_patch.compilation import is_torch_compiling
-from tllm.runtime.workload_execution import BackendObservableEvent
 
 if TYPE_CHECKING:
     from tllm.runtime.workload_execution import NativeWorkloadExecution

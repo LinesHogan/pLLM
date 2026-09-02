@@ -8,6 +8,7 @@ import json
 import pytest
 
 from tllm import _core
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.packed_rows import (
@@ -17,7 +18,6 @@ from tllm.contracts.packed_rows import (
 from tllm.contracts.request_identity import RequestKeyField
 from tllm.schedule.contracts import (
     ExecutionRegion,
-    BackendObservableEvent,
     CompileOptions,
     MainWorkloadTimeline,
     HiddenLayerKind as ScheduleHiddenLayerKind,

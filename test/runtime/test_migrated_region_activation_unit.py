@@ -36,7 +36,7 @@ from tllm.runtime.scheduling.workgraph_executor import (
 )
 from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.schedule.contracts import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.workgraph import placement
 from tllm.workgraph.frontend import (
     ArtifactKey,

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 from tllm.schedule.contracts import (
     AffineRegionSchedule,
     AsyncBatchCaptureMode,
-    BackendObservableEvent,
     BackendRegionBinderStage,
     CompileOptions,
     CostBreakdown,
@@ -118,7 +117,6 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "AffineRegionSchedule",
     "AsyncBatchCaptureMode",
-    "BackendObservableEvent",
     "BackendRegionBinderStage",
     "CompileOptions",
     "CostBreakdown",

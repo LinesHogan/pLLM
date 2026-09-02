@@ -22,7 +22,7 @@ from tllm.runtime.ports.residual_bundle_dispatch import (
 )
 from tllm.runtime.state import ResidualRuntimeState
 from tllm.runtime.vllm_patch import common_hooks as _common_hooks
-from tllm.schedule.contracts import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 
 
 class _MovableConsumer(BaseConsumer[object]):

@@ -32,10 +32,10 @@ from tllm.runtime.torch_adapter import (
     CudaLongHostStaging,
     torch_regular_position_view,
 )
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.stats import PlacementStats
-from tllm.runtime.workload_execution import BackendObservableEvent
 from tllm.contracts.request_identity import resolve_request_identity
 from tllm.runtime.request_trainable_state import RequestIdentityBatch
 

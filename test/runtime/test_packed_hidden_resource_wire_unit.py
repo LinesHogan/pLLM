@@ -22,8 +22,8 @@ from tllm.runtime.workload_plugins import (
     WorkloadWorkerSpec,
     reconstruct_worker_bindings,
 )
+from tllm.backends.protocol import BackendObservableEvent
 from tllm.schedule import (
-    BackendObservableEvent,
     HiddenLayerKind,
     MainWorkloadTimeline,
     PackedHiddenResourceBinding,

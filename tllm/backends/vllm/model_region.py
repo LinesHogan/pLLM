@@ -12,7 +12,7 @@ from tllm.runtime.backend_region_binders import (
     BackendRegionStageContext,
     BackendRegionStagerRegistry,
 )
-from tllm.runtime.workload_execution import BackendObservableEvent
+from tllm.backends.protocol import BackendObservableEvent
 
 
 def stage_signed_backend_region_event(
