@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import TYPE_CHECKING, Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 import torch
 
@@ -887,7 +887,7 @@ def register_dispatch_consumer(consumer: BaseConsumer[object]) -> None:
     _refresh_dispatch_plan()
 
 
-def replace_dispatch_consumers(consumers: Sequence[BaseConsumer]) -> None:
+def replace_dispatch_consumers(consumers: Sequence[BaseConsumer[Any]]) -> None:
     _ensure_dispatch_registry().replace_all(consumers)
     _refresh_dispatch_plan()
 
@@ -897,7 +897,7 @@ def clear_dispatch_consumers() -> None:
     _refresh_dispatch_plan()
 
 
-def set_runtime_consumer(consumer: BaseConsumer | None) -> None:
+def set_runtime_consumer(consumer: BaseConsumer[Any] | None) -> None:
     RUNTIME.consumer = consumer
     _refresh_dispatch_plan()
 
