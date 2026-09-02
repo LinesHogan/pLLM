@@ -137,9 +137,6 @@ def lower_physical_flow_plan(
         ),
         schedule_signature=decision.signature,
     )
-    from tllm import core as _core
-
-    _core.validate_physical_flow_plan(physical)
     return physical
 
 

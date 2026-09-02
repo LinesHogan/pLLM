@@ -10,7 +10,7 @@ from tllm.contracts.typed_replay import (
 )
 from tllm.consumers.recirculation.graph import build_recirculation_graph
 from tllm.consumers.recirculation.spec import RecirculationSettings
-from tllm.workgraph.recurrence import RecurrenceGraph
+from tllm.contracts.recurrence import RecurrenceGraph
 
 PREFILL_BINDER_IMPLEMENTATION_ID = "tllm.recirculation:bind_prefill@1"
 RECIRCULATION_MIX_PRIMITIVE = "tllm.recirculation:typed_mix@1"

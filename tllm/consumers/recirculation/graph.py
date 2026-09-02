@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tllm.consumers.recirculation.spec import RecirculationSettings
-from tllm.workgraph.recurrence import (
+from tllm.contracts.recurrence import (
     DependenceKind,
     IterationPoint,
     RecurrenceEdge,

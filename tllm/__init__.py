@@ -8,10 +8,10 @@ process-wide default :class:`tllm.runtime.runtime.TllmRuntime`:
     llm = runtime.make_llm(...)
 
 The legacy/runtime names (:class:`BaseConsumer`, :class:`TllmRuntime`,
-``default_runtime``, ``BeforeNextUse``, ``extern``, ``flow``) load lazily via
+``default_runtime``) load lazily via
 PEP 562 so that importing a native-stack subpackage (``tllm.workload``,
-``tllm.schedule``) never pulls the legacy Program/workgraph frontend or the
-runtime into a compiler-only process.  They are gone at legacy retirement.
+``tllm.schedule``) never pulls the runtime into a compiler-only process.  They
+are gone at legacy retirement.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tllm.consumers.base import BaseConsumer
     from tllm.runtime.runtime import TllmRuntime, default_runtime
-    from tllm.workgraph.frontend import BeforeNextUse, extern, flow
 
 
 def make_llm(*args: object, **kwargs: object) -> object:
@@ -128,21 +127,14 @@ def __getattr__(name: str) -> object:
         from tllm.runtime import runtime as _runtime
 
         return getattr(_runtime, name)
-    if name in ("BeforeNextUse", "extern", "flow"):
-        from tllm.workgraph import frontend as _frontend
-
-        return getattr(_frontend, name)
     raise AttributeError(f"module 'tllm' has no attribute {name!r}")
 
 
 __all__ = [
     "BaseConsumer",
-    "BeforeNextUse",
     "TllmRuntime",
     "clear_consumers",
     "default_runtime",
-    "extern",
-    "flow",
     "make_llm",
     "register_consumer",
 ]

@@ -17,7 +17,7 @@ from tllm.ports.residual_stream import ResidualLocator
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime import active_targets
 from tllm.runtime import hidden_event_bridge as _hidden_bridge
-from tllm.runtime.ports import residual_bundle_dispatch as _residual_bundle_dispatch
+from tllm.runtime.ports import residual_bundle as _residual_bundle
 from tllm.runtime.ports import post_generate_dispatch as _post_generate_dispatch
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports import residual_bindings as _residual_bindings
@@ -556,7 +556,7 @@ def run_prepare_inputs_post_producers(
     localize_decode: Callable[[], object],
 ) -> None:
     """Run compiler-selected prepare producers in DAG order."""
-    _residual_bundle_dispatch.retire_step_device_leases(core=core, runner=runner)
+    _residual_bundle.retire_step_device_leases(core=core, runner=runner)
     executor = getattr(core.RUNTIME, "producer_executor", None)
     if executor is not None:
         from tllm.runtime.producer_executor import PrepareInputsPostContext
@@ -581,13 +581,13 @@ def run_prepare_inputs_post_producers(
 
 
 def build_decode_port_frames(*, core: PortDispatchCoreLike, layer_path: str) -> List[PortFrame]:
-    return _residual_bundle_dispatch.build_decode_port_frames(core=core, layer_path=layer_path)
+    return _residual_bundle.build_decode_port_frames(core=core, layer_path=layer_path)
 
 
 def build_step_scope_port_bundle(
     *, core: PortDispatchCoreLike, flow: ConsumerFlow, consumer_id: str = ""
 ) -> PortBundle | None:
-    return _residual_bundle_dispatch.build_step_scope_port_bundle(
+    return _residual_bundle.build_step_scope_port_bundle(
         core=core,
         flow=flow,
         consumer_id=consumer_id,
@@ -595,7 +595,7 @@ def build_step_scope_port_bundle(
 
 
 def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLike) -> int:
-    return _residual_bundle_dispatch.dispatch_decode_port_bundles(core=core, runner=runner)
+    return _residual_bundle.dispatch_decode_port_bundles(core=core, runner=runner)
 
 
 def run_execute_model_post_producers(
@@ -951,12 +951,6 @@ def wrapped_execute_model(
             layer_path=None,
             capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )
-        from tllm.runtime import residual_runtime as _residual_runtime
-
-        if core is _residual_runtime:
-            _residual_runtime.finish_workgraph_distributed_step(
-                int(core.RUNTIME.event_step_id)
-            )
     return out
 
 

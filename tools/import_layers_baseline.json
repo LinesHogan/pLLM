@@ -29,7 +29,6 @@
       "kit",
       "ports",
       "producers",
-      "program",
       "runtime",
       "workgraph"
     ],
@@ -53,14 +52,6 @@
       "contracts",
       "core",
       "ports"
-    ],
-    "program": [
-      "common",
-      "contracts",
-      "core",
-      "ports",
-      "producers",
-      "workgraph"
     ],
     "runtime": [
       "common",
@@ -119,9 +110,6 @@
       "tllm.schedule.physical -> tllm.contracts.physical_plan",
       "tllm.schedule.timeline -> tllm.backends.protocol",
       "tllm.workload -> tllm.contracts.request_identity",
-      "tllm.workload.compat -> tllm.contracts.request_identity",
-      "tllm.workload.compat -> tllm.program.decl",
-      "tllm.workload.compat -> tllm.workgraph.frontend",
       "tllm.workload.frontend -> tllm.contracts.hidden_locator",
       "tllm.workload.frontend -> tllm.contracts.request_identity",
       "tllm.workload.ir -> tllm.contracts.hidden_locator",

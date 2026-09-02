@@ -1,8 +1,5 @@
 """Public auxiliary-workload declaration API."""
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING
-
 from tllm.workload.frontend import (
     AdamSpec,
     AdamWSpec,
@@ -95,34 +92,6 @@ from tllm.workload.region_compiler import (
     materialize_region_callable,
 )
 
-if TYPE_CHECKING:
-    from tllm.program.decl import StateSpec
-
-
-def lower_program(
-    instance: object,
-    *,
-    states: "Mapping[str, StateSpec]",
-    workload_id: str | None = None,
-) -> WorkloadIR:
-    from tllm.workload.compat import lower_program as lower_legacy_program
-
-    return lower_legacy_program(
-        instance,
-        states=states,
-        workload_id=workload_id,
-    )
-
-
-def dependence_effect_fingerprint(
-    ir: WorkloadIR,
-) -> tuple[tuple[str, str, str, str], ...]:
-    from tllm.workload.compat import (
-        dependence_effect_fingerprint as legacy_fingerprint,
-    )
-
-    return legacy_fingerprint(ir)
-
 __all__ = [
     "AdamSpec",
     "AdamWSpec",
@@ -174,7 +143,6 @@ __all__ = [
     "WorkloadEdgeKind",
     "WorkloadIR",
     "current",
-    "dependence_effect_fingerprint",
     "declare_workload",
     "definition_for_workload_class",
     "extern",
@@ -188,7 +156,6 @@ __all__ = [
     "packed_sampler_rows",
     "packed_selection",
     "host_output",
-    "lower_program",
     "lower_schedule_graph",
     "materialize_region_artifacts",
     "materialize_region_callable",

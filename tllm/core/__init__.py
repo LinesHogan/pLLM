@@ -32,14 +32,6 @@ try:
         plan_packed_prefill_rows,
         plan_prefill_rows,
         plan_sampler_step,
-        WorkGraphValidation,
-        validate_adaptive_flow_plan,
-        validate_capture_hierarchy,
-        validate_distributed_flow_plan,
-        validate_physical_flow_plan,
-        validate_placement_plan,
-        validate_workgraph,
-        validate_workgraph_ir,
     )
 except ImportError as exc:  # pragma: no cover - build guard
     raise ImportError(
@@ -67,12 +59,4 @@ __all__ = [
     "plan_packed_prefill_rows",
     "plan_prefill_rows",
     "plan_sampler_step",
-    "WorkGraphValidation",
-    "validate_adaptive_flow_plan",
-    "validate_capture_hierarchy",
-    "validate_distributed_flow_plan",
-    "validate_physical_flow_plan",
-    "validate_placement_plan",
-    "validate_workgraph",
-    "validate_workgraph_ir",
 ]

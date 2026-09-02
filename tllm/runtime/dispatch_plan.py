@@ -16,7 +16,7 @@ from tllm.runtime.placement import CompiledPlacement
 
 if TYPE_CHECKING:
     from tllm.backends.protocol import BackendCapabilities
-    from tllm.workgraph.recurrence import CompiledRecurrence, RecurrenceRequirements
+    from tllm.contracts.recurrence import CompiledRecurrence, RecurrenceRequirements
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ class DispatchPlan:
                 else None
             )
             if recurrence is not None:
-                from tllm.workgraph.recurrence import RecurrenceRequirements
+                from tllm.contracts.recurrence import RecurrenceRequirements
 
                 if not isinstance(recurrence, RecurrenceRequirements):
                     raise TypeError(
@@ -182,7 +182,7 @@ class DispatchPlan:
         graph_mode: GraphMode,
         tp_size: int = 1,
     ) -> None:
-        from tllm.workgraph.recurrence import validate_recurrence_admission
+        from tllm.contracts.recurrence import validate_recurrence_admission
 
         for target in self._recurrence_targets:
             validate_recurrence_admission(
@@ -201,7 +201,7 @@ class DispatchPlan:
         graph_mode: GraphMode,
         tp_size: int = 1,
     ) -> tuple[tuple[str, "CompiledRecurrence"], ...]:
-        from tllm.workgraph.recurrence import compile_recurrence
+        from tllm.contracts.recurrence import compile_recurrence
 
         return tuple(
             (

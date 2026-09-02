@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite recurrence graphs and semantics-preserving schedule synthesis.
+"""Finite recurrence contracts and semantics-preserving schedule synthesis.
 
 Consumers declare dependence, not execution tricks.  Exact schedules preserve
 every edge.  Approximation transforms (currently Jacobi) are explicit and

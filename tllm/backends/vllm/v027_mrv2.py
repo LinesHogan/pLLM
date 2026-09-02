@@ -405,12 +405,6 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
         layer_path=None,
         capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
-    from tllm.runtime import residual_runtime as _residual_runtime
-
-    if core is _residual_runtime:
-        _residual_runtime.finish_workgraph_distributed_step(
-            int(runtime.event_step_id)
-        )
     return out
 
 

@@ -13,7 +13,6 @@ mod recurrence;
 mod sampler_plan;
 mod schedule;
 mod shape_specialization;
-mod workgraph;
 mod workload_frontend;
 
 #[pymodule]
@@ -30,7 +29,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     prefill_row_plan::register(m)?;
     recurrence::register(m)?;
     schedule::register(m)?;
-    workgraph::register(m)?;
     workload_frontend::register(m)?;
     Ok(())
 }

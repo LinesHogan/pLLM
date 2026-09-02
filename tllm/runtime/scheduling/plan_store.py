@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import TypeVar, cast
@@ -18,18 +18,6 @@ from tllm.runtime.scheduling.physical import (
     PreflightContextGraphLike,
     StreamLike,
 )
-from tllm.runtime.scheduling.transfer import (
-    CopyHandle,
-    PlacementImplementationBinding,
-    PlacementPlanDispatcher,
-    TensorLike,
-)
-from tllm.runtime.scheduling.adaptive import (
-    AdaptiveFlowBinding,
-    AdaptiveTransferStatus,
-    AdaptiveAdmissionScheduler,
-    validate_adaptive_flow_bindings,
-)
 from tllm.contracts.physical_plan import (
     ArtifactKey,
     BufferBucketDesc,
@@ -39,9 +27,6 @@ from tllm.contracts.physical_plan import (
     PhysicalFlowPlan,
     StreamClass,
 )
-from tllm.workgraph.placement import PlacementPlan
-from tllm.workgraph.admission import CandidateActionDesc, AdmissionControlPlan
-
 
 _T = TypeVar("_T")
 
@@ -141,132 +126,15 @@ class PlanResources:
     """One physical plan and the Python runtime resources owned by its epoch."""
 
     plan: PhysicalFlowPlan
-    placement_plan: PlacementPlan | None = None
-    placement_dispatcher: PlacementPlanDispatcher | None = None
-    placement_implementations: tuple[PlacementImplementationBinding, ...] = ()
-    adaptive_plan: AdmissionControlPlan | None = None
-    adaptive_scheduler: AdaptiveAdmissionScheduler | None = None
-    adaptive_flow_bindings: tuple[AdaptiveFlowBinding, ...] = ()
     leases: tuple[BufferLease, ...] = ()
     streams: tuple[RuntimeStream, ...] = ()
     events: tuple[RuntimeEvent, ...] = ()
     graphs: tuple[RuntimeGraph, ...] = ()
-    _adaptive_transfers: dict[
-        tuple[str, object, int],
-        tuple[CandidateActionDesc, tuple[CopyHandle, ...]],
-    ] = field(default_factory=dict, init=False, repr=False, compare=False)
-    _deferred_handoffs: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         raw_plan = cast(object, self.plan)
         if not isinstance(raw_plan, PhysicalFlowPlan):
             raise TypeError("PlanResources.plan must be PhysicalFlowPlan")
-        placement_plan = self.placement_plan
-        placement_dispatcher = self.placement_dispatcher
-        placement_implementations = _typed_tuple(
-            self.placement_implementations,
-            PlacementImplementationBinding,
-            "PlanResources.placement_implementations",
-        )
-        if (placement_plan is None) != (placement_dispatcher is None):
-            raise ValueError(
-                "PlanResources placement plan and dispatcher must be published together"
-            )
-        if placement_plan is not None:
-            if not isinstance(cast(object, placement_plan), PlacementPlan):
-                raise TypeError("PlanResources.placement_plan must be PlacementPlan")
-            if not isinstance(
-                cast(object, placement_dispatcher), PlacementPlanDispatcher
-            ):
-                raise TypeError(
-                    "PlanResources.placement_dispatcher must be PlacementPlanDispatcher"
-                )
-            assert placement_dispatcher is not None
-            if placement_plan.plan_epoch != raw_plan.plan_epoch:
-                raise ValueError(
-                    "PlanResources physical and placement epochs must match"
-                )
-            if placement_dispatcher.plan != placement_plan:
-                raise ValueError(
-                    "PlanResources dispatcher must bind its frozen placement plan"
-                )
-            physical_executors = {
-                node.node_key: node.executor for node in raw_plan.nodes
-            }
-            placement_executors = {
-                selection.node_key: selection.logical_executor
-                for selection in placement_plan.selections
-            }
-            if placement_executors != physical_executors:
-                raise ValueError(
-                    "PlanResources placement selections must match physical nodes and executors"
-                )
-            expected_implementations = {
-                (selection.node_key, selection.key)
-                for selection in placement_plan.selections
-            }
-            actual_implementations = {
-                (binding.node_key, binding.implementation_key)
-                for binding in placement_implementations
-            }
-            if (
-                len(actual_implementations) != len(placement_implementations)
-                or actual_implementations != expected_implementations
-            ):
-                raise ValueError(
-                    "PlanResources implementation bindings must exactly cover placement selections"
-                )
-        elif placement_implementations:
-            raise ValueError(
-                "PlanResources implementation bindings require a placement plan"
-            )
-        adaptive_plan = self.adaptive_plan
-        adaptive_scheduler = self.adaptive_scheduler
-        adaptive_flow_bindings = _typed_tuple(
-            self.adaptive_flow_bindings,
-            AdaptiveFlowBinding,
-            "PlanResources.adaptive_flow_bindings",
-        )
-        if (adaptive_plan is None) != (adaptive_scheduler is None):
-            raise ValueError(
-                "PlanResources adaptive plan and scheduler must be published together"
-            )
-        if adaptive_plan is not None:
-            if not isinstance(cast(object, adaptive_plan), AdmissionControlPlan):
-                raise TypeError("PlanResources.adaptive_plan must be AdmissionControlPlan")
-            if not isinstance(
-                cast(object, adaptive_scheduler), AdaptiveAdmissionScheduler
-            ):
-                raise TypeError(
-                    "PlanResources.adaptive_scheduler must be AdaptiveAdmissionScheduler"
-                )
-            if placement_plan is None or adaptive_plan.placement_plan != placement_plan:
-                raise ValueError(
-                    "PlanResources adaptive plan must bind its exact placement plan"
-                )
-            if adaptive_plan.plan_epoch != raw_plan.plan_epoch:
-                raise ValueError(
-                    "PlanResources physical and adaptive epochs must match"
-                )
-            assert adaptive_scheduler is not None
-            prepared = adaptive_scheduler.prepared
-            if prepared is None or prepared.plan != adaptive_plan:
-                raise ValueError(
-                    "PlanResources adaptive scheduler must prepare its frozen plan"
-                )
-            flow_ids = tuple(binding.flow_id for binding in adaptive_flow_bindings)
-            if len(set(flow_ids)) != len(flow_ids):
-                raise ValueError(
-                    "PlanResources adaptive flow bindings must use unique flow ids"
-                )
-            adaptive_flow_bindings = validate_adaptive_flow_bindings(
-                adaptive_plan,
-                adaptive_flow_bindings,
-            )
-        elif adaptive_flow_bindings:
-            raise ValueError(
-                "PlanResources adaptive flow bindings require an adaptive plan"
-            )
         leases = _typed_tuple(self.leases, BufferLease, "PlanResources.leases")
         streams = _typed_tuple(self.streams, RuntimeStream, "PlanResources.streams")
         events = _typed_tuple(self.events, RuntimeEvent, "PlanResources.events")
@@ -343,20 +211,6 @@ class PlanResources:
                 "PlanResources binds one fence key to different event objects"
             )
         object.__setattr__(self, "plan", raw_plan)
-        object.__setattr__(self, "placement_plan", placement_plan)
-        object.__setattr__(self, "placement_dispatcher", placement_dispatcher)
-        object.__setattr__(
-            self,
-            "placement_implementations",
-            placement_implementations,
-        )
-        object.__setattr__(self, "adaptive_plan", adaptive_plan)
-        object.__setattr__(self, "adaptive_scheduler", adaptive_scheduler)
-        object.__setattr__(
-            self,
-            "adaptive_flow_bindings",
-            adaptive_flow_bindings,
-        )
         object.__setattr__(self, "leases", leases)
         object.__setattr__(self, "streams", streams)
         object.__setattr__(self, "events", events)
@@ -370,159 +224,13 @@ class PlanResources:
                 resource.retire_fence.recorded and resource.retire_fence.complete
                 for resource in self.streams
             )
-            and (
-                self.placement_dispatcher is None
-                or self.placement_dispatcher.in_flight == 0
-            )
-            and not self._adaptive_transfers
-            and self._deferred_handoffs == 0
         )
-
-    def retain_deferred_handoff(self) -> None:
-        object.__setattr__(self, "_deferred_handoffs", self._deferred_handoffs + 1)
-
-    def release_deferred_handoff(self) -> None:
-        if self._deferred_handoffs <= 0:
-            raise RuntimeError("adaptive deferred handoff ownership is unbalanced")
-        object.__setattr__(self, "_deferred_handoffs", self._deferred_handoffs - 1)
 
     def poll_transfers(self) -> None:
-        if self.placement_dispatcher is not None:
-            self.placement_dispatcher.poll()
-
-    def adaptive_flow_binding(self, flow_id: str) -> AdaptiveFlowBinding | None:
-        if not isinstance(flow_id, str) or not flow_id:
-            raise ValueError("adaptive flow lookup requires a non-empty flow id")
-        return next(
-            (
-                binding
-                for binding in self.adaptive_flow_bindings
-                if binding.flow_id == flow_id
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _adaptive_transfer_token(
-        binding: AdaptiveFlowBinding,
-        bundle_key: object,
-        bundle_version: int,
-    ) -> tuple[str, object, int]:
-        try:
-            hash(bundle_key)
-        except TypeError as exc:
-            raise TypeError("adaptive transfer bundle key must be hashable") from exc
-        if not isinstance(bundle_version, int) or isinstance(bundle_version, bool):
-            raise TypeError("adaptive transfer bundle version must be int")
-        return binding.flow_id, bundle_key, bundle_version
-
-    def adaptive_pending_action(
-        self,
-        binding: AdaptiveFlowBinding,
-        *,
-        bundle_key: object,
-        bundle_version: int,
-    ) -> CandidateActionDesc | None:
-        token = self._adaptive_transfer_token(
-            binding,
-            bundle_key,
-            bundle_version,
-        )
-        batch = self._adaptive_transfers.get(token)
-        return None if batch is None else batch[0]
-
-    def abandon_adaptive_transfer(
-        self,
-        *,
-        flow_id: str,
-        bundle_key: object,
-        bundle_version: int,
-    ) -> None:
-        """Drop a discarded callback's token while its copy fence stays owned."""
-
-        binding = self.adaptive_flow_binding(flow_id)
-        if binding is None:
-            return
-        token = self._adaptive_transfer_token(
-            binding,
-            bundle_key,
-            bundle_version,
-        )
-        self._adaptive_transfers.pop(token, None)
-
-    def advance_adaptive_transfers(
-        self,
-        binding: AdaptiveFlowBinding,
-        *,
-        bundle_key: object,
-        bundle_version: int,
-        entries: Mapping[str, object],
-        candidate: CandidateActionDesc,
-        must_resolve: bool,
-    ) -> AdaptiveTransferStatus:
-        """Start or poll the exact placement MoveSet selected for one bundle."""
-
-        if not isinstance(binding, AdaptiveFlowBinding):
-            raise TypeError("adaptive transfer requires AdaptiveFlowBinding")
-        if not isinstance(candidate, CandidateActionDesc):
-            raise TypeError("adaptive transfer requires CandidateActionDesc")
-        if not isinstance(entries, Mapping):
-            raise TypeError("adaptive transfer entries must be a mapping")
-        move_set_key = candidate.move_set
-        if move_set_key is None:
-            return AdaptiveTransferStatus.READY
-        adaptive_plan = self.adaptive_plan
-        dispatcher = self.placement_dispatcher
-        if adaptive_plan is None or dispatcher is None:
-            raise RuntimeError("adaptive transfer requires a prepared placement epoch")
-        move_set = next(
-            item for item in adaptive_plan.move_sets if item.key == move_set_key
-        )
-        if not move_set.moves:
-            return AdaptiveTransferStatus.READY
-        transfer = binding.transfer_for(move_set_key)
-        if transfer is None:
-            raise RuntimeError("adaptive MoveSet lacks its explicit transfer binding")
-        token = self._adaptive_transfer_token(
-            binding,
-            bundle_key,
-            bundle_version,
-        )
-        batch = self._adaptive_transfers.get(token)
-        if batch is None:
-            try:
-                source = entries[transfer.source_entry]
-                destination = entries[transfer.destination_entry]
-            except KeyError as exc:
-                raise KeyError(
-                    "adaptive transfer bundle lacks an explicitly bound payload"
-                ) from exc
-            handle = dispatcher.submit_scheduled(
-                move_set.moves,
-                source=cast(TensorLike, source),
-                destination=cast(TensorLike, destination),
-            )
-            batch = candidate, (handle,)
-            self._adaptive_transfers[token] = batch
-        elif batch[0] != candidate:
-            raise RuntimeError("adaptive bundle changed action while transfers were pending")
-
-        dispatcher.poll()
-        handles = batch[1]
-        failed = next((handle.error for handle in handles if handle.error is not None), None)
-        if failed is not None:
-            self._adaptive_transfers.pop(token, None)
-            raise RuntimeError("adaptive placement transfer failed") from failed
-        if all(handle.complete for handle in handles):
-            self._adaptive_transfers.pop(token, None)
-            return AdaptiveTransferStatus.READY
-        if must_resolve:
-            raise RuntimeError("adaptive placement transfer missed the bundle deadline")
-        return AdaptiveTransferStatus.PENDING
+        return None
 
     def reset_adaptive_reservations(self) -> None:
-        if self.adaptive_scheduler is not None:
-            self.adaptive_scheduler.reset_reservations()
+        return None
 
 
 class PlanSnapshotStore:
@@ -605,36 +313,6 @@ class PlanSnapshotStore:
     def active(self, step_id: int) -> PlanResources:
         with self._lock:
             return self._active[_step_id(step_id)]
-
-    def adaptive_transfer_owner(
-        self,
-        *,
-        flow_id: str,
-        bundle_key: object,
-        bundle_version: int,
-    ) -> PlanResources | None:
-        """Find the retained epoch that owns an in-flight adaptive transfer."""
-
-        with self._lock:
-            candidates = (
-                *self._active.values(),
-                self._current,
-                *self._retired,
-            )
-        seen: set[int] = set()
-        for resources in candidates:
-            resource_id = id(resources)
-            if resource_id in seen:
-                continue
-            seen.add(resource_id)
-            binding = resources.adaptive_flow_binding(flow_id)
-            if binding is not None and resources.adaptive_pending_action(
-                binding,
-                bundle_key=bundle_key,
-                bundle_version=bundle_version,
-            ) is not None:
-                return resources
-        return None
 
     def finish_step(self, step_id: int) -> None:
         with self._lock:

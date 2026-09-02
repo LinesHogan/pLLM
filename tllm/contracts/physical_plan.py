@@ -9,9 +9,8 @@ It is a control-plane boundary.  It deliberately contains no Tensor, CUDA
 stream/event, CUDAGraph, callback, request id, or backend runtime handle.
 Those objects belong to the Python physical executor.
 
-The legacy ``tllm.workgraph`` modules re-export these names so existing
-legacy import paths keep working with identical class identity; new native
-code must import from here, never from ``tllm.workgraph``.
+Runtime code imports these contracts directly; there is no WorkGraph
+compatibility re-export layer.
 """
 
 from __future__ import annotations
@@ -33,9 +32,6 @@ def _require_str(value: object, label: str, *, nonempty: bool = False) -> str:
 
 
 def _require_label(value: object, label: str, *, nonempty: bool = False) -> str:
-    # Historical workgraph.frontend semantics: an empty label is a TypeError
-    # there but a ValueError in workgraph.ir.  Both exception contracts are
-    # kept verbatim so existing callers observe identical failures.
     if not isinstance(value, str):
         raise TypeError(f"{label} must be str")
     if nonempty and not value:

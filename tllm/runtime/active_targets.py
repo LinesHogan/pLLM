@@ -23,7 +23,6 @@ class SamplerProviderOwner(Protocol):
 class RuntimeWithTargets(Protocol):
     dispatch_plan: ActivityPlan | None
     consumer: SamplerProviderOwner | None
-    distributed_runtime_binding: object | None
     workload_execution: "NativeWorkloadExecution | None"
     native_workloads_pending: bool
 
@@ -54,7 +53,6 @@ def runtime_has_active_targets(runtime: RuntimeWithTargets) -> bool:
     return bool(
         (plan is not None and plan.has_active_targets())
         or _has_active_sampler_provider(runtime)
-        or runtime.distributed_runtime_binding is not None
         or runtime.workload_execution is not None
         or runtime.native_workloads_pending
     )

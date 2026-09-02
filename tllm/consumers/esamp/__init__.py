@@ -7,30 +7,18 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from tllm.consumers.esamp.config import ESampConsumerConfig
-    from tllm.consumers.esamp.consumer import ESampConsumer
-    from tllm.consumers.esamp.program import ESampProgram
-    from tllm.consumers.esamp.program_consumer import ESampProgramConsumer
-    from tllm.consumers.esamp.register import activate
     from tllm.consumers.esamp.sampler_provider import ESampSamplerModifierProvider
     from tllm.consumers.esamp.workload import ESampConfig, ESampWorkload
 
 __all__ = [
-    "ESampConsumer",
-    "activate",
     "ESampConsumerConfig",
-    "ESampProgram",
-    "ESampProgramConsumer",
     "ESampConfig",
     "ESampSamplerModifierProvider",
     "ESampWorkload",
 ]
 
 _MODULE_BY_NAME = {
-    "ESampConsumer": "tllm.consumers.esamp.consumer",
-    "activate": "tllm.consumers.esamp.register",
     "ESampConsumerConfig": "tllm.consumers.esamp.config",
-    "ESampProgram": "tllm.consumers.esamp.program",
-    "ESampProgramConsumer": "tllm.consumers.esamp.program_consumer",
     "ESampConfig": "tllm.consumers.esamp.workload",
     "ESampSamplerModifierProvider": "tllm.consumers.esamp.sampler_provider",
     "ESampWorkload": "tllm.consumers.esamp.workload",

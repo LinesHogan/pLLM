@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from tllm.consumers.recirculation.spec import RecirculationSettings
-from tllm.workgraph.recurrence import RecurrenceOp
+from tllm.contracts.recurrence import RecurrenceOp
 
 
 def mix_recirculation_tensors(

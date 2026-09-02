@@ -45,30 +45,17 @@ from tllm.runtime.resources import (
     SamplerPrecomputeCache,
     SamplerPrecomputeState,
 )
-from tllm.runtime.state import RUNTIME, ResidualRuntimeConfig, ResidualRuntimeState, RuntimeConsumer
+from tllm.runtime.state import (
+    RUNTIME,
+    ResidualRuntimeConfig,
+    ResidualRuntimeState,
+    RuntimeConsumer,
+)
 from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspotStats, PlacementStats
-from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
 
 if TYPE_CHECKING:
     from vllm import LLM
-    from tllm.workgraph.anchors import BackendResolution
-    from tllm.workgraph.frontend import CapturedFlow
-    from tllm.workgraph.hierarchy import CaptureAttachment
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
-    from tllm.runtime.specialization import RuntimeSpecializationSpec
-    from tllm.runtime.scheduling.transfer import (
-        CopyHandle,
-        PlacementRuntimeBinding,
-        TensorLike,
-    )
-    from tllm.runtime.scheduling.collective import (
-        CollectiveHandle,
-        DistributedRuntimeBinding,
-    )
-    from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
-    from tllm.workgraph.ir import NodeKey
-    from tllm.workgraph.placement import ValueKey
-    from tllm.workgraph.distributed import CollectiveKey
 
 ensure_v1_env()
 
@@ -105,38 +92,13 @@ def _active_dispatch_consumers() -> list[BaseConsumer[object]]:
     return consumers
 
 
-def _collect_workgraph_capture_metadata(
-    consumers: Sequence[BaseConsumer[object]],
-) -> tuple[tuple["CapturedFlow", ...], tuple["CaptureAttachment", ...]]:
-    captures = tuple(
-        capture
-        for consumer in consumers
-        for capture in consumer.workgraph_captures()
-    )
-    attachments = tuple(
-        attachment
-        for consumer in consumers
-        for attachment in consumer.workgraph_attachments()
-    )
-    return captures, attachments
-
-
 def _refresh_dispatch_plan() -> None:
     consumers = _active_dispatch_consumers()
     if not consumers:
         RUNTIME.dispatch_plan = None
         RUNTIME.execution_plan = None
-        RUNTIME.workgraph_snapshot = None
-        RUNTIME.workgraph_captures = ()
-        RUNTIME.workgraph_attachments = ()
-        RUNTIME.workgraph_refresh_pending = False
-        RUNTIME.physical_plan_store = None
-        _clear_physical_capture_regions()
         RUNTIME.producer_executor = None
         return
-    captures, attachments = _collect_workgraph_capture_metadata(consumers)
-    RUNTIME.workgraph_captures = captures
-    RUNTIME.workgraph_attachments = attachments
     plan = DispatchPlan.build(consumers)
     RUNTIME.dispatch_plan = None if plan.is_empty() else plan
     # Fail fast at startup when a consumer reads a migrated port kind that no
@@ -144,49 +106,13 @@ def _refresh_dispatch_plan() -> None:
     # producers are not enforced yet).
     from tllm.runtime.execution_plan import compile_default_plan
 
-    resolution = RUNTIME.workgraph_backend_resolution
-    execution_plan = compile_default_plan(
-        consumers=consumers,
-        backend_capabilities=None if resolution is None else resolution.capabilities,
-    )
-    if resolution is not None:
-        plan.validate_recurrence_admission(
-            backend_capabilities=resolution.capabilities,
-            graph_mode=resolution.graph_mode,
-            tp_size=resolution.tp_size,
-        )
+    execution_plan = compile_default_plan(consumers=consumers)
     from tllm.runtime.producer_executor import (
         ProducerExecutor,
         default_producer_materializers,
     )
 
     RUNTIME.execution_plan = execution_plan
-    # Shadow-only compatibility metadata. The runtime dispatch path continues
-    # to consume DispatchPlan/ExecutionPlan directly and never reads this
-    # snapshot from a per-step hook.  Once a typed backend has been resolved,
-    # retain the previous concrete snapshot until the replacement can be
-    # compiled.  Persisting an unresolved intermediate would make one logical
-    # plan rebuild consume two reconciliation epochs.
-    if RUNTIME.dispatch_plan is None:
-        RUNTIME.workgraph_snapshot = None
-        RUNTIME.workgraph_refresh_pending = False
-    elif RUNTIME.workgraph_backend_resolution is None:
-        from tllm.workgraph.shadow import compile_shadow_snapshot
-
-        RUNTIME.workgraph_snapshot = compile_shadow_snapshot(
-            consumers=consumers,
-            dispatch_plan=plan,
-            execution_plan=execution_plan,
-            previous=RUNTIME.workgraph_snapshot,
-            captures=captures,
-            attachments=attachments,
-        )
-        RUNTIME.workgraph_refresh_pending = True
-    elif not plan.requires_graph_mode_refresh(RUNTIME.workgraph_backend_resolution.graph_mode):
-        RUNTIME.workgraph_refresh_pending = True
-        _compile_concrete_workgraph_snapshot()
-    else:
-        RUNTIME.workgraph_refresh_pending = True
     RUNTIME.producer_executor = ProducerExecutor.bind(
         plan=execution_plan,
         registry=default_producer_materializers(),
@@ -194,201 +120,7 @@ def _refresh_dispatch_plan() -> None:
     RUNTIME.placement_stats.capture_resident_stage_count = max(
         RUNTIME.placement_stats.capture_resident_stage_count,
         len(execution_plan.capture_resident_producer_ids),
-    )
-
-
-def _compile_concrete_workgraph_snapshot() -> None:
-    """Compile one concrete shadow snapshot from already-authoritative plans.
-
-    This cold path deliberately has no access to runner instances or runtime
-    payloads. ``DispatchPlan`` and ``ExecutionPlan`` remain the only inputs
-    used to describe scheduling; this result is never consulted for dispatch.
-    """
-
-    resolution = RUNTIME.workgraph_backend_resolution
-    plan = RUNTIME.dispatch_plan
-    execution_plan = RUNTIME.execution_plan
-    if resolution is None:
-        raise RuntimeError("WorkGraph refresh requires a resolved backend context")
-    if plan is None or execution_plan is None:
-        raise RuntimeError("WorkGraph refresh requires DispatchPlan and ExecutionPlan")
-
-    from tllm.workgraph.anchors import backend_snapshot_from_resolution
-    from tllm.workgraph.shadow import compile_shadow_parity
-
-    # ``lower_plans`` binds the existing authoritative plans directly; it
-    # intentionally does not inspect consumer instances at this boundary.
-    RUNTIME.workgraph_snapshot = compile_shadow_parity(
-        consumers=(),
-        dispatch_plan=plan,
-        execution_plan=execution_plan,
-        backend=backend_snapshot_from_resolution(resolution),
-        previous=RUNTIME.workgraph_snapshot,
-        captures=RUNTIME.workgraph_captures,
-        attachments=RUNTIME.workgraph_attachments,
-    )
-    _stage_physical_workgraph_snapshot()
-    RUNTIME.workgraph_refresh_pending = False
-
-
-def _stage_physical_workgraph_snapshot() -> None:
-    """Lower and stage one concrete physical descriptor snapshot.
-
-    Runtime streams, events, leases, and graphs are attached by the executor
-    resource factory when an executable region is activated.  Publishing the
-    frozen plan here keeps compilation off the step path and gives every step
-    a stable epoch even while those resources are still legacy-owned.
-    """
-
-    snapshot = RUNTIME.workgraph_snapshot
-    if snapshot is None:
-        RUNTIME.physical_plan_store = None
-        _clear_physical_capture_regions()
-        return
-    backend = snapshot.backend
-    if backend is None or backend.graph_mode == "full":
-        # FULL remains a typed shadow-parity diagnostic and an explicit legacy
-        # boundary.  It must never acquire a partially usable physical plan.
-        RUNTIME.physical_plan_store = None
-        _clear_physical_capture_regions()
-        return
-
-    from tllm.runtime.scheduling.plan_store import PlanResources, PlanSnapshotStore
-    from tllm.workgraph.physical import compile_physical_flow_plan
-
-    physical_plan = compile_physical_flow_plan(snapshot)
-    placement_plan = None
-    placement_dispatcher = None
-    placement_implementations = ()
-    adaptive_plan = None
-    adaptive_scheduler = None
-    adaptive_flow_bindings = ()
-    placement_binding = RUNTIME.placement_runtime_binding
-    if placement_binding is not None:
-        (
-            placement_plan,
-            placement_dispatcher,
-            placement_implementations,
-        ) = placement_binding.compile(physical_plan)
-    adaptive_binding = RUNTIME.adaptive_runtime_binding
-    if adaptive_binding is not None:
-        if placement_plan is None:
-            raise RuntimeError(
-                "adaptive WorkGraph compilation requires a placement binding"
-            )
-        (
-            adaptive_plan,
-            adaptive_scheduler,
-            adaptive_flow_bindings,
-        ) = adaptive_binding.compile(placement_plan)
-    resources = PlanResources(
-        plan=physical_plan,
-        placement_plan=placement_plan,
-        placement_dispatcher=placement_dispatcher,
-        placement_implementations=placement_implementations,
-        adaptive_plan=adaptive_plan,
-        adaptive_scheduler=adaptive_scheduler,
-        adaptive_flow_bindings=adaptive_flow_bindings,
-    )
-    store = RUNTIME.physical_plan_store
-    if store is None:
-        RUNTIME.physical_plan_store = PlanSnapshotStore(resources)
-        _activate_physical_capture_regions(snapshot)
-        return
-    current_epoch = store.current.plan.plan_epoch
-    if resources.plan.plan_epoch <= current_epoch:
-        _activate_physical_capture_regions(snapshot)
-        return
-    store.stage(resources)
-    _activate_physical_capture_regions(snapshot)
-
-
-def _activate_physical_capture_regions(snapshot: object) -> None:
-    """Publish migrated regions through the typed consumer interface."""
-
-    from tllm.workgraph.shadow import ShadowParityPlan
-    from tllm.workgraph.ir import NodeKey
-    from tllm.workgraph.physical import compile_physical_capture_region
-
-    if not isinstance(snapshot, ShadowParityPlan):
-        raise TypeError("physical capture activation requires ShadowParityPlan")
-    hierarchy = snapshot.hierarchy
-    if hierarchy is None:
-        return
-    from tllm.workgraph.frontend import CaptureStatus
-
-    executable_artifacts = {
-        root.artifact_key
-        for root in hierarchy.roots
-        if root.status == CaptureStatus.CAPTURED and len(root.children) == 1
-    }
-    consumers = _active_dispatch_consumers()
-    for consumer in consumers:
-        declared_executors = consumer.workgraph_region_executors()
-        executor_descs = {
-            descriptor.artifact_key: descriptor
-            for descriptor in declared_executors
-        }
-        if len(executor_descs) != len(declared_executors):
-            raise ValueError("consumer declares duplicate WorkGraph region executors")
-        owned_nodes = {
-            NodeKey.consumer_flow(consumer.consumer_id, ordinal)
-            for ordinal, _flow in enumerate(consumer.flows())
-        }
-        owned_attachments = tuple(
-            attachment
-            for attachment in hierarchy.attachments
-            if attachment.node_key in owned_nodes
-            and attachment.artifact_key in executable_artifacts
-        )
-        owned_artifacts = {attachment.artifact_key for attachment in owned_attachments}
-        undeclared_artifacts = set(executor_descs).difference(owned_artifacts)
-        if undeclared_artifacts:
-            raise ValueError(
-                "consumer declares WorkGraph executors without matching attachments"
-            )
-        executable_attachments = tuple(
-            attachment
-            for attachment in owned_attachments
-            if attachment.artifact_key in executor_descs
-        )
-        regions = tuple(
-            compile_physical_capture_region(
-                snapshot,
-                attachment.artifact_key,
-                executor_descs[attachment.artifact_key],
-            )
-            for attachment in executable_attachments
-        )
-        placement_binding = RUNTIME.placement_runtime_binding
-        if placement_binding is None:
-            consumer.activate_workgraph_regions(regions)
-            continue
-        from tllm.runtime.scheduling.plan_store import PlanResources
-
-        placement_resources: list[PlanResources] = []
-        for region in regions:
-            placement_plan, dispatcher, implementations = placement_binding.compile(
-                region.plan,
-                value_flows=(),
-            )
-            placement_resources.append(
-                PlanResources(
-                    plan=region.plan,
-                    placement_plan=placement_plan,
-                    placement_dispatcher=dispatcher,
-                    placement_implementations=implementations,
-                )
-            )
-        consumer.activate_workgraph_region_resources(
-            regions,
-            tuple(placement_resources),
-        )
-
-
-def _clear_physical_capture_regions() -> None:
-    for consumer in _active_dispatch_consumers():
-        consumer.activate_workgraph_regions(())
+)
 
 
 def prepare_physical_workgraph_step(step_id: int) -> None:
@@ -396,37 +128,13 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
 
     step = int(step_id)
     if step < 0:
-        raise ValueError("physical WorkGraph step id must be non-negative")
+        raise ValueError("physical step id must be non-negative")
     previous = RUNTIME.physical_prepared_step_id
-    distributed_previous = RUNTIME.distributed_prepared_step_id
-    distributed_store = RUNTIME.distributed_plan_store
-    if distributed_previous >= 0 and distributed_previous != step:
-        if distributed_store is not None:
-            distributed_store.poll()
-            distributed_store.finish_step(distributed_previous)
-            distributed_store.collect_retired()
-        RUNTIME.distributed_prepared_step_id = -1
-    store = RUNTIME.physical_plan_store
     if previous >= 0 and previous != step:
-        if store is not None:
-            store.active(previous).poll_transfers()
-            store.finish_step(previous)
-            store.collect_retired()
-        for consumer in _active_dispatch_consumers():
-            consumer.finish_workgraph_step(previous)
         workload_store = RUNTIME.workload_execution_store
         if workload_store is not None:
             workload_store.finish_step(previous)
             workload_store.collect_retired()
-    for consumer in _active_dispatch_consumers():
-        consumer.drain_workgraph_specializations()
-    if store is not None:
-        resources = store.prepare_step(step)
-        if resources is not None:
-            resources.poll_transfers()
-            resources.reset_adaptive_reservations()
-    for consumer in _active_dispatch_consumers():
-        consumer.prepare_workgraph_step(step)
     workload_store = RUNTIME.workload_execution_store
     if workload_store is not None:
         pending_shapes = workload_store.current.peek_shape_specialization_requests()
@@ -450,195 +158,7 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
         workload_execution = RUNTIME.workload_execution
         if workload_execution is not None:
             workload_execution.prepare_step(step)
-    if distributed_store is not None:
-        distributed_store.prepare_step(step)
-        RUNTIME.distributed_prepared_step_id = step
     RUNTIME.physical_prepared_step_id = step
-
-
-def prepare_workgraph_step(step_id: int) -> None:
-    """Compatibility-free public name used by runner safe-point adapters."""
-
-    prepare_physical_workgraph_step(step_id)
-
-
-def configure_workgraph_placement(
-    binding: "PlacementRuntimeBinding | None",
-) -> None:
-    """Install or remove typed placement cold-compilation inputs."""
-
-    from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
-
-    if binding is not None and not isinstance(binding, PlacementRuntimeBinding):
-        raise TypeError(
-            "configure_workgraph_placement binding must be PlacementRuntimeBinding"
-        )
-    if binding is None and RUNTIME.adaptive_runtime_binding is not None:
-        raise RuntimeError(
-            "cannot remove WorkGraph placement while adaptive planning is configured"
-        )
-    store = RUNTIME.physical_plan_store
-    if store is not None and not store.closeable:
-        raise RuntimeError(
-            "cannot replace WorkGraph placement binding while an epoch is active"
-        )
-    _clear_physical_capture_regions()
-    RUNTIME.placement_runtime_binding = binding
-    RUNTIME.physical_plan_store = None
-    RUNTIME.physical_prepared_step_id = -1
-    if RUNTIME.workgraph_snapshot is not None:
-        _stage_physical_workgraph_snapshot()
-
-
-def configure_workgraph_adaptive(
-    binding: "AdaptiveRuntimeBinding | None",
-) -> None:
-    """Install typed adaptive-admission cold-compilation inputs and explicit flow bindings."""
-
-    from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
-
-    if binding is not None and not isinstance(binding, AdaptiveRuntimeBinding):
-        raise TypeError(
-            "configure_workgraph_adaptive binding must be AdaptiveRuntimeBinding"
-        )
-    if binding is not None and RUNTIME.placement_runtime_binding is None:
-        raise RuntimeError(
-            "adaptive WorkGraph configuration requires a placement binding"
-        )
-    store = RUNTIME.physical_plan_store
-    if store is not None and not store.closeable:
-        raise RuntimeError(
-            "cannot replace WorkGraph adaptive binding while an epoch is active"
-        )
-    RUNTIME.adaptive_runtime_binding = binding
-    RUNTIME.physical_plan_store = None
-    RUNTIME.physical_prepared_step_id = -1
-    if RUNTIME.workgraph_snapshot is not None:
-        _stage_physical_workgraph_snapshot()
-
-
-def configure_workgraph_distributed(
-    binding: "DistributedRuntimeBinding | None",
-) -> None:
-    """Install typed distributed topology and rank-local runtime bindings."""
-
-    from tllm.runtime.scheduling.collective import DistributedRuntimeBinding
-
-    if binding is not None and not isinstance(binding, DistributedRuntimeBinding):
-        raise TypeError(
-            "configure_workgraph_distributed binding must be DistributedRuntimeBinding"
-        )
-    store = RUNTIME.distributed_plan_store
-    if store is not None and not store.closeable:
-        raise RuntimeError(
-            "cannot replace WorkGraph distributed binding while an epoch is active"
-        )
-    RUNTIME.distributed_runtime_binding = binding
-    RUNTIME.distributed_plan_store = None
-    RUNTIME.distributed_prepared_step_id = -1
-
-
-def publish_workgraph_distributed(*, plan_epoch: int) -> None:
-    """Compile and stage one distributed plan on the explicit cold path."""
-
-    from tllm.runtime.scheduling.collective import (
-        DistributedPlanResources,
-        DistributedPlanSnapshotStore,
-    )
-
-    binding = RUNTIME.distributed_runtime_binding
-    if binding is None:
-        raise RuntimeError("distributed WorkGraph publication requires a binding")
-    plan, executor = binding.compile(plan_epoch)
-    resources = DistributedPlanResources(plan, executor)
-    store = RUNTIME.distributed_plan_store
-    if store is None:
-        RUNTIME.distributed_plan_store = DistributedPlanSnapshotStore(resources)
-    else:
-        store.stage(resources)
-
-
-def launch_workgraph_collective(
-    step_id: int,
-    *,
-    collective: "CollectiveKey",
-    payload: object,
-) -> "CollectiveHandle":
-    """Launch only the next collective approved by the prepared rank plan."""
-
-    step = int(step_id)
-    if step != RUNTIME.distributed_prepared_step_id:
-        raise RuntimeError("collective launch requires the currently prepared step")
-    store = RUNTIME.distributed_plan_store
-    if store is None:
-        raise RuntimeError("collective launch requires a distributed plan")
-    return store.executor(step).launch(
-        step,
-        collective=collective,
-        payload=payload,
-    )
-
-
-def poll_workgraph_collectives() -> int:
-    """Poll Python-owned async collective fences without global synchronization."""
-
-    store = RUNTIME.distributed_plan_store
-    if store is None:
-        return 0
-    completed = store.poll()
-    store.collect_retired()
-    return completed
-
-
-def finish_workgraph_distributed_step(step_id: int) -> None:
-    """Close one distributed step after its full frozen local sequence launched."""
-
-    step = int(step_id)
-    store = RUNTIME.distributed_plan_store
-    if store is None:
-        return
-    store.poll()
-    store.finish_step(step)
-    store.collect_retired()
-    if RUNTIME.distributed_prepared_step_id == step:
-        RUNTIME.distributed_prepared_step_id = -1
-
-
-def dispatch_workgraph_value(
-    *,
-    producer: "NodeKey",
-    consumer: "NodeKey",
-    value: "ValueKey",
-    source: "TensorLike",
-    destination: "TensorLike",
-) -> "CopyHandle":
-    """Submit one transfer from the placement snapshot acquired for this step."""
-
-    store = RUNTIME.physical_plan_store
-    step = RUNTIME.physical_prepared_step_id
-    if store is None or step < 0:
-        raise RuntimeError("WorkGraph placement dispatch requires a prepared step")
-    resources = store.active(step)
-    dispatcher = resources.placement_dispatcher
-    if dispatcher is None:
-        raise RuntimeError("prepared WorkGraph epoch has no placement dispatcher")
-    return dispatcher.submit(
-        producer=producer,
-        consumer=consumer,
-        value=value,
-        source=source,
-        destination=destination,
-    )
-
-
-def poll_workgraph_transfers() -> None:
-    """Poll asynchronous transfers owned by the currently prepared epoch."""
-
-    store = RUNTIME.physical_plan_store
-    step = RUNTIME.physical_prepared_step_id
-    if store is None or step < 0:
-        return
-    store.active(step).poll_transfers()
 
 
 def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
@@ -646,10 +166,7 @@ def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
 
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
 
-    snapshots = [
-        consumer.read_workgraph_runtime_stats()
-        for consumer in _active_dispatch_consumers()
-    ]
+    snapshots: list[WorkGraphRuntimeStats] = []
     physical_executor = RUNTIME.physical_executor
     if physical_executor is not None:
         snapshots.insert(0, physical_executor.read_workgraph_runtime_stats())
@@ -682,45 +199,6 @@ def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
     return WorkGraphRuntimeStats.merge(
         (local, *(reply.workgraph for reply in plane.pull_stats("workgraph", sync=False)))
     )
-
-
-def record_workgraph_backend_resolution(*, resolution: "BackendResolution") -> None:
-    """Record one typed backend resolution and refresh non-placement plans.
-
-    Drivers call this only after vLLM has resolved its effective graph mode.
-    Plans whose fusion placement depends on that mode wait for the existing
-    dispatch-side placement refresh so its counters and behavior remain
-    unchanged.
-    """
-
-    previous_resolution = RUNTIME.workgraph_backend_resolution
-    RUNTIME.workgraph_backend_resolution = resolution
-    plan = RUNTIME.dispatch_plan
-    if plan is None:
-        return
-    plan.validate_recurrence_admission(
-        backend_capabilities=resolution.capabilities,
-        graph_mode=resolution.graph_mode,
-        tp_size=resolution.tp_size,
-    )
-    from tllm.runtime.execution_plan import compile_default_plan
-
-    # Re-run the Rust admission checks against the concrete backend facts,
-    # but keep the already-authoritative plan and executor identities stable.
-    compile_default_plan(
-        consumers=_active_dispatch_consumers(),
-        backend_capabilities=resolution.capabilities,
-    )
-    if previous_resolution == resolution and not RUNTIME.workgraph_refresh_pending:
-        return
-    if plan.requires_graph_mode_refresh(resolution.graph_mode):
-        RUNTIME.workgraph_refresh_pending = True
-        return
-    RUNTIME.workgraph_refresh_pending = True
-    # Placement is already current for this graph mode.  A changed typed
-    # backend descriptor therefore needs only the cold shadow refresh, not a
-    # second dispatch-side placement transition.
-    _compile_concrete_workgraph_snapshot()
 
 
 def publish_workload_compilation(
@@ -821,65 +299,6 @@ def advance_workload_anchor(anchor: str) -> bool:
     if execution is None:
         return False
     return execution.advance_anchor(str(anchor))
-
-
-def finalize_workgraph_snapshot_after_placement_refresh() -> None:
-    """Finish the one-time refresh after existing placement/fusion work."""
-
-    if RUNTIME.workgraph_refresh_pending:
-        _compile_concrete_workgraph_snapshot()
-
-
-def refresh_workgraph_capture_metadata() -> None:
-    """Publish cold-path consumer captures without rebuilding runtime plans."""
-
-    consumers = _active_dispatch_consumers()
-    captures, attachments = _collect_workgraph_capture_metadata(consumers)
-    if (
-        captures == RUNTIME.workgraph_captures
-        and attachments == RUNTIME.workgraph_attachments
-    ):
-        return
-
-    RUNTIME.workgraph_captures = captures
-    RUNTIME.workgraph_attachments = attachments
-    plan = RUNTIME.dispatch_plan
-    execution_plan = RUNTIME.execution_plan
-    if plan is None or execution_plan is None:
-        RUNTIME.workgraph_snapshot = None
-        RUNTIME.workgraph_refresh_pending = False
-        return
-
-    resolution = RUNTIME.workgraph_backend_resolution
-    if resolution is None:
-        from tllm.workgraph.shadow import compile_shadow_snapshot
-
-        RUNTIME.workgraph_snapshot = compile_shadow_snapshot(
-            consumers=consumers,
-            dispatch_plan=plan,
-            execution_plan=execution_plan,
-            previous=RUNTIME.workgraph_snapshot,
-            captures=captures,
-            attachments=attachments,
-        )
-        RUNTIME.workgraph_refresh_pending = True
-        return
-
-    RUNTIME.workgraph_refresh_pending = True
-    if not plan.requires_graph_mode_refresh(resolution.graph_mode):
-        _compile_concrete_workgraph_snapshot()
-
-
-def cold_specialize_workgraph(spec: "RuntimeSpecializationSpec") -> None:
-    """Publish backend-derived capture examples before the first runtime step."""
-
-    from tllm.runtime.specialization import RuntimeSpecializationSpec
-
-    if not isinstance(spec, RuntimeSpecializationSpec):
-        raise TypeError("cold WorkGraph specialization requires RuntimeSpecializationSpec")
-    for consumer in _active_dispatch_consumers():
-        consumer.cold_specialize_workgraph(spec)
-    refresh_workgraph_capture_metadata()
 
 
 def register_dispatch_consumer(consumer: BaseConsumer[object]) -> None:
@@ -1045,11 +464,6 @@ def set_esamp_training_enabled(enabled: bool) -> None:
 
 
 def synchronize_esamp() -> None:
-    from tllm.runtime.ports.residual_bundle_dispatch import (
-        synchronize_deferred_port_bundles,
-    )
-
-    synchronize_deferred_port_bundles(runtime=RUNTIME)
     if RUNTIME.consumer is not None:
         synchronize_consumer(RUNTIME.consumer)
     elif RUNTIME.workload_execution is not None:
@@ -1146,14 +560,20 @@ def read_graph_debug_stats(*, mode: str = "model_bank") -> GraphDebugStats:
 
 
 def _wrapped_load_model(self: object, *args: object, **kwargs: object) -> object:
+    from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
+
     return _hooks.wrapped_load_model(core=sys.modules[__name__], runner=self, args=args, kwargs=kwargs)
 
 
 def _wrapped_prepare_inputs(self: object, scheduler_output: object) -> object:
+    from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
+
     return _hooks.wrapped_prepare_inputs(core=sys.modules[__name__], runner=self, scheduler_output=scheduler_output)
 
 
 def _wrapped_execute_model(self: object, *args: object, **kwargs: object) -> object:
+    from tllm.runtime.vllm_patch import port_runtime_hooks as _hooks
+
     return _hooks.wrapped_execute_model(core=sys.modules[__name__], runner=self, args=args, kwargs=kwargs)
 
 
@@ -1184,25 +604,15 @@ __all__ = [
     "clear_dispatch_consumers",
     "compute_decode_localization",
     "configure_runtime",
-    "configure_workgraph_adaptive",
-    "configure_workgraph_distributed",
-    "configure_workgraph_placement",
-    "dispatch_workgraph_value",
     "infer_hidden_dtype",
     "make_llm",
-    "finish_workgraph_distributed_step",
-    "launch_workgraph_collective",
     "pick_common_attn_metadata",
-    "poll_workgraph_transfers",
-    "poll_workgraph_collectives",
-    "publish_workgraph_distributed",
     "read_and_reset_distiller_timing_stats",
     "read_and_reset_path_hotspot_stats",
     "read_and_reset_placement_stats",
     "read_graph_debug_stats",
     "read_and_reset_esamp_per_request_stats",
     "read_and_reset_esamp_stats",
-    "refresh_workgraph_capture_metadata",
     "register_dispatch_consumer",
     "replace_dispatch_consumers",
     "resolve_module_by_path_with_fallback",

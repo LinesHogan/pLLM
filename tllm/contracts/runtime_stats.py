@@ -2,9 +2,8 @@
 """Wire-format runtime stats snapshot shared across process boundaries.
 
 Pure data: no torch, no runtime objects. The physical executor owns the
-counters; consumers expose a snapshot through
-``BaseConsumer.read_workgraph_runtime_stats``; the control plane merges
-parent- and worker-side snapshots from plain mappings.
+counters; the control plane merges parent- and worker-side snapshots from
+plain mappings.
 """
 
 from __future__ import annotations

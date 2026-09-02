@@ -13,7 +13,6 @@ from tllm.contracts.runtime_context import RunnerLike, RuntimeContext
 from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.consumer_compat import dispatch_consumer_event
-from tllm.runtime.scheduling.deferred import DeferredWorkQueue
 from tllm.runtime.vllm_patch.compilation import is_torch_compiling
 
 if TYPE_CHECKING:
@@ -23,7 +22,6 @@ if TYPE_CHECKING:
 class RuntimeWithDispatchPlan(Protocol):
     dispatch_plan: DispatchPlan | None
     workload_execution: "NativeWorkloadExecution | None"
-    deferred_work_queue: DeferredWorkQueue
     event_step_id: int
 
 
@@ -35,27 +33,6 @@ def _advance_native_workload(
     if execution is None or event is None:
         return
     execution.advance_backend_event(event)
-
-
-def _advance_distributed_collective_window(
-    runtime: RuntimeWithDispatchPlan,
-    event_name: str,
-) -> None:
-    from tllm.runtime.state import ResidualRuntimeState
-    from tllm.workgraph.distributed import CollectiveWindow
-
-    if not isinstance(runtime, ResidualRuntimeState):
-        return
-    window = {
-        "prepare_inputs.pre": CollectiveWindow.PREPARE,
-        "execute_model.pre": CollectiveWindow.BEFORE_COMPUTE,
-        "execute_model.post": CollectiveWindow.AFTER_COMPUTE,
-        "sample_tokens.post": CollectiveWindow.STEP_END,
-    }.get(event_name)
-    store = runtime.distributed_plan_store
-    step = runtime.distributed_prepared_step_id
-    if window is not None and store is not None and step >= 0:
-        store.executor(step).advance_window(step, window)
 
 
 def _runner_uses_cudagraph(runner: RunnerLike) -> bool:
@@ -190,29 +167,7 @@ def _dispatch_runtime_event(
     predecessor_events: Sequence[object] = (),
 ) -> int:
     """Dispatch one runtime event to registered consumers, if any."""
-    _advance_distributed_collective_window(runtime, event_name)
     effective_predecessors = tuple(predecessor_events)
-    if (
-        runtime.deferred_work_queue
-        and not effective_predecessors
-        and event_name == "prepare_inputs.pre"
-    ):
-        device = _resolve_device(runner)
-        if device.type == "cuda" and torch.cuda.is_available():
-            stream = torch.cuda.current_stream(device=device)
-            deadline_fence = torch.cuda.Event(blocking=False)
-            deadline_fence.record(stream)
-            effective_predecessors = (deadline_fence,)
-    if runtime.deferred_work_queue:
-        from tllm.runtime.ports.residual_bundle_dispatch import drain_deferred_port_bundles
-
-        drain_deferred_port_bundles(
-            runtime=runtime,
-            step_id=int(runtime.event_step_id),
-            hook=event_name,
-            expired_only=event_name == "prepare_inputs.pre",
-            predecessor_events=effective_predecessors,
-        )
     plan = runtime.dispatch_plan
     if plan is None:
         _advance_native_workload(runtime, native_event)

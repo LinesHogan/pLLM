@@ -27,7 +27,6 @@ from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlSt
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
-from tllm.runtime.scheduling.deferred import DeferredWorkQueue
 from tllm.runtime.fusion import FusionExecutor
 from tllm.runtime.stats import PlacementStats
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
@@ -40,18 +39,7 @@ if TYPE_CHECKING:
     )
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.torch_adapter import CudaLongHostStaging
-    from tllm.runtime.scheduling.plan_store import PlanSnapshotStore
-    from tllm.runtime.scheduling.transfer import PlacementRuntimeBinding
-    from tllm.runtime.scheduling.collective import (
-        DistributedPlanSnapshotStore,
-        DistributedRuntimeBinding,
-    )
-    from tllm.runtime.scheduling.adaptive import AdaptiveRuntimeBinding
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
-    from tllm.workgraph.anchors import BackendResolution
-    from tllm.workgraph.shadow import ShadowParityPlan
-    from tllm.workgraph.frontend import CapturedFlow
-    from tllm.workgraph.hierarchy import CaptureAttachment
 
 
 RuntimeConsumer = BaseConsumer
@@ -129,23 +117,6 @@ class ResidualRuntimeState:
     consumer_registry: Optional[ConsumerRegistry] = None
     dispatch_plan: Optional[DispatchPlan] = None
     execution_plan: Optional[ExecutionPlan] = None
-    # Startup-only WorkGraph shadow metadata. Runtime dispatch does not read
-    # this field; the existing plans above remain authoritative.
-    workgraph_snapshot: Optional["ShadowParityPlan"] = None
-    workgraph_captures: tuple["CapturedFlow", ...] = ()
-    workgraph_attachments: tuple["CaptureAttachment", ...] = ()
-    # The latest concrete backend context is captured at the backend boundary
-    # and reused by cold shadow refreshes after later plan changes.
-    workgraph_backend_resolution: Optional["BackendResolution"] = None
-    workgraph_refresh_pending: bool = False
-    # Physical descriptors are published only by the cold compiler path and
-    # become visible when the next step acquires its prepare-time snapshot.
-    physical_plan_store: Optional["PlanSnapshotStore"] = None
-    placement_runtime_binding: Optional["PlacementRuntimeBinding"] = None
-    adaptive_runtime_binding: Optional["AdaptiveRuntimeBinding"] = None
-    distributed_runtime_binding: Optional["DistributedRuntimeBinding"] = None
-    distributed_plan_store: Optional["DistributedPlanSnapshotStore"] = None
-    distributed_prepared_step_id: int = -1
     physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
     physical_prepared_step_id: int = -1
     # Immutable new-middle-end output. Legacy dispatch remains authoritative
@@ -157,7 +128,6 @@ class ResidualRuntimeState:
     native_schedule_graph: Optional["ScheduleGraph"] = None
     native_hidden_path_aliases: dict[str, str] = field(default_factory=dict)
     producer_executor: Optional["ProducerExecutor"] = None
-    deferred_work_queue: DeferredWorkQueue = field(default_factory=DeferredWorkQueue)
     fusion_executor: FusionExecutor = field(default_factory=FusionExecutor)
     placement_stats: PlacementStats = field(default_factory=PlacementStats)
     reward_outcome_store: RewardOutcomeStore = field(default_factory=RewardOutcomeStore)

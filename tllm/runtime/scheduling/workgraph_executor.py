@@ -630,14 +630,8 @@ class PhysicalExecutor:
             raise PhysicalExecutionError(f"physical plan is missing events: {names}")
 
         resolved_handlers: dict[NodeKey, PhysicalNodeHandler] = {}
-        placement_handlers = {
-            binding.node_key: binding.execute
-            for binding in resources.placement_implementations
-        }
         for node in resources.plan.nodes:
-            handler = placement_handlers.get(node.node_key)
-            if handler is None:
-                handler = self._bindings.get(node.executor)
+            handler = self._bindings.get(node.executor)
             if handler is None:
                 handler = self._bindings.get(node.node_key)
             if handler is None:

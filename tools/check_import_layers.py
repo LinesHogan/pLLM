@@ -67,8 +67,6 @@ RULES: dict[str, frozenset[str]] = {
     "producers": frozenset({"contracts", "ports", "core"}),
     "workgraph": frozenset({"contracts", "ports", "producers", "core"}),
     "runtime": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
-    # Program compiler: lowers frontend declarations into static IR.
-    "program": frozenset({"contracts", "ports", "common", "producers", "workgraph", "core"}),
     # The workload frontend and schedule middle-end communicate only through
     # the source-module-specific bridges below.  Neither package gets a broad
     # cross-package allowance: that would hide an import cycle or permit the
@@ -86,7 +84,7 @@ RULES: dict[str, frozenset[str]] = {
     "consumers": frozenset(
         {
             "contracts", "ports", "common", "producers", "workgraph",
-            "runtime", "program", "kit", "core",
+            "runtime", "kit", "core",
         }
     ),
     "workflows": None,  # leaf entry points: may import anything
@@ -126,9 +124,6 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.workload.ir", "tllm.contracts.request_identity"),
         ("tllm.workload.staging", "tllm.contracts.workload_ports"),
         # Workload frontend adapters.
-        ("tllm.workload.compat", "tllm.program.decl"),
-        ("tllm.workload.compat", "tllm.contracts.request_identity"),
-        ("tllm.workload.compat", "tllm.workgraph.frontend"),
         ("tllm.workload", "tllm.contracts.request_identity"),
         ("tllm.workload.lowering", "tllm.schedule.contracts"),
         ("tllm.workload.region_compiler", "tllm.schedule.contracts"),

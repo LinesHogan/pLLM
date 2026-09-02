@@ -859,16 +859,17 @@ class TllmWorkerExtension:
 
         import json
 
-        from tllm.runtime import residual_runtime as core
+        from tllm.backends.protocol import runner_binding_for
+        from tllm.runtime.graph_policy import resolve_graph_mode
         from tllm.runtime.static_resources import static_device_headroom_bytes
         from tllm.schedule.timeline import export_main_workload_timeline
 
-        resolution = core.RUNTIME.workgraph_backend_resolution
-        if resolution is None:
-            raise RuntimeError("worker has not resolved its workload backend timeline")
         runner = _runner_of(self)
         if runner is None:
             raise RuntimeError("worker has no model runner")
+        binding = runner_binding_for(runner)
+        if binding is None:
+            raise RuntimeError("worker has no backend binding for workload timeline")
         facts = _runner_specialization_facts(runner)
         import torch
 
@@ -884,10 +885,10 @@ class TllmWorkerExtension:
                 device, configured_budget=int(configured_budget)
             )
         timeline = export_main_workload_timeline(
-            resolution.capabilities,
-            graph_mode=resolution.graph_mode.name.lower(),
+            binding.capabilities,
+            graph_mode=resolve_graph_mode(runner).name.lower(),
             static_headroom_bytes=headroom,
-            backend_version=resolution.backend_version,
+            backend_version=binding.driver.backend_id,
         )
         specialization: dict[str, object] | None = None
         if facts is not None:
