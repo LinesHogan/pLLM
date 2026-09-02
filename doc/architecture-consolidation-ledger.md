@@ -18,10 +18,10 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 ## Current checkpoint
 
-| Fact | Value | Cumulative change from `12551b8` | Change since `99f7067` checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `71afa2e` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `71afa2e` | — | after `99f7067` |
-| Counted production/support source | 123,247 lines | -9,963 lines | -3,165 lines |
+| Commit | `3da233b` | — | after `71afa2e` |
+| Counted production/support source | 96,589 lines | -36,621 lines | -26,658 lines |
 | Pytest collection | 25 items | -1,324 items | -1,260 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -96,6 +96,25 @@ the four canonical/public survivor bases:
 `canonical_vllm_esamp_smoke.py`, and
 `canonical_vllm_inplace_ttt_smoke.py`.
 
+The old-authority deletion checkpoint `3da233b` removed the tracked
+`tllm/program` package, the tracked `tllm/workgraph` package, Rust
+`workgraph.rs`, ESamp's old Program/BaseConsumer path, old adaptive,
+collective, deferred and transfer scheduling modules, stale repro workflows
+and the old verification tool wrapper.  Recurrence declarations were moved
+unchanged into `tllm.contracts.recurrence`, because Recirculation still has a
+live typed recurrence semantic survivor; `GraphMode` moved into
+`tllm.runtime.graph_policy`.  `tllm/runtime/ports/residual_bundle_dispatch.py`
+was reduced to the direct residual-bundle owner
+`tllm/runtime/ports/residual_bundle.py`; deferred/adaptive WorkGraph dispatch
+was not restored.  The same checkpoint also removed stale `_core.pyi` and
+`tllm.core` exports for Rust WorkGraph validators that no longer exist in the
+Rust extension.  Under the plan's counted-source command this commit is
+`+201 / -26,859 / net -26,658`, with 988 moved lines recorded separately by
+Git rename accounting.  Import probes report `None` for `tllm.workgraph`,
+`tllm.program`, `tllm.runtime.scheduling.deferred`, and
+`tllm.runtime.ports.residual_bundle_dispatch`; `tllm.contracts.recurrence`
+is now the recurrence owner.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -104,7 +123,7 @@ the four canonical/public survivor bases:
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 275 | 507 | 0 | -232 | active: backend event seam and vLLM WorkGraph cold handoff removed; seam rewrite still pending |
-| E — legacy authority removal | — | — | — | — | pending |
+| E — legacy authority removal | 201 | 26,859 | 988 | -26,658 | active: Program and old WorkGraph packages removed; runtime shadow/deferred/adaptive/distributed residuals pruned |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
@@ -118,11 +137,13 @@ Moves are recorded separately and never counted as deletion.
 | `tllm/canonical`, `tllm/contracts` | keep and compress | semantic descriptors, tensor math, FFI DTOs | canonical graph/execution core |
 | `tllm/canonical_runtime` | delete in B | no workload-specific orchestration | generic executor/backend seam |
 | `tllm/canonical_vllm` | merge in D | vLLM probes and physical adapter mechanics | `tllm/backends/vllm` |
-| `tllm/runtime` | delete in E | MP/backend facts only | closed MP and generic backend owners |
-| `tllm/workgraph`, `tllm/schedule`, `tllm/workload`, `tllm/program` | delete in E | independent math/loaders only | canonical descriptors/workloads |
+| `tllm/runtime` | prune in E/F | MP/backend facts, native safe points, stats | closed MP and generic backend owners |
+| `tllm/workgraph` | deleted in `3da233b` | finite recurrence declarations moved | `tllm.contracts.recurrence` |
+| `tllm/program` | deleted in `3da233b` | none | canonical descriptors/workloads |
+| `tllm/schedule`, `tllm/workload` | delete remaining old authority in E/F | independent math/loaders only | canonical descriptors/workloads |
 | `tllm/consumers` | delete by workload in C/E | math, loaders, judge, environment | one canonical workload owner each |
 | `tllm/kit`, `tllm/ports` | delete in E | none after typed execution cutover | canonical contracts |
-| Rust non-canonical graph/schedule | delete in E | no duplicated authority | `rust/tllm_core/src/canonical` |
+| Rust non-canonical graph/schedule | prune in E/F | WorkGraph removed; remaining schedule/recurrence are pending audit | `rust/tllm_core/src/canonical` |
 | provisional `canonical/ptts/dense_page*` | replace in F | lifecycle invariants and CUDA kernels | PageBundle/generational arena |
 
 ## Workload cutover manifest
