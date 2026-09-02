@@ -20,8 +20,8 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `71afa2e` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `0fde70c` | — | after `71afa2e` |
-| Counted production/support source | 93,803 lines | -39,407 lines | -29,444 lines |
+| Commit | `e03816d` | — | after `71afa2e` |
+| Counted production/support source | 91,326 lines | -41,884 lines | -31,921 lines |
 | Pytest collection | 11 items | -1,338 items | -1,274 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -140,6 +140,20 @@ root facade.  Under `SOURCE_LOC`, this checkpoint is
 `tllm.consumers.esamp.sampler_provider` and
 `tllm.consumers.esamp.initializers` all return `None`.
 
+The legacy consumer dispatch deletion in `e03816d` removed the remaining
+`BaseConsumer` object authority, `DispatchPlan`, `consumer_compat`,
+consumer plugin/spec reconstruction, consumer registry, fusion executor,
+HiddenBatch event bridge, residual-bundle flow dispatch and post-generate
+consumer dispatch.  `TllmRuntime` no longer accepts `consumers=` and the
+top-level `tllm.register_consumer`/`clear_consumers` façade is gone.  MP
+bootstrap now carries runtime config only; workers no longer reconstruct
+consumer specs.  Production/tools grep for `BaseConsumer`, `DispatchPlan`,
+`consumer_compat`, `consumer_registry`, `consumer_plugins`,
+`declaration_adapter`, `register_dispatch_consumer` and
+`set_runtime_consumer` is empty.  Probe imports for the removed runtime
+modules return `None`.  Under `SOURCE_LOC`, this checkpoint is
+`+80 / -2,557 / net -2,477`; `SOURCE_LOC` is now 91,326.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -148,7 +162,7 @@ root facade.  Under `SOURCE_LOC`, this checkpoint is
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 275 | 507 | 0 | -232 | active: backend event seam and vLLM WorkGraph cold handoff removed; seam rewrite still pending |
-| E — legacy authority removal | 264 | 29,708 | 988 | -29,444 | active: Program, old WorkGraph, consumer compat island and recurrence FFI shim removed |
+| E — legacy authority removal | 344 | 32,265 | 988 | -31,921 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
