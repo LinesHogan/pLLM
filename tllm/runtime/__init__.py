@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runtime layer public surface.
 
-Submodules (``residual_runtime``, ``dispatch_plan``, ``scheduling.*`` ...) are
+Submodules (``residual_runtime``, ``scheduling.*`` ...) are
 imported directly by their consumers; the package root exports only the
 instance-scoped runtime API.
 """

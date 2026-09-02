@@ -9,9 +9,7 @@ from typing import TYPE_CHECKING, Dict, Protocol, cast
 import torch
 
 from tllm.contracts.runtime_context import RunnerLike
-from tllm.ports.base import WriteMode, WriteRows
 from tllm.ports.residual_stream import ResidualLocator
-from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.ports import residual_bindings as _residual_bindings
 from tllm.runtime.ports import residual_capture_buffers as _residual_capture_buffers
 from tllm.runtime.ports import residual_capture_hooks as _residual_capture_hooks
@@ -49,7 +47,6 @@ class ConfigLike(Protocol):
 class RuntimeLike(Protocol):
     config: ConfigLike
     residual_raw_paths: dict[ResidualLocator, str]
-    dispatch_plan: DispatchPlan | None
     decode_row_idx: torch.Tensor | None
     decode_valid_mask: torch.Tensor | None
     decode_prompt_idx_buf: torch.Tensor | None
@@ -94,19 +91,11 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
 
     model = runner_model_module(runner)
     cfg = core.RUNTIME.config
-    plan = getattr(core.RUNTIME, "dispatch_plan", None)
-    required = set(plan.required_residual_layers()) if plan is not None and hasattr(plan, "required_residual_layers") else set()
-    if plan is not None and hasattr(plan, "required_residual_writes"):
-        # Written layers must be tapped too: the staged write applies inside
-        # the tapped forward, before capture.
-        required |= set(plan.required_residual_writes())
-
     raw_paths_by_locator = _residual_bindings.raw_paths_from_runtime(core.RUNTIME)
     native_graph = core.RUNTIME.native_schedule_graph
-    if not required and native_graph is not None:
+    required: set[tuple[int, str, str]] = set()
+    if native_graph is not None:
         # Native resources declare the exact logical locators they can bind.
-        # The empty legacy plan must not expand that contract to the historical
-        # ESamp source/target pair before the backend timeline is compiled.
         required = {
             (locator.layer, locator.site, locator.phase)
             for locator in raw_paths_by_locator
@@ -164,13 +153,9 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
         raise RuntimeError("Please set graph_scratch_rows > 0 (or ensure runner.max_num_reqs > 0)")
     compact_rows = 0
     compact_lane_enabled = bool(getattr(cfg, "compact_capture_lane", False))
-    if compact_lane_enabled and plan is not None and hasattr(plan, "has_residual_row_compaction") and plan.has_residual_row_compaction("first_per_prompt"):
-        compact_rows = int(plan.max_residual_compact_rows("first_per_prompt")) if hasattr(plan, "max_residual_compact_rows") else 0
-        if compact_rows <= 0:
-            compact_rows = rows
+    if compact_lane_enabled and native_graph is not None:
+        compact_rows = rows
     capture_full_rows = True
-    if plan is not None and hasattr(plan, "requires_full_residual_capture"):
-        capture_full_rows = bool(plan.requires_full_residual_capture())
     if bool(getattr(cfg, "enable_distiller_intervention", False)):
         capture_full_rows = True
     hidden_size = int(getattr(getattr(model, "config", None), "hidden_size", 0) or 0)
@@ -261,24 +246,8 @@ def apply_runtime_setup(*, core: CoreLike, runner: object, setup: ResidualRuntim
     )
     core.RUNTIME.tap_handles = dict(handles)
 
-    plan = getattr(core.RUNTIME, "dispatch_plan", None)
-    write_specs = []
-    if plan is not None and hasattr(plan, "residual_writes"):
-        for consumer_id, _flow, write in plan.residual_writes():
-            locator = getattr(write, "locator")
-            if not isinstance(locator, ResidualLocator):
-                continue
-            write_specs.append(
-                (
-                    consumer_id,
-                    locator,
-                    WriteMode(str(getattr(write, "mode", "replace") or "replace")),
-                    WriteRows(str(getattr(write, "rows", "decode_only"))),
-                    int(getattr(write, "order", 0)),
-                )
-            )
     core.RUNTIME.write_leases = _residual_write.build_write_leases(
-        writes=write_specs,
+        writes=(),
         resolve_path=lambda locator: _residual_bindings.resolved_path_for_locator(
             setup.runtime_bindings, locator
         ),

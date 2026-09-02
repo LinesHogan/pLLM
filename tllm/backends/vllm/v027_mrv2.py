@@ -332,15 +332,8 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     _hooks.run_execute_model_post_producers(
         core=core,
         runner=runner,
-        publish_decode=lambda: _hooks.dispatch_decode_port_bundles(
-            core=core,
-            runner=runner,
-        ),
+        publish_decode=lambda: 0,
     )
-    if not runtime.launch_consumer_from_hooks:
-        from tllm.runtime import hidden_event_bridge as _hidden_bridge
-
-        _hidden_bridge.dispatch_deferred_layer_batches(core=core, runner=runner)
     _model_region.stage_signed_backend_region_event(
         event=BackendObservableEvent.EXECUTE_MODEL_POST,
         runtime=runtime,

@@ -10,19 +10,7 @@ if TYPE_CHECKING:
     from tllm.runtime.workload_execution import NativeWorkloadExecution
 
 
-class ActivityPlan(Protocol):
-    def has_active_targets(self) -> bool:
-        ...
-
-
-class SamplerProviderOwner(Protocol):
-    def sampler_modifier_provider(self) -> "SamplerModifierProvider | None":
-        ...
-
-
 class RuntimeWithTargets(Protocol):
-    dispatch_plan: ActivityPlan | None
-    consumer: SamplerProviderOwner | None
     workload_execution: "NativeWorkloadExecution | None"
     native_workloads_pending: bool
 
@@ -42,17 +30,12 @@ def _sampler_provider(
         provider = execution.sampler_modifier_provider()
         if provider is not None:
             return provider
-    consumer = runtime.consumer
-    if consumer is None:
-        return None
-    return consumer.sampler_modifier_provider()
+    return None
 
 
 def runtime_has_active_targets(runtime: RuntimeWithTargets) -> bool:
-    plan = runtime.dispatch_plan
     return bool(
-        (plan is not None and plan.has_active_targets())
-        or _has_active_sampler_provider(runtime)
+        _has_active_sampler_provider(runtime)
         or runtime.workload_execution is not None
         or runtime.native_workloads_pending
     )

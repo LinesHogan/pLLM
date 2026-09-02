@@ -331,7 +331,6 @@ class TllmWorkerExtension:
             "pid": os.getpid(),
             "worker_id": self._tllm_worker_id(),
             "patch_installed": core.runtime_patch_installed(),
-            "consumer": core.active_consumer_id(),
             "mapping_size": len(core.RUNTIME.reqid_to_promptidx),
         }
 
@@ -581,19 +580,6 @@ class TllmWorkerExtension:
                     "cold workload epoch"
                 )
             core.set_esamp_training_enabled(bool(flags["esamp_training_enabled"]))
-
-    def tllm_register_consumer(self, name: str, config: dict[str, object], primary: bool = False) -> None:
-        """Rebuild a consumer from its spec and activate it in this process."""
-        from tllm.runtime import consumer_plugins as consumer_registry
-        from tllm.runtime.mp.bootstrap import ConsumerSpec
-
-        consumer = consumer_registry.build_consumer_from_spec(ConsumerSpec(name=str(name), config=dict(config)))
-        consumer_registry.activate_consumer(consumer, primary=bool(primary))
-
-    def tllm_clear_consumers(self) -> None:
-        from tllm.runtime import residual_runtime as core
-
-        core.clear_dispatch_consumers()
 
     def tllm_bind_runner_runtime(self) -> None:
         """Record this worker's runner in the runner->runtime routing table.

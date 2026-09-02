@@ -1126,14 +1126,6 @@ class ControlPlane:
     def apply_enable_flags(self, flags: Mapping[str, bool], *, timeout: float | None = None) -> None:
         self.call("tllm_apply_enable_flags", {str(k): bool(v) for k, v in flags.items()}, timeout=timeout)
 
-    def register_consumer(
-        self, name: str, config: Mapping[str, Any], *, primary: bool = False, timeout: float | None = None
-    ) -> None:
-        self.call("tllm_register_consumer", str(name), dict(config), bool(primary), timeout=timeout)
-
-    def clear_consumers(self, *, timeout: float | None = None) -> None:
-        self.call("tllm_clear_consumers", timeout=timeout)
-
     def workload_timelines(
         self,
         *,

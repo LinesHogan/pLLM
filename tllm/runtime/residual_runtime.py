@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 import torch
 
 from tllm.common.state import ensure_v1_env, pick_common_attn_metadata, resolve_object_by_path
-from tllm.ports.consumer import BaseConsumer
 from tllm.contracts.consumer_stats import TrainingStats, merge_training_stats_maps
 from tllm.contracts.request_identity import resolve_prompt_sample
 
@@ -37,9 +36,6 @@ from tllm.common.decode_localization import compute_decode_localization
 from tllm.runtime import lifecycle as _lifecycle
 from tllm.runtime import stats as _stats
 from tllm.runtime.config import normalize_adaptation_stream_mode
-from tllm.runtime.consumer_registry import ConsumerRegistry
-from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.runtime.consumer_compat import synchronize as synchronize_consumer
 from tllm.runtime.resources import (
     SamplerPrecomputeBuffers,
     SamplerPrecomputeCache,
@@ -49,7 +45,6 @@ from tllm.runtime.state import (
     RUNTIME,
     ResidualRuntimeConfig,
     ResidualRuntimeState,
-    RuntimeConsumer,
 )
 from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspotStats, PlacementStats
 
@@ -71,56 +66,6 @@ MODEL_HOOK_SPEC_ATTR = "esamp_hook_spec"
 
 def runtime_patch_installed() -> bool:
     return _PATCH_INSTALLED
-
-
-def active_consumer_id() -> str | None:
-    consumer = RUNTIME.consumer
-    return None if consumer is None else str(consumer.consumer_id)
-
-
-
-def _ensure_dispatch_registry() -> ConsumerRegistry:
-    if RUNTIME.consumer_registry is None:
-        RUNTIME.consumer_registry = ConsumerRegistry()
-    return RUNTIME.consumer_registry
-
-
-def _active_dispatch_consumers() -> list[BaseConsumer[object]]:
-    consumers = _ensure_dispatch_registry().consumers()
-    if isinstance(RUNTIME.consumer, BaseConsumer):
-        consumers = consumers + [RUNTIME.consumer]
-    return consumers
-
-
-def _refresh_dispatch_plan() -> None:
-    consumers = _active_dispatch_consumers()
-    if not consumers:
-        RUNTIME.dispatch_plan = None
-        RUNTIME.execution_plan = None
-        RUNTIME.producer_executor = None
-        return
-    plan = DispatchPlan.build(consumers)
-    RUNTIME.dispatch_plan = None if plan.is_empty() else plan
-    # Fail fast at startup when a consumer reads a migrated port kind that no
-    # registered producer can serve (kinds still served by legacy hardcoded
-    # producers are not enforced yet).
-    from tllm.runtime.execution_plan import compile_default_plan
-
-    execution_plan = compile_default_plan(consumers=consumers)
-    from tllm.runtime.producer_executor import (
-        ProducerExecutor,
-        default_producer_materializers,
-    )
-
-    RUNTIME.execution_plan = execution_plan
-    RUNTIME.producer_executor = ProducerExecutor.bind(
-        plan=execution_plan,
-        registry=default_producer_materializers(),
-    )
-    RUNTIME.placement_stats.capture_resident_stage_count = max(
-        RUNTIME.placement_stats.capture_resident_stage_count,
-        len(execution_plan.capture_resident_producer_ids),
-)
 
 
 def prepare_physical_workgraph_step(step_id: int) -> None:
@@ -226,10 +171,7 @@ def publish_workload_compilation(
         execution = build_native_workload_execution(
             compilation,
             runtime=RUNTIME,
-            # A WorkloadExecutionBindings object is the complete native
-            # authority contract.  Do not even instantiate the legacy
-            # registry while binding it.
-            consumers=() if bindings is not None else _active_dispatch_consumers(),
+            consumers=(),
             bindings=bindings,
         )
     else:
@@ -299,26 +241,6 @@ def advance_workload_anchor(anchor: str) -> bool:
     if execution is None:
         return False
     return execution.advance_anchor(str(anchor))
-
-
-def register_dispatch_consumer(consumer: BaseConsumer[object]) -> None:
-    _ensure_dispatch_registry().register(consumer)
-    _refresh_dispatch_plan()
-
-
-def replace_dispatch_consumers(consumers: Sequence[BaseConsumer[Any]]) -> None:
-    _ensure_dispatch_registry().replace_all(consumers)
-    _refresh_dispatch_plan()
-
-
-def clear_dispatch_consumers() -> None:
-    _ensure_dispatch_registry().clear()
-    _refresh_dispatch_plan()
-
-
-def set_runtime_consumer(consumer: BaseConsumer[Any] | None) -> None:
-    RUNTIME.consumer = consumer
-    _refresh_dispatch_plan()
 
 
 def runner_uses_compilation_or_cudagraph(runner: RunnerLike) -> bool:
@@ -426,19 +348,15 @@ def configure_runtime(
     RUNTIME.path_hotspot_enabled = os.getenv("TLLM_TRACE_PATH_HOTSPOTS", "") == "1"
     RUNTIME.path_hotspot_cpu_ms = {}
     RUNTIME.path_hotspot_counts = {}
-    _refresh_dispatch_plan()
     RUNTIME.reset_step()
 
 
 def set_esamp_training_enabled(enabled: bool) -> None:
-    """Toggle legacy ESamp directly or publish native ESamp through an epoch."""
+    """Publish native ESamp enable semantics through an owning epoch."""
     from tllm.runtime.runtime import active_runtime
 
     runtime = active_runtime()
-    if RUNTIME.consumer is not None:
-        RUNTIME.consumer.set_enabled(enabled)
-        _refresh_dispatch_plan()
-    elif runtime.has_native_workloads and (
+    if runtime.has_native_workloads and (
         RUNTIME.workload_execution is not None
         or RUNTIME.workload_execution_store is not None
     ):
@@ -464,14 +382,8 @@ def set_esamp_training_enabled(enabled: bool) -> None:
 
 
 def synchronize_esamp() -> None:
-    if RUNTIME.consumer is not None:
-        synchronize_consumer(RUNTIME.consumer)
-    elif RUNTIME.workload_execution is not None:
+    if RUNTIME.workload_execution is not None:
         RUNTIME.workload_execution.synchronize()
-    registry = RUNTIME.consumer_registry
-    if registry is not None:
-        for consumer in registry.consumers():
-            synchronize_consumer(consumer)
 
     from tllm.runtime.mp.control import active_control_plane
 
@@ -481,9 +393,7 @@ def synchronize_esamp() -> None:
 
 
 def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
-    if RUNTIME.consumer is not None:
-        local = RUNTIME.consumer.read_and_reset_stats(sync=sync)
-    elif RUNTIME.workload_execution is not None:
+    if RUNTIME.workload_execution is not None:
         local = RUNTIME.workload_execution.read_and_reset_stats(sync=sync)
     else:
         local = TrainingStats(loss_avg=0.0, loss_count=0)
@@ -496,9 +406,7 @@ def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
 
 
 def read_and_reset_esamp_per_request_stats(sync: bool = True) -> Dict[int, TrainingStats]:
-    if RUNTIME.consumer is not None:
-        local = dict(RUNTIME.consumer.read_and_reset_per_request_stats(sync=sync))
-    elif RUNTIME.workload_execution is not None:
+    if RUNTIME.workload_execution is not None:
         local = dict(
             RUNTIME.workload_execution.read_and_reset_per_request_stats(sync=sync)
         )
@@ -553,7 +461,7 @@ def read_and_reset_placement_stats() -> PlacementStats:
 
 
 def read_graph_debug_stats(*, mode: str = "model_bank") -> GraphDebugStats:
-    return _stats.read_graph_debug_stats(RUNTIME.consumer, mode=mode)
+    return _stats.read_graph_debug_stats(None, mode=mode)
 
 
 
@@ -597,11 +505,9 @@ __all__ = [
     "RUNTIME",
     "ResidualRuntimeConfig",
     "ResidualRuntimeState",
-    "RuntimeConsumer",
     "SamplerPrecomputeBuffers",
     "SamplerPrecomputeCache",
     "SamplerPrecomputeState",
-    "clear_dispatch_consumers",
     "compute_decode_localization",
     "configure_runtime",
     "infer_hidden_dtype",
@@ -613,12 +519,9 @@ __all__ = [
     "read_graph_debug_stats",
     "read_and_reset_esamp_per_request_stats",
     "read_and_reset_esamp_stats",
-    "register_dispatch_consumer",
-    "replace_dispatch_consumers",
     "resolve_module_by_path_with_fallback",
     "record_path_hotspot_cpu",
     "runner_uses_compilation_or_cudagraph",
-    "set_runtime_consumer",
     "set_esamp_training_enabled",
     "synchronize_esamp",
 ]

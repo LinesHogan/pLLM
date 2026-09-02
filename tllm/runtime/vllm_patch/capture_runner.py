@@ -7,7 +7,6 @@ from typing import Any, Callable, Sequence
 
 from tllm.runtime.trajectory_store import apply_prompt_contexts
 from tllm.runtime.generation_trace_runtime import build_generation_trace_from_outputs
-from tllm.runtime.vllm_patch.port_runtime_hooks import dispatch_post_generate_port_bundles
 from tllm.contracts.request_identity import resolve_prompt_sample
 from tllm.runtime.request_lifecycle import register_request_alias
 
@@ -111,5 +110,4 @@ def run_generate_with_request_mapping(
             resolve_prompt_sample_fn=lambda request_id: _resolve_prompt_sample_for_req_id(runtime, str(request_id)),
             group_id=str(generation_group_id),
         )
-        dispatch_post_generate_port_bundles(runtime=runtime, runner=llm)
     return outputs

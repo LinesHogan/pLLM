@@ -44,7 +44,6 @@ from tllm.workload.ir import (
 )
 
 if TYPE_CHECKING:
-    from tllm.ports.consumer import BaseConsumer
     from tllm.runtime.request_trainable_state import RequestStateRuntimeService
 
 
@@ -1592,33 +1591,6 @@ class WorkloadAuthority(str, Enum):
     """The execution runtime explicitly authorized for a declaration."""
 
     NATIVE_REGION = "native_region"
-    LEGACY_ADAPTER = "legacy_adapter"
-
-
-LegacyConsumerFactory = Callable[[object], "BaseConsumer[object]"]
-
-
-@dataclass(frozen=True, slots=True)
-class NoLegacyConsumerAdapter:
-    def build(self, instance: object) -> "BaseConsumer[object]":
-        _ = instance
-        raise RuntimeError("workload definition has no legacy consumer binding")
-
-
-NO_LEGACY_CONSUMER_ADAPTER = NoLegacyConsumerAdapter()
-
-
-@dataclass(frozen=True, slots=True)
-class LegacyConsumerAdapter:
-    """Explicit compatibility binding captured when a workload is declared."""
-
-    factory: LegacyConsumerFactory
-
-    def build(self, instance: object) -> "BaseConsumer[object]":
-        return self.factory(instance)
-
-
-LegacyConsumerBinding = NoLegacyConsumerAdapter | LegacyConsumerAdapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -1636,7 +1608,6 @@ class WorkloadDefinition:
     states: tuple[StateDescriptor, ...] = ()
     staged_ports: tuple[StagedPort[object], ...] = ()
     host_outputs: tuple[HostOutput[object], ...] = ()
-    legacy_consumer: LegacyConsumerBinding = NO_LEGACY_CONSUMER_ADAPTER
 
 
 @dataclass(frozen=True, slots=True)
@@ -1656,7 +1627,6 @@ class NativeWorkloadDefinition:
     states: tuple[StateDescriptor, ...] = ()
     staged_ports: tuple[StagedPort[object], ...] = ()
     host_outputs: tuple[HostOutput[object], ...] = ()
-    legacy_consumer: LegacyConsumerBinding = NO_LEGACY_CONSUMER_ADAPTER
 
 
 _Definition = WorkloadDefinition | NativeWorkloadDefinition
@@ -1704,25 +1674,10 @@ def workload(
     approximation_criteria: ApproximationCriteria | None = None,
     config: type[WorkloadConfig] | None = None,
     enabled: ConfigField[bool] | None = None,
-    legacy_consumer: LegacyConsumerFactory | None = None,
 ) -> type[_T] | Callable[[type[_T]], type[_T]]:
     def decorate(target: type[_T]) -> type[_T]:
         policy = ApproximationPolicy(approximation)
         resolved_authority = WorkloadAuthority(authority)
-        if resolved_authority is WorkloadAuthority.LEGACY_ADAPTER:
-            if legacy_consumer is None:
-                raise TypeError(
-                    "legacy-adapter workload declaration requires legacy_consumer="
-                )
-            legacy_binding: LegacyConsumerBinding = LegacyConsumerAdapter(
-                legacy_consumer
-            )
-        else:
-            if legacy_consumer is not None:
-                raise TypeError(
-                    "legacy_consumer= is only valid with LEGACY_ADAPTER authority"
-                )
-            legacy_binding = NO_LEGACY_CONSUMER_ADAPTER
         if approximation_criteria is not None:
             if policy is ApproximationPolicy.EXACT:
                 raise ValueError(
@@ -1735,13 +1690,8 @@ def workload(
                 policy,
                 resolved_authority,
                 approximation_criteria,
-                legacy_consumer=legacy_binding,
             )
         elif config is not None and enabled is not None:
-            if resolved_authority is WorkloadAuthority.LEGACY_ADAPTER:
-                raise TypeError(
-                    "legacy-adapter declarations cannot use the native config surface"
-                )
             definition = NativeWorkloadDefinition(
                 workload_id=_name(workload_id, "workload.id"),
                 approximation=policy,
@@ -1749,7 +1699,6 @@ def workload(
                 approximation_criteria=approximation_criteria,
                 config_type=config,
                 enabled=ConfigFieldValue(enabled.name),
-                legacy_consumer=legacy_binding,
             )
         else:
             raise TypeError(

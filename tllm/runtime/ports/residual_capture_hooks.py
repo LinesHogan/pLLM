@@ -11,7 +11,6 @@ import torch
 
 from tllm.contracts.runtime_context import RunnerLike
 from tllm.runtime import active_targets
-from tllm.runtime import hidden_event_bridge as _hidden_bridge
 from tllm.runtime.ports import residual_write as _residual_write
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
@@ -35,8 +34,6 @@ class ResidualCaptureRuntimeLike(Protocol):
     tap_decode_hidden_compact: dict[str, torch.Tensor]
     write_leases: Dict[WriteLeaseKey, ResidualWriteLease]
     launch_consumer_from_hooks: bool
-    dispatch_plan: object | None
-    consumer: object | None
     source_resolved_path: str
     target_resolved_path: str
     producer_executor: ProducerExecutorLike | None
@@ -219,17 +216,6 @@ def install_layer_forward_taps(
                     layer_path=__path,
                     hidden=tensor,
                 )
-            if not active_targets.runtime_has_active_targets(
-                cast(active_targets.RuntimeWithTargets, core.RUNTIME)
-            ):
-                return out
-
-            _hidden_bridge.dispatch_layer_lifecycle_events(
-                core=cast(_hidden_bridge.EventCoreLike, core),
-                runner=runner,
-                layer_path=__path,
-                capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
-            )
             return out
 
         layer.forward = MethodType(_forward_with_tap, layer)  # type: ignore[method-assign]

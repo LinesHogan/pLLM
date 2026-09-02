@@ -14,12 +14,9 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
-from tllm.ports.consumer import BaseConsumer
 from tllm.ports.residual_stream import ResidualLocator
 from tllm.producers.registry import ExecutionPlan
 from tllm.runtime.config import AdaptationStreamMode
-from tllm.runtime.consumer_registry import ConsumerRegistry
-from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.request_lifecycle import RequestLifecycleLedger
 from tllm.runtime.reward_outcome_runtime import RewardOutcomeBatch, RewardOutcomeStore
@@ -27,7 +24,6 @@ from tllm.runtime.retry_control_runtime import RetryControlBatch, RetryControlSt
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
-from tllm.runtime.fusion import FusionExecutor
 from tllm.runtime.stats import PlacementStats
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
 
@@ -41,9 +37,6 @@ if TYPE_CHECKING:
     from tllm.runtime.producer_executor import ProducerExecutor
     from tllm.runtime.torch_adapter import CudaLongHostStaging
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
-
-
-RuntimeConsumer = BaseConsumer
 
 
 @dataclass
@@ -114,14 +107,10 @@ class ResidualRuntimeState:
     path_hotspot_cpu_ms: dict[str, float] = field(default_factory=dict)
     path_hotspot_counts: dict[str, int] = field(default_factory=dict)
 
-    consumer: Optional[RuntimeConsumer] = None
-    consumer_registry: Optional[ConsumerRegistry] = None
-    dispatch_plan: Optional[DispatchPlan] = None
     execution_plan: Optional[ExecutionPlan] = None
     physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
     physical_prepared_step_id: int = -1
-    # Immutable new-middle-end output. Legacy dispatch remains authoritative
-    # until a workload explicitly enters native physical execution.
+    # Immutable new-middle-end output activated by the native physical executor.
     workload_compilation: Optional["WorkloadCompilation"] = None
     workload_execution: Optional["NativeWorkloadExecution"] = None
     workload_execution_store: Optional["NativeWorkloadExecutionStore"] = None
@@ -129,7 +118,6 @@ class ResidualRuntimeState:
     native_schedule_graph: Optional["ScheduleGraph"] = None
     native_hidden_path_aliases: dict[str, str] = field(default_factory=dict)
     producer_executor: Optional["ProducerExecutor"] = None
-    fusion_executor: FusionExecutor = field(default_factory=FusionExecutor)
     placement_stats: PlacementStats = field(default_factory=PlacementStats)
     reward_outcome_store: RewardOutcomeStore = field(default_factory=RewardOutcomeStore)
     retry_control_store: RetryControlStore = field(default_factory=RetryControlStore)

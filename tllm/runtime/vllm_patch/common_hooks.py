@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Common runtime hook helpers for consumer dispatch."""
+"""Common runtime hook helpers for signed native backend events."""
 
 from __future__ import annotations
 
@@ -7,26 +7,22 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, Sequence
 
 import torch
 
-from tllm.contracts.port_bundle import PortBundle
 from tllm.contracts.hidden_batch import HiddenBatch
 from tllm.contracts.runtime_context import RunnerLike, RuntimeContext
 from tllm.backends.protocol import BackendObservableEvent
-from tllm.runtime.dispatch_plan import DispatchPlan
-from tllm.runtime.consumer_compat import dispatch_consumer_event
 from tllm.runtime.vllm_patch.compilation import is_torch_compiling
 
 if TYPE_CHECKING:
     from tllm.runtime.workload_execution import NativeWorkloadExecution
 
 
-class RuntimeWithDispatchPlan(Protocol):
-    dispatch_plan: DispatchPlan | None
+class RuntimeWithWorkloadExecution(Protocol):
     workload_execution: "NativeWorkloadExecution | None"
     event_step_id: int
 
 
 def _advance_native_workload(
-    runtime: RuntimeWithDispatchPlan,
+    runtime: RuntimeWithWorkloadExecution,
     event: BackendObservableEvent | None,
 ) -> None:
     execution = runtime.workload_execution
@@ -101,7 +97,7 @@ def build_runtime_context(
 
 def dispatch_runtime_event(
     *,
-    runtime: RuntimeWithDispatchPlan,
+    runtime: RuntimeWithWorkloadExecution,
     runner: RunnerLike,
     event: BackendObservableEvent,
     phase: Optional[str] = None,
@@ -111,7 +107,7 @@ def dispatch_runtime_event(
     batch_factory: Optional[Callable[[], Optional[HiddenBatch]]] = None,
     predecessor_events: Sequence[object] = (),
 ) -> int:
-    """Dispatch a signed backend event to legacy and native consumers."""
+    """Advance a signed backend event through native workload execution."""
     return _dispatch_runtime_event(
         runtime=runtime,
         runner=runner,
@@ -128,7 +124,7 @@ def dispatch_runtime_event(
 
 def dispatch_legacy_runtime_event(
     *,
-    runtime: RuntimeWithDispatchPlan,
+    runtime: RuntimeWithWorkloadExecution,
     runner: RunnerLike,
     event_name: str,
     phase: Optional[str] = None,
@@ -138,24 +134,24 @@ def dispatch_legacy_runtime_event(
     batch_factory: Optional[Callable[[], Optional[HiddenBatch]]] = None,
     predecessor_events: Sequence[object] = (),
 ) -> int:
-    """Dispatch a legacy-only hook without advancing a native workload."""
-    return _dispatch_runtime_event(
-        runtime=runtime,
-        runner=runner,
-        event_name=event_name,
-        native_event=None,
-        phase=phase,
-        layer_path=layer_path,
-        capture_enabled=capture_enabled,
-        batch=batch,
-        batch_factory=batch_factory,
-        predecessor_events=predecessor_events,
+    """Legacy event-consumer dispatch has been retired."""
+    _ = (
+        runtime,
+        runner,
+        event_name,
+        phase,
+        layer_path,
+        capture_enabled,
+        batch,
+        batch_factory,
+        predecessor_events,
     )
+    return 0
 
 
 def _dispatch_runtime_event(
     *,
-    runtime: RuntimeWithDispatchPlan,
+    runtime: RuntimeWithWorkloadExecution,
     runner: RunnerLike,
     event_name: str,
     native_event: BackendObservableEvent | None,
@@ -166,54 +162,16 @@ def _dispatch_runtime_event(
     batch_factory: Optional[Callable[[], Optional[HiddenBatch]]] = None,
     predecessor_events: Sequence[object] = (),
 ) -> int:
-    """Dispatch one runtime event to registered consumers, if any."""
-    effective_predecessors = tuple(predecessor_events)
-    plan = runtime.dispatch_plan
-    if plan is None:
-        _advance_native_workload(runtime, native_event)
-        return 0
-
-    # ``mixed`` is an exact transport of Rust's SchedulerBatchPhase.Mixed,
-    # never a Python reclassification.  Legacy subscriptions express only a
-    # single row phase, so treating it as no match would silently omit a
-    # consumer and treating it as ``None`` would run it on the wrong rows.
-    # Native Regions are advanced by the signed BackendObservableEvent and do
-    # not use this compatibility filter.
-    if phase == "mixed" and plan.has_legacy_event_targets(event_name):
-        raise RuntimeError(
-            "Rust-derived mixed scheduler batch cannot be dispatched to "
-            f"legacy event subscribers at {event_name!r}; use a native "
-            "Region-only workload or split the scheduler batch"
-        )
-
-    if capture_enabled is None:
-        capture_enabled = not _runner_uses_cudagraph(runner)
-
-    targets = plan.select(
-        event_name=event_name,
-        phase=phase,
-        layer_path=layer_path,
-        capture_enabled=bool(capture_enabled),
+    """Advance one signed runtime event; retired consumers receive nothing."""
+    _ = (
+        runner,
+        event_name,
+        phase,
+        layer_path,
+        capture_enabled,
+        batch,
+        batch_factory,
+        predecessor_events,
     )
-    if not targets:
-        _advance_native_workload(runtime, native_event)
-        return 0
-
-    ctx = build_runtime_context(
-        runner=runner,
-        event_name=event_name,
-        predecessor_events=effective_predecessors,
-    )
-    payload = batch
-    if payload is None and batch_factory is not None:
-        payload = batch_factory()
-
-    for target in targets:
-        dispatch_consumer_event(
-            consumer=target.consumer,
-            payload=payload,
-            event_name=event_name,
-            ctx=ctx,
-        )
     _advance_native_workload(runtime, native_event)
-    return len(targets)
+    return 0

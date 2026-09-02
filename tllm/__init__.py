@@ -1,10 +1,10 @@
-"""Public tLLM API and the sole clean-room/legacy routing boundary.
+"""Public tLLM API and the sole clean-room routing boundary.
 
 Nominal clean-room workloads are routed before the legacy runtime is imported.
-All other module-level calls remain a backward-compatible façade over the
-process-wide default :class:`tllm.runtime.runtime.TllmRuntime`:
+All other module-level calls route through the process-wide default
+:class:`tllm.runtime.runtime.TllmRuntime`:
 
-    runtime = TllmRuntime(consumers=[...])
+    runtime = TllmRuntime(workloads=[...])
     llm = runtime.make_llm(...)
 
 The legacy/runtime names (:class:`TllmRuntime`, ``default_runtime``) load lazily via
@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tllm.ports.consumer import BaseConsumer
     from tllm.runtime.runtime import TllmRuntime, default_runtime
 
 
@@ -105,18 +104,6 @@ def _make_canonical_llm(
     return create_canonical_vllm_llm(workload, config)
 
 
-def register_consumer(consumer: "BaseConsumer[object]") -> None:
-    from tllm.runtime.runtime import default_runtime
-
-    default_runtime().register_consumer(consumer)
-
-
-def clear_consumers() -> None:
-    from tllm.runtime.runtime import default_runtime
-
-    default_runtime().clear_consumers()
-
-
 def __getattr__(name: str) -> object:
     if name in ("TllmRuntime", "default_runtime"):
         from tllm.runtime import runtime as _runtime
@@ -127,8 +114,6 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "TllmRuntime",
-    "clear_consumers",
     "default_runtime",
     "make_llm",
-    "register_consumer",
 ]

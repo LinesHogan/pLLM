@@ -3,11 +3,11 @@
 
 ``TllmRuntime`` is the recommended entry point:
 
-    runtime = TllmRuntime(workloads=[EsampConsumer(...)])
+    runtime = TllmRuntime(workloads=[...])
     llm = runtime.make_llm(model_name=..., dtype=..., ...)
 
-Module-level ``tllm.make_llm`` / ``tllm.register_consumer`` remain as a thin
-façade over a process-wide default runtime for backward compatibility.
+Module-level ``tllm.make_llm`` remains as a thin façade over a process-wide
+default runtime.
 
 Current limitation (tracked by the runtime-instancing migration): backend
 hooks are installed on engine classes once per process, and the active
@@ -28,14 +28,12 @@ from typing_extensions import TypeVar as TypeVarWithDefault
 import warnings
 from uuid import uuid4
 
-from tllm.ports.consumer import BaseConsumer
 from tllm.producers.base import ProducerDescriptor
-from tllm.runtime.declaration_adapter import (
-    DeclarationDefinition,
-    consumer_spec,
-    legacy_consumer,
-    register_legacy_consumer,
-    workload_definition,
+from tllm.workload import (
+    NativeWorkloadDefinition,
+    WorkloadAuthority,
+    WorkloadDefinition,
+    definition_for_workload_class,
 )
 from tllm.runtime.workload_bindings import (
     DiagnosticsRuntimeServices,
@@ -112,6 +110,7 @@ PublishedModuleT = TypeVar("PublishedModuleT", bound="torch.nn.Module")
 ConfiguredWorkloadT = TypeVarWithDefault(
     "ConfiguredWorkloadT", default=Never
 )
+DeclarationDefinition = WorkloadDefinition | NativeWorkloadDefinition
 
 
 class _PortTransactionOwner(Protocol):
@@ -725,7 +724,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         *,
         backend: str = "auto",
         producers: Sequence[ProducerDescriptor] = (),
-        consumers: Sequence[BaseConsumer[object]] = (),
         workloads: Sequence[ConfiguredWorkloadT] = (),
         workload_memory_budget_bytes: int = 0,
         workload_allow_serial_fallback: bool = True,
@@ -743,7 +741,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
         self._workloads_by_type: dict[type[object], object] = {
             type(workload): workload for workload in self._workloads
         }
-        self._consumers: list[BaseConsumer[object]] = list(consumers)
         self._unadapted_workload_ids: list[str] = []
         self._native_workload_resources: dict[int, WorkloadRuntimeBinding] = {}
         from tllm.schedule.contracts import CompileOptions
@@ -785,19 +782,16 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             tuple[ConfiguredWorkloadT, DeclarationDefinition]
         ] = []
         for workload_instance in self._workloads:
-            definition = workload_definition(workload_instance)
+            definition = definition_for_workload_class(type(workload_instance))
             if definition is None:
                 raise TypeError(
-                    "workloads must be declared with @workload; pass legacy "
-                    "consumers through consumers="
+                    "workloads must be declared with @workload"
                 )
-            consumer = legacy_consumer(workload_instance, definition)
-            if consumer is None:
-                native_workloads.append((workload_instance, definition))
-                self._record_native_resources(workload_instance)
-                self._unadapted_workload_ids.append(definition.workload_id)
-            elif consumer not in self._consumers:
-                self._consumers.append(consumer)
+            if definition.authority is not WorkloadAuthority.NATIVE_REGION:
+                raise RuntimeError("only native Region workload authority is supported")
+            native_workloads.append((workload_instance, definition))
+            self._record_native_resources(workload_instance)
+            self._unadapted_workload_ids.append(definition.workload_id)
         self._native_workloads = tuple(native_workloads)
         resource_worker_specs: list["WorkloadWorkerSpec"] = []
         for resources in self._native_workload_resources.values():
@@ -813,11 +807,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                     "resources and TllmRuntime"
                 )
             self._workload_worker_specs = tuple(resource_worker_specs)
-        if self._unadapted_workload_ids and self._consumers:
-            raise RuntimeError(
-                "native Region authority cannot be coinstalled with legacy "
-                "dispatch consumers"
-            )
         self._refresh_resource_specialization_options()
         self._rebuild_workload_compiler()
 
@@ -943,10 +932,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
     @property
     def workloads(self) -> tuple[ConfiguredWorkloadT, ...]:
         return self._workloads
-
-    @property
-    def consumers(self) -> tuple[BaseConsumer[object], ...]:
-        return tuple(self._consumers)
 
     @property
     def workload_compilation(self) -> "WorkloadCompilation | None":
@@ -1601,47 +1586,10 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             raise
         return True
 
-    def register_consumer(self, consumer: BaseConsumer[object]) -> None:
-        if self._unadapted_workload_ids:
-            raise RuntimeError(
-                "native Region authority cannot be coinstalled with legacy "
-                "dispatch consumers"
-            )
-        plane = None
-        spec = None
-        if active_runtime() is self:
-            from tllm.runtime.mp.control import active_control_plane
-
-            plane = active_control_plane()
-            if plane is not None:
-                spec = consumer_spec(consumer)
-        self._consumers.append(consumer)
-        if active_runtime() is self:
-            from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
-
-            register_legacy_consumer(consumer)
-            refresh_exported_bootstrap_spec()
-            if plane is not None and spec is not None:
-                plane.register_consumer(spec.name, spec.config)
-
-    def clear_consumers(self) -> None:
-        self._consumers.clear()
-        if active_runtime() is self:
-            from tllm.runtime import residual_runtime
-            from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
-            from tllm.runtime.mp.control import active_control_plane
-
-            residual_runtime.clear_dispatch_consumers()
-            refresh_exported_bootstrap_spec()
-            plane = active_control_plane()
-            if plane is not None:
-                plane.clear_consumers()
-
     def activate(self) -> None:
         """Make this runtime the one global hooks dispatch to.
 
-        A runtime with no consumers of its own leaves any consumers already
-        registered through the legacy façade untouched (backward compat).
+        Native workload state is published through signed workload epochs.
         """
         self._require_workload_live()
         if self._staged_port_transactions:
@@ -1669,20 +1617,6 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
             native_residual_paths.update(resources.residual_paths)
         if native_residual_paths:
             residual_runtime.RUNTIME.residual_raw_paths = native_residual_paths
-        self._apply_consumers()
-
-    def _apply_consumers(self) -> None:
-        if not self._consumers:
-            if self._unadapted_workload_ids:
-                from tllm.runtime import residual_runtime
-
-                residual_runtime.clear_dispatch_consumers()
-            return
-        from tllm.runtime import residual_runtime
-
-        residual_runtime.clear_dispatch_consumers()
-        for consumer in self._consumers:
-            register_legacy_consumer(consumer)
 
     def make_llm(self, *args: object, **kwargs: object) -> LLM:
         from tllm.runtime.mp.control import set_active_control_plane

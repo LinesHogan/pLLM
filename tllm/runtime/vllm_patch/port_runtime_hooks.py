@@ -12,13 +12,8 @@ from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence, TYPE_
 import torch
 
 from tllm.contracts.runtime_context import RunnerLike
-from tllm.ports.base import ConsumerFlow
 from tllm.ports.residual_stream import ResidualLocator
-from tllm.runtime.dispatch_plan import DispatchPlan
 from tllm.runtime import active_targets
-from tllm.runtime import hidden_event_bridge as _hidden_bridge
-from tllm.runtime.ports import residual_bundle as _residual_bundle
-from tllm.runtime.ports import post_generate_dispatch as _post_generate_dispatch
 from tllm.runtime.ports.residual_bindings import ResidualPathBinding
 from tllm.runtime.ports import residual_bindings as _residual_bindings
 from tllm.runtime.ports import residual_runtime_setup as _residual_runtime_setup
@@ -235,7 +230,6 @@ class PortRuntimeStateLike(Protocol):
     source_resolved_path: str
     target_resolved_path: str
     event_step_id: int
-    dispatch_plan: DispatchPlan | None
     workload_execution: "NativeWorkloadExecution | None"
     reqid_to_promptidx: Mapping[str, int]
     reqid_to_sampleidx: Mapping[str, int]
@@ -267,12 +261,8 @@ class PortDispatchCoreLike(Protocol):
 
 
 def _needs_device_decode_metadata(runtime: PortRuntimeStateLike) -> bool:
-    plan = getattr(runtime, "dispatch_plan", None)
-    if plan is None or not hasattr(plan, "requires_device_decode_metadata"):
-        return True
-    if bool(plan.requires_device_decode_metadata()):
-        return True
-    return _sampler_patch.runtime_has_active_sampler_provider(runtime)
+    _ = runtime
+    return True
 
 
 def store_decode_localization(
@@ -556,7 +546,6 @@ def run_prepare_inputs_post_producers(
     localize_decode: Callable[[], object],
 ) -> None:
     """Run compiler-selected prepare producers in DAG order."""
-    _residual_bundle.retire_step_device_leases(core=core, runner=runner)
     executor = getattr(core.RUNTIME, "producer_executor", None)
     if executor is not None:
         from tllm.runtime.producer_executor import PrepareInputsPostContext
@@ -578,26 +567,6 @@ def run_prepare_inputs_post_producers(
     elif not hasattr(core.RUNTIME, "producer_executor"):
         localize_decode()
 
-
-
-def build_decode_port_frames(*, core: PortDispatchCoreLike, layer_path: str) -> List[PortFrame]:
-    return _residual_bundle.build_decode_port_frames(core=core, layer_path=layer_path)
-
-
-def build_step_scope_port_bundle(
-    *, core: PortDispatchCoreLike, flow: ConsumerFlow, consumer_id: str = ""
-) -> PortBundle | None:
-    return _residual_bundle.build_step_scope_port_bundle(
-        core=core,
-        flow=flow,
-        consumer_id=consumer_id,
-    )
-
-
-def dispatch_decode_port_bundles(*, core: PortDispatchCoreLike, runner: RunnerLike) -> int:
-    return _residual_bundle.dispatch_decode_port_bundles(core=core, runner=runner)
-
-
 def run_execute_model_post_producers(
     *,
     core: PortDispatchCoreLike,
@@ -618,16 +587,6 @@ def run_execute_model_post_producers(
         )
     elif not hasattr(core.RUNTIME, "producer_executor"):
         publish_decode()  # type: ignore[operator]
-
-
-def build_post_generate_port_bundle(*, runtime: object, flow: ConsumerFlow) -> PortBundle:
-    return _post_generate_dispatch.build_post_generate_port_bundle(runtime=runtime, flow=flow)
-
-
-def dispatch_post_generate_port_bundles(*, runtime: object, runner: RunnerLike) -> int:
-    return _post_generate_dispatch.dispatch_post_generate_port_bundles(runtime=runtime, runner=runner)
-
-
 def maybe_launch_post_logits_decode_work(*, core: Any, runner: Any) -> None:
     runtime = core.RUNTIME
     precompute = runtime.sampler_precompute
@@ -922,12 +881,10 @@ def wrapped_execute_model(
     run_execute_model_post_producers(
         core=core,
         runner=runner,
-        publish_decode=lambda: dispatch_decode_port_bundles(core=core, runner=runner),
+        publish_decode=lambda: 0,
     )
     t3 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.dispatch_bundles_cpu", t2, t3)
-    if not core.RUNTIME.launch_consumer_from_hooks:
-        _hidden_bridge.dispatch_deferred_layer_batches(core=core, runner=runner)
     t4 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.deferred_layers_cpu", t3, t4)
     if before_runtime_event is not None:

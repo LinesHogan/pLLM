@@ -22,13 +22,7 @@ def _resolve_provider(runtime: Any) -> Any:
             provider = getter()
             if provider is not None:
                 return provider
-    consumer = getattr(runtime, "consumer", None)
-    if consumer is None:
-        return None
-    getter = getattr(consumer, "sampler_modifier_provider", None)
-    if not callable(getter):
-        return None
-    return getter()
+    return None
 
 
 def sample_with_optional_modifier(*args, **kwargs):

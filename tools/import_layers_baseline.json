@@ -81,7 +81,6 @@
       "tllm.consumers.reft.workload -> tllm.workload",
       "tllm.consumers.tlm.workload -> tllm.workload",
       "tllm.consumers.ttrl.workload -> tllm.workload",
-      "tllm.runtime.declaration_adapter -> tllm.workload",
       "tllm.runtime.mp.control -> tllm.schedule.coordinator",
       "tllm.runtime.mp.worker_extension -> tllm.schedule.contracts",
       "tllm.runtime.mp.worker_extension -> tllm.schedule.coordinator",

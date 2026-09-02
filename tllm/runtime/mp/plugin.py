@@ -54,14 +54,5 @@ def tllm_general_plugin() -> None:
     if runtime_matches_spec(spec):
         _write_marker(path, matched=True, applied=False)
         return
-    if spec.skipped_consumers:
-        import sys
-
-        print(
-            f"tllm bootstrap: consumer(s) {list(spec.skipped_consumers)} have no registered "
-            "builder and are LOST in this spawn-built child process; register them via "
-            "tllm.runtime.consumer_plugins to make them reconstructable",
-            file=sys.stderr,
-        )
     apply_bootstrap_spec(spec)
     _write_marker(path, matched=False, applied=True)
