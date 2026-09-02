@@ -2,8 +2,6 @@
 """Thin Python shim over the Rust core (``tllm._core``).
 
 Hard dependency: there is no runtime fallback to a Python implementation.
-The legacy Python implementations live under ``test/core/oracles/`` as
-differential oracles only (see their headers for the sunset plan).
 
 Build the extension once per toolchain change:
 

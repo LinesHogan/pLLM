@@ -73,7 +73,6 @@
     "workload": [],
     "exact_module_edges": [
       "tllm.backends.timeline -> tllm.schedule.timeline",
-      "tllm.consumers.dummy -> tllm.canonical.workloads.dummy",
       "tllm.consumers.esamp.workload -> tllm.workload",
       "tllm.consumers.override.workload -> tllm.workload",
       "tllm.consumers.recirculation.native_backend -> tllm.workload",

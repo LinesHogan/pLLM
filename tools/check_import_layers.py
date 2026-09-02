@@ -164,9 +164,6 @@ EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("tllm.runtime.runtime", "tllm.schedule.coordinator"),
         ("tllm.runtime.runtime", "tllm.workload"),
         # Leaf workload implementations may use only the public DSL facade.
-        # Public migration routing boundary; the deleted Dummy implementation
-        # cannot be imported back into the clean-room core.
-        ("tllm.consumers.dummy", "tllm.canonical.workloads.dummy"),
         ("tllm.consumers.esamp.workload", "tllm.workload"),
         ("tllm.consumers.override.workload", "tllm.workload"),
         ("tllm.consumers.recirculation.native_backend", "tllm.workload"),

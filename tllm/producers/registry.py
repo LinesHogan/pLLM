@@ -112,8 +112,7 @@ def compile_execution_plan(
 
     ``enforced_kinds`` limits the consumer-port fail-fast check to the given
     kinds. ``None`` enforces every kind any consumer reads (strict mode).
-    The legacy Python implementation survives only as the differential
-    oracle under ``test/core/oracles/`` (see its sunset header).
+    The Rust core is the only implementation.
     """
     from tllm import core as _core
 

@@ -46,8 +46,6 @@
     "tllm/consumers/recirculation/native_backend.py",
     "tllm/consumers/recirculation/stage_definition.py",
     "tllm/consumers/recirculation/stage_binding.py",
-    "test/core/test_canonical_dense_state_producer_unit.py",
-    "test/core/test_canonical_dummy_workload_unit.py",
     "test/gpu/canonical_vllm_esamp_smoke.py",
     "test/gpu/canonical_fttt_cuda_smoke.py"
   ],
