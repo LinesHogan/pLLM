@@ -18,14 +18,14 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 ## Current checkpoint
 
-| Fact | Value | Cumulative change from `12551b8` | Change since `71afa2e` checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `e03816d` | — | after `71afa2e` |
-| Counted production/support source | 91,326 lines | -41,884 lines | -31,921 lines |
-| Pytest collection | 11 items | -1,338 items | -1,274 items |
+| Commit | `e47fbaf` | — | after `e03816d` |
+| Counted production/support source | 91,037 lines | -42,173 lines | -289 lines |
+| Pytest collection | 9 items | -1,340 items | -2 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 18 items | now below the 50-item ceiling | — |
+| Visible `TEST_COUNT` | 16 items | now below the 50-item ceiling | -2 items |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -154,14 +154,28 @@ consumer specs.  Production/tools grep for `BaseConsumer`, `DispatchPlan`,
 modules return `None`.  Under `SOURCE_LOC`, this checkpoint is
 `+80 / -2,557 / net -2,477`; `SOURCE_LOC` is now 91,326.
 
+The duplicate-test and retired event-hook cleanup in `e47fbaf` deleted the
+remaining duplicate Python attachment/state validator tests
+`test_parameter_overlay_attachment_unit.py` and
+`test_state_representation_plan_unit.py`, removed the old workload public
+typing fixture plus its ConfigKind negative pseudo-test, and dropped the
+tracked prompt debug list.  Pytest collection is now 9 items.  The same commit
+removed the no-op legacy load-model event dispatch and collapsed
+`runtime/vllm_patch/common_hooks.py` to a single native-event advancement
+helper; sampler pre-draw no longer constructs an unused predecessor-event
+fence for a retired consumer receiver.  Production/tools grep for the deleted
+test names, old typing fixture, `dispatch_legacy_runtime_event` and
+`build_runtime_context` is empty.  Under `SOURCE_LOC`, this checkpoint is
+`+11 / -300 / net -289`; `SOURCE_LOC` is now 91,037.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | 0 | 2,807 | 0 | -2,807 | active: stale consumer tests pruned; pytest 11, Rust 3, standalone smokes 4 |
+| A — ledger and survivor extraction | 0 | 2,827 | 0 | -2,827 | active: stale consumer/duplicate tests pruned; pytest 9, Rust 3, standalone smokes 4 |
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
-| D — backend quarantine and closed MP | 275 | 507 | 0 | -232 | active: backend event seam and vLLM WorkGraph cold handoff removed; seam rewrite still pending |
+| D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
 | E — legacy authority removal | 344 | 32,265 | 988 | -31,921 | active: Program, old WorkGraph, consumer compat island, BaseConsumer dispatch chain and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
