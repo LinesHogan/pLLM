@@ -193,11 +193,11 @@ row provenance; ESamp consumes those links through its signed request tasks. A
 bounded retired-step high-watermark prevents a completed `(epoch, step)` from
 being staged again with different rows.
 
-An eager `PackedHiddenSnapshotService` now provides the next neutral layer:
-any number of exact signed resources can arrive in any order but must share one
-canonical row batch and exact cold specialization. It owns ordinary tensor
-clones, returns fresh resource-keyed clones to readers, and has bounded
-finish/abort semantics. WorkloadIR
+An eager runner-owned packed-hidden capture now provides the next neutral
+handoff: any number of exact signed resources can arrive in any order but must
+share one canonical row batch and exact cold specialization. Its backend-local
+buffer owns ordinary tensor clones, returns fresh resource-keyed clones to
+readers, and has bounded finish/abort semantics. WorkloadIR
 v4 / ScheduleGraph v5 / Decision v7 now sign packed-row, packed-hidden, and
 selection provenance and force the initial implementation to eager/default/
 inline. Parent, worker, and local execution also compare an independent packed

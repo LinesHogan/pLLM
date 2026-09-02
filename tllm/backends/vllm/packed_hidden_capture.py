@@ -16,13 +16,11 @@ from tllm.backends.protocol import (
 )
 from tllm.contracts.packed_hidden import (
     PackedHiddenResourceBinding,
+    PackedHiddenSnapshot,
     PackedHiddenSnapshotBatch,
     PackedHiddenSnapshotSpecialization,
 )
 from tllm.contracts.packed_rows import PackedPhaseRowBatch
-from tllm.runtime.packed_hidden_snapshot import PackedHiddenSnapshotService
-from tllm.runtime.specialization import RuntimeSpecializationSpec
-from tllm.workgraph.graph_mode import GraphMode
 
 
 class PackedHiddenExecution(PackedHiddenSnapshotSink, Protocol):
@@ -36,6 +34,19 @@ class PackedHiddenExecution(PackedHiddenSnapshotSink, Protocol):
     def packed_hidden_resources(
         self,
     ) -> tuple[PackedHiddenResourceBinding, ...]: ...
+
+
+class PackedHiddenSpecialization(Protocol):
+    rows: int
+    hidden_size: int
+    dtype: torch.dtype
+    device: torch.device
+    max_prefill_tokens: int | None
+
+
+class PackedHiddenGraphMode(Protocol):
+    @property
+    def name(self) -> str: ...
 
 
 def _exact_module_path_tokens(path: str) -> tuple[str | int, ...]:
@@ -99,6 +110,162 @@ class _ActivePackedCapture:
     published: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _StagedPackedHidden:
+    row_batch: PackedPhaseRowBatch
+    hidden: torch.Tensor
+
+
+class _PackedHiddenSnapshotBuffer:
+    """Own exact ordinary snapshots without borrowing backend decode buffers."""
+
+    def __init__(
+        self, specialization: PackedHiddenSnapshotSpecialization
+    ) -> None:
+        self._specialization = specialization
+        self._row_batches: dict[int, PackedPhaseRowBatch] = {}
+        self._hidden: dict[
+            int,
+            dict[PackedHiddenResourceBinding, _StagedPackedHidden],
+        ] = {}
+        self._finished_high_watermark = -1
+        self._lock = RLock()
+
+    @property
+    def specialization(self) -> PackedHiddenSnapshotSpecialization:
+        return self._specialization
+
+    def stage(
+        self,
+        row_batch: PackedPhaseRowBatch,
+        resource: PackedHiddenResourceBinding,
+        layer_hidden: torch.Tensor,
+    ) -> None:
+        """Copy one exact packed layer tensor into service-owned storage."""
+
+        spec = self._specialization
+        with self._lock:
+            if row_batch.plan_epoch != spec.plan_epoch:
+                raise RuntimeError(
+                    "packed hidden batch belongs to another plan epoch"
+                )
+            if resource not in spec.resources:
+                raise RuntimeError(
+                    "packed hidden resource is absent from the specialization"
+                )
+            staged_batch = self._row_batches.get(row_batch.step_id)
+            if (
+                row_batch.step_id <= self._finished_high_watermark
+                and staged_batch is None
+            ):
+                raise RuntimeError("packed hidden step was already finished")
+            if row_batch.total_rows > spec.max_packed_rows:
+                raise RuntimeError(
+                    "packed hidden rows exceed the specialized capacity"
+                )
+            expected_shape = (row_batch.total_rows, spec.hidden_size)
+            if tuple(layer_hidden.shape) != expected_shape:
+                raise RuntimeError(
+                    "packed hidden tensor shape differs from the exact row batch"
+                )
+            if (
+                layer_hidden.dtype is not spec.dtype
+                or layer_hidden.device != spec.device
+            ):
+                raise RuntimeError(
+                    "packed hidden tensor differs from the specialized dtype or device"
+                )
+            if staged_batch is not None and staged_batch != row_batch:
+                raise RuntimeError(
+                    "packed hidden resources must use the same row batch"
+                )
+            canonical_batch = (
+                row_batch if staged_batch is None else staged_batch
+            )
+            staged_resources = self._hidden.setdefault(row_batch.step_id, {})
+            if resource in staged_resources:
+                raise RuntimeError("packed hidden resource is already staged")
+            with torch.inference_mode(False), torch.no_grad():
+                owned = layer_hidden.clone()
+            self._row_batches[row_batch.step_id] = canonical_batch
+            staged_resources[resource] = _StagedPackedHidden(
+                row_batch=canonical_batch,
+                hidden=owned,
+            )
+
+    def snapshot_for_step(
+        self, plan_epoch: int, step_id: int
+    ) -> PackedHiddenSnapshotBatch:
+        with self._lock:
+            row_batch, ordered = self._complete_step_locked(
+                plan_epoch, step_id
+            )
+            with torch.inference_mode(False), torch.no_grad():
+                snapshots = tuple(
+                    PackedHiddenSnapshot(resource, staged.hidden.clone())
+                    for resource, staged in zip(
+                        self._specialization.resources,
+                        ordered,
+                        strict=True,
+                    )
+                )
+            return PackedHiddenSnapshotBatch(
+                row_batch=row_batch,
+                snapshots=snapshots,
+            )
+
+    def _complete_step_locked(
+        self, plan_epoch: int, step_id: int
+    ) -> tuple[PackedPhaseRowBatch, tuple[_StagedPackedHidden, ...]]:
+        if plan_epoch != self._specialization.plan_epoch:
+            raise RuntimeError(
+                "packed hidden snapshot requested from another plan epoch"
+            )
+        try:
+            row_batch = self._row_batches[step_id]
+            staged_resources = self._hidden[step_id]
+        except KeyError as exc:
+            raise RuntimeError(
+                "packed hidden resources are not staged"
+            ) from exc
+        if set(staged_resources) != set(self._specialization.resources):
+            raise RuntimeError(
+                "not all signed packed hidden resources are staged"
+            )
+        ordered = tuple(
+            staged_resources[resource]
+            for resource in self._specialization.resources
+        )
+        if any(staged.row_batch != row_batch for staged in ordered):
+            raise RuntimeError("packed hidden resource provenance differs")
+        return row_batch, ordered
+
+    def finish_step(self, plan_epoch: int, step_id: int) -> None:
+        with self._lock:
+            self._complete_step_locked(plan_epoch, step_id)
+            del self._row_batches[step_id]
+            del self._hidden[step_id]
+            self._finished_high_watermark = max(
+                self._finished_high_watermark, step_id
+            )
+
+    def abort_step(self, plan_epoch: int, step_id: int) -> None:
+        """Retire a partial eager snapshot step without publishing a bundle."""
+
+        with self._lock:
+            if plan_epoch != self._specialization.plan_epoch:
+                raise RuntimeError(
+                    "packed hidden abort requested from another plan epoch"
+                )
+            if step_id not in self._row_batches:
+                raise RuntimeError("packed hidden step is not staged")
+            del self._row_batches[step_id]
+            del self._hidden[step_id]
+            self._finished_high_watermark = max(
+                self._finished_high_watermark, step_id
+            )
+
+
 def _require_eager() -> None:
     if torch.compiler.is_compiling():
         raise RuntimeError("packed hidden capture is eager-only")
@@ -129,7 +296,7 @@ class RunnerPackedHiddenCapture:
         *,
         model: torch.nn.Module,
         resources: tuple[PackedHiddenResourceBinding, ...],
-        specialization: RuntimeSpecializationSpec,
+        specialization: PackedHiddenSpecialization,
         plan_epoch: int,
     ) -> None:
         max_packed_rows = max(
@@ -141,7 +308,7 @@ class RunnerPackedHiddenCapture:
             ),
         )
         self._resources = resources
-        self._service = PackedHiddenSnapshotService(
+        self._service = _PackedHiddenSnapshotBuffer(
             PackedHiddenSnapshotSpecialization(
                 plan_epoch=plan_epoch,
                 max_packed_rows=max_packed_rows,
@@ -357,8 +524,8 @@ def begin_runner_packed_hidden_capture(
     binding: RunnerBinding | None,
     model: torch.nn.Module,
     execution: PackedHiddenExecution | None,
-    specialization: RuntimeSpecializationSpec,
-    graph_mode: GraphMode,
+    specialization: PackedHiddenSpecialization,
+    graph_mode: PackedHiddenGraphMode,
     row_batch: PackedPhaseRowBatch,
 ) -> None:
     """Install or refresh one runner-owned eager capture and open its step."""
@@ -369,7 +536,7 @@ def begin_runner_packed_hidden_capture(
         raise RuntimeError(
             "packed hidden execution requires a bound vLLM runner"
         )
-    if graph_mode is not GraphMode.EAGER:
+    if graph_mode.name != "EAGER":
         raise RuntimeError("packed hidden capture requires eager graph mode")
     resources = execution.packed_hidden_resources
     synchronize_runner_packed_hidden_capture(
