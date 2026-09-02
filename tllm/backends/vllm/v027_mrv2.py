@@ -119,12 +119,11 @@ def _wrapped_prepare_inputs(
 
     # InputBatch is the first point where all three scheduler columns are
     # available in MRv2. Rust classifies them before any lifecycle event is
-    # visible to a phase-filtered legacy target.
+    # advanced through native workload execution.
     packed_execution = runtime.workload_execution
     batch_phase = _scheduler_batch_phase.scheduler_batch_phase(
         columns=batch_columns
     )
-    hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
     _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
         binding=binding,
         execution=runtime.workload_execution,
@@ -180,11 +179,7 @@ def _wrapped_prepare_inputs(
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,
-        phase=hook_phase,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     spec_rows: tuple = ()
 
@@ -225,11 +220,7 @@ def _wrapped_prepare_inputs(
         )
         _common_hooks.dispatch_runtime_event(
             runtime=runtime,
-            runner=runner,
             event=BackendObservableEvent.PREPARE_INPUTS_POST,
-            phase=hook_phase,
-            layer_path=None,
-            capture_enabled=bool(runtime.launch_consumer_from_hooks),
         )
         _model_region.stage_signed_backend_region_event(
             event=BackendObservableEvent.EXECUTE_MODEL_PRE,
@@ -240,11 +231,7 @@ def _wrapped_prepare_inputs(
         )
         _common_hooks.dispatch_runtime_event(
             runtime=runtime,
-            runner=runner,
             event=BackendObservableEvent.EXECUTE_MODEL_PRE,
-            phase=hook_phase,
-            layer_path=None,
-            capture_enabled=bool(runtime.launch_consumer_from_hooks),
         )
     return input_batch
 
@@ -343,11 +330,7 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.EXECUTE_MODEL_POST,
-        phase=_scheduler_batch_phase.session_hook_phase(session),
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     return out
 
@@ -359,7 +342,6 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     session = get_step_session(runner)
     if session is not None and session.state is StepState.BACKEND_WARMUP:
         return orig(runner, grammar_output)
-    hook_phase = _scheduler_batch_phase.session_hook_phase(session)
     _model_region.stage_signed_backend_region_event(
         event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
         runtime=runtime,
@@ -368,11 +350,7 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
-        phase=hook_phase,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     if session is not None and session.state == StepState.FORWARD_DONE:
         session.transition(StepState.SAMPLING)
@@ -392,11 +370,7 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.SAMPLE_TOKENS_POST,
-        phase=hook_phase,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     return out
 
@@ -408,25 +382,9 @@ def _wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict, or
         out = orig(runner, *args, **kwargs)
         _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
         return out
-    _common_hooks.dispatch_legacy_runtime_event(
-        runtime=runtime,
-        runner=runner,
-        event_name="load_model.pre",
-        phase=None,
-        layer_path=None,
-        capture_enabled=False,
-    )
     out = orig(runner, *args, **kwargs)
     _sampler_mrv2.bind_runner_sampler_mrv2(runtime=runtime, runner=runner)
     _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
-    _common_hooks.dispatch_legacy_runtime_event(
-        runtime=runtime,
-        runner=runner,
-        event_name="load_model.post",
-        phase=None,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
-    )
     return out
 
 

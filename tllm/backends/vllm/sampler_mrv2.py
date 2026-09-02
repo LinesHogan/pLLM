@@ -504,8 +504,6 @@ def make_mrv2_sample_wrapper(*, sampler: Any, runtime: Any, runner: Any, orig_sa
         # sampler.pre_draw (mirrors sample_with_optional_modifier).
         dispatch_sampler_pre_draw(
             runtime=runtime,
-            runner=runner,
-            device=logits.device,
         )
         state = provider.prepare_step(view) if view is not None else None
         if _trace:

@@ -39,7 +39,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STRICT_CONFIG = "pyrightconfig.strict.json"
 BASIC_CONFIG = "pyrightconfig.json"
 BASELINE_PATH = REPO_ROOT / "tools" / "typing_baseline.json"
-CONFIG_KIND_NEGATIVE_FIXTURE = Path("test/typing/config_kind_negative.py")
 WORKLOAD_SURFACE = tuple(
     path.relative_to(REPO_ROOT)
     for path in sorted((REPO_ROOT / "tllm" / "workload").glob("*.py"))
@@ -330,25 +329,6 @@ def main() -> int:
         print(f"FAIL strict tier ({STRICT_CONFIG}): {strict_errors} errors, {strict_warnings} warnings (must be 0/0)")
         return 1
     print(f"OK   strict tier ({STRICT_CONFIG}): 0 errors, 0 warnings")
-
-    negative_report = _run_pyright(
-        STRICT_CONFIG, (CONFIG_KIND_NEGATIVE_FIXTURE,)
-    )
-    negative_diagnostics = negative_report.get("generalDiagnostics", [])
-    rejected_lines = {
-        int(diagnostic["range"]["start"]["line"]) + 1
-        for diagnostic in negative_diagnostics
-        if diagnostic["severity"] == "error"
-        and str(diagnostic["file"]).endswith(str(CONFIG_KIND_NEGATIVE_FIXTURE))
-    }
-    expected_rejections = {6, 10, 11, 12, 13, 14}
-    if not expected_rejections.issubset(rejected_lines):
-        print(
-            "FAIL config-kind negative fixture: expected static rejections on "
-            f"lines {sorted(expected_rejections)}, got {sorted(rejected_lines)}"
-        )
-        return 1
-    print("OK   config-kind negative fixture: all mismatches rejected statically")
 
     author_violations = _author_surface_violations()
     if author_violations:

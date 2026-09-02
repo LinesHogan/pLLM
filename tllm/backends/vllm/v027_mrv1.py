@@ -239,7 +239,6 @@ def _wrapped_prepare_inputs(
             columns=batch_columns,
         )
     batch_phase = _scheduler_batch_phase.scheduler_batch_phase(columns=batch_columns)
-    hook_phase = _scheduler_batch_phase.hook_phase(batch_phase)
 
     from tllm.runtime import residual_runtime as _residual_runtime
 
@@ -284,11 +283,7 @@ def _wrapped_prepare_inputs(
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,
-        phase=hook_phase,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     model_hook_flag = getattr(core, "MODEL_HOOK_FLAG", "_tllm_residual_hooks_installed")
     if getattr(getattr(runner, "model", None), model_hook_flag, False):
@@ -343,11 +338,7 @@ def _wrapped_prepare_inputs(
         )
         _common_hooks.dispatch_runtime_event(
             runtime=runtime,
-            runner=runner,
             event=BackendObservableEvent.PREPARE_INPUTS_POST,
-            phase=hook_phase,
-            layer_path=None,
-            capture_enabled=bool(runtime.launch_consumer_from_hooks),
         )
         # MRv1 constructs inputs from inside its original execute_model.
         # The Rust-signed phase therefore only exists here, before the model
@@ -361,11 +352,7 @@ def _wrapped_prepare_inputs(
         )
         _common_hooks.dispatch_runtime_event(
             runtime=runtime,
-            runner=runner,
             event=BackendObservableEvent.EXECUTE_MODEL_PRE,
-            phase=hook_phase,
-            layer_path=None,
-            capture_enabled=bool(runtime.launch_consumer_from_hooks),
         )
     except Exception:
         _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
@@ -378,7 +365,6 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     if not active_targets.runtime_has_active_targets(runtime):
         return orig(runner, grammar_output)
     session = get_step_session(runner)
-    hook_phase = _scheduler_batch_phase.session_hook_phase(session)
     _model_region.stage_signed_backend_region_event(
         event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
         runtime=runtime,
@@ -387,11 +373,7 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
-        phase=hook_phase,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     if session is not None and session.state in (StepState.INPUTS_READY, StepState.FORWARD_DONE):
         if session.state == StepState.INPUTS_READY:
@@ -419,11 +401,7 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.SAMPLE_TOKENS_POST,
-        phase=hook_phase,
-        layer_path=None,
-        capture_enabled=bool(runtime.launch_consumer_from_hooks),
     )
     return out
 
@@ -612,11 +590,8 @@ class V027MRv1Driver:
                 # borrowing its phase.
                 set_step_session(runner, None)
 
-            def _phase_after_nested_prepare() -> str | None:
-                session = get_step_session(runner)
-                if session is None:
-                    return None
-                return _scheduler_batch_phase.session_hook_phase(session)
+            def _nested_prepare_created_step() -> bool:
+                return get_step_session(runner) is not None
 
             def _stage_event(event: BackendObservableEvent) -> None:
                 session = get_step_session(runner)
@@ -649,11 +624,10 @@ class V027MRv1Driver:
                     args=args,
                     kwargs=kwargs,
                     split_execute_and_sample=True,
-                    phase=None,
                     before_runtime_event=_stage_event,
                     execute_pre_already_dispatched=active,
-                    phase_after_inputs=(
-                        _phase_after_nested_prepare if active else None
+                    has_nested_prepare_step=(
+                        _nested_prepare_created_step if active else None
                     ),
                     after_model_forward=_stage_forward_captures,
                 )

@@ -739,25 +739,9 @@ def wrapped_load_model(*, core: Any, runner: Any, args: tuple, kwargs: dict) -> 
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
         return out
-    _common_hooks.dispatch_legacy_runtime_event(
-        runtime=core.RUNTIME,
-        runner=runner,
-        event_name="load_model.pre",
-        phase=None,
-        layer_path=None,
-        capture_enabled=False,
-    )
     out = core._ORIG_LOAD_MODEL(runner, *args, **kwargs)
     _sampler_patch.bind_runner_sampler(runtime=core.RUNTIME, runner=runner)
     setup_runtime_hooks_if_active(core=core, runner=runner)
-    _common_hooks.dispatch_legacy_runtime_event(
-        runtime=core.RUNTIME,
-        runner=runner,
-        event_name="load_model.post",
-        phase=None,
-        layer_path=None,
-        capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
-    )
     return out
 
 
@@ -776,11 +760,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         )
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
-        runner=runner,
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,
-        phase="decode",
-        layer_path=None,
-        capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
     )
     model_hook_flag = getattr(core, "MODEL_HOOK_FLAG", "_tllm_residual_hooks_installed")
     if getattr(getattr(runner, "model", None), model_hook_flag, False):
@@ -817,11 +797,7 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
         record_path_hotspot_cpu(core, "prepare_inputs.sampler_prepare_cpu", t3, t4)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
-            runner=runner,
             event=BackendObservableEvent.PREPARE_INPUTS_POST,
-            phase="decode",
-            layer_path=None,
-            capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )
     else:
         _clear_decode_localization(core)
@@ -836,10 +812,9 @@ def wrapped_execute_model(
     args: tuple,
     kwargs: dict,
     split_execute_and_sample: bool = False,
-    phase: str | None = "decode",
     before_runtime_event: Callable[[BackendObservableEvent], None] | None = None,
     execute_pre_already_dispatched: bool = False,
-    phase_after_inputs: Callable[[], str | None] | None = None,
+    has_nested_prepare_step: Callable[[], bool] | None = None,
     after_model_forward: Callable[[], None] | None = None,
 ) -> Any:
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
@@ -849,11 +824,7 @@ def wrapped_execute_model(
             before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_PRE)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
-            runner=runner,
             event=BackendObservableEvent.EXECUTE_MODEL_PRE,
-            phase=phase,
-            layer_path=None,
-            capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )
     model_hook_flag = getattr(core, "MODEL_HOOK_FLAG", "_tllm_residual_hooks_installed")
     if getattr(getattr(runner, "model", None), model_hook_flag, False):
@@ -865,12 +836,11 @@ def wrapped_execute_model(
     out = core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
     t1 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.forward_cpu", t0, t1)
-    if phase_after_inputs is not None:
-        phase = phase_after_inputs()
+    if has_nested_prepare_step is not None:
         # MRv1's original execute_model can return before its nested
         # _prepare_inputs call for an empty scheduler batch. There is then no
         # signed logical step and consequently no post-execute work to emit.
-        if phase is None:
+        if not has_nested_prepare_step():
             return out
     if after_model_forward is not None:
         after_model_forward()
@@ -891,22 +861,14 @@ def wrapped_execute_model(
         before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_POST)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
-        runner=runner,
         event=BackendObservableEvent.EXECUTE_MODEL_POST,
-        phase=phase,
-        layer_path=None,
-        capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
     )
     if not split_execute_and_sample:
         if before_runtime_event is not None:
             before_runtime_event(BackendObservableEvent.SAMPLE_TOKENS_POST)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
-            runner=runner,
             event=BackendObservableEvent.SAMPLE_TOKENS_POST,
-            phase=phase,
-            layer_path=None,
-            capture_enabled=bool(core.RUNTIME.launch_consumer_from_hooks),
         )
     return out
 

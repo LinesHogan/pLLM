@@ -82,26 +82,13 @@ def runtime_has_active_sampler_provider(runtime: Any) -> bool:
 def dispatch_sampler_pre_draw(
     *,
     runtime: Any,
-    runner: Any,
-    device: torch.device,
 ) -> None:
-    """Publish the sampler parameter-read fence, then drain placed side work."""
-    predecessor_events: tuple[object, ...] = ()
-    if device.type == "cuda" and torch.cuda.is_available():
-        stream = torch.cuda.current_stream(device=device)
-        parameter_read_done = torch.cuda.Event(blocking=False)
-        parameter_read_done.record(stream)
-        predecessor_events = (parameter_read_done,)
+    """Advance the signed sampler pre-draw event."""
     from tllm.runtime.vllm_patch import common_hooks as _common_hooks
 
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
-        runner=runner,
         event=BackendObservableEvent.SAMPLER_PRE_DRAW,
-        phase="decode",
-        layer_path=None,
-        capture_enabled=bool(getattr(runtime, "launch_consumer_from_hooks", False)),
-        predecessor_events=predecessor_events,
     )
 
 
@@ -184,8 +171,6 @@ def wrapped_sampler_sample(*, sampler: Any, logits: torch.Tensor, sampling_metad
         greedy_sampled=greedy_sampled,
         before_draw=lambda: dispatch_sampler_pre_draw(
             runtime=runtime,
-            runner=runner,
-            device=logits_for_sampling.device,
         ),
     )
     if sampled is not None:

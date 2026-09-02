@@ -142,8 +142,6 @@ def wrapped_sampler_sample_v027(
         if raw_view is not None:
             dispatch_sampler_pre_draw(
                 runtime=runtime,
-                runner=runner,
-                device=logits.device,
             )
             prepared_state = provider.prepare_step(raw_view)
         if prepared_state is not None:
@@ -196,8 +194,6 @@ def wrapped_sampler_sample_v027(
         greedy_sampled=greedy_sampled,
         before_draw=lambda: dispatch_sampler_pre_draw(
             runtime=runtime,
-            runner=runner,
-            device=logits.device,
         ),
     )
 
