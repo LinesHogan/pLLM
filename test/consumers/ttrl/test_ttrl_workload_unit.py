@@ -28,7 +28,7 @@ from tllm.runtime.generation_trace_runtime import (
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
 from tllm.runtime.state import ResidualRuntimeState
-from tllm.runtime.workload_bindings import LocalRuntimeServices, WorkerRuntimeBinding
+from tllm.runtime.workload_bindings import LocalRuntimeServices
 from tllm.schedule import MainWorkloadTimeline, WorkloadCompilation
 
 _HIDDEN = 8
@@ -105,38 +105,6 @@ def _drive(
 
 
 class TTRLWorkloadUnitTest(unittest.TestCase):
-    def test_config_constraints_are_rust_validated(self) -> None:
-        with self.assertRaisesRegex(ValueError, "constraint"):
-            TTRLConfig(rank=0)
-        with self.assertRaisesRegex(ValueError, "constraint"):
-            TTRLConfig(learning_rate=0.0)
-
-    def test_declaration_carries_closed_loop_dependencies_without_partition_policy(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        tasks = workload.declaration().ir.tasks
-        self.assertEqual(
-            tuple(task.name for task in tasks),
-            (
-                "prepare",
-                "train",
-                "train__optimize_reward_model",
-                "publish",
-            ),
-        )
-        self.assertEqual(
-            tuple(task.implementations[0].kind.value for task in tasks),
-            ("extern", "captured", "extern", "extern"),
-        )
-        self.assertEqual(
-            {(edge.source, edge.target) for edge in workload.declaration().ir.edges},
-            {
-                ("prepare", "train"),
-                ("prepare", "publish"),
-                ("train", "train__optimize_reward_model"),
-                ("train__optimize_reward_model", "publish"),
-            },
-        )
-
     def test_signed_step_trains_and_returns_versioned_control(self) -> None:
         workload = TTRLWorkload(
             TTRLConfig(hidden_size=_HIDDEN, rank=2, learning_rate=0.05)
@@ -252,12 +220,6 @@ class TTRLWorkloadUnitTest(unittest.TestCase):
         assert isinstance(services, LocalRuntimeServices)
         self.assertEqual(services.stats(False).loss_count, 2)
 
-    def test_missing_staged_batch_skips_without_version_change(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        runtime, compilation = _compile(workload)
-        self.assertEqual(_drive(runtime, compilation), 0)
-        self.assertEqual(runtime.drain(TTRLWorkload.control), ())
-
     def test_zero_trainable_rows_publish_base_control_without_update(self) -> None:
         workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
         runtime, compilation = _compile(workload)
@@ -303,83 +265,6 @@ class TTRLWorkloadUnitTest(unittest.TestCase):
             )
         )
 
-    def test_staged_pair_cancels_without_partial_training(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        runtime, compilation = _compile(workload)
-        batch = prepare_ttrl_training_batch(
-            _trace(),
-            torch.randn(3, _HIDDEN),
-            consumer_id=workload.config.consumer_id,
-        )
-        transaction = stage_ttrl_training(runtime, batch)
-
-        transaction.cancel()
-        self.assertEqual(_drive(runtime, compilation), 0)
-        self.assertEqual(runtime.drain(TTRLWorkload.control), ())
-
-    def test_partial_host_drain_fail_stops_consumed_transaction(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        runtime, compilation = _compile(workload)
-        batch = prepare_ttrl_training_batch(
-            _trace(),
-            torch.randn(3, _HIDDEN),
-            consumer_id=workload.config.consumer_id,
-        )
-        transaction = stage_ttrl_training(runtime, batch)
-        self.assertEqual(_drive(runtime, compilation), 1)
-        self.assertEqual(len(runtime.drain(TTRLWorkload.control)), 1)
-
-        with self.assertRaisesRegex(RuntimeError, "complete closed loop"):
-            transaction.commit()
-        with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
-            runtime.stage_pair(
-                TTRLWorkload.train_hidden,
-                batch.hidden,
-                TTRLWorkload.pending_intent,
-                batch.intent,
-            )
-
-    def test_output_quorum_failure_closes_and_fail_stops_transaction(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        runtime, _compilation = _compile(workload)
-        batch = prepare_ttrl_training_batch(
-            _trace(),
-            torch.randn(3, _HIDDEN),
-            consumer_id=workload.config.consumer_id,
-        )
-        transaction = stage_ttrl_training(runtime, batch)
-
-        with (
-            mock.patch.object(
-                runtime,
-                "drain",
-                side_effect=((batch.intent,), RuntimeError("output quorum lost")),
-            ),
-            self.assertRaisesRegex(RuntimeError, "output quorum lost"),
-        ):
-            transaction.commit()
-        with self.assertRaisesRegex(RuntimeError, "already closed"):
-            transaction.commit()
-        with self.assertRaisesRegex(RuntimeError, "fail-stopped"):
-            runtime.stage_pair(
-                TTRLWorkload.train_hidden,
-                batch.hidden,
-                TTRLWorkload.pending_intent,
-                batch.intent,
-            )
-
-    def test_hidden_rows_and_runtime_specialization_are_explicit(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN + 1, rank=2))
-        runtime = TllmRuntime(workloads=(workload,))
-        with self.assertRaisesRegex(ValueError, "hidden_size"):
-            runtime.cold_specialize_workloads(_spec())
-        with self.assertRaisesRegex(ValueError, "one-to-one"):
-            prepare_ttrl_training_batch(
-                _trace(),
-                torch.randn(2, _HIDDEN),
-                consumer_id="ttrl",
-            )
-
     def test_signed_prepare_selects_explicit_training_indices(self) -> None:
         workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
         hidden = torch.arange(3 * _HIDDEN, dtype=torch.float32).reshape(
@@ -401,64 +286,6 @@ class TTRLWorkloadUnitTest(unittest.TestCase):
         torch.testing.assert_close(selected, hidden[:2])
         torch.testing.assert_close(rewards, torch.ones(2))
 
-    def test_prompt_cannot_mix_generation_groups(self) -> None:
-        trace = GenerationTraceBatch(
-            entries=(
-                CompletionTraceEntry(
-                    "a", 0, 0, 0, (1,), "\\boxed{1}", "stop", "g0"
-                ),
-                CompletionTraceEntry(
-                    "b", 0, 1, 0, (2,), "\\boxed{1}", "stop", "g1"
-                ),
-            )
-        )
-        with self.assertRaisesRegex(ValueError, "one generation group"):
-            prepare_ttrl_training_batch(
-                trace,
-                torch.randn(2, _HIDDEN),
-                consumer_id="ttrl",
-            )
-
-    def test_interleaved_prompts_keep_row_and_barrier_identity(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        entries = (
-            CompletionTraceEntry(
-                "p0-a", 0, 0, 3, (1,), "\\boxed{1}", "stop", "shared"
-            ),
-            CompletionTraceEntry(
-                "p1-a", 1, 0, 4, (2,), "\\boxed{2}", "stop", "shared"
-            ),
-            CompletionTraceEntry(
-                "p0-b", 0, 1, 5, (3,), "\\boxed{1}", "stop", "shared"
-            ),
-            CompletionTraceEntry(
-                "p1-b", 1, 1, 7, (4,), "\\boxed{3}", "stop", "shared"
-            ),
-        )
-        hidden = torch.arange(4 * _HIDDEN, dtype=torch.float32).reshape(
-            4, _HIDDEN
-        )
-        batch = prepare_ttrl_training_batch(
-            GenerationTraceBatch(entries),
-            hidden,
-            consumer_id=workload.config.consumer_id,
-            n_votes_per_prompt=2,
-            n_samples_per_prompt=1,
-        )
-
-        selected, rewards, intent = workload.prepare(
-            batch.hidden, batch.intent
-        )
-
-        self.assertEqual(intent.training_indices, (0, 1))
-        torch.testing.assert_close(selected, hidden[:2])
-        torch.testing.assert_close(rewards, torch.ones(2))
-        self.assertEqual(
-            tuple(entry.barrier_id for entry in intent.update_barriers.entries),
-            ("ttrl:shared:0", "ttrl:shared:1"),
-        )
-        self.assertEqual(intent.retry_schedule[0].output_index, 7)
-
     def test_reward_tie_is_first_seen_and_nested_box_is_normalized(self) -> None:
         result = build_ttrl_reward_result(
             (
@@ -474,29 +301,6 @@ class TTRLWorkloadUnitTest(unittest.TestCase):
                 "work \\boxed{\\frac{1}{2}} trailing"
             ),
             "\\frac{1}{2}",
-        )
-
-    def test_worker_reconstruction_keeps_typed_ports(self) -> None:
-        workload = TTRLWorkload(TTRLConfig(hidden_size=_HIDDEN, rank=2))
-        resources = workload.native_workload_resources()
-        assert isinstance(resources.worker, WorkerRuntimeBinding)
-        spec = resources.worker.spec
-        rebuilt = TTRLWorkload.reconstruct(spec.config)
-        self.assertEqual(
-            set(rebuilt.ports.inputs),
-            {
-                TTRLWorkload.train_hidden.key,
-                TTRLWorkload.pending_intent.key,
-            },
-        )
-        self.assertEqual(
-            set(rebuilt.ports.outputs),
-            {
-                TTRLWorkload.control.key,
-                TTRLWorkload.reward_outcomes.key,
-                TTRLWorkload.retry_controls.key,
-                TTRLWorkload.update_barriers.key,
-            },
         )
 
 

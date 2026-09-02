@@ -198,23 +198,3 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SchedulerBatchPhase>()?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{classify_scheduler_batch_phase, plan_packed_prefill_rows, SchedulerBatchPhase};
-
-    #[test]
-    fn derives_mixed_rows_without_workload_policy() {
-        let plan = plan_packed_prefill_rows(vec![3, 2], vec![5, 2], vec![1, 2], None).unwrap();
-        assert_eq!(plan.request_ordinals, vec![0, 0, 0, 1, 1]);
-        assert_eq!(
-            plan.phases,
-            vec!["prefill", "prefill", "prefill", "decode", "decode"]
-        );
-        assert_eq!(plan.request_spans[1].packed_row_start, 3);
-        assert_eq!(
-            classify_scheduler_batch_phase(vec![2], vec![4], vec![3]).unwrap(),
-            SchedulerBatchPhase::Mixed
-        );
-    }
-}

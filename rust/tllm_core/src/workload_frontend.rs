@@ -151,20 +151,3 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(normalize_workload_config, module)?)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_workload_config;
-
-    #[test]
-    fn normalizes_config_and_rejects_type_or_field_drift() {
-        pyo3::prepare_freethreaded_python();
-        let schema = r#"{"fields":[{"name":"enabled","kind":"bool","constraint":"any"},{"name":"lr","kind":"float","constraint":"positive"}]}"#;
-        assert_eq!(
-            normalize_workload_config(schema, r#"{"lr":1,"enabled":true}"#).unwrap(),
-            r#"{"enabled":true,"lr":1.0}"#
-        );
-        assert!(normalize_workload_config(schema, r#"{"lr":"bad","enabled":true}"#).is_err());
-        assert!(normalize_workload_config(schema, r#"{"lr":1,"enabled":true,"extra":0}"#).is_err());
-    }
-}

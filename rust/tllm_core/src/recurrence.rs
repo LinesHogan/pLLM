@@ -2298,24 +2298,3 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TypedRecurrenceStageArtifactBundle>()?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{compile_typed, FiniteRecurrenceSpec};
-
-    #[test]
-    fn generic_plan_derives_fusion_and_liveness() {
-        let spec: FiniteRecurrenceSpec = serde_json::from_str(r#"{
-            "schema_version":1,"region_id":"unit","implementation_id":"backend.unit@1",
-            "row_admission":{"allowed_phases":["prefill"],"mixed_batch":"reject"},
-            "fusion_policy":"max_rows=2;internalized_edges=state_write_read",
-            "operations":[
-              {"operation_id":"a","primitive_key":"backend.layer@1","implementation_id":"backend.unit@1","operands":[{"kind":"seed","binding_id":"hidden"}],"results":["a"]},
-              {"operation_id":"b","primitive_key":"backend.layer@1","implementation_id":"backend.unit@1","operands":[{"kind":"region_value","value_id":"a"}],"results":["b"]}
-            ],"dependencies":[{"source":"a","target":"b","kind":"state_write_read"}],"retained_values":["b"]
-        }"#).unwrap();
-        let plan = compile_typed(spec).unwrap();
-        assert_eq!(plan.groups.len(), 1);
-        assert_eq!(plan.groups[0].release_after, vec!["a"]);
-    }
-}

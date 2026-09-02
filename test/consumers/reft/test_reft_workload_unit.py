@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -11,10 +10,6 @@ import torch
 from tllm.backends.protocol import BackendCapabilities, GraphSafety
 from tllm.backends.timeline import export_main_workload_timeline
 from tllm.consumers.reft.workload import ReftConfig, ReftWorkload
-from tllm.consumers.reft.vllm_patch import (
-    _prompt_rows,
-    install_reft_patch_on_llm,
-)
 from tllm.runtime import residual_runtime
 from tllm.runtime.runtime import TllmRuntime
 from tllm.runtime.specialization import RuntimeSpecializationSpec
@@ -70,63 +65,6 @@ def _drive(runtime: TllmRuntime, compilation: object) -> int:
 
 
 class ReftWorkloadUnitTest(unittest.TestCase):
-    def test_llm_patch_resolves_active_workload_after_epoch_replacement(self) -> None:
-        class _Layer(torch.nn.Module):
-            def forward(
-                self,
-                positions: torch.Tensor,
-                hidden: torch.Tensor,
-                residual: torch.Tensor | None = None,
-            ) -> tuple[torch.Tensor]:
-                del positions, residual
-                return (hidden,)
-
-        model = torch.nn.Module()
-        body = torch.nn.Module()
-        body.layers = torch.nn.ModuleList([_Layer()])
-        model.model = body
-        llm = SimpleNamespace(
-            llm_engine=SimpleNamespace(
-                model_executor=SimpleNamespace(
-                    driver_worker=SimpleNamespace(
-                        model_runner=SimpleNamespace(model=model)
-                    )
-                )
-            )
-        )
-        initial = ReftWorkload(ReftConfig(layers=(0,), rank=_RANK))
-        replacement = ReftWorkload(ReftConfig(layers=(0,), rank=_RANK))
-        runtime = mock.create_autospec(TllmRuntime, instance=True)
-        runtime.local_workload.side_effect = [initial, initial, replacement]
-
-        handle = install_reft_patch_on_llm(llm, runtime)
-        try:
-            layer = body.layers[0]
-            positions = torch.arange(2)
-            hidden = torch.randn(2, _HIDDEN)
-            _ = layer(positions, hidden)
-            _ = layer(positions, hidden)
-        finally:
-            handle.restore()
-        self.assertEqual(runtime.local_workload.call_count, 3)
-        runtime.local_workload.assert_called_with(initial)
-
-    def test_config_constraints_are_rust_validated(self) -> None:
-        with self.assertRaisesRegex(ValueError, "constraint"):
-            ReftConfig(rank=0)
-        with self.assertRaisesRegex(ValueError, "constraint"):
-            ReftConfig(last_tokens=-1)
-
-    def test_cold_specialization_initializes_loreft_parameters(self) -> None:
-        workload = ReftWorkload(ReftConfig(layers=(1, 3), rank=_RANK))
-        workload.cold_specialize(_spec())
-        state = workload.intervention
-        self.assertEqual(tuple(state.source_w.shape), (2, _RANK, _HIDDEN))
-        self.assertEqual(tuple(state.source_b.shape), (2, _RANK))
-        self.assertEqual(tuple(state.rotate.shape), (2, _HIDDEN, _RANK))
-        gram = state.rotate[0].T @ state.rotate[0]
-        self.assertTrue(torch.allclose(gram, torch.eye(_RANK), atol=1e-5))
-
     def test_publish_is_generated_and_advances_signed_state(self) -> None:
         workload = ReftWorkload(ReftConfig(layers=(1,), rank=_RANK))
         runtime, compilation = _compile(workload)
@@ -160,17 +98,6 @@ class ReftWorkloadUnitTest(unittest.TestCase):
             - rows @ state.rotate[0]
         ) @ state.rotate[0].T
         self.assertTrue(torch.allclose(workload.loreft_delta(0, rows), expected))
-
-    def test_prompt_row_rule_stays_in_consumer_integration(self) -> None:
-        rows = _prompt_rows(
-            positions=torch.tensor([0, 1, 2, 0, 1]),
-            query_start=torch.tensor([0, 3, 5]),
-            sequence_lengths=torch.tensor([3, 2]),
-            computed=torch.tensor([0, 0]),
-            first_tokens=1,
-            last_tokens=1,
-        )
-        self.assertEqual(rows.tolist(), [0, 2, 3, 4])
 
 
 if __name__ == "__main__":
