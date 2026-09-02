@@ -198,7 +198,7 @@ examples and typing configs.  Under `SOURCE_LOC`, this checkpoint is
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
-| A — ledger and survivor extraction | 0 | 2,827 | 0 | -2,827 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
+| A — ledger and survivor extraction | 1 | 4,609 | 0 | -4,608 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
