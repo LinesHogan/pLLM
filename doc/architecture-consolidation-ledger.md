@@ -18,10 +18,11 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 ## Current checkpoint
 
-| Fact | Value | Cumulative change from `12551b8` | Change in FTTT cutover |
+| Fact | Value | Cumulative change from `12551b8` | Change since FTTT checkpoint |
 | --- | ---: | ---: | ---: |
-| Production/support source | 131,973 lines | -1,237 lines | -912 lines |
-| Pytest collection | 1,333 items | -16 items | -16 items |
+| Commit | `a822028` | — | after `753bdfd` |
+| Production/support source | 126,767 lines | -6,443 lines | -5,206 lines |
+| Pytest collection | 1,325 items | -24 items | -8 items |
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
@@ -31,12 +32,19 @@ and 38 remain as the canonical CPU and CUDA survivors. Documentation and JSON
 config changes are excluded from `SOURCE_LOC` and are not used to offset these
 deletions.
 
+The canonical vertical-compression checkpoint now includes `753bdfd`
+(`+3,868 / -8,972 / net -5,104` under `SOURCE_LOC`) and `a822028`
+(`+296 / -398 / net -102`) on top of the previous Tranche B ledger entry
+(`+249 / -574 / net -325`).  Current `SOURCE_LOC` was recalculated at
+`a822028` with the transparent command from the plan and matches the cumulative
+delta: `133,210 - 6,443 = 126,767`.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
 | A — ledger and survivor extraction | — | — | — | — | active |
-| B — canonical vertical compression | 249 | 574 | 0 | -325 | active |
+| B — canonical vertical compression | 4,413 | 9,944 | 0 | -5,531 | active: canonical runtime attachments and ESamp task merge |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | — | — | — | — | pending |
 | E — legacy authority removal | — | — | — | — | pending |
