@@ -27,6 +27,15 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
 | Visible `TEST_COUNT` | 8 items | now below the 50-item ceiling | -10 items |
 
+The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
+currently executable survivor base after old-stack tests were deleted:
+evidence IDs 1, 3, 5, 13, 30, 32, 37 and 38.  The manifest now records
+31 pending survivor evidence items.  Those pending items are implementation
+debt tied to their cutover tranche; they must become compact observable
+oracles or public runtime smokes before the corresponding canonical boundary
+is claimed complete, and must not be recreated as legacy wrapper,
+class-hierarchy, registry or mock-call-count tests.
+
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
 from static gates, for `+0 / -912 / net -912` under `SOURCE_LOC`. It also
