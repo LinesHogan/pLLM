@@ -20,8 +20,8 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `76a0cf9` | — | after `e03816d` |
-| Counted production/support source | 82,591 lines | -50,619 lines | -8,735 lines |
+| Commit | `ed1c487` | — | after `e03816d` |
+| Counted production/support source | 82,143 lines | -51,067 lines | -9,183 lines |
 | Pytest collection | 1 item | -1,348 items | -10 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -212,6 +212,16 @@ tracks 16 live production files instead of missing retired files.  Basic typing
 baseline is rebased to 108 errors.  Under `SOURCE_LOC`, this checkpoint is
 `+7 / -170 / net -163`; `SOURCE_LOC` is now 82,591.
 
+The public workload facade retirement in `ed1c487` removed the lazy top-level
+`TllmRuntime`/`default_runtime` export, closed the legacy
+`make_llm(workloads=...)` branch to non-canonical workloads, deleted the
+`tllm.workload` and `tllm.schedule` root re-export catalogs, and removed
+vLLM/MP fail-stop hooks whose only consumer was the retired native workload
+coordinator.  Remaining old workload/schedule references are direct owner
+module imports from the still-live legacy runtime execution island, not root
+facades.  Under `SOURCE_LOC`, this checkpoint is `+31 / -479 / net -448`;
+`SOURCE_LOC` is now 82,143.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -220,7 +230,7 @@ baseline is rebased to 108 errors.  Under `SOURCE_LOC`, this checkpoint is
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 364 | 40,568 | 988 | -40,204 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
+| E — legacy authority removal | 395 | 41,047 | 988 | -40,652 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
