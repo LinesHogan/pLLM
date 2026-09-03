@@ -36,8 +36,6 @@ from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.backends.vllm import runner_adapter as _runner_adapter
-from tllm.backends.vllm import model_region as _model_region
-from tllm.backends.vllm import packed_hidden_capture as _packed_hidden_capture
 from tllm.backends.vllm import scheduler_batch_phase as _scheduler_batch_phase
 from tllm.backends.vllm import versioned_parameter_overlay as _parameter_overlay
 from tllm.backends.vllm import sampler_mrv1 as _sampler_mrv1
@@ -223,13 +221,6 @@ def _wrapped_prepare_inputs(
         num_scheduled_tokens=num_scheduled_tokens,
         input_batch=None,
     )
-    packed_execution = None
-    if (
-        packed_execution is not None
-        and packed_execution.requires_packed_rows
-        and _runner_adapter.is_v027_warmup_packed_rows(batch_columns)
-    ):
-        return orig(runner, scheduler_output, num_scheduled_tokens)
     if (
         overlay_controller is not None
         and overlay_controller.requires_dense_step()
@@ -248,39 +239,6 @@ def _wrapped_prepare_inputs(
             # Prepare that next step before its PREPARE lifecycle event.
             int(runtime.event_step_id) + 1
         )
-    _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
-        binding=binding,
-        execution=None,
-    )
-    packed_rows = _scheduler_batch_phase.stage_prepared_packed_rows(
-        execution=None,
-        step_id=int(runtime.event_step_id) + 1,
-        columns=batch_columns,
-        prompt_indices=runtime.reqid_to_promptidx,
-        sample_indices=runtime.reqid_to_sampleidx,
-    )
-    if (
-        packed_rows is not None
-        and packed_execution is not None
-        and packed_execution.requires_packed_hidden
-    ):
-        from tllm.runtime.graph_policy import resolve_graph_mode
-
-        _packed_hidden_capture.begin_runner_packed_hidden_capture(
-            binding=binding,
-            model=runner_model_module(runner),
-            execution=packed_execution,
-            specialization=_runner_adapter.runner_runtime_specialization(runner),
-            graph_mode=resolve_graph_mode(runner),
-            row_batch=packed_rows,
-        )
-    _model_region.stage_signed_backend_region_event(
-        event=BackendObservableEvent.PREPARE_INPUTS_PRE,
-        runtime=runtime,
-        runner=runner,
-        num_scheduled_tokens=num_scheduled_tokens,
-        step_id=runtime.event_step_id + 1,
-    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,
@@ -298,17 +256,6 @@ def _wrapped_prepare_inputs(
         out=out,
         num_scheduled_tokens=num_scheduled_tokens,
     )
-    if (
-        packed_rows is not None
-        and packed_execution is not None
-        and packed_execution.requires_packed_sampler_rows
-    ):
-        packed_execution.stage_packed_sampler_rows(
-            _runner_adapter.mrv1_packed_sampler_row_batch(
-                row_batch=packed_rows,
-                logits_indices=view.logits_indices,
-            )
-        )
     _hooks.prepare_native_decode_metadata(
         core=core,
         runner=runner,
@@ -330,32 +277,15 @@ def _wrapped_prepare_inputs(
         )
         session.spec_rows = _build_spec_rows_mrv1(core=core, view=view, session=session)
         _restore_first_row_localization_mrv1(core=core, view=view, session=session)
-        _model_region.stage_signed_backend_region_event(
-            event=BackendObservableEvent.PREPARE_INPUTS_POST,
-            runtime=runtime,
-            runner=runner,
-            num_scheduled_tokens=view.num_scheduled_tokens_np,
-        )
         _common_hooks.dispatch_runtime_event(
             runtime=runtime,
             event=BackendObservableEvent.PREPARE_INPUTS_POST,
-        )
-        # MRv1 constructs inputs from inside its original execute_model.
-        # The Rust-signed phase therefore only exists here, before the model
-        # body continues, rather than at the outer execute wrapper entry.
-        _model_region.stage_signed_backend_region_event(
-            event=BackendObservableEvent.EXECUTE_MODEL_PRE,
-            runtime=runtime,
-            runner=runner,
-            num_scheduled_tokens=view.num_scheduled_tokens_np,
-            step_id=session.step_id,
         )
         _common_hooks.dispatch_runtime_event(
             runtime=runtime,
             event=BackendObservableEvent.EXECUTE_MODEL_PRE,
         )
     except Exception:
-        _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
         raise
     return out
 
@@ -365,12 +295,6 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     if not active_targets.runtime_has_active_targets(runtime):
         return orig(runner, grammar_output)
     session = get_step_session(runner)
-    _model_region.stage_signed_backend_region_event(
-        event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
-        runtime=runtime,
-        runner=runner,
-        num_scheduled_tokens=None if session is None else session.num_scheduled_tokens,
-    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         event=BackendObservableEvent.SAMPLE_TOKENS_PRE,
@@ -393,12 +317,6 @@ def _wrapped_sample_tokens(*, core: Any, runner: Any, grammar_output: Any, orig:
     if session is not None and session.state == StepState.SAMPLING:
         session.sampled_tokens = getattr(out, "sampled_token_ids", None)
         session.transition(StepState.COMPLETED)
-    _model_region.stage_signed_backend_region_event(
-        event=BackendObservableEvent.SAMPLE_TOKENS_POST,
-        runtime=runtime,
-        runner=runner,
-        num_scheduled_tokens=None if session is None else session.num_scheduled_tokens,
-    )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         event=BackendObservableEvent.SAMPLE_TOKENS_POST,
@@ -438,15 +356,7 @@ class V027MRv1Driver:
             graph_safety=GraphSafety.CAPTURE_SAFE,
             extensions=frozenset(
                 {
-                    BackendCapability.BACKEND_REGION_BINDER,
                     BackendCapability.TYPED_LAYER_REPLAY,
-                }
-            ),
-            eager_extensions=frozenset(
-                {
-                    BackendCapability.PACKED_PHASE_ROWS,
-                    BackendCapability.PACKED_SAMPLER_ROWS,
-                    BackendCapability.PACKED_HIDDEN_BLOCK_OUTPUT,
                 }
             ),
             hidden_locators=frozenset(
@@ -559,10 +469,6 @@ class V027MRv1Driver:
         def _execute_model(runner: Any, *args: Any, **kwargs: Any) -> Any:
             active = active_targets.runtime_has_active_targets(core.RUNTIME)
             binding = _runner_adapter.get_runner_binding(runner)
-            _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
-                binding=binding,
-                execution=None,
-            )
             overlay_controller = _parameter_overlay.maybe_bind_publisher(
                 runtime=core.RUNTIME,
                 runner=runner,
@@ -582,23 +488,7 @@ class V027MRv1Driver:
             def _nested_prepare_created_step() -> bool:
                 return get_step_session(runner) is not None
 
-            def _stage_event(event: BackendObservableEvent) -> None:
-                session = get_step_session(runner)
-                _model_region.stage_signed_backend_region_event(
-                    event=event,
-                    runtime=core.RUNTIME,
-                    runner=runner,
-                    num_scheduled_tokens=(
-                        None if session is None else session.num_scheduled_tokens
-                    ),
-                    step_id=None if session is None else session.step_id,
-                )
-
             def _stage_forward_captures() -> None:
-                _packed_hidden_capture.publish_runner_packed_hidden_capture(
-                    binding=binding,
-                    execution=None,
-                )
                 if overlay_controller is not None:
                     overlay_controller.stage_dense_operand_captured()
 
@@ -609,7 +499,6 @@ class V027MRv1Driver:
                     args=args,
                     kwargs=kwargs,
                     split_execute_and_sample=True,
-                    before_runtime_event=_stage_event,
                     execute_pre_already_dispatched=active,
                     has_nested_prepare_step=(
                         _nested_prepare_created_step if active else None
@@ -617,15 +506,9 @@ class V027MRv1Driver:
                     after_model_forward=_stage_forward_captures,
                 )
             except Exception as error:
-                _packed_hidden_capture.abort_runner_packed_hidden_capture(
-                    binding
-                )
                 session = get_step_session(runner)
                 if session is not None:
                     session.fail(str(error))
-                _model_region.abort_model_region_step(
-                    core.RUNTIME, int(core.RUNTIME.event_step_id)
-                )
                 raise
             finally:
                 if overlay_controller is not None:
@@ -652,7 +535,6 @@ class V027MRv1Driver:
         _sampler_mrv1.install_sampler_patch_v027(core=core)
 
     def unbind(self, binding: RunnerBinding) -> None:
-        _packed_hidden_capture.close_runner_packed_hidden_capture(binding)
         _parameter_overlay.unbind_parameter_overlays(
             runner=binding.runner,
             state=binding.parameter_overlay_state,

@@ -7,7 +7,6 @@ use pyo3::prelude::*;
 mod canonical;
 mod decode_localization;
 mod prefill_row_plan;
-mod recurrence;
 mod sampler_plan;
 mod shape_specialization;
 mod workload_frontend;
@@ -22,7 +21,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     sampler_plan::register(m)?;
     shape_specialization::register(m)?;
     prefill_row_plan::register(m)?;
-    recurrence::register(m)?;
     workload_frontend::register(m)?;
     Ok(())
 }

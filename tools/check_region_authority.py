@@ -26,7 +26,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # a migration inventory and encourage exemptions.
 AUTHORITY_FILES = (
     Path("tllm/runtime/backend_region_binders.py"),
-    Path("tllm/runtime/typed_recurrence.py"),
     Path("tllm/backends/vllm/model_region.py"),
     Path("tllm/backends/vllm/sampler_mrv1.py"),
     Path("tllm/backends/vllm/sampler_mrv2.py"),
@@ -45,7 +44,6 @@ NATIVE_BINDING_FILES = (
 PHYSICAL_FILES = frozenset(
     {
         Path("tllm/runtime/backend_region_binders.py"),
-        Path("tllm/runtime/typed_recurrence.py"),
         Path("tllm/backends/vllm/model_region.py"),
     }
 )

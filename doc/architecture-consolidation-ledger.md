@@ -241,6 +241,14 @@ mapping, stats, synchronization and enable flags; import-layer baseline is now
 Under `SOURCE_LOC`, this checkpoint is `+125 / -27,036 / net -26,911`;
 `SOURCE_LOC` is now 55,232.
 
+The recurrence island deletion removed the orphan finite-recurrence contracts,
+typed recurrence executor, Rust `recurrence.rs` FFI/classes, `_core.pyi`
+typed-recurrence stubs, and MRv1 backend-region/packed-hidden capture hooks
+whose old signed Region consumer had been deleted.  Recirculation survivor
+semantics must be rebuilt as the compact canonical typed replay effect named
+by evidence 27/35, not by restoring this recurrence API.  Under `SOURCE_LOC`,
+this checkpoint is `+2 / -3,296 / net -3,294`; `SOURCE_LOC` is now 51,938.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -249,7 +257,7 @@ Under `SOURCE_LOC`, this checkpoint is `+125 / -27,036 / net -26,911`;
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 520 | 68,083 | 988 | -67,563 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
+| E — legacy authority removal | 522 | 71,379 | 988 | -70,857 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler/recurrence island, consumer compat island, BaseConsumer dispatch chain and dummy consumer re-export removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
