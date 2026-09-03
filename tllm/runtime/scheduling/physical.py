@@ -1,4 +1,4 @@
-"""Python-owned fence and buffer primitives for physical WorkGraph execution."""
+"""Python-owned fence and buffer primitives for physical runtime execution."""
 
 from __future__ import annotations
 

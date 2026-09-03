@@ -2,7 +2,7 @@
 
 This package is intentionally separate from ``tllm.backends`` and
 ``tllm.runtime``.  It contains only the signed eager MRv2 attachment pieces;
-legacy runtime, backend-driver, and workgraph authority are forbidden here.
+legacy runtime and backend-driver authority are forbidden here.
 """
 
 from tllm.canonical_vllm.hidden_capture import Vllm027EagerPackedHiddenCapture

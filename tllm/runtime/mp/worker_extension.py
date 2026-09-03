@@ -115,7 +115,6 @@ class TllmWorkerExtension:
             "distiller_timing",
             "path_hotspot",
             "placement",
-            "workgraph",
         }
         if category not in supported:
             raise ValueError(
@@ -127,7 +126,6 @@ class TllmWorkerExtension:
             "distiller_timing": {},
             "path_hotspot": {},
             "placement": {},
-            "workgraph": {},
         }
         if category in ("all", "esamp"):
             payload["esamp"] = _to_plain(core.read_and_reset_esamp_stats(sync=sync))
@@ -145,8 +143,6 @@ class TllmWorkerExtension:
             )
         if category in ("all", "placement"):
             payload["placement"] = _to_plain(core.read_and_reset_placement_stats())
-        if category in ("all", "workgraph"):
-            payload["workgraph"] = _to_plain(core.read_workgraph_runtime_stats())
         return payload
 
     def tllm_synchronize(self) -> None:

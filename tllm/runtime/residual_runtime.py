@@ -50,7 +50,6 @@ from tllm.runtime.stats import DistillerTimingStats, GraphDebugStats, PathHotspo
 
 if TYPE_CHECKING:
     from vllm import LLM
-    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
 
 ensure_v1_env()
 
@@ -66,46 +65,6 @@ MODEL_HOOK_SPEC_ATTR = "esamp_hook_spec"
 
 def runtime_patch_installed() -> bool:
     return _PATCH_INSTALLED
-
-
-def prepare_physical_workgraph_step(step_id: int) -> None:
-    """Advance the residual hook step counter."""
-
-    step = int(step_id)
-    if step < 0:
-        raise ValueError("physical step id must be non-negative")
-    RUNTIME.physical_prepared_step_id = step
-
-
-def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
-    """Aggregate non-resetting physical executor and deadline statistics."""
-
-    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
-
-    local = WorkGraphRuntimeStats(
-        active_plan_epoch=0,
-        prepare_count=0,
-        execute_count=0,
-        finish_count=0,
-        replay_count=0,
-        eager_count=0,
-        fallback_count=0,
-        fence_wait_count=0,
-        fence_record_count=0,
-        bucket_miss_count=0,
-        specialization_request_count=0,
-        active_leases=0,
-        retired_plans=0,
-        deadline_flush_count=int(RUNTIME.placement_stats.deadline_flush_count),
-    )
-    from tllm.runtime.mp.control import active_control_plane
-
-    plane = active_control_plane()
-    if plane is None:
-        return local
-    return WorkGraphRuntimeStats.merge(
-        (local, *(reply.workgraph for reply in plane.pull_stats("workgraph", sync=False)))
-    )
 
 
 def advance_workload_anchor(anchor: str) -> bool:

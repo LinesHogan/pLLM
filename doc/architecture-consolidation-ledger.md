@@ -249,6 +249,14 @@ semantics must be rebuilt as the compact canonical typed replay effect named
 by evidence 27/35, not by restoring this recurrence API.  Under `SOURCE_LOC`,
 this checkpoint is `+2 / -3,296 / net -3,294`; `SOURCE_LOC` is now 51,938.
 
+The WorkGraph/backend-region cleanup removed the residual WorkGraph stats
+executor, runtime stats DTO, backend-region binder, old packed-hidden capture,
+old packed-phase row staging, and the remaining backend timeline/model-region
+hooks tied to the retired native scheduler.  The MP stats surface no longer
+publishes a `workgraph` category, and import-layer rules no longer contain a
+deleted WorkGraph package tier.  Under `SOURCE_LOC`, this checkpoint is
+`+7 / -2,223 / net -2,216`; `SOURCE_LOC` is now 49,718.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -257,7 +265,7 @@ this checkpoint is `+2 / -3,296 / net -3,294`; `SOURCE_LOC` is now 51,938.
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 522 | 71,379 | 988 | -70,857 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler/recurrence island, consumer compat island, BaseConsumer dispatch chain and dummy consumer re-export removed |
+| E — legacy authority removal | 529 | 73,602 | 988 | -73,073 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler/recurrence island, backend-region/packed-hidden old hooks, consumer compat island, BaseConsumer dispatch chain and dummy consumer re-export removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 

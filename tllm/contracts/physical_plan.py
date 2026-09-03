@@ -3,14 +3,14 @@
 This module is the native home of the single-device physical execution
 vocabulary: stable identity keys (``ArtifactKey``/``NodeKey``/``ExecutorKey``),
 tensor metadata descriptors, and the frozen ``PhysicalFlowPlan`` record that
-both the schedule middle-end lowering and the runtime executor consume.
+the runtime executor consumes.
 
 It is a control-plane boundary.  It deliberately contains no Tensor, CUDA
 stream/event, CUDAGraph, callback, request id, or backend runtime handle.
 Those objects belong to the Python physical executor.
 
-Runtime code imports these contracts directly; there is no WorkGraph
-compatibility re-export layer.
+Runtime code imports these contracts directly; there is no compatibility
+re-export layer.
 """
 
 from __future__ import annotations

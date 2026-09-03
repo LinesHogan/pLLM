@@ -32,7 +32,6 @@ class ResidualCaptureRuntimeLike(Protocol):
     target_resolved_path: str
     capture_full_residual_rows: bool
     placement_stats: PlacementStats
-    workload_execution: object | None
 
 
 class ResidualCaptureCoreLike(Protocol):

@@ -30,7 +30,6 @@ from tllm.backends.protocol import (
     SamplerStage,
     UnsupportedBackendError,
     VersionedParameterOverlayCapabilities,
-    runner_model_module,
 )
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
 from tllm.contracts.request_identity import RequestFinishedBatch
@@ -231,14 +230,6 @@ def _wrapped_prepare_inputs(
         )
     batch_phase = _scheduler_batch_phase.scheduler_batch_phase(columns=batch_columns)
 
-    from tllm.runtime import residual_runtime as _residual_runtime
-
-    if core is _residual_runtime:
-        _residual_runtime.prepare_physical_workgraph_step(
-            # MRv1 increments the public step id after input construction.
-            # Prepare that next step before its PREPARE lifecycle event.
-            int(runtime.event_step_id) + 1
-        )
     _common_hooks.dispatch_runtime_event(
         runtime=runtime,
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,

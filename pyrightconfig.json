@@ -9,7 +9,6 @@
     "tllm/contracts",
     "tllm/ports",
     "tllm/core",
-    "tllm/workgraph",
     "**/__pycache__"
   ],
   "reportMissingImports": true,

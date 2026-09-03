@@ -21,10 +21,8 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 from tllm.backends.protocol import (
-    ORDERED_ROW_FUSION_POLICY_PREFIX,
     GraphSafety,
     RunnerBinding,
-    ordered_row_fusion_policy_fingerprint,
 )
 from tllm.backends.vllm import runner_adapter as _runner_adapter
 from tllm.contracts.typed_replay import (
@@ -456,7 +454,6 @@ def install_typed_layer_replay(*, runtime: object, runner: object) -> VllmTypedL
     """Return the single restorable typed replay hook for an active runner."""
 
     binding = _admit_typed_layer_replay(runtime=runtime, runner=runner)
-    signed_ordered_row_fusion_policy(runtime=runtime, binding=binding)
     existing = binding.typed_layer_replay_handle
     if isinstance(existing, VllmTypedLayerReplayHandle) and not existing.restored:
         return existing
@@ -464,36 +461,6 @@ def install_typed_layer_replay(*, runtime: object, runner: object) -> VllmTypedL
     binding.typed_layer_replay_handle = handle
     setattr(runtime, "typed_layer_replay_binding", binding)
     return handle
-
-
-def signed_ordered_row_fusion_policy(
-    *, runtime: object, binding: RunnerBinding
-) -> str:
-    """Check the worker replay capability against the signed Region epoch."""
-
-    compilation = getattr(runtime, "workload_compilation", None)
-    timeline = getattr(compilation, "timeline", None)
-    capabilities = getattr(timeline, "capabilities", ())
-    signed = tuple(
-        capability[len(ORDERED_ROW_FUSION_POLICY_PREFIX) :]
-        for capability in capabilities
-        if capability.startswith(ORDERED_ROW_FUSION_POLICY_PREFIX)
-    )
-    if len(signed) != 1:
-        raise RuntimeError(
-            "signed typed layer replay Region must contain exactly one "
-            "ordered-row fusion policy"
-        )
-    model_region = binding.capabilities.model_region
-    local = ordered_row_fusion_policy_fingerprint(
-        None if model_region is None else model_region.ordered_row_fusion
-    )
-    if signed[0] != local:
-        raise RuntimeError(
-            "worker ordered-row fusion policy disagrees with the signed "
-            f"typed Region epoch: signed={signed[0]!r}, local={local!r}"
-        )
-    return signed[0]
 
 
 def abort_typed_layer_replay(runtime: object) -> bool:
@@ -526,5 +493,4 @@ __all__ = [
     "abort_typed_layer_replay",
     "install_typed_layer_replay",
     "restore_typed_layer_replay",
-    "signed_ordered_row_fusion_policy",
 ]

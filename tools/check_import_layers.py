@@ -10,9 +10,8 @@ Usage (from the repo root, venv activated)::
 Target direction (a package may import only the packages listed in RULES)::
 
     core ← contracts ← canonical
-                     ← ports ← common
-                         ← workgraph ← runtime
-    backends (contracts/ports/workgraph only; runtime types arrive via protocols)
+                     ← ports ← common ← runtime
+    backends (contracts/ports/runtime only; runtime types arrive via protocols)
     workflows: leaf entry points, may import anything below
 
 Two tiers, mirroring tools/check_typing.py:
@@ -47,19 +46,18 @@ RULES: dict[str, frozenset[str]] = {
     "core": frozenset(),
     "contracts": frozenset({"core"}),
     # Clean-room native core. It consumes only closed contracts and Rust FFI;
-    # legacy runtime/workload/workgraph layers must never become dependencies.
+    # legacy runtime/workload layers must never become dependencies.
     "canonical": frozenset({"contracts", "core"}),
     # Clean in-process vLLM attachment.  It may consume signed canonical
     # plans/contracts and Rust FFI, but never the legacy runtime/backends.
     "canonical_vllm": frozenset({"canonical", "contracts", "core"}),
     "ports": frozenset({"contracts", "core"}),
     "common": frozenset({"contracts", "ports", "core"}),
-    "workgraph": frozenset({"contracts", "ports", "core"}),
-    "runtime": frozenset({"contracts", "ports", "common", "workgraph", "core"}),
+    "runtime": frozenset({"contracts", "ports", "common", "core"}),
     # Backend drivers are adapters *above* the runtime: they may import it,
     # but the runtime must never import a concrete driver (only the pure
     # protocol module, via SANCTIONED_EDGES).
-    "backends": frozenset({"contracts", "ports", "workgraph", "runtime", "core"}),
+    "backends": frozenset({"contracts", "ports", "runtime", "core"}),
     "workflows": None,  # leaf entry points: may import anything
     # Script helpers used by workflows/starter/gpu scripts.
     "util": None,
@@ -70,7 +68,6 @@ RULES: dict[str, frozenset[str]] = {
 SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("runtime", "tllm.backends.protocol"),
-        ("workgraph", "tllm.backends.protocol"),
     }
 )
 

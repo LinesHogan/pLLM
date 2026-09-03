@@ -187,10 +187,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         return orig(runner, *args, **kwargs)
 
     runtime.event_step_id += 1
-    from tllm.runtime import residual_runtime as _residual_runtime
-
-    if core is _residual_runtime:
-        _residual_runtime.prepare_physical_workgraph_step(int(runtime.event_step_id))
     session = StepSession(
         step_id=int(runtime.event_step_id),
         backend_id=V027MRv2Driver.backend_id,
@@ -205,8 +201,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         out = orig(runner, *args, **kwargs)
         if session.state is StepState.BACKEND_WARMUP:
             return out
-        if session.state is not StepState.CREATED:
-            pass
         if overlay_controller is not None:
             overlay_controller.stage_dense_operand_captured()
     except Exception as exc:

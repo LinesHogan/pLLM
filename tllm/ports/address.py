@@ -92,8 +92,8 @@ class PortAddressDesc:
         """Stable digest of the complete tagged address structure.
 
         ``label`` is intentionally concise for logs and can contain arbitrary
-        locator text. WorkGraph value identities use this closed-world digest
-        instead, so delimiters in user values cannot merge distinct ports.
+        locator text. Closed value identities use this digest instead, so
+        delimiters in user values cannot merge distinct ports.
         """
 
         payload = {

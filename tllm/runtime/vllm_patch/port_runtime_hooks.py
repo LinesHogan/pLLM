@@ -650,15 +650,6 @@ def wrapped_prepare_inputs(*, core: Any, runner: Any, scheduler_output: Any) -> 
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         out = core._ORIG_PREPARE_INPUTS(runner, scheduler_output)
         return out
-    from tllm.runtime import residual_runtime as _residual_runtime
-
-    if core is _residual_runtime:
-        _residual_runtime.prepare_physical_workgraph_step(
-            # ``event_step_id`` is advanced after the legacy runner builds
-            # its inputs.  Prepare the step that the resulting bundle will
-            # carry, while retaining this prepare-inputs safe point.
-            int(_residual_runtime.RUNTIME.event_step_id) + 1
-        )
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         event=BackendObservableEvent.PREPARE_INPUTS_PRE,
@@ -713,7 +704,6 @@ def wrapped_execute_model(
     args: tuple,
     kwargs: dict,
     split_execute_and_sample: bool = False,
-    before_runtime_event: Callable[[BackendObservableEvent], None] | None = None,
     execute_pre_already_dispatched: bool = False,
     has_nested_prepare_step: Callable[[], bool] | None = None,
     after_model_forward: Callable[[], None] | None = None,
@@ -721,8 +711,6 @@ def wrapped_execute_model(
     if not active_targets.runtime_has_active_targets(core.RUNTIME):
         return core._ORIG_EXECUTE_MODEL(runner, *args, **kwargs)
     if not execute_pre_already_dispatched:
-        if before_runtime_event is not None:
-            before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_PRE)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
             event=BackendObservableEvent.EXECUTE_MODEL_PRE,
@@ -749,15 +737,11 @@ def wrapped_execute_model(
         maybe_launch_post_logits_decode_work(core=core, runner=runner)
     t2 = time.perf_counter() if trace_hotspots else 0.0
     record_path_hotspot_cpu(core, "execute_model.post_logits_cpu", t1, t2)
-    if before_runtime_event is not None:
-        before_runtime_event(BackendObservableEvent.EXECUTE_MODEL_POST)
     _common_hooks.dispatch_runtime_event(
         runtime=core.RUNTIME,
         event=BackendObservableEvent.EXECUTE_MODEL_POST,
     )
     if not split_execute_and_sample:
-        if before_runtime_event is not None:
-            before_runtime_event(BackendObservableEvent.SAMPLE_TOKENS_POST)
         _common_hooks.dispatch_runtime_event(
             runtime=core.RUNTIME,
             event=BackendObservableEvent.SAMPLE_TOKENS_POST,

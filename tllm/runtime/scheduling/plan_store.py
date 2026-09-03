@@ -1,4 +1,4 @@
-"""Safe-point publication and retirement for physical WorkGraph plans."""
+"""Safe-point publication and retirement for physical runtime plans."""
 
 from __future__ import annotations
 

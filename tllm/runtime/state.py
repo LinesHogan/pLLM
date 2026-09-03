@@ -98,15 +98,7 @@ class ResidualRuntimeState:
     path_hotspot_cpu_ms: dict[str, float] = field(default_factory=dict)
     path_hotspot_counts: dict[str, int] = field(default_factory=dict)
 
-    physical_executor: object | None = None
-    physical_prepared_step_id: int = -1
-    # Retired native workload execution state.  These remain empty while the
-    # residual vLLM hook surface is pruned away from the old scheduler.
-    workload_compilation: object | None = None
-    workload_execution: object | None = None
-    workload_execution_store: object | None = None
     native_workloads_pending: bool = False
-    native_schedule_graph: object | None = None
     native_hidden_path_aliases: dict[str, str] = field(default_factory=dict)
     placement_stats: PlacementStats = field(default_factory=PlacementStats)
     reward_outcome_store: RewardOutcomeStore = field(default_factory=RewardOutcomeStore)

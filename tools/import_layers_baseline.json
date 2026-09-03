@@ -5,8 +5,7 @@
       "contracts",
       "core",
       "ports",
-      "runtime",
-      "workgraph"
+      "runtime"
     ],
     "canonical": [
       "contracts",
@@ -34,20 +33,13 @@
       "common",
       "contracts",
       "core",
-      "ports",
-      "workgraph"
+      "ports"
     ],
     "util": "leaf (any)",
     "workflows": "leaf (any)",
-    "workgraph": [
-      "contracts",
-      "core",
-      "ports"
-    ],
     "exact_module_edges": [],
     "sanctioned_edges": [
-      "runtime -> tllm.backends.protocol",
-      "workgraph -> tllm.backends.protocol"
+      "runtime -> tllm.backends.protocol"
     ]
   },
   "module_level": {},

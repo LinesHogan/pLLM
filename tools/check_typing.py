@@ -39,12 +39,9 @@ STRICT_CONFIG = "pyrightconfig.strict.json"
 BASIC_CONFIG = "pyrightconfig.json"
 BASELINE_PATH = REPO_ROOT / "tools" / "typing_baseline.json"
 AUTHOR_SURFACE = (
-    Path("tllm/backends/vllm/packed_hidden_capture.py"),
     Path("tllm/backends/vllm/typed_layer_replay.py"),
-    Path("tllm/runtime/backend_region_binders.py"),
     Path("tllm/runtime/mp/worker_extension.py"),
     Path("tllm/runtime/parameter_overlay.py"),
-    Path("tllm/runtime/packed_phase_row_staging.py"),
 )
 
 FORBIDDEN_COMPATIBILITY_NAMES = frozenset(
@@ -88,11 +85,6 @@ DYNAMIC_BOUNDARY_ALLOWLIST = frozenset(
             Path("tllm/backends/vllm/typed_layer_replay.py"),
             "install_typed_layer_replay",
             "setattr",
-        ),
-        (
-            Path("tllm/backends/vllm/typed_layer_replay.py"),
-            "signed_ordered_row_fusion_policy",
-            "getattr",
         ),
         (
             Path("tllm/backends/vllm/typed_layer_replay.py"),

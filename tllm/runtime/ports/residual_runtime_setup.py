@@ -68,7 +68,6 @@ class RuntimeLike(Protocol):
     source_resolved_path: str
     target_resolved_path: str
     launch_consumer_from_hooks: bool
-    native_schedule_graph: object | None
     native_hidden_path_aliases: dict[str, str]
 
 
