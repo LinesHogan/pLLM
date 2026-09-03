@@ -25,23 +25,11 @@ class NativeRequestFinishCleanup:
     binding: "RunnerBinding | None"
 
     def stage(self, batch: RequestFinishedBatch) -> int:
-        execution = self.runtime.workload_execution
-        return 0 if execution is None else execution.stage_request_finished(batch)
+        return 0
 
     def confirm(self, batch: RequestFinishedBatch, staged_ports: int) -> None:
-        execution = self.runtime.workload_execution
         if staged_ports:
-            step = int(self.runtime.event_step_id) + 1
-            if execution is None:
-                raise RuntimeError("request-finish flush has no active native execution")
-            execution.execute_staged_request_finished(step)
-            self.runtime.event_step_id = step
-        if execution is not None:
-            # Native request-state retirement drains async host work and
-            # verifies all typed state-effect receipts at the safe point.
-            if not staged_ports:
-                execution.finish_step(int(self.runtime.event_step_id))
-            execution.retire_request_states(batch)
+            raise RuntimeError("native request-finish execution is retired")
         binding = self.binding
         if binding is not None:
             binding.driver.consume_parameter_overlay_finished_batch(

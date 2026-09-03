@@ -101,9 +101,8 @@ def make_llm(core: Any, *args: object, **kwargs: object) -> LLM:
     # (in-process under mp=0, EngineCore child under mp=1).
     kwargs.setdefault("worker_extension_cls", TLLM_WORKER_EXTENSION_QUALNAME)
     llm = make_plain_llm(*args, **kwargs)  # pyright: ignore[reportArgumentType] — untyped passthrough by design
-    # The legacy ``residual_runtime.make_llm`` entry point bypasses
-    # ``TllmRuntime._bind_engine_runners``. Bind its parent-side stats/control
-    # channel here so mp=1 callers do not silently read the empty parent state.
+    # Bind the parent-side stats/control channel here so mp=1 callers do not
+    # silently read the empty parent state.
     from tllm.runtime.mp.control import ControlPlane, set_active_control_plane
 
     set_active_control_plane(ControlPlane.try_bind(llm))

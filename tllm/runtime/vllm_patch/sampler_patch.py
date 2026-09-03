@@ -15,13 +15,6 @@ _PATCH_INSTALLED = False
 _ORIG_VLLM_SAMPLER_SAMPLE = None
 _SAMPLING_EPS = 1e-5
 def _resolve_provider(runtime: Any) -> Any:
-    execution = getattr(runtime, "workload_execution", None)
-    if execution is not None:
-        getter = getattr(execution, "sampler_modifier_provider", None)
-        if callable(getter):
-            provider = getter()
-            if provider is not None:
-                return provider
     return None
 
 

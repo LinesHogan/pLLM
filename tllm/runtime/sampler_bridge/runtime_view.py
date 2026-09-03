@@ -9,33 +9,9 @@ from typing import Protocol
 
 import torch
 
-from tllm.contracts.packed_rows import PackedSamplerRowBatch
 from tllm.runtime.sampler_bridge.types import (
-    NoSamplerSourceHidden,
     SamplerStepView,
 )
-
-
-class _PackedSamplerExecution(Protocol):
-    @property
-    def requires_packed_sampler_rows(self) -> bool: ...
-
-    def packed_sampler_rows_for_step(
-        self, step_id: int
-    ) -> PackedSamplerRowBatch: ...
-
-
-class _PackedSamplerRuntime(Protocol):
-    @property
-    def workload_execution(self) -> _PackedSamplerExecution | None: ...
-
-    @property
-    def event_step_id(self) -> int: ...
-
-
-class _PackedSamplerRunner(Protocol):
-    @property
-    def model(self) -> torch.nn.Module: ...
 
 
 class _PackedSamplingMetadata(Protocol):
@@ -58,45 +34,6 @@ class _PackedSamplingMetadata(Protocol):
     def generators(self) -> Mapping[int, torch.Generator]: ...
 
 
-def build_packed_sampler_step_view(
-    *,
-    runtime: _PackedSamplerRuntime,
-    runner: _PackedSamplerRunner,
-    model: torch.nn.Module,
-    logits: torch.Tensor,
-    sampling_metadata: _PackedSamplingMetadata | None,
-) -> SamplerStepView | None:
-    """Bind sampler logits to the execution's explicit packed-row links."""
-
-    execution = runtime.workload_execution
-    if execution is None or not execution.requires_packed_sampler_rows:
-        return None
-    step_id = int(runtime.event_step_id)
-    sampler_rows = execution.packed_sampler_rows_for_step(step_id)
-    row_count = len(sampler_rows.links)
-    if logits.ndim != 2 or int(logits.shape[0]) < row_count:
-        raise RuntimeError(
-            "packed sampler logits do not cover the signed sampler rows"
-        )
-    identities = sampler_rows.identities
-    return SamplerStepView(
-        engine_step_id=step_id,
-        phase="packed",
-        logits=logits[:row_count],
-        sampling_metadata=sampling_metadata,
-        decode_count=row_count,
-        request_ids=tuple(identity.request_id for identity in identities),
-        prompt_idxs=tuple(identity.prompt_idx for identity in identities),
-        sample_idxs=tuple(identity.sample_idx for identity in identities),
-        prompt_idx_tensor=None,
-        sample_idx_tensor=None,
-        source_hidden=NoSamplerSourceHidden(),
-        device=logits.device,
-        model=model,
-        runner=runner,
-    )
-
-
 def build_sampler_step_view(
     *,
     runtime: Any,
@@ -105,15 +42,6 @@ def build_sampler_step_view(
     logits: torch.Tensor,
     sampling_metadata: Any,
 ) -> SamplerStepView | None:
-    packed = build_packed_sampler_step_view(
-        runtime=runtime,
-        runner=runner,
-        model=model,
-        logits=logits,
-        sampling_metadata=sampling_metadata,
-    )
-    if packed is not None:
-        return packed
     decode_count = int(getattr(runtime, "decode_count", 0) or 0)
     if logits.ndim != 2 or decode_count <= 0 or int(logits.shape[0]) != decode_count:
         return None

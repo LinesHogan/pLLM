@@ -76,7 +76,6 @@ if TYPE_CHECKING:
         OverlayVersionRef,
         OverlayVersionStore,
     )
-    from tllm.schedule.contracts import MainWorkloadTimeline
 
 
 class PackedHiddenSnapshotSink(Protocol):
@@ -404,15 +403,6 @@ class BackendDriver(Protocol):
         ...
 
     def capabilities(self) -> BackendCapabilities:
-        ...
-
-    def export_main_workload_timeline(
-        self,
-        *,
-        graph_mode: str,
-        static_headroom_bytes: int,
-    ) -> "MainWorkloadTimeline":
-        """Return pinned backend regions and only genuinely observable anchors."""
         ...
 
     def install(self, *, core: Any, info: Any) -> None:

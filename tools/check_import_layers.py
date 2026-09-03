@@ -15,16 +15,6 @@ Target direction (a package may import only the packages listed in RULES)::
     backends (contracts/ports/workgraph only; runtime types arrive via protocols)
     workflows: leaf entry points, may import anything below
 
-The workload compiler has two deliberately narrow bridges, declared in
-``EXACT_MODULE_EDGES`` rather than at package scope:
-
-    workload.lowering / workload.region_compiler → schedule.contracts
-    schedule.coordinator → workload frontend/lowering
-
-This keeps the frontend independent from the compiler, permits the typed IR
-adapter at its intended boundary, and prevents a new workload or schedule
-module from acquiring runtime or legacy-consumer authority by accident.
-
 Two tiers, mirroring tools/check_typing.py:
   - module-level violations: the red line; any new one fails the gate.
   - function-local imports: a ledger; still circular at call time, so they are
@@ -66,12 +56,6 @@ RULES: dict[str, frozenset[str]] = {
     "common": frozenset({"contracts", "ports", "core"}),
     "workgraph": frozenset({"contracts", "ports", "core"}),
     "runtime": frozenset({"contracts", "ports", "common", "workgraph", "core"}),
-    # The workload frontend and schedule middle-end communicate only through
-    # the source-module-specific bridges below.  Neither package gets a broad
-    # cross-package allowance: that would hide an import cycle or permit the
-    # frontend to take runtime/legacy execution authority.
-    "schedule": frozenset(),
-    "workload": frozenset(),
     # Backend drivers are adapters *above* the runtime: they may import it,
     # but the runtime must never import a concrete driver (only the pure
     # protocol module, via SANCTIONED_EDGES).
@@ -90,64 +74,8 @@ SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-# Source-module-specific compiler integration edges.  These are intentionally
-# not package rules: e.g. allowing ``workload -> schedule`` would let the DSL
-# frontend call the planner, while allowing ``schedule -> workload`` would let
-# arbitrary planner code reach user executors.  Keep the coordinator as the
-# sole composition root and schedule.contracts as the sole reverse dependency.
 EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
-        # Closed locator enums are pure wire vocabulary shared by the DSL and
-        # the signed schedule contract. Keep this narrower than a package-wide
-        # dependency so neither layer can acquire general contract authority.
-        ("tllm.schedule.contracts", "tllm.contracts.hidden_locator"),
-        ("tllm.schedule.contracts", "tllm.contracts.packed_hidden"),
-        ("tllm.schedule.contracts", "tllm.contracts.request_identity"),
-        ("tllm.workload.frontend", "tllm.contracts.hidden_locator"),
-        ("tllm.workload.frontend", "tllm.contracts.request_identity"),
-        ("tllm.workload.ir", "tllm.contracts.hidden_locator"),
-        ("tllm.workload.ir", "tllm.contracts.request_identity"),
-        ("tllm.workload.staging", "tllm.contracts.workload_ports"),
-        # Workload frontend adapters.
-        ("tllm.workload", "tllm.contracts.request_identity"),
-        ("tllm.workload.lowering", "tllm.schedule.contracts"),
-        ("tllm.workload.region_compiler", "tllm.schedule.contracts"),
-        # Compiler composition and mechanical physical lowering.  The frozen
-        # physical-plan vocabulary lives in the native contracts layer; the
-        # schedule middle-end never touches the legacy workgraph stack.
-        ("tllm.schedule.coordinator", "tllm.contracts.physical_plan"),
-        ("tllm.schedule.coordinator", "tllm.workload.frontend"),
-        ("tllm.schedule.coordinator", "tllm.workload.lowering"),
-        ("tllm.schedule.physical", "tllm.contracts.physical_plan"),
-        ("tllm.schedule.contracts", "tllm.backends.protocol"),
-        ("tllm.schedule.timeline", "tllm.backends.protocol"),
-        # Backends export the typed main-workload timeline, but never import
-        # the coordinator or workload executors.
-        ("tllm.backends.timeline", "tllm.schedule.timeline"),
-        # Runtime consumes signed compiler output and local artifacts.  It is
-        # intentionally a consumer of these packages, never their dependency.
-        ("tllm.runtime.mp.control", "tllm.schedule.coordinator"),
-        ("tllm.runtime.mp.worker_extension", "tllm.schedule.contracts"),
-        ("tllm.runtime.mp.worker_extension", "tllm.schedule.coordinator"),
-        ("tllm.runtime.mp.worker_extension", "tllm.schedule.timeline"),
-        ("tllm.runtime.residual_runtime", "tllm.schedule.coordinator"),
-        ("tllm.runtime.state", "tllm.schedule.contracts"),
-        ("tllm.runtime.state", "tllm.schedule.coordinator"),
-        ("tllm.runtime.workload_execution", "tllm.schedule.contracts"),
-        ("tllm.runtime.workload_execution", "tllm.schedule.coordinator"),
-        ("tllm.runtime.workload_execution", "tllm.schedule.physical"),
-        ("tllm.runtime.workload_execution", "tllm.workload.frontend"),
-        ("tllm.runtime.workload_execution", "tllm.workload.lowering"),
-        ("tllm.runtime.workload_execution", "tllm.workload.region_compiler"),
-        ("tllm.runtime.workload_execution", "tllm.workload.frontend"),
-        ("tllm.runtime.workload_plugins", "tllm.schedule.contracts"),
-        ("tllm.runtime.workload_plugins", "tllm.schedule.coordinator"),
-        ("tllm.runtime.workload_plugins", "tllm.workload.frontend"),
-        ("tllm.runtime.workload_plugins", "tllm.workload.ir"),
-        ("tllm.runtime.workload_plugins", "tllm.workload.lowering"),
-        ("tllm.runtime.runtime", "tllm.schedule.contracts"),
-        ("tllm.runtime.runtime", "tllm.schedule.coordinator"),
-        ("tllm.runtime.runtime", "tllm.workload.frontend"),
     }
 )
 

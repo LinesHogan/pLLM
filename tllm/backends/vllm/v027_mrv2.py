@@ -120,16 +120,16 @@ def _wrapped_prepare_inputs(
     # InputBatch is the first point where all three scheduler columns are
     # available in MRv2. Rust classifies them before any lifecycle event is
     # advanced through native workload execution.
-    packed_execution = runtime.workload_execution
+    packed_execution = None
     batch_phase = _scheduler_batch_phase.scheduler_batch_phase(
         columns=batch_columns
     )
     _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
         binding=binding,
-        execution=runtime.workload_execution,
+        execution=None,
     )
     packed_rows = _scheduler_batch_phase.stage_prepared_packed_rows(
-        execution=runtime.workload_execution,
+        execution=None,
         step_id=int(runtime.event_step_id),
         columns=batch_columns,
         prompt_indices=runtime.reqid_to_promptidx,
@@ -241,7 +241,7 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
     binding = _runner_adapter.get_runner_binding(runner)
     _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
         binding=binding,
-        execution=runtime.workload_execution,
+        execution=None,
     )
     overlay_controller = _parameter_overlay.maybe_bind_publisher(
         runtime=runtime,
@@ -275,7 +275,7 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         if session.state is not StepState.CREATED:
             _packed_hidden_capture.publish_runner_packed_hidden_capture(
                 binding=binding,
-                execution=runtime.workload_execution,
+                execution=None,
             )
         if overlay_controller is not None:
             overlay_controller.stage_dense_operand_captured()
@@ -440,17 +440,6 @@ class V027MRv2Driver:
                 graph_safety=GraphSafety.EAGER_ONLY,
                 tensor_parallel_sizes=frozenset({1}),
             ),
-        )
-
-    def export_main_workload_timeline(
-        self, *, graph_mode: str, static_headroom_bytes: int
-    ) -> Any:
-        from tllm.backends.timeline import export_main_workload_timeline
-
-        return export_main_workload_timeline(
-            self.capabilities(),
-            graph_mode=graph_mode,
-            static_headroom_bytes=static_headroom_bytes,
         )
 
     def install_typed_layer_replay(self, *, runtime: Any, runner: Any) -> Any:

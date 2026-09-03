@@ -231,6 +231,16 @@ module imports from the still-live legacy runtime execution island, not root
 facades.  Under `SOURCE_LOC`, this checkpoint is `+31 / -479 / net -448`;
 `SOURCE_LOC` is now 82,143.
 
+The native workload/schedule island deletion in this checkpoint removed the
+old `_core.compile_schedule` Rust scheduler, `tllm.runtime.runtime`,
+`tllm.schedule`, `tllm.workload`, native workload execution/plugins/bindings/
+sinks, and the MP worker/control-plane workload-decision RPC surface.  The
+remaining worker/control plane exposes only residual vLLM liveness, request
+mapping, stats, synchronization and enable flags; import-layer baseline is now
+0/0 and the region-authority gate no longer lists deleted old authorities.
+Under `SOURCE_LOC`, this checkpoint is `+125 / -27,036 / net -26,911`;
+`SOURCE_LOC` is now 55,232.
+
 ## Tranche accounting
 
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
@@ -239,7 +249,7 @@ facades.  Under `SOURCE_LOC`, this checkpoint is `+31 / -479 / net -448`;
 | B — canonical vertical compression | 4,418 | 10,430 | 0 | -6,012 | active: canonical runtime attachments, ESamp task merge, duplicated Python validation pruning, boundary gate repair and re-export cleanup |
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
-| E — legacy authority removal | 395 | 41,047 | 988 | -40,652 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
+| E — legacy authority removal | 520 | 68,083 | 988 | -67,563 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler, consumer compat island, BaseConsumer dispatch chain, dummy consumer re-export and recurrence FFI shim removed |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 

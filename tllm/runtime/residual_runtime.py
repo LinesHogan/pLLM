@@ -69,35 +69,11 @@ def runtime_patch_installed() -> bool:
 
 
 def prepare_physical_workgraph_step(step_id: int) -> None:
-    """Publish staged physical epochs at the existing prepare safe point."""
+    """Advance the residual hook step counter."""
 
     step = int(step_id)
     if step < 0:
         raise ValueError("physical step id must be non-negative")
-    previous = RUNTIME.physical_prepared_step_id
-    if previous >= 0 and previous != step:
-        workload_store = RUNTIME.workload_execution_store
-        if workload_store is not None:
-            workload_store.finish_step(previous)
-            workload_store.collect_retired()
-    workload_store = RUNTIME.workload_execution_store
-    if workload_store is not None:
-        pending_shapes = workload_store.current.peek_shape_specialization_requests()
-        if pending_shapes:
-            raise RuntimeError(
-                "native workload shape-specialization coordinator is retired"
-            )
-        workload_execution = workload_store.prepare_step(step)
-        RUNTIME.workload_execution = workload_execution
-        RUNTIME.workload_compilation = workload_execution.compilation
-        RUNTIME.physical_executor = workload_execution
-        RUNTIME.native_schedule_graph = workload_execution.compilation.graph
-        RUNTIME.native_workloads_pending = False
-        workload_store.collect_retired()
-    else:
-        workload_execution = RUNTIME.workload_execution
-        if workload_execution is not None:
-            workload_execution.prepare_step(step)
     RUNTIME.physical_prepared_step_id = step
 
 
@@ -106,29 +82,20 @@ def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
 
     from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStats
 
-    snapshots: list[WorkGraphRuntimeStats] = []
-    physical_executor = RUNTIME.physical_executor
-    if physical_executor is not None:
-        snapshots.insert(0, physical_executor.read_workgraph_runtime_stats())
     local = WorkGraphRuntimeStats(
-        active_plan_epoch=max(
-            (snapshot.active_plan_epoch for snapshot in snapshots),
-            default=0,
-        ),
-        prepare_count=sum(snapshot.prepare_count for snapshot in snapshots),
-        execute_count=sum(snapshot.execute_count for snapshot in snapshots),
-        finish_count=sum(snapshot.finish_count for snapshot in snapshots),
-        replay_count=sum(snapshot.replay_count for snapshot in snapshots),
-        eager_count=sum(snapshot.eager_count for snapshot in snapshots),
-        fallback_count=sum(snapshot.fallback_count for snapshot in snapshots),
-        fence_wait_count=sum(snapshot.fence_wait_count for snapshot in snapshots),
-        fence_record_count=sum(snapshot.fence_record_count for snapshot in snapshots),
-        bucket_miss_count=sum(snapshot.bucket_miss_count for snapshot in snapshots),
-        specialization_request_count=sum(
-            snapshot.specialization_request_count for snapshot in snapshots
-        ),
-        active_leases=sum(snapshot.active_leases for snapshot in snapshots),
-        retired_plans=sum(snapshot.retired_plans for snapshot in snapshots),
+        active_plan_epoch=0,
+        prepare_count=0,
+        execute_count=0,
+        finish_count=0,
+        replay_count=0,
+        eager_count=0,
+        fallback_count=0,
+        fence_wait_count=0,
+        fence_record_count=0,
+        bucket_miss_count=0,
+        specialization_request_count=0,
+        active_leases=0,
+        retired_plans=0,
         deadline_flush_count=int(RUNTIME.placement_stats.deadline_flush_count),
     )
     from tllm.runtime.mp.control import active_control_plane
@@ -141,101 +108,8 @@ def read_workgraph_runtime_stats() -> "WorkGraphRuntimeStats":
     )
 
 
-def publish_workload_compilation(
-    compilation: object | None,
-    *,
-    bindings: object | None = None,
-) -> None:
-    """Publish an immutable result and activate only fully bound native plans."""
-
-    if compilation is not None:
-        from tllm.schedule.coordinator import WorkloadCompilation
-
-        if not isinstance(compilation, WorkloadCompilation):
-            raise TypeError("workload compilation must be WorkloadCompilation or None")
-        from tllm.runtime.workload_execution import build_native_workload_execution
-        from tllm.runtime.workload_execution import WorkloadExecutionBindings
-
-        if bindings is not None and not isinstance(bindings, WorkloadExecutionBindings):
-            raise TypeError("workload runtime bindings must be WorkloadExecutionBindings")
-        if bindings is None and RUNTIME.native_workloads_pending:
-            raise RuntimeError(
-                "native workload publication requires explicit bindings"
-            )
-
-        execution = build_native_workload_execution(
-            compilation,
-            runtime=RUNTIME,
-            consumers=(),
-            bindings=bindings,
-        )
-    else:
-        if bindings is not None:
-            raise ValueError("workload runtime bindings require a compilation")
-        execution = None
-    from tllm.runtime.workload_execution import NativeWorkloadExecutionStore
-
-    store = RUNTIME.workload_execution_store
-    previous = RUNTIME.workload_execution
-    if compilation is None:
-        if store is not None:
-            store.close()
-        elif previous is not None:
-            previous.close()
-        if RUNTIME.physical_executor is previous:
-            RUNTIME.physical_executor = None
-        RUNTIME.workload_execution_store = None
-        RUNTIME.workload_compilation = None
-        RUNTIME.workload_execution = None
-        return
-    if execution is None:
-        if store is not None:
-            store.close()
-        elif previous is not None:
-            previous.close()
-        if RUNTIME.physical_executor is previous:
-            RUNTIME.physical_executor = None
-        RUNTIME.workload_execution_store = None
-        RUNTIME.workload_compilation = compilation
-        RUNTIME.workload_execution = None
-        return
-    if (
-        previous is not None
-        and previous.plan_epoch == execution.plan_epoch
-        and previous.compilation.decision.signature
-        == execution.compilation.decision.signature
-        and previous.artifact_report == execution.artifact_report
-    ):
-        execution.close()
-        if store is None:
-            store = NativeWorkloadExecutionStore(previous)
-            RUNTIME.workload_execution_store = store
-        RUNTIME.workload_compilation = compilation
-        RUNTIME.workload_execution = previous
-        RUNTIME.physical_executor = previous
-        return
-    if store is None:
-        if previous is not None and previous is not execution:
-            store = NativeWorkloadExecutionStore(previous)
-            store.stage(execution)
-            RUNTIME.workload_execution_store = store
-            return
-        store = NativeWorkloadExecutionStore(execution)
-        RUNTIME.workload_execution_store = store
-        RUNTIME.workload_compilation = compilation
-        RUNTIME.workload_execution = execution
-        RUNTIME.physical_executor = execution
-        return
-    store.stage(execution)
-
-
 def advance_workload_anchor(anchor: str) -> bool:
-    """Advance the native plan at one backend-exported observable anchor."""
-
-    execution = RUNTIME.workload_execution
-    if execution is None:
-        return False
-    return execution.advance_anchor(str(anchor))
+    return False
 
 
 def runner_uses_compilation_or_cudagraph(runner: RunnerLike) -> bool:
@@ -347,14 +221,6 @@ def configure_runtime(
 
 
 def set_esamp_training_enabled(enabled: bool) -> None:
-    """Publish native ESamp enable semantics through an owning epoch."""
-    if (
-        RUNTIME.workload_execution is not None
-        or RUNTIME.workload_execution_store is not None
-    ):
-        raise RuntimeError(
-            "native ESamp enable changes require the retired workload coordinator"
-        )
     from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
     from tllm.runtime.mp.control import active_control_plane
 
@@ -365,9 +231,6 @@ def set_esamp_training_enabled(enabled: bool) -> None:
 
 
 def synchronize_esamp() -> None:
-    if RUNTIME.workload_execution is not None:
-        RUNTIME.workload_execution.synchronize()
-
     from tllm.runtime.mp.control import active_control_plane
 
     plane = active_control_plane()
@@ -376,10 +239,7 @@ def synchronize_esamp() -> None:
 
 
 def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
-    if RUNTIME.workload_execution is not None:
-        local = RUNTIME.workload_execution.read_and_reset_stats(sync=sync)
-    else:
-        local = TrainingStats(loss_avg=0.0, loss_count=0)
+    local = TrainingStats(loss_avg=0.0, loss_count=0)
     from tllm.runtime.mp.control import active_control_plane
 
     plane = active_control_plane()
@@ -389,12 +249,7 @@ def read_and_reset_esamp_stats(sync: bool = True) -> TrainingStats:
 
 
 def read_and_reset_esamp_per_request_stats(sync: bool = True) -> Dict[int, TrainingStats]:
-    if RUNTIME.workload_execution is not None:
-        local = dict(
-            RUNTIME.workload_execution.read_and_reset_per_request_stats(sync=sync)
-        )
-    else:
-        local = {}
+    local: Dict[int, TrainingStats] = {}
     from tllm.runtime.mp.control import active_control_plane
 
     plane = active_control_plane()

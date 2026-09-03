@@ -223,7 +223,7 @@ def _wrapped_prepare_inputs(
         num_scheduled_tokens=num_scheduled_tokens,
         input_batch=None,
     )
-    packed_execution = runtime.workload_execution
+    packed_execution = None
     if (
         packed_execution is not None
         and packed_execution.requires_packed_rows
@@ -250,10 +250,10 @@ def _wrapped_prepare_inputs(
         )
     _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
         binding=binding,
-        execution=runtime.workload_execution,
+        execution=None,
     )
     packed_rows = _scheduler_batch_phase.stage_prepared_packed_rows(
-        execution=runtime.workload_execution,
+        execution=None,
         step_id=int(runtime.event_step_id) + 1,
         columns=batch_columns,
         prompt_indices=runtime.reqid_to_promptidx,
@@ -480,17 +480,6 @@ class V027MRv1Driver:
             ),
         )
 
-    def export_main_workload_timeline(
-        self, *, graph_mode: str, static_headroom_bytes: int
-    ) -> Any:
-        from tllm.backends.timeline import export_main_workload_timeline
-
-        return export_main_workload_timeline(
-            self.capabilities(),
-            graph_mode=graph_mode,
-            static_headroom_bytes=static_headroom_bytes,
-        )
-
     def install_typed_layer_replay(self, *, runtime: Any, runner: Any) -> Any:
         from tllm.backends.vllm import typed_layer_replay
 
@@ -572,7 +561,7 @@ class V027MRv1Driver:
             binding = _runner_adapter.get_runner_binding(runner)
             _packed_hidden_capture.synchronize_runner_packed_hidden_capture(
                 binding=binding,
-                execution=core.RUNTIME.workload_execution,
+                execution=None,
             )
             overlay_controller = _parameter_overlay.maybe_bind_publisher(
                 runtime=core.RUNTIME,
@@ -608,7 +597,7 @@ class V027MRv1Driver:
             def _stage_forward_captures() -> None:
                 _packed_hidden_capture.publish_runner_packed_hidden_capture(
                     binding=binding,
-                    execution=core.RUNTIME.workload_execution,
+                    execution=None,
                 )
                 if overlay_controller is not None:
                     overlay_controller.stage_dense_operand_captured()

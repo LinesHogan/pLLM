@@ -9,7 +9,6 @@ mod decode_localization;
 mod prefill_row_plan;
 mod recurrence;
 mod sampler_plan;
-mod schedule;
 mod shape_specialization;
 mod workload_frontend;
 
@@ -24,7 +23,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     shape_specialization::register(m)?;
     prefill_row_plan::register(m)?;
     recurrence::register(m)?;
-    schedule::register(m)?;
     workload_frontend::register(m)?;
     Ok(())
 }

@@ -1,48 +1,18 @@
 #!/usr/bin/env python3
-"""Shared helpers for deciding whether dispatch-plan targets are active."""
+"""Shared helpers for deciding whether hook targets are active."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
-
-if TYPE_CHECKING:
-    from tllm.runtime.sampler_bridge.provider import SamplerModifierProvider
-    from tllm.runtime.workload_execution import NativeWorkloadExecution
+from typing import Protocol
 
 
 class RuntimeWithTargets(Protocol):
-    workload_execution: "NativeWorkloadExecution | None"
     native_workloads_pending: bool
 
 
-def _has_active_sampler_provider(runtime: RuntimeWithTargets) -> bool:
-    provider = _sampler_provider(runtime)
-    if provider is None:
-        return False
-    return bool(provider.is_active())
-
-
-def _sampler_provider(
-    runtime: RuntimeWithTargets,
-) -> "SamplerModifierProvider | None":
-    execution = runtime.workload_execution
-    if execution is not None:
-        provider = execution.sampler_modifier_provider()
-        if provider is not None:
-            return provider
-    return None
-
-
 def runtime_has_active_targets(runtime: RuntimeWithTargets) -> bool:
-    return bool(
-        _has_active_sampler_provider(runtime)
-        or runtime.workload_execution is not None
-        or runtime.native_workloads_pending
-    )
+    return bool(runtime.native_workloads_pending)
 
 
 def runtime_requires_decode_hidden(runtime: RuntimeWithTargets) -> bool:
-    """Read the decode-residual requirement projected from the signed Regions."""
-
-    execution = runtime.workload_execution
-    return execution is not None and execution.requires_decode_hidden
+    return False

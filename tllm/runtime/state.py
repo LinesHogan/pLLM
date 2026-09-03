@@ -27,14 +27,7 @@ from tllm.runtime.stats import PlacementStats
 from tllm.runtime.update_barrier_runtime import UpdateBarrierBatch, UpdateBarrierStore
 
 if TYPE_CHECKING:
-    from tllm.schedule.contracts import ScheduleGraph
-    from tllm.schedule.coordinator import WorkloadCompilation
-    from tllm.runtime.workload_execution import (
-        NativeWorkloadExecution,
-        NativeWorkloadExecutionStore,
-    )
     from tllm.runtime.torch_adapter import CudaLongHostStaging
-    from tllm.runtime.scheduling.workgraph_executor import WorkGraphRuntimeStatsReader
 
 
 @dataclass
@@ -105,14 +98,15 @@ class ResidualRuntimeState:
     path_hotspot_cpu_ms: dict[str, float] = field(default_factory=dict)
     path_hotspot_counts: dict[str, int] = field(default_factory=dict)
 
-    physical_executor: Optional["WorkGraphRuntimeStatsReader"] = None
+    physical_executor: object | None = None
     physical_prepared_step_id: int = -1
-    # Immutable new-middle-end output activated by the native physical executor.
-    workload_compilation: Optional["WorkloadCompilation"] = None
-    workload_execution: Optional["NativeWorkloadExecution"] = None
-    workload_execution_store: Optional["NativeWorkloadExecutionStore"] = None
+    # Retired native workload execution state.  These remain empty while the
+    # residual vLLM hook surface is pruned away from the old scheduler.
+    workload_compilation: object | None = None
+    workload_execution: object | None = None
+    workload_execution_store: object | None = None
     native_workloads_pending: bool = False
-    native_schedule_graph: Optional["ScheduleGraph"] = None
+    native_schedule_graph: object | None = None
     native_hidden_path_aliases: dict[str, str] = field(default_factory=dict)
     placement_stats: PlacementStats = field(default_factory=PlacementStats)
     reward_outcome_store: RewardOutcomeStore = field(default_factory=RewardOutcomeStore)

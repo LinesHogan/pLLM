@@ -7,9 +7,8 @@ Usage (from the repo root, venv activated)::
     python tools/check_typing.py --rebase   # lock in a strictly non-regressing baseline
 
 Tiers:
-  - strict: ``pyrightconfig.strict.json`` over core contracts plus the workload
-    DSL, typed kit/runtime bindings, migrated native workloads, and their public
-    composition fixture. Hard gate: 0 errors, 0 warnings.
+  - strict: ``pyrightconfig.strict.json`` over core contracts plus canonical
+    runtime/backend boundaries. Hard gate: 0 errors, 0 warnings.
   - basic: ``pyrightconfig.json`` over the rest of tllm/ (vllm_patch and
     backends excluded as the sanctioned getattr quarantine). Errors are
     bucketed per directory and compared against ``tools/typing_baseline.json``;
@@ -20,8 +19,8 @@ Dynamic-boundary allowlist:
     version-dependent vLLM token-limit attributes. It returns a closed typed
     facts object or fails closed; reflection cannot escape that function.
 
-All other workload/native-runtime files reject ``Any``, reflection, and type
-ignore escapes through the AST gate below.
+The strict surface rejects ``Any``, reflection, and type ignore escapes through
+the AST gate below.
 """
 
 from __future__ import annotations
@@ -39,28 +38,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STRICT_CONFIG = "pyrightconfig.strict.json"
 BASIC_CONFIG = "pyrightconfig.json"
 BASELINE_PATH = REPO_ROOT / "tools" / "typing_baseline.json"
-WORKLOAD_SURFACE = tuple(
-    path.relative_to(REPO_ROOT)
-    for path in sorted((REPO_ROOT / "tllm" / "workload").glob("*.py"))
-)
 AUTHOR_SURFACE = (
-    *WORKLOAD_SURFACE,
     Path("tllm/backends/vllm/packed_hidden_capture.py"),
     Path("tllm/backends/vllm/typed_layer_replay.py"),
     Path("tllm/runtime/backend_region_binders.py"),
     Path("tllm/runtime/mp/worker_extension.py"),
     Path("tllm/runtime/parameter_overlay.py"),
     Path("tllm/runtime/packed_phase_row_staging.py"),
-    Path("tllm/runtime/runtime.py"),
-    Path("tllm/runtime/workload_bindings.py"),
-    Path("tllm/runtime/workload_execution.py"),
-    Path("tllm/runtime/workload_plugins.py"),
 )
 
 FORBIDDEN_COMPATIBILITY_NAMES = frozenset(
     {
-        "NativeWorkloadResources",
-        "ReconstructedWorkload",
         "workload_output_sinks",
         "workload_provided_inputs",
         "workload_state_snapshots",
@@ -126,16 +114,6 @@ DYNAMIC_BOUNDARY_ALLOWLIST = frozenset(
             "_runner_specialization_facts",
             "getattr",
         ),
-        (
-            Path("tllm/runtime/workload_plugins.py"),
-            "_resolve_factory",
-            "getattr",
-        ),
-        (
-            Path("tllm/runtime/workload_plugins.py"),
-            "_resolve_factory",
-            "importlib.import_module",
-        ),
     }
 )
 
@@ -164,19 +142,6 @@ class _TypingRuleVisitor(ast.NodeVisitor):
             self.violations.append(
                 f"{self.relative}:{node.lineno}: type-check wrapper helpers are forbidden"
             )
-        if self.class_name == "TllmRuntime" and node.name == "local_workload":
-            parameter = node.args.args[1] if len(node.args.args) > 1 else None
-            parameter_type = (
-                ast.unparse(parameter.annotation)
-                if parameter is not None and parameter.annotation is not None
-                else ""
-            )
-            return_type = ast.unparse(node.returns) if node.returns is not None else ""
-            if parameter_type != "ConfiguredWorkloadT" or return_type != "ConfiguredWorkloadT":
-                self.violations.append(
-                    f"{self.relative}:{node.lineno}: local_workload must preserve the "
-                    "runtime workload-set TypeVar"
-                )
         previous = self.function
         self.function = node.name
         self.generic_visit(node)
@@ -191,15 +156,6 @@ class _TypingRuleVisitor(ast.NodeVisitor):
         self.class_name = previous
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if (
-            self.class_name == "WorkloadExecutionBindings"
-            and isinstance(node.target, ast.Name)
-            and node.target.id in {"provided_inputs", "output_sinks"}
-        ):
-            self.violations.append(
-                f"{self.relative}:{node.lineno}: execution callback maps must use "
-                "RuntimePortRegistry"
-            )
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:

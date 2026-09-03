@@ -25,15 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # to legacy compatibility modules: that would turn this focused hard gate into
 # a migration inventory and encourage exemptions.
 AUTHORITY_FILES = (
-    Path("rust/tllm_core/src/schedule.rs"),
-    Path("tllm/schedule/compiler.py"),
-    Path("tllm/schedule/contracts.py"),
-    Path("tllm/schedule/physical.py"),
-    Path("tllm/workload/region_compiler.py"),
-    Path("tllm/runtime/workload_execution.py"),
     Path("tllm/runtime/backend_region_binders.py"),
     Path("tllm/runtime/typed_recurrence.py"),
-    Path("tllm/backends/timeline.py"),
     Path("tllm/backends/vllm/model_region.py"),
     Path("tllm/backends/vllm/sampler_mrv1.py"),
     Path("tllm/backends/vllm/sampler_mrv2.py"),
@@ -46,24 +39,19 @@ AUTHORITY_FILES = (
 # those names without acquiring physical scheduling authority.
 NATIVE_BINDING_FILES = (
     Path("tllm/runtime/mp/worker_extension.py"),
-    Path("tllm/runtime/workload_plugins.py"),
     Path("tllm/backends/vllm/typed_layer_replay.py"),
 )
 
 PHYSICAL_FILES = frozenset(
     {
-        Path("tllm/schedule/physical.py"),
-        Path("tllm/runtime/workload_execution.py"),
         Path("tllm/runtime/backend_region_binders.py"),
         Path("tllm/runtime/typed_recurrence.py"),
-        Path("tllm/backends/timeline.py"),
         Path("tllm/backends/vllm/model_region.py"),
     }
 )
 
 COMPILER_DISPATCH_FILES = frozenset(
     {
-        Path("tllm/workload/region_compiler.py"),
         *PHYSICAL_FILES,
     }
 )

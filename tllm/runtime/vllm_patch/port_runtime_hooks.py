@@ -7,7 +7,7 @@ import copy
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence
 
 import torch
 
@@ -31,11 +31,6 @@ from tllm.backends.protocol import BackendObservableEvent
 from tllm.runtime.instrumentation import path_hotspots_enabled, record_path_hotspot_cpu
 from tllm.runtime.resources import SamplerPrecomputeState
 from tllm.runtime.stats import PlacementStats
-from tllm.contracts.request_identity import resolve_request_identity
-from tllm.runtime.request_trainable_state import RequestIdentityBatch
-
-if TYPE_CHECKING:
-    from tllm.runtime.workload_execution import NativeWorkloadExecution
 
 
 _COMPUTE_LOGITS_HOOK_FLAG = "_tllm_compute_logits_wrapped"
@@ -230,7 +225,6 @@ class PortRuntimeStateLike(Protocol):
     source_resolved_path: str
     target_resolved_path: str
     event_step_id: int
-    workload_execution: "NativeWorkloadExecution | None"
     reqid_to_promptidx: Mapping[str, int]
     reqid_to_sampleidx: Mapping[str, int]
 
@@ -307,16 +301,6 @@ def store_decode_localization(
         core.RUNTIME.decode_sample_idx_tensor = None
         core.RUNTIME.decode_compact_count = 0
         core.RUNTIME.decode_compact_row_ids = ()
-        execution = core.RUNTIME.workload_execution
-        if execution is not None:
-            execution.stage_sampler_identity(
-                core.RUNTIME.event_step_id, (), (), None
-            )
-            if execution.requires_request_identities:
-                execution.stage_request_identities(
-                    core.RUNTIME.event_step_id,
-                    RequestIdentityBatch(()),
-                )
         return
 
     k = int(row_idx.numel())
@@ -360,41 +344,6 @@ def store_decode_localization(
     else:
         core.RUNTIME.decode_prompt_idx_tensor = None
         core.RUNTIME.decode_sample_idx_tensor = None
-    execution = core.RUNTIME.workload_execution
-    if execution is not None:
-        execution.stage_sampler_identity(
-            core.RUNTIME.event_step_id,
-            tuple(core.RUNTIME.decode_request_ids),
-            tuple(core.RUNTIME.decode_sample_idxs),
-            core.RUNTIME.decode_sample_idx_tensor,
-        )
-        if execution.requires_request_identities:
-            identities = []
-            for request_id, prompt_idx, sample_idx in zip(
-                core.RUNTIME.decode_request_ids,
-                core.RUNTIME.decode_prompt_idxs,
-                core.RUNTIME.decode_sample_idxs,
-                strict=True,
-            ):
-                identity = resolve_request_identity(
-                    request_id,
-                    prompt_indices=core.RUNTIME.reqid_to_promptidx,
-                    sample_indices=core.RUNTIME.reqid_to_sampleidx,
-                )
-                if (
-                    identity is None
-                    or identity.prompt_idx != prompt_idx
-                    or identity.sample_idx != sample_idx
-                ):
-                    raise RuntimeError(
-                        "native request-state identity differs from decode metadata"
-                    )
-                identities.append(identity)
-            execution.stage_request_identities(
-                core.RUNTIME.event_step_id,
-                RequestIdentityBatch(tuple(identities)),
-            )
-
     compact_row_idx = getattr(core.RUNTIME, "decode_compact_row_idx", None)
     if isinstance(compact_row_idx, torch.Tensor):
         seen: set[int] = set()
@@ -444,16 +393,6 @@ def _clear_decode_localization(core: DecodeHookCoreLike) -> None:
     core.RUNTIME.decode_sample_idx_tensor = None
     core.RUNTIME.decode_compact_count = 0
     core.RUNTIME.decode_compact_row_ids = ()
-    execution = core.RUNTIME.workload_execution
-    if execution is not None:
-        execution.stage_sampler_identity(
-            core.RUNTIME.event_step_id, (), (), None
-        )
-        if execution.requires_request_identities:
-            execution.stage_request_identities(
-                core.RUNTIME.event_step_id,
-                RequestIdentityBatch(()),
-            )
 
 
 def prepare_decode_localization(
@@ -546,12 +485,7 @@ def prepare_native_decode_metadata(
     localize_decode: Callable[[], object],
 ) -> None:
     """Prepare native runtime decode metadata after vLLM input assembly."""
-    if (
-        core.RUNTIME.workload_execution is not None
-        and core.RUNTIME.workload_execution.requires_request_identities
-    ):
-        localize_decode()
-    elif active_targets.runtime_requires_decode_hidden(core.RUNTIME):
+    if active_targets.runtime_requires_decode_hidden(core.RUNTIME):
         localize_decode()
 
 def maybe_launch_post_logits_decode_work(*, core: Any, runner: Any) -> None:

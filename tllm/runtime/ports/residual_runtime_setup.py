@@ -19,7 +19,6 @@ from tllm.runtime.ports.residual_write import ResidualWriteLease, WriteLeaseKey
 from tllm.runtime.ports.tap_handle import TapHandle
 
 if TYPE_CHECKING:
-    from tllm.schedule.contracts import ScheduleGraph
     from tllm.runtime.torch_adapter import CudaLongHostStaging
 
 
@@ -69,7 +68,7 @@ class RuntimeLike(Protocol):
     source_resolved_path: str
     target_resolved_path: str
     launch_consumer_from_hooks: bool
-    native_schedule_graph: "ScheduleGraph | None"
+    native_schedule_graph: object | None
     native_hidden_path_aliases: dict[str, str]
 
 
@@ -92,23 +91,12 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
     model = runner_model_module(runner)
     cfg = core.RUNTIME.config
     raw_paths_by_locator = _residual_bindings.raw_paths_from_runtime(core.RUNTIME)
-    native_graph = core.RUNTIME.native_schedule_graph
     required: set[tuple[int, str, str]] = set()
-    if native_graph is not None:
-        # Native resources declare the exact logical locators they can bind.
-        required = {
-            (locator.layer, locator.site, locator.phase)
-            for locator in raw_paths_by_locator
-        }
     tap_paths = _residual_bindings.build_raw_tap_paths(
         raw_paths_by_locator=raw_paths_by_locator,
         required=required,
     )
-    native_paths = (
-        []
-        if native_graph is None
-        else list(dict.fromkeys(raw_paths_by_locator.values()))
-    )
+    native_paths: list[str] = []
     for path in native_paths:
         if path not in tap_paths:
             tap_paths.append(path)
@@ -153,7 +141,7 @@ def resolve_runtime_setup(*, core: CoreLike, runner: object) -> ResidualRuntimeS
         raise RuntimeError("Please set graph_scratch_rows > 0 (or ensure runner.max_num_reqs > 0)")
     compact_rows = 0
     compact_lane_enabled = bool(getattr(cfg, "compact_capture_lane", False))
-    if compact_lane_enabled and native_graph is not None:
+    if compact_lane_enabled and raw_paths_by_locator:
         compact_rows = rows
     capture_full_rows = True
     if bool(getattr(cfg, "enable_distiller_intervention", False)):

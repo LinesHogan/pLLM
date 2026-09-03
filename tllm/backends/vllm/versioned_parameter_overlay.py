@@ -22,7 +22,6 @@ from tllm.contracts.request_identity import (
     resolve_request_identity,
 )
 from tllm.runtime.parameter_overlay import (
-    DenseOperandCaptureBatch,
     OverlayChannel,
     OverlayCaptureRows,
     OverlayLeaseKey,
@@ -47,23 +46,7 @@ _IN_MEMORY_PATH = "__tllm_in_memory_overlay__"
 _LORA_ID_BASE = 1_000_000_000
 
 
-class _OverlayExecution(Protocol):
-    @property
-    def parameter_overlays(
-        self,
-    ) -> Mapping[OverlayChannel, OverlayVersionStore]: ...
-
-    def stage_request_finished(self, batch: RequestFinishedBatch) -> int: ...
-
-    def stage_dense_operand_captured(
-        self, batch: DenseOperandCaptureBatch
-    ) -> int: ...
-
-
 class _OverlayRuntime(Protocol):
-    @property
-    def workload_execution(self) -> _OverlayExecution | None: ...
-
     @property
     def reqid_to_promptidx(self) -> Mapping[str, int]: ...
 
@@ -524,19 +507,7 @@ class VLLMParameterOverlayController:
             raise RuntimeError(
                 "dense operand capture did not observe every signed target"
             )
-        execution = self.runtime.workload_execution
-        if execution is None:
-            raise RuntimeError(
-                "dense operand capture requires an active native execution"
-            )
-        staged = execution.stage_dense_operand_captured(
-            DenseOperandCaptureBatch(captures)
-        )
-        if staged < 1:
-            raise RuntimeError(
-                "dense operand capture requires a signed capture port"
-            )
-        return staged
+        raise RuntimeError("signed dense operand capture staging is retired")
 
     def clear_dense_step(self) -> None:
         for target, handle in self.state.dense_targets.items():
@@ -645,19 +616,6 @@ class VLLMParameterOverlayController:
         """Legacy direct-overlay path; runtime adapters do not call this."""
 
         batch = self.release_finished(request_ids)
-        execution = self.runtime.workload_execution
-        if execution is not None and batch.requests:
-            requires_signed_cleanup = any(
-                lineage.request in batch.requests
-                for store in set(self.stores.values())
-                for lineage in store.lineages()
-            )
-            if requires_signed_cleanup:
-                staged = execution.stage_request_finished(batch)
-                if staged < 1:
-                    raise RuntimeError(
-                        "request-scoped overlays require a signed request-finished port"
-                    )
         self.consume_finished_batch(batch)
         return batch
 
@@ -697,9 +655,8 @@ def maybe_bind_publisher(
     runner: VLLMParameterOverlayRunner,
     state: OverlayBackendState | None,
 ) -> VLLMParameterOverlayController | None:
-    execution = runtime.workload_execution
     stores: Mapping[OverlayChannel, OverlayVersionStore] = (
-        {} if execution is None else execution.parameter_overlays
+        {} if state is None else state.stores
     )
     if state is None:
         if stores:
