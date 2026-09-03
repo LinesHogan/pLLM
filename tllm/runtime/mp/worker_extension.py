@@ -581,18 +581,6 @@ class TllmWorkerExtension:
                 )
             core.set_esamp_training_enabled(bool(flags["esamp_training_enabled"]))
 
-    def tllm_bind_runner_runtime(self) -> None:
-        """Record this worker's runner in the runner->runtime routing table.
-
-        String-method replacement for the old closure RPC (closures need
-        VLLM_ALLOW_INSECURE_SERIALIZATION and cannot cross to the child).
-        """
-        from tllm.runtime.runtime import active_runtime, bind_runner_runtime
-
-        runner = _runner_of(self)
-        if runner is not None:
-            bind_runner_runtime(runner, active_runtime())
-
     def tllm_runner_name(self) -> str:
         """Report the model runner class actually serving this worker."""
         runner = _runner_of(self)

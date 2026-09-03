@@ -605,16 +605,12 @@ class V027MRv1Driver:
                     step_id=None if session is None else session.step_id,
                 )
 
-            capture_attempted = False
-
             def _stage_forward_captures() -> None:
-                nonlocal capture_attempted
                 _packed_hidden_capture.publish_runner_packed_hidden_capture(
                     binding=binding,
                     execution=core.RUNTIME.workload_execution,
                 )
                 if overlay_controller is not None:
-                    capture_attempted = True
                     overlay_controller.stage_dense_operand_captured()
 
             try:
@@ -641,14 +637,6 @@ class V027MRv1Driver:
                 _model_region.abort_model_region_step(
                     core.RUNTIME, int(core.RUNTIME.event_step_id)
                 )
-                if capture_attempted:
-                    from tllm.runtime import residual_runtime as _residual_runtime
-                    from tllm.runtime.runtime import active_runtime
-
-                    if core is _residual_runtime:
-                        active_runtime().fail_stop_native_workloads(
-                            "MRv1 dense operand capture failed after forward"
-                        )
                 raise
             finally:
                 if overlay_controller is not None:

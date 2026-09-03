@@ -268,7 +268,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         runtime.launch_consumer_from_hooks = not core._runner_uses_compilation_or_cudagraph(runner)
     else:
         _hooks.setup_runtime_hooks_if_active(core=core, runner=runner)
-    capture_attempted = False
     try:
         out = orig(runner, *args, **kwargs)
         if session.state is StepState.BACKEND_WARMUP:
@@ -279,7 +278,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
                 execution=runtime.workload_execution,
             )
         if overlay_controller is not None:
-            capture_attempted = True
             overlay_controller.stage_dense_operand_captured()
     except Exception as exc:
         if session.state is StepState.BACKEND_WARMUP:
@@ -287,14 +285,6 @@ def _wrapped_execute_model(*, core: Any, runner: Any, args: tuple, kwargs: dict,
         _packed_hidden_capture.abort_runner_packed_hidden_capture(binding)
         session.fail(str(exc))
         _model_region.abort_model_region_step(runtime, int(runtime.event_step_id))
-        if capture_attempted:
-            from tllm.runtime import residual_runtime as _residual_runtime
-            from tllm.runtime.runtime import active_runtime
-
-            if core is _residual_runtime:
-                active_runtime().fail_stop_native_workloads(
-                    "MRv2 dense operand capture failed after forward"
-                )
         raise
     finally:
         if overlay_controller is not None:

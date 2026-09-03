@@ -4210,7 +4210,7 @@ def _native_workload_execution(
     if compilation.decision.completion_anchor not in known_anchors:
         raise RuntimeError("signed Region completion anchor has no Region binding")
 
-    from tllm.workload import WorkloadAuthority
+    from tllm.workload.frontend import WorkloadAuthority
 
     if any(
         declaration.authority is not WorkloadAuthority.NATIVE_REGION

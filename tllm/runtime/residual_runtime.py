@@ -84,14 +84,9 @@ def prepare_physical_workgraph_step(step_id: int) -> None:
     if workload_store is not None:
         pending_shapes = workload_store.current.peek_shape_specialization_requests()
         if pending_shapes:
-            from tllm.runtime.runtime import active_runtime
-
-            if active_runtime().apply_region_shape_specializations(pending_shapes):
-                drained = workload_store.current.drain_shape_specialization_requests()
-                if drained != pending_shapes:
-                    raise RuntimeError(
-                        "native shape specialization queue changed during safe-point compilation"
-                    )
+            raise RuntimeError(
+                "native workload shape-specialization coordinator is retired"
+            )
         workload_execution = workload_store.prepare_step(step)
         RUNTIME.workload_execution = workload_execution
         RUNTIME.workload_compilation = workload_execution.compilation
@@ -353,24 +348,12 @@ def configure_runtime(
 
 def set_esamp_training_enabled(enabled: bool) -> None:
     """Publish native ESamp enable semantics through an owning epoch."""
-    from tllm.runtime.runtime import active_runtime
-
-    runtime = active_runtime()
-    if runtime.has_native_workloads and (
+    if (
         RUNTIME.workload_execution is not None
         or RUNTIME.workload_execution_store is not None
     ):
-        from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
-        from tllm.runtime.mp.control import active_control_plane
-
-        runtime.transition_native_workload_enabled(
-            bool(enabled), plane=active_control_plane()
-        )
-        refresh_exported_bootstrap_spec()
-        return
-    elif RUNTIME.workload_execution is not None:
         raise RuntimeError(
-            "native ESamp enable changes require the owning coordinator runtime"
+            "native ESamp enable changes require the retired workload coordinator"
         )
     from tllm.runtime.mp.bootstrap import refresh_exported_bootstrap_spec
     from tllm.runtime.mp.control import active_control_plane

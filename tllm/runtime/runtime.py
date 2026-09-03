@@ -28,7 +28,7 @@ from typing_extensions import TypeVar as TypeVarWithDefault
 import warnings
 from uuid import uuid4
 
-from tllm.workload import (
+from tllm.workload.frontend import (
     NativeWorkloadDefinition,
     WorkloadAuthority,
     WorkloadDefinition,
@@ -1239,7 +1239,7 @@ class TllmRuntime(Generic[ConfiguredWorkloadT]):
                 "cannot rebuild a workload epoch with unresolved staged ports"
             )
         from tllm.schedule.coordinator import WorkloadCompilerCoordinator
-        from tllm.workload import declare_workload
+        from tllm.workload.frontend import declare_workload
 
         declarations = tuple(
             declare_workload(workload_instance)

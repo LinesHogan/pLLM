@@ -235,7 +235,8 @@ def reconstruct_worker_bindings(
         StateVersionBinding,
         WorkloadExecutionBindings,
     )
-    from tllm.workload import StateScope, declare_workload
+    from tllm.workload.frontend import declare_workload
+    from tllm.workload.ir import StateScope
     from tllm.workload.lowering import lower_schedule_graph
 
     if not specs:

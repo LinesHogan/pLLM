@@ -1,35 +1,10 @@
 #!/usr/bin/env python3
-"""Runtime layer public surface.
+"""Runtime package marker.
 
-Submodules (``residual_runtime``, ``scheduling.*`` ...) are
-imported directly by their consumers; the package root exports only the
-instance-scoped runtime API.
+Runtime submodules are imported directly by their owners.  The retired
+``TllmRuntime`` workload authority is intentionally not re-exported here.
 """
 
 from __future__ import annotations
 
-from tllm.contracts.workload_ports import StagedPortTransactionResolution
-from tllm.runtime.runtime import (
-    StagedPortTransactionReceipt,
-    TllmRuntime,
-    default_runtime,
-)
-from tllm.runtime.backend_region_binders import BackendRegionBinderSlot
-from tllm.runtime.workload_execution import StateVersionBinding
-from tllm.runtime.workload_plugins import (
-    NativeWorkload,
-    WorkloadWorkerSpec,
-)
-from tllm.runtime.workload_bindings import WorkloadRuntimeBinding
-
-__all__ = [
-    "NativeWorkload",
-    "BackendRegionBinderSlot",
-    "StateVersionBinding",
-    "StagedPortTransactionReceipt",
-    "StagedPortTransactionResolution",
-    "TllmRuntime",
-    "WorkloadWorkerSpec",
-    "WorkloadRuntimeBinding",
-    "default_runtime",
-]
+__all__: list[str] = []
