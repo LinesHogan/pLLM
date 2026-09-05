@@ -24,22 +24,46 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `e57caa6` on `main` | — | after `e03816d` |
-| Counted production/support source | 26,014 lines | -107,196 lines | -65,312 lines |
-| Pytest collection | 8 items | -1,341 items | -3 items |
+| Commit | `70a82d2` on `main` | — | after `e03816d` |
+| Counted production/support source | 25,339 lines | -107,871 lines | -65,987 lines |
+| Pytest collection | 9 items | -1,340 items | -2 items |
 | Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 16 items | below the 50-item ceiling; not yet the final evidence set | -2 items |
+| Visible `TEST_COUNT` | 17 items | below the 50-item ceiling; not yet the final evidence set | -1 item |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38 and 39.
+evidence IDs 1, 2, 3, 5, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38 and 39.
 The agreed programmable-inference composition adds target IDs 40/41 to the
-original 39, leaving 25 pending survivor evidence items. Those items are implementation
+original 39, leaving 24 pending survivor evidence items. Those items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared attachment boundary after `e57caa6`
+
+Commit `70a82d2`: counted source `+330 / -1,005 / net -675`; the 24-line
+task-binding function moved unchanged. Independent tensor math did not change.
+Attachment inputs now retain the original request, probe and plan; the plan
+retains original tensor-layout facts. Removed copied probe/signature/key facts,
+wire DTOs, the sampler attachment module, deployment field copies and compilation
+digest copies. Python attachment guards were removed; Rust is the validator.
+Request/decision/physical attachment schema is now 2; probe remains schema 1.
+
+Evidence 15 first exposed acceptance of overlay field 999 outside the layout.
+It now covers both actual workload compilations, signed layout identity, field
+membership, task/hidden/stage binding, mechanical projection, reconstruction
+drift and closed schema. Legal alternate field/module choices change signatures;
+the test does not claim inference of algorithm-specific field roles. There are
+17 active and 24 pending items. Generic backend sessions/factory, final PTTS,
+AER, MP and programmable composition remain unfinished.
+
+Repository-venv verification: full pytest 9 passed in 26.10s, Rust 4 passed,
+strict/basic typing 0/0 and import/authority gates passed. All four standalone
+GPU smokes ran: ESamp loss/update 2; In-Place updates/trained rows 6, apply rows 8;
+CUDA Graph loss/update 4 with stable addresses; FTTT loss/update 1 and version 1.
+Cleanup and zero-fallback checks passed. No benchmark, release or research-note edits.
 
 ### Shared In-Place execution after `9dfa7e7`
 

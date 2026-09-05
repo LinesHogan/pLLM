@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`e57caa6`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`70a82d2`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,24 +13,24 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 26,014；相对 133,210 净减 107,196（约 80.5%） |
-| 距第一轮 30k 上限 | 当前余量 3,986 行；补齐缺失能力仍须与新栈压缩配套 |
-| 本轮源码差分 | 相对 `9dfa7e7` 新增 294 / 删除 523 / 净减 229；无文件搬移，无独立数学 kernel 变更 |
+| SOURCE_LOC | 25,339；相对 133,210 净减 107,871（约 81.0%） |
+| 距第一轮 30k 上限 | 当前余量 4,661 行；补齐缺失能力仍须与新栈压缩配套 |
+| 本轮源码差分 | 相对 `e57caa6` 新增 330 / 删除 1,005 / 净减 675；任务绑定函数 24 行原样移动，无独立数学 kernel 变更 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
-| 留存证据基础 | 4 个 Rust tests + 8 个 pytest items + 4 个独立 GPU smoke，共 16 项 |
-| 终态证据债务 | 原 39 项中 23 项待补，加新增组合 40/41，共 25 项待补 |
+| 留存证据基础 | 4 个 Rust tests + 9 个 pytest items + 4 个独立 GPU smoke，共 17 项 |
+| 终态证据债务 | 原 39 项中 22 项待补，加新增组合 40/41，共 24 项待补 |
 
 SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除。移动不作为减量成果。
 当前目录体积用于选择整块处理边界，不能直接当作可删除量：
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 13,022 |
-| tllm/backends + canonical_vllm | 3,360 + 2,853 |
-| tllm/contracts | 2,262 |
-| Rust | 3,432 |
+| tllm/canonical | 12,728 |
+| tllm/backends + canonical_vllm | 3,360 + 2,691 |
+| tllm/contracts | 2,141 |
+| Rust | 3,334 |
 | tools / 顶层入口及 stub | 857 / 228 |
 
 ## 下一轮实施顺序与完成条件
@@ -69,7 +69,13 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   Rust 现在从结果输入、附加 ordering edge 和 timing 派生唯一 GraphIndex；FTTT、GTTA、
   In-Place、ESamp 的重复 producer→consumer 边已删除。Python FFI 从共享 dataclass 机械编码，
   删除第二套 wire DTO 及其逐字段复制，只补封闭 input variant tag。
-- `canonical_vllm/runtime.py` 仍有 1,494 行，直接 import ESamp/In-Place-TTT，
+- 附件输入收敛为原始 `request/probe/plan` 引用，plan 持有原始 tensor-layout request/decision；
+  request 不再复制 probe facts、plan signatures 或 request-key schema。sampler 独立附件模块和
+  wire DTO 删除，FFI 机械编码同一结构；Rust 校验 layout 身份、字段存在性和阶段/任务绑定。
+  deployment 只保留 compilation 和 signed attachment；execution、hidden/target facts、dtype、
+  sampler beta 和参数 digest 不再额外复制。附件相关 Python 重复校验删除，由 Rust 边界负责。
+  第 15 项已补统一证据；这不代表跨 workload executor/factory/session 已通用化。
+- `canonical_vllm/runtime.py` 仍有 1,332 行，直接 import ESamp/In-Place-TTT，
   deployment/execution 类型为两者 union，公共 factory 仅接受这两种 workload。
   `canonical_runtime` 目录虽然已删，workload-specific 编排职责仍有残留。
 - 把 workload 编排收进同一 typed executor/host transaction；CPU/CUDA 共享 transition，
@@ -115,7 +121,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   旧 workload RPC 被删除不等于新的 worker reconstruction、prepare/commit/abort、quorum
   已实现；补共享 tensor 生命周期和真实 EngineCore child 路径，对应 16–18、36。
 - generic host transaction 的 abort/requeue/post-publish settlement（19）已通过；
-  发布后失败返回原始 receipt 继续结算，不重跑 host effect。signed attachment 统一证据（15）仍待补。
+  发布后失败返回原始 receipt 继续结算，不重跑 host effect。signed attachment 统一证据（15）已补；
+  它证明字段属于签名 layout 及原始选择不可篡改，不声称推导了 workload 字段的数学角色。
 - typed authoring descriptors、统一 workload-independent profiling 仍待完成；
   profiling 消费通用执行事件，替换散落 counters/hooks，不新增 workload callback。
 
@@ -125,9 +132,9 @@ PTTS/AER 设计继续以 `doc/research-aer-paged-state.md` 为唯一权威。
 
 ### 5. 补齐证据、发布验证与最终压缩（A/G）
 
-- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,13,19,20,21,22,23,25,30,32,37,38,39`。
-  pending IDs 是 `4,6–12,14–18,24,26–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
-- 25 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
+- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,13,15,19,20,21,22,23,25,30,32,37,38,39`。
+  pending IDs 是 `4,6–12,14,16–18,24,26–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
+- 24 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
   数值/版本/cleanup contract。禁止为凑 39 写 DTO、mock 调用次数或旧内部结构测试。
 - manifest 最终逐项列出实际文件/命令、observable contract、环境、GPU/MP 要求及替代的
   旧测试来源。训练必须非零 loss/update，执行必须 zero fallback。
@@ -223,6 +230,15 @@ execution 缺少接口处先失败，合并后通过取消重试、sampler gate�
 active_lineages/pending_releases/fallback 均 0；公共 plain→ESamp loss/update 各 2，
 active_lineages/fallback 均 0。CUDA Graph/FTTT 路径本次未改、未复跑，分别沿用
 `9dfa7e7`/`86e1326`。未运行吞吐 benchmark；未声称完成发布后故障恢复。
+
+`70a82d2`：附件字段越界反例在旧 Rust 编译器接受字段 999 时先失败，改为共享 plan/layout
+验证后通过。第 15 项用真实 ESamp/In-Place 编译覆盖 exact task/hidden/field/stage、跨 layout
+错配、mechanical projection、reconstruction/local drift 和 closed schema，替代原附件 fixture。
+完整 pytest 9 passed（26.10s）、Rust 4 passed，strict/basic typing 0/0、import/authority gates
+通过。四个 GPU smoke 均复跑：公共 ESamp loss/update 各 2，In-Place update/trained_rows 各 6、
+apply_rows 8、updated_rows 2，CUDA Graph loss/update 各 4 且地址稳定，FTTT loss/update 各 1、
+version 1；清理和零 fallback 检查通过。未运行吞吐 benchmark。没有改 provisional PTTS、
+没有新增镜像图/版本账本；generic factory/session、AER/PageBundle/MP/组合 replay 仍未完成。
 
 所有 Python 使用 `/workspace/pllm/.venv/bin/python`。canonical vLLM 当前代码要求
 `0.27.1`，且限定 in-process/eager 等边界；本轮实测 vLLM runtime 为 0.27.1，发行元数据
