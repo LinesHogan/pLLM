@@ -19,9 +19,6 @@ from tllm.canonical_vllm.runtime import (
     CanonicalVllmDType,
     CanonicalVllmLlm,
 )
-from tllm.canonical.workloads.inplace_ttt.workload import (
-    CanonicalDenseOverlayExecution,
-)
 from tllm.contracts.parameter_overlay import (
     ParameterModuleKind,
     ParameterRole,
@@ -73,8 +70,6 @@ def main() -> int:
             ),
         )
         execution = handle.deployment.compilation.execution
-        if not isinstance(execution, CanonicalDenseOverlayExecution):
-            raise RuntimeError("canonical vLLM routed to the wrong execution")
         diagnostics = execution.diagnostics()
         if (
             any(not output.outputs[0].text for output in outputs)

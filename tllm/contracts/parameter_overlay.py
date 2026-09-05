@@ -53,24 +53,6 @@ class ParameterOverlayFieldBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class ParameterOverlayPublication:
-    """One atomic StateRef publication exposed to a backend adapter."""
-
-    identity: RequestIdentity
-    ref: StateRef
-    bindings: tuple[ParameterOverlayFieldBinding, ...]
-
-    def __post_init__(self) -> None:
-        targets = tuple(binding.target for binding in self.bindings)
-        if (
-            not self.bindings
-            or tuple(sorted(targets)) != targets
-            or len(targets) != len(set(targets))
-        ):
-            raise ValueError("parameter overlay bindings must be sorted and unique")
-
-
-@dataclass(frozen=True, slots=True)
 class ParameterOverlayPinnedTensor:
     target: ParameterTarget
     ref: StateRef
@@ -148,7 +130,6 @@ __all__ = [
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",
     "ParameterOverlayPinnedTensor",
-    "ParameterOverlayPublication",
     "ParameterOverlayRowAssignment",
     "ParameterOverlayStepPlan",
     "ParameterRole",

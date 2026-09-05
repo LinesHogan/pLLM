@@ -25,7 +25,6 @@ from tllm.contracts.semantic_graph import (
     SchedulerTimeline,
 )
 from tllm.contracts.state_ref import StateRef
-from tllm.contracts.state_representation import StatePhysicalPlan
 from tllm.contracts.state_representation import StateDeviceKind
 from tllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 
@@ -267,20 +266,9 @@ class ESampRequestStepResult:
             raise ValueError("ESamp request result is not state-aligned")
 
 
-@dataclass(frozen=True, slots=True)
-class ESampRequestDiagnostics:
-    active_lineages: int
-    loss_count: int
-    update_count: int
-    completed_sampler_pins: int
-    pending_state_releases: int
-    state_plan: StatePhysicalPlan
-
-
 __all__ = [
     "ESampRequestCompileOptions",
     "ESampRequestConfig",
-    "ESampRequestDiagnostics",
     "ESampRequestPackedHiddenBindings",
     "ESampRequestSpecialization",
     "ESampRequestStepInput",

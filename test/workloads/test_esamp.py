@@ -4,14 +4,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
 from tllm.canonical.workloads.esamp_request import (
+    ESampMath,
     ESampRequestWorkload,
 )
+from tllm.canonical.state_execution import StateSettlementError, StateTaskContext
+from tllm.canonical.workloads.esamp_request_task_common import ESampData
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions, ESampRequestConfig, ESampRequestPackedHiddenBindings,
-    ESampRequestSpecialization, ESampRequestStepInput,
+    ESampRequestSpecialization, ESampRequestStepInput, ESampRequestStepResult,
 )
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import (
@@ -108,7 +112,7 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
             execution.complete_sampler(failed)
             with pytest.raises(RuntimeError, match="injected publication failure"):
                 execution.execute_anchor(failed, AnchorId(2))
-        assert execution.free_state_pages == 4
+        assert execution.arena.free_pages == 4
         for ref, root in zip(latest, before, strict=True):
             for actual, expected in zip(execution.snapshot(ref), root, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -133,6 +137,14 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         execution.execute_anchor(handle, AnchorId(1))
         execution.complete_sampler(handle)
         execution.execute_anchor(handle, AnchorId(2))
+        publication = handle.cursor.context.publication
+        def reject_output(self: ESampMath, context: StateTaskContext[ESampData]) -> ESampRequestStepResult:
+            raise RuntimeError("injected postpublication output failure")
+        with monkeypatch.context() as fault:
+            fault.setattr(ESampMath, "output", reject_output)
+            with pytest.raises(StateSettlementError) as failed:
+                execution.finish_step(handle)
+        assert failed.value.invocation is handle and failed.value.receipt is publication
         result = execution.finish_step(handle)
         assert result.guidance is guidance
         for index, owner in enumerate(sorted(set(owners))):
@@ -165,5 +177,18 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert diagnostics.loss_count == diagnostics.update_count == 3
     assert diagnostics.completed_sampler_pins == 4
-    assert execution.free_state_pages == 6
+    assert execution.arena.free_pages == 6
     assert execution.plan.fallback_count == 0
+
+    def reject_admission(self: PageBundleArena, write: PageWrite) -> PagePublication:
+        raise RuntimeError("injected admission publication failure")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(PageBundleArena, "publish", reject_admission)
+        with pytest.raises(RuntimeError, match="admission publication failure"):
+            execution.admit(identities)
+    assert execution.diagnostics().active_lineages == 0
+    assert execution.arena.free_pages == 6
+    execution.admit(identities)
+    execution.retire(identities)
+    assert execution.arena.free_pages == 6

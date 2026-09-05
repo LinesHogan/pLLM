@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
+from tllm.canonical.state_execution import StateExecution
+from tllm.canonical.workloads.esamp_request_task_common import ESampData
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.workloads.esamp_request import (
-    CanonicalRequestSamplerExecution,
     ESampRequestWorkload,
 )
 from tllm.canonical.workloads.esamp_request_types import (
@@ -21,6 +23,7 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestPackedHiddenBindings,
     ESampRequestSpecialization,
     ESampRequestStepInput,
+    ESampRequestStepResult,
 )
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import (
@@ -35,6 +38,7 @@ from tllm.contracts.packed_rows import (
     PackedSamplerRowLink,
 )
 from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.sampler import PackedSamplerGuidanceBatch
 from tllm.contracts.semantic_graph import (
     AnchorId,
     AnchorSymbol,
@@ -149,7 +153,7 @@ def _step_input(
 
 def _run_step(
     *,
-    execution: CanonicalRequestSamplerExecution,
+    execution: StateExecution[ESampRequestStepInput, ESampData, ESampRequestStepResult],
     step_id: int,
     identities: tuple[RequestIdentity, RequestIdentity],
     hidden_bindings: ESampRequestPackedHiddenBindings,
@@ -180,10 +184,27 @@ def _run_step(
         ),
         execution_stream,
     )
-    execution.execute_anchor(handle, AnchorId(0))
+    def delayed_guidance(rows: PackedSamplerRowBatch, prediction: torch.Tensor,
+                         affected: tuple[int, ...]) -> PackedSamplerGuidanceBatch:
+        if affected:
+            torch.cuda._sleep(500_000_000)
+            prediction.add_(1)
+        return PackedSamplerGuidanceBatch(rows, prediction, affected)
+
+    with patch("tllm.canonical.workloads.esamp_request_task_common.PackedSamplerGuidanceBatch", delayed_guidance):
+        execution.execute_anchor(handle, AnchorId(0))
+    prediction_done = torch.cuda.Event()
+    prediction_done.record(execution_stream)
     guidance = execution.sampler_guidance(handle, sampler_stream)
     if guidance.affected_row_ids and guidance.pred_hidden.data_ptr() == 0:
         raise RuntimeError("canonical ESamp guidance did not materialize on CUDA")
+    with torch.cuda.stream(sampler_stream):
+        consumed = guidance.pred_hidden.clone()
+    sampler_stream.synchronize()
+    if not prediction_done.query():
+        execution_stream.synchronize()
+        raise RuntimeError("sampler read completed before prediction readiness")
+    torch.testing.assert_close(consumed, guidance.pred_hidden)
     execution.execute_anchor(handle, AnchorId(1))
     execution.complete_sampler(handle, sampler_stream)
     execution.execute_anchor(handle, AnchorId(2))
@@ -270,17 +291,17 @@ def main() -> int:
         target.copy_(base_target)
 
     hidden_addresses = (source.data_ptr(), target.data_ptr())
-    state_addresses = execution.state_pool_addresses
+    state_addresses = execution.arena.pool_addresses
     all_losses: list[float] = []
     for step_id in range(2):
         graph.replay()
         graph_stream.synchronize()
         if (
             hidden_addresses != (source.data_ptr(), target.data_ptr())
-            or state_addresses != execution.state_pool_addresses
+            or state_addresses != execution.arena.pool_addresses
         ):
             raise RuntimeError("CUDA graph replay changed canonical buffer addresses")
-        execution.require_stable_state_pool()
+        execution.arena.require_stable()
         all_losses.extend(
             _run_step(
                 execution=execution,
@@ -293,7 +314,7 @@ def main() -> int:
                 sampler_stream=sampler_stream,
             )
         )
-        execution.collect_completed()
+        execution.arena.collect_completed()
 
     diagnostics = execution.diagnostics()
     if (
@@ -327,7 +348,7 @@ def main() -> int:
         sampler_stream.synchronize()
         raise RuntimeError("retirement released state before the cancelled sampler completed")
     torch.testing.assert_close(consumed, guidance.pred_hidden)
-    execution.collect_completed()
+    execution.arena.collect_completed()
     retired = execution.diagnostics()
     if retired.active_lineages != 0 or retired.pending_state_releases != 0:
         raise RuntimeError("cancelled request retirement left live state or release receipts")

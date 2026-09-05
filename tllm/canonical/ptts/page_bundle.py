@@ -363,13 +363,13 @@ class PageBundleArena:
 
     def settle(self, receipt: PagePublication) -> None:
         with self._lock:
+            self.collect_completed()
             issued = self._publications.get(receipt.operation_id)
             if issued is None or issued.settled:
                 raise RuntimeError("PageBundle publication is unknown or already settled")
             if issued.receipt is not receipt:
                 raise RuntimeError("PageBundle publication differs from the issued receipt")
             issued.settled = True
-            self.collect_completed()
 
     def abort(self, token: PageWrite) -> None:
         with self._lock:

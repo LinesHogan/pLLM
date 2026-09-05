@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # a migration inventory and encourage exemptions.
 AUTHORITY_FILES = (
     Path("tllm/canonical/execution.py"),
+    Path("tllm/canonical/state_execution.py"),
     Path("tllm/canonical/host_runtime.py"),
     Path("tllm/canonical_vllm/sampler.py"),
 )
@@ -41,6 +42,7 @@ NATIVE_BINDING_FILES = (
 PHYSICAL_FILES = frozenset(
     {
         Path("tllm/canonical/execution.py"),
+        Path("tllm/canonical/state_execution.py"),
     }
 )
 

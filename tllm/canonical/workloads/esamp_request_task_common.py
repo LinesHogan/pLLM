@@ -10,10 +10,8 @@ import torch
 from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout, low_rank_gated_forward
 from tllm.canonical.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
-from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePin, PagePublication
-from tllm.canonical.ptts.request_state import (
-    RequestStateDirectory, RequestStateSelection, RequestStateTransitionLease,
-)
+from tllm.canonical.ptts.request_state import RequestStateSelection
+from tllm.canonical.state_execution import StateTaskContext
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestConfig,
     ESampRequestStepInput,
@@ -42,7 +40,6 @@ class ESampPredicted:
     training_target: torch.Tensor
     state_vectors: torch.Tensor
     row_state_indices: torch.Tensor
-    readiness: CudaStreamReadiness | None = None
 
 
 ESampPrediction = ESampPredictionPending | ESampPredicted
@@ -62,26 +59,13 @@ class ESampOptimized:
 ESampOptimization = ESampOptimizationPending | ESampOptimized
 
 
-@dataclass(frozen=True, slots=True)
-class ESampPublicationPending:
-    pass
-
-
-ESampPublication = ESampPublicationPending | PagePublication
-
-
 @dataclass(slots=True)
-class ESampStepContext:
+class ESampData:
     step: ESampRequestStepInput
     source: torch.Tensor
     target: torch.Tensor
-    selection: RequestStateSelection
-    transition_lease: RequestStateTransitionLease
     prediction: ESampPrediction
     optimization: ESampOptimization
-    publication: ESampPublication
-    arena: PageBundleArena
-    pin: PagePin
 
 
 def esamp_adamw_field_binding() -> AdamWFields:
@@ -132,7 +116,6 @@ def build_prediction(
     state_vectors: torch.Tensor,
     row_state_indices: torch.Tensor,
     layout: LowRankGatedLayout,
-    readiness: CudaStreamReadiness | None = None,
 ) -> ESampPredicted:
     local_row_by_packed = {
         row.canonical_row_index: position
@@ -174,7 +157,6 @@ def build_prediction(
         training_target,
         state_vectors,
         row_state_indices,
-        readiness,
     )
 
 
@@ -225,20 +207,23 @@ class ESampPredictTask:
         self._layout = layout
         self.implementation_id = implementation_id
 
-    def execute(self, context: ESampStepContext) -> None:
+    def execute(self, context: StateTaskContext[ESampData]) -> None:
+        data = context.data()
         state_vectors = context.arena.field_rows(context.pin, ESAMP_PARAMETER_FIELD)
         stream = context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             training_source, training_target, row_state_indices = selected_training_tensors(
-                context.selection, context.source, context.target,
+                context.selection, data.source, data.target,
             )
-            context.prediction = build_prediction(
-                config=self._config, step=context.step, selection=context.selection,
+            predicted = build_prediction(
+                config=self._config, step=data.step, selection=context.selection,
                 training_source=training_source, training_target=training_target,
                 state_vectors=state_vectors, row_state_indices=row_state_indices,
                 layout=self._layout,
-                readiness=CudaStreamReadiness(stream) if stream is not None else None,
             )
+            data.prediction = predicted
+            context.guidance = predicted.guidance
+            context.guidance_ready = CudaStreamReadiness(stream) if stream is not None else None
 
 
 class ESampLossTask:
@@ -248,8 +233,9 @@ class ESampLossTask:
         self._layout = layout
         self.implementation_id = implementation_id
 
-    def execute(self, context: ESampStepContext) -> None:
-        match context.prediction:
+    def execute(self, context: StateTaskContext[ESampData]) -> None:
+        data = context.data()
+        match data.prediction:
             case ESampPredicted() as predicted:
                 pass
             case ESampPredictionPending():
@@ -259,34 +245,29 @@ class ESampLossTask:
             losses, gradients = compute_low_rank_losses_and_gradients(
                 predicted, self._layout, clone_outputs=stream is None,
             )
-        context.optimization = ESampOptimized(losses, gradients)
+        data.optimization = ESampOptimized(losses, gradients)
+        context.loss_count = len(losses)
 
 
 class ESampTrainTask:
-    __slots__ = ("_config", "_directory", "implementation_id")
+    __slots__ = ("_config", "implementation_id")
 
     def __init__(
-        self, config: ESampRequestConfig, directory: RequestStateDirectory,
+        self, config: ESampRequestConfig,
         implementation_id: ImplementationId,
     ) -> None:
         self._config = config
-        self._directory = directory
         self.implementation_id = implementation_id
 
-    def execute(self, context: ESampStepContext) -> None:
-        match context.optimization:
+    def execute(self, context: StateTaskContext[ESampData]) -> None:
+        match context.data().optimization:
             case ESampOptimized() as optimized:
                 pass
             case ESampOptimizationPending():
                 raise RuntimeError("ESamp train requires the planned loss")
-        write = self._directory.prepare_transition(
-            context.selection, context.transition_lease, context.pin.stream,
-        )
-        try:
-            with nullcontext() if write.stream is None else torch.cuda.stream(write.stream):
-                apply_adamw(context.arena.writable_roots(write), esamp_adamw_field_binding(),
-                    esamp_adamw_config(self._config), optimized.gradients)
-            context.publication = context.arena.publish(write)
-        except Exception:
-            context.arena.abort(write)
-            raise
+        context.write = context.arena.prepare_transition(context.pin.refs, context.pin.stream)
+        with nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream):
+            apply_adamw(context.arena.writable_roots(context.write), esamp_adamw_field_binding(),
+                esamp_adamw_config(self._config), optimized.gradients)
+        context.publish()
+        context.update_count = len(context.pin.refs)

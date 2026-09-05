@@ -3,22 +3,25 @@
 import pytest
 import torch
 
+from tllm.canonical.state_execution import StateSettlementError
+
+
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.workloads.inplace_ttt.types import (
-    InPlaceTTTCompileOptions, InPlaceTTTConfig, InPlaceTTTOperandPair,
-    InPlaceTTTPhase, InPlaceTTTSpecialization, InPlaceTTTStepInput,
-    InPlaceTTTStepBatch, InPlaceTTTTargetSpecialization,
+    InPlaceTTTCompileOptions, InPlaceTTTConfig,
+    InPlaceTTTSpecialization, InPlaceTTTTargetSpecialization,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
     InPlaceTTTWorkload,
 )
 from tllm.contracts.parameter_overlay import (
-    ParameterModuleKind, ParameterRole, ParameterTarget,
+    CapturedParameterOperand, ParameterModuleKind, ParameterRole, ParameterTarget,
 )
-from tllm.contracts.backend_attachment import AttachmentTaskBinding, AttachmentTaskRole
+from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.request_state import IndexedRequestIdentityBatch, IndexedRequestIdentityRow
 from tllm.contracts.tensor_layout import TensorDType
 
 
@@ -55,11 +58,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
     ], dtype=torch.float64)
     latest = refs[0]
     for row in range(2):
-        step = InPlaceTTTStepInput(identities[0], tuple(
-            InPlaceTTTOperandPair(target, InPlaceTTTPhase.PREFILL,
+        step = tuple(
+            CapturedParameterOperand(identities[0], target, HiddenPhase.PREFILL,
                 hidden[row:row + 1], desired[index, row:row + 1], bases[index])
             for index, target in enumerate(targets)
-        ))
+        )
         before = execution.snapshot(latest)
 
         def reject_publication(
@@ -74,27 +77,36 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         for actual, expected in zip(execution.snapshot(latest), before, strict=True):
             torch.testing.assert_close(actual, expected)
         if row == 0:
-            result = execution.step(step)
+            result, = execution.step(step).entries
         else:
             transition, publish = execution.plan.tasks
-            args = ((step.identity,), None, compiled.state_layout.overlay_bindings,
-                    transition.anchor_id)
-            cancelled = execution.begin_batch(*args)
-            execution.abort_step(cancelled)
+            rows = IndexedRequestIdentityBatch((IndexedRequestIdentityRow(0, identities[0]),))
+            cancelled = execution.begin(rows)
+            execution.cancel_step(cancelled)
             with pytest.raises(RuntimeError, match="active"):
-                execution.abort_step(cancelled)
-            handle = execution.begin_batch(*args)
-            execution.submit_captured(
-                handle, InPlaceTTTStepBatch((step,)),
-                AttachmentTaskBinding(AttachmentTaskRole.TRANSITION, transition.task_id,
-                                      transition.implementation_id, transition.anchor_id),
-                AttachmentTaskBinding(AttachmentTaskRole.PUBLISH, publish.task_id,
-                                      publish.implementation_id, publish.anchor_id),
-            )
+                execution.cancel_step(cancelled)
+            handle = execution.begin(rows)
+            execution.submit_input(handle, step)
+            assert handle.cursor.context.data().operands is step
+            execution.execute_anchor(handle, transition.anchor_id)
+            execution.execute_anchor(handle, publish.anchor_id)
             with pytest.raises(RuntimeError, match="sampler completion"):
                 execution.finish_step(handle)
-            execution.complete_sampler(handle, None, publish.anchor_id)
-            (result,) = execution.finish_step(handle).entries
+            execution.execute_anchor(handle, execution.sampler_anchor_id)
+            execution.complete_sampler(handle)
+            publication = handle.cursor.context.publication
+            def reject_settlement(self: PageBundleArena, receipt: PagePublication) -> None:
+                raise RuntimeError("injected postpublication settlement failure")
+            with monkeypatch.context() as fault:
+                fault.setattr(PageBundleArena, "settle", reject_settlement)
+                with pytest.raises(StateSettlementError) as failed:
+                    execution.finish_step(handle)
+            assert failed.value.invocation is handle and failed.value.receipt is publication
+            release = handle.cursor.context.release
+            assert release is not None
+            completed = execution.finish_step(handle)
+            assert handle.cursor.context.release is release
+            (result,) = completed.entries
             with pytest.raises(RuntimeError, match="active"):
                 execution.finish_step(handle)
         assert result.before_ref == latest
@@ -106,26 +118,26 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
                 (0, 0, 1) if row == 0 else (1, 2, 0)
             )
         if row == 0:
-            assert result.publication is None
+            assert not result.weight_changed
         else:
-            assert result.publication is not None and result.publication.ref == latest
-            assert tuple(binding.target for binding in result.publication.bindings) == targets
+            assert result.weight_changed
+            assert publication is not None and publication.after_refs == (latest,)
 
     # The independent outer-product oracle must be visible only to the trained request.
     deltas = 0.3 * desired.transpose(1, 2) @ hidden
     for request_index, identity in enumerate(identities):
-        result = execution.step(InPlaceTTTStepInput(identity, tuple(
-            InPlaceTTTOperandPair(target, InPlaceTTTPhase.DECODE,
+        result, = execution.step(tuple(
+            CapturedParameterOperand(identity, target, HiddenPhase.DECODE,
                 hidden[:1], desired[index, :1], bases[index])
             for index, target in enumerate(targets)
-        )))
+        )).entries
         assert result.before_ref == result.after_ref == (latest if request_index == 0 else refs[1])
-        assert result.publication is None
+        assert not result.weight_changed
         for index, target_result in enumerate(result.targets):
             weight = bases[index] + deltas[index] if request_index == 0 else bases[index]
             torch.testing.assert_close(target_result.output, hidden[:1] @ weight.T)
             assert target_result.update_count == 0
-    assert execution.retire(identities).retired == (latest, refs[1])
+    assert execution.retire(identities) == (latest, refs[1])
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert (diagnostics.update_count, diagnostics.trained_rows, diagnostics.fallback_count) == (2, 4, 0)

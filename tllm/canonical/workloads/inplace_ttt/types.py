@@ -3,28 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from hashlib import sha256
 
 import torch
 
-from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.contracts.parameter_overlay import (
-    ParameterOverlayPinnedTensor,
-    ParameterOverlayPublication,
+    CapturedParameterOperand,
     ParameterTarget,
 )
 from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.semantic_graph import SchedulerTimeline
 from tllm.contracts.state_ref import StateRef
-from tllm.contracts.state_representation import StateDeviceKind, StatePhysicalPlan
+from tllm.contracts.state_representation import StateDeviceKind
 from tllm.contracts.tensor_layout import TensorDType
-
-
-class InPlaceTTTPhase(StrEnum):
-    PREFILL = "prefill"
-    DECODE = "decode"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,12 +38,14 @@ class InPlaceTTTConfig:
         ):
             raise ValueError("In-Place-TTT mathematical configuration is invalid")
 
-    def updates(self, phase: InPlaceTTTPhase) -> bool:
+    def updates(self, phase: HiddenPhase) -> bool:
         match phase:
-            case InPlaceTTTPhase.PREFILL:
+            case HiddenPhase.PREFILL:
                 return self.update_prefill
-            case InPlaceTTTPhase.DECODE:
+            case HiddenPhase.DECODE:
                 return self.update_decode
+            case _:
+                raise ValueError("dense operands require prefill or decode phase")
 
     def execution_parameters_digest(self) -> str:
         fields = (
@@ -176,85 +171,14 @@ class InPlaceTTTCompileOptions:
             raise ValueError("In-Place-TTT physical compile facts are invalid")
 
 
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTOperandPair:
-    target: ParameterTarget
-    phase: InPlaceTTTPhase
-    hidden: torch.Tensor
-    desired: torch.Tensor
-    base_weight: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTStepInput:
-    identity: RequestIdentity
-    operands: tuple[InPlaceTTTOperandPair, ...]
-
-    def __post_init__(self) -> None:
-        targets = tuple(operand.target for operand in self.operands)
-        if (
-            not targets
-            or tuple(sorted(targets)) != targets
-            or len(targets) != len(set(targets))
-        ):
-            raise ValueError("In-Place-TTT operands must be sorted and unique")
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTStepBatch:
-    entries: tuple[InPlaceTTTStepInput, ...]
-
-    def __post_init__(self) -> None:
-        identities = tuple(entry.identity for entry in self.entries)
-        if not identities or len(identities) != len(set(identities)):
-            raise ValueError("In-Place-TTT step batch requires unique requests")
-
-
-class CudaInPlaceTTTStepBatchInput:
-    """One typed operand batch plus its CUDA producer readiness."""
-
-    __slots__ = ("_readiness", "batch")
-
-    def __init__(
-        self,
-        batch: InPlaceTTTStepBatch,
-        readiness: CudaStreamReadiness,
-    ) -> None:
-        self.batch = batch
-        self._readiness = readiness
-
-    @classmethod
-    def assert_produced_on(
-        cls,
-        batch: InPlaceTTTStepBatch,
-        producer_stream: torch.cuda.Stream,
-    ) -> "CudaInPlaceTTTStepBatchInput":
-        return cls(batch, CudaStreamReadiness(producer_stream))
-
-    def order_on(self, consumer_stream: torch.cuda.Stream) -> None:
-        self._readiness.order_on(consumer_stream)
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTStepHandle:
-    handle_id: int
-    identities: tuple[RequestIdentity, ...]
-    refs: tuple[StateRef, ...]
-    deltas: tuple[ParameterOverlayPinnedTensor, ...]
-
-    def __post_init__(self) -> None:
-        if self.handle_id < 1:
-            raise ValueError("In-Place-TTT handle requires an ID")
-
-
 def validate_inplace_ttt_step(
-    step: InPlaceTTTStepInput,
+    operands: tuple[CapturedParameterOperand, ...],
     specialization: InPlaceTTTSpecialization,
 ) -> None:
     specialization_by_target = {
         target.target: target for target in specialization.targets
     }
-    for operand in step.operands:
+    for operand in operands:
         try:
             target = specialization_by_target[operand.target]
         except KeyError as exc:
@@ -294,7 +218,7 @@ class InPlaceTTTStepResult:
     before_ref: StateRef
     after_ref: StateRef
     targets: tuple[InPlaceTTTTargetResult, ...]
-    publication: ParameterOverlayPublication | None
+    weight_changed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,34 +226,11 @@ class InPlaceTTTStepBatchResult:
     entries: tuple[InPlaceTTTStepResult, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTCleanupReceipt:
-    retired: tuple[StateRef, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTDiagnostics:
-    active_lineages: int
-    update_count: int
-    trained_rows: int
-    state_plan: StatePhysicalPlan
-    fallback_count: int
-    pending_state_releases: int
-
-
 __all__ = [
-    "CudaInPlaceTTTStepBatchInput",
-    "InPlaceTTTCleanupReceipt",
     "InPlaceTTTCompileOptions",
     "InPlaceTTTConfig",
-    "InPlaceTTTDiagnostics",
-    "InPlaceTTTOperandPair",
-    "InPlaceTTTPhase",
     "InPlaceTTTSpecialization",
-    "InPlaceTTTStepInput",
-    "InPlaceTTTStepBatch",
     "InPlaceTTTStepBatchResult",
-    "InPlaceTTTStepHandle",
     "InPlaceTTTStepResult",
     "InPlaceTTTTargetResult",
     "InPlaceTTTTargetSpecialization",

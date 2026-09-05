@@ -10,24 +10,15 @@ import torch
 from tllm.canonical.kernels.dense_fast_weight import (
     transition_dense_fast_weight,
 )
-from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
-from tllm.canonical.ptts.request_state import (
-    RequestStateDirectory, RequestStateSelection, RequestStateTransitionLease,
-)
+from tllm.canonical.state_execution import StateTaskContext
 from tllm.canonical.workloads.inplace_ttt.layout import InPlaceTTTStateLayout
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTConfig,
-    InPlaceTTTStepBatch,
     InPlaceTTTStepBatchResult,
-    InPlaceTTTStepInput,
     InPlaceTTTStepResult,
     InPlaceTTTTargetResult,
 )
-from tllm.contracts.parameter_overlay import (
-    ParameterOverlayFieldBinding,
-    ParameterOverlayPublication,
-)
-from tllm.contracts.state_ref import StateRef
+from tllm.contracts.parameter_overlay import CapturedParameterOperand
 from tllm.contracts.semantic_graph import ImplementationId
 
 
@@ -45,61 +36,10 @@ INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION = ImplementationId(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTTransitionPending:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTNoTransition:
-    result: InPlaceTTTStepBatchResult
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTPreparedTransition:
-    write: PageWrite
-    result: InPlaceTTTStepBatchResult
-
-
-@dataclass(frozen=True, slots=True)
-class InPlaceTTTCommittedTransition:
-    receipt: PagePublication
-    result: InPlaceTTTStepBatchResult
-
-
-InPlaceTTTTransitionState = (
-    InPlaceTTTTransitionPending
-    | InPlaceTTTNoTransition
-    | InPlaceTTTPreparedTransition
-    | InPlaceTTTCommittedTransition
-)
-
-
 @dataclass(slots=True)
-class InPlaceTTTStepContext:
-    batch: InPlaceTTTStepBatch | None
-    selection: RequestStateSelection
-    transition_lease: RequestStateTransitionLease
-    arena: PageBundleArena
-    pin: PagePin
-    transition: InPlaceTTTTransitionState
-
-    def abort(self) -> None:
-        match self.transition:
-            case InPlaceTTTPreparedTransition(write=write):
-                self.arena.abort(write)
-                self.transition = InPlaceTTTTransitionPending()
-            case InPlaceTTTCommittedTransition():
-                raise RuntimeError("cannot abort a submitted parameter transition")
-            case InPlaceTTTTransitionPending() | InPlaceTTTNoTransition():
-                pass
-
-    def result(self) -> InPlaceTTTStepBatchResult:
-        match self.transition:
-            case InPlaceTTTNoTransition(result=result) | InPlaceTTTCommittedTransition(result=result):
-                return result
-            case _:
-                raise RuntimeError("signed dense overlay graph did not publish")
+class InPlaceTTTData:
+    operands: tuple[CapturedParameterOperand, ...]
+    result: InPlaceTTTStepBatchResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,34 +49,10 @@ class InPlaceTTTComputedTransition:
     weight_changed: bool
 
 
-def build_inplace_ttt_step_result(
-    step: InPlaceTTTStepInput,
-    before_ref: StateRef,
-    after_ref: StateRef,
-    targets: tuple[InPlaceTTTTargetResult, ...],
-    overlay_bindings: tuple[ParameterOverlayFieldBinding, ...],
-    *,
-    weight_changed: bool,
-) -> InPlaceTTTStepResult:
-    return InPlaceTTTStepResult(
-        step.identity,
-        before_ref,
-        after_ref,
-        targets,
-        ParameterOverlayPublication(
-            step.identity,
-            after_ref,
-            overlay_bindings,
-        )
-        if weight_changed
-        else None,
-    )
-
-
 def compute_inplace_ttt_transition(
     config: InPlaceTTTConfig,
     layout: InPlaceTTTStateLayout,
-    step: InPlaceTTTStepInput,
+    operands: tuple[CapturedParameterOperand, ...],
     source_root: tuple[torch.Tensor, ...],
 ) -> InPlaceTTTComputedTransition:
     """Shared CPU/CUDA tensor transition; providers own storage mechanics."""
@@ -144,7 +60,7 @@ def compute_inplace_ttt_transition(
     target_root = list(source_root)
     results: list[InPlaceTTTTargetResult] = []
     weight_changed = False
-    for operand in step.operands:
+    for operand in operands:
         fields = layout.fields_for(operand.target)
         delta = source_root[int(fields.delta_weight)]
         if config.updates(operand.phase):
@@ -191,67 +107,45 @@ def compute_inplace_ttt_transition(
 
 
 class InPlaceTTTTransitionTask:
-    __slots__ = ("_config", "_directory", "_layout", "implementation_id")
+    __slots__ = ("_config", "_layout", "implementation_id")
 
     def __init__(
         self,
         config: InPlaceTTTConfig,
         layout: InPlaceTTTStateLayout,
-        directory: RequestStateDirectory,
         implementation_id: ImplementationId,
     ) -> None:
         self._config = config
         self._layout = layout
-        self._directory = directory
         self.implementation_id = implementation_id
 
-    def execute(self, context: InPlaceTTTStepContext) -> None:
-        batch = context.batch
-        if batch is None:
-            raise RuntimeError("parameter transition requires captured operands")
-        match context.transition:
-            case InPlaceTTTTransitionPending():
-                pass
-            case _:
-                raise RuntimeError("parameter transition already computed")
+    def execute(self, context: StateTaskContext[InPlaceTTTData]) -> None:
+        data = context.data()
+        operands = tuple(tuple(sorted(
+            (operand for operand in data.operands if operand.identity == row.identity),
+            key=lambda operand: operand.target,
+        )) for row in context.selection.rows)
         source_roots = tuple(context.arena.snapshot(context.pin, ref) for ref in context.selection.refs)
         stream = context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             computed = tuple(
                 compute_inplace_ttt_transition(self._config, self._layout, entry, root)
-                for entry, root in zip(batch.entries, source_roots, strict=True)
+                for entry, root in zip(operands, source_roots, strict=True)
             )
         changed = tuple(
-            index for index, entry in enumerate(batch.entries)
-            if any(self._config.updates(operand.phase) for operand in entry.operands)
+            index for index, entry in enumerate(operands)
+            if any(self._config.updates(operand.phase) for operand in entry)
         )
-        logical = self._directory.prepare_transition_subset(
-            context.selection, context.transition_lease, changed, stream,
-        ) if changed else None
-        try:
-            after = {} if logical is None else {
-                before: after for before, after in zip(logical.before_refs, logical.after_refs, strict=True)
-            }
-            result = InPlaceTTTStepBatchResult(
-                tuple(
-                    build_inplace_ttt_step_result(
-                        entry, before, after.get(before, before), values.targets,
-                        self._layout.overlay_bindings, weight_changed=values.weight_changed,
-                    )
-                    for entry, before, values in zip(
-                        batch.entries, context.selection.refs, computed, strict=True,
-                    )
-                )
-            )
-            if logical is None:
-                context.transition = InPlaceTTTNoTransition(result)
-                return
-            context.arena.copy_roots(logical, tuple(computed[index].target_root for index in changed))
-        except Exception:
-            if logical is not None:
-                context.arena.abort(logical)
-            raise
-        context.transition = InPlaceTTTPreparedTransition(logical, result)
+        write = context.arena.prepare_transition(tuple(context.pin.refs[index] for index in changed), stream) if changed else None
+        context.write = write
+        after = {} if write is None else dict(zip(write.before_refs, write.after_refs, strict=True))
+        data.result = InPlaceTTTStepBatchResult(tuple(InPlaceTTTStepResult(
+            row.identity, before, after.get(before, before), values.targets, values.weight_changed,
+        ) for row, before, values in zip(context.selection.rows, context.pin.refs, computed, strict=True)))
+        if write is not None:
+            context.arena.copy_roots(write, tuple(computed[index].target_root for index in changed))
+        context.update_count = sum(target.update_count for values in computed for target in values.targets)
+        context.trained_rows = sum(target.trained_rows for values in computed for target in values.targets)
 
 
 class InPlaceTTTPublishTask:
@@ -260,14 +154,5 @@ class InPlaceTTTPublishTask:
     def __init__(self, implementation_id: ImplementationId) -> None:
         self.implementation_id = implementation_id
 
-    def execute(self, context: InPlaceTTTStepContext) -> None:
-        match context.transition:
-            case InPlaceTTTNoTransition():
-                return
-            case InPlaceTTTPreparedTransition(write=write, result=result):
-                receipt = context.arena.publish(write)
-                context.transition = InPlaceTTTCommittedTransition(receipt, result)
-            case InPlaceTTTTransitionPending():
-                raise RuntimeError("parameter publication requires transition output")
-            case InPlaceTTTCommittedTransition():
-                raise RuntimeError("parameter transition is already committed")
+    def execute(self, context: StateTaskContext[InPlaceTTTData]) -> None:
+        context.publish()

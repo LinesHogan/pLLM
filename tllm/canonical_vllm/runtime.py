@@ -10,6 +10,12 @@ from typing import Literal
 
 import torch
 
+from tllm.canonical.state_execution import StateInvocation
+from tllm.canonical.cuda_stream import CudaStreamReadiness
+from tllm.canonical.workloads.esamp_request_task_common import ESampData
+from tllm.canonical.workloads.inplace_ttt.tasks import InPlaceTTTData
+from tllm.contracts.request_state import IndexedRequestIdentityBatch, IndexedRequestIdentityRow
+
 from tllm.canonical.backend_attachment import (
     compile_parameter_overlay_attachment,
     compile_request_sampler_attachment,
@@ -33,8 +39,6 @@ from tllm.canonical_vllm.sampler import (
     SignedPostFilterGuidance,
 )
 from tllm.canonical.workloads.esamp_request import (
-    CanonicalRequestStepHandle,
-    CanonicalRequestSamplerExecution,
     ESampRequestCompilation,
     ESampRequestWorkload,
 )
@@ -46,17 +50,10 @@ from tllm.canonical.workloads.esamp_request_types import (
 )
 from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTCompileOptions,
-    InPlaceTTTStepHandle,
-    InPlaceTTTOperandPair,
-    InPlaceTTTPhase,
     InPlaceTTTSpecialization,
-    InPlaceTTTStepBatch,
-    InPlaceTTTStepInput,
     InPlaceTTTTargetSpecialization,
 )
-from tllm.canonical.workloads.inplace_ttt.types import CudaInPlaceTTTStepBatchInput
 from tllm.canonical.workloads.inplace_ttt.workload import (
-    CanonicalDenseOverlayExecution,
     InPlaceTTTCompilation,
     InPlaceTTTWorkload,
 )
@@ -75,6 +72,7 @@ from tllm.contracts.backend_attachment import (
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.parameter_overlay import (
+    ParameterOverlayPinnedTensor,
     ParameterOverlayRowAssignment,
     ParameterOverlayStepPlan,
 )
@@ -243,39 +241,16 @@ class _Capturing:
 
 
 @dataclass(frozen=True, slots=True)
-class _RequestPredicted:
-    handle: CanonicalRequestStepHandle
+class _RequestActive:
+    handle: StateInvocation[ESampData]
 
 
 @dataclass(frozen=True, slots=True)
-class _RequestSampled:
-    handle: CanonicalRequestStepHandle
+class _OverlayActive:
+    handle: StateInvocation[InPlaceTTTData]
 
 
-@dataclass(frozen=True, slots=True)
-class _OverlayPrepared:
-    handle: InPlaceTTTStepHandle
-
-
-@dataclass(frozen=True, slots=True)
-class _OverlayTransitioned:
-    handle: InPlaceTTTStepHandle
-
-
-@dataclass(frozen=True, slots=True)
-class _OverlaySampled:
-    handle: InPlaceTTTStepHandle
-
-
-_SessionState = (
-    _Idle
-    | _Capturing
-    | _RequestPredicted
-    | _RequestSampled
-    | _OverlayPrepared
-    | _OverlayTransitioned
-    | _OverlaySampled
-)
+_SessionState = _Idle | _Capturing | _RequestActive | _OverlayActive
 
 
 class CanonicalVllmSession:
@@ -313,7 +288,7 @@ class CanonicalVllmSession:
         self._dense_adapter: VllmDenseAddAdapter | None = None
         match deployment:
             case _RequestSamplerVllmDeployment():
-                bindings = deployment.compilation.execution.specialization.hidden_bindings
+                bindings = deployment.compilation.math.specialization.hidden_bindings
                 self._capture = Vllm027EagerPackedHiddenCapture(
                     model=model,
                     source=bindings.source,
@@ -329,7 +304,7 @@ class CanonicalVllmSession:
             case _DenseOverlayVllmDeployment():
                 self._dense_adapter = VllmDenseAddAdapter(
                     model,
-                    deployment.compilation.execution.config.targets,
+                    deployment.compilation.math.config.targets,
                 )
         self._identities: dict[str, RequestIdentity] = {}
         self._next_prompt_index = 0
@@ -359,8 +334,7 @@ class CanonicalVllmSession:
             case _:
                 raise RuntimeError("prior canonical vLLM step is still active")
         deployment = self._deployment
-        if isinstance(deployment, _RequestSamplerVllmDeployment):
-            deployment.compilation.execution.collect_completed()
+        deployment.compilation.execution.arena.collect_completed()
         finished = tuple(
             self._identities[request_id]
             for request_id in sorted(scheduler_output.finished_req_ids)
@@ -415,18 +389,21 @@ class CanonicalVllmSession:
             case _DenseOverlayVllmDeployment() as deployment:
                 adapter = self._require_dense_adapter()
                 bindings = deployment.compilation.state_layout.overlay_bindings
-                identities = tuple(binding.identity for binding in request_ids.bindings)
+                identities = tuple(sorted((binding.identity for binding in request_ids.bindings),
+                    key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)))
                 stream = torch.cuda.current_stream(deployment.compilation.execution.device)
-                handle = deployment.compilation.execution.begin_batch(
-                    identities,
-                    stream,
-                    bindings,
-                    self._stage(AttachmentOverlayStage.PIN).anchor_id,
-                )
-                ref_by_identity = dict(zip(handle.identities, handle.refs, strict=True))
+                execution = deployment.compilation.execution
+                handle = execution.begin(IndexedRequestIdentityBatch(tuple(
+                    IndexedRequestIdentityRow(index, identity) for index, identity in enumerate(identities))), stream)
+                context = handle.cursor.context
+                ref_by_identity = dict(zip(identities, context.pin.refs, strict=True))
+                deltas = tuple(ParameterOverlayPinnedTensor(binding.target, ref, values[index])
+                    for binding in bindings
+                    for values in (context.arena.field_rows(context.pin, binding.fields[0]),)
+                    for index, ref in enumerate(context.pin.refs))
                 assignments: list[ParameterOverlayRowAssignment] = []
-                for target in deployment.compilation.execution.config.targets:
-                    for identity in handle.identities:
+                for target in deployment.compilation.math.config.targets:
+                    for identity in identities:
                         selected_rows = tuple(
                             row
                             for row in rows.phase_rows.rows
@@ -469,12 +446,12 @@ class CanonicalVllmSession:
                             rows.phase_rows.total_rows,
                             canonical_assignments,
                         ),
-                        handle.deltas,
+                        deltas,
                 )
                 except Exception:
-                    deployment.compilation.execution.abort_step(handle)
+                    execution.cancel_active()
                     raise
-                self._state = _OverlayPrepared(handle)
+                self._state = _OverlayActive(handle)
 
     def complete_forward(self) -> None:
         match self._deployment.kind:
@@ -487,11 +464,11 @@ class CanonicalVllmSession:
         match self._state:
             case _Idle():
                 return False
-            case _RequestPredicted(handle=handle):
+            case _RequestActive(handle=handle):
                 pass
             case _:
                 raise RuntimeError("canonical sampler began in the wrong phase")
-        execution = self._request_execution()
+        execution = self._request_deployment().compilation.execution
         stream = torch.cuda.current_stream(execution.device)
         guidance = execution.sampler_guidance(handle, stream)
         pred_dense_logits = model.compute_logits(
@@ -502,7 +479,7 @@ class CanonicalVllmSession:
         self.sampler.begin_guidance(
             SignedPostFilterGuidance(
                 guidance,
-                execution.config.intervention_beta,
+                self._request_deployment().compilation.math.config.intervention_beta,
                 pred_dense_logits,
             )
         )
@@ -519,18 +496,14 @@ class CanonicalVllmSession:
         match self._state:
             case _Idle():
                 return
-            case _RequestSampled(handle=handle):
-                execution = self._request_execution()
-                try:
-                    execution.execute_anchor(handle, self._task(AttachmentTaskRole.TRANSITION).anchor_id)
-                    execution.finish_step(handle)
-                    execution.collect_completed()
-                except Exception:
-                    self._state = _Idle()
-                    raise
+            case _RequestActive(handle=handle):
+                execution = self._request_deployment().compilation.execution
+                execution.execute_anchor(handle, self._task(AttachmentTaskRole.TRANSITION).anchor_id)
+                execution.finish_step(handle)
+                execution.arena.collect_completed()
                 self._state = _Idle()
-            case _OverlaySampled(handle=handle):
-                self._overlay_execution().finish_step(handle)
+            case _OverlayActive(handle=handle):
+                self._overlay_deployment().compilation.execution.finish_step(handle)
                 self._state = _Idle()
             case _:
                 raise RuntimeError("canonical token committed before sampling")
@@ -542,17 +515,7 @@ class CanonicalVllmSession:
             self._capture.abort_if_active()
         if self._dense_adapter is not None:
             self._dense_adapter.clear()
-        match self._state:
-            case _RequestPredicted(handle=handle) | _RequestSampled(handle=handle):
-                self._request_execution().cancel_step(handle)
-            case (
-                _OverlayPrepared(handle=handle)
-                | _OverlayTransitioned(handle=handle)
-                | _OverlaySampled(handle=handle)
-            ):
-                self._overlay_execution().abort_step(handle)
-            case _Idle() | _Capturing():
-                pass
+        self._deployment.compilation.execution.cancel_active()
         self._state = _Idle()
 
     def retire_all(self) -> None:
@@ -567,8 +530,7 @@ class CanonicalVllmSession:
         if identities:
             self._retire(identities)
         self._identities.clear()
-        if isinstance(self._deployment, _RequestSamplerVllmDeployment):
-            self._deployment.compilation.execution.collect_completed()
+        self._deployment.compilation.execution.arena.collect_completed()
 
     def close(self) -> None:
         self.abort_active()
@@ -592,7 +554,7 @@ class CanonicalVllmSession:
             capture.finish()
             self._state = _Idle()
             return
-        execution = self._request_execution()
+        execution = self._request_deployment().compilation.execution
         stream = torch.cuda.current_stream(execution.device)
         try:
             handle = execution.start_step(
@@ -604,11 +566,11 @@ class CanonicalVllmSession:
             capture.finish()
             raise
         capture.finish()
-        self._state = _RequestPredicted(handle)
+        self._state = _RequestActive(handle)
 
     def _complete_overlay_forward(self) -> None:
         match self._state:
-            case _OverlayPrepared(handle=handle):
+            case _OverlayActive(handle=handle):
                 pass
             case _Idle():
                 return
@@ -616,57 +578,16 @@ class CanonicalVllmSession:
                 raise RuntimeError("canonical overlay forward is out of order")
         adapter = self._require_dense_adapter()
         captures = adapter.take_captures()
-        actual = frozenset((capture.identity, capture.target) for capture in captures)
-        expected = frozenset(
-            (identity, target)
-            for identity in handle.identities
-            for target in self._overlay_execution().config.targets
-        )
-        if actual != expected:
-            raise RuntimeError("vLLM did not capture every signed overlay target")
-        captures_by_identity = {
-            identity: tuple(
-                sorted(
-                    (capture for capture in captures if capture.identity == identity),
-                    key=lambda capture: capture.target,
-                )
-            )
-            for identity in handle.identities
-        }
-        batch = InPlaceTTTStepBatch(
-            tuple(
-                InPlaceTTTStepInput(
-                    identity,
-                    tuple(
-                        InPlaceTTTOperandPair(
-                            capture.target,
-                            InPlaceTTTPhase.PREFILL
-                            if capture.phase is HiddenPhase.PREFILL
-                            else InPlaceTTTPhase.DECODE,
-                            capture.hidden,
-                            capture.desired,
-                            capture.base_weight,
-                        )
-                        for capture in captures_by_identity[identity]
-                    ),
-                )
-                for identity in handle.identities
-            )
-        )
         stream = torch.cuda.current_stream(self._deployment.compilation.execution.device)
         try:
-            self._overlay_execution().submit_captured(
-                handle,
-                CudaInPlaceTTTStepBatchInput.assert_produced_on(batch, stream),
-                self._task(AttachmentTaskRole.TRANSITION),
-                self._task(AttachmentTaskRole.PUBLISH),
-            )
+            execution = self._overlay_deployment().compilation.execution
+            execution.submit_input(handle, captures, CudaStreamReadiness(stream))
+            for role in (AttachmentTaskRole.TRANSITION, AttachmentTaskRole.PUBLISH):
+                execution.execute_anchor(handle, self._task(role).anchor_id)
         except Exception:
             adapter.clear()
-            self._state = _Idle()
             raise
         adapter.clear()
-        self._state = _OverlayTransitioned(handle)
 
     def _complete_request_sampler(self, active: bool) -> None:
         if not active:
@@ -676,49 +597,31 @@ class CanonicalVllmSession:
                 case _:
                     raise RuntimeError("canonical sampler skipped an active step")
         match self._state:
-            case _RequestPredicted(handle=handle):
+            case _RequestActive(handle=handle):
                 pass
             case _:
                 raise RuntimeError("canonical request sampler is out of order")
         self.sampler.finish_guidance()
-        execution = self._request_execution()
+        execution = self._request_deployment().compilation.execution
         execution.execute_anchor(handle, self._deployment.attachment.inputs.request.sampler_anchor_id)
         stream = torch.cuda.current_stream(execution.device)
         execution.complete_sampler(handle, stream)
-        self._state = _RequestSampled(handle)
 
     def _complete_overlay_sampler(self) -> None:
         match self._state:
-            case _OverlayTransitioned(handle=handle):
+            case _OverlayActive(handle=handle):
                 pass
             case _Idle():
                 return
             case _:
                 raise RuntimeError("canonical overlay sampler is out of order")
-        execution = self._overlay_execution()
-        stream = torch.cuda.current_stream(execution.specialization.device)
-        execution.complete_sampler(
-            handle,
-            stream,
-            self._stage(AttachmentOverlayStage.RELEASE).anchor_id,
-        )
-        self._state = _OverlaySampled(handle)
+        execution = self._overlay_deployment().compilation.execution
+        stream = torch.cuda.current_stream(execution.device)
+        execution.execute_anchor(handle, self._stage(AttachmentOverlayStage.RELEASE).anchor_id)
+        execution.complete_sampler(handle, stream)
 
     def _retire(self, identities: tuple[RequestIdentity, ...]) -> None:
-        match self._deployment:
-            case _RequestSamplerVllmDeployment() as deployment:
-                deployment.compilation.execution.retire(identities)
-            case _DenseOverlayVllmDeployment() as deployment:
-                deployment.compilation.execution.retire(
-                    identities,
-                    self._stage(AttachmentOverlayStage.FINISH).anchor_id,
-                )
-
-    def _request_execution(self) -> CanonicalRequestSamplerExecution:
-        return self._request_deployment().compilation.execution
-
-    def _overlay_execution(self) -> CanonicalDenseOverlayExecution:
-        return self._overlay_deployment().compilation.execution
+        self._deployment.compilation.execution.retire(identities)
 
     def _request_deployment(self) -> _RequestSamplerVllmDeployment:
         deployment = self._deployment

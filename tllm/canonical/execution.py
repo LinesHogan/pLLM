@@ -99,8 +99,7 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
         context: ExecutionContextT,
     ) -> "TaskGraphInvocation[ExecutionContextT]":
         return TaskGraphInvocation(
-            self.plan.schedule_signature,
-            self.plan.plan_epoch,
+            self.plan,
             context,
         )
 
@@ -109,10 +108,7 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
         invocation: "TaskGraphInvocation[ExecutionContextT]",
         anchor_id: AnchorId,
     ) -> None:
-        if invocation.plan_identity != (
-            self.plan.schedule_signature,
-            self.plan.plan_epoch,
-        ):
+        if invocation.plan is not self.plan:
             raise ValueError("task invocation belongs to another physical plan")
         invocation.execute_anchor(
             self.plan,
@@ -124,10 +120,7 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
         self,
         invocation: "TaskGraphInvocation[ExecutionContextT]",
     ) -> ExecutionContextT:
-        if invocation.plan_identity != (
-            self.plan.schedule_signature,
-            self.plan.plan_epoch,
-        ):
+        if invocation.plan is not self.plan:
             raise ValueError("task invocation belongs to another physical plan")
         return invocation.finish(self.plan)
 
@@ -136,8 +129,7 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
     """One staged execution cursor advanced only by signed anchor events."""
 
     __slots__ = (
-        "_schedule_signature",
-        "_plan_epoch",
+        "plan",
         "_context",
         "_next_task_index",
         "_last_anchor_id",
@@ -146,20 +138,14 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
 
     def __init__(
         self,
-        schedule_signature: str,
-        plan_epoch: int,
+        plan: PhysicalPlan,
         context: ExecutionContextT,
     ) -> None:
-        self._schedule_signature = schedule_signature
-        self._plan_epoch = plan_epoch
+        self.plan = plan
         self._context = context
         self._next_task_index = 0
         self._last_anchor_id = -1
         self._finished = False
-
-    @property
-    def plan_identity(self) -> tuple[str, int]:
-        return (self._schedule_signature, self._plan_epoch)
 
     @property
     def context(self) -> ExecutionContextT:
@@ -168,6 +154,10 @@ class TaskGraphInvocation(Generic[ExecutionContextT]):
     @property
     def last_anchor_id(self) -> int:
         return self._last_anchor_id
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
 
     def execute_anchor(
         self,

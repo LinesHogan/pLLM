@@ -8,8 +8,9 @@ from threading import RLock
 import torch
 
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
-from tllm.contracts.request_identity import RequestIdentity, RequestKeyField, canonical_request_key_fields
+from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_state import IndexedRequestIdentityBatch, RequestStateKey
+from tllm.contracts.semantic_graph import SemanticState
 from tllm.contracts.state_ref import LineageId, StateRef
 
 
@@ -43,11 +44,9 @@ class RequestStateTransitionLease:
 class RequestStateDirectory:
     """Own key-to-lineage relations, never another latest-version map."""
 
-    def __init__(self, arena: PageBundleArena, resource: str, key_fields: tuple[RequestKeyField, ...]) -> None:
-        canonical_request_key_fields(key_fields)
+    def __init__(self, arena: PageBundleArena, state: SemanticState) -> None:
         self.arena = arena
-        self._resource = resource
-        self._key_fields = key_fields
+        self.state = state
         self._lineages: dict[RequestStateKey, LineageId] = {}
         self._leases: dict[int, RequestStateTransitionLease] = {}
         self._leased_keys: set[RequestStateKey] = set()
@@ -68,7 +67,7 @@ class RequestStateDirectory:
             if not keys or any(key in self._lineages for key in keys):
                 raise RuntimeError("request admission requires unadmitted keys")
             batch = RequestStateAdmissionBatch(keys,
-                self.arena.prepare_admission((self._resource,) * len(keys), stream))
+                self.arena.prepare_admission((str(self.state.resource),) * len(keys), stream))
             self._pending = batch
             return batch
 
@@ -96,7 +95,7 @@ class RequestStateDirectory:
             rows: list[RequestStateSelectedRow] = []
             indices: dict[RequestStateKey, int] = {}
             for indexed in indexed_rows.rows:
-                key = RequestStateKey.project(indexed.identity, self._key_fields)
+                key = RequestStateKey.project(indexed.identity, self.state.key_fields)
                 if key not in indices:
                     try:
                         ref = self.arena.latest(self._lineages[key])
@@ -127,22 +126,6 @@ class RequestStateDirectory:
             self._leases.pop(lease.lease_id)
             self._leased_keys.difference_update(lease.selection.keys)
 
-    def prepare_transition(self, selection: RequestStateSelection, lease: RequestStateTransitionLease,
-                           stream: torch.cuda.Stream | None = None) -> PageWrite:
-        return self.prepare_transition_subset(selection, lease, tuple(range(len(selection.keys))), stream)
-
-    def prepare_transition_subset(self, selection: RequestStateSelection, lease: RequestStateTransitionLease,
-                                  state_indices: tuple[int, ...], stream: torch.cuda.Stream | None = None) -> PageWrite:
-        with self._lock:
-            self._require_lease(lease)
-            if lease.selection is not selection:
-                raise RuntimeError("request transition uses another leased selection")
-            self._require_latest(selection)
-            if (not state_indices or state_indices != tuple(sorted(set(state_indices)))
-                or any(index < 0 or index >= len(selection.refs) for index in state_indices)):
-                raise ValueError("request transition subset is not canonical")
-            return self.arena.prepare_transition(tuple(selection.refs[index] for index in state_indices), stream)
-
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
             keys = self._unique_keys(identities)
@@ -158,7 +141,7 @@ class RequestStateDirectory:
             return refs
 
     def _unique_keys(self, identities: tuple[RequestIdentity, ...]) -> tuple[RequestStateKey, ...]:
-        return tuple(dict.fromkeys(RequestStateKey.project(identity, self._key_fields) for identity in identities))
+        return tuple(dict.fromkeys(RequestStateKey.project(identity, self.state.key_fields) for identity in identities))
 
     def _require_latest(self, selection: RequestStateSelection) -> None:
         for key, ref in zip(selection.keys, selection.refs, strict=True):

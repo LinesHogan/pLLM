@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from contextlib import nullcontext
-from threading import RLock
 
 import torch
 
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
-from tllm.canonical.execution import TaskGraphExecution, TaskGraphInvocation
+from tllm.canonical.state_execution import StateExecution, StateTaskContext
 from tllm.canonical.kernels.low_rank_gated import (
     LowRankGatedLayout,
     initialize_low_rank_gated,
@@ -39,18 +37,16 @@ from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.esamp_request_task_common import (
     ESampLossTask,
     ESampPredictTask,
-    ESampStepContext,
+    ESampData,
     ESampTrainTask,
     ESampOptimizationPending,
     ESampOptimized,
     ESampPredicted,
     ESampPredictionPending,
-    ESampPublicationPending,
 )
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions,
     ESampRequestConfig,
-    ESampRequestDiagnostics,
     ESampRequestSpecialization,
     ESampRequestStepInput,
     ESampRequestStepResult,
@@ -68,13 +64,10 @@ from tllm.canonical.workloads.esamp_request_types import (
 )
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
-from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_state import (
     IndexedRequestIdentityBatch,
     IndexedRequestIdentityRow,
-    RequestStateKey,
 )
-from tllm.contracts.sampler import PackedSamplerGuidanceBatch
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
 from tllm.contracts.semantic_graph import (
     AnchorId,
@@ -85,7 +78,6 @@ from tllm.contracts.semantic_graph import (
     PackedSamplerRowsInputSource,
     SemanticEffect,
     SemanticGraph,
-    PhysicalPlan,
     SemanticInput,
     SemanticOutput,
     SemanticOutputKind,
@@ -103,11 +95,9 @@ from tllm.contracts.semantic_graph import (
 )
 from tllm.contracts.state_representation import (
     StateDeviceKind,
-    StatePhysicalPlan,
     StateLayoutRequirement,
     StateRepresentationRequest,
 )
-from tllm.contracts.state_ref import StateRef
 from tllm.contracts.tensor_layout import (
     MutationGranularity,
     StateTensorLayout,
@@ -141,401 +131,57 @@ def _decode_indexed_rows(
     return indexed_rows
 
 
-def _require_sampler_anchor_reached(
-    *,
-    last_anchor_id: int,
-    sampler_completion_anchor_id: AnchorId,
-    message: str,
-) -> None:
-    if last_anchor_id < int(sampler_completion_anchor_id):
-        raise RuntimeError(message)
-
-
-def _completed_step_result(
-    context: ESampStepContext,
-    *,
-    intervention_beta: float,
-    error_message: str,
-) -> ESampRequestStepResult:
-    match context.prediction, context.optimization, context.publication:
-        case (
-            ESampPredicted() as predicted,
-            ESampOptimized() as optimized,
-            PagePublication() as published,
-        ):
-            return ESampRequestStepResult(
-                context.step.rows.step_id,
-                predicted.guidance,
-                intervention_beta,
-                optimized.losses,
-                published.before_refs,
-                published.after_refs,
-            )
-        case _:
-            raise RuntimeError(error_message)
-
-
-@dataclass(frozen=True, slots=True)
-class _SamplerPending:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class _SamplerReady:
-    stream: torch.cuda.Stream
-
-
-@dataclass(frozen=True, slots=True)
-class _SamplerCompleted:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class CanonicalRequestStepHandle:
-    """Opaque token issued by one request-sampler execution."""
-
-    handle_id: int
-
-
 @dataclass(slots=True)
-class _ActiveRequestSamplerStep:
-    token: CanonicalRequestStepHandle
-    invocation: TaskGraphInvocation[ESampStepContext]
-    sampler: _SamplerPending | _SamplerReady | _SamplerCompleted
+class ESampMath:
+    config: ESampRequestConfig
+    specialization: ESampRequestSpecialization
+    layout: LowRankGatedLayout
+    generator: torch.Generator
 
+    def initialize(self, roots: tuple[tuple[torch.Tensor, ...], ...]) -> None:
+        for root in roots:
+            parameters = root[int(ESAMP_PARAMETER_FIELD)]
+            parameters.copy_(initialize_low_rank_gated(self.layout, dtype=parameters.dtype,
+                device=parameters.device, generator=self.generator))
 
-class CanonicalRequestSamplerExecution:
-    """One request lifecycle; device-specific operations bind physical storage."""
+    def rows(self, value: ESampRequestStepInput) -> IndexedRequestIdentityBatch:
+        return _decode_indexed_rows(value, empty_message="ESamp requires decode rows")
 
-    def __init__(
-        self,
-        *,
-        config: ESampRequestConfig,
-        specialization: ESampRequestSpecialization,
-        plan: PhysicalPlan,
-        state_plan: StatePhysicalPlan,
-        kernel_layout: LowRankGatedLayout,
-        arena: PageBundleArena,
-        directory: RequestStateDirectory,
-        sampler_completion_anchor_id: AnchorId,
-    ) -> None:
-        expected_device = (
-            torch.device("cpu") if specialization.device_kind is StateDeviceKind.CPU
-            else torch.device("cuda", specialization.device_ordinal)
-        )
-        if plan.plan_epoch != state_plan.plan_epoch or arena.device != expected_device:
-            raise ValueError("request-sampler plans or placement differ")
-        self._config = config
-        self._specialization = specialization
-        self._plan = plan
-        self._state_plan = state_plan
-        self._kernel_layout = kernel_layout
-        self._arena = arena
-        self._directory = directory
-        self._sampler_completion_anchor_id = sampler_completion_anchor_id
-        loss_id, predict_id, train_id = (
-            (ESAMP_REQUEST_LOSS_IMPLEMENTATION, ESAMP_REQUEST_PREDICT_IMPLEMENTATION,
-             ESAMP_REQUEST_TRAIN_IMPLEMENTATION)
-            if specialization.device_kind is StateDeviceKind.CPU else
-            (ESAMP_REQUEST_CUDA_LOSS_IMPLEMENTATION, ESAMP_REQUEST_CUDA_PREDICT_IMPLEMENTATION,
-             ESAMP_REQUEST_CUDA_TRAIN_IMPLEMENTATION)
-        )
-        self._runner = TaskGraphExecution(
-            plan,
-            (ESampLossTask(kernel_layout, loss_id),
-             ESampPredictTask(config, kernel_layout, predict_id),
-             ESampTrainTask(config, directory, train_id)),
-        )
-        self._generator = torch.Generator(device=arena.device)
-        self._generator.manual_seed(specialization.initialization_seed)
-        self._loss_count = 0
-        self._update_count = 0
-        self._completed_sampler_pins = 0
-        self._active_handles: dict[int, _ActiveRequestSamplerStep] = {}
-        self._next_handle_id = 1
-        self._lock = RLock()
-
-    @property
-    def plan(self) -> PhysicalPlan:
-        return self._plan
-
-    @property
-    def state_plan(self) -> StatePhysicalPlan:
-        return self._state_plan
-
-    @property
-    def config(self) -> ESampRequestConfig:
-        return self._config
-
-    @property
-    def specialization(self) -> ESampRequestSpecialization:
-        return self._specialization
-
-    @property
-    def execution_parameters_digest(self) -> str:
-        return self._specialization.execution_parameters_digest(self._config)
-
-    @property
-    def device(self) -> torch.device:
-        return self._arena.device
-
-    @property
-    def free_state_pages(self) -> int:
-        return self._arena.free_pages
-
-    @property
-    def state_pool_addresses(self) -> tuple[int, ...]:
-        return self._arena.pool_addresses
-
-    def require_stable_state_pool(self) -> None:
-        self._arena.require_stable()
-
-    def admit(
-        self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None,
-    ) -> tuple[StateRef, ...]:
-        with self._lock:
-            batch = self._directory.prepare_admission(identities, stream)
-            try:
-                with nullcontext() if stream is None else torch.cuda.stream(stream):
-                    for tensors in self._arena.writable_roots(batch.write):
-                        self._initialize(tensors)
-            except Exception:
-                self._directory.abort_admission(batch)
-                raise
-            receipt = self._directory.commit_admission(batch)
-            self._arena.settle(receipt)
-            return receipt.after_refs
-
-    def _initialize(self, tensors: tuple[torch.Tensor, ...]) -> None:
-        parameters = tensors[int(ESAMP_PARAMETER_FIELD)]
-        parameters.copy_(initialize_low_rank_gated(
-            self._kernel_layout, dtype=parameters.dtype, device=parameters.device,
-            generator=self._generator,
-        ))
-
-    def start_step(
-        self, step: ESampRequestStepInput, stream: torch.cuda.Stream | None = None,
-    ) -> CanonicalRequestStepHandle:
-        with self._lock:
-            self._require_stream(stream)
-            match step.hidden, stream:
-                case PackedHiddenSnapshotBatch() as hidden, None:
-                    pass
-                case CudaPackedHiddenSnapshotBatch() as captured, torch.cuda.Stream():
-                    captured.order_on(stream)
-                    hidden = captured.batch
-                case _:
-                    raise TypeError("request-sampler hidden snapshots differ from device binding")
-            bindings = self._specialization.hidden_bindings
-            if tuple(snapshot.resource for snapshot in hidden.snapshots) != bindings.resources:
-                raise ValueError("request-sampler snapshots differ from signed bindings")
-            source = hidden.hidden_for(bindings.source)
-            target = hidden.hidden_for(bindings.target)
-            if (
-                step.rows.plan_epoch != self._plan.plan_epoch
-                or int(source.shape[1]) != self._specialization.hidden_size
-                or source.dtype is not torch.float32
-                or source.device != self.device
-                or target.shape != source.shape
-            ):
-                raise ValueError("request-sampler step differs from specialization")
-            selection = self._directory.select(_decode_indexed_rows(
-                step, empty_message="request-sampler step requires decode rows",
-            ))
-            lease = self._directory.acquire_transition_lease(selection)
-            try:
-                pin = self._arena.pin_exact(selection.refs, stream)
-            except Exception:
-                self._directory.release_transition_lease(lease)
-                raise
-            context = ESampStepContext(
-                step, source, target, selection, lease, ESampPredictionPending(),
-                ESampOptimizationPending(), ESampPublicationPending(), self._arena, pin,
-            )
-            handle = CanonicalRequestStepHandle(self._next_handle_id)
-            self._next_handle_id += 1
-            self._active_handles[handle.handle_id] = _ActiveRequestSamplerStep(
-                handle, self._runner.start(context), _SamplerPending(),
-            )
-            return handle
-
-    def execute_anchor(self, handle: CanonicalRequestStepHandle, anchor_id: AnchorId) -> None:
-        with self._lock:
-            active = self._active_step(handle)
-            if int(anchor_id) > int(self._sampler_completion_anchor_id):
-                match active.sampler:
-                    case _SamplerPending() | _SamplerReady():
-                        raise RuntimeError("later anchors require sampler completion")
-                    case _SamplerCompleted():
-                        pass
-            try:
-                self._runner.execute_anchor(active.invocation, anchor_id)
-            except Exception:
-                self._fail_step(active)
-                raise
-
-    def sampler_guidance(
-        self, handle: CanonicalRequestStepHandle, stream: torch.cuda.Stream | None = None,
-    ) -> PackedSamplerGuidanceBatch:
-        with self._lock:
-            self._require_stream(stream)
-            active = self._active_step(handle)
-            match active.invocation.context.prediction:
-                case ESampPredicted() as predicted:
-                    pass
-                case ESampPredictionPending():
-                    raise RuntimeError("request-sampler prediction anchor has not executed")
-            if stream is not None:
-                match active.sampler:
-                    case _SamplerPending():
-                        if predicted.readiness is None:
-                            raise RuntimeError("CUDA request-sampler readiness is absent")
-                        predicted.readiness.order_on(stream)
-                        active.sampler = _SamplerReady(stream)
-                    case _SamplerReady(stream=issued) if issued == stream:
-                        pass
-                    case _SamplerReady() | _SamplerCompleted():
-                        raise RuntimeError("request-sampler sampler phase is invalid")
-            return predicted.guidance
-
-    def complete_sampler(
-        self, handle: CanonicalRequestStepHandle, stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        with self._lock:
-            self._require_stream(stream)
-            active = self._active_step(handle)
-            _require_sampler_anchor_reached(
-                last_anchor_id=active.invocation.last_anchor_id,
-                sampler_completion_anchor_id=self._sampler_completion_anchor_id,
-                message="request-sampler sampler cannot complete before its signed anchor",
-            )
-            match active.sampler:
-                case _SamplerPending() if stream is None:
-                    pass
-                case _SamplerReady(stream=issued) if issued == stream:
-                    self._order_sampler_completion(active, issued)
-                case _SamplerPending():
-                    raise RuntimeError("request-sampler guidance was not acquired")
-                case _SamplerReady() | _SamplerCompleted():
-                    raise RuntimeError("request-sampler completion is invalid or already completed")
-            active.sampler = _SamplerCompleted()
-            self._completed_sampler_pins += 1
-
-    def _order_sampler_completion(
-        self, active: _ActiveRequestSamplerStep, sampler_stream: torch.cuda.Stream,
-    ) -> None:
-        stream = active.invocation.context.pin.stream
-        if stream is not None:
-            completion = torch.cuda.Event(blocking=False)
-            completion.record(sampler_stream)
-            stream.wait_event(completion)
-
-    def finish_step(self, handle: CanonicalRequestStepHandle) -> ESampRequestStepResult:
-        with self._lock:
-            active = self._active_step(handle)
-            match active.sampler:
-                case _SamplerCompleted():
-                    pass
-                case _SamplerPending() | _SamplerReady():
-                    raise RuntimeError("request-sampler requires sampler completion")
-            context = self._runner.finish(active.invocation)
-            result = _completed_step_result(
-                context, intervention_beta=self._config.intervention_beta,
-                error_message="request-sampler physical plan did not produce all outputs",
-            )
-            self._loss_count += len(result.losses)
-            self._update_count += len(result.after_refs)
-            self._release_step(active)
-            return result
-
-    def cancel_step(self, handle: CanonicalRequestStepHandle) -> None:
-        with self._lock:
-            self._fail_step(self._active_step(handle))
-
-    def _release_step(self, active: _ActiveRequestSamplerStep) -> None:
-        context = active.invocation.context
-        self._arena.release_pin(context.pin)
-        if isinstance(context.publication, PagePublication):
-            self._arena.settle(context.publication)
-        self._directory.release_transition_lease(context.transition_lease)
-        self._active_handles.pop(active.token.handle_id)
-
-    def _fail_step(self, active: _ActiveRequestSamplerStep) -> None:
-        match active.sampler:
-            case _SamplerReady(stream=stream):
-                self._order_sampler_completion(active, stream)
-            case _SamplerPending() | _SamplerCompleted():
+    def prepare(self, value: ESampRequestStepInput, context: StateTaskContext[ESampData]) -> ESampData:
+        stream = context.pin.stream
+        match value.hidden, stream:
+            case PackedHiddenSnapshotBatch() as hidden, None:
                 pass
-        self._release_step(active)
+            case CudaPackedHiddenSnapshotBatch() as captured, torch.cuda.Stream():
+                captured.order_on(stream)
+                hidden = captured.batch
+            case _:
+                raise ValueError("ESamp hidden snapshots differ from the input device")
+        bindings = self.specialization.hidden_bindings
+        if tuple(snapshot.resource for snapshot in hidden.snapshots) != bindings.resources:
+            raise ValueError("ESamp snapshots differ from signed bindings")
+        source, target = hidden.hidden_for(bindings.source), hidden.hidden_for(bindings.target)
+        if (value.rows.plan_epoch != context.arena.plan.schedule_physical.plan_epoch
+            or source.shape[1:] != (self.specialization.hidden_size,) or source.dtype is not torch.float32
+            or target.shape != source.shape or source.device != context.arena.device):
+            raise ValueError("ESamp input differs from specialization")
+        return ESampData(value, source, target, ESampPredictionPending(), ESampOptimizationPending())
 
-    def retire(self, identities: tuple[RequestIdentity, ...]) -> None:
-        with self._lock:
-            retirement_keys = {
-                RequestStateKey.project(identity, self._config.key_fields)
-                for identity in identities
-            }
-            for active in tuple(self._active_handles.values()):
-                if retirement_keys.intersection(active.invocation.context.selection.keys):
-                    self._fail_step(active)
-            self._collect_completed(wait=True)
-            self._directory.retire(identities)
-
-    def snapshot(
-        self, ref: StateRef, stream: torch.cuda.Stream | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        with self._lock:
-            pin = self._arena.pin_exact((ref,), stream)
-            try:
-                return self._arena.snapshot(pin, ref)
-            finally:
-                self._arena.release_pin(pin)
-                self._arena.collect_completed()
-
-    def collect_completed(self) -> None:
-        self._arena.collect_completed()
-
-    def _collect_completed(self, *, wait: bool) -> None:
-        self._arena.collect_completed(wait=wait)
-
-    def diagnostics(self) -> ESampRequestDiagnostics:
-        with self._lock:
-            return ESampRequestDiagnostics(
-                self._directory.active_count, self._loss_count, self._update_count,
-                self._completed_sampler_pins, self._arena.pending_pin_releases, self._state_plan,
-            )
-
-    def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
-        if self.device.type == "cpu":
-            if stream is not None:
-                raise RuntimeError("CPU request-sampler does not accept a CUDA stream")
-        elif stream is None or stream.device != self.device:
-            raise RuntimeError("CUDA request-sampler requires a stream on its device")
-
-    def _active_step(self, handle: CanonicalRequestStepHandle) -> _ActiveRequestSamplerStep:
-        try:
-            active = self._active_handles[handle.handle_id]
-        except KeyError as exc:
-            raise RuntimeError("request-sampler step is not registered as active") from exc
-        if active.token is not handle:
-            raise RuntimeError("request-sampler step differs from the registered handle")
-        return active
+    def output(self, context: StateTaskContext[ESampData]) -> ESampRequestStepResult:
+        data = context.data()
+        match data.prediction, data.optimization, context.publication:
+            case ESampPredicted() as predicted, ESampOptimized() as optimized, PagePublication() as published:
+                return ESampRequestStepResult(data.step.rows.step_id, predicted.guidance,
+                    self.config.intervention_beta, optimized.losses, published.before_refs, published.after_refs)
+            case _:
+                raise RuntimeError("ESamp signed graph did not produce all outputs")
 
 
 @dataclass(frozen=True, slots=True)
 class ESampRequestCompilation:
-    """One executable ESamp specialization and its complete signed plan bundle."""
-
-    execution: CanonicalRequestSamplerExecution
+    execution: StateExecution[ESampRequestStepInput, ESampData, ESampRequestStepResult]
     plan_bundle: CanonicalPlanBundle
-
-    def __post_init__(self) -> None:
-        if (
-            self.execution.plan is not self.plan_bundle.schedule_physical
-            or self.execution.state_plan is not self.plan_bundle.state_physical
-            or self.execution.execution_parameters_digest
-            != self.plan_bundle.semantic_graph.execution_parameters_digest
-        ):
-            raise TypeError("ESamp compilation requires exact execution and plan bundle")
+    math: ESampMath
 
 
 class ESampRequestWorkload(CanonicalWorkload):
@@ -907,21 +553,20 @@ class ESampRequestWorkload(CanonicalWorkload):
             tensor_layout_decision=layout_decision,
         )
         arena = PageBundleArena(plan_bundle, candidates)
-        directory = RequestStateDirectory(arena, str(_STATE_RESOURCE), self.config.key_fields)
-        execution = CanonicalRequestSamplerExecution(
-            config=self.config,
-            specialization=specialization,
-            plan=physical,
-            state_plan=state_physical,
-            kernel_layout=kernel_layout,
-            arena=arena,
-            directory=directory,
-            sampler_completion_anchor_id=sampler_anchor_ids[0],
+        directory = RequestStateDirectory(arena, graph.states[0])
+        math = ESampMath(self.config, specialization, kernel_layout,
+            torch.Generator(device=arena.device).manual_seed(specialization.initialization_seed))
+        loss_id, predict_id, train_id = (
+            (ESAMP_REQUEST_LOSS_IMPLEMENTATION, ESAMP_REQUEST_PREDICT_IMPLEMENTATION,
+             ESAMP_REQUEST_TRAIN_IMPLEMENTATION) if specialization.device_kind is StateDeviceKind.CPU else
+            (ESAMP_REQUEST_CUDA_LOSS_IMPLEMENTATION, ESAMP_REQUEST_CUDA_PREDICT_IMPLEMENTATION,
+             ESAMP_REQUEST_CUDA_TRAIN_IMPLEMENTATION)
         )
-        return ESampRequestCompilation(
-            execution,
-            plan_bundle,
+        execution = StateExecution(arena, directory, math,
+            (ESampLossTask(kernel_layout, loss_id), ESampPredictTask(self.config, kernel_layout, predict_id),
+             ESampTrainTask(self.config, train_id)), sampler_anchor_ids[0],
         )
+        return ESampRequestCompilation(execution, plan_bundle, math)
 
 
 __all__ = [
@@ -929,7 +574,5 @@ __all__ = [
     "ESampRequestCompilation",
     "ESampRequestConfig",
     "ESampRequestSpecialization",
-    "CanonicalRequestSamplerExecution",
-    "CanonicalRequestStepHandle",
     "ESampRequestWorkload",
 ]
