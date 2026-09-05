@@ -24,8 +24,8 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `86e1326` on `main` | — | after `e03816d` |
-| Counted production/support source | 26,744 lines | -106,466 lines | -64,582 lines |
+| Commit | `4f7e370` on `main` | — | after `e03816d` |
+| Counted production/support source | 26,617 lines | -106,593 lines | -64,709 lines |
 | Pytest collection | 8 items | -1,341 items | -3 items |
 | Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -40,6 +40,33 @@ debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared ESamp task state after `86e1326`
+
+Commit `4f7e370`: counted source `+152 / -279 / net -127`; no unchanged
+moves or independent tensor math changes. Six CPU/CUDA tasks became three
+shared tasks with one gradient-typed context and one logical transition path.
+Device kernels only bind existing storage, gradients, pins and streams.
+The CUDA invocation and context reference the same kernel object.
+`ESampPublished` was deleted; context holds the original shared
+`RequestStatePublicationReceipt`, not a workload-specific receipt projection.
+
+Evidence 25 now checks cancellation after prediction and injected failure
+after AdamW but before publication: original roots and capacity are preserved,
+and retry still matches the independent oracle. Evidence 37 exercises CUDA
+cancellation before each successful capture/replay step. These additions
+passed before and after replacement; active/pending counts remain 16/25.
+Execution lifecycles and backend sessions remain separate. This change does
+not complete PageBundle, generational identity or cross-root settlement;
+provisional dense_page internals were left unchanged.
+
+Validation using the repository venv: full pytest 8 passed in 27.33s;
+CUDA Graph loss/update 4, stable addresses and zero fallback; strict/basic
+typing 0/0 and import/authority gates passed. Public plain-to-ESamp MRv2 smoke
+also passed with loss/update 2, zero live lineages and zero fallback.
+Rust and In-Place/FTTT paths
+are unchanged and were not rerun; their last evidence remains at `86e1326`.
+No throughput benchmark or release.
 
 ### Shared Graph Index and Codec after `1a9eca6`
 
@@ -471,7 +498,7 @@ Moves are recorded separately and never counted as deletion.
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
 | In-Place-TTT | dense fast-weight math and layout | shared task state complete; generic execution/PTTS pending | 23, 32 active |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
-| ESamp | request math, sampler guidance, random init | task/lifecycle unification and MRv1 pending | 25, 30, 37 active; 31 pending |
+| ESamp | request math, sampler guidance, random init | shared task/context complete; execution lifecycle and MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
 | Recirculation | row selection and replay math | typed replay effect | 27, 35 |
 | OverRIDE | reweight and Adam math | generic sampler/state transition | 28 |
