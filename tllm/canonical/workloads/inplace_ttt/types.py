@@ -236,7 +236,7 @@ class CudaInPlaceTTTStepBatchInput:
 
 
 @dataclass(frozen=True, slots=True)
-class InPlaceTTTCudaStepHandle:
+class InPlaceTTTStepHandle:
     handle_id: int
     identities: tuple[RequestIdentity, ...]
     refs: tuple[StateRef, ...]
@@ -244,7 +244,7 @@ class InPlaceTTTCudaStepHandle:
 
     def __post_init__(self) -> None:
         if self.handle_id < 1:
-            raise ValueError("CUDA In-Place-TTT handle requires an ID")
+            raise ValueError("In-Place-TTT handle requires an ID")
 
 
 def validate_inplace_ttt_step(
@@ -329,7 +329,7 @@ __all__ = [
     "InPlaceTTTStepInput",
     "InPlaceTTTStepBatch",
     "InPlaceTTTStepBatchResult",
-    "InPlaceTTTCudaStepHandle",
+    "InPlaceTTTStepHandle",
     "InPlaceTTTStepResult",
     "InPlaceTTTTargetResult",
     "InPlaceTTTTargetSpecialization",

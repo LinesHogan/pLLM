@@ -13,14 +13,15 @@ from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTCompileOptions, InPlaceTTTConfig, InPlaceTTTOperandPair,
     InPlaceTTTPhase, InPlaceTTTSpecialization, InPlaceTTTStepInput,
-    InPlaceTTTTargetSpecialization,
+    InPlaceTTTStepBatch, InPlaceTTTTargetSpecialization,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
-    CanonicalDenseOverlayExecution, InPlaceTTTWorkload,
+    InPlaceTTTWorkload,
 )
 from tllm.contracts.parameter_overlay import (
     ParameterModuleKind, ParameterRole, ParameterTarget,
 )
+from tllm.contracts.backend_attachment import AttachmentTaskBinding, AttachmentTaskRole
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.tensor_layout import TensorDType
 
@@ -44,7 +45,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         ),
     )
     execution = compiled.execution
-    assert isinstance(execution, CanonicalDenseOverlayExecution)
+    assert execution.device.type == "cpu"
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
     refs = execution.admit(identities)
     bases = torch.tensor([
@@ -78,7 +79,30 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
                 execution.step(step)
         for actual, expected in zip(execution.snapshot(latest), before, strict=True):
             torch.testing.assert_close(actual, expected)
-        result = execution.step(step)
+        if row == 0:
+            result = execution.step(step)
+        else:
+            transition, publish = execution.plan.tasks
+            args = ((step.identity,), None, compiled.state_layout.overlay_bindings,
+                    transition.anchor_id)
+            cancelled = execution.begin_batch(*args)
+            execution.abort_step(cancelled)
+            with pytest.raises(RuntimeError, match="active"):
+                execution.abort_step(cancelled)
+            handle = execution.begin_batch(*args)
+            execution.submit_captured(
+                handle, InPlaceTTTStepBatch((step,)),
+                AttachmentTaskBinding(AttachmentTaskRole.TRANSITION, transition.task_id,
+                                      transition.implementation_id, transition.anchor_id),
+                AttachmentTaskBinding(AttachmentTaskRole.PUBLISH, publish.task_id,
+                                      publish.implementation_id, publish.anchor_id),
+            )
+            with pytest.raises(RuntimeError, match="sampler completion"):
+                execution.finish_step(handle)
+            execution.complete_sampler(handle, None, publish.anchor_id)
+            (result,) = execution.finish_step(handle).entries
+            with pytest.raises(RuntimeError, match="active"):
+                execution.finish_step(handle)
         assert result.before_ref == latest
         latest = result.after_ref
         assert latest.version_id == row + 1

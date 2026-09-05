@@ -13,13 +13,14 @@ from tllm.canonical.kernels.dense_fast_weight import (
 from tllm.canonical.ptts.dense_page import (
     DensePageStateProvider,
     DensePageTransitionBatch,
+    DensePageVersionPin,
 )
 from tllm.canonical.ptts.cuda_publication import (
     CudaRequestStatePreparedPublication,
     CudaRequestStatePublicationCoordinator,
 )
 from tllm.canonical.ptts.dense_page_cuda import CudaDensePageStateProvider
-from tllm.canonical.ptts.dense_page_cuda_types import CudaDensePageVersionPin
+from tllm.canonical.ptts.dense_page_cuda_types import CudaDensePageRelease, CudaDensePageVersionPin
 from tllm.canonical.ptts.request_state import (
     RequestStateDirectory,
     RequestStateSelection,
@@ -45,6 +46,7 @@ from tllm.contracts.parameter_overlay import (
 )
 from tllm.contracts.state_ref import StateRef
 from tllm.contracts.semantic_graph import ImplementationId
+from tllm.contracts.tensor_layout import LayoutFieldId
 
 
 INPLACE_TTT_TRANSITION_IMPLEMENTATION = ImplementationId(
@@ -114,7 +116,14 @@ InPlaceTTTTransitionState = (
 class InPlaceTTTCpuStorage:
     provider: DensePageStateProvider
     publication: RequestStatePublicationCoordinator
+    pin: DensePageVersionPin
     stream: None = None
+
+    def field_rows(self, refs: tuple[StateRef, ...], field: LayoutFieldId) -> torch.Tensor:
+        return torch.stack(tuple(self.provider.snapshot(ref)[int(field)] for ref in refs))
+
+    def release(self) -> None:
+        self.provider.release_pin(self.pin)
 
     def read(
         self, layout: InPlaceTTTStateLayout, refs: tuple[StateRef, ...],
@@ -139,6 +148,12 @@ class InPlaceTTTCudaStorage:
     publication: CudaRequestStatePublicationCoordinator
     pin: CudaDensePageVersionPin
     stream: torch.cuda.Stream
+
+    def field_rows(self, refs: tuple[StateRef, ...], field: LayoutFieldId) -> torch.Tensor:
+        return self.provider.pinned_field_rows(self.pin, field, self.stream)
+
+    def release(self) -> CudaDensePageRelease:
+        return self.provider.release_pin(self.pin, self.stream)
 
     def read(
         self, layout: InPlaceTTTStateLayout, refs: tuple[StateRef, ...],
@@ -168,7 +183,7 @@ class InPlaceTTTCudaStorage:
 
 @dataclass(slots=True)
 class InPlaceTTTStepContext:
-    batch: InPlaceTTTStepBatch
+    batch: InPlaceTTTStepBatch | None
     selection: RequestStateSelection
     transition_lease: RequestStateTransitionLease
     storage: InPlaceTTTCpuStorage | InPlaceTTTCudaStorage
@@ -300,6 +315,9 @@ class InPlaceTTTTransitionTask:
         self.implementation_id = implementation_id
 
     def execute(self, context: InPlaceTTTStepContext) -> None:
+        batch = context.batch
+        if batch is None:
+            raise RuntimeError("parameter transition requires captured operands")
         match context.transition:
             case InPlaceTTTTransitionPending():
                 pass
@@ -310,10 +328,10 @@ class InPlaceTTTTransitionTask:
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             computed = tuple(
                 compute_inplace_ttt_transition(self._config, self._layout, entry, root)
-                for entry, root in zip(context.batch.entries, source_roots, strict=True)
+                for entry, root in zip(batch.entries, source_roots, strict=True)
             )
         changed = tuple(
-            index for index, entry in enumerate(context.batch.entries)
+            index for index, entry in enumerate(batch.entries)
             if any(self._config.updates(operand.phase) for operand in entry.operands)
         )
         logical = self._directory.prepare_transition_subset(
@@ -330,7 +348,7 @@ class InPlaceTTTTransitionTask:
                         self._layout.overlay_bindings, weight_changed=values.weight_changed,
                     )
                     for entry, before, values in zip(
-                        context.batch.entries, context.selection.refs, computed, strict=True,
+                        batch.entries, context.selection.refs, computed, strict=True,
                     )
                 )
             )

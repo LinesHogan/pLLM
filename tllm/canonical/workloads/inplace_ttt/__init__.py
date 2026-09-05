@@ -6,7 +6,7 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTCompileOptions,
     InPlaceTTTConfig,
     InPlaceTTTDiagnostics,
-    InPlaceTTTCudaStepHandle,
+    InPlaceTTTStepHandle,
     InPlaceTTTOperandPair,
     InPlaceTTTPhase,
     InPlaceTTTSpecialization,
@@ -18,13 +18,11 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTTargetSpecialization,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
-    CanonicalDenseOverlayCudaExecution,
     CanonicalDenseOverlayExecution,
     InPlaceTTTCompilation,
     InPlaceTTTWorkload,
 )
 __all__ = [
-    "CanonicalDenseOverlayCudaExecution",
     "CanonicalDenseOverlayExecution",
     "CudaInPlaceTTTStepBatchInput",
     "InPlaceTTTCleanupReceipt",
@@ -32,7 +30,7 @@ __all__ = [
     "InPlaceTTTCompileOptions",
     "InPlaceTTTConfig",
     "InPlaceTTTDiagnostics",
-    "InPlaceTTTCudaStepHandle",
+    "InPlaceTTTStepHandle",
     "InPlaceTTTOperandPair",
     "InPlaceTTTPhase",
     "InPlaceTTTSpecialization",

@@ -53,7 +53,7 @@ from tllm.canonical.workloads.esamp_request_types import (
 from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTCompileOptions,
     InPlaceTTTConfig,
-    InPlaceTTTCudaStepHandle,
+    InPlaceTTTStepHandle,
     InPlaceTTTOperandPair,
     InPlaceTTTPhase,
     InPlaceTTTSpecialization,
@@ -63,7 +63,7 @@ from tllm.canonical.workloads.inplace_ttt import (
 )
 from tllm.canonical.workloads.inplace_ttt.types import CudaInPlaceTTTStepBatchInput
 from tllm.canonical.workloads.inplace_ttt.workload import (
-    CanonicalDenseOverlayCudaExecution,
+    CanonicalDenseOverlayExecution,
     InPlaceTTTCompilation,
     InPlaceTTTWorkload,
 )
@@ -213,7 +213,7 @@ def _model_dtype(dtype: CanonicalVllmDType) -> Literal["bfloat16", "float16", "f
 class CanonicalVllmDeployment:
     workload: ESampRequestWorkload | InPlaceTTTWorkload
     compilation: ESampRequestCompilation | InPlaceTTTCompilation
-    execution: CanonicalRequestSamplerExecution | CanonicalDenseOverlayCudaExecution
+    execution: CanonicalRequestSamplerExecution | CanonicalDenseOverlayExecution
     attachment: SignedBackendAttachment
     hidden_bindings: tuple[PackedHiddenResourceBinding, ...]
     overlay_targets: tuple[VllmDenseAddTargetSpec, ...]
@@ -268,7 +268,7 @@ class _RequestSamplerVllmDeployment(CanonicalVllmDeployment):
 class _DenseOverlayVllmDeployment(CanonicalVllmDeployment):
     workload: InPlaceTTTWorkload
     compilation: InPlaceTTTCompilation
-    execution: CanonicalDenseOverlayCudaExecution
+    execution: CanonicalDenseOverlayExecution
     hidden_bindings: tuple[()]
     overlay_targets: tuple[VllmDenseAddTargetSpec, ...]
 
@@ -298,17 +298,17 @@ class _RequestSampled:
 
 @dataclass(frozen=True, slots=True)
 class _OverlayPrepared:
-    handle: InPlaceTTTCudaStepHandle
+    handle: InPlaceTTTStepHandle
 
 
 @dataclass(frozen=True, slots=True)
 class _OverlayTransitioned:
-    handle: InPlaceTTTCudaStepHandle
+    handle: InPlaceTTTStepHandle
 
 
 @dataclass(frozen=True, slots=True)
 class _OverlaySampled:
-    handle: InPlaceTTTCudaStepHandle
+    handle: InPlaceTTTStepHandle
 
 
 _SessionState = (
@@ -762,7 +762,7 @@ class CanonicalVllmSession:
     def _request_execution(self) -> CanonicalRequestSamplerExecution:
         return self._request_deployment().execution
 
-    def _overlay_execution(self) -> CanonicalDenseOverlayCudaExecution:
+    def _overlay_execution(self) -> CanonicalDenseOverlayExecution:
         return self._overlay_deployment().execution
 
     def _request_deployment(self) -> _RequestSamplerVllmDeployment:
@@ -1346,7 +1346,7 @@ def _compile_dense_overlay_deployment(
             state_memory_budget_bytes=free_device_bytes,
         ),
     )
-    if type(compilation.execution) is not CanonicalDenseOverlayCudaExecution:
+    if compilation.execution.device.type != "cuda":
         raise RuntimeError("vLLM facts did not select CUDA dense overlay execution")
     probe = _base_probe(
         runner,

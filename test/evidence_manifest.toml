@@ -166,7 +166,7 @@ group = "workload"
 path = "test/workloads/test_inplace_ttt.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_inplace_ttt.py"
 environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Two targets match independent outer-product updates across a tail/chunk boundary; injected prepublication failure preserves original roots and permits clean retry; one atomic publication, decode isolation between same-ID samples, exact version retirement and zero fallback"
+observable_contract = "Two targets match independent outer-product updates across a tail/chunk boundary through synchronous and staged execution; cancellation before capture permits retry, finish requires sampler completion and consumed handles reject repeated settlement; injected prepublication failure preserves original roots; one atomic publication, decode isolation between same-ID samples, exact version retirement and zero fallback"
 replaces = "test/core/test_canonical_inplace_ttt_workload_unit.py; no legacy fixtures or internal class assertions"
 
 [[evidence]]
