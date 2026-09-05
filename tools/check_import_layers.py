@@ -9,10 +9,8 @@ Usage (from the repo root, venv activated)::
 
 Target direction (a package may import only the packages listed in RULES)::
 
-    core ← contracts ← canonical
-                     ← ports ← common ← runtime
-    backends (contracts/ports/runtime only; runtime types arrive via protocols)
-    workflows: leaf entry points, may import anything below
+    contracts ← canonical ← canonical_vllm
+    backends (contracts only); Rust FFI is tllm._core
 
 Two tiers, mirroring tools/check_typing.py:
   - module-level violations: the red line; any new one fails the gate.
@@ -20,9 +18,6 @@ Two tiers, mirroring tools/check_typing.py:
     counted separately and must only decrease until R3 eliminates them.
 
 Imports under ``if TYPE_CHECKING:`` are erased at runtime and exempt.
-
-``runtime -> backends`` is exempt only for ``tllm.backends.protocol`` (the
-sanctioned protocol seam); imports of concrete backend drivers fail.
 
 Files directly under ``tllm/`` (the package facade) are exempt. Every new
 subpackage of ``tllm`` must be declared in RULES — undeclared packages fail.
@@ -43,32 +38,17 @@ BASELINE_PATH = REPO_ROOT / "tools" / "import_layers_baseline.json"
 
 # importer package -> allowed internal targets (besides itself).
 RULES: dict[str, frozenset[str]] = {
-    "core": frozenset(),
-    "contracts": frozenset({"core"}),
+    "contracts": frozenset(),
     # Clean-room native core. It consumes only closed contracts and Rust FFI;
     # legacy runtime/workload layers must never become dependencies.
-    "canonical": frozenset({"contracts", "core"}),
+    "canonical": frozenset({"contracts"}),
     # Clean in-process vLLM attachment.  It may consume signed canonical
     # plans/contracts and Rust FFI, but never the legacy runtime/backends.
-    "canonical_vllm": frozenset({"canonical", "contracts", "core"}),
-    "ports": frozenset({"contracts", "core"}),
-    "common": frozenset({"contracts", "ports", "core"}),
-    "runtime": frozenset({"contracts", "ports", "common", "core"}),
-    # Backend drivers are adapters *above* the runtime: they may import it,
-    # but the runtime must never import a concrete driver (only the pure
-    # protocol module, via SANCTIONED_EDGES).
-    "backends": frozenset({"contracts", "ports", "runtime", "core"}),
-    "workflows": None,  # leaf entry points: may import anything
-    # Script helpers used by workflows/starter/gpu scripts.
-    "util": None,
+    "canonical_vllm": frozenset({"canonical", "contracts"}),
+    "backends": frozenset({"contracts"}),
 }
 
-# Any package may import the pure backend contract module (it has zero
-# internal imports); the runtime may touch nothing else under backends/.
 SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("runtime", "tllm.backends.protocol"),
-    }
 )
 
 EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(

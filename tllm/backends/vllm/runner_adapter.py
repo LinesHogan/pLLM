@@ -26,7 +26,7 @@ from tllm.contracts.packed_rows import (
 _BINDING_ATTR = RUNNER_BINDING_ATTR
 
 if TYPE_CHECKING:
-    from tllm.runtime.specialization import RuntimeSpecializationSpec
+    from tllm.backends.vllm.specialization import RuntimeSpecializationSpec
 
 
 def ensure_runner_binding(
@@ -110,7 +110,7 @@ class _RuntimeSpecializationRunner(Protocol):
 def runner_runtime_specialization(
     runner: _RuntimeSpecializationRunner,
 ) -> "RuntimeSpecializationSpec":
-    from tllm.runtime.specialization import RuntimeSpecializationSpec
+    from tllm.backends.vllm.specialization import RuntimeSpecializationSpec
 
     model_config = runner.model_config
     binding = runner_binding_for(runner)

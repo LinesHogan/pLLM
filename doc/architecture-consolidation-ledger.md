@@ -18,19 +18,23 @@ All Python commands use `/workspace/pllm/.venv/bin/python`.
 
 ## Current checkpoint
 
+Verified on 2026-09-06. See the [implementation handoff](architecture-consolidation-handoff.md)
+for outstanding architecture, functionality and evidence work. The narrative
+entries below are chronological history, not additional current checkpoints.
+
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `ed1c487` | — | after `e03816d` |
-| Counted production/support source | 82,143 lines | -51,067 lines | -9,183 lines |
-| Pytest collection | 1 item | -1,348 items | -10 items |
+| Commit | `766b360` plus current worktree | — | after `e03816d` |
+| Counted production/support source | 27,973 lines | -105,237 lines | -63,353 lines |
+| Pytest collection | 3 items | -1,346 items | -8 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 8 items | now below the 50-item ceiling | -10 items |
+| Visible `TEST_COUNT` | 10 items | below the 50-item ceiling; not yet the final evidence set | -8 items |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 3, 5, 13, 30, 32, 37 and 38.  The manifest now records
-31 pending survivor evidence items.  Those pending items are implementation
+evidence IDs 1, 3, 5, 13, 20, 30, 32, 37, 38 and 39. The manifest now records
+29 pending survivor evidence items. Those pending items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
@@ -39,8 +43,8 @@ class-hierarchy, registry or mock-call-count tests.
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines
 from static gates, for `+0 / -912 / net -912` under `SOURCE_LOC`. It also
-deleted 1,026 test lines from the superseded unit and GPU smoke; evidence 21
-and 38 remain as the canonical CPU and CUDA survivors. Documentation and JSON
+deleted 1,026 test lines from the superseded unit and GPU smoke. At the current
+checkpoint evidence 21 is pending and evidence 38 retains its CUDA smoke base. Documentation and JSON
 config changes are excluded from `SOURCE_LOC` and are not used to offset these
 deletions.
 
@@ -259,6 +263,44 @@ deleted WorkGraph package tier.  Under `SOURCE_LOC`, this checkpoint is
 
 ## Tranche accounting
 
+The 2026-09-06 residual retirement slice removed the remaining old runtime,
+ports, common, core re-export and util packages; orphan slot/paged-state and
+physical-plan stores; old driver installers and sampler hooks; MP bootstrap,
+plugin and control plane; and unused Rust shape/decode/sampler FFI. Plain
+`make_llm` now constructs vLLM directly with typed engine options, while the
+canonical route still attaches the supported workloads. No compatibility
+entry point or no-op installer was left behind.
+
+This coordinated D/E slice is `+111 / -21,856 / net -21,745` counted source.
+Three independent backend helpers moved byte-for-byte: graph mode (79),
+overlay state (486), and specialization facts (52), totaling 617 lines.
+These moves are not deletion. The retained overlay version store and replay
+callback contracts still need consolidation with canonical PTTS/effects;
+deleting the runtime directory does not certify a single final state authority.
+Retained structural probes do not constitute verified MRv1/legacy public support.
+
+Evidence 39 now builds and installs a fresh non-editable wheel in an isolated
+directory, verifies package/native-module provenance and removal of the old
+plugin/packages, and executes the Rust layout codec. Evidence 20 restores a
+compact Dummy graph/plan/owned-export oracle from the historical numerical
+scenario without its legacy consumer import. Neither adds production helpers.
+Evidence 30 now exercises plain inference followed by canonical ESamp in the
+same process, covering the public routing change without another test item.
+
+Validation uses `/workspace/pllm/.venv/bin/python`: pytest 3 passed, Rust
+tests 3 passed, import-layer 0/0, region authority OK (4 real execution/binding
+files), strict and basic typing both 0 errors/0 warnings. The basic baseline
+fell from 108 errors to 0 through deletion. The root-project editable wheel
+was rebuilt; installed metadata has no tLLM general plugin. Real public GPU
+smokes passed: plain -> ESamp (loss/update 2, active lineages 0, fallback 0),
+In-Place-TTT (updates 6, dense apply rows 8, active lineages 0, fallback 0).
+The remaining standalone CUDA evidence also passed: graph replay reported
+4 losses and 4 updates with stable addresses and zero fallback; FTTT reported
+1 loss, 1 update, state version 1 and zero fallback. All 10 currently retained
+evidence items executed successfully; this does not settle the 29 pending items.
+No throughput benchmark was run. SOURCE_LOC now meets the numeric window,
+but missing workloads, MRv1, AER/PTTS, closed MP and evidence remain open.
+
 | Tranche | Added | Deleted | Moved unchanged | Net | State |
 | --- | ---: | ---: | ---: | ---: | --- |
 | A — ledger and survivor extraction | 7 | 2,997 | 0 | -2,990 | active: stale consumer/duplicate/core unit tests pruned; pytest 1, Rust 3, standalone smokes 4 |
@@ -266,6 +308,7 @@ deleted WorkGraph package tier.  Under `SOURCE_LOC`, this checkpoint is
 | C — workload cutovers | 0 | 912 | 0 | -912 | active: FTTT retired |
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
 | E — legacy authority removal | 529 | 73,602 | 988 | -73,073 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler/recurrence island, backend-region/packed-hidden old hooks, consumer compat island, BaseConsumer dispatch chain and dummy consumer re-export removed |
+| D/E — residual retirement continuation | 111 | 21,856 | 617 | -21,745 | old packages and public hook/plugin path deleted; retained backend state/effects still require canonical consolidation |
 | F — AER/PTTS final core | — | — | — | — | pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
@@ -277,24 +320,24 @@ Moves are recorded separately and never counted as deletion.
 | Current owner | Disposition | Unique content that survives | Final owner |
 | --- | --- | --- | --- |
 | `tllm/canonical`, `tllm/contracts` | keep and compress | semantic descriptors, tensor math, FFI DTOs | canonical graph/execution core |
-| `tllm/canonical_runtime` | delete in B | no workload-specific orchestration | generic executor/backend seam |
+| `tllm/canonical_runtime` | directory deleted; B remains incomplete | workload-specific branching still exists in canonical_vllm/runtime.py | generic executor/backend seam |
 | `tllm/canonical_vllm` | merge in D | vLLM probes and physical adapter mechanics | `tllm/backends/vllm` |
-| `tllm/runtime` | prune in E/F | MP/backend facts, native safe points, stats | closed MP and generic backend owners |
-| `tllm/workgraph` | deleted in `3da233b` | finite recurrence declarations moved | `tllm.contracts.recurrence` |
+| `tllm/runtime` | deleted in current worktree | 617 lines of backend helper content moved; closed MP remains missing | backend primitives, then canonical state/effect consolidation |
+| `tllm/workgraph` | deleted in `3da233b`; temporary recurrence owner subsequently deleted in `07a64d8` | row-selection/replay semantics still to implement | canonical typed replay effect |
 | `tllm/program` | deleted in `3da233b` | none | canonical descriptors/workloads |
-| `tllm/schedule`, `tllm/workload` | delete remaining old authority in E/F | independent math/loaders only | canonical descriptors/workloads |
+| `tllm/schedule`, `tllm/workload` | deleted in `19e0389` | missing workload semantics remain implementation debt | canonical descriptors/workloads |
 | `tllm/consumers` | deleted in `b3af0d4` | survivor semantics to be rebuilt only in canonical owners | one canonical workload owner each |
 | `tllm/kit` | deleted in `b3af0d4` | none after typed execution cutover | canonical public factories |
-| `tllm/ports` | delete in E/F | none after typed execution cutover | canonical contracts |
-| Rust non-canonical graph/schedule | prune in E/F | WorkGraph, execution_plan and placement removed; remaining schedule/recurrence are pending audit | `rust/tllm_core/src/canonical` |
+| `tllm/ports`, `tllm/common`, `tllm/core`, `tllm/util` | deleted in current worktree | plain engine construction moved into public factory; obsolete helpers removed | canonical contracts and direct public factory |
+| Rust non-canonical graph/schedule | old graph/schedule/recurrence/placement/execution_plan and shape/decode/sampler removed | prefill row planning and batch-phase classification still consumed by adapters | unique backend fact helpers |
 | provisional `canonical/ptts/dense_page*` | replace in F | lifecycle invariants and CUDA kernels | PageBundle/generational arena |
 
 ## Workload cutover manifest
 
 | Workload | Unique content to retain | Old owner removal gate | Evidence IDs |
 | --- | --- | --- | --- |
-| Dummy | minimum graph/sign/plan/execute declaration | generic public factory | 20 |
-| FTTT | edit math, judge, feedback retry | legacy owner removed; canonical host transaction and receipt only | 21, 38 survivors |
+| Dummy | minimum graph/sign/plan/execute declaration | workload compile/owned export oracle restored; generic public factory pending | 20 active |
+| FTTT | edit math, judge, feedback retry | legacy owner removed; canonical host transaction and receipt only | 21 pending; 38 smoke base |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
 | In-Place-TTT | dense fast-weight math and layout | generic request PTTS/overlay | 23, 32 |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |

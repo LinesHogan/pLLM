@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import gc
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import tllm
-from vllm import SamplingParams
+import torch
+from vllm import LLM, SamplingParams
 
 from tllm.canonical.workloads.esamp_request import (
     CanonicalRequestSamplerCudaExecution,
@@ -34,6 +37,27 @@ def _require_esamp_execution(
 
 
 def main() -> int:
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    plain = tllm.make_llm(
+        model_name="Qwen/Qwen2.5-0.5B-Instruct", dtype="bfloat16",
+        gpu_memory_utilization=0.25, max_model_len=64,
+        enable_prefix_caching=False, enforce_eager=True, seed=7,
+        max_num_seqs=1, max_num_batched_tokens=64,
+    )
+    if not isinstance(plain, LLM):
+        raise RuntimeError("plain public route did not construct vLLM")
+    try:
+        outputs = plain.generate(
+            ["The sky is"], SamplingParams(max_tokens=3, temperature=0.0),
+            use_tqdm=False,
+        )
+        if not outputs[0].outputs[0].text:
+            raise RuntimeError("plain public inference produced no text")
+    finally:
+        plain.llm_engine.engine_core.shutdown()
+        del plain
+        gc.collect()
+        torch.cuda.empty_cache()
     workload = ESampRequestWorkload(
         ESampRequestConfig(
             rank=2,

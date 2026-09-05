@@ -14,11 +14,6 @@ Tiers:
     bucketed per directory and compared against ``tools/typing_baseline.json``;
     any bucket exceeding its baseline count (or any new bucket) fails the gate.
 
-Dynamic-boundary allowlist:
-  - ``worker_extension._runner_specialization_facts`` may probe the two
-    version-dependent vLLM token-limit attributes. It returns a closed typed
-    facts object or fails closed; reflection cannot escape that function.
-
 The strict surface rejects ``Any``, reflection, and type ignore escapes through
 the AST gate below.
 """
@@ -40,8 +35,7 @@ BASIC_CONFIG = "pyrightconfig.json"
 BASELINE_PATH = REPO_ROOT / "tools" / "typing_baseline.json"
 AUTHOR_SURFACE = (
     Path("tllm/backends/vllm/typed_layer_replay.py"),
-    Path("tllm/runtime/mp/worker_extension.py"),
-    Path("tllm/runtime/parameter_overlay.py"),
+    Path("tllm/backends/vllm/overlay_state.py"),
 )
 
 FORBIDDEN_COMPATIBILITY_NAMES = frozenset(
@@ -100,11 +94,6 @@ DYNAMIC_BOUNDARY_ALLOWLIST = frozenset(
             Path("tllm/backends/vllm/typed_layer_replay.py"),
             "restore_typed_layer_replay",
             "setattr",
-        ),
-        (
-            Path("tllm/runtime/mp/worker_extension.py"),
-            "_runner_specialization_facts",
-            "getattr",
         ),
     }
 )

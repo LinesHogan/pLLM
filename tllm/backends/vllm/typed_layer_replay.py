@@ -413,7 +413,7 @@ def _admit_typed_layer_replay(*, runtime: object, runner: object) -> RunnerBindi
     if capability is None or not capability.replay or not capability.kv_overwrite:
         raise RuntimeError("backend does not provide typed model-region replay with KV overwrite")
     if capability.graph_safety is GraphSafety.EAGER_ONLY:
-        from tllm.runtime.graph_policy import GraphMode, resolve_graph_mode
+        from tllm.backends.vllm.graph_mode import GraphMode, resolve_graph_mode
 
         if resolve_graph_mode(runner) is not GraphMode.EAGER:
             raise RuntimeError("vLLM typed layer replay is eager-only")

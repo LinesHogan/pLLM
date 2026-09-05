@@ -62,7 +62,7 @@ def runner_device(runner: object) -> "torch.device":
 
 if TYPE_CHECKING:
     import torch
-    from tllm.runtime.parameter_overlay import (
+    from tllm.backends.vllm.overlay_state import (
         OverlayChannel,
         DenseOperandCapture,
         OverlayStepPlan,

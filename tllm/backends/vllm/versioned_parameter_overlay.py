@@ -21,7 +21,7 @@ from tllm.contracts.request_identity import (
     RequestIdentity,
     resolve_request_identity,
 )
-from tllm.runtime.parameter_overlay import (
+from tllm.backends.vllm.overlay_state import (
     OverlayChannel,
     OverlayCaptureRows,
     OverlayLeaseKey,

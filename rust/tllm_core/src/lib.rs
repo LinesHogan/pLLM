@@ -5,10 +5,7 @@
 use pyo3::prelude::*;
 
 mod canonical;
-mod decode_localization;
 mod prefill_row_plan;
-mod sampler_plan;
-mod shape_specialization;
 mod workload_frontend;
 
 #[pymodule]
@@ -17,9 +14,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     canonical::scheduler::register(m)?;
     canonical::state_representation::register(m)?;
     canonical::tensor_layout::register(m)?;
-    decode_localization::register(m)?;
-    sampler_plan::register(m)?;
-    shape_specialization::register(m)?;
     prefill_row_plan::register(m)?;
     workload_frontend::register(m)?;
     Ok(())

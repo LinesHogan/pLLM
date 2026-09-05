@@ -9,7 +9,7 @@ from typing import Protocol
 import torch
 from torch.nn import Parameter
 from torch.nn import functional as F
-from tllm.runtime.parameter_overlay import (
+from tllm.backends.vllm.overlay_state import (
     BaseWeightLease,
     DenseOperandCapture,
     OverlayCaptureRows,

@@ -2,27 +2,6 @@
 
 from __future__ import annotations
 
-class DecodeLocalization:
-    positions: list[int]
-    row_idx: list[int]
-    contiguous: bool
-
-class DecodePositions:
-    positions: list[int]
-    contiguous: bool
-
-class RowPartition:
-    affected_greedy: list[int]
-    affected_random: list[int]
-    unaffected_greedy: list[int]
-    unaffected_random: list[int]
-
-class SamplerPlan:
-    path: str
-    use_candidate_kernel: bool
-    dense_inplace_applied: bool
-    base: str
-
 class PrefillRowSpan:
     request_ordinal: int
     packed_row_start: int
@@ -65,38 +44,6 @@ def plan_prefill_rows(
     computed_tokens: list[int],
     expected_total_rows: int | None = None,
 ) -> PackedPrefillRowPlan: ...
-
-def localize_decode_rows(
-    is_decode: list[bool],
-    logits_indices: list[int],
-    req_count: int,
-    num_actual_tokens: int,
-    max_decode_rows: int,
-) -> DecodeLocalization: ...
-
-def localize_decode_positions(
-    is_decode: list[bool],
-    n_logits: int,
-    req_count: int,
-    max_decode_rows: int,
-) -> DecodePositions: ...
-
-def plan_sampler_step(
-    backend: str,
-    temperature_mode: str,
-    n_rows: int,
-    n_affected: int,
-    n_greedy: int,
-    greedy_sampled_available: bool,
-    candidate_eligible: bool,
-) -> SamplerPlan: ...
-
-def partition_rows(
-    n_rows: int,
-    affected_rows: list[int],
-    greedy_rows: list[int],
-    greedy_sampled_available: bool,
-) -> RowPartition: ...
 
 def compile_state_representation_plan(request_json: str) -> str: ...
 def validate_state_representation_plan(
@@ -169,6 +116,3 @@ def validate_backend_attachment_reconstruction(
     local_inputs_json: str,
     local_physical_json: str,
 ) -> None: ...
-
-def normalize_region_shape_specialization_request(payload: str) -> str: ...
-def validate_region_shape_specialization_request(payload: str) -> None: ...

@@ -2,45 +2,18 @@
   "comment": "Cross-package import baseline (only-decrease). Regenerate with `python tools/check_import_layers.py --rebase`.",
   "rules": {
     "backends": [
-      "contracts",
-      "core",
-      "ports",
-      "runtime"
+      "contracts"
     ],
     "canonical": [
-      "contracts",
-      "core"
+      "contracts"
     ],
     "canonical_vllm": [
       "canonical",
-      "contracts",
-      "core"
+      "contracts"
     ],
-    "common": [
-      "contracts",
-      "core",
-      "ports"
-    ],
-    "contracts": [
-      "core"
-    ],
-    "core": [],
-    "ports": [
-      "contracts",
-      "core"
-    ],
-    "runtime": [
-      "common",
-      "contracts",
-      "core",
-      "ports"
-    ],
-    "util": "leaf (any)",
-    "workflows": "leaf (any)",
+    "contracts": [],
     "exact_module_edges": [],
-    "sanctioned_edges": [
-      "runtime -> tllm.backends.protocol"
-    ]
+    "sanctioned_edges": []
   },
   "module_level": {},
   "local_level": {}

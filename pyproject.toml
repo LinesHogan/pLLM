@@ -22,11 +22,6 @@ vllm027 = ["vllm>=0.27.1,<0.28"]
 test = ["pytest==9.0.3"]
 tlm = ["transformers>=5.0,<6", "peft>=0.20,<0.21"]
 
-# Runs in every vLLM process (parent, EngineCore child, workers) to
-# rehydrate the tLLM runtime under VLLM_ENABLE_V1_MULTIPROCESSING=1.
-[project.entry-points."vllm.general_plugins"]
-tllm = "tllm.runtime.mp.plugin:tllm_general_plugin"
-
 [tool.maturin]
 manifest-path = "rust/tllm_core/Cargo.toml"
 python-source = "."

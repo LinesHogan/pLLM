@@ -25,9 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # to legacy compatibility modules: that would turn this focused hard gate into
 # a migration inventory and encourage exemptions.
 AUTHORITY_FILES = (
-    Path("tllm/backends/vllm/sampler_mrv1.py"),
-    Path("tllm/backends/vllm/sampler_mrv2.py"),
-    Path("tllm/runtime/vllm_patch/sampler_patch.py"),
+    Path("tllm/canonical/execution.py"),
+    Path("tllm/canonical/host_runtime.py"),
+    Path("tllm/canonical_vllm/sampler.py"),
 )
 
 # These are native binding surfaces outside the generic executor.  They must
@@ -35,12 +35,12 @@ AUTHORITY_FILES = (
 # workload names: worker statistics and registered backend primitives may use
 # those names without acquiring physical scheduling authority.
 NATIVE_BINDING_FILES = (
-    Path("tllm/runtime/mp/worker_extension.py"),
     Path("tllm/backends/vllm/typed_layer_replay.py"),
 )
 
 PHYSICAL_FILES = frozenset(
     {
+        Path("tllm/canonical/execution.py"),
     }
 )
 
@@ -52,9 +52,7 @@ COMPILER_DISPATCH_FILES = frozenset(
 
 SAMPLER_FILES = frozenset(
     {
-        Path("tllm/backends/vllm/sampler_mrv1.py"),
-        Path("tllm/backends/vllm/sampler_mrv2.py"),
-        Path("tllm/runtime/vllm_patch/sampler_patch.py"),
+        Path("tllm/canonical_vllm/sampler.py"),
     }
 )
 

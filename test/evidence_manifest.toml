@@ -1,14 +1,15 @@
 schema_version = 1
 target_count = 39
 maximum_count = 50
-active_executable_count = 8
-pending_survivor_count = 31
-active_executable_ids = [1, 3, 5, 13, 30, 32, 37, 38]
+active_executable_count = 10
+pending_survivor_count = 29
+active_executable_ids = [1, 3, 5, 13, 20, 30, 32, 37, 38, 39]
 
 # The active count is deliberately not the terminal evidence set.  It records
-# only the executable survivor bases left after deleting stale old-stack tests:
+# the executable survivor bases left after deleting stale old-stack tests:
 # three Rust canonical tests, one CUDA PTTS pytest, and four standalone GPU
-# smokes.  The remaining survivor IDs are implementation debt tied to the
+# smokes, plus the Dummy export oracle and fresh isolated-wheel release evidence.
+# The remaining IDs are debt tied to the
 # corresponding cutover tranche; they must be added as compact observable
 # oracles or public runtime smokes, not restored as legacy class-hierarchy or
 # wrapper tests.
@@ -117,6 +118,11 @@ group = "boundary"
 id = 20
 name = "dummy_runs_graph_sign_plan_execute"
 group = "workload"
+path = "test/workloads/test_dummy.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_dummy.py"
+environment = "Repository Python venv with torch and freshly built Rust extension; CPU"
+observable_contract = "Compile a semantic graph, execute its signed Rust plan, skip by stride and export exact bounded rows with ownership isolated from later input mutation; zero fallback"
+replaces = "test/core/test_canonical_dummy_workload_unit.py; legacy consumer import removed"
 
 [[evidence]]
 id = 21
@@ -222,3 +228,8 @@ requires_gpu = true
 id = 39
 name = "isolated_wheel_imports_and_executes_rust_codec"
 group = "release"
+path = "test/release/test_wheel.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/release/test_wheel.py"
+environment = "Repository Python venv, maturin, pip and cached Rust build dependencies; no GPU or MP"
+observable_contract = "Fresh non-editable wheel imports its own Python and native module, executes Rust layout codec, and contains no residual packages or bootstrap plugin"
+replaces = "Legacy package/import probes; original plan evidence 39 had no executable survivor"
