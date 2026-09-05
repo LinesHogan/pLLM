@@ -22,7 +22,6 @@ from tllm.contracts.semantic_graph import (
     HostServiceInputSource,
     HostServicePort,
     SchedulerTimeline,
-    SemanticEdge,
     SemanticEffect,
     SemanticGraph,
     SemanticInput,
@@ -167,11 +166,6 @@ class GTTAWorkload(CanonicalWorkload):
             ),
             execution_parameters_digest=self.config.execution_parameters_digest(),
             states=(SemanticState(_DYNAMICS_STATE, StateScope.INSTANCE, ()),),
-            edges=(
-                SemanticEdge(_QUERY_TASK, _PUBLISH_TASK),
-                SemanticEdge(_UPDATE_TASK, _PUBLISH_TASK),
-                SemanticEdge(_UPDATE_TASK, _QUERY_TASK),
-            ),
         )
 
     def compile(

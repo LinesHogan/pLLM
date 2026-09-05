@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Literal, TypedDict, cast
+from dataclasses import asdict
+from typing import cast
 
 from tllm import _core
 from tllm.contracts.semantic_graph import (
@@ -28,284 +29,40 @@ from tllm.contracts.semantic_graph import (
 )
 
 
-class _TimingWire(TypedDict):
-    after: str
-    before: str
-
-
-class _HiddenSourceWire(TypedDict):
-    kind: Literal["hidden"]
-    layer: int
-    site: str
-    phase: str
-
-
-class _StepIdSourceWire(TypedDict):
-    kind: Literal["step_id"]
-
-
-class _PackedRowsSourceWire(TypedDict):
-    kind: Literal["packed_rows"]
-
-
-class _PackedSamplerRowsSourceWire(TypedDict):
-    kind: Literal["packed_sampler_rows"]
-
-
-class _HostServiceSourceWire(TypedDict):
-    kind: Literal["host_service"]
-    service: str
-    port: str
-    schema: str
-
-
-class _StateSelectionSourceWire(TypedDict):
-    kind: Literal["state_selection"]
-    resource: str
-    phase: str
-
-
-class _TaskResultSourceWire(TypedDict):
-    kind: Literal["result"]
-    task: str
-    output: str
-
-
-_InputSourceWire = (
-    _HiddenSourceWire
-    | _StepIdSourceWire
-    | _PackedRowsSourceWire
-    | _PackedSamplerRowsSourceWire
-    | _HostServiceSourceWire
-    | _StateSelectionSourceWire
-    | _TaskResultSourceWire
-)
-
-
-class _InputWire(TypedDict):
-    name: str
-    source: _InputSourceWire
-
-
-class _OutputWire(TypedDict):
-    name: str
-    kind: str
-    schema: str
-
-
-class _ImplementationWire(TypedDict):
-    implementation_id: str
-    execution_kind: str
-    required_capabilities: list[str]
-
-
-class _EffectWire(TypedDict):
-    resource: str
-    kind: str
-
-
-class _TaskWire(TypedDict):
-    symbol: str
-    timing: _TimingWire
-    inputs: list[_InputWire]
-    outputs: list[_OutputWire]
-    implementations: list[_ImplementationWire]
-    effects: list[_EffectWire]
-
-
-class _EdgeWire(TypedDict):
-    source: str
-    target: str
-
-
-class _StateWire(TypedDict):
-    resource: str
-    scope: str
-    key_fields: list[str]
-
-
-class _GraphWire(TypedDict):
-    workload_id: str
-    tasks: list[_TaskWire]
-    execution_parameters_digest: str
-    states: list[_StateWire]
-    edges: list[_EdgeWire]
-    schema_version: int
-
-
-class _AnchorWire(TypedDict):
-    symbol: str
-    ordinal: int
-
-
-class _TimelineWire(TypedDict):
-    anchors: list[_AnchorWire]
-    capabilities: list[str]
-    schema_version: int
+def _json(value: object) -> str:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+    )
 
 
 def _graph_json(graph: SemanticGraph) -> str:
-    tasks: list[_TaskWire] = []
-    for task in graph.tasks:
-        inputs: list[_InputWire] = []
-        for task_input in task.inputs:
+    # The dataclasses are the schema. Only the closed union tag is wire-specific.
+    wire = asdict(graph)
+    for task, task_wire in zip(graph.tasks, wire["tasks"], strict=True):
+        for task_input, input_wire in zip(task.inputs, task_wire["inputs"], strict=True):
             match task_input.source:
-                case HiddenInputSource(layer=layer, site=site, phase=phase):
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_HiddenSourceWire(
-                                kind="hidden",
-                                layer=layer,
-                                site=site.value,
-                                phase=phase.value,
-                            ),
-                        )
-                    )
+                case HiddenInputSource():
+                    kind = "hidden"
                 case StepIdInputSource():
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_StepIdSourceWire(kind="step_id"),
-                        )
-                    )
+                    kind = "step_id"
                 case PackedRowsInputSource():
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_PackedRowsSourceWire(kind="packed_rows"),
-                        )
-                    )
+                    kind = "packed_rows"
                 case PackedSamplerRowsInputSource():
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_PackedSamplerRowsSourceWire(
-                                kind="packed_sampler_rows"
-                            ),
-                        )
-                    )
-                case HostServiceInputSource(
-                    service=service,
-                    port=port,
-                    schema=schema,
-                ):
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_HostServiceSourceWire(
-                                kind="host_service",
-                                service=str(service),
-                                port=str(port),
-                                schema=str(schema),
-                            ),
-                        )
-                    )
-                case StateSelectionInputSource(
-                    resource=resource,
-                    phase=phase,
-                ):
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_StateSelectionSourceWire(
-                                kind="state_selection",
-                                resource=str(resource),
-                                phase=phase.value,
-                            ),
-                        )
-                    )
-                case TaskResultInputSource(task=producer, output=output):
-                    inputs.append(
-                        _InputWire(
-                            name=task_input.name,
-                            source=_TaskResultSourceWire(
-                                kind="result",
-                                task=str(producer),
-                                output=output,
-                            ),
-                        )
-                    )
+                    kind = "packed_sampler_rows"
+                case HostServiceInputSource():
+                    kind = "host_service"
+                case StateSelectionInputSource():
+                    kind = "state_selection"
+                case TaskResultInputSource():
+                    kind = "result"
                 case _:
                     raise TypeError("semantic input source is outside the closed codec")
-        tasks.append(
-            _TaskWire(
-                symbol=str(task.symbol),
-                timing=_TimingWire(
-                    after=str(task.timing.after),
-                    before=str(task.timing.before),
-                ),
-                inputs=inputs,
-                outputs=[
-                    _OutputWire(
-                        name=output.name,
-                        kind=output.kind.value,
-                        schema=str(output.schema),
-                    )
-                    for output in task.outputs
-                ],
-                implementations=[
-                    _ImplementationWire(
-                        implementation_id=str(implementation.implementation_id),
-                        execution_kind=implementation.execution_kind.value,
-                        required_capabilities=list(
-                            implementation.required_capabilities
-                        ),
-                    )
-                    for implementation in task.implementations
-                ],
-                effects=[
-                    _EffectWire(
-                        resource=str(effect.resource),
-                        kind=effect.kind.value,
-                    )
-                    for effect in task.effects
-                ],
-            )
-        )
-    wire = _GraphWire(
-        workload_id=str(graph.workload_id),
-        tasks=tasks,
-        execution_parameters_digest=graph.execution_parameters_digest,
-        states=[
-            _StateWire(
-                resource=str(state.resource),
-                scope=state.scope.value,
-                key_fields=[field.value for field in state.key_fields],
-            )
-            for state in graph.states
-        ],
-        edges=[
-            _EdgeWire(source=str(edge.source), target=str(edge.target))
-            for edge in graph.edges
-        ],
-        schema_version=graph.schema_version,
-    )
-    return json.dumps(
-        wire,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+            input_wire["source"]["kind"] = kind
+    return _json(wire)
 
 
 def _timeline_json(timeline: SchedulerTimeline) -> str:
-    wire = _TimelineWire(
-        anchors=[
-            _AnchorWire(symbol=str(anchor.symbol), ordinal=anchor.ordinal)
-            for anchor in timeline.anchors
-        ],
-        capabilities=list(timeline.capabilities),
-        schema_version=timeline.schema_version,
-    )
-    return json.dumps(
-        wire,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+    return _json(asdict(timeline))
 
 
 def _scheduled_task(raw: object, label: str) -> ScheduledTask:
@@ -385,29 +142,7 @@ def _decision_from_boundary(payload: str) -> ScheduleDecision:
 
 
 def _decision_json(decision: ScheduleDecision) -> str:
-    return json.dumps(
-        {
-            "graph_digest": decision.graph_digest,
-            "timeline_digest": decision.timeline_digest,
-            "tasks": [
-                {
-                    "task_id": int(task.task_id),
-                    "task_symbol": str(task.task_symbol),
-                    "implementation_id": str(task.implementation_id),
-                    "anchor_id": int(task.anchor_id),
-                    "anchor_symbol": str(task.anchor_symbol),
-                }
-                for task in decision.tasks
-            ],
-            "fallback_count": decision.fallback_count,
-            "signature": decision.signature,
-            "schema_version": decision.schema_version,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+    return _json(asdict(decision))
 
 
 def _physical_from_boundary(payload: str) -> PhysicalPlan:
@@ -469,26 +204,7 @@ def _physical_from_boundary(payload: str) -> PhysicalPlan:
 
 
 def _physical_json(plan: PhysicalPlan) -> str:
-    return json.dumps(
-        {
-            "plan_epoch": plan.plan_epoch,
-            "schedule_signature": plan.schedule_signature,
-            "tasks": [
-                {
-                    "task_id": int(task.task_id),
-                    "implementation_id": str(task.implementation_id),
-                    "anchor_id": int(task.anchor_id),
-                }
-                for task in plan.tasks
-            ],
-            "fallback_count": plan.fallback_count,
-            "schema_version": plan.schema_version,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+    return _json(asdict(plan))
 
 
 def compile_schedule(

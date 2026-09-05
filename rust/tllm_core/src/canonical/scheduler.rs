@@ -2,7 +2,7 @@
 
 use super::semantic_graph::{
     canonical_ascii_json, decode_graph, decode_timeline, digest, validate_graph, validate_timeline,
-    ImplementationCandidate, SemanticGraph, Timeline, SCHEMA_VERSION,
+    ImplementationCandidate, InputSource, SemanticGraph, StateEffectKind, Timeline, SCHEMA_VERSION,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -88,17 +88,67 @@ fn task_index(graph: &SemanticGraph, symbol: &str) -> Result<usize, String> {
         .map_err(|_| "semantic graph edge references an unknown task".to_owned())
 }
 
-fn topological_order(graph: &SemanticGraph) -> Result<(Vec<usize>, Vec<Vec<usize>>), String> {
-    let mut successors = vec![Vec::new(); graph.tasks.len()];
-    let mut predecessors = vec![Vec::new(); graph.tasks.len()];
-    let mut indegree = vec![0_usize; graph.tasks.len()];
+struct GraphIndex {
+    order: Vec<usize>,
+    predecessors: Vec<BTreeSet<usize>>,
+    windows: Vec<(u32, u32)>,
+}
+
+fn graph_index(graph: &SemanticGraph, timeline: &Timeline) -> Result<GraphIndex, String> {
+    let anchors = anchor_ids(timeline)?;
+    let windows: Vec<_> = graph
+        .tasks
+        .iter()
+        .map(|task| {
+            let after = *anchors
+                .get(task.timing.after.as_str())
+                .ok_or_else(|| "task timing.after references an unknown anchor".to_owned())?;
+            let before = *anchors
+                .get(task.timing.before.as_str())
+                .ok_or_else(|| "task timing.before references an unknown anchor".to_owned())?;
+            if after >= before {
+                return Err("task timing window is empty".to_owned());
+            }
+            Ok((after, before))
+        })
+        .collect::<Result<_, String>>()?;
+    let mut predecessors = vec![BTreeSet::new(); graph.tasks.len()];
     for edge in &graph.edges {
-        let source = task_index(graph, &edge.source)?;
-        let target = task_index(graph, &edge.target)?;
-        successors[source].push(target);
-        predecessors[target].push(source);
-        indegree[target] += 1;
+        predecessors[task_index(graph, &edge.target)?].insert(task_index(graph, &edge.source)?);
     }
+    for (consumer, task) in graph.tasks.iter().enumerate() {
+        for input in &task.inputs {
+            if let InputSource::Result { task: producer, .. } = &input.source {
+                predecessors[consumer].insert(task_index(graph, producer)?);
+            }
+        }
+    }
+    let mut conflicts = Vec::new();
+    for (left, task) in graph.tasks.iter().enumerate() {
+        for (right, other) in graph.tasks.iter().enumerate().skip(left + 1) {
+            if task.effects.iter().any(|a| {
+                other.effects.iter().any(|b| {
+                    a.resource == b.resource
+                        && (a.kind != StateEffectKind::Read || b.kind != StateEffectKind::Read)
+                })
+            }) {
+                conflicts.push((left, right));
+                // Disjoint semantic windows prove an order; overlapping writes need causality.
+                if windows[left].1 <= windows[right].0 {
+                    predecessors[right].insert(left);
+                } else if windows[right].1 <= windows[left].0 {
+                    predecessors[left].insert(right);
+                }
+            }
+        }
+    }
+    let mut successors = vec![Vec::new(); graph.tasks.len()];
+    for (target, sources) in predecessors.iter().enumerate() {
+        for &source in sources {
+            successors[source].push(target);
+        }
+    }
+    let mut indegree: Vec<_> = predecessors.iter().map(BTreeSet::len).collect();
     let mut ready = BTreeSet::new();
     for (index, degree) in indegree.iter().enumerate() {
         if *degree == 0 {
@@ -118,7 +168,28 @@ fn topological_order(graph: &SemanticGraph) -> Result<(Vec<usize>, Vec<Vec<usize
     if order.len() != graph.tasks.len() {
         return Err("semantic graph contains a dependency cycle".to_owned());
     }
-    Ok((order, predecessors))
+    let mut ancestors = vec![vec![false; graph.tasks.len()]; graph.tasks.len()];
+    for &task in &order {
+        for &parent in &predecessors[task] {
+            ancestors[task][parent] = true;
+            for ancestor in 0..graph.tasks.len() {
+                ancestors[task][ancestor] |= ancestors[parent][ancestor];
+            }
+        }
+    }
+    for (left, right) in conflicts {
+        if !ancestors[left][right] && !ancestors[right][left] {
+            return Err(format!(
+                "unordered state effects between {} and {}",
+                graph.tasks[left].symbol, graph.tasks[right].symbol
+            ));
+        }
+    }
+    Ok(GraphIndex {
+        order,
+        predecessors,
+        windows,
+    })
 }
 
 fn selected_implementation<'a>(
@@ -153,22 +224,13 @@ fn anchor_ids(timeline: &Timeline) -> Result<HashMap<&str, u32>, String> {
 fn compile(graph: &SemanticGraph, timeline: &Timeline) -> Result<ScheduleDecision, String> {
     validate_graph(graph)?;
     validate_timeline(timeline)?;
-    let anchors = anchor_ids(timeline)?;
-    let (order, predecessors) = topological_order(graph)?;
+    let index = graph_index(graph, timeline)?;
     let mut selected_anchors = vec![0_u32; graph.tasks.len()];
     let mut plans = Vec::with_capacity(graph.tasks.len());
-    for task_index in order {
+    for task_index in index.order {
         let task = &graph.tasks[task_index];
-        let after = *anchors
-            .get(task.timing.after.as_str())
-            .ok_or_else(|| "task timing.after references an unknown anchor".to_owned())?;
-        let before = *anchors
-            .get(task.timing.before.as_str())
-            .ok_or_else(|| "task timing.before references an unknown anchor".to_owned())?;
-        if after >= before {
-            return Err("task timing window is empty".to_owned());
-        }
-        let dependency_anchor = predecessors[task_index]
+        let (after, before) = index.windows[task_index];
+        let dependency_anchor = index.predecessors[task_index]
             .iter()
             .map(|predecessor| selected_anchors[*predecessor])
             .max()
@@ -340,9 +402,164 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{compile, lower_physical, validate_decision, validate_physical, ScheduleDecision};
     use crate::canonical::semantic_graph::{decode_graph, decode_timeline};
+    use serde_json::json;
+
+    fn graph_fixture() -> crate::canonical::semantic_graph::SemanticGraph {
+        decode_graph(&json!({
+            "workload_id": "oracle", "execution_parameters_digest": "a".repeat(64),
+            "schema_version": 1, "edges": [], "states": [],
+            "tasks": (0..3).map(|i| json!({
+                "symbol": format!("t{i}"), "timing": {"after": "a0", "before": "a3"},
+                "inputs": [], "outputs": [{"name": "value", "kind": "temporary", "schema": ""}],
+                "effects": [], "implementations": [{"implementation_id": "cpu", "execution_kind": "native_task", "required_capabilities": []}]
+            })).collect::<Vec<_>>()
+        }).to_string()).unwrap()
+    }
+
+    fn check_exhaustive_graphs() {
+        use crate::canonical::semantic_graph::{InputSource, SemanticEdge, TypedInput};
+        let timeline = decode_timeline(&json!({
+            "schema_version": 1, "capabilities": [],
+            "anchors": (0..4).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>()
+        }).to_string()).unwrap();
+        let windows = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        let arcs = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for mask in 0..64 {
+            let edges: Vec<_> = arcs
+                .iter()
+                .enumerate()
+                .filter_map(|(bit, &arc)| (mask & (1 << bit) != 0).then_some(arc))
+                .collect();
+            let acyclic = permutations.iter().any(|order| {
+                edges.iter().all(|(a, b)| {
+                    order.iter().position(|i| i == a) < order.iter().position(|i| i == b)
+                })
+            });
+            for window_code in 0..216 {
+                let bounds = [
+                    windows[window_code % 6],
+                    windows[window_code / 6 % 6],
+                    windows[window_code / 36],
+                ];
+                let mut graph = graph_fixture();
+                for (task, (after, before)) in graph.tasks.iter_mut().zip(bounds) {
+                    task.timing.after = format!("a{after}");
+                    task.timing.before = format!("a{before}");
+                }
+                for &(a, b) in &edges {
+                    if a < b {
+                        graph.tasks[b].inputs.push(TypedInput {
+                            name: format!("from{a}"),
+                            source: InputSource::Result {
+                                task: format!("t{a}"),
+                                output: "value".into(),
+                            },
+                        });
+                    } else {
+                        graph.edges.push(SemanticEdge {
+                            source: format!("t{a}"),
+                            target: format!("t{b}"),
+                        });
+                    }
+                }
+                // Enumerate assignments independently; no planner index or placement helper.
+                let expected = (0..27)
+                    .map(|code| [code % 3, code / 3 % 3, code / 9])
+                    .filter(|slots| {
+                        acyclic
+                            && bounds
+                                .iter()
+                                .enumerate()
+                                .all(|(i, &(lo, hi))| lo <= slots[i] && slots[i] < hi)
+                            && edges.iter().all(|&(a, b)| slots[a] <= slots[b])
+                    })
+                    .min();
+                let actual = compile(&graph, &timeline);
+                assert_eq!(
+                    actual.is_ok(),
+                    expected.is_some(),
+                    "mask={mask}, windows={bounds:?}: {actual:?}"
+                );
+                if let Some(expected) = expected {
+                    let decision = actual.unwrap();
+                    let mut slots = [0; 3];
+                    for task in &decision.tasks {
+                        slots[task.task_id as usize] = task.anchor_id;
+                    }
+                    assert_eq!(slots, expected);
+                    for &(a, b) in &edges {
+                        assert!(
+                            decision.tasks.iter().position(|t| t.task_id == a as u32)
+                                < decision.tasks.iter().position(|t| t.task_id == b as u32)
+                        );
+                    }
+                }
+            }
+        }
+        let mut graph = graph_fixture();
+        graph.tasks[0].inputs.push(TypedInput {
+            name: "self".into(),
+            source: InputSource::Result {
+                task: "t0".into(),
+                output: "value".into(),
+            },
+        });
+        assert!(compile(&graph, &timeline).is_err());
+        graph = graph_fixture();
+        graph.states = serde_json::from_value(
+            json!([{"resource": "state", "scope": "instance", "key_fields": []}]),
+        )
+        .unwrap();
+        for left in ["read", "transition", "transition_maybe", "publish"] {
+            for right in ["read", "transition", "transition_maybe", "publish"] {
+                for (i, kind) in [left, right].iter().enumerate() {
+                    graph.tasks[i].effects =
+                        serde_json::from_value(json!([{"resource": "state", "kind": kind}]))
+                            .unwrap();
+                }
+                assert_eq!(
+                    compile(&graph, &timeline).is_ok(),
+                    left == "read" && right == "read"
+                );
+            }
+        }
+        graph.tasks[0].timing.before = "a1".into();
+        graph.tasks[1].timing.after = "a1".into();
+        assert!(compile(&graph, &timeline).is_ok());
+        graph.tasks[0].timing.before = "a3".into();
+        graph.edges.push(SemanticEdge {
+            source: "t0".into(),
+            target: "t1".into(),
+        });
+        assert!(compile(&graph, &timeline).is_ok());
+        graph.edges = vec![
+            SemanticEdge {
+                source: "t0".into(),
+                target: "t2".into(),
+            },
+            SemanticEdge {
+                source: "t2".into(),
+                target: "t1".into(),
+            },
+        ];
+        assert!(compile(&graph, &timeline).is_ok());
+        graph.tasks[0].timing.after = "a2".into();
+        graph.tasks[1].timing.after = "a0".into();
+        graph.tasks[1].timing.before = "a1".into();
+        assert!(compile(&graph, &timeline).is_err());
+    }
 
     #[test]
-    fn scheduler_selects_capabilities_dense_ids_timing_dependencies_and_rejects_tampering() {
+    fn scheduler_matches_exhaustive_small_dag_oracle() {
+        check_exhaustive_graphs();
         let graph = decode_graph(
             r#"{"workload_id":"esamp.request","execution_parameters_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","tasks":[{"symbol":"predict","timing":{"after":"begin","before":"decode"},"inputs":[{"name":"hidden","source":{"kind":"hidden","layer":0,"site":"block_output","phase":"decode"}},{"name":"rows","source":{"kind":"packed_rows"}},{"name":"sampler_rows","source":{"kind":"packed_sampler_rows"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller","phase":"decode"}}],"outputs":[{"name":"guidance","kind":"sampler","schema":""},{"name":"loss_batch","kind":"temporary","schema":""}],"effects":[{"resource":"request_distiller","kind":"read"}],"implementations":[{"implementation_id":"esamp:cpu@1","execution_kind":"native_task","required_capabilities":["cpu"]},{"implementation_id":"esamp:gpu@1","execution_kind":"native_task","required_capabilities":["cuda"]}]},{"symbol":"train","timing":{"after":"decode","before":"end"},"inputs":[{"name":"loss_batch","source":{"kind":"result","task":"predict","output":"loss_batch"}},{"name":"selection","source":{"kind":"state_selection","resource":"request_distiller","phase":"decode"}}],"outputs":[],"effects":[{"resource":"request_distiller","kind":"transition"}],"implementations":[{"implementation_id":"esamp:train@1","execution_kind":"native_task","required_capabilities":[]}]}],"edges":[{"source":"predict","target":"train"}],"states":[{"resource":"request_distiller","scope":"request","key_fields":["request_id"]}],"schema_version":1}"#,
         )

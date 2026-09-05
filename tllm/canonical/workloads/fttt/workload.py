@@ -30,7 +30,6 @@ from tllm.contracts.semantic_graph import (
     HostServicePort,
     HostPayloadSchemaId,
     SchedulerTimeline,
-    SemanticEdge,
     SemanticEffect,
     SemanticGraph,
     SemanticInput,
@@ -274,12 +273,6 @@ class FTTTWorkload(CanonicalWorkload):
             ),
             states=(
                 SemanticState(_EDIT_STATE, StateScope.INSTANCE, ()),
-            ),
-            edges=(
-                SemanticEdge(_LOSS_TASK, _OPTIMIZE_TASK),
-                SemanticEdge(_OPTIMIZE_TASK, _PREDICT_TASK),
-                SemanticEdge(_OPTIMIZE_TASK, _PUBLISH_TASK),
-                SemanticEdge(_PREPARE_TASK, _LOSS_TASK),
             ),
             execution_parameters_digest=self.config.execution_parameters_digest(),
         )

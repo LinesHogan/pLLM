@@ -408,16 +408,6 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
                     {
                         return Err("result input producer output is unknown".to_owned());
                     }
-                    if !graph
-                        .edges
-                        .iter()
-                        .any(|edge| edge.source == *producer && edge.target == task.symbol)
-                    {
-                        return Err(
-                            "result input requires an explicit producer-to-consumer edge"
-                                .to_owned(),
-                        );
-                    }
                 }
                 InputSource::PackedRows | InputSource::PackedSamplerRows => {}
             }

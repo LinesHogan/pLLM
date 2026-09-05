@@ -28,6 +28,17 @@ typed workload declaration
 vLLM; with a supported canonical workload it installs the instance-owned
 attachment. No residual runtime or process-wide bootstrap plugin is installed.
 
+Result inputs imply dependencies directly; explicit `SemanticEdge` values add
+ordering constraints that are not already expressed by dataflow. Rust derives
+one index of predecessors, timing windows and execution order from this graph.
+Overlapping conflicting state effects require a causal path; disjoint windows
+can prove their order. Ambiguous accesses fail closed instead of acquiring an
+accidental order from task names. This is not yet exact-version hazard analysis.
+
+Python serializes these same immutable descriptors at the FFI boundary, adding
+only the closed input-variant tag. There is no second wire DTO hierarchy or
+workload-maintained copy of the dependency graph.
+
 ## Incomplete Boundaries
 
 The existing task executor and host coordinator are shared foundations.

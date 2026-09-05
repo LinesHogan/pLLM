@@ -99,7 +99,6 @@ from tllm.contracts.semantic_graph import (
     HiddenInputSource,
     PackedRowsInputSource,
     PackedSamplerRowsInputSource,
-    SemanticEdge,
     SemanticEffect,
     SemanticGraph,
     PhysicalPlan,
@@ -1192,10 +1191,6 @@ class ESampRequestWorkload(CanonicalWorkload):
                     StateScope.REQUEST,
                     self.config.key_fields,
                 ),
-            ),
-            edges=(
-                SemanticEdge(_LOSS_TASK, _TRAIN_TASK),
-                SemanticEdge(_PREDICT_TASK, _LOSS_TASK),
             ),
             execution_parameters_digest=self.config.execution_parameters_digest(),
         )

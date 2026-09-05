@@ -33,6 +33,11 @@ replaces = "Python DTO semantic validation and repeated schema fixture tests"
 id = 3
 name = "scheduler_matches_exhaustive_small_dag_oracle"
 group = "rust"
+path = "rust/tllm_core/src/canonical/scheduler.rs"
+command = "cargo test --manifest-path rust/tllm_core/Cargo.toml scheduler_matches_exhaustive_small_dag_oracle"
+environment = "Rust toolchain with cached dependencies; CPU"
+observable_contract = "All 64 directed edge subsets on three tasks across 216 window assignments match independent enumeration of feasible earliest placements and topological orders; result dependencies, duplicate edges, cycles, capability choice, tamper rejection and ambiguous state-effect ordering; not an AER partition or exact-version oracle"
+replaces = "Legacy Rust scheduler timing/dependency tests and duplicate explicit producer-to-consumer edge requirements"
 
 [[evidence]]
 id = 4

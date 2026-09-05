@@ -96,7 +96,6 @@ from tllm.contracts.semantic_graph import (
     HostServiceId,
     HostServiceInputSource,
     HostServicePort,
-    SemanticEdge,
     SemanticEffect,
     ImplementationId,
     PhysicalPlan,
@@ -926,7 +925,6 @@ class InPlaceTTTWorkload(CanonicalWorkload):
                     ),
                 ),
             ),
-            edges=(SemanticEdge(_TRANSITION_TASK, _PUBLISH_TASK),),
         )
 
     def compile(
