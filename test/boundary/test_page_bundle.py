@@ -62,6 +62,8 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     arena = _arena()
     write = arena.prepare_admission(("dense_fast_weights", "dense_fast_weights"))
     for index in range(2):
+        for field in arena.plan.tensor_layout_request.layouts[0].layout.fields:
+            assert arena.write_field(write, index, field.field_id).data_ptr() % field.alignment_bytes == 0
         arena.write_field(write, index, LayoutFieldId(0)).fill_(index + 1)
     admitted = arena.publish(write)
     a, b = admitted.after_refs

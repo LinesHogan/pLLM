@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from math import prod
 from threading import RLock
 from weakref import WeakValueDictionary
 
 import torch
 
+from tllm.canonical.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from tllm.canonical.scheduler import validate_plan_bundle
 from tllm.canonical.state_representation import validate_state_representation_reconstruction
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
@@ -99,13 +101,23 @@ class _Pools:
     def __init__(self, layout: TensorLayoutSpec, selected: StateProviderPlan, device: torch.device) -> None:
         self.layout, self.selected = layout, selected
         capacity = selected.max_admitted_lineages * selected.max_live_versions_per_lineage
-        self.tensors = tuple(torch.zeros((capacity, *field.shape), dtype=tensor_dtype(field.dtype),
-            device=device) for field in layout.fields)
+        tensors: list[torch.Tensor] = []
+        allocated_bytes = 0
+        for field in layout.fields:
+            size = DTYPE_BYTES[field.dtype]
+            stride = page_stride_bytes(field) // size
+            alignment = max(field.alignment_bytes // size, 1)
+            pool = torch.zeros(capacity * stride + alignment - 1, dtype=tensor_dtype(field.dtype), device=device)
+            offset = (-pool.data_ptr() // size) % alignment
+            tensors.append(pool[offset:offset + capacity * stride].view(capacity, stride)
+                [:, :prod(field.shape)].view(capacity, *field.shape))
+            allocated_bytes += pool.numel() * size
+        self.tensors = tuple(tensors)
         self.addresses = tuple(pool.data_ptr() for pool in self.tensors)
         self.free = [list(range(capacity)) for _ in layout.fields]
         self.generations = [[0] * capacity for _ in layout.fields]
         self.users = [[0] * capacity for _ in layout.fields]
-        if sum(pool.numel() * pool.element_size() for pool in self.tensors) != selected.reserved_bytes:
+        if allocated_bytes != selected.reserved_bytes:
             raise ValueError("PageBundle pool allocation differs from signed capacity")
 
     def allocate(self, field: int) -> PageSlot:

@@ -4,7 +4,18 @@ from dataclasses import dataclass
 from math import prod
 
 from tllm.contracts.state_representation import StateDeviceKind, StateProviderPlan, StateRepresentation
-from tllm.contracts.tensor_layout import TensorDType, TensorLayoutBinding, TensorLayoutSpec
+from tllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutBinding, TensorLayoutSpec
+
+
+DTYPE_BYTES = {
+    TensorDType.BOOL: 1, TensorDType.UINT8: 1, TensorDType.INT32: 4, TensorDType.INT64: 8,
+    TensorDType.FLOAT16: 2, TensorDType.BFLOAT16: 2, TensorDType.FLOAT32: 4, TensorDType.FLOAT64: 8,
+}
+
+
+def page_stride_bytes(field: TensorFieldSpec) -> int:
+    size = prod(field.shape) * DTYPE_BYTES[field.dtype]
+    return (size + field.alignment_bytes - 1) // field.alignment_bytes * field.alignment_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,11 +27,9 @@ class PageBundleProviderFacts:
 
     def materialize_plan(self, *, resource: str, layout: TensorLayoutSpec,
                          binding: TensorLayoutBinding, max_admitted_lineages: int) -> StateProviderPlan:
-        sizes = {
-            TensorDType.BOOL: 1, TensorDType.UINT8: 1, TensorDType.INT32: 4, TensorDType.INT64: 8,
-            TensorDType.FLOAT16: 2, TensorDType.BFLOAT16: 2, TensorDType.FLOAT32: 4, TensorDType.FLOAT64: 8,
-        }
-        root_bytes = sum(prod(field.shape) * sizes[field.dtype] for field in layout.fields)
+        capacity = max_admitted_lineages * self.max_live_versions_per_lineage
+        reserved_bytes = sum(capacity * page_stride_bytes(field)
+            + max(field.alignment_bytes - DTYPE_BYTES[field.dtype], 0) for field in layout.fields)
         return StateProviderPlan(
             resource=resource, provider_id=self.provider_id,
             representation=StateRepresentation.DENSE_PAGE_ARENA,
@@ -29,7 +38,7 @@ class PageBundleProviderFacts:
             max_admitted_lineages=max_admitted_lineages,
             max_live_versions_per_lineage=self.max_live_versions_per_lineage,
             root_page_count=len(layout.fields),
-            reserved_bytes=root_bytes * max_admitted_lineages * self.max_live_versions_per_lineage,
+            reserved_bytes=reserved_bytes,
             capture_stable=False,
             capabilities=tuple(sorted((
                 f"device/{self.device_kind.value}@1", "optimizer/adamw@1", "state/exact_versions@1",
