@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`9dfa7e7`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`e57caa6`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,9 +13,9 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 26,243；相对 133,210 净减 106,967（约 80.3%） |
-| 距第一轮 30k 上限 | 当前余量 3,757 行；补齐缺失能力仍须与新栈压缩配套 |
-| 本轮源码差分 | 相对 `4f7e370` 新增 276 / 删除 650 / 净减 374；无文件搬移，无独立数学 kernel 变更 |
+| SOURCE_LOC | 26,014；相对 133,210 净减 107,196（约 80.5%） |
+| 距第一轮 30k 上限 | 当前余量 3,986 行；补齐缺失能力仍须与新栈压缩配套 |
+| 本轮源码差分 | 相对 `9dfa7e7` 新增 294 / 删除 523 / 净减 229；无文件搬移，无独立数学 kernel 变更 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
@@ -27,7 +27,7 @@ SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 13,251 |
+| tllm/canonical | 13,022 |
 | tllm/backends + canonical_vllm | 3,360 + 2,853 |
 | tllm/contracts | 2,262 |
 | Rust | 3,432 |
@@ -52,15 +52,18 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 - FTTT/GTTA 已删除各自 execution、receipt、completion、compilation/options 包装；
   `compile` 直接返回同一个 `HostExecution`，共享 signed task 执行、快照回滚和 receipt 结算。
   FTTT/GTTA 的数学状态各自保留，不被复制进通用 Context/service locator。
-  In-Place 已共用 CPU/CUDA task、step context、transition/result 状态和原始 publication receipt；
-  `cuda_tasks.py` 整块删除，storage binding 只持有现有 provider/pin/stream，不保存另一份版本根。
+  In-Place 已共用 CPU/CUDA execution、handle、task/context 和结算流程；同步 `step` 复用
+  分阶段生命周期，独立 CUDA execution、`cuda_tasks.py` 和镜像 executed/result 状态已删除。
+  active step 从捕获前到 sampler release/finish 持有同一个 context 和原始 publication receipt；
+  设备 binding 只持有现有 provider/publication coordinator/pin/stream，不保存另一份版本根。
+  fail-stop 时保留原始 invocation 资源，不清空账目；这不是故障恢复或发布后结算已完成的证明。
   CPU/CUDA publication 的设备操作仍不同，CUDA 提交后失败仍 fail-stop。
   ESamp 的 CPU/CUDA execution、handle、active invocation、task/context 已合并；
   admission、anchor 推进、cancel/retire/settlement 只保留一条流程。删除独立 CUDA execution，
   不留兼容别名。context 直接持有共享 publication receipt、梯度 tensor 和原始 pin binding；
   CUDA gradient token 仅在物理提交内部存在。取消已借出 guidance 的请求时，以 sampler
   completion event 排序后再释放。设备差异仅在物理 admission/pin/pool 和 stream 操作中分派。
-  In-Place execution lifecycle、跨 workload 的通用执行与 backend session 仍待合并。
+  两个 workload 各自的双设备 lifecycle 已合并；跨 workload 的通用执行与 backend session 仍待合并。
 - SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
   保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
   Rust 现在从结果输入、附加 ordering edge 和 timing 派生唯一 GraphIndex；FTTT、GTTA、
@@ -86,7 +89,7 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 | Dummy | graph→sign→plan→execute、stride 与 owned export oracle 已补；统一 factory 尚待 B | 20 |
 | FTTT | 已切共享 host execution；独立 Adam/edit、回滚、retry/stop/accept oracle 与 CUDA receipt 通过 | 21, 38 |
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
-| In-Place-TTT | CPU/CUDA task 状态已共用；数值、发布前失败回滚、版本隔离/清理通过；执行 lifecycle 合并待 B | 23, 32 |
+| In-Place-TTT | CPU/CUDA execution/task/context 已共享；同步/分阶段独立数值、取消重试、一次性结算、发布前失败和版本清理通过；generic factory/backend session 待 B | 23, 32 |
 | ESamp | CPU/CUDA execution/task/context 已共享；独立数学、prediction/loss 后取消、在途 sampler retire、发布前失败和 retry 通过；跨 workload generic factory/backend session、MRv1 仍待完成 | 25, 30, 31, 37 |
 | TLM | 仅 loader/cold facts 与 objective kernel 基础；缺完整 online/offline graph、global LOW_RANK_ADD publication/pin | 11, 24, 33 |
 | ReFT | 旧 owner 已删，canonical owner 缺失；补 LoReFT 数学、publish/skip 和 activation patch | 26, 34 |
@@ -212,6 +215,14 @@ strict/basic typing 0/0、import/authority gates 通过。prediction/loss 后取
 update/trained_rows 各 6、apply_rows 8。live lineage、pending release 和 fallback 检查通过。
 FTTT CUDA 未改、未复跑，沿用 `86e1326`。未运行吞吐 benchmark；PTTS 内部拆分、
 跨根 settlement 和 CUDA 提交 fail-stop 语义未在本次替换中宣称完成。
+
+`e57caa6`：In-Place lifecycle 合并后，完整 pytest 8 passed（24.23s）、Rust 4 passed，
+strict/basic typing 0/0、import/authority gates 通过。第 23 项新增分阶段更新在旧 CPU
+execution 缺少接口处先失败，合并后通过取消重试、sampler gate、重复结算拒绝及独立数值。
+公共 In-Place MRv2 smoke：update/trained_rows 各 6、apply_rows 8、updated_rows 2，
+active_lineages/pending_releases/fallback 均 0；公共 plain→ESamp loss/update 各 2，
+active_lineages/fallback 均 0。CUDA Graph/FTTT 路径本次未改、未复跑，分别沿用
+`9dfa7e7`/`86e1326`。未运行吞吐 benchmark；未声称完成发布后故障恢复。
 
 所有 Python 使用 `/workspace/pllm/.venv/bin/python`。canonical vLLM 当前代码要求
 `0.27.1`，且限定 in-process/eager 等边界；本轮实测 vLLM runtime 为 0.27.1，发行元数据

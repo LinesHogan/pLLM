@@ -24,8 +24,8 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `9dfa7e7` on `main` | — | after `e03816d` |
-| Counted production/support source | 26,243 lines | -106,967 lines | -65,083 lines |
+| Commit | `e57caa6` on `main` | — | after `e03816d` |
+| Counted production/support source | 26,014 lines | -107,196 lines | -65,312 lines |
 | Pytest collection | 8 items | -1,341 items | -3 items |
 | Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -40,6 +40,31 @@ debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared In-Place execution after `9dfa7e7`
+
+Commit `e57caa6`: counted source `+294 / -523 / net -229`; no file moves or
+independent math-kernel changes. CPU/CUDA use one execution and handle type;
+synchronous steps reuse the staged pin/submit/sampler/finish lifecycle.
+The active invocation holds one context and its original publication receipt
+through settlement. Mirrored executed/result states and the separate CUDA
+execution were deleted without compatibility aliases. Fail-stop retains the
+original invocation resources; recovery and post-publication settlement remain
+pending. Physical providers/coordinators are existing objects, not copied ledgers.
+
+Evidence 23 first failed on the old CPU execution's missing staged entry,
+then passed with synchronous/staged updates matching the independent
+multi-target oracle, pre-capture cancellation/retry, sampler completion gating,
+consumed-handle rejection and prepublication rollback. Counts remain 16 active
+and 25 pending. Generic execution across workloads, backend sessions and final
+PTTS ownership remain incomplete; provisional dense_page was not refactored.
+
+Repository-venv verification: pytest 8 passed in 24.23s, Rust 4 passed,
+strict/basic typing 0/0, import/authority gates passed. Real In-Place MRv2
+reported 6 updates/trained rows, 8 apply rows, zero live lineages/releases
+and zero fallback. Public plain-to-ESamp also passed with 2 losses/updates,
+zero live lineages and zero fallback. CUDA Graph/FTTT paths are unchanged and were not rerun;
+their last records remain at `9dfa7e7`/`86e1326`. No benchmark or release.
 
 ### Shared ESamp execution after `4f7e370`
 
@@ -522,7 +547,7 @@ Moves are recorded separately and never counted as deletion.
 | Dummy | minimum graph/sign/plan/execute declaration | workload compile/owned export oracle restored; generic public factory pending | 20 active |
 | FTTT | edit math, judge, feedback retry | legacy owner removed; shared host transaction and receipt | 21, 38 active |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
-| In-Place-TTT | dense fast-weight math and layout | shared task state complete; generic execution/PTTS pending | 23, 32 active |
+| In-Place-TTT | dense fast-weight math and layout | shared device execution/task/context complete; generic backend sessions/PTTS pending | 23, 32 active |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
 | ESamp | request math, sampler guidance, random init | shared device execution/task/context complete; generic backend sessions and MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
