@@ -226,6 +226,8 @@ def _graph_json(graph: SemanticGraph) -> str:
                             ),
                         )
                     )
+                case _:
+                    raise TypeError("semantic input source is outside the closed codec")
         tasks.append(
             _TaskWire(
                 symbol=str(task.symbol),

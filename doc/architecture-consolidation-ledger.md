@@ -24,21 +24,50 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `4cd162f` plus current worktree | — | after `e03816d` |
-| Counted production/support source | 27,961 lines | -105,249 lines | -63,365 lines |
-| Pytest collection | 5 items | -1,344 items | -6 items |
-| Rust tests | 3 items | -51 items | -51 items |
+| Commit | `19c59d5` plus current worktree | — | after `e03816d` |
+| Counted production/support source | 27,163 lines | -106,047 lines | -64,163 lines |
+| Pytest collection | 7 items | -1,342 items | -4 items |
+| Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 12 items | below the 50-item ceiling; not yet the final evidence set | -6 items |
+| Visible `TEST_COUNT` | 15 items | below the 50-item ceiling; not yet the final evidence set | -3 items |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 3, 5, 13, 20, 22, 23, 30, 32, 37, 38 and 39. The manifest now records
-27 pending survivor evidence items. Those pending items are implementation
+evidence IDs 1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 30, 32, 37, 38 and 39.
+The agreed programmable-inference composition adds target IDs 40/41 to the
+original 39, leaving 26 pending survivor evidence items. Those items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared host boundary and Rust validation after `19c59d5`
+
+Counted source: `+457 / -1,255 / net -798`. This includes 100 unchanged lines
+of GTTA tasks moved next to their state owner; that move contributes zero net
+deletion. Independent tensor math is unchanged. Rust inline evidence adds 51
+counted lines, included in the source budget rather than hidden as test cleanup.
+
+Both workload execution modules, private receipt/completion state machines and
+compilation/options wrappers are gone. FTTT and GTTA compile directly to the
+same `HostExecution`: the signed plan, rollback snapshot, issued receipt and
+CUDA readiness/completion have one owner. Publication failure restores state;
+post-publication settlement failure carries the exact receipt, never a copied
+message or retry of the host effect. Evidence 19/21 proves these contracts and
+matches independent PyTorch Adam/edit math through abort and retry settlement.
+
+Seventeen Python graph/plan validators (213 lines) were deleted. The shared
+immutable descriptors remain data; Rust validates graph semantics, and the FFI
+codec retains closed type parsing. Rust evidence 2 covers schema drift and
+semantic digest changes. No separate AER/replay/MP graph family was introduced.
+
+Validation: repository-venv pytest 7 passed; Rust 4 passed; strict/basic typing
+0/0, import/authority gates passed. All four existing GPU smokes rerun with
+nonzero training and zero fallback. No throughput benchmark or release.
+Remaining B/F work is substantive: unified ESamp/In-Place transitions,
+backend attachment, PageBundle/AER, closed MP and conditional control remain
+unfinished. Snapshot branches preserve original dirty main and LoRA changes;
+the research draft is neither modified nor committed.
 
 ### Release-preparation slice after `4cd162f`
 

@@ -3,10 +3,11 @@
 ## 文档地位
 
 2026-09-06 实施交接见[剩余工作清单](architecture-consolidation-handoff.md)：
-代码检查点 `4cd162f` 后的工作区，SOURCE_LOC 27,961，终态 39 项证据尚欠 27 项。
+代码检查点 `19c59d5` 后的工作区，SOURCE_LOC 27,163，终态 41 项证据尚欠 26 项。
 旧 runtime/ports/common 和公共 hook/plugin 入口已删除；行数达标不代表功能验收完成。
 历史 worktree 已从 30 个降至 3 个；过时文档与重复打包配置已清理，sdist→wheel 隔离验证通过。
 下文基线与估算保留历史口径；当前完成情况以交接清单和 ledger 的最新检查点为准。
+本轮纳入可编程推理契约的决定见第 10 节；原 39 项证据保留，新增组合边界 40、41。
 
 本文是从 2026-09-01 起执行的减法计划。它不把 10k 当作倒填配额，而是先根据当前
 代码的可达性、重复职责和待完成功能估算可以删除的范围，再持续向 10k 靠近。
@@ -576,3 +577,25 @@ GPU/MP 只为真正不同的程序–运行时边界保留代表性 smoke，不�
 
 完成第一轮后继续以实际 owner/reachability 证据向 10k 压缩。10k 是方向，不是允许拍脑袋
 删除功能或倒填层级预算的理由。
+
+## 10. 可编程推理补充的实施决定（2026-09-06）
+
+纳入 `programmable-inference-next-design.md` 的契约与最小组合路径；完整性能研究、
+机制消融和独立变体接入实验留到后续。原 PTTS/AER 研究原稿继续作为其唯一权威，保持未跟踪。
+
+**共用边界结构，而非各子系统各造一套结构后互相搬运：** SemanticGraph 是唯一语义来源；
+AER 的派生索引/解引用不复制图的事实；PhysicalPlan 只投影已签定的决策；PTTS 拥有唯一
+版本根。执行、replay、MP 与 trace 共用稳定身份和原始 receipt，不维护自己的版本选择、
+镜像 graph 或生命周期账本。传输编码只在进程/FFI 边界存在，不能变成另一份可修改 authority。
+
+- 沿现有语义图增加有界条件区域、predicate/carry、梯度截断及取消边界；不新建控制流 runtime。
+- KV/RNG、私有写入、版本发布和 host 外部动作显式声明；未支持的 effect 在边界拒绝。
+- 首条组合：request fast-weight 更新/发布后，固定 pin 新版本进行最后一层 replay，最多两轮、
+  相邻结果相对 L2 阈值 `1e-5`，零更新跳过；当前正常 logits 保留，只有当前 token/选定层 KV
+  被覆盖，历史 KV 和 sampler RNG 不变。不跨 replay 反传，不读未来 token。
+- 第 40 项为独立 PyTorch 组合 oracle；第 41 项为 Qwen2/MRv2/eager/单 GPU 公共边界。
+  不声称该组合支持 prefix caching、speculative decoding 或 CUDA Graph。总目标 41、硬上限 50。
+- 同一份有界执行元数据关联 source/operation/region/request/iteration/version/completion；
+  默认不保存 prompt/tensor，详细快照显式开启，缓冲溢出丢最旧事件并计数。
+- 先完成整个第一轮，再做剩余 owner 的第二轮压缩。最终代码回到主目录；旧改动先完整保存
+  可恢复快照，只迁入仍有价值的数学和行为，不恢复旧 runtime。不得以阶段提交冒充全部完成。

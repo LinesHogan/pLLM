@@ -1,11 +1,5 @@
 """Canonical FTTT workload and typed host-service boundary."""
 
-from tllm.canonical.workloads.fttt.execution import (
-    FTTTDiagnostics,
-    FTTTExecution,
-    FTTTExecutionReceipt,
-    FTTTExecutionResult,
-)
 from tllm.canonical.workloads.fttt.host_service import FTTTFeedbackService
 from tllm.canonical.workloads.fttt.judge import (
     FTTTDefaultJudge,
@@ -29,17 +23,11 @@ from tllm.canonical.workloads.fttt.types import (
     FTTTRetryAction,
     FTTTSpecialization,
 )
-from tllm.canonical.workloads.fttt.workload import (
-    FTTTCompilation,
-    FTTTCompileOptions,
-    FTTTWorkload,
-)
+from tllm.canonical.workloads.fttt.workload import FTTTWorkload
 
 __all__ = [
     "FTTTBarrierState",
     "FTTTClosedLoopIntent",
-    "FTTTCompilation",
-    "FTTTCompileOptions",
     "FTTTCompletion",
     "FTTTCompletionBatch",
     "FTTTConfig",
@@ -47,10 +35,6 @@ __all__ = [
     "FTTTCpuReadiness",
     "FTTTCudaReadiness",
     "FTTTDefaultJudge",
-    "FTTTDiagnostics",
-    "FTTTExecution",
-    "FTTTExecutionReceipt",
-    "FTTTExecutionResult",
     "FTTTFeedbackService",
     "FTTTFinishReason",
     "FTTTHostReadiness",

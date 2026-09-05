@@ -7,6 +7,13 @@ from enum import StrEnum
 from hashlib import sha256
 
 
+@dataclass(frozen=True, slots=True)
+class GTTAResult:
+    transaction_id: int
+    update: GTTAUpdateReceipt
+    query: GTTAQueryResult
+
+
 class GTTAPromptPosition(StrEnum):
     PREFIX = "prefix"
     SUFFIX = "suffix"

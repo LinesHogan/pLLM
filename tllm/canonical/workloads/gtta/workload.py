@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import torch
 
-from tllm.canonical.scheduler import compile_schedule, lower_physical_plan
+from tllm.canonical.host_runtime import HostExecution
 from tllm.canonical.workloads.base import CanonicalWorkload
-from tllm.canonical.workloads.gtta.execution import GTTAExecution
-from tllm.canonical.workloads.gtta.tasks import (
+from tllm.canonical.workloads.gtta.state import (
+    GTTADynamicsState, GTTADynamicsSnapshot, GTTAStepContext,
+    GTTAPublishTask, GTTAQueryTask, GTTAUpdateTask,
     GTTA_PUBLISH_IMPLEMENTATION,
     GTTA_QUERY_IMPLEMENTATION,
     GTTA_UPDATE_IMPLEMENTATION,
 )
-from tllm.canonical.workloads.gtta.types import GTTAConfig
-from tllm.contracts.canonical_compilation import CanonicalScheduleBundle
+from tllm.canonical.workloads.gtta.types import GTTAConfig, GTTAHostTransaction, GTTAResult
 from tllm.contracts.semantic_graph import (
     AnchorSymbol,
     ExecutionKind,
@@ -45,33 +45,6 @@ _DYNAMICS_STATE = StateResource("dynamics")
 _PUBLISH_TASK = TaskSymbol("publish")
 _QUERY_TASK = TaskSymbol("query")
 _UPDATE_TASK = TaskSymbol("update")
-
-
-@dataclass(frozen=True, slots=True)
-class GTTACompileOptions:
-    timeline: SchedulerTimeline
-    plan_epoch: int = 1
-
-    def __post_init__(self) -> None:
-        if self.plan_epoch < 1:
-            raise ValueError("GTTA compile options are not canonical")
-
-
-@dataclass(frozen=True, slots=True)
-class GTTACompilation:
-    execution: GTTAExecution
-    schedule_bundle: CanonicalScheduleBundle
-    execution_parameters_digest: str
-
-    def __post_init__(self) -> None:
-        if (
-            self.execution.plan is not self.schedule_bundle.schedule_physical
-            or self.execution.execution_parameters_digest
-            != self.execution_parameters_digest
-            or self.schedule_bundle.semantic_graph.execution_parameters_digest
-            != self.execution_parameters_digest
-        ):
-            raise TypeError("GTTA compilation is not execution-aligned")
 
 
 class GTTAWorkload(CanonicalWorkload):
@@ -201,22 +174,14 @@ class GTTAWorkload(CanonicalWorkload):
             ),
         )
 
-    def compile(self, options: GTTACompileOptions) -> GTTACompilation:
-        graph = self.semantic_graph()
-        decision = compile_schedule(graph, options.timeline)
-        physical = lower_physical_plan(
-            graph,
-            options.timeline,
-            decision,
-            plan_epoch=options.plan_epoch,
-        )
-        bundle = CanonicalScheduleBundle(graph, options.timeline, decision, physical)
-        execution = GTTAExecution(self.config, bundle)
-        return GTTACompilation(
-            execution,
-            bundle,
-            self.config.execution_parameters_digest(),
+    def compile(
+        self, timeline: SchedulerTimeline, *, plan_epoch: int = 1,
+    ) -> HostExecution[GTTAHostTransaction, GTTAStepContext, GTTADynamicsSnapshot, GTTAResult]:
+        return HostExecution(
+            self.semantic_graph(), timeline, GTTADynamicsState(),
+            (GTTAPublishTask(), GTTAQueryTask(), GTTAUpdateTask(self.config)),
+            torch.device("cpu"), plan_epoch=plan_epoch,
         )
 
 
-__all__ = ["GTTACompilation", "GTTACompileOptions", "GTTAWorkload"]
+__all__ = ["GTTAWorkload"]

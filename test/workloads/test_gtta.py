@@ -6,7 +6,7 @@ import torch
 
 from tllm.canonical.host_runtime import CanonicalHostRuntimeFacts, HostTransactionCoordinator
 from tllm.canonical.workloads.gtta import (
-    GTTACompileOptions, GTTAConfig, GTTAHostRequest, GTTAPromptPosition,
+    GTTAConfig, GTTAHostRequest, GTTAPromptPosition,
     GTTAQuery, GTTAWorkload, TrajectoryFeedback,
 )
 from tllm.canonical.workloads.gtta.environment import GTTAEnvironmentService
@@ -14,9 +14,9 @@ from tllm.canonical.workloads.gtta.environment import GTTAEnvironmentService
 
 def test_gtta_updates_environment_and_rolls_back_fifo() -> None:
     config = GTTAConfig(max_queue_size=3, score_momentum=0.25)
-    execution = GTTAWorkload(config).compile(GTTACompileOptions(
+    execution = GTTAWorkload(config).compile(
         CanonicalHostRuntimeFacts(torch.device("cpu")).timeline(),
-    )).execution
+    )
     service = GTTAEnvironmentService(config)
     feedback = (
         TrajectoryFeedback("maps", "open", "Map Results", "directions", "", 1.0),

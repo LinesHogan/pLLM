@@ -12,7 +12,10 @@ from tllm.canonical.workloads.fttt.math import edit_inputs, target_delta
 from tllm.canonical.workloads.fttt.types import (
     FTTTClosedLoopIntent,
     FTTTConfig,
+    FTTTCpuReadiness,
+    FTTTCudaReadiness,
     FTTTHostTransaction,
+    FTTTResult,
     FTTTSpecialization,
 )
 from tllm.contracts.semantic_graph import ImplementationId
@@ -43,6 +46,7 @@ class FTTTEditState:
     down_exp_avg_sq: torch.Tensor
     up_exp_avg: torch.Tensor
     up_exp_avg_sq: torch.Tensor
+    specialization: FTTTSpecialization
     step: int = 0
     version: int = 0
 
@@ -65,6 +69,56 @@ class FTTTEditState:
             or self.version < 0
         ):
             raise ValueError("FTTT edit state is not layout-aligned")
+
+    def prepare(self, transaction: FTTTHostTransaction) -> FTTTStepContext:
+        if (
+            int(transaction.hidden_rows.shape[1]) != self.specialization.hidden_size
+            or transaction.hidden_rows.dtype is not torch.float32
+            or transaction.hidden_rows.device != self.specialization.device
+        ):
+            raise ValueError("FTTT transaction differs from specialization")
+        match transaction.readiness:
+            case FTTTCpuReadiness() if self.specialization.device.type == "cpu":
+                pass
+            case FTTTCudaReadiness() as readiness if self.specialization.device.type == "cuda":
+                readiness.order_on(torch.cuda.current_stream(self.specialization.device))
+            case _:
+                raise ValueError("FTTT readiness differs from placement")
+        return FTTTStepContext(
+            transaction, self, FTTTPreparePending(), FTTTLossPending(),
+            FTTTOptimizationPending(), FTTTPredictionPending(), FTTTPublicationPending(),
+        )
+
+    def snapshot(self) -> FTTTEditState:
+        return replace(
+            self, down=self.down.detach().clone(), up=self.up.detach().clone(),
+            down_exp_avg=self.down_exp_avg.clone(), down_exp_avg_sq=self.down_exp_avg_sq.clone(),
+            up_exp_avg=self.up_exp_avg.clone(), up_exp_avg_sq=self.up_exp_avg_sq.clone(),
+        )
+
+    def restore(self, snapshot: FTTTEditState) -> None:
+        self.down, self.up = snapshot.down, snapshot.up
+        self.down_exp_avg, self.down_exp_avg_sq = snapshot.down_exp_avg, snapshot.down_exp_avg_sq
+        self.up_exp_avg, self.up_exp_avg_sq = snapshot.up_exp_avg, snapshot.up_exp_avg_sq
+        self.step, self.version = snapshot.step, snapshot.version
+
+    def output(self, context: FTTTStepContext) -> FTTTResult:
+        match context.prediction, context.publication, context.optimization:
+            case (
+                FTTTPredicted(delta=delta), FTTTPublished(intent=intent),
+                FTTTNotUpdated(version=version, update_count=updates),
+            ):
+                losses: tuple[torch.Tensor, ...] = ()
+            case (
+                FTTTPredicted(delta=delta), FTTTPublished(intent=intent),
+                FTTTOptimized(loss=loss, version=version, update_count=updates),
+            ):
+                losses = (loss,)
+            case _:
+                raise RuntimeError("FTTT signed graph did not produce all outputs")
+        return FTTTResult(
+            context.transaction.plan.intent.transaction_id, delta, intent, losses, updates, version,
+        )
 
 
 def initialize_edit_state(
@@ -98,6 +152,7 @@ def initialize_edit_state(
         torch.zeros_like(down),
         torch.zeros_like(up),
         torch.zeros_like(up),
+        specialization,
     )
 
 

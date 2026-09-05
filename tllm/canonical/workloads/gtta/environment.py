@@ -4,16 +4,14 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from tllm.canonical.workloads.gtta.execution import GTTAExecutionReceipt
+from tllm.canonical.host_runtime import HostReceipt
 
 from tllm.canonical.workloads.gtta.types import (
     DynamicsEvent,
     GTTAConfig,
     GTTAHostRequest,
     GTTAHostTransaction,
+    GTTAResult,
     GTTATrajectoryBatch,
     TrajectoryFeedback,
     canonical_state_signature,
@@ -105,7 +103,7 @@ class GTTAEnvironmentService:
     def commit(
         self,
         transaction: GTTAHostTransaction,
-        receipt: GTTAExecutionReceipt,
+        receipt: HostReceipt[GTTAResult],
     ) -> None:
         del receipt
         self._active_transaction(transaction)

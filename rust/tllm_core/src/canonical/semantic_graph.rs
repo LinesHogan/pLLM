@@ -496,3 +496,54 @@ pub(crate) fn canonical_ascii_json<T: Serialize>(value: &T) -> Result<String, St
 pub(crate) fn digest(payload: &str) -> String {
     format!("{:x}", Sha256::digest(payload.as_bytes()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_ascii_json, decode_graph, digest, validate_graph};
+    use serde_json::json;
+
+    #[test]
+    fn semantic_graph_closed_codec_rejects_schema_drift() {
+        let graph = json!({
+            "schema_version": 1, "workload_id": "closed",
+            "execution_parameters_digest": "a".repeat(64), "edges": [],
+            "states": [{"resource": "weights", "scope": "request", "key_fields": ["request_id"]}],
+            "tasks": [{
+                "symbol": "predict", "timing": {"after": "begin", "before": "end"},
+                "inputs": [{"name": "hidden", "source": {"kind": "hidden", "layer": 0,
+                    "site": "block_output", "phase": "decode"}}],
+                "outputs": [{"name": "prediction", "kind": "temporary", "schema": ""}],
+                "effects": [{"resource": "weights", "kind": "read"}],
+                "implementations": [{"implementation_id": "cpu", "execution_kind": "native_task",
+                    "required_capabilities": ["cpu"]}]
+            }]
+        });
+        let encoded = graph.to_string();
+        let decoded = decode_graph(&encoded).unwrap();
+        validate_graph(&decoded).unwrap();
+        let canonical = canonical_ascii_json(&decoded).unwrap();
+        assert_eq!(decode_graph(&canonical).unwrap(), decoded);
+        let duplicate = format!("{{\"schema_version\":1,{}", &encoded[1..]);
+        assert!(decode_graph(&duplicate).is_err());
+        let mut missing = graph.clone();
+        missing.as_object_mut().unwrap().remove("states");
+        assert!(decode_graph(&missing.to_string()).is_err());
+        let mut unknown = graph.clone();
+        unknown["tasks"][0]["inputs"][0]["source"]["callback"] = json!("unregistered");
+        assert!(decode_graph(&unknown.to_string()).is_err());
+        let mut wrong_kind = graph.clone();
+        wrong_kind["tasks"][0]["inputs"][0]["source"]["kind"] = json!("python_hook");
+        assert!(decode_graph(&wrong_kind.to_string()).is_err());
+        let mut wrong_schema = graph.clone();
+        wrong_schema["schema_version"] = json!(2);
+        assert!(validate_graph(&decode_graph(&wrong_schema.to_string()).unwrap()).is_err());
+        let mut unknown_state = graph.clone();
+        unknown_state["tasks"][0]["effects"][0]["resource"] = json!("missing");
+        assert!(validate_graph(&decode_graph(&unknown_state.to_string()).unwrap()).is_err());
+        let mut changed = graph;
+        changed["tasks"][0]["symbol"] = json!("changed");
+        let changed = decode_graph(&changed.to_string()).unwrap();
+        validate_graph(&changed).unwrap();
+        assert_ne!(digest(&canonical), digest(&canonical_ascii_json(&changed).unwrap()));
+    }
+}

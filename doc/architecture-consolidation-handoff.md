@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`4cd162f` 后的工作区变更，分支 `tranche-b-atomic`。
+核查日期：2026-09-06。代码检查点：`19c59d5` 后的工作区变更，分支 `tranche-b-atomic`。
 工作目录：`/workspace/pllm/.worktrees/tranche-b-atomic`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,24 +13,24 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 27,961；相对 133,210 净减 105,249（约 79.0%） |
-| 距第一轮 30k 上限 | 当前余量 2,039 行；补齐缺失能力仍须与新栈压缩配套 |
-| 本轮源码差分 | 相对 `4cd162f` 新增 10 / 删除 22 / 净减 12；无移动、无数学抽取 |
+| SOURCE_LOC | 27,163；相对 133,210 净减 106,047（约 79.6%） |
+| 距第一轮 30k 上限 | 当前余量 2,837 行；补齐缺失能力仍须与新栈压缩配套 |
+| 本轮源码差分 | 相对 `19c59d5` 新增 457 / 删除 1,255 / 净减 798；含 100 行原样移动，未改变独立数学 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
-| 留存证据基础 | 3 个 Rust tests + 5 个 pytest items + 4 个独立 GPU smoke，共 12 项 |
-| 终态证据债务 | 39 项目标中 27 项待补；留存基础也须复核完整 observable contract |
+| 留存证据基础 | 4 个 Rust tests + 7 个 pytest items + 4 个独立 GPU smoke，共 15 项 |
+| 终态证据债务 | 原 39 项中 24 项待补，加新增组合 40/41，共 26 项待补 |
 
 SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除。移动不作为减量成果。
 当前目录体积用于选择整块处理边界，不能直接当作可删除量：
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 15,011 |
+| tllm/canonical | 14,378 |
 | tllm/backends + canonical_vllm | 3,360 + 2,853 |
-| tllm/contracts | 2,478 |
-| Rust | 3,174 |
+| tllm/contracts | 2,262 |
+| Rust | 3,225 |
 | tools / 顶层入口及 stub | 857 / 228 |
 
 ## 下一轮实施顺序与完成条件
@@ -49,9 +49,12 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 
 ### 2. 完成 generic execution 与 backend 的实质合并（B/D）
 
-- `canonical/execution.py` 的 `TaskGraphExecution.run` 已接管 FTTT、GTTA、In-Place CPU
-  的同步执行循环，按 signed task 顺序执行。CUDA 外部 anchor 游标保留；仅完成 B 的小切片，
-  workload transaction/session 和 CPU/CUDA transition 合并仍未完成。
+- FTTT/GTTA 已删除各自 execution、receipt、completion、compilation/options 包装；
+  `compile` 直接返回同一个 `HostExecution`，共享 signed task 执行、快照回滚和 receipt 结算。
+  FTTT/GTTA 的数学状态各自保留，不被复制进通用 Context/service locator。
+  ESamp/In-Place 的 CPU/CUDA transition 与 backend session 仍待合并。
+- SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
+  保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
 - `canonical_vllm/runtime.py` 仍有 1,494 行，直接 import ESamp/In-Place-TTT，
   deployment/execution 类型为两者 union，公共 factory 仅接受这两种 workload。
   `canonical_runtime` 目录虽然已删，workload-specific 编排职责仍有残留。
@@ -70,7 +73,7 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 | Workload | 现状与待办 | Evidence IDs |
 | --- | --- | --- |
 | Dummy | graph→sign→plan→execute、stride 与 owned export oracle 已补；统一 factory 尚待 B | 20 |
-| FTTT | 数学/judge/host owner 存在；收敛 generic transaction，补 retry/receipt oracle | 21, 38 |
+| FTTT | 已切共享 host execution；独立 Adam/edit、回滚、retry/stop/accept oracle 与 CUDA receipt 通过 | 21, 38 |
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
 | In-Place-TTT | 多 target tail/chunk 数值、原子发布、两请求版本隔离/清理 oracle 已补；CPU/CUDA 合并待 B | 23, 32 |
 | ESamp | 有 request CUDA/sampler 路径；补 request isolation、先预测后训练及 MRv1 证据 | 25, 30, 31, 37 |
@@ -94,8 +97,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 - 旧 `runtime/mp/port_wire.py` 的反射 transport 已删除；closed typed MP 尚未实现。
   旧 workload RPC 被删除不等于新的 worker reconstruction、prepare/commit/abort、quorum
   已实现；补共享 tensor 生命周期和真实 EngineCore child 路径，对应 16–18、36。
-- 完成 generic host transaction 的 abort/requeue/post-publish settlement（19），
-  统一 signed attachment exact binding/tamper 证据（15）。
+- generic host transaction 的 abort/requeue/post-publish settlement（19）已通过；
+  发布后失败返回原始 receipt 继续结算，不重跑 host effect。signed attachment 统一证据（15）仍待补。
 - typed authoring descriptors、统一 workload-independent profiling 仍待完成；
   profiling 消费通用执行事件，替换散落 counters/hooks，不新增 workload callback。
 
@@ -105,16 +108,16 @@ PTTS/AER 设计继续以 `doc/research-aer-paged-state.md` 为唯一权威。
 
 ### 5. 补齐证据、发布验证与最终压缩（A/G）
 
-- `test/evidence_manifest.toml` 的 active IDs 是 `1,3,5,13,20,22,23,30,32,37,38,39`。
-  pending IDs 是 `2,4,6–12,14–19,21,24–29,31,33–36`。这些编号对应原计划第 5.3 节。
-- 27 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
+- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,13,19,20,21,22,23,30,32,37,38,39`。
+  pending IDs 是 `4,6–12,14–18,24–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
+- 26 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
   数值/版本/cleanup contract。禁止为凑 39 写 DTO、mock 调用次数或旧内部结构测试。
 - manifest 最终逐项列出实际文件/命令、observable contract、环境、GPU/MP 要求及替代的
   旧测试来源。训练必须非零 loss/update，执行必须 zero fallback。
 - 第 39 项已验证 sdist→从归档构建 wheel→隔离安装/import→Rust codec 执行，并核对
   Torch 依赖、LICENSE 和退役包/plugin 缺席。根 `pyproject.toml` 是唯一 Python 打包配置；
   删除 Rust 子目录重复配置和 `requirements-minimal.txt`，支持 ABI 限定 vLLM 0.27.1。
-- 全量行为证据不超过 50，39 项目标完整；SOURCE_LOC 进入 22k–30k；strict typing 0/0、
+- 全量行为证据不超过 50，原 39 项及组合 40/41 完整；SOURCE_LOC 进入 22k–30k；strict typing 0/0、
   import/authority gates、Rust build、代表性 backend 边界和发布验证通过后才算第一轮完成。
   再逐 owner 审计向 10k 压缩，不承诺缺乏代码依据的工期或最终行数。
 
@@ -130,6 +133,17 @@ PTTS/AER 设计继续以 `doc/research-aer-paged-state.md` 为唯一权威。
 - 已补齐原元数据声明的 Apache-2.0 正文。README 明示实际支持范围与开发状态；
   原历史 benchmark harness 已删，旧 n=16 吞吐不能作为当前 n=1 公共路径的支持证明。
 - 未发布、未打 tag、未推送。功能/架构证据未齐，以及 dirty 分支整合，仍是发布阻碍。
+- 两处改动已保存为可恢复快照：`archive/consolidation-main-20260906` (`865ad4c`)、
+  `archive/consolidation-lora-20260906` (`c5b3589`)，包括 LoRA 的四个未跟踪源码/测试文件。
+  原文件和索引未被快照操作修改。LoRA 的 grouped kernel、weighted-CE/shared update、
+  进程训练边界须按 PTTS/closed MP 语义吸收，不能复制旧 registry、反射或 fallback。
+
+### 7. 新设计的组合路径与共享边界（未完成）
+
+执行原计划第 10 节已确认的范围：同一 SemanticGraph、同一版本根、同一 issued receipt，
+不按 AER/PTTS/replay/MP/trace 分别建立镜像 authority。需要完成有界条件区、明确 KV/RNG
+effect、统一有界 trace，以及独立 PyTorch oracle 和真实 Qwen2 最后一层 replay 场景（40/41）。
+全面性能研究和独立变体实验不纳入本次门槛。第一轮完整后仍须进行 owner 第二轮压缩。
 
 ## 验证记录与复现
 
@@ -141,11 +155,16 @@ In-Place-TTT 双请求 smoke 通过（update=6、dense_apply_rows=8、active_lin
 CUDA graph replay 为 loss/update 各 4、stable addresses、fallback=0；FTTT 为 loss/update
 各 1、version=1、fallback=0。当时 10 项均已执行通过。
 
-本轮新增 GTTA、In-Place CPU oracle 并强化分发包证据后，完整 pytest 5 passed；
+`19c59d5` 新增 GTTA、In-Place CPU oracle 并强化分发包证据后，完整 pytest 5 passed；
 import-layer 0/0、region authority gate、strict/basic Pyright 均 0 errors/0 warnings。
 FTTT CUDA 重新执行通过：loss/update 各 1、version=1、delta_max=0.0127174、fallback=0。
 其余三个 GPU smoke 与 Rust 核心本轮未改、未重复执行，沿用 `4cd162f` 证据。
 本轮未运行吞吐 benchmark。
+
+当前共享 host/Rust validation tranche：完整 pytest 7 passed、Rust 4 passed、strict/basic
+typing 0/0、import/authority gates 通过。四个 GPU smoke 均复跑：ESamp loss/update 2，
+In-Place update 6，CUDA Graph loss/update 4，FTTT loss/update 1；清理正确且 fallback 全为 0。
+FTTT CUDA 初始化也以 issued readiness event 跨流排序，不依赖编译耗时碰巧掩盖竞态。
 
 所有 Python 使用 `/workspace/pllm/.venv/bin/python`。canonical vLLM 当前代码要求
 `0.27.1`，且限定 in-process/eager 等边界；本轮实测 vLLM runtime 为 0.27.1，发行元数据

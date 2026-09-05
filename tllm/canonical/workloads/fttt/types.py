@@ -19,6 +19,16 @@ class FTTTFinishReason(StrEnum):
     ERROR = "error"
 
 
+@dataclass(frozen=True, slots=True)
+class FTTTResult:
+    transaction_id: int
+    edit_delta: torch.Tensor
+    intent: FTTTClosedLoopIntent
+    losses: tuple[torch.Tensor, ...]
+    update_count: int
+    state_version: int
+
+
 class FTTTRetryAction(StrEnum):
     ACCEPT = "accept"
     RETRY = "retry"

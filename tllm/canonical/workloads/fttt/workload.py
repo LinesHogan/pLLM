@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
-from tllm.canonical.scheduler import (
-    compile_schedule,
-    lower_physical_plan,
-)
+from tllm.canonical.host_runtime import HostExecution
 from tllm.canonical.workloads.base import CanonicalWorkload
-from tllm.canonical.workloads.fttt.execution import FTTTExecution
 from tllm.canonical.workloads.fttt.tasks import (
     FTTT_CUDA_LOSS_IMPLEMENTATION,
     FTTT_CUDA_OPTIMIZE_IMPLEMENTATION,
@@ -20,9 +16,12 @@ from tllm.canonical.workloads.fttt.tasks import (
     FTTT_PREDICT_IMPLEMENTATION,
     FTTT_PREPARE_IMPLEMENTATION,
     FTTT_PUBLISH_IMPLEMENTATION,
+    FTTTEditState, FTTTStepContext, initialize_edit_state,
+    FTTTLossTask, FTTTOptimizeTask, FTTTPredictTask, FTTTPrepareTask, FTTTPublishTask,
 )
-from tllm.canonical.workloads.fttt.types import FTTTConfig, FTTTSpecialization
-from tllm.contracts.canonical_compilation import CanonicalScheduleBundle
+from tllm.canonical.workloads.fttt.types import (
+    FTTTConfig, FTTTHostTransaction, FTTTResult, FTTTSpecialization,
+)
 from tllm.contracts.semantic_graph import (
     AnchorSymbol,
     ExecutionKind,
@@ -56,45 +55,6 @@ _OPTIMIZE_TASK = TaskSymbol("optimize")
 _PREDICT_TASK = TaskSymbol("predict")
 _PREPARE_TASK = TaskSymbol("prepare")
 _PUBLISH_TASK = TaskSymbol("publish")
-
-
-@dataclass(frozen=True, slots=True)
-class FTTTCompileOptions:
-    timeline: SchedulerTimeline
-    plan_epoch: int = 1
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.timeline) is not SchedulerTimeline
-            or type(self.plan_epoch) is not int
-            or self.plan_epoch < 1
-        ):
-            raise ValueError("FTTT compile options are not canonical")
-
-
-@dataclass(frozen=True, slots=True)
-class FTTTCompilation:
-    execution: FTTTExecution
-    schedule_bundle: CanonicalScheduleBundle
-    execution_parameters_digest: str
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.execution) is not FTTTExecution
-            or type(self.schedule_bundle) is not CanonicalScheduleBundle
-            or self.execution.plan is not self.schedule_bundle.schedule_physical
-            or type(self.execution_parameters_digest) is not str
-            or len(self.execution_parameters_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.execution_parameters_digest
-            )
-            or self.execution.execution_parameters_digest
-            != self.execution_parameters_digest
-            or self.schedule_bundle.semantic_graph.execution_parameters_digest
-            != self.execution_parameters_digest
-        ):
-            raise TypeError("FTTT compilation is not execution-aligned")
 
 
 class FTTTWorkload(CanonicalWorkload):
@@ -327,8 +287,10 @@ class FTTTWorkload(CanonicalWorkload):
     def compile(
         self,
         specialization: FTTTSpecialization,
-        options: FTTTCompileOptions,
-    ) -> FTTTCompilation:
+        timeline: SchedulerTimeline,
+        *,
+        plan_epoch: int = 1,
+    ) -> HostExecution[FTTTHostTransaction, FTTTStepContext, FTTTEditState, FTTTResult]:
         if self.config.rank > specialization.hidden_size:
             raise ValueError("FTTT rank exceeds the specialized hidden size")
         execution_parameters_digest = specialization.execution_parameters_digest(
@@ -338,33 +300,25 @@ class FTTTWorkload(CanonicalWorkload):
             self.semantic_graph(),
             execution_parameters_digest=execution_parameters_digest,
         )
-        decision = compile_schedule(graph, options.timeline)
-        physical = lower_physical_plan(
-            graph,
-            options.timeline,
-            decision,
-            plan_epoch=options.plan_epoch,
-        )
-        schedule_bundle = CanonicalScheduleBundle(
-            graph,
-            options.timeline,
-            decision,
-            physical,
-        )
-        execution = FTTTExecution(
-            self.config,
-            specialization,
-            schedule_bundle,
-        )
-        return FTTTCompilation(
-            execution,
-            schedule_bundle,
-            execution_parameters_digest,
+        state = initialize_edit_state(self.config, specialization)
+        cpu = specialization.device.type == "cpu"
+        return HostExecution(
+            graph, timeline, state,
+            (
+                FTTTLossTask(FTTT_LOSS_IMPLEMENTATION if cpu else FTTT_CUDA_LOSS_IMPLEMENTATION),
+                FTTTOptimizeTask(
+                    self.config, FTTT_OPTIMIZE_IMPLEMENTATION if cpu else FTTT_CUDA_OPTIMIZE_IMPLEMENTATION,
+                ),
+                FTTTPredictTask(FTTT_PREDICT_IMPLEMENTATION if cpu else FTTT_CUDA_PREDICT_IMPLEMENTATION),
+                FTTTPrepareTask(
+                    self.config, FTTT_PREPARE_IMPLEMENTATION if cpu else FTTT_CUDA_PREPARE_IMPLEMENTATION,
+                ),
+                FTTTPublishTask(),
+            ),
+            specialization.device, plan_epoch=plan_epoch,
         )
 
 
 __all__ = [
-    "FTTTCompilation",
-    "FTTTCompileOptions",
     "FTTTWorkload",
 ]

@@ -10,7 +10,6 @@ from tllm.canonical.host_runtime import (
     NO_HOST_REQUEST,
 )
 from tllm.canonical.workloads.fttt import (
-    FTTTCompileOptions,
     FTTTCompletion,
     FTTTCompletionBatch,
     FTTTConfig,
@@ -59,12 +58,12 @@ def main() -> int:
         initialization_seed=7,
     )
     workload = FTTTWorkload(config)
-    compiled = workload.compile(
+    execution = workload.compile(
         specialization,
-        FTTTCompileOptions(CanonicalHostRuntimeFacts(device).timeline()),
+        CanonicalHostRuntimeFacts(device).timeline(),
     )
     service = FTTTFeedbackService(config, _CudaNegativeJudge())
-    coordinator = HostTransactionCoordinator(service, compiled.execution)
+    coordinator = HostTransactionCoordinator(service, execution)
     identity = RequestIdentity("cuda-feedback-0", 0, 0)
     completion = FTTTCompletion(
         identity,
@@ -89,7 +88,7 @@ def main() -> int:
         result = coordinator.run(NO_HOST_REQUEST)
     if result is None:
         raise RuntimeError("canonical FTTT did not execute its queued transaction")
-    diagnostics = compiled.execution.diagnostics()
+    diagnostics = execution.diagnostics()
     if (
         result.edit_delta.device != device
         or result.edit_delta.shape != (1, 4)
@@ -102,15 +101,15 @@ def main() -> int:
             FTTTInstanceKey("cuda-feedback-0", 0)
         ).adapter_version
         != 1
-        or diagnostics.loss_count != 1
-        or diagnostics.update_count != 1
+        or len(result.losses) != 1
+        or diagnostics.transaction_count != 1
         or diagnostics.fallback_count != 0
     ):
         raise RuntimeError("canonical FTTT CUDA lifecycle evidence is incomplete")
     print(
         {
-            "loss_count": diagnostics.loss_count,
-            "update_count": diagnostics.update_count,
+            "loss_count": len(result.losses),
+            "update_count": result.update_count,
             "state_version": diagnostics.state_version,
             "delta_max": float(result.edit_delta.abs().max().item()),
             "fallback_count": diagnostics.fallback_count,

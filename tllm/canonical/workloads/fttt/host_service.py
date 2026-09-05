@@ -9,10 +9,7 @@ import re
 
 import torch
 
-from tllm.canonical.workloads.fttt.execution import (
-    FTTTExecutionReceipt,
-)
-from tllm.canonical.host_runtime import NoHostRequest
+from tllm.canonical.host_runtime import HostReceipt, NoHostRequest
 from tllm.canonical.workloads.fttt.judge import FTTTJudgeService
 from tllm.canonical.workloads.fttt.types import (
     FTTTBarrierState,
@@ -29,6 +26,7 @@ from tllm.canonical.workloads.fttt.types import (
     FTTTJudgeResult,
     FTTTLifecycleTransition,
     FTTTRewardOutcome,
+    FTTTResult,
     FTTTRetryAction,
     FTTTRetryControl,
     FTTTTrainingPlan,
@@ -312,10 +310,8 @@ class FTTTFeedbackService:
     def commit(
         self,
         transaction: FTTTHostTransaction,
-        receipt: FTTTExecutionReceipt,
+        receipt: HostReceipt[FTTTResult],
     ) -> None:
-        if type(receipt) is not FTTTExecutionReceipt:
-            raise TypeError("FTTT settlement requires the exact execution receipt")
         intent = receipt.result.intent
         match self._active:
             case _ActiveTransaction(transaction=active) if active is transaction:
@@ -345,10 +341,10 @@ class FTTTFeedbackService:
                 transition.next,
                 adapter_version=version,
             )
+        projected = self._projected_instances if self._queue else dict(settled)
         self._instances = settled
         self._active = _NoActiveTransaction()
-        if not self._queue:
-            self._projected_instances = dict(settled)
+        self._projected_instances = projected
 
     def abort(self, transaction: FTTTHostTransaction) -> None:
         match self._active:

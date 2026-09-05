@@ -51,7 +51,7 @@ python -m maturin sdist
 
 Wheel success alone does not authorize a release. Before tagging or publishing,
 complete the [handoff](../architecture-consolidation-handoff.md), all selected
-39 evidence contracts (maximum 50), supported runtime boundaries, and the
+39 original evidence contracts plus composition evidence 40/41 (maximum 50), runtime boundaries, and the
 22k–30k source gate. Consolidate the release branch without discarding pending
 worktree changes. No throughput or unsupported topology claim may be inferred
 from a short correctness smoke.

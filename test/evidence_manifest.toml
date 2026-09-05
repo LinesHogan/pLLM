@@ -1,14 +1,14 @@
 schema_version = 1
-target_count = 39
+target_count = 41
 maximum_count = 50
-active_executable_count = 12
-pending_survivor_count = 27
-active_executable_ids = [1, 3, 5, 13, 20, 22, 23, 30, 32, 37, 38, 39]
+active_executable_count = 15
+pending_survivor_count = 26
+active_executable_ids = [1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 30, 32, 37, 38, 39]
 
 # The active count is deliberately not the terminal evidence set.  It records
 # the executable survivor bases left after deleting stale old-stack tests:
-# three Rust canonical tests, one CUDA PTTS pytest, and four standalone GPU
-# smokes, plus Dummy/GTTA/In-Place oracles and isolated distribution evidence.
+# four Rust canonical tests, one CUDA PTTS pytest, and four standalone GPU
+# smokes, plus four workload oracles, a host boundary and distribution evidence.
 # The remaining IDs are debt tied to the
 # corresponding cutover tranche; they must be added as compact observable
 # oracles or public runtime smokes, not restored as legacy class-hierarchy or
@@ -23,6 +23,11 @@ group = "rust"
 id = 2
 name = "semantic_graph_closed_codec_rejects_schema_drift"
 group = "rust"
+path = "rust/tllm_core/src/canonical/semantic_graph.rs"
+command = "cargo test --manifest-path rust/tllm_core/Cargo.toml semantic_graph_closed_codec_rejects_schema_drift"
+environment = "Rust toolchain with cached dependencies; CPU"
+observable_contract = "Closed graph codec roundtrip; missing/duplicate/unknown fields and variants rejected; schema and state references checked; semantic changes alter canonical digest"
+replaces = "Python DTO semantic validation and repeated schema fixture tests"
 
 [[evidence]]
 id = 3
@@ -113,6 +118,11 @@ requires_mp = true
 id = 19
 name = "typed_host_transaction_abort_requeue_and_postpublish_settlement"
 group = "boundary"
+path = "test/workloads/test_host_transaction.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_host_transaction.py"
+environment = "Repository venv with torch and Rust extension; CPU"
+observable_contract = "Precommit failure restores actual dynamics and FIFO; postpublish failure returns the original issued receipt without repeating host effects; cloned and double-settled receipts rejected"
+replaces = "Duplicated workload-specific receipt and transaction lifecycle tests"
 
 [[evidence]]
 id = 20
@@ -128,6 +138,11 @@ replaces = "test/core/test_canonical_dummy_workload_unit.py; legacy consumer imp
 id = 21
 name = "fttt_matches_edit_oracle_and_settles_judge_retry"
 group = "workload"
+path = "test/workloads/test_fttt.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_fttt.py"
+environment = "Repository venv with torch and Rust extension; CPU"
+observable_contract = "Independent feature projection and PyTorch Adam match edit outputs after rollback, two updates, retry/stop/accept settlement and a no-update branch; zero fallback"
+replaces = "test/core/test_canonical_fttt_workload_unit.py; no consumer hierarchy fixtures"
 
 [[evidence]]
 id = 22
@@ -243,3 +258,14 @@ command = "/workspace/pllm/.venv/bin/python -m pytest -q test/release/test_wheel
 environment = "Repository Python venv, maturin, pip and cached Rust build dependencies; no GPU or MP"
 observable_contract = "Fresh sdist builds a non-editable wheel that imports its own Python/native module, declares tensor dependencies, executes Rust layout codec, and contains no residual packages or bootstrap plugin"
 replaces = "Legacy package/import probes; original plan evidence 39 had no executable survivor"
+
+[[evidence]]
+id = 40
+name = "learning_publication_conditional_replay_matches_reference"
+group = "workload"
+
+[[evidence]]
+id = 41
+name = "public_conditional_replay_preserves_kv_rng_and_request_isolation"
+group = "runtime"
+requires_gpu = true
