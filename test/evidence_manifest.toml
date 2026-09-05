@@ -70,7 +70,7 @@ group = "ptts"
 path = "test/boundary/test_page_bundle.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_cpu_request_ptts_admit_cow_publish_pin_retire"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "Admission, partial-field COW with unchanged slot sharing, exact old/new version values, one-lineage updates without cross-request mutation, retire retains old pins and then reclaims all capacity"
+observable_contract = "Admission with signed field alignment, partial-field COW with unchanged slot sharing, exact old/new version values, one-lineage updates without cross-request mutation, retire retains old pins and then reclaims all capacity"
 replaces = "Legacy dense producer, request-slot and separate logical/physical publication lifecycle tests"
 
 [[evidence]]

@@ -3,7 +3,9 @@
 ## 文档地位
 
 2026-09-06 实施交接见[剩余工作清单](architecture-consolidation-handoff.md)：
-代码检查点 `70a82d2`，SOURCE_LOC 25,339，终态 41 项证据尚欠 24 项。
+代码检查点 `519d4ed`，SOURCE_LOC 21,789，终态 41 项证据尚欠 21 项。
+PageBundle 已替换 13 个旧 PTTS 模块，request 目录不再持有另一份版本根；TLM/global overlay、
+跨版本 CUDA Graph 间接寻址、AER 和 closed MP 等仍待完成，不能以行数下降宣称终态完成。
 旧 runtime/ports/common 和公共 hook/plugin 入口已删除；行数达标不代表功能验收完成。
 历史 worktree 已从 30 个降至 1 个，代码已合入主目录 `main`；过时文档与重复打包配置已清理，sdist→wheel 隔离验证通过。
 下文基线与估算保留历史口径；当前完成情况以交接清单和 ledger 的最新检查点为准。

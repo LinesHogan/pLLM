@@ -22,24 +22,59 @@ Verified on 2026-09-06. See the [implementation handoff](architecture-consolidat
 for outstanding architecture, functionality and evidence work. The narrative
 entries below are chronological history, not additional current checkpoints.
 
-| Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `70a82d2` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `70a82d2` on `main` | — | after `e03816d` |
-| Counted production/support source | 25,339 lines | -107,871 lines | -65,987 lines |
-| Pytest collection | 9 items | -1,340 items | -2 items |
-| Rust tests | 4 items | -50 items | -50 items |
+| Commit | `519d4ed` on `main` | — | after `70a82d2` |
+| Counted production/support source | 21,789 lines | -111,421 lines | -3,550 lines |
+| Pytest collection | 12 items | -1,337 items | +3 items |
+| Rust tests | 4 items | -50 items | unchanged |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 17 items | below the 50-item ceiling; not yet the final evidence set | -1 item |
+| Visible `TEST_COUNT` | 20 items | below the 50-item ceiling; not yet the final evidence set | +3 items |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 2, 3, 5, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38 and 39.
+evidence IDs 1, 2, 3, 5, 9, 10, 12, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38 and 39.
 The agreed programmable-inference composition adds target IDs 40/41 to the
-original 39, leaving 24 pending survivor evidence items. Those items are implementation
+original 39, leaving 21 pending survivor evidence items. Those items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared PageBundle replacement after `70a82d2`
+
+Commits `e996998` and `519d4ed`: combined counted source `+1,011 / -4,561 / net -3,550`, including all new
+arena/planning/math source. No complete files moved unchanged. AdamW formulas
+were extracted from the CPU/CUDA providers into 118 lines operating on private
+tensors; common Rust plan validation moved out of attachment into the shared
+bundle and is not an independent deletion achievement.
+The first commit was `+990 / -4,561 / net -3,571`; the alignment correction was
+`+31 / -10 / net +21` within this replacement tranche. It pads field strides
+and pool bases to the declared layout alignment, with all padding in signed
+capacity; a real second-slot misalignment counterexample failed before the fix.
+
+Deleted 13 old PTTS modules and the CPU/CUDA storage/coordinator wrappers.
+One arena owns logical versions, generational field pools, multi-resource COW,
+publication, pins, completion and reclaim. The request directory retains only
+key-to-lineage selection and exclusive leases. ESamp and In-Place share the
+original arena/pin/publication, without mirrored release lists or gradient tokens.
+Attachment and arena reconstruction use the same native plan-bundle validator.
+
+Evidence 9/10/12 are now active; 13 uses the same arena on CUDA. The heterogeneous
+request/instance test covers partial initialization failure, private-write abort,
+atomic publication and complete reclaim. An unsettled-publication retirement
+counterexample first failed, then passed after receipts retained the associated
+roots until settlement and device completion. This does not complete TLM (11),
+captured version indirection (14), the generic backend, AER, MP or composition.
+Provider capture stability remains false. Source below the original estimated
+22k floor is not a reason to inflate code; missing capabilities still need work.
+
+Repository-venv verification: full pytest 12 passed in 27.24s including the
+isolated sdist/wheel gate; Rust 4 passed, strict/basic typing 0/0 and import/authority
+gates passed. All four standalone GPU smokes passed: ESamp loss/update 2,
+In-Place updates/trained rows 6 and apply rows 8, CUDA Graph loss/update 4 with
+stable addresses, FTTT loss/update 1 and version 1. Cleanup passed and all
+fallback counts were zero. No throughput benchmark, release or research-note edits.
 
 ### Shared attachment boundary after `e57caa6`
 
@@ -541,7 +576,7 @@ but missing workloads, MRv1, AER/PTTS, closed MP and evidence remain open.
 | D — backend quarantine and closed MP | 286 | 787 | 0 | -501 | active: backend event seam, vLLM WorkGraph cold handoff and retired legacy hook payload removed; seam rewrite still pending |
 | E — legacy authority removal | 529 | 73,602 | 988 | -73,073 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler/recurrence island, backend-region/packed-hidden old hooks, consumer compat island, BaseConsumer dispatch chain and dummy consumer re-export removed |
 | D/E — residual retirement continuation | 111 | 21,856 | 617 | -21,745 | old packages and public hook/plugin path deleted; retained backend state/effects still require canonical consolidation |
-| F — AER/PTTS final core | — | — | — | — | pending |
+| F — AER/PTTS final core | 1,011 | 4,561 | 0 complete files | -3,550 | active: shared PageBundle replacement; AER, MP, TLM and captured version selection remain pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
 Update this table from tracked physical line counts at each tranche boundary.
@@ -562,7 +597,7 @@ Moves are recorded separately and never counted as deletion.
 | `tllm/kit` | deleted in `b3af0d4` | none after typed execution cutover | canonical public factories |
 | `tllm/ports`, `tllm/common`, `tllm/core`, `tllm/util` | deleted in current worktree | plain engine construction moved into public factory; obsolete helpers removed | canonical contracts and direct public factory |
 | Rust non-canonical graph/schedule | old graph/schedule/recurrence/placement/execution_plan and shape/decode/sampler removed | prefill row planning and batch-phase classification still consumed by adapters | unique backend fact helpers |
-| provisional `canonical/ptts/dense_page*` | replace in F | lifecycle invariants and CUDA kernels | PageBundle/generational arena |
+| provisional `canonical/ptts/dense_page*` | deleted in `e996998` | one CPU/CUDA lifecycle and independent AdamW math | shared PageBundleArena; TLM/captured indirection still pending |
 
 ## Workload cutover manifest
 
