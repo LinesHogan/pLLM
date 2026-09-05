@@ -72,7 +72,7 @@ def main() -> int:
                 ignore_eos=True,
             ),
         )
-        execution = handle.deployment.execution
+        execution = handle.deployment.compilation.execution
         if not isinstance(execution, CanonicalDenseOverlayExecution):
             raise RuntimeError("canonical vLLM routed to the wrong execution")
         diagnostics = execution.diagnostics()

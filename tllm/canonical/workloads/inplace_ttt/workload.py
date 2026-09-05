@@ -119,7 +119,6 @@ from tllm.contracts.state_representation import (
 from tllm.contracts.state_ref import StateRef
 from tllm.contracts.tensor_layout import (
     StateTensorLayout,
-    TensorLayoutDecision,
     TensorLayoutRequest,
 )
 
@@ -565,18 +564,13 @@ class InPlaceTTTCompilation:
     execution: CanonicalDenseOverlayExecution
     plan_bundle: CanonicalPlanBundle
     state_layout: InPlaceTTTStateLayout
-    tensor_layout_request: TensorLayoutRequest
-    tensor_layout_decision: TensorLayoutDecision
-    execution_parameters_digest: str
 
     def __post_init__(self) -> None:
         if (
             self.execution.plan is not self.plan_bundle.schedule_physical
             or self.execution.state_plan is not self.plan_bundle.state_physical
             or self.execution.execution_parameters_digest
-            != self.execution_parameters_digest
-            or self.plan_bundle.semantic_graph.execution_parameters_digest
-            != self.execution_parameters_digest
+            != self.plan_bundle.semantic_graph.execution_parameters_digest
         ):
             raise ValueError("In-Place-TTT compilation is not execution-aligned")
 
@@ -797,6 +791,8 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             representation_request,
             representation,
             state_physical,
+            layout_request,
+            layout_decision,
         )
         match selected_provider.device_kind:
             case StateDeviceKind.CPU:
@@ -837,9 +833,6 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             execution,
             plan_bundle,
             state_layout,
-            layout_request,
-            layout_decision,
-            execution_parameters_digest,
         )
 
 

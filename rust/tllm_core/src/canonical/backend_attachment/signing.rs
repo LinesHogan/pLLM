@@ -46,17 +46,18 @@ pub(crate) fn lower(
     decision: &BackendAttachmentDecision,
 ) -> Result<BackendAttachmentPhysicalPlan, String> {
     validate_decision(inputs, decision)?;
-    let request = &inputs.request;
+    let probe = &inputs.probe;
+    let plan = &inputs.plan;
     let mut physical = BackendAttachmentPhysicalPlan {
-        plan_epoch: request.plan_epoch,
-        adapter_id: request.adapter_id.clone(),
+        plan_epoch: plan.schedule_physical.plan_epoch,
+        adapter_id: probe.adapter_id.clone(),
         attachment_signature: decision.signature.clone(),
-        schedule_signature: request.schedule_signature.clone(),
-        state_representation_signature: request.state_representation_signature.clone(),
-        device_kind: request.device_kind.clone(),
-        device_ordinal: request.device_ordinal,
-        topology: request.topology.clone(),
-        graph_mode: request.graph_mode.clone(),
+        schedule_signature: plan.schedule_physical.schedule_signature.clone(),
+        state_representation_signature: plan.state_physical.representation_signature.clone(),
+        device_kind: probe.device_kind.clone(),
+        device_ordinal: probe.device_ordinal,
+        topology: probe.topology.clone(),
+        graph_mode: probe.graph_mode.clone(),
         bundle_signature: String::new(),
         schema_version: SCHEMA_VERSION,
     };

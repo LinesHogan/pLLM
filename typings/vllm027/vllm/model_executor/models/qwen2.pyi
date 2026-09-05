@@ -32,8 +32,13 @@ class Qwen2ModelConfig:
     hidden_size: int
 
 
+class Qwen2LMHead(Module):
+    weight: Parameter
+
+
 class Qwen2ForCausalLM(Module):
     model: Qwen2Model
+    lm_head: Qwen2LMHead
     config: Qwen2ModelConfig
     quant_config: object | None
 

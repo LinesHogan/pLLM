@@ -2,13 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::super::scheduler::{PhysicalPlan as SchedulePhysicalPlan, ScheduleDecision};
-use super::super::semantic_graph::{SemanticGraph, Timeline};
-use super::super::state_representation::{
-    StateDeviceKind, StatePhysicalPlan, StateRepresentationDecision, StateRepresentationRequest,
-};
+use super::super::state_representation::StateDeviceKind;
+use super::super::tensor_layout::TensorDType;
+use super::super::CanonicalPlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -72,27 +70,6 @@ pub(crate) enum AttachmentTaskRole {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RequestKeyField {
-    RequestId,
-    PromptIdx,
-    SampleIdx,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TensorDType {
-    Bool,
-    Uint8,
-    Int32,
-    Int64,
-    Float16,
-    Bfloat16,
-    Float32,
-    Float64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum HiddenLayerKind {
     Index,
     Path,
@@ -118,6 +95,12 @@ pub(crate) struct HiddenBinding {
     pub(crate) layer_kind: HiddenLayerKind,
     pub(crate) site: HiddenSite,
     pub(crate) module_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttachmentHiddenResource {
+    pub(crate) binding: HiddenBinding,
     pub(crate) phase: HiddenPhase,
 }
 
@@ -154,7 +137,7 @@ pub(crate) struct BackendPlacementProbe {
     pub(crate) tensor_dtype: TensorDType,
     pub(crate) hidden_size: u64,
     pub(crate) max_packed_rows: u64,
-    pub(crate) hidden_resources: Vec<HiddenBinding>,
+    pub(crate) hidden_resources: Vec<AttachmentHiddenResource>,
     pub(crate) capabilities: Vec<String>,
     pub(crate) schema_version: u64,
 }
@@ -164,48 +147,21 @@ pub(crate) struct BackendPlacementProbe {
 pub(crate) struct AttachmentCompilerInputs {
     pub(crate) request: BackendAttachmentRequest,
     pub(crate) probe: BackendPlacementProbe,
-    pub(crate) graph: SemanticGraph,
-    pub(crate) timeline: Timeline,
-    pub(crate) schedule_decision: ScheduleDecision,
-    pub(crate) schedule_physical: SchedulePhysicalPlan,
-    pub(crate) state_request: StateRepresentationRequest,
-    pub(crate) state_decision: StateRepresentationDecision,
-    pub(crate) state_physical: StatePhysicalPlan,
+    pub(crate) plan: CanonicalPlanBundle,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackendAttachmentRequest {
-    pub(crate) adapter_id: String,
     pub(crate) attachment_kind: AttachmentKind,
-    pub(crate) backend_abi_digest: String,
-    pub(crate) runner_fingerprint: String,
-    pub(crate) model_fingerprint: String,
-    pub(crate) topology: AttachmentTopology,
-    pub(crate) graph_mode: AttachmentGraphMode,
-    pub(crate) device_kind: StateDeviceKind,
-    pub(crate) device_ordinal: u64,
-    pub(crate) tensor_parallel_size: u64,
-    pub(crate) pipeline_parallel_size: u64,
-    pub(crate) tensor_dtype: TensorDType,
-    pub(crate) hidden_size: u64,
-    pub(crate) max_packed_rows: u64,
     pub(crate) packed_row_schema_version: u64,
-    pub(crate) hidden_resources: Vec<HiddenBinding>,
     pub(crate) task_bindings: Vec<AttachmentTaskBinding>,
     pub(crate) sampler_anchor_id: u32,
     pub(crate) sampler_anchor_symbol: String,
     pub(crate) stream_dependencies: Vec<StreamDependency>,
     pub(crate) sampler_stage: AttachmentSamplerStage,
     pub(crate) cleanup_stage: AttachmentCleanupStage,
-    pub(crate) request_key_fields: Vec<RequestKeyField>,
     pub(crate) state_resource: String,
-    pub(crate) plan_epoch: u64,
-    pub(crate) schedule_signature: String,
-    pub(crate) state_request_digest: String,
-    pub(crate) state_representation_signature: String,
-    pub(crate) execution_parameters_digest: String,
-    pub(crate) capabilities: Vec<String>,
     pub(crate) overlay_field_ids: Vec<u32>,
     pub(crate) overlay_stage_anchors: Vec<AttachmentOverlayStageAnchor>,
     pub(crate) schema_version: u64,

@@ -15,6 +15,7 @@ from tllm.contracts.state_representation import (
     StateRepresentationDecision,
     StateRepresentationRequest,
 )
+from tllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,15 +26,6 @@ class CanonicalScheduleBundle:
     timeline: SchedulerTimeline
     schedule_decision: ScheduleDecision
     schedule_physical: PhysicalPlan
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.semantic_graph) is not SemanticGraph
-            or type(self.timeline) is not SchedulerTimeline
-            or type(self.schedule_decision) is not ScheduleDecision
-            or type(self.schedule_physical) is not PhysicalPlan
-        ):
-            raise TypeError("canonical schedule bundle requires exact signed facts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,18 +39,8 @@ class CanonicalPlanBundle:
     state_request: StateRepresentationRequest
     state_decision: StateRepresentationDecision
     state_physical: StatePhysicalPlan
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.semantic_graph) is not SemanticGraph
-            or type(self.timeline) is not SchedulerTimeline
-            or type(self.schedule_decision) is not ScheduleDecision
-            or type(self.schedule_physical) is not PhysicalPlan
-            or type(self.state_request) is not StateRepresentationRequest
-            or type(self.state_decision) is not StateRepresentationDecision
-            or type(self.state_physical) is not StatePhysicalPlan
-        ):
-            raise TypeError("canonical plan bundle requires exact signed plan facts")
+    tensor_layout_request: TensorLayoutRequest
+    tensor_layout_decision: TensorLayoutDecision
 
 
 __all__ = ["CanonicalPlanBundle", "CanonicalScheduleBundle"]

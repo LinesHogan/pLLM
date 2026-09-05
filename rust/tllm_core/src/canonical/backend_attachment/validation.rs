@@ -3,16 +3,15 @@
 use super::super::scheduler::{validate_physical as validate_schedule_physical, PhysicalPlan};
 use super::super::semantic_graph::{
     HiddenPhase as SemanticHiddenPhase, HiddenSite as SemanticHiddenSite, InputSource, OutputKind,
-    RequestKeyField as SemanticRequestKeyField, SemanticGraph, SemanticTask, StateEffectKind,
-    StateScope, Timeline,
+    SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
 };
 use super::super::state_representation::{
     validate_physical_plan as validate_state_physical, StateDeviceKind, StatePhysicalPlan,
 };
 use super::types::{
-    AttachmentCompilerInputs, AttachmentKind, AttachmentOverlayStage, AttachmentTaskBinding,
-    AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe, HiddenBinding,
-    HiddenLayerKind, HiddenPhase, HiddenSite, RequestKeyField, StreamDependency, SCHEMA_VERSION,
+    AttachmentCompilerInputs, AttachmentHiddenResource, AttachmentKind, AttachmentOverlayStage,
+    AttachmentTaskBinding, AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe,
+    HiddenLayerKind, HiddenPhase, HiddenSite, StreamDependency, SCHEMA_VERSION,
 };
 
 pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -43,64 +42,18 @@ fn require_sorted_unique_text(values: &[String], label: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
-    if request.schema_version != SCHEMA_VERSION {
+fn validate_request(
+    request: &BackendAttachmentRequest,
+    probe: &BackendPlacementProbe,
+) -> Result<(), String> {
+    if request.schema_version != SCHEMA_VERSION || request.packed_row_schema_version != 1 {
         return Err("unsupported backend attachment schema".to_owned());
     }
-    require_text(&request.adapter_id, "adapter_id")?;
     require_text(&request.state_resource, "state_resource")?;
-    for (value, label) in [
-        (&request.backend_abi_digest, "backend_abi_digest"),
-        (&request.runner_fingerprint, "runner_fingerprint"),
-        (&request.model_fingerprint, "model_fingerprint"),
-        (&request.schedule_signature, "schedule_signature"),
-        (&request.state_request_digest, "state_request_digest"),
-        (
-            &request.state_representation_signature,
-            "state_representation_signature",
-        ),
-        (
-            &request.execution_parameters_digest,
-            "execution_parameters_digest",
-        ),
-    ] {
-        require_digest(value, label)?;
-    }
-    if request.device_kind == StateDeviceKind::Cpu && request.device_ordinal != 0 {
-        return Err("CPU attachment device ordinal must be zero".to_owned());
-    }
-    if request.tensor_parallel_size != 1
-        || request.pipeline_parallel_size != 1
-        || request.hidden_size == 0
-        || request.max_packed_rows == 0
-        || request.packed_row_schema_version != 1
-        || request.plan_epoch == 0
-    {
-        return Err("attachment topology or capacity facts are unsupported".to_owned());
-    }
     if request.attachment_kind == AttachmentKind::RequestSamplerTraining
-        && request.hidden_resources.is_empty()
+        && probe.hidden_resources.is_empty()
     {
         return Err("attachment requires hidden resources".to_owned());
-    }
-    for resource in &request.hidden_resources {
-        require_text(&resource.layer, "hidden_resources.layer")?;
-        require_text(&resource.module_path, "hidden_resources.module_path")?;
-        if resource.layer_kind == HiddenLayerKind::Index {
-            let index = resource
-                .layer
-                .parse::<i64>()
-                .map_err(|_| "indexed hidden layer must be a signed integer".to_owned())?;
-            if index.to_string() != resource.layer {
-                return Err("indexed hidden layer must be canonical".to_owned());
-            }
-        }
-    }
-    if request.hidden_resources.windows(2).any(|pair| {
-        (pair[0].layer.as_str(), &pair[0].layer_kind, &pair[0].site)
-            >= (pair[1].layer.as_str(), &pair[1].layer_kind, &pair[1].site)
-    }) {
-        return Err("hidden resources must be sorted unique".to_owned());
     }
     require_text(&request.sampler_anchor_symbol, "sampler_anchor_symbol")?;
     match request.attachment_kind {
@@ -119,7 +72,9 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
                 || request.task_bindings[1].role != AttachmentTaskRole::Publish
                 || request.task_bindings[0].task_id == request.task_bindings[1].task_id
             {
-                return Err("dense overlay attachment tasks must be transition then publish".to_owned());
+                return Err(
+                    "dense overlay attachment tasks must be transition then publish".to_owned(),
+                );
             }
         }
     }
@@ -158,7 +113,10 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
         }
         AttachmentKind::DenseParameterOverlay => {
             if request.overlay_field_ids.is_empty()
-                || request.overlay_field_ids.windows(2).any(|pair| pair[0] >= pair[1])
+                || request
+                    .overlay_field_ids
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
             {
                 return Err("dense overlay attachment requires sorted unique fields".to_owned());
             }
@@ -185,19 +143,11 @@ fn validate_request(request: &BackendAttachmentRequest) -> Result<(), String> {
             }
         }
     }
-    if request.request_key_fields.is_empty()
-        || request
-            .request_key_fields
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-    {
-        return Err("request key fields must be sorted unique".to_owned());
-    }
-    require_sorted_unique_text(&request.capabilities, "capabilities")
+    Ok(())
 }
 
 fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
-    if probe.schema_version != SCHEMA_VERSION {
+    if probe.schema_version != 1 {
         return Err("unsupported backend placement probe schema".to_owned());
     }
     require_text(&probe.adapter_id, "probe.adapter_id")?;
@@ -215,50 +165,36 @@ fn validate_probe(probe: &BackendPlacementProbe) -> Result<(), String> {
         return Err("backend placement probe topology is unsupported".to_owned());
     }
     for resource in &probe.hidden_resources {
-        require_text(&resource.layer, "probe.hidden_resources.layer")?;
-        require_text(&resource.module_path, "probe.hidden_resources.module_path")?;
-        if resource.layer_kind == HiddenLayerKind::Index {
+        require_text(&resource.binding.layer, "probe.hidden_resources.layer")?;
+        require_text(
+            &resource.binding.module_path,
+            "probe.hidden_resources.module_path",
+        )?;
+        if resource.binding.layer_kind == HiddenLayerKind::Index {
             let index = resource
+                .binding
                 .layer
                 .parse::<i64>()
                 .map_err(|_| "probe indexed hidden layer is invalid".to_owned())?;
-            if index.to_string() != resource.layer {
+            if index.to_string() != resource.binding.layer {
                 return Err("probe indexed hidden layer is not canonical".to_owned());
             }
         }
     }
     if probe.hidden_resources.windows(2).any(|pair| {
-        (pair[0].layer.as_str(), &pair[0].layer_kind, &pair[0].site)
-            >= (pair[1].layer.as_str(), &pair[1].layer_kind, &pair[1].site)
+        (
+            pair[0].binding.layer.as_str(),
+            &pair[0].binding.layer_kind,
+            &pair[0].binding.site,
+        ) >= (
+            pair[1].binding.layer.as_str(),
+            &pair[1].binding.layer_kind,
+            &pair[1].binding.site,
+        )
     }) {
         return Err("probe hidden resources must be sorted unique".to_owned());
     }
     require_sorted_unique_text(&probe.capabilities, "probe.capabilities")
-}
-
-fn request_key_fields_match(
-    semantic_fields: &[SemanticRequestKeyField],
-    attachment_fields: &[RequestKeyField],
-) -> bool {
-    semantic_fields.len() == attachment_fields.len()
-        && semantic_fields
-            .iter()
-            .zip(attachment_fields)
-            .all(|(semantic, attachment)| {
-                matches!(
-                    (semantic, attachment),
-                    (
-                        SemanticRequestKeyField::RequestId,
-                        RequestKeyField::RequestId
-                    ) | (
-                        SemanticRequestKeyField::PromptIdx,
-                        RequestKeyField::PromptIdx
-                    ) | (
-                        SemanticRequestKeyField::SampleIdx,
-                        RequestKeyField::SampleIdx
-                    )
-                )
-            })
 }
 
 fn semantic_hidden_key(input: &InputSource) -> Option<(i64, u8, u8)> {
@@ -276,15 +212,16 @@ fn semantic_hidden_key(input: &InputSource) -> Option<(i64, u8, u8)> {
     Some((*layer, site, phase))
 }
 
-fn attachment_hidden_key(resource: &HiddenBinding) -> Result<(i64, u8, u8), String> {
-    if resource.layer_kind != HiddenLayerKind::Index {
+fn attachment_hidden_key(resource: &AttachmentHiddenResource) -> Result<(i64, u8, u8), String> {
+    if resource.binding.layer_kind != HiddenLayerKind::Index {
         return Err("attachment hidden resources must use indexed graph locators".to_owned());
     }
     let layer = resource
+        .binding
         .layer
         .parse::<i64>()
         .map_err(|_| "attachment hidden resource layer is invalid".to_owned())?;
-    let site = match resource.site {
+    let site = match resource.binding.site {
         HiddenSite::BlockOutput => 1,
     };
     let phase = match resource.phase {
@@ -320,6 +257,7 @@ fn has_decode_selection(task: &SemanticTask, state_resource: &str) -> bool {
 
 fn validate_request_sampler_training_graph(
     request: &BackendAttachmentRequest,
+    probe: &BackendPlacementProbe,
     graph: &SemanticGraph,
 ) -> Result<(), String> {
     let state = graph
@@ -327,9 +265,7 @@ fn validate_request_sampler_training_graph(
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
         .map(|index| &graph.states[index])
         .map_err(|_| "attachment state resource is absent from the semantic graph".to_owned())?;
-    if state.scope != StateScope::Request
-        || !request_key_fields_match(&state.key_fields, &request.request_key_fields)
-    {
+    if state.scope != StateScope::Request {
         return Err("attachment request state differs from semantic graph state".to_owned());
     }
 
@@ -360,7 +296,7 @@ fn validate_request_sampler_training_graph(
         .iter()
         .filter_map(|input| semantic_hidden_key(&input.source))
         .collect::<Vec<_>>();
-    let mut signed_hidden = request
+    let mut signed_hidden = probe
         .hidden_resources
         .iter()
         .map(attachment_hidden_key)
@@ -394,9 +330,7 @@ fn validate_dense_parameter_overlay_graph(
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
         .map(|index| &graph.states[index])
         .map_err(|_| "dense overlay state resource is absent from the semantic graph".to_owned())?;
-    if state.scope != StateScope::Request
-        || !request_key_fields_match(&state.key_fields, &request.request_key_fields)
-    {
+    if state.scope != StateScope::Request {
         return Err("dense overlay state differs from semantic graph state".to_owned());
     }
     let transition = task_for_dense_id(graph, &request.task_bindings[0])?;
@@ -429,58 +363,14 @@ fn validate_cross_binding(
     schedule: &PhysicalPlan,
     state: &StatePhysicalPlan,
 ) -> Result<(), String> {
-    validate_request(request)?;
+    validate_request(request, probe)?;
     validate_probe(probe)?;
-    require_digest(&schedule.schedule_signature, "schedule.schedule_signature")?;
-    require_digest(&state.request_digest, "state.request_digest")?;
-    require_digest(
-        &state.representation_signature,
-        "state.representation_signature",
-    )?;
-    if state.representations.is_empty()
-        || state
-            .representations
-            .windows(2)
-            .any(|pair| pair[0].resource >= pair[1].resource)
-    {
-        return Err("state providers must be sorted unique resources".to_owned());
-    }
-    for provider in &state.representations {
-        require_text(&provider.resource, "state.providers.resource")?;
-        if provider.device_kind == StateDeviceKind::Cpu && provider.device_ordinal != 0 {
-            return Err("CPU state provider device ordinal must be zero".to_owned());
-        }
-    }
-    if request.plan_epoch != schedule.plan_epoch
-        || request.plan_epoch != state.plan_epoch
-        || request.execution_parameters_digest != graph.execution_parameters_digest
-        || request.schedule_signature != schedule.schedule_signature
-        || request.state_request_digest != state.request_digest
-        || request.state_representation_signature != state.representation_signature
-    {
-        return Err("attachment does not match canonical schedule/state plans".to_owned());
-    }
-    if request.adapter_id != probe.adapter_id
-        || request.backend_abi_digest != probe.backend_abi_digest
-        || request.runner_fingerprint != probe.runner_fingerprint
-        || request.model_fingerprint != probe.model_fingerprint
-        || request.topology != probe.topology
-        || request.graph_mode != probe.graph_mode
-        || request.device_kind != probe.device_kind
-        || request.device_ordinal != probe.device_ordinal
-        || request.tensor_parallel_size != probe.tensor_parallel_size
-        || request.pipeline_parallel_size != probe.pipeline_parallel_size
-        || request.tensor_dtype != probe.tensor_dtype
-        || request.hidden_size != probe.hidden_size
-        || request.max_packed_rows != probe.max_packed_rows
-        || request.hidden_resources != probe.hidden_resources
-        || request.capabilities != probe.capabilities
-    {
-        return Err("attachment differs from backend placement probe".to_owned());
+    if schedule.plan_epoch != state.plan_epoch {
+        return Err("schedule and state epochs differ".to_owned());
     }
     match request.attachment_kind {
         AttachmentKind::RequestSamplerTraining => {
-            validate_request_sampler_training_graph(request, graph)?;
+            validate_request_sampler_training_graph(request, probe, graph)?;
         }
         AttachmentKind::DenseParameterOverlay => {
             validate_dense_parameter_overlay_graph(request, graph)?;
@@ -491,8 +381,7 @@ fn validate_cross_binding(
         .binary_search_by(|provider| provider.resource.cmp(&request.state_resource))
         .map(|index| &state.representations[index])
         .map_err(|_| "attachment state resource is not physically selected".to_owned())?;
-    if provider.device_kind != request.device_kind
-        || provider.device_ordinal != request.device_ordinal
+    if provider.device_kind != probe.device_kind || provider.device_ordinal != probe.device_ordinal
     {
         return Err("attachment placement differs from selected state provider".to_owned());
     }
@@ -539,7 +428,15 @@ fn validate_cross_binding(
         AttachmentKind::DenseParameterOverlay => {
             let transition = &request.task_bindings[0];
             let publish = &request.task_bindings[1];
-            if transition.anchor_id > publish.anchor_id {
+            if request
+                .overlay_stage_anchors
+                .windows(2)
+                .any(|pair| pair[0].anchor_id > pair[1].anchor_id)
+                || request.overlay_stage_anchors[3].anchor_id != transition.anchor_id
+                || request.overlay_stage_anchors[4].anchor_id != publish.anchor_id
+                || request.overlay_stage_anchors[5].anchor_id != request.sampler_anchor_id
+                || transition.anchor_id > publish.anchor_id
+            {
                 return Err("dense overlay task anchors violate publication timing".to_owned());
             }
         }
@@ -548,23 +445,57 @@ fn validate_cross_binding(
 }
 
 pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), String> {
+    let plan = &inputs.plan;
+    super::super::tensor_layout::validate_decision(
+        &plan.tensor_layout_request,
+        &plan.tensor_layout_decision,
+    )?;
     validate_schedule_physical(
-        &inputs.graph,
-        &inputs.timeline,
-        &inputs.schedule_decision,
-        &inputs.schedule_physical,
+        &plan.semantic_graph,
+        &plan.timeline,
+        &plan.schedule_decision,
+        &plan.schedule_physical,
     )?;
     validate_state_physical(
-        &inputs.state_request,
-        &inputs.state_decision,
-        &inputs.state_physical,
+        &plan.state_request,
+        &plan.state_decision,
+        &plan.state_physical,
     )?;
+    for state in &plan.state_physical.representations {
+        let binding = plan
+            .tensor_layout_decision
+            .bindings
+            .iter()
+            .find(|binding| binding.resource == state.resource)
+            .ok_or_else(|| "state representation lacks a signed tensor layout".to_owned())?;
+        if state.layout_id != u64::from(binding.layout_id)
+            || state.layout_namespace != binding.layout_namespace
+            || state.layout_digest != binding.layout_digest
+        {
+            return Err("state representation differs from signed tensor layout".to_owned());
+        }
+    }
+    let layout = plan
+        .tensor_layout_request
+        .layouts
+        .iter()
+        .find(|layout| layout.resource == inputs.request.state_resource)
+        .ok_or_else(|| "attachment state has no tensor layout".to_owned())?;
+    if inputs.request.overlay_field_ids.iter().any(|field| {
+        !layout
+            .layout
+            .fields
+            .iter()
+            .any(|known| known.field_id == u64::from(*field))
+    }) {
+        return Err("overlay field is absent from the signed tensor layout".to_owned());
+    }
     validate_cross_binding(
         &inputs.request,
         &inputs.probe,
-        &inputs.graph,
-        &inputs.timeline,
-        &inputs.schedule_physical,
-        &inputs.state_physical,
+        &plan.semantic_graph,
+        &plan.timeline,
+        &plan.schedule_physical,
+        &plan.state_physical,
     )
 }

@@ -26,7 +26,7 @@ from tllm.canonical.ptts.dense_page_cuda_types import (
 )
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.canonical.ptts.publication import RequestStatePublicationReceipt
-from tllm.canonical.request_sampler_attachment import (
+from tllm.contracts.backend_attachment import (
     RequestSamplerAttachmentSpec,
 )
 from tllm.canonical.scheduler import (
@@ -608,22 +608,13 @@ class ESampRequestCompilation:
 
     execution: CanonicalRequestSamplerExecution
     plan_bundle: CanonicalPlanBundle
-    execution_parameters_digest: str
 
     def __post_init__(self) -> None:
         if (
             self.execution.plan is not self.plan_bundle.schedule_physical
             or self.execution.state_plan is not self.plan_bundle.state_physical
-            or type(self.execution_parameters_digest) is not str
-            or len(self.execution_parameters_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.execution_parameters_digest
-            )
             or self.execution.execution_parameters_digest
-            != self.execution_parameters_digest
-            or self.plan_bundle.semantic_graph.execution_parameters_digest
-            != self.execution_parameters_digest
+            != self.plan_bundle.semantic_graph.execution_parameters_digest
         ):
             raise TypeError("ESamp compilation requires exact execution and plan bundle")
 
@@ -827,7 +818,6 @@ class ESampRequestWorkload(CanonicalWorkload):
 
     def request_sampler_attachment_spec(
         self,
-        execution_parameters_digest: str,
     ) -> RequestSamplerAttachmentSpec:
         """Expose semantic roles; Rust still owns task and provider selection."""
 
@@ -836,8 +826,6 @@ class ESampRequestWorkload(CanonicalWorkload):
             transition_task=_TRAIN_TASK,
             sampler_anchor=AnchorSymbol("sampler.pre_draw"),
             state_resource=_STATE_RESOURCE,
-            request_key_fields=self.config.key_fields,
-            execution_parameters_digest=execution_parameters_digest,
         )
 
     def compile(
@@ -1000,6 +988,8 @@ class ESampRequestWorkload(CanonicalWorkload):
             state_request=representation_request,
             state_decision=representation,
             state_physical=state_physical,
+            tensor_layout_request=layout_request,
+            tensor_layout_decision=layout_decision,
         )
         match selected_provider.device_kind:
             case StateDeviceKind.CPU:
@@ -1036,7 +1026,6 @@ class ESampRequestWorkload(CanonicalWorkload):
         return ESampRequestCompilation(
             execution,
             plan_bundle,
-            execution_parameters_digest,
         )
 
 

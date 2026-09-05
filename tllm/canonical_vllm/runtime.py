@@ -11,20 +11,14 @@ from typing import Literal
 import torch
 
 from tllm.canonical.backend_attachment import (
-    compile_backend_attachment,
-    lower_backend_attachment,
+    compile_parameter_overlay_attachment,
+    compile_request_sampler_attachment,
     validate_backend_attachment_physical,
 )
 from tllm.canonical.ptts import DensePageCudaProviderFacts
-from tllm.canonical.request_sampler_attachment import (
-    SignedBackendAttachment,
-    bind_attachment_tasks,
-    compile_request_sampler_attachment,
-)
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical_vllm.dense_overlay import (
     VllmDenseAddAdapter,
-    VllmDenseAddTargetSpec,
     inspect_dense_add_targets,
 )
 from tllm.canonical_vllm.hidden_capture import Vllm027EagerPackedHiddenCapture
@@ -52,7 +46,6 @@ from tllm.canonical.workloads.esamp_request_types import (
 )
 from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTCompileOptions,
-    InPlaceTTTConfig,
     InPlaceTTTStepHandle,
     InPlaceTTTOperandPair,
     InPlaceTTTPhase,
@@ -68,20 +61,16 @@ from tllm.canonical.workloads.inplace_ttt.workload import (
     InPlaceTTTWorkload,
 )
 from tllm.contracts.backend_attachment import (
-    AttachmentCleanupStage,
     AttachmentGraphMode,
     AttachmentHiddenResource,
     AttachmentKind,
     AttachmentOverlayStage,
     AttachmentOverlayStageAnchor,
-    AttachmentSamplerStage,
     AttachmentTaskBinding,
     AttachmentTaskRole,
     AttachmentTopology,
-    BackendAttachmentCompilerInputs,
-    BackendAttachmentRequest,
     BackendPlacementProbe,
-    StreamDependency,
+    SignedBackendAttachment,
 )
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
@@ -91,10 +80,9 @@ from tllm.contracts.parameter_overlay import (
 )
 from tllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from tllm.contracts.semantic_graph import (
-    AnchorId,
     AnchorSymbol,
     SchedulerTimeline,
-    TaskSymbol,
+    StateResource,
     TimelineAnchor,
 )
 from tllm.contracts.state_representation import StateDeviceKind
@@ -130,6 +118,7 @@ _BACKEND_ABI_FIELDS = (
     "sampler=vllm.v1.worker.gpu.sample.sampler.Sampler",
     "mode=in_process/eager/tp1/pp1/dp1/non_spec",
     "rows=one_logit_per_request",
+    "attachment=shared_plan_v2",
     "attachments=request_sampler_training|dense_parameter_overlay",
 )
 _REQUEST_CAPABILITIES = (
@@ -211,42 +200,17 @@ def _model_dtype(dtype: CanonicalVllmDType) -> Literal["bfloat16", "float16", "f
 
 @dataclass(frozen=True, slots=True)
 class CanonicalVllmDeployment:
-    workload: ESampRequestWorkload | InPlaceTTTWorkload
     compilation: ESampRequestCompilation | InPlaceTTTCompilation
-    execution: CanonicalRequestSamplerExecution | CanonicalDenseOverlayExecution
     attachment: SignedBackendAttachment
-    hidden_bindings: tuple[PackedHiddenResourceBinding, ...]
-    overlay_targets: tuple[VllmDenseAddTargetSpec, ...]
-    hidden_size: int
-    max_packed_rows: int
-    model_dtype: torch.dtype
-    sampler_beta: float
 
     def __post_init__(self) -> None:
-        plan_bundle = self.compilation.plan_bundle
-        attachment_inputs = self.attachment.inputs
-        attachment_request = attachment_inputs.request
-        attachment_physical = self.attachment.physical
+        plan = self.compilation.plan_bundle
+        execution = self.compilation.execution
         if (
-            self.compilation.execution is not self.execution
-            or plan_bundle.schedule_physical is not self.execution.plan
-            or plan_bundle.state_physical is not self.execution.state_plan
-            or attachment_inputs.graph is not plan_bundle.semantic_graph
-            or attachment_inputs.timeline is not plan_bundle.timeline
-            or attachment_inputs.schedule_decision is not plan_bundle.schedule_decision
-            or attachment_inputs.schedule_physical is not plan_bundle.schedule_physical
-            or attachment_inputs.state_request is not plan_bundle.state_request
-            or attachment_inputs.state_decision is not plan_bundle.state_decision
-            or attachment_inputs.state_physical is not plan_bundle.state_physical
-            or attachment_request.plan_epoch != self.execution.plan.plan_epoch
-            or attachment_physical.plan_epoch != self.execution.plan.plan_epoch
-            or attachment_physical.schedule_signature
-            != self.execution.plan.schedule_signature
-            or attachment_physical.state_representation_signature
-            != self.execution.state_plan.representation_signature
-            or attachment_physical.device_kind is not StateDeviceKind.CUDA
-            or self.max_packed_rows < 1
-            or self.hidden_size < 1
+            self.attachment.inputs.plan is not plan
+            or plan.schedule_physical is not execution.plan
+            or plan.state_physical is not execution.state_plan
+            or self.attachment.physical.device_kind is not StateDeviceKind.CUDA
         ):
             raise ValueError("canonical vLLM deployment is not closed")
 
@@ -257,20 +221,12 @@ class CanonicalVllmDeployment:
 
 @dataclass(frozen=True, slots=True)
 class _RequestSamplerVllmDeployment(CanonicalVllmDeployment):
-    workload: ESampRequestWorkload
     compilation: ESampRequestCompilation
-    execution: CanonicalRequestSamplerExecution
-    hidden_bindings: tuple[PackedHiddenResourceBinding, PackedHiddenResourceBinding]
-    overlay_targets: tuple[()]
 
 
 @dataclass(frozen=True, slots=True)
 class _DenseOverlayVllmDeployment(CanonicalVllmDeployment):
-    workload: InPlaceTTTWorkload
     compilation: InPlaceTTTCompilation
-    execution: CanonicalDenseOverlayExecution
-    hidden_bindings: tuple[()]
-    overlay_targets: tuple[VllmDenseAddTargetSpec, ...]
 
 
 _ClosedVllmDeployment = _RequestSamplerVllmDeployment | _DenseOverlayVllmDeployment
@@ -357,14 +313,14 @@ class CanonicalVllmSession:
         self._dense_adapter: VllmDenseAddAdapter | None = None
         match deployment:
             case _RequestSamplerVllmDeployment():
-                source, target = deployment.hidden_bindings
+                bindings = deployment.compilation.execution.specialization.hidden_bindings
                 self._capture = Vllm027EagerPackedHiddenCapture(
                     model=model,
-                    source=source,
-                    target=target,
+                    source=bindings.source,
+                    target=bindings.target,
                     plan_epoch=deployment.attachment.physical.plan_epoch,
-                    max_packed_rows=deployment.max_packed_rows,
-                    hidden_size=deployment.hidden_size,
+                    max_packed_rows=deployment.attachment.inputs.probe.max_packed_rows,
+                    hidden_size=deployment.attachment.inputs.probe.hidden_size,
                 )
                 self._sampler = CanonicalVllm027PostFilterSampler(
                     upstream_sampler,
@@ -373,7 +329,7 @@ class CanonicalVllmSession:
             case _DenseOverlayVllmDeployment():
                 self._dense_adapter = VllmDenseAddAdapter(
                     model,
-                    tuple(target.target for target in deployment.overlay_targets),
+                    deployment.compilation.execution.config.targets,
                 )
         self._identities: dict[str, RequestIdentity] = {}
         self._next_prompt_index = 0
@@ -404,7 +360,7 @@ class CanonicalVllmSession:
                 raise RuntimeError("prior canonical vLLM step is still active")
         deployment = self._deployment
         if isinstance(deployment, _RequestSamplerVllmDeployment):
-            deployment.execution.collect_completed()
+            deployment.compilation.execution.collect_completed()
         finished = tuple(
             self._identities[request_id]
             for request_id in sorted(scheduler_output.finished_req_ids)
@@ -426,9 +382,9 @@ class CanonicalVllmSession:
             sample_idx = 0
             pending.append(RequestIdentity(request.req_id, prompt_idx, sample_idx))
         if pending:
-            device = deployment.execution.device
+            device = deployment.compilation.execution.device
             stream = torch.cuda.current_stream(device)
-            deployment.execution.admit(tuple(pending), stream)
+            deployment.compilation.execution.admit(tuple(pending), stream)
             for identity in pending:
                 self._identities[identity.request_id] = identity
             self._next_prompt_index += len(pending)
@@ -458,11 +414,10 @@ class CanonicalVllmSession:
                 self._state = _Capturing(rows)
             case _DenseOverlayVllmDeployment() as deployment:
                 adapter = self._require_dense_adapter()
-                request = deployment.attachment.inputs.request
                 bindings = deployment.compilation.state_layout.overlay_bindings
                 identities = tuple(binding.identity for binding in request_ids.bindings)
-                stream = torch.cuda.current_stream(deployment.execution.device)
-                handle = deployment.execution.begin_batch(
+                stream = torch.cuda.current_stream(deployment.compilation.execution.device)
+                handle = deployment.compilation.execution.begin_batch(
                     identities,
                     stream,
                     bindings,
@@ -470,7 +425,7 @@ class CanonicalVllmSession:
                 )
                 ref_by_identity = dict(zip(handle.identities, handle.refs, strict=True))
                 assignments: list[ParameterOverlayRowAssignment] = []
-                for target in deployment.overlay_targets:
+                for target in deployment.compilation.execution.config.targets:
                     for identity in handle.identities:
                         selected_rows = tuple(
                             row
@@ -486,7 +441,7 @@ class CanonicalVllmSession:
                         assignments.append(
                             ParameterOverlayRowAssignment(
                                 identity,
-                                target.target,
+                                target,
                                 ref_by_identity[identity],
                                 phase,
                                 tuple(row.packed_row_index for row in selected_rows),
@@ -508,7 +463,7 @@ class CanonicalVllmSession:
                 try:
                     adapter.prepare(
                         ParameterOverlayStepPlan(
-                            request.plan_epoch,
+                            deployment.attachment.physical.plan_epoch,
                             self._stage(AttachmentOverlayStage.APPLY).anchor_id,
                             self._stage(AttachmentOverlayStage.CAPTURE).anchor_id,
                             rows.phase_rows.total_rows,
@@ -517,7 +472,7 @@ class CanonicalVllmSession:
                         handle.deltas,
                 )
                 except Exception:
-                    deployment.execution.abort_step(handle)
+                    deployment.compilation.execution.abort_step(handle)
                     raise
                 self._state = _OverlayPrepared(handle)
 
@@ -540,14 +495,14 @@ class CanonicalVllmSession:
         stream = torch.cuda.current_stream(execution.device)
         guidance = execution.sampler_guidance(handle, stream)
         pred_dense_logits = model.compute_logits(
-            guidance.pred_hidden.to(dtype=self._deployment.model_dtype)
+            guidance.pred_hidden.to(dtype=model.lm_head.weight.dtype)
         )
         if type(pred_dense_logits) is not torch.Tensor:
             raise RuntimeError("Qwen2 LM head did not produce dense logits")
         self.sampler.begin_guidance(
             SignedPostFilterGuidance(
                 guidance,
-                self._deployment.sampler_beta,
+                execution.config.intervention_beta,
                 pred_dense_logits,
             )
         )
@@ -613,7 +568,7 @@ class CanonicalVllmSession:
             self._retire(identities)
         self._identities.clear()
         if isinstance(self._deployment, _RequestSamplerVllmDeployment):
-            self._deployment.execution.collect_completed()
+            self._deployment.compilation.execution.collect_completed()
 
     def close(self) -> None:
         self.abort_active()
@@ -663,9 +618,9 @@ class CanonicalVllmSession:
         captures = adapter.take_captures()
         actual = frozenset((capture.identity, capture.target) for capture in captures)
         expected = frozenset(
-            (identity, target.target)
+            (identity, target)
             for identity in handle.identities
-            for target in self._deployment.overlay_targets
+            for target in self._overlay_execution().config.targets
         )
         if actual != expected:
             raise RuntimeError("vLLM did not capture every signed overlay target")
@@ -698,7 +653,7 @@ class CanonicalVllmSession:
                 for identity in handle.identities
             )
         )
-        stream = torch.cuda.current_stream(self._deployment.execution.device)
+        stream = torch.cuda.current_stream(self._deployment.compilation.execution.device)
         try:
             self._overlay_execution().submit_captured(
                 handle,
@@ -752,18 +707,18 @@ class CanonicalVllmSession:
     def _retire(self, identities: tuple[RequestIdentity, ...]) -> None:
         match self._deployment:
             case _RequestSamplerVllmDeployment() as deployment:
-                deployment.execution.retire(identities)
+                deployment.compilation.execution.retire(identities)
             case _DenseOverlayVllmDeployment() as deployment:
-                deployment.execution.retire(
+                deployment.compilation.execution.retire(
                     identities,
                     self._stage(AttachmentOverlayStage.FINISH).anchor_id,
                 )
 
     def _request_execution(self) -> CanonicalRequestSamplerExecution:
-        return self._request_deployment().execution
+        return self._request_deployment().compilation.execution
 
     def _overlay_execution(self) -> CanonicalDenseOverlayExecution:
-        return self._overlay_deployment().execution
+        return self._overlay_deployment().compilation.execution
 
     def _request_deployment(self) -> _RequestSamplerVllmDeployment:
         deployment = self._deployment
@@ -1274,22 +1229,9 @@ def _compile_sampler_training(
     attachment = compile_request_sampler_attachment(
         compilation.plan_bundle,
         probe,
-        workload.request_sampler_attachment_spec(
-            compilation.execution_parameters_digest
-        ),
+        workload.request_sampler_attachment_spec(),
     )
-    return _RequestSamplerVllmDeployment(
-        workload,
-        compilation,
-        compilation.execution,
-        attachment,
-        (hidden_resources[0].binding, hidden_resources[1].binding),
-        (),
-        hidden_size,
-        runner.max_num_tokens,
-        runner.dtype,
-        workload.config.intervention_beta,
-    )
+    return _RequestSamplerVllmDeployment(compilation, attachment)
 
 
 def _hidden_binding(layer: int, layer_count: int) -> PackedHiddenResourceBinding:
@@ -1371,115 +1313,11 @@ def _compile_dense_overlay_deployment(
         hidden_resources=(),
         capabilities=_OVERLAY_CAPABILITIES,
     )
-    attachment = _compile_overlay_attachment(
-        workload.config,
-        compilation,
-        probe,
+    attachment = compile_parameter_overlay_attachment(
+        compilation.plan_bundle, probe, compilation.state_layout.overlay_bindings,
+        StateResource("dense_fast_weights"),
     )
-    return _DenseOverlayVllmDeployment(
-        workload,
-        compilation,
-        compilation.execution,
-        attachment,
-        (),
-        targets,
-        probe.hidden_size,
-        runner.max_num_tokens,
-        runner.dtype,
-        0.0,
-    )
-
-
-def _compile_overlay_attachment(
-    config: InPlaceTTTConfig,
-    compilation: InPlaceTTTCompilation,
-    probe: BackendPlacementProbe,
-) -> SignedBackendAttachment:
-    plan = compilation.plan_bundle
-    anchor_by_symbol = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
-    stage_specs = (
-        (AttachmentOverlayStage.PIN, AnchorSymbol("request.prepare")),
-        (AttachmentOverlayStage.APPLY, AnchorSymbol("model.execute")),
-        (AttachmentOverlayStage.CAPTURE, AnchorSymbol("model.execute")),
-        (AttachmentOverlayStage.TRANSITION, AnchorSymbol("model.execute")),
-        (AttachmentOverlayStage.PUBLISH, AnchorSymbol("state.publish")),
-        (AttachmentOverlayStage.RELEASE, AnchorSymbol("sampler.complete")),
-        (AttachmentOverlayStage.FINISH, AnchorSymbol("request.finish")),
-    )
-    stages = tuple(
-        AttachmentOverlayStageAnchor(
-            stage,
-            AnchorId(anchor_by_symbol[symbol].ordinal),
-            symbol,
-        )
-        for stage, symbol in stage_specs
-    )
-    task_bindings = bind_attachment_tasks(
-        plan,
-        (
-            (AttachmentTaskRole.TRANSITION, TaskSymbol("transition")),
-            (AttachmentTaskRole.PUBLISH, TaskSymbol("publish")),
-        ),
-    )
-    overlay_bindings = compilation.state_layout.overlay_bindings
-    request = BackendAttachmentRequest(
-        adapter_id=probe.adapter_id,
-        attachment_kind=AttachmentKind.DENSE_PARAMETER_OVERLAY,
-        backend_abi_digest=probe.backend_abi_digest,
-        runner_fingerprint=probe.runner_fingerprint,
-        model_fingerprint=probe.model_fingerprint,
-        topology=probe.topology,
-        graph_mode=probe.graph_mode,
-        device_kind=probe.device_kind,
-        device_ordinal=probe.device_ordinal,
-        tensor_parallel_size=probe.tensor_parallel_size,
-        pipeline_parallel_size=probe.pipeline_parallel_size,
-        tensor_dtype=probe.tensor_dtype,
-        hidden_size=probe.hidden_size,
-        max_packed_rows=probe.max_packed_rows,
-        packed_row_schema_version=1,
-        hidden_resources=(),
-        task_bindings=task_bindings,
-        sampler_anchor_id=AnchorId(anchor_by_symbol[AnchorSymbol("sampler.complete")].ordinal),
-        sampler_anchor_symbol="sampler.complete",
-        stream_dependencies=(StreamDependency.TRANSITION_TO_RELEASE,),
-        sampler_stage=AttachmentSamplerStage.PACKED_POST_FILTER_EXACT,
-        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH,
-        request_key_fields=(
-            RequestKeyField.REQUEST_ID,
-            RequestKeyField.PROMPT_IDX,
-            RequestKeyField.SAMPLE_IDX,
-        ),
-        state_resource="dense_fast_weights",
-        plan_epoch=plan.schedule_physical.plan_epoch,
-        schedule_signature=plan.schedule_physical.schedule_signature,
-        state_request_digest=plan.state_physical.request_digest,
-        state_representation_signature=plan.state_physical.representation_signature,
-        execution_parameters_digest=compilation.execution_parameters_digest,
-        capabilities=probe.capabilities,
-        overlay_field_ids=tuple(
-            field
-            for binding in overlay_bindings
-            for field in binding.fields
-        ),
-        overlay_stage_anchors=stages,
-    )
-    if tuple(binding.target for binding in overlay_bindings) != config.targets:
-        raise RuntimeError("dense overlay state bindings differ from config")
-    inputs = BackendAttachmentCompilerInputs(
-        request,
-        probe,
-        plan.semantic_graph,
-        plan.timeline,
-        plan.schedule_decision,
-        plan.schedule_physical,
-        plan.state_request,
-        plan.state_decision,
-        plan.state_physical,
-    )
-    decision = compile_backend_attachment(inputs)
-    physical = lower_backend_attachment(inputs, decision)
-    return SignedBackendAttachment(inputs, decision, physical)
+    return _DenseOverlayVllmDeployment(compilation, attachment)
 
 
 __all__ = [

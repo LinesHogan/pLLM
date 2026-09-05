@@ -28,9 +28,7 @@ from tllm.canonical_vllm.runtime import (
 def _require_esamp_execution(
     handle: CanonicalVllmLlm,
 ) -> CanonicalRequestSamplerExecution:
-    execution = handle.deployment.execution
-    if type(handle.deployment.workload) is not ESampRequestWorkload:
-        raise RuntimeError("canonical vLLM smoke did not receive an ESamp deployment")
+    execution = handle.deployment.compilation.execution
     if type(execution) is not CanonicalRequestSamplerExecution:
         raise RuntimeError("canonical vLLM smoke did not receive ESamp CUDA execution")
     return execution
