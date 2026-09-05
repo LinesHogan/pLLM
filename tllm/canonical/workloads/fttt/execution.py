@@ -46,7 +46,6 @@ from tllm.canonical.workloads.fttt.types import (
 )
 from tllm.contracts.canonical_compilation import CanonicalScheduleBundle
 from tllm.contracts.semantic_graph import (
-    AnchorId,
     ImplementationId,
     PhysicalPlan,
 )
@@ -328,17 +327,9 @@ class FTTTExecution:
             FTTTPredictionPending(),
             FTTTPublicationPending(),
         )
-        invocation = self._runner.start(context)
         try:
             with torch.inference_mode(False), torch.enable_grad():
-                anchor_ids = tuple(
-                    dict.fromkeys(
-                        AnchorId(int(task.anchor_id)) for task in self.plan.tasks
-                    )
-                )
-                for anchor_id in anchor_ids:
-                    self._runner.execute_anchor(invocation, anchor_id)
-                completed = self._runner.finish(invocation)
+                completed = self._runner.run(context)
         except Exception:
             try:
                 self._restore_snapshot(snapshot, execution_device)

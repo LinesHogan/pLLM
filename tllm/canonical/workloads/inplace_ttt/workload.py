@@ -303,11 +303,8 @@ class CanonicalDenseOverlayExecution:
                 InPlaceTTTTransitionPending(),
                 InPlaceTTTPublicationPending(),
             )
-            invocation = self._runner.start(context)
             try:
-                for task in self.plan.tasks:
-                    self._runner.execute_anchor(invocation, AnchorId(int(task.anchor_id)))
-                completed = self._runner.finish(invocation)
+                completed = self._runner.run(context)
             except Exception:
                 match context.transition, context.publication:
                     case InPlaceTTTPreparedTransition(

@@ -1,41 +1,57 @@
-# Native Workload Validation
+# Validation and Release Checks
 
-Validate legacy and native implementations in independent processes with the
-same backend, inputs, seed, and configuration. Freeze only a minimal numerical
-oracle or golden before deleting the old production implementation; do not
-keep a runnable dual stack indefinitely.
+Run from the repository root. This checkout uses
+`/workspace/pllm/.venv/bin/python`, including when working in a worktree.
 
-For deterministic paths compare tensors, tokens, losses, update counts, and
-state versions exactly or under a declared tolerance. For stochastic sampling,
-compare token-by-token under a fixed RNG; when that is impossible, use a
-predeclared distribution-level test. Also verify retry/barrier/trajectory,
-version pinning, request cleanup, and epoch replacement.
+## CPU, Rust and Static Checks
 
-GPU coverage must include the supported MRv1/MRv2 and in-process/EngineCore-MP
-cells, plus eager/CUDA Graph and distributed boundaries when the workload
-claims those capabilities. Training evidence requires positive loss and update
-counts. Every fallback count must be zero.
+```bash
+python -m maturin develop --offline
+python -m pytest -q
+cargo test --manifest-path rust/tllm_core/Cargo.toml
+python tools/check_import_layers.py
+python tools/check_region_authority.py
+python tools/check_typing.py
+```
 
-## ESamp deletion gate
+Use the activated repository virtualenv for these commands. The offline native
+build requires cached Rust dependencies. Strict and basic typing both have a
+zero-error baseline. CUDA tests skipped on a CPU-only host are not GPU evidence.
 
-Legacy ESamp and its Program baseline remain reachable until native ESamp has:
+## GPU Boundaries
 
-1. numerical and lifecycle parity for shared, per-request, and model-bank
-   state;
-2. compact capture, sampler intervention, request cleanup, and claimed CUDA
-   Graph coverage;
-3. an aligned native-vs-legacy run from the workload in
-   [benchmarking.md](benchmarking.md), with real training work and zero
-   fallback;
-4. throughput ratio `>= 0.98`. A result below `0.95` blocks deletion outright.
+Run sequentially on a compatible CUDA host with vLLM 0.27.1 and the
+Qwen/Qwen2.5-0.5B-Instruct checkpoint available:
 
-The request-scoped MRv2 eager differential is now numerically green: fixed-seed
-legacy/native tokens and losses match with intervention off/on, both execute
-four updates, and intervention count is one. Native also proves version-2
-retirement and zero cleanup residue;
-the retained legacy baseline has no equivalent request-finish transaction.
+```bash
+python test/gpu/canonical_vllm_esamp_smoke.py
+python test/gpu/canonical_vllm_inplace_ttt_smoke.py
+python test/gpu/canonical_esamp_cuda_graph_replay_smoke.py
+python test/gpu/canonical_fttt_cuda_smoke.py
+```
 
-The existing `docs/p5_paired_benchmark_report.json` measures Program against
-legacy and records a ratio near 0.7968 with `gate_pass=false`; it is evidence
-that deletion remains blocked, not native takeover evidence. Model-bank,
-compact-capture, CUDA Graph, and aligned throughput gates remain open.
+The first scenario runs plain inference followed by attached ESamp in one
+process. Training must have nonzero loss/update counts, request state must be
+cleaned up and fallback must be zero. The CUDA Graph scenario covers the
+training core, not a vLLM capture-mode support matrix.
+
+## Release Gate
+
+Evidence 39, collected by pytest, builds an sdist, builds a wheel from that
+extracted source archive and installs it in an isolated directory. It verifies
+Python/native-module provenance, executes the Rust codec and checks tensor
+dependencies, license packaging and absence of retired packages/plugins.
+
+Build distribution artifacts from the repository root:
+
+```bash
+python -m maturin build --release
+python -m maturin sdist
+```
+
+Wheel success alone does not authorize a release. Before tagging or publishing,
+complete the [handoff](../architecture-consolidation-handoff.md), all selected
+39 evidence contracts (maximum 50), supported runtime boundaries, and the
+22k–30k source gate. Consolidate the release branch without discarding pending
+worktree changes. No throughput or unsupported topology claim may be inferred
+from a short correctness smoke.

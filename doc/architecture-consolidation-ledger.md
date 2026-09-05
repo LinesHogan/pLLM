@@ -24,21 +24,52 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `766b360` plus current worktree | — | after `e03816d` |
-| Counted production/support source | 27,973 lines | -105,237 lines | -63,353 lines |
-| Pytest collection | 3 items | -1,346 items | -8 items |
+| Commit | `4cd162f` plus current worktree | — | after `e03816d` |
+| Counted production/support source | 27,961 lines | -105,249 lines | -63,365 lines |
+| Pytest collection | 5 items | -1,344 items | -6 items |
 | Rust tests | 3 items | -51 items | -51 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 10 items | below the 50-item ceiling; not yet the final evidence set | -8 items |
+| Visible `TEST_COUNT` | 12 items | below the 50-item ceiling; not yet the final evidence set | -6 items |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 3, 5, 13, 20, 30, 32, 37, 38 and 39. The manifest now records
-29 pending survivor evidence items. Those pending items are implementation
+evidence IDs 1, 3, 5, 13, 20, 22, 23, 30, 32, 37, 38 and 39. The manifest now records
+27 pending survivor evidence items. Those pending items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Release-preparation slice after `4cd162f`
+
+The previous residual-runtime retirement is committed in `4cd162f`:
+`+111 / -21,856 / net -21,745`, with 617 unchanged moved lines separately
+accounted for. This slice is primarily G documentation/distribution cleanup,
+not completion of the B generic executor migration. Its counted-source change
+is `+10 / -22 / net -12`: three workload-local synchronous anchor loops now
+use `TaskGraphExecution.run`, preserving the signed order. No source was moved
+and no independent mathematics was extracted or changed.
+
+Seventeen obsolete documents were removed; the maintained entry guides were
+rewritten around real supported boundaries. The redundant Rust Python-package
+configuration and minimal requirements file were removed. The root project
+metadata now owns tensor/runtime/test dependencies and the existing Apache-2.0
+license is included in distributions. None of these non-source deletions offsets
+the source budget. Evidence 39 now builds a wheel from a fresh extracted sdist,
+then checks isolated import/codec execution, dependency and license metadata.
+
+Evidence 22 adds the GTTA FIFO/EMA rollback oracle; evidence 23 adds the
+multi-target In-Place chunk-update/publication/isolation/retirement oracle.
+Full pytest: 5 passed in the repository venv. Import and authority gates passed;
+strict/basic typing: 0 errors, 0 warnings. FTTT CUDA: loss/update 1, version 1,
+zero fallback. Rust and the other three GPU smokes retain the unchanged
+`4cd162f` results; no throughput benchmark was run.
+
+Worktrees decreased from 30 to 3 using non-force removal of 27 clean historical
+checkouts. Branches and commits remain recoverable. Dirty main (five modified
+files and the protected research note) and shared-test-time-lora-runtime
+(31 changes) remain untouched. Their integration and the outstanding functional
+contracts are release blockers; this checkpoint is neither tagged nor published.
 
 The FTTT authority-retirement slice added no counted source. It deleted 909
 production lines from `tllm/consumers/fttt` and three counted support lines

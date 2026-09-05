@@ -3,17 +3,29 @@
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 from zipfile import ZipFile
 
 
 def test_isolated_wheel_imports_and_executes_rust_codec(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     subprocess.run(
-        [sys.executable, "-m", "maturin", "build", "--offline", "--out", str(tmp_path)],
+        [sys.executable, "-m", "maturin", "sdist", "--out", str(tmp_path)],
         cwd=root, check=True, capture_output=True, text=True,
+    )
+    source_archive, = tmp_path.glob("tllm-*.tar.gz")
+    source = tmp_path / "source"
+    with tarfile.open(source_archive) as archive:
+        archive.extractall(source, filter="data")
+    project, = source.iterdir()
+    subprocess.run(
+        [sys.executable, "-m", "maturin", "build", "--offline", "--out", str(tmp_path)],
+        cwd=project, check=True, capture_output=True, text=True,
     )
     wheel, = tmp_path.glob("tllm-*.whl")
     with ZipFile(wheel) as archive:
+        license_path, = (name for name in archive.namelist() if name.endswith("/licenses/LICENSE"))
+        assert b"Apache License" in archive.read(license_path)
         assert not any(
             name.startswith(("tllm/runtime/", "tllm/ports/", "tllm/common/"))
             for name in archive.namelist()
@@ -30,6 +42,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import sys
+from packaging.requirements import Requirement
 
 installed = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(installed))
@@ -40,6 +53,8 @@ assert Path(tllm.__file__).resolve().is_relative_to(installed)
 assert Path(_core.__file__).resolve().is_relative_to(installed)
 distribution = importlib.metadata.Distribution.at(installed / sys.argv[2])
 assert not any(e.group == 'vllm.general_plugins' for e in distribution.entry_points)
+requirements = [Requirement(value) for value in distribution.requires or ()]
+assert any(req.name == 'torch' and req.marker is None for req in requirements)
 request = json.dumps({'schema_version': 1, 'layouts': [{
     'resource': 'wheel', 'layout': {'namespace': 'wheel', 'schema_version': 1,
     'fields': [{'field_id': 0, 'shape': [2, 4], 'dtype': 'float32',

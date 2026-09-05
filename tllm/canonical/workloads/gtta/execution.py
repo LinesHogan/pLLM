@@ -30,7 +30,7 @@ from tllm.canonical.workloads.gtta.types import (
     GTTAUpdateReceipt,
 )
 from tllm.contracts.canonical_compilation import CanonicalScheduleBundle
-from tllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan
+from tllm.contracts.semantic_graph import ImplementationId, PhysicalPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,14 +170,8 @@ class GTTAExecution:
             GTTAQueryPending(),
             GTTAPublishPending(),
         )
-        invocation = self._runner.start(context)
         try:
-            anchor_ids = tuple(
-                dict.fromkeys(AnchorId(int(task.anchor_id)) for task in self.plan.tasks)
-            )
-            for anchor_id in anchor_ids:
-                self._runner.execute_anchor(invocation, anchor_id)
-            completed = self._runner.finish(invocation)
+            completed = self._runner.run(context)
         except Exception:
             self._dynamics.restore(snapshot)
             raise

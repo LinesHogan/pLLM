@@ -8,19 +8,17 @@ version = "0.1.0"
 description = "Auxiliary-workload compiler middle-end for the vLLM inference engine"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
-    "opt-einsum>=3.4,<4",
-    "safetensors>=0.4,<1",
+    "torch>=2.13,<2.14",
 ]
 
 [project.optional-dependencies]
-# vLLM 0.27 backend drivers (MRv1 + MRv2). For CUDA 12.x drivers, install
-# the cu129 wheels instead of the default cu130 builds — see
-# docs/environment.md.
-vllm027 = ["vllm>=0.27.1,<0.28"]
-test = ["pytest==9.0.3"]
-tlm = ["transformers>=5.0,<6", "peft>=0.20,<0.21"]
+# The public attachment currently supports the exact MRv2 ABI in this release.
+vllm027 = ["vllm==0.27.1"]
+test = ["pytest==9.0.3", "maturin>=1.14,<2.0", "pyright==1.1.411"]
+tlm = ["transformers>=5.0,<6", "peft>=0.20,<0.21", "safetensors>=0.4,<1"]
 
 [tool.maturin]
 manifest-path = "rust/tllm_core/Cargo.toml"

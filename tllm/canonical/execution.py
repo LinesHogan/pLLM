@@ -88,6 +88,12 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
                 "task-graph implementation differs from the Rust physical plan"
             )
 
+    def run(self, context: ExecutionContextT) -> ExecutionContextT:
+        """Execute a synchronous invocation in the complete signed task order."""
+        for task in self.plan.tasks:
+            self.implementations[int(task.task_id)].execute(context)
+        return context
+
     def start(
         self,
         context: ExecutionContextT,

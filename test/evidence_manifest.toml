@@ -1,14 +1,14 @@
 schema_version = 1
 target_count = 39
 maximum_count = 50
-active_executable_count = 10
-pending_survivor_count = 29
-active_executable_ids = [1, 3, 5, 13, 20, 30, 32, 37, 38, 39]
+active_executable_count = 12
+pending_survivor_count = 27
+active_executable_ids = [1, 3, 5, 13, 20, 22, 23, 30, 32, 37, 38, 39]
 
 # The active count is deliberately not the terminal evidence set.  It records
 # the executable survivor bases left after deleting stale old-stack tests:
 # three Rust canonical tests, one CUDA PTTS pytest, and four standalone GPU
-# smokes, plus the Dummy export oracle and fresh isolated-wheel release evidence.
+# smokes, plus Dummy/GTTA/In-Place oracles and isolated distribution evidence.
 # The remaining IDs are debt tied to the
 # corresponding cutover tranche; they must be added as compact observable
 # oracles or public runtime smokes, not restored as legacy class-hierarchy or
@@ -133,11 +133,21 @@ group = "workload"
 id = 22
 name = "gtta_updates_environment_and_rolls_back_fifo"
 group = "workload"
+path = "test/workloads/test_gtta.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_gtta.py"
+environment = "Repository Python venv with torch and Rust extension; CPU"
+observable_contract = "Executed transaction abort restores state and FIFO; subsequent commit produces exact EMA rankings and prompt rewards; empty update preserves version; zero fallback"
+replaces = "test/core/test_canonical_gtta_workload_unit.py; DTO tamper fixtures are excluded"
 
 [[evidence]]
 id = 23
 name = "inplace_ttt_matches_multitarget_oracle_and_cleans_versions"
 group = "workload"
+path = "test/workloads/test_inplace_ttt.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_inplace_ttt.py"
+environment = "Repository Python venv with torch and Rust extension; CPU"
+observable_contract = "Two targets match independent outer-product updates across a tail/chunk boundary; one atomic publication, decode isolation between same-ID samples, exact version retirement and zero fallback"
+replaces = "test/core/test_canonical_inplace_ttt_workload_unit.py; no legacy fixtures or internal class assertions"
 
 [[evidence]]
 id = 24
@@ -231,5 +241,5 @@ group = "release"
 path = "test/release/test_wheel.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/release/test_wheel.py"
 environment = "Repository Python venv, maturin, pip and cached Rust build dependencies; no GPU or MP"
-observable_contract = "Fresh non-editable wheel imports its own Python and native module, executes Rust layout codec, and contains no residual packages or bootstrap plugin"
+observable_contract = "Fresh sdist builds a non-editable wheel that imports its own Python/native module, declares tensor dependencies, executes Rust layout codec, and contains no residual packages or bootstrap plugin"
 replaces = "Legacy package/import probes; original plan evidence 39 had no executable survivor"

@@ -1,49 +1,16 @@
-# tLLM Documentation
+# Documentation
 
-tLLM is an auxiliary-workload compiler for vLLM. New work is declared with
-`tllm.workload`; its task graph is fine-grained for analysis, while signed
-`ExecutionRegion`s are the coarse-grained physical execution units. Rust makes
-and signs that decision; Python mechanically binds the signed plan.
-Program/Consumer lanes, streams, and events remain documented as migration
-compatibility, not as the optimization model.
+The guides describe the current canonical implementation. Deleted API guides
+and historical implementation reports remain available through Git history.
 
-## Reading order
+- [Installation and ESamp example](../README.md)
+- [In-Place-TTT dense overlays](inplace-ttt.md)
+- [Current architecture and ownership](architecture.md)
+- [Validation and release checks](guides/validation.md)
+- [Benchmark interpretation](guides/benchmarking.md)
+- [Consolidation plan](architecture-consolidation-10k-plan.md)
+- [Current handoff and remaining work](architecture-consolidation-handoff.md)
+- [Deletion and evidence ledger](architecture-consolidation-ledger.md)
 
-1. [Auxiliary workload compiler](workload-compiler.md) — the current frontend, signed Region contracts, and migration boundary.
-2. [Region authority v1](region-authority.md) — frozen Rust/Python authority, fail-closed matrix, and migration checklist.
-3. [Quickstart](quickstart.md) — native ESamp orientation and the retained Program example.
-4. [Write a consumer](write-a-consumer.md) — `tllm.workload` guidance plus the legacy Program compatibility API.
-5. [Architecture](architecture.md) — the Region execution stack and compatibility layers.
-6. [ESamp reference](esamp.md) — the built-in test-time training consumer.
-7. [Native In-Place TTT](inplace-ttt.md) — signed exact fast-weight tasks and shared immutable overlays.
-8. [TLM q/v LoRA](tlm.md) — full HF/PEFT side training and immutable versions through vLLM's native LoRA path.
-
-## The one-paragraph mental model
-
-For a native workload, declare `@workload` and `@task` nodes with typed inputs,
-outputs, effects, timing, and optional affine access. Rust validates the full
-graph and signs Region boundaries, bindings, materializations, lifetimes, and
-capture policy. The legacy `@flow`/`@extern` Program lane remains available as
-an adapter while workloads migrate; it is not used to make new physical
-scheduling decisions.
-
-Unsupported native or compatibility declarations fail closed; there is no
-silent fallback.
-
-With `torch==2.13.0+cu129` and `vllm==0.27.1`, GPU correctness covers exact
-eager in-process native Recirculation and native ESamp on MRv1/MRv2.
-The former runtime-backed Dummy GPU/MP evidence is frozen historical context:
-its public entry now targets a clean-room CPU vertical oracle and makes no
-GPU/MP claim. Recirculation also passed EngineCore MP on both runners, replaying
-two requests and seven prompt rows with zero fallback. The
-latest request-scoped ESamp smoke records four losses/updates, two parent
-slots retired at version 2, one intervention state when enabled, and zero
-fallback/replay. Its corrected MRv2 legacy/native fixed-seed differential has
-exact token and loss parity after the capture-disabled request optimizer was
-aligned to eager AdamW. Native
-ESamp exact eager Regions also passed EngineCore MP correctness on both
-runners. This is not a throughput claim. Model-backed native piecewise CUDA Graph execution,
-Recirculation capture/hook-retirement integration, and shape-miss epoch
-switching are not yet claims.
-
-中文文档见 [doc_zh/README.md](../doc_zh/README.md)。
+The plan, handoff and ledger are maintained in Chinese or bilingual form.
+There is no separately maintained translation of the retired consumer API.
