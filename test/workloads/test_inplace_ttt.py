@@ -1,8 +1,14 @@
 """Evidence 23: multi-target chunk updates, request isolation and retirement."""
 
+import pytest
 import torch
 
 from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.canonical.ptts.dense_page import DensePageTransitionBatch
+from tllm.canonical.ptts.publication import (
+    RequestStatePublicationCoordinator, RequestStatePublicationReceipt,
+)
+from tllm.canonical.ptts.request_state import RequestStateTransitionBatch
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTCompileOptions, InPlaceTTTConfig, InPlaceTTTOperandPair,
@@ -19,7 +25,9 @@ from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.tensor_layout import TensorDType
 
 
-def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
+def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     targets = tuple(ParameterTarget(
         layer, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT,
     ) for layer in (0, 1))
@@ -50,11 +58,27 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     ], dtype=torch.float64)
     latest = refs[0]
     for row in range(2):
-        result = execution.step(InPlaceTTTStepInput(identities[0], tuple(
+        step = InPlaceTTTStepInput(identities[0], tuple(
             InPlaceTTTOperandPair(target, InPlaceTTTPhase.PREFILL,
                 hidden[row:row + 1], desired[index, row:row + 1], bases[index])
             for index, target in enumerate(targets)
-        )))
+        ))
+        before = execution.snapshot(latest)
+
+        def reject_publication(
+            self: RequestStatePublicationCoordinator,
+            logical: RequestStateTransitionBatch,
+            physical: DensePageTransitionBatch,
+        ) -> RequestStatePublicationReceipt:
+            raise RuntimeError("injected prepublication failure")
+
+        with monkeypatch.context() as fault:
+            fault.setattr(RequestStatePublicationCoordinator, "publish", reject_publication)
+            with pytest.raises(RuntimeError, match="injected prepublication failure"):
+                execution.step(step)
+        for actual, expected in zip(execution.snapshot(latest), before, strict=True):
+            torch.testing.assert_close(actual, expected)
+        result = execution.step(step)
         assert result.before_ref == latest
         latest = result.after_ref
         assert latest.version_id == row + 1

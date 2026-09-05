@@ -1,14 +1,14 @@
 schema_version = 1
 target_count = 41
 maximum_count = 50
-active_executable_count = 15
-pending_survivor_count = 26
-active_executable_ids = [1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 30, 32, 37, 38, 39]
+active_executable_count = 16
+pending_survivor_count = 25
+active_executable_ids = [1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38, 39]
 
 # The active count is deliberately not the terminal evidence set.  It records
 # the executable survivor bases left after deleting stale old-stack tests:
 # four Rust canonical tests, one CUDA PTTS pytest, and four standalone GPU
-# smokes, plus four workload oracles, a host boundary and distribution evidence.
+# smokes, plus five workload oracles, a host boundary and distribution evidence.
 # The remaining IDs are debt tied to the
 # corresponding cutover tranche; they must be added as compact observable
 # oracles or public runtime smokes, not restored as legacy class-hierarchy or
@@ -161,7 +161,7 @@ group = "workload"
 path = "test/workloads/test_inplace_ttt.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_inplace_ttt.py"
 environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Two targets match independent outer-product updates across a tail/chunk boundary; one atomic publication, decode isolation between same-ID samples, exact version retirement and zero fallback"
+observable_contract = "Two targets match independent outer-product updates across a tail/chunk boundary; injected prepublication failure preserves original roots and permits clean retry; one atomic publication, decode isolation between same-ID samples, exact version retirement and zero fallback"
 replaces = "test/core/test_canonical_inplace_ttt_workload_unit.py; no legacy fixtures or internal class assertions"
 
 [[evidence]]
@@ -173,6 +173,11 @@ group = "workload"
 id = 25
 name = "esamp_predicts_before_training_and_isolates_request_versions"
 group = "workload"
+path = "test/workloads/test_esamp.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_esamp.py"
+environment = "Repository Python venv with torch and Rust extension; CPU"
+observable_contract = "Fixed-seed initialization; independent gated-residual/layernorm and torch.optim.AdamW oracle including per-state row averaging, gradients, moments and steps; same-ID sample isolation; immutable prediction guidance across publication; training only after sampler completion; exact cleanup and zero fallback"
+replaces = "Historical ESamp base-consumer/per-request training and hidden-storage numerical contracts; no legacy classes, benchmark selection fixtures or mock-count assertions"
 
 [[evidence]]
 id = 26

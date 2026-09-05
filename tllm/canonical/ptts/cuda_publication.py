@@ -8,31 +8,17 @@ from threading import RLock
 import torch
 
 from tllm.canonical.ptts.dense_page_cuda import CudaDensePageStateProvider
-from tllm.canonical.ptts.dense_page_cuda_types import (
-    CudaDensePagePublication,
-    CudaDensePageTransition,
-)
+from tllm.canonical.ptts.dense_page_cuda_types import CudaDensePageTransition
+from tllm.canonical.ptts.publication import RequestStatePublicationReceipt
 from tllm.canonical.ptts.request_state import (
     RequestStateDirectory,
     RequestStateTransitionBatch,
 )
-from tllm.contracts.state_ref import StateRef
 
 
 @dataclass(frozen=True, slots=True)
 class CudaRequestStatePreparedPublication:
     receipt_id: int
-
-
-@dataclass(frozen=True, slots=True)
-class CudaRequestStatePublicationReceipt:
-    """One receipt for a logical transition published by a CUDA fence."""
-
-    operation_id: int
-    physical_transaction_id: int
-    before_refs: tuple[StateRef, ...]
-    after_refs: tuple[StateRef, ...]
-    publication: CudaDensePagePublication
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +84,7 @@ class CudaRequestStatePublicationCoordinator:
     def commit_full_root(
         self,
         token: CudaRequestStatePreparedPublication,
-    ) -> CudaRequestStatePublicationReceipt:
+    ) -> RequestStatePublicationReceipt:
         """Cross the fail-stop CUDA submission point, then publish logical latest."""
 
         with self._lock:
@@ -109,7 +95,7 @@ class CudaRequestStatePublicationCoordinator:
                 prepared.stream,
             )
             self._directory.commit_transition(prepared.logical)
-            receipt = CudaRequestStatePublicationReceipt(
+            receipt = RequestStatePublicationReceipt(
                 prepared.logical.operation_id,
                 prepared.physical.transaction_id,
                 prepared.logical.before_refs,
@@ -118,17 +104,6 @@ class CudaRequestStatePublicationCoordinator:
             )
             self._prepared.pop(token.receipt_id)
             return receipt
-
-    def abort_reservation(
-        self,
-        logical: RequestStateTransitionBatch,
-        physical: CudaDensePageTransition,
-    ) -> None:
-        """Abort only a reservation that has not acquired a CUDA fence."""
-
-        with self._lock:
-            self._provider.abort_unsubmitted_transition(physical)
-            self._directory.abort_transition(logical)
 
     def abort_prepared(
         self,
@@ -156,5 +131,4 @@ class CudaRequestStatePublicationCoordinator:
 __all__ = [
     "CudaRequestStatePublicationCoordinator",
     "CudaRequestStatePreparedPublication",
-    "CudaRequestStatePublicationReceipt",
 ]

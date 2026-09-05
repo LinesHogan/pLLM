@@ -9,6 +9,7 @@ from tllm.canonical.ptts.dense_page import (
     DensePageStateProvider,
     DensePageTransitionBatch,
 )
+from tllm.canonical.ptts.dense_page_cuda_types import CudaDensePagePublication
 from tllm.canonical.ptts.request_state import (
     RequestStateDirectory,
     RequestStateTransitionBatch,
@@ -22,6 +23,7 @@ class RequestStatePublicationReceipt:
     physical_transaction_id: int
     before_refs: tuple[StateRef, ...]
     after_refs: tuple[StateRef, ...]
+    publication: CudaDensePagePublication | None = None
 
 
 class RequestStatePublicationCoordinator:

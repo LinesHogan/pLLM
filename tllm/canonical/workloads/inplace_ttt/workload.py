@@ -45,31 +45,21 @@ from tllm.canonical.tensor_layout import (
     validate_tensor_layouts,
 )
 from tllm.canonical.workloads.base import CanonicalWorkload
-from tllm.canonical.workloads.inplace_ttt.cuda_tasks import (
-    CudaInPlaceTTTCommittedTransition,
-    CudaInPlaceTTTPreparedTransition,
-    CudaInPlaceTTTPublicationPending,
-    CudaInPlaceTTTPublishTask,
-    CudaInPlaceTTTPublished,
-    CudaInPlaceTTTStepContext,
-    CudaInPlaceTTTTransitionPending,
-    CudaInPlaceTTTTransitionTask,
-    CudaInPlaceTTTValidatedTransition,
-    INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION,
-    INPLACE_TTT_CUDA_TRANSITION_IMPLEMENTATION,
-)
 from tllm.canonical.workloads.inplace_ttt.layout import (
     InPlaceTTTStateLayout,
     build_inplace_ttt_state_layout,
 )
 from tllm.canonical.workloads.inplace_ttt.tasks import (
-    InPlaceTTTPreparedTransition,
-    InPlaceTTTPublicationPending,
+    InPlaceTTTCommittedTransition,
+    InPlaceTTTCpuStorage,
+    InPlaceTTTCudaStorage,
     InPlaceTTTPublishTask,
-    InPlaceTTTPublished,
     InPlaceTTTStepContext,
+    InPlaceTTTSubmitting,
     InPlaceTTTTransitionPending,
     InPlaceTTTTransitionTask,
+    INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION,
+    INPLACE_TTT_CUDA_TRANSITION_IMPLEMENTATION,
     INPLACE_TTT_PUBLISH_IMPLEMENTATION,
     INPLACE_TTT_TRANSITION_IMPLEMENTATION,
 )
@@ -81,6 +71,7 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTDiagnostics,
     InPlaceTTTCudaStepHandle,
     InPlaceTTTSpecialization,
+    InPlaceTTTStepBatch,
     InPlaceTTTStepBatchResult,
     InPlaceTTTStepInput,
     InPlaceTTTStepResult,
@@ -229,13 +220,12 @@ class CanonicalDenseOverlayExecution:
         self._runner = TaskGraphExecution(
             plan_bundle.schedule_physical,
             (
-                InPlaceTTTPublishTask(layout, publication),
+                InPlaceTTTPublishTask(INPLACE_TTT_PUBLISH_IMPLEMENTATION),
                 InPlaceTTTTransitionTask(
                     config,
                     layout,
                     directory,
-                    provider,
-                    publication,
+                    INPLACE_TTT_TRANSITION_IMPLEMENTATION,
                 ),
             ),
         )
@@ -297,35 +287,21 @@ class CanonicalDenseOverlayExecution:
                 self._directory.release_transition_lease(transition_lease)
                 raise
             context = InPlaceTTTStepContext(
-                step,
+                InPlaceTTTStepBatch((step,)),
                 selection,
                 transition_lease,
+                InPlaceTTTCpuStorage(self._provider, self._publication),
                 InPlaceTTTTransitionPending(),
-                InPlaceTTTPublicationPending(),
             )
             try:
                 completed = self._runner.run(context)
+                (result,) = completed.result().entries
             except Exception:
-                match context.transition, context.publication:
-                    case InPlaceTTTPreparedTransition(
-                        logical=logical,
-                        physical=physical,
-                    ), InPlaceTTTPublicationPending():
-                        self._publication.abort(logical, physical)
-                    case _:
-                        pass
+                context.abort()
+                raise
+            finally:
                 self._provider.release_pin(pin)
                 self._directory.release_transition_lease(transition_lease)
-                raise
-            match completed.publication:
-                case InPlaceTTTPublished(result=result):
-                    pass
-                case InPlaceTTTPublicationPending():
-                    self._provider.release_pin(pin)
-                    self._directory.release_transition_lease(transition_lease)
-                    raise RuntimeError("signed dense overlay graph did not publish")
-            self._provider.release_pin(pin)
-            self._directory.release_transition_lease(transition_lease)
             self._update_count += sum(target.update_count for target in result.targets)
             self._trained_rows += sum(target.trained_rows for target in result.targets)
             return result
@@ -460,13 +436,12 @@ class CanonicalDenseOverlayCudaExecution:
         self._runner = TaskGraphExecution(
             plan_bundle.schedule_physical,
             (
-                CudaInPlaceTTTPublishTask(layout, publication),
-                CudaInPlaceTTTTransitionTask(
+                InPlaceTTTPublishTask(INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION),
+                InPlaceTTTTransitionTask(
                     config,
                     layout,
                     directory,
-                    provider,
-                    publication,
+                    INPLACE_TTT_CUDA_TRANSITION_IMPLEMENTATION,
                 ),
             ),
         )
@@ -646,45 +621,32 @@ class CanonicalDenseOverlayCudaExecution:
             except Exception:
                 self._fail_step(active)
                 raise
-            context = CudaInPlaceTTTStepContext(
+            context = InPlaceTTTStepContext(
                 batch,
                 active.selection,
                 active.transition_lease,
-                active.state_pin,
-                active.stream,
-                CudaInPlaceTTTTransitionPending(),
-                CudaInPlaceTTTPublicationPending(),
+                InPlaceTTTCudaStorage(
+                    self._provider, self._publication, active.state_pin, active.stream,
+                ),
+                InPlaceTTTTransitionPending(),
             )
             invocation = self._runner.start(context)
             try:
                 self._runner.execute_anchor(invocation, transition_task.anchor_id)
                 self._runner.execute_anchor(invocation, publish_task.anchor_id)
                 completed = self._runner.finish(invocation)
+                result = completed.result()
             except Exception:
-                match context.transition, context.publication:
-                    case CudaInPlaceTTTPreparedTransition(
-                        logical=logical,
-                        physical=physical,
-                    ), CudaInPlaceTTTPublicationPending():
-                        self._publication.abort_reservation(logical, physical)
-                        self._fail_step(active)
-                    case (
-                        CudaInPlaceTTTValidatedTransition()
-                        | CudaInPlaceTTTCommittedTransition(),
-                        _,
-                    ):
+                match context.transition:
+                    case InPlaceTTTSubmitting() | InPlaceTTTCommittedTransition():
                         self._execution_state = _DenseCudaFailed()
                         self._active.clear()
                     case _:
+                        context.abort()
                         self._fail_step(active)
                 raise
-            match completed.publication:
-                case CudaInPlaceTTTPublished(result=result):
-                    active.last_attachment_anchor_id = int(publish_task.anchor_id)
-                    active.state = _DenseCudaExecuted(result)
-                case CudaInPlaceTTTPublicationPending():
-                    self._fail_step(active)
-                    raise RuntimeError("signed CUDA dense overlay graph did not publish")
+            active.last_attachment_anchor_id = int(publish_task.anchor_id)
+            active.state = _DenseCudaExecuted(result)
 
     def complete_sampler(
         self,
