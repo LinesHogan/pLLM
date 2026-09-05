@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
 from tllm.canonical.ptts.dense_page import DensePageStateProvider, DensePageTransitionBatch, DensePageRoot
 from tllm.canonical.workloads.esamp_request import (
-    CanonicalRequestSamplerExecution, ESampRequestWorkload,
+    ESampRequestWorkload,
 )
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions, ESampRequestConfig, ESampRequestPackedHiddenBindings,
@@ -58,7 +58,7 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
         ESampRequestCompileOptions(timeline, (DensePageCpuProviderFacts("test.esamp@1", 3),), 2, 10000),
     )
     execution = compiled.execution
-    assert isinstance(execution, CanonicalRequestSamplerExecution)
+    assert execution.device.type == "cpu"
     identities = (RequestIdentity("shared-id", 0, 0), RequestIdentity("shared-id", 0, 1))
     latest = list(execution.admit(identities))
     parameters = [execution.snapshot(ref)[0].requires_grad_() for ref in latest]
@@ -87,9 +87,13 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
                 for resource in bindings.resources)),
         )
         before = [execution.snapshot(ref) for ref in latest]
-        cancelled = execution.start_step(step)
-        execution.execute_anchor(cancelled, AnchorId(0))
-        execution.cancel_step(cancelled)
+        for last_anchor in (0, 1):
+            cancelled = execution.start_step(step)
+            for anchor in range(last_anchor + 1):
+                execution.execute_anchor(cancelled, AnchorId(anchor))
+            execution.cancel_step(cancelled)
+            with pytest.raises(RuntimeError, match="active"):
+                execution.cancel_step(cancelled)
 
         def reject_publication(
             self: DensePageStateProvider, batch: DensePageTransitionBatch,

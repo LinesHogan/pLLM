@@ -4,18 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
-from typing import Generic, Protocol, TypeVar
+from typing import Protocol
 
 import torch
 
 from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout, low_rank_gated_forward
-from tllm.canonical.ptts import CudaDensePageGradientBatch
 from tllm.canonical.ptts import CudaDensePageStateProvider, CudaDensePageVersionPin
+from tllm.canonical.ptts.dense_page_cuda_types import CudaDensePageRelease
 from tllm.canonical.ptts.dense_page import (
     DensePageAdamWConfig,
     DensePageAdamWFieldBinding,
     DensePageStateProvider,
+    DensePageVersionPin,
 )
 from tllm.canonical.ptts.request_state import (
     RequestStateDirectory,
@@ -39,20 +40,19 @@ from tllm.contracts.state_ref import StateRef
 
 
 TensorGradients = tuple[torch.Tensor, ...]
-GradientT = TypeVar("GradientT")
 
 
-class ESampStateKernel(Protocol[GradientT]):
+class ESampStateKernel(Protocol):
     @property
     def stream(self) -> torch.cuda.Stream | None: ...
 
     def read(self, refs: tuple[StateRef, ...]) -> torch.Tensor: ...
 
-    def bind_gradients(self, values: TensorGradients) -> GradientT: ...
+    def release(self) -> CudaDensePageRelease | None: ...
 
     def submit(
         self, logical: RequestStateTransitionBatch, config: ESampRequestConfig,
-        gradients: GradientT,
+        gradients: TensorGradients,
     ) -> RequestStatePublicationReceipt: ...
 
 
@@ -80,12 +80,12 @@ class ESampOptimizationPending:
 
 
 @dataclass(frozen=True, slots=True)
-class ESampOptimized(Generic[GradientT]):
+class ESampOptimized:
     losses: tuple[torch.Tensor, ...]
-    gradients: GradientT
+    gradients: TensorGradients
 
 
-ESampOptimization = ESampOptimizationPending | ESampOptimized[GradientT]
+ESampOptimization = ESampOptimizationPending | ESampOptimized
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,16 +97,16 @@ ESampPublication = ESampPublicationPending | RequestStatePublicationReceipt
 
 
 @dataclass(slots=True)
-class ESampStepContext(Generic[GradientT]):
+class ESampStepContext:
     step: ESampRequestStepInput
     source: torch.Tensor
     target: torch.Tensor
     selection: RequestStateSelection
     transition_lease: RequestStateTransitionLease
     prediction: ESampPrediction
-    optimization: ESampOptimization[GradientT]
+    optimization: ESampOptimization
     publication: ESampPublication
-    kernel: ESampStateKernel[GradientT]
+    kernel: ESampStateKernel
 
 
 def esamp_adamw_field_binding() -> DensePageAdamWFieldBinding:
@@ -242,13 +242,14 @@ def compute_low_rank_losses_and_gradients(
 @dataclass(frozen=True, slots=True)
 class ESampCpuStateKernel:
     provider: DensePageStateProvider
+    state_pin: DensePageVersionPin
     stream: None = None
 
     def read(self, refs: tuple[StateRef, ...]) -> torch.Tensor:
         return torch.stack(tuple(self.provider.snapshot(ref)[int(ESAMP_PARAMETER_FIELD)] for ref in refs))
 
-    def bind_gradients(self, values: TensorGradients) -> TensorGradients:
-        return values
+    def release(self) -> None:
+        self.provider.release_pin(self.state_pin)
 
     def submit(
         self, logical: RequestStateTransitionBatch, config: ESampRequestConfig,
@@ -278,23 +279,30 @@ class ESampCudaStateKernel:
     def read(self, refs: tuple[StateRef, ...]) -> torch.Tensor:
         return self.provider.pinned_field_rows(self.state_pin, ESAMP_PARAMETER_FIELD, self.stream)
 
-    def bind_gradients(self, values: TensorGradients) -> CudaDensePageGradientBatch:
-        return self.provider.bind_gradients(values, self.stream)
+    def release(self) -> CudaDensePageRelease:
+        return self.provider.release_pin(self.state_pin, self.stream)
 
     def submit(
         self, logical: RequestStateTransitionBatch, config: ESampRequestConfig,
-        gradients: CudaDensePageGradientBatch,
+        gradients: TensorGradients,
     ) -> RequestStatePublicationReceipt:
-        physical = self.provider.prepare_transition_batch(logical.before_refs, logical.after_refs, self.stream)
-        publication = self.provider.submit_adamw_transition(
-            physical, esamp_adamw_field_binding(), esamp_adamw_config(config), gradients, self.stream,
-        )
+        bound = self.provider.bind_gradients(gradients, self.stream)
+        try:
+            physical = self.provider.prepare_transition_batch(
+                logical.before_refs, logical.after_refs, self.stream,
+            )
+            publication = self.provider.submit_adamw_transition(
+                physical, esamp_adamw_field_binding(), esamp_adamw_config(config), bound, self.stream,
+            )
+        except Exception:
+            self.provider.discard_gradients(bound)
+            raise
         return RequestStatePublicationReceipt(
             logical.operation_id, physical.transaction_id, logical.before_refs, logical.after_refs, publication,
         )
 
 
-class ESampPredictTask(Generic[GradientT]):
+class ESampPredictTask:
     __slots__ = ("_config", "_layout", "implementation_id")
 
     def __init__(
@@ -305,7 +313,7 @@ class ESampPredictTask(Generic[GradientT]):
         self._layout = layout
         self.implementation_id = implementation_id
 
-    def execute(self, context: ESampStepContext[GradientT]) -> None:
+    def execute(self, context: ESampStepContext) -> None:
         state_vectors = context.kernel.read(context.selection.refs)
         stream = context.kernel.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream):
@@ -321,14 +329,14 @@ class ESampPredictTask(Generic[GradientT]):
             )
 
 
-class ESampLossTask(Generic[GradientT]):
+class ESampLossTask:
     __slots__ = ("_layout", "implementation_id")
 
     def __init__(self, layout: LowRankGatedLayout, implementation_id: ImplementationId) -> None:
         self._layout = layout
         self.implementation_id = implementation_id
 
-    def execute(self, context: ESampStepContext[GradientT]) -> None:
+    def execute(self, context: ESampStepContext) -> None:
         match context.prediction:
             case ESampPredicted() as predicted:
                 pass
@@ -339,10 +347,10 @@ class ESampLossTask(Generic[GradientT]):
             losses, gradients = compute_low_rank_losses_and_gradients(
                 predicted, self._layout, clone_outputs=stream is None,
             )
-        context.optimization = ESampOptimized(losses, context.kernel.bind_gradients(gradients))
+        context.optimization = ESampOptimized(losses, gradients)
 
 
-class ESampTrainTask(Generic[GradientT]):
+class ESampTrainTask:
     __slots__ = ("_config", "_directory", "implementation_id")
 
     def __init__(
@@ -353,7 +361,7 @@ class ESampTrainTask(Generic[GradientT]):
         self._directory = directory
         self.implementation_id = implementation_id
 
-    def execute(self, context: ESampStepContext[GradientT]) -> None:
+    def execute(self, context: ESampStepContext) -> None:
         match context.optimization:
             case ESampOptimized() as optimized:
                 pass

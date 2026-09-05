@@ -39,8 +39,8 @@ from tllm.canonical_vllm.sampler import (
     SignedPostFilterGuidance,
 )
 from tllm.canonical.workloads.esamp_request import (
-    CanonicalRequestCudaStepHandle,
-    CanonicalRequestSamplerCudaExecution,
+    CanonicalRequestStepHandle,
+    CanonicalRequestSamplerExecution,
     ESampRequestCompilation,
     ESampRequestWorkload,
 )
@@ -213,7 +213,7 @@ def _model_dtype(dtype: CanonicalVllmDType) -> Literal["bfloat16", "float16", "f
 class CanonicalVllmDeployment:
     workload: ESampRequestWorkload | InPlaceTTTWorkload
     compilation: ESampRequestCompilation | InPlaceTTTCompilation
-    execution: CanonicalRequestSamplerCudaExecution | CanonicalDenseOverlayCudaExecution
+    execution: CanonicalRequestSamplerExecution | CanonicalDenseOverlayCudaExecution
     attachment: SignedBackendAttachment
     hidden_bindings: tuple[PackedHiddenResourceBinding, ...]
     overlay_targets: tuple[VllmDenseAddTargetSpec, ...]
@@ -259,7 +259,7 @@ class CanonicalVllmDeployment:
 class _RequestSamplerVllmDeployment(CanonicalVllmDeployment):
     workload: ESampRequestWorkload
     compilation: ESampRequestCompilation
-    execution: CanonicalRequestSamplerCudaExecution
+    execution: CanonicalRequestSamplerExecution
     hidden_bindings: tuple[PackedHiddenResourceBinding, PackedHiddenResourceBinding]
     overlay_targets: tuple[()]
 
@@ -288,12 +288,12 @@ class _Capturing:
 
 @dataclass(frozen=True, slots=True)
 class _RequestPredicted:
-    handle: CanonicalRequestCudaStepHandle
+    handle: CanonicalRequestStepHandle
 
 
 @dataclass(frozen=True, slots=True)
 class _RequestSampled:
-    handle: CanonicalRequestCudaStepHandle
+    handle: CanonicalRequestStepHandle
 
 
 @dataclass(frozen=True, slots=True)
@@ -759,7 +759,7 @@ class CanonicalVllmSession:
                     self._stage(AttachmentOverlayStage.FINISH).anchor_id,
                 )
 
-    def _request_execution(self) -> CanonicalRequestSamplerCudaExecution:
+    def _request_execution(self) -> CanonicalRequestSamplerExecution:
         return self._request_deployment().execution
 
     def _overlay_execution(self) -> CanonicalDenseOverlayCudaExecution:
@@ -1244,7 +1244,7 @@ def _compile_sampler_training(
             state_memory_budget_bytes=free_device_bytes,
         ),
     )
-    if type(compilation.execution) is not CanonicalRequestSamplerCudaExecution:
+    if compilation.execution.device.type != "cuda":
         raise RuntimeError("vLLM facts did not select CUDA request-sampler execution")
     sorted_hidden_resources = sorted(
         (

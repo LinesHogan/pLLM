@@ -12,7 +12,7 @@ import torch
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
 from tllm.canonical.ptts import DensePageCudaProviderFacts
 from tllm.canonical.workloads.esamp_request import (
-    CanonicalRequestSamplerCudaExecution,
+    CanonicalRequestSamplerExecution,
     ESampRequestWorkload,
 )
 from tllm.canonical.workloads.esamp_request_types import (
@@ -149,7 +149,7 @@ def _step_input(
 
 def _run_step(
     *,
-    execution: CanonicalRequestSamplerCudaExecution,
+    execution: CanonicalRequestSamplerExecution,
     step_id: int,
     identities: tuple[RequestIdentity, RequestIdentity],
     hidden_bindings: ESampRequestPackedHiddenBindings,
@@ -158,15 +158,17 @@ def _run_step(
     execution_stream: torch.cuda.Stream,
     sampler_stream: torch.cuda.Stream,
 ) -> tuple[float, ...]:
-    cancelled = execution.start_step(
-        _step_input(
-            step_id=step_id, identities=identities, hidden_bindings=hidden_bindings,
-            source=source, target=target, producer_stream=execution_stream,
-        ),
-        execution_stream,
-    )
-    execution.execute_anchor(cancelled, AnchorId(0))
-    execution.cancel_step(cancelled)
+    for last_anchor in (0, 1):
+        cancelled = execution.start_step(
+            _step_input(
+                step_id=step_id, identities=identities, hidden_bindings=hidden_bindings,
+                source=source, target=target, producer_stream=execution_stream,
+            ),
+            execution_stream,
+        )
+        for anchor in range(last_anchor + 1):
+            execution.execute_anchor(cancelled, AnchorId(anchor))
+        execution.cancel_step(cancelled)
     handle = execution.start_step(
         _step_input(
             step_id=step_id,
@@ -227,7 +229,7 @@ def main() -> int:
         ),
     )
     execution = compiled.execution
-    if type(execution) is not CanonicalRequestSamplerCudaExecution:
+    if execution.device.type != "cuda":
         raise RuntimeError("canonical ESamp did not compile CUDA execution")
     if execution.plan.fallback_count != 0:
         raise RuntimeError("canonical ESamp CUDA plan used fallback tasks")
@@ -303,8 +305,31 @@ def main() -> int:
         or execution.plan.fallback_count != 0
     ):
         raise RuntimeError("canonical ESamp CUDA graph replay evidence is incomplete")
+    cancelled = execution.start_step(
+        _step_input(
+            step_id=2, identities=identities, hidden_bindings=hidden_bindings,
+            source=source, target=target, producer_stream=execution_stream,
+        ),
+        execution_stream,
+    )
+    execution.execute_anchor(cancelled, AnchorId(0))
+    guidance = execution.sampler_guidance(cancelled, sampler_stream)
+    sampler_done = torch.cuda.Event()
+    with torch.cuda.stream(sampler_stream):
+        torch.cuda._sleep(500_000_000)
+        consumed = guidance.pred_hidden.clone()
+        sampler_done.record()
+    if sampler_done.query():
+        raise RuntimeError("cancellation evidence requires an unfinished sampler read")
     execution.retire(identities)
+    if not sampler_done.query():
+        sampler_stream.synchronize()
+        raise RuntimeError("retirement released state before the cancelled sampler completed")
+    torch.testing.assert_close(consumed, guidance.pred_hidden)
     execution.collect_completed()
+    retired = execution.diagnostics()
+    if retired.active_lineages != 0 or retired.pending_state_releases != 0:
+        raise RuntimeError("cancelled request retirement left live state or release receipts")
     print(
         {
             "losses": all_losses,

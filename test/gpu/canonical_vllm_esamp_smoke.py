@@ -14,7 +14,7 @@ import torch
 from vllm import LLM, SamplingParams
 
 from tllm.canonical.workloads.esamp_request import (
-    CanonicalRequestSamplerCudaExecution,
+    CanonicalRequestSamplerExecution,
     ESampRequestWorkload,
 )
 from tllm.canonical.workloads.esamp_request_types import ESampRequestConfig
@@ -27,11 +27,11 @@ from tllm.canonical_vllm.runtime import (
 
 def _require_esamp_execution(
     handle: CanonicalVllmLlm,
-) -> CanonicalRequestSamplerCudaExecution:
+) -> CanonicalRequestSamplerExecution:
     execution = handle.deployment.execution
     if type(handle.deployment.workload) is not ESampRequestWorkload:
         raise RuntimeError("canonical vLLM smoke did not receive an ESamp deployment")
-    if type(execution) is not CanonicalRequestSamplerCudaExecution:
+    if type(execution) is not CanonicalRequestSamplerExecution:
         raise RuntimeError("canonical vLLM smoke did not receive ESamp CUDA execution")
     return execution
 
