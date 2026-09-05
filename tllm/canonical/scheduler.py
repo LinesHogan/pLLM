@@ -7,6 +7,7 @@ from dataclasses import asdict
 from typing import cast
 
 from tllm import _core
+from tllm.contracts.canonical_compilation import CanonicalPlanBundle
 from tllm.contracts.semantic_graph import (
     AnchorId,
     AnchorSymbol,
@@ -63,6 +64,12 @@ def _graph_json(graph: SemanticGraph) -> str:
 
 def _timeline_json(timeline: SchedulerTimeline) -> str:
     return _json(asdict(timeline))
+
+
+def validate_plan_bundle(plan: CanonicalPlanBundle) -> None:
+    wire = asdict(plan)
+    wire["semantic_graph"] = json.loads(_graph_json(plan.semantic_graph))
+    _core.validate_canonical_plan_bundle(_json(wire))
 
 
 def _scheduled_task(raw: object, label: str) -> ScheduledTask:

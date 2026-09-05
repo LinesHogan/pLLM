@@ -9,22 +9,8 @@ import torch
 
 from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.canonical.execution import TaskGraphExecution
-from tllm.canonical.ptts.dense_page import (
-    DensePageAdmission,
-    DensePageStateProvider,
-)
-from tllm.canonical.ptts.dense_page_cuda_types import (
-    CudaDensePageAdmission,
-    CudaDensePageRelease,
-)
-from tllm.canonical.ptts.dense_page_cuda import CudaDensePageStateProvider
-from tllm.canonical.ptts.cuda_publication import (
-    CudaRequestStatePublicationCoordinator,
-)
-from tllm.canonical.ptts.request_state import (
-    RequestStateDirectory,
-)
-from tllm.canonical.ptts.publication import RequestStatePublicationCoordinator
+from tllm.canonical.ptts.page_bundle import PageBundleArena, PageRelease
+from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.canonical.scheduler import (
     compile_schedule,
     lower_physical_plan,
@@ -48,11 +34,8 @@ from tllm.canonical.workloads.inplace_ttt.layout import (
 )
 from tllm.canonical.workloads.inplace_ttt.tasks import (
     InPlaceTTTCommittedTransition,
-    InPlaceTTTCpuStorage,
-    InPlaceTTTCudaStorage,
     InPlaceTTTPublishTask,
     InPlaceTTTStepContext,
-    InPlaceTTTSubmitting,
     InPlaceTTTTransitionPending,
     InPlaceTTTTransitionTask,
     INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION,
@@ -127,12 +110,6 @@ _PUBLISH_TASK = TaskSymbol("publish")
 _TRANSITION_TASK = TaskSymbol("transition")
 
 
-_DenseStorage = (
-    tuple[DensePageStateProvider, RequestStatePublicationCoordinator]
-    | tuple[CudaDensePageStateProvider, CudaRequestStatePublicationCoordinator]
-)
-
-
 @dataclass(frozen=True, slots=True)
 class _DenseSamplerPending:
     pass
@@ -140,7 +117,7 @@ class _DenseSamplerPending:
 
 @dataclass(frozen=True, slots=True)
 class _DenseSamplerReleased:
-    release: CudaDensePageRelease | None
+    release: PageRelease
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,14 +147,14 @@ class CanonicalDenseOverlayExecution:
         specialization: InPlaceTTTSpecialization,
         plan_bundle: CanonicalPlanBundle,
         layout: InPlaceTTTStateLayout,
-        storage: _DenseStorage,
+        arena: PageBundleArena,
         directory: RequestStateDirectory,
     ) -> None:
         if (
             plan_bundle.semantic_graph.execution_parameters_digest
             != specialization.execution_parameters_digest(config)
             or plan_bundle.schedule_physical.plan_epoch != plan_bundle.state_physical.plan_epoch
-            or storage[0].device != specialization.device
+            or arena.device != specialization.device
         ):
             raise ValueError("dense overlay execution artifacts disagree")
         validate_schedule(
@@ -189,9 +166,8 @@ class CanonicalDenseOverlayExecution:
         )
         self._config = config
         self._specialization = specialization
-        self._plan_bundle = plan_bundle
         self._layout = layout
-        self._storage = storage
+        self._arena = arena
         self._directory = directory
         publish_id, transition_id = (
             (INPLACE_TTT_PUBLISH_IMPLEMENTATION, INPLACE_TTT_TRANSITION_IMPLEMENTATION)
@@ -206,18 +182,17 @@ class CanonicalDenseOverlayExecution:
         self._active: dict[int, _ActiveDenseStep] = {}
         self._execution_state: _DenseLive | _DenseFailed = _DenseLive()
         self._next_handle_id = 1
-        self._pending_releases: list[CudaDensePageRelease] = []
         self._update_count = 0
         self._trained_rows = 0
         self._lock = RLock()
 
     @property
     def plan(self) -> PhysicalPlan:
-        return self._plan_bundle.schedule_physical
+        return self._arena.plan.schedule_physical
 
     @property
     def state_plan(self) -> StatePhysicalPlan:
-        return self._plan_bundle.state_physical
+        return self._arena.plan.state_physical
 
     @property
     def config(self) -> InPlaceTTTConfig:
@@ -241,27 +216,10 @@ class CanonicalDenseOverlayExecution:
         with self._lock:
             self._require_live()
             self._require_stream(stream)
-            logical = self._directory.prepare_admission(identities)
-            try:
-                match self._storage[0]:
-                    case DensePageStateProvider() as provider:
-                        provider.admit_batch(tuple(
-                            DensePageAdmission(admission.ref, provider.new_zero_root_tensors())
-                            for admission in logical.admissions
-                        ))
-                    case CudaDensePageStateProvider() as provider:
-                        if stream is None:
-                            raise RuntimeError("CUDA admission requires a stream")
-                        prepared = provider.prepare_admission_batch(tuple(
-                            CudaDensePageAdmission(admission.ref, provider.new_zero_root(stream))
-                            for admission in logical.admissions
-                        ))
-                        provider.submit_admission_batch(prepared, stream)
-            except Exception:
-                self._directory.abort_admission(logical)
-                raise
-            self._directory.commit_admission(logical)
-            return tuple(admission.ref for admission in logical.admissions)
+            batch = self._directory.prepare_admission(identities, stream)
+            receipt = self._directory.commit_admission(batch)
+            self._arena.settle(receipt)
+            return receipt.after_refs
 
     def step(self, step: InPlaceTTTStepInput) -> InPlaceTTTStepResult:
         with self._lock:
@@ -302,16 +260,16 @@ class CanonicalDenseOverlayExecution:
         )))
         lease = self._directory.acquire_transition_lease(selection)
         try:
-            storage = self._pin(selection.refs, stream)
+            pin = self._arena.pin_exact(selection.refs, stream)
         except Exception:
             self._directory.release_transition_lease(lease)
             raise
         context = InPlaceTTTStepContext(
-            None, selection, lease, storage, InPlaceTTTTransitionPending(),
+            None, selection, lease, self._arena, pin, InPlaceTTTTransitionPending(),
         )
         try:
             field_rows = tuple(
-                (binding, storage.field_rows(selection.refs, binding.fields[0]))
+                (binding, self._arena.field_rows(pin, binding.fields[0]))
                 for binding in bindings
             )
             deltas = tuple(
@@ -320,9 +278,7 @@ class CanonicalDenseOverlayExecution:
                 for index, ref in enumerate(selection.refs)
             )
         except Exception:
-            release = storage.release()
-            if release is not None:
-                self._pending_releases.append(release)
+            self._arena.release_pin(pin)
             self._directory.release_transition_lease(lease)
             raise
         token = InPlaceTTTStepHandle(self._next_handle_id, identities, selection.refs, deltas)
@@ -330,19 +286,6 @@ class CanonicalDenseOverlayExecution:
         active = _ActiveDenseStep(token, context, int(pin_anchor_id), _DenseSamplerPending())
         self._active[token.handle_id] = active
         return active
-
-    def _pin(
-        self, refs: tuple[StateRef, ...], stream: torch.cuda.Stream | None,
-    ) -> InPlaceTTTCpuStorage | InPlaceTTTCudaStorage:
-        match self._storage:
-            case DensePageStateProvider() as provider, RequestStatePublicationCoordinator() as publication:
-                return InPlaceTTTCpuStorage(provider, publication, provider.pin_exact(refs))
-            case CudaDensePageStateProvider() as provider, CudaRequestStatePublicationCoordinator() as publication:
-                if stream is None:
-                    raise RuntimeError("CUDA pin requires a stream")
-                return InPlaceTTTCudaStorage(
-                    provider, publication, provider.pin_exact(refs, stream), stream,
-                )
 
     def submit_captured(
         self,
@@ -372,7 +315,7 @@ class CanonicalDenseOverlayExecution:
                         or physical.anchor_id != binding.anchor_id
                     ):
                         raise ValueError("signed overlay task differs from physical plan")
-                stream = active.context.storage.stream
+                stream = active.context.pin.stream
                 match captured, stream:
                     case InPlaceTTTStepBatch() as batch, None:
                         pass
@@ -398,11 +341,15 @@ class CanonicalDenseOverlayExecution:
             context.result()
         except Exception:
             match context.transition:
-                case InPlaceTTTSubmitting() | InPlaceTTTCommittedTransition():
+                case InPlaceTTTCommittedTransition():
                     self._execution_state = _DenseFailed()
                 case _:
-                    context.abort()
-                    self._release_step(active)
+                    try:
+                        context.abort()
+                        self._release_step(active)
+                    except Exception:
+                        self._execution_state = _DenseFailed()
+                        raise
             raise
         active.last_attachment_anchor_id = int(self.plan.tasks[-1].anchor_id)
 
@@ -422,10 +369,10 @@ class CanonicalDenseOverlayExecution:
                     raise RuntimeError("sampler completion is already recorded")
             if int(release_anchor_id) < active.last_attachment_anchor_id:
                 raise ValueError("signed release anchor precedes publication")
-            stream = active.context.storage.stream
+            stream = active.context.pin.stream
             if sampler_stream is not None and stream is not None and sampler_stream != stream:
                 CudaStreamReadiness(sampler_stream).order_on(stream)
-            release = active.context.storage.release()
+            release = self._arena.release_pin(active.context.pin)
             active.last_attachment_anchor_id = int(release_anchor_id)
             active.sampler = _DenseSamplerReleased(release)
 
@@ -455,13 +402,13 @@ class CanonicalDenseOverlayExecution:
 
     def _release_step(self, active: _ActiveDenseStep) -> None:
         match active.sampler:
-            case _DenseSamplerReleased(release=release):
+            case _DenseSamplerReleased():
                 pass
             case _DenseSamplerPending():
-                release = active.context.storage.release()
+                self._arena.release_pin(active.context.pin)
+        if isinstance(active.context.transition, InPlaceTTTCommittedTransition):
+            self._arena.settle(active.context.transition.receipt)
         self._directory.release_transition_lease(active.context.transition_lease)
-        if release is not None:
-            self._pending_releases.append(release)
         self._active.pop(active.token.handle_id)
 
     def retire(
@@ -473,67 +420,31 @@ class CanonicalDenseOverlayExecution:
                 raise ValueError("signed finish anchor is invalid")
             if self.device.type == "cuda" and finish_anchor_id is None:
                 raise ValueError("CUDA retirement requires a signed finish anchor")
-            self._collect_completed()
-            match self._storage[0]:
-                case CudaDensePageStateProvider() as provider:
-                    for release in self._pending_releases:
-                        provider.wait_release(release)
-                    self._pending_releases.clear()
-                    provider.collect_completed()
-                case DensePageStateProvider():
-                    pass
-            logical = self._directory.prepare_retirement(identities)
-            try:
-                self._storage[0].retire_batch(logical.refs)
-            except Exception:
-                self._directory.abort_retirement(logical)
-                raise
-            self._directory.commit_retirement(logical)
-            return InPlaceTTTCleanupReceipt(logical.refs)
+            self._arena.collect_completed(wait=True)
+            return InPlaceTTTCleanupReceipt(self._directory.retire(identities))
 
     def snapshot(
         self, ref: StateRef, stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, ...]:
         with self._lock:
             self._require_live()
-            self._require_stream(stream)
-            match self._storage[0]:
-                case DensePageStateProvider() as provider:
-                    return provider.snapshot(ref)
-                case CudaDensePageStateProvider() as provider:
-                    if stream is None:
-                        raise RuntimeError("CUDA snapshot requires a stream")
-                    pin = provider.pin_exact((ref,), stream)
-                    try:
-                        return provider.snapshot(pin, ref, stream)
-                    finally:
-                        release = provider.release_pin(pin, stream)
-                        provider.wait_release(release)
+            pin = self._arena.pin_exact((ref,), stream)
+            try:
+                return self._arena.snapshot(pin, ref)
+            finally:
+                self._arena.wait_release(self._arena.release_pin(pin))
 
     def diagnostics(self) -> InPlaceTTTDiagnostics:
         with self._lock:
             self._require_live()
-            self._collect_completed()
-            match self._storage[0]:
-                case CudaDensePageStateProvider() as provider:
-                    pending = provider.pending_pin_releases
-                case DensePageStateProvider():
-                    pending = 0
+            self._arena.collect_completed()
             return InPlaceTTTDiagnostics(
                 self._directory.active_count, self._update_count, self._trained_rows,
-                self.state_plan, self.plan.fallback_count, pending,
+                self.state_plan, self.plan.fallback_count, self._arena.pending_pin_releases,
             )
 
     def _collect_completed(self) -> None:
-        match self._storage[0]:
-            case CudaDensePageStateProvider() as provider:
-                self._pending_releases = [
-                    release for release in self._pending_releases
-                    if not provider.release_complete(release)
-                ]
-                provider.collect_completed()
-            case DensePageStateProvider():
-                pass
+        self._arena.collect_completed()
 
     def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
         if self.device.type == "cpu":
@@ -775,14 +686,6 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             or selected_provider.device_ordinal != specialization.device_ordinal
         ):
             raise RuntimeError("Rust-selected state placement differs from device")
-        directory = RequestStateDirectory(
-            layout_binding.layout_id,
-            (
-                RequestKeyField.REQUEST_ID,
-                RequestKeyField.PROMPT_IDX,
-                RequestKeyField.SAMPLE_IDX,
-            ),
-        )
         plan_bundle = CanonicalPlanBundle(
             graph,
             options.timeline,
@@ -794,40 +697,10 @@ class InPlaceTTTWorkload(CanonicalWorkload):
             layout_request,
             layout_decision,
         )
-        match selected_provider.device_kind:
-            case StateDeviceKind.CPU:
-                cpu_provider = DensePageStateProvider(
-                    tensor_layout_request=layout_request,
-                    tensor_layout_decision=layout_decision,
-                    representation_request=representation_request,
-                    representation_decision=representation,
-                    physical_plan=state_physical,
-                    local_candidates=candidates,
-                    resource=str(_FAST_WEIGHT_STATE),
-                )
-                cpu_publication = RequestStatePublicationCoordinator(
-                    directory,
-                    cpu_provider,
-                )
-                storage: _DenseStorage = (cpu_provider, cpu_publication)
-            case StateDeviceKind.CUDA:
-                cuda_provider = CudaDensePageStateProvider(
-                    tensor_layout_request=layout_request,
-                    tensor_layout_decision=layout_decision,
-                    representation_request=representation_request,
-                    representation_decision=representation,
-                    physical_plan=state_physical,
-                    local_candidates=candidates,
-                    resource=str(_FAST_WEIGHT_STATE),
-                    device_ordinal=selected_provider.device_ordinal,
-                )
-                cuda_publication = CudaRequestStatePublicationCoordinator(
-                    directory,
-                    cuda_provider,
-                )
-                storage = (cuda_provider, cuda_publication)
+        arena = PageBundleArena(plan_bundle, candidates)
+        directory = RequestStateDirectory(arena, str(_FAST_WEIGHT_STATE), tuple(RequestKeyField))
         execution = CanonicalDenseOverlayExecution(
-            self.config, specialization, plan_bundle, state_layout, storage, directory,
+            self.config, specialization, plan_bundle, state_layout, arena, directory,
         )
         return InPlaceTTTCompilation(
             execution,

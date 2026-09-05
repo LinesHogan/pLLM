@@ -9,7 +9,7 @@ from hashlib import sha256
 import torch
 
 from tllm.canonical.cuda_stream import CudaStreamReadiness
-from tllm.canonical.ptts.dense_page_planning import DensePageProviderFacts
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.contracts.parameter_overlay import (
     ParameterOverlayPinnedTensor,
     ParameterOverlayPublication,
@@ -158,7 +158,7 @@ class InPlaceTTTSpecialization:
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTCompileOptions:
     timeline: SchedulerTimeline
-    providers: tuple[DensePageProviderFacts, ...]
+    providers: tuple[PageBundleProviderFacts, ...]
     max_admitted_lineages: int
     state_memory_budget_bytes: int
     plan_epoch: int = 1

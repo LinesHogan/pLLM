@@ -4,27 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
-from typing import Protocol
 
 import torch
 
 from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout, low_rank_gated_forward
-from tllm.canonical.ptts import CudaDensePageStateProvider, CudaDensePageVersionPin
-from tllm.canonical.ptts.dense_page_cuda_types import CudaDensePageRelease
-from tllm.canonical.ptts.dense_page import (
-    DensePageAdamWConfig,
-    DensePageAdamWFieldBinding,
-    DensePageStateProvider,
-    DensePageVersionPin,
-)
+from tllm.canonical.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
+from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePin, PagePublication
 from tllm.canonical.ptts.request_state import (
-    RequestStateDirectory,
-    RequestStateSelection,
-    RequestStateTransitionLease,
-    RequestStateTransitionBatch,
+    RequestStateDirectory, RequestStateSelection, RequestStateTransitionLease,
 )
-from tllm.canonical.ptts.publication import RequestStatePublicationReceipt
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestConfig,
     ESampRequestStepInput,
@@ -36,24 +25,9 @@ from tllm.canonical.workloads.esamp_request_types import (
 )
 from tllm.contracts.sampler import PackedSamplerGuidanceBatch
 from tllm.contracts.semantic_graph import ImplementationId
-from tllm.contracts.state_ref import StateRef
 
 
 TensorGradients = tuple[torch.Tensor, ...]
-
-
-class ESampStateKernel(Protocol):
-    @property
-    def stream(self) -> torch.cuda.Stream | None: ...
-
-    def read(self, refs: tuple[StateRef, ...]) -> torch.Tensor: ...
-
-    def release(self) -> CudaDensePageRelease | None: ...
-
-    def submit(
-        self, logical: RequestStateTransitionBatch, config: ESampRequestConfig,
-        gradients: TensorGradients,
-    ) -> RequestStatePublicationReceipt: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +67,7 @@ class ESampPublicationPending:
     pass
 
 
-ESampPublication = ESampPublicationPending | RequestStatePublicationReceipt
+ESampPublication = ESampPublicationPending | PagePublication
 
 
 @dataclass(slots=True)
@@ -106,11 +80,12 @@ class ESampStepContext:
     prediction: ESampPrediction
     optimization: ESampOptimization
     publication: ESampPublication
-    kernel: ESampStateKernel
+    arena: PageBundleArena
+    pin: PagePin
 
 
-def esamp_adamw_field_binding() -> DensePageAdamWFieldBinding:
-    return DensePageAdamWFieldBinding(
+def esamp_adamw_field_binding() -> AdamWFields:
+    return AdamWFields(
         ESAMP_PARAMETER_FIELD,
         ESAMP_GRADIENT_FIELD,
         ESAMP_STEP_FIELD,
@@ -119,8 +94,8 @@ def esamp_adamw_field_binding() -> DensePageAdamWFieldBinding:
     )
 
 
-def esamp_adamw_config(config: ESampRequestConfig) -> DensePageAdamWConfig:
-    return DensePageAdamWConfig(
+def esamp_adamw_config(config: ESampRequestConfig) -> AdamWConfig:
+    return AdamWConfig(
         config.learning_rate, config.betas, config.eps, config.weight_decay
     )
 
@@ -239,69 +214,6 @@ def compute_low_rank_losses_and_gradients(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ESampCpuStateKernel:
-    provider: DensePageStateProvider
-    state_pin: DensePageVersionPin
-    stream: None = None
-
-    def read(self, refs: tuple[StateRef, ...]) -> torch.Tensor:
-        return torch.stack(tuple(self.provider.snapshot(ref)[int(ESAMP_PARAMETER_FIELD)] for ref in refs))
-
-    def release(self) -> None:
-        self.provider.release_pin(self.state_pin)
-
-    def submit(
-        self, logical: RequestStateTransitionBatch, config: ESampRequestConfig,
-        gradients: TensorGradients,
-    ) -> RequestStatePublicationReceipt:
-        physical = self.provider.prepare_transition_batch(logical.before_refs, logical.after_refs)
-        self.provider.compute_adamw_transition(
-            physical, esamp_adamw_field_binding(), esamp_adamw_config(config), gradients,
-        )
-        try:
-            receipt = RequestStatePublicationReceipt(
-                logical.operation_id, physical.transaction_id, logical.before_refs, logical.after_refs,
-            )
-            self.provider.publish_transition_batch(physical)
-        except Exception:
-            self.provider.abort_transition_batch(physical)
-            raise
-        return receipt
-
-
-@dataclass(frozen=True, slots=True)
-class ESampCudaStateKernel:
-    provider: CudaDensePageStateProvider
-    state_pin: CudaDensePageVersionPin
-    stream: torch.cuda.Stream
-
-    def read(self, refs: tuple[StateRef, ...]) -> torch.Tensor:
-        return self.provider.pinned_field_rows(self.state_pin, ESAMP_PARAMETER_FIELD, self.stream)
-
-    def release(self) -> CudaDensePageRelease:
-        return self.provider.release_pin(self.state_pin, self.stream)
-
-    def submit(
-        self, logical: RequestStateTransitionBatch, config: ESampRequestConfig,
-        gradients: TensorGradients,
-    ) -> RequestStatePublicationReceipt:
-        bound = self.provider.bind_gradients(gradients, self.stream)
-        try:
-            physical = self.provider.prepare_transition_batch(
-                logical.before_refs, logical.after_refs, self.stream,
-            )
-            publication = self.provider.submit_adamw_transition(
-                physical, esamp_adamw_field_binding(), esamp_adamw_config(config), bound, self.stream,
-            )
-        except Exception:
-            self.provider.discard_gradients(bound)
-            raise
-        return RequestStatePublicationReceipt(
-            logical.operation_id, physical.transaction_id, logical.before_refs, logical.after_refs, publication,
-        )
-
-
 class ESampPredictTask:
     __slots__ = ("_config", "_layout", "implementation_id")
 
@@ -314,8 +226,8 @@ class ESampPredictTask:
         self.implementation_id = implementation_id
 
     def execute(self, context: ESampStepContext) -> None:
-        state_vectors = context.kernel.read(context.selection.refs)
-        stream = context.kernel.stream
+        state_vectors = context.arena.field_rows(context.pin, ESAMP_PARAMETER_FIELD)
+        stream = context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             training_source, training_target, row_state_indices = selected_training_tensors(
                 context.selection, context.source, context.target,
@@ -342,7 +254,7 @@ class ESampLossTask:
                 pass
             case ESampPredictionPending():
                 raise RuntimeError("ESamp loss requires the planned prediction")
-        stream = context.kernel.stream
+        stream = context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             losses, gradients = compute_low_rank_losses_and_gradients(
                 predicted, self._layout, clone_outputs=stream is None,
@@ -367,11 +279,14 @@ class ESampTrainTask:
                 pass
             case ESampOptimizationPending():
                 raise RuntimeError("ESamp train requires the planned loss")
-        logical = self._directory.prepare_transition(context.selection, context.transition_lease)
+        write = self._directory.prepare_transition(
+            context.selection, context.transition_lease, context.pin.stream,
+        )
         try:
-            receipt = context.kernel.submit(logical, self._config, optimized.gradients)
+            with nullcontext() if write.stream is None else torch.cuda.stream(write.stream):
+                apply_adamw(context.arena.writable_roots(write), esamp_adamw_field_binding(),
+                    esamp_adamw_config(self._config), optimized.gradients)
+            context.publication = context.arena.publish(write)
         except Exception:
-            self._directory.abort_transition(logical)
+            context.arena.abort(write)
             raise
-        self._directory.commit_transition(logical)
-        context.publication = receipt

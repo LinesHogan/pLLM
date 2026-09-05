@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from contextlib import nullcontext
 from threading import RLock
 
 import torch
@@ -13,19 +14,8 @@ from tllm.canonical.kernels.low_rank_gated import (
     LowRankGatedLayout,
     initialize_low_rank_gated,
 )
-from tllm.canonical.ptts import (
-    CudaDensePageStateProvider,
-)
-from tllm.canonical.ptts.dense_page import (
-    DensePageAdmission,
-    DensePageStateProvider,
-)
-from tllm.canonical.ptts.dense_page_cuda_types import (
-    CudaDensePageAdmission,
-    CudaDensePageRelease,
-)
+from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication
 from tllm.canonical.ptts.request_state import RequestStateDirectory
-from tllm.canonical.ptts.publication import RequestStatePublicationReceipt
 from tllm.contracts.backend_attachment import (
     RequestSamplerAttachmentSpec,
 )
@@ -47,12 +37,9 @@ from tllm.canonical.tensor_layout import (
 )
 from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.esamp_request_task_common import (
-    ESampCpuStateKernel,
-    ESampCudaStateKernel,
     ESampLossTask,
     ESampPredictTask,
     ESampStepContext,
-    ESampStateKernel,
     ESampTrainTask,
     ESampOptimizationPending,
     ESampOptimized,
@@ -174,7 +161,7 @@ def _completed_step_result(
         case (
             ESampPredicted() as predicted,
             ESampOptimized() as optimized,
-            RequestStatePublicationReceipt() as published,
+            PagePublication() as published,
         ):
             return ESampRequestStepResult(
                 context.step.rows.step_id,
@@ -228,7 +215,7 @@ class CanonicalRequestSamplerExecution:
         plan: PhysicalPlan,
         state_plan: StatePhysicalPlan,
         kernel_layout: LowRankGatedLayout,
-        provider: DensePageStateProvider | CudaDensePageStateProvider,
+        arena: PageBundleArena,
         directory: RequestStateDirectory,
         sampler_completion_anchor_id: AnchorId,
     ) -> None:
@@ -236,14 +223,14 @@ class CanonicalRequestSamplerExecution:
             torch.device("cpu") if specialization.device_kind is StateDeviceKind.CPU
             else torch.device("cuda", specialization.device_ordinal)
         )
-        if plan.plan_epoch != state_plan.plan_epoch or provider.device != expected_device:
+        if plan.plan_epoch != state_plan.plan_epoch or arena.device != expected_device:
             raise ValueError("request-sampler plans or placement differ")
         self._config = config
         self._specialization = specialization
         self._plan = plan
         self._state_plan = state_plan
         self._kernel_layout = kernel_layout
-        self._provider = provider
+        self._arena = arena
         self._directory = directory
         self._sampler_completion_anchor_id = sampler_completion_anchor_id
         loss_id, predict_id, train_id = (
@@ -259,14 +246,13 @@ class CanonicalRequestSamplerExecution:
              ESampPredictTask(config, kernel_layout, predict_id),
              ESampTrainTask(config, directory, train_id)),
         )
-        self._generator = torch.Generator(device=provider.device)
+        self._generator = torch.Generator(device=arena.device)
         self._generator.manual_seed(specialization.initialization_seed)
         self._loss_count = 0
         self._update_count = 0
         self._completed_sampler_pins = 0
         self._active_handles: dict[int, _ActiveRequestSamplerStep] = {}
         self._next_handle_id = 1
-        self._pending_releases: list[CudaDensePageRelease] = []
         self._lock = RLock()
 
     @property
@@ -291,41 +277,34 @@ class CanonicalRequestSamplerExecution:
 
     @property
     def device(self) -> torch.device:
-        return self._provider.device
+        return self._arena.device
 
     @property
     def free_state_pages(self) -> int:
-        return self._provider.free_pages
+        return self._arena.free_pages
 
     @property
     def state_pool_addresses(self) -> tuple[int, ...]:
-        match self._provider:
-            case CudaDensePageStateProvider() as provider:
-                return provider.pool_addresses
-            case DensePageStateProvider():
-                raise RuntimeError("stable capture pools require CUDA storage")
+        return self._arena.pool_addresses
 
     def require_stable_state_pool(self) -> None:
-        match self._provider:
-            case CudaDensePageStateProvider() as provider:
-                provider.require_stable()
-            case DensePageStateProvider():
-                raise RuntimeError("stable capture pools require CUDA storage")
+        self._arena.require_stable()
 
     def admit(
         self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None,
     ) -> tuple[StateRef, ...]:
         with self._lock:
-            self._require_stream(stream)
-            logical = self._directory.prepare_admission(identities)
-            refs = tuple(admission.ref for admission in logical.admissions)
+            batch = self._directory.prepare_admission(identities, stream)
             try:
-                self._admit_physical(refs, stream)
+                with nullcontext() if stream is None else torch.cuda.stream(stream):
+                    for tensors in self._arena.writable_roots(batch.write):
+                        self._initialize(tensors)
             except Exception:
-                self._directory.abort_admission(logical)
+                self._directory.abort_admission(batch)
                 raise
-            self._directory.commit_admission(logical)
-            return refs
+            receipt = self._directory.commit_admission(batch)
+            self._arena.settle(receipt)
+            return receipt.after_refs
 
     def _initialize(self, tensors: tuple[torch.Tensor, ...]) -> None:
         parameters = tensors[int(ESAMP_PARAMETER_FIELD)]
@@ -333,29 +312,6 @@ class CanonicalRequestSamplerExecution:
             self._kernel_layout, dtype=parameters.dtype, device=parameters.device,
             generator=self._generator,
         ))
-
-    def _admit_physical(
-        self, refs: tuple[StateRef, ...], stream: torch.cuda.Stream | None,
-    ) -> None:
-        match self._provider:
-            case DensePageStateProvider() as provider:
-                admissions: list[DensePageAdmission] = []
-                for ref in refs:
-                    tensors = provider.new_zero_root_tensors()
-                    self._initialize(tensors)
-                    admissions.append(DensePageAdmission(ref, tensors))
-                provider.admit_batch(tuple(admissions))
-            case CudaDensePageStateProvider() as provider:
-                if stream is None:
-                    raise RuntimeError("CUDA admission requires a stream")
-                cuda_admissions: list[CudaDensePageAdmission] = []
-                for ref in refs:
-                    initial = provider.new_zero_root(stream)
-                    with torch.cuda.stream(stream):
-                        self._initialize(initial.tensors)
-                    cuda_admissions.append(CudaDensePageAdmission(ref, initial))
-                prepared = provider.prepare_admission_batch(tuple(cuda_admissions))
-                provider.submit_admission_batch(prepared, stream)
 
     def start_step(
         self, step: ESampRequestStepInput, stream: torch.cuda.Stream | None = None,
@@ -388,13 +344,13 @@ class CanonicalRequestSamplerExecution:
             ))
             lease = self._directory.acquire_transition_lease(selection)
             try:
-                kernel = self._pin(selection.refs, stream)
+                pin = self._arena.pin_exact(selection.refs, stream)
             except Exception:
                 self._directory.release_transition_lease(lease)
                 raise
             context = ESampStepContext(
                 step, source, target, selection, lease, ESampPredictionPending(),
-                ESampOptimizationPending(), ESampPublicationPending(), kernel,
+                ESampOptimizationPending(), ESampPublicationPending(), self._arena, pin,
             )
             handle = CanonicalRequestStepHandle(self._next_handle_id)
             self._next_handle_id += 1
@@ -402,17 +358,6 @@ class CanonicalRequestSamplerExecution:
                 handle, self._runner.start(context), _SamplerPending(),
             )
             return handle
-
-    def _pin(
-        self, refs: tuple[StateRef, ...], stream: torch.cuda.Stream | None,
-    ) -> ESampStateKernel:
-        match self._provider:
-            case DensePageStateProvider() as provider:
-                return ESampCpuStateKernel(provider, provider.pin_exact(refs))
-            case CudaDensePageStateProvider() as provider:
-                if stream is None:
-                    raise RuntimeError("CUDA pin requires a stream")
-                return ESampCudaStateKernel(provider, provider.pin_exact(refs, stream), stream)
 
     def execute_anchor(self, handle: CanonicalRequestStepHandle, anchor_id: AnchorId) -> None:
         with self._lock:
@@ -479,7 +424,7 @@ class CanonicalRequestSamplerExecution:
     def _order_sampler_completion(
         self, active: _ActiveRequestSamplerStep, sampler_stream: torch.cuda.Stream,
     ) -> None:
-        stream = active.invocation.context.kernel.stream
+        stream = active.invocation.context.pin.stream
         if stream is not None:
             completion = torch.cuda.Event(blocking=False)
             completion.record(sampler_stream)
@@ -509,9 +454,9 @@ class CanonicalRequestSamplerExecution:
 
     def _release_step(self, active: _ActiveRequestSamplerStep) -> None:
         context = active.invocation.context
-        release = context.kernel.release()
-        if release is not None:
-            self._pending_releases.append(release)
+        self._arena.release_pin(context.pin)
+        if isinstance(context.publication, PagePublication):
+            self._arena.settle(context.publication)
         self._directory.release_transition_lease(context.transition_lease)
         self._active_handles.pop(active.token.handle_id)
 
@@ -533,56 +478,30 @@ class CanonicalRequestSamplerExecution:
                 if retirement_keys.intersection(active.invocation.context.selection.keys):
                     self._fail_step(active)
             self._collect_completed(wait=True)
-            logical = self._directory.prepare_retirement(identities)
-            try:
-                self._provider.retire_batch(logical.refs)
-            except Exception:
-                self._directory.abort_retirement(logical)
-                raise
-            self._directory.commit_retirement(logical)
+            self._directory.retire(identities)
 
     def snapshot(
         self, ref: StateRef, stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, ...]:
         with self._lock:
-            self._require_stream(stream)
-            match self._provider:
-                case DensePageStateProvider() as provider:
-                    return provider.snapshot(ref)
-                case CudaDensePageStateProvider() as provider:
-                    if stream is None:
-                        raise RuntimeError("CUDA snapshot requires a stream")
-                    pin = provider.pin_exact((ref,), stream)
-                    try:
-                        return provider.snapshot(pin, ref, stream)
-                    finally:
-                        self._pending_releases.append(provider.release_pin(pin, stream))
+            pin = self._arena.pin_exact((ref,), stream)
+            try:
+                return self._arena.snapshot(pin, ref)
+            finally:
+                self._arena.release_pin(pin)
+                self._arena.collect_completed()
 
     def collect_completed(self) -> None:
-        with self._lock:
-            self._collect_completed(wait=False)
+        self._arena.collect_completed()
 
     def _collect_completed(self, *, wait: bool) -> None:
-        match self._provider:
-            case CudaDensePageStateProvider() as provider:
-                if wait:
-                    for release in self._pending_releases:
-                        provider.wait_release(release)
-                    self._pending_releases.clear()
-                else:
-                    self._pending_releases = [
-                        release for release in self._pending_releases
-                        if not provider.release_complete(release)
-                    ]
-                provider.collect_completed()
-            case DensePageStateProvider():
-                pass
+        self._arena.collect_completed(wait=wait)
 
     def diagnostics(self) -> ESampRequestDiagnostics:
         with self._lock:
             return ESampRequestDiagnostics(
                 self._directory.active_count, self._loss_count, self._update_count,
-                self._completed_sampler_pins, len(self._pending_releases), self._state_plan,
+                self._completed_sampler_pins, self._arena.pending_pin_releases, self._state_plan,
             )
 
     def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
@@ -976,10 +895,6 @@ class ESampRequestWorkload(CanonicalWorkload):
             raise RuntimeError(
                 "Rust-selected state placement differs from specialization"
             )
-        directory = RequestStateDirectory(
-            binding.layout_id,
-            self.config.key_fields,
-        )
         plan_bundle = CanonicalPlanBundle(
             semantic_graph=graph,
             timeline=options.timeline,
@@ -991,35 +906,15 @@ class ESampRequestWorkload(CanonicalWorkload):
             tensor_layout_request=layout_request,
             tensor_layout_decision=layout_decision,
         )
-        match selected_provider.device_kind:
-            case StateDeviceKind.CPU:
-                provider = DensePageStateProvider(
-                    tensor_layout_request=layout_request,
-                    tensor_layout_decision=layout_decision,
-                    representation_request=representation_request,
-                    representation_decision=representation,
-                    physical_plan=state_physical,
-                    local_candidates=candidates,
-                    resource=str(_STATE_RESOURCE),
-                )
-            case StateDeviceKind.CUDA:
-                provider = CudaDensePageStateProvider(
-                    tensor_layout_request=layout_request,
-                    tensor_layout_decision=layout_decision,
-                    representation_request=representation_request,
-                    representation_decision=representation,
-                    physical_plan=state_physical,
-                    local_candidates=candidates,
-                    resource=str(_STATE_RESOURCE),
-                    device_ordinal=selected_provider.device_ordinal,
-                )
+        arena = PageBundleArena(plan_bundle, candidates)
+        directory = RequestStateDirectory(arena, str(_STATE_RESOURCE), self.config.key_fields)
         execution = CanonicalRequestSamplerExecution(
             config=self.config,
             specialization=specialization,
             plan=physical,
             state_plan=state_physical,
             kernel_layout=kernel_layout,
-            provider=provider,
+            arena=arena,
             directory=directory,
             sampler_completion_anchor_id=sampler_anchor_ids[0],
         )

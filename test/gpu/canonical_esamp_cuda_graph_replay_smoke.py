@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
-from tllm.canonical.ptts import DensePageCudaProviderFacts
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.workloads.esamp_request import (
     CanonicalRequestSamplerExecution,
     ESampRequestWorkload,
@@ -218,8 +218,9 @@ def main() -> int:
         ESampRequestCompileOptions(
             timeline=_timeline(),
             providers=(
-                DensePageCudaProviderFacts(
+                PageBundleProviderFacts(
                     "canonical.cuda_dense_page@1",
+                    device_kind=StateDeviceKind.CUDA,
                     device_ordinal=0,
                     max_live_versions_per_lineage=3,
                 ),

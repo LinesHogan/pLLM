@@ -13,7 +13,7 @@ from tllm.canonical.backend_attachment import (
     validate_backend_attachment, validate_backend_attachment_physical,
     validate_backend_attachment_reconstruction,
 )
-from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.tensor_layout import intern_tensor_layouts
 from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
@@ -48,7 +48,7 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
         ),
         InPlaceTTTCompileOptions(
             CanonicalRuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
-            (DensePageCpuProviderFacts("test.attachment@1", 2),), 2, 4096,
+            (PageBundleProviderFacts("test.attachment@1", 2),), 2, 4096,
         ),
     )
     probe = BackendPlacementProbe(
@@ -74,7 +74,7 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
             TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate((
                 "model.execute", "sampler.pre_draw", "token.commit", "next.prepare",
             ))), ("compute/cpu@1", "state/dense_page_cpu@1")),
-            (DensePageCpuProviderFacts("test.attachment@1", 2),), 2, 4096),
+            (PageBundleProviderFacts("test.attachment@1", 2),), 2, 4096),
     )
     sampler_probe = replace(probe, hidden_resources=tuple(
         AttachmentHiddenResource(binding, HiddenPhase.DECODE) for binding in hidden.resources

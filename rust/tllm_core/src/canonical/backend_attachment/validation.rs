@@ -1,13 +1,11 @@
 //! Semantic, plan, and backend-fact validation for attachment signing.
 
-use super::super::scheduler::{validate_physical as validate_schedule_physical, PhysicalPlan};
+use super::super::scheduler::PhysicalPlan;
 use super::super::semantic_graph::{
     HiddenPhase as SemanticHiddenPhase, HiddenSite as SemanticHiddenSite, InputSource, OutputKind,
     SemanticGraph, SemanticTask, StateEffectKind, StateScope, Timeline,
 };
-use super::super::state_representation::{
-    validate_physical_plan as validate_state_physical, StateDeviceKind, StatePhysicalPlan,
-};
+use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
 use super::types::{
     AttachmentCompilerInputs, AttachmentHiddenResource, AttachmentKind, AttachmentOverlayStage,
     AttachmentTaskBinding, AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe,
@@ -365,9 +363,6 @@ fn validate_cross_binding(
 ) -> Result<(), String> {
     validate_request(request, probe)?;
     validate_probe(probe)?;
-    if schedule.plan_epoch != state.plan_epoch {
-        return Err("schedule and state epochs differ".to_owned());
-    }
     match request.attachment_kind {
         AttachmentKind::RequestSamplerTraining => {
             validate_request_sampler_training_graph(request, probe, graph)?;
@@ -446,35 +441,7 @@ fn validate_cross_binding(
 
 pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), String> {
     let plan = &inputs.plan;
-    super::super::tensor_layout::validate_decision(
-        &plan.tensor_layout_request,
-        &plan.tensor_layout_decision,
-    )?;
-    validate_schedule_physical(
-        &plan.semantic_graph,
-        &plan.timeline,
-        &plan.schedule_decision,
-        &plan.schedule_physical,
-    )?;
-    validate_state_physical(
-        &plan.state_request,
-        &plan.state_decision,
-        &plan.state_physical,
-    )?;
-    for state in &plan.state_physical.representations {
-        let binding = plan
-            .tensor_layout_decision
-            .bindings
-            .iter()
-            .find(|binding| binding.resource == state.resource)
-            .ok_or_else(|| "state representation lacks a signed tensor layout".to_owned())?;
-        if state.layout_id != u64::from(binding.layout_id)
-            || state.layout_namespace != binding.layout_namespace
-            || state.layout_digest != binding.layout_digest
-        {
-            return Err("state representation differs from signed tensor layout".to_owned());
-        }
-    }
+    plan.validate()?;
     let layout = plan
         .tensor_layout_request
         .layouts

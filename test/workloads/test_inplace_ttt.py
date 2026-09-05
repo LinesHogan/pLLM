@@ -3,12 +3,8 @@
 import pytest
 import torch
 
-from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
-from tllm.canonical.ptts.dense_page import DensePageTransitionBatch
-from tllm.canonical.ptts.publication import (
-    RequestStatePublicationCoordinator, RequestStatePublicationReceipt,
-)
-from tllm.canonical.ptts.request_state import RequestStateTransitionBatch
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
+from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTCompileOptions, InPlaceTTTConfig, InPlaceTTTOperandPair,
@@ -40,7 +36,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         ),
         InPlaceTTTCompileOptions(
             CanonicalRuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
-            (DensePageCpuProviderFacts("test.cpu.full_root@1", 2),),
+            (PageBundleProviderFacts("test.cpu.full_root@1", 2),),
             max_admitted_lineages=2, state_memory_budget_bytes=4096,
         ),
     )
@@ -67,14 +63,12 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         before = execution.snapshot(latest)
 
         def reject_publication(
-            self: RequestStatePublicationCoordinator,
-            logical: RequestStateTransitionBatch,
-            physical: DensePageTransitionBatch,
-        ) -> RequestStatePublicationReceipt:
+            self: PageBundleArena, write: PageWrite,
+        ) -> PagePublication:
             raise RuntimeError("injected prepublication failure")
 
         with monkeypatch.context() as fault:
-            fault.setattr(RequestStatePublicationCoordinator, "publish", reject_publication)
+            fault.setattr(PageBundleArena, "publish", reject_publication)
             with pytest.raises(RuntimeError, match="injected prepublication failure"):
                 execution.step(step)
         for actual, expected in zip(execution.snapshot(latest), before, strict=True):

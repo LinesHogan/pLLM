@@ -1,14 +1,13 @@
 schema_version = 1
 target_count = 41
 maximum_count = 50
-active_executable_count = 17
-pending_survivor_count = 24
-active_executable_ids = [1, 2, 3, 5, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38, 39]
+active_executable_count = 20
+pending_survivor_count = 21
+active_executable_ids = [1, 2, 3, 5, 9, 10, 12, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38, 39]
 
 # The active count is deliberately not the terminal evidence set.  It records
 # the executable survivor bases left after deleting stale old-stack tests:
-# four Rust canonical tests, one CUDA PTTS pytest, and four standalone GPU
-# smokes, plus five workload oracles, host/attachment boundaries and distribution evidence.
+# four Rust tests, twelve pytest items and four standalone GPU smokes.
 # The remaining IDs are debt tied to the
 # corresponding cutover tranche; they must be added as compact observable
 # oracles or public runtime smokes, not restored as legacy class-hierarchy or
@@ -68,11 +67,21 @@ group = "rust"
 id = 9
 name = "cpu_request_ptts_admit_cow_publish_pin_retire"
 group = "ptts"
+path = "test/boundary/test_page_bundle.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_cpu_request_ptts_admit_cow_publish_pin_retire"
+environment = "Repository venv with torch and rebuilt Rust extension; CPU"
+observable_contract = "Admission, partial-field COW with unchanged slot sharing, exact old/new version values, one-lineage updates without cross-request mutation, retire retains old pins and then reclaims all capacity"
+replaces = "Legacy dense producer, request-slot and separate logical/physical publication lifecycle tests"
 
 [[evidence]]
 id = 10
 name = "multi_lineage_admission_and_publication_roll_back_atomically"
 group = "ptts"
+path = "test/boundary/test_page_bundle.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_multi_lineage_admission_and_publication_roll_back_atomically"
+environment = "Repository venv with torch and rebuilt Rust extension; CPU"
+observable_contract = "One signed plan and arena for differently shaped request/instance resources; capacity and partial initialization failure leave no admission; invalid data and aborted private mutation preserve both roots; successful publication advances both exact versions and values; complete reclaim; cross-plan epoch drift rejected by shared Rust validation"
+replaces = "Separate admission/factory rollback and multi-lineage publication tests; does not substitute for TLM numerical evidence 11"
 
 [[evidence]]
 id = 11
@@ -83,12 +92,22 @@ group = "ptts"
 id = 12
 name = "generation_receipt_blocks_aba_and_double_settlement"
 group = "ptts"
+path = "test/boundary/test_page_bundle.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_generation_receipt_blocks_aba_and_double_settlement"
+environment = "Repository venv with torch and rebuilt Rust extension; CPU"
+observable_contract = "Reused physical slots advance generations and new lineage identity; cloned and consumed tokens/receipts rejected; old release cannot affect reused capacity; unsettled publication retains retiring roots until settlement"
+replaces = "Legacy CUDA/CPU transaction-token, generation, double-commit and stale-release tests"
 
 [[evidence]]
 id = 13
 name = "cuda_ptts_waits_for_exact_fence_before_reclaim"
 group = "ptts"
 requires_gpu = true
+path = "test/gpu/test_page_bundle_cuda.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/gpu/test_page_bundle_cuda.py"
+environment = "Repository venv with torch and rebuilt Rust extension; CUDA GPU"
+observable_contract = "Actual CUDA two-root AdamW COW, immutable old values, a delayed original consumer stream blocks reclaim until its issued event completes; no reads after release; forged receipts rejected; full reclaim and stable pool addresses"
+replaces = "test/gpu/test_canonical_cuda_dense_page_smoke.py; no separate CPU/CUDA state owners"
 
 [[evidence]]
 id = 14

@@ -8,11 +8,7 @@ from hashlib import sha256
 import torch
 
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
-from tllm.canonical.ptts.dense_page_planning import (
-    DensePageCpuProviderFacts,
-    DensePageCudaProviderFacts,
-    DensePageProviderFacts,
-)
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from tllm.contracts.packed_hidden import (
     PackedHiddenResourceBinding,
@@ -211,18 +207,12 @@ class ESampRequestPackedHiddenBindings:
 @dataclass(frozen=True, slots=True)
 class ESampRequestCompileOptions:
     timeline: SchedulerTimeline
-    providers: tuple[DensePageProviderFacts, ...]
+    providers: tuple[PageBundleProviderFacts, ...]
     max_admitted_lineages: int
     state_memory_budget_bytes: int
     plan_epoch: int = 1
 
     def __post_init__(self) -> None:
-        if type(self.providers) is not tuple or any(
-            type(provider)
-            not in (DensePageCpuProviderFacts, DensePageCudaProviderFacts)
-            for provider in self.providers
-        ):
-            raise ValueError("ESamp providers must be exact CPU provider facts")
         provider_ids = tuple(provider.provider_id for provider in self.providers)
         if (
             type(self.timeline) is not SchedulerTimeline

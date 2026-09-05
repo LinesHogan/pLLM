@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
-from tllm.canonical.ptts.dense_page import DensePageStateProvider, DensePageTransitionBatch, DensePageRoot
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
+from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
 from tllm.canonical.workloads.esamp_request import (
     ESampRequestWorkload,
 )
@@ -55,7 +55,7 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     )
     compiled = ESampRequestWorkload(config).compile(
         ESampRequestSpecialization(4, TensorDType.FLOAT32, 7, bindings, StateDeviceKind.CPU, 0),
-        ESampRequestCompileOptions(timeline, (DensePageCpuProviderFacts("test.esamp@1", 3),), 2, 10000),
+        ESampRequestCompileOptions(timeline, (PageBundleProviderFacts("test.esamp@1", 3),), 2, 10000),
     )
     execution = compiled.execution
     assert execution.device.type == "cpu"
@@ -96,12 +96,12 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
                 execution.cancel_step(cancelled)
 
         def reject_publication(
-            self: DensePageStateProvider, batch: DensePageTransitionBatch,
-        ) -> tuple[DensePageRoot, ...]:
+            self: PageBundleArena, batch: PageWrite,
+        ) -> PagePublication:
             raise RuntimeError("injected publication failure")
 
         with monkeypatch.context() as fault:
-            fault.setattr(DensePageStateProvider, "publish_transition_batch", reject_publication)
+            fault.setattr(PageBundleArena, "publish", reject_publication)
             failed = execution.start_step(step)
             execution.execute_anchor(failed, AnchorId(0))
             execution.execute_anchor(failed, AnchorId(1))

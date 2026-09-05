@@ -15,7 +15,7 @@ from tllm.canonical.backend_attachment import (
     compile_request_sampler_attachment,
     validate_backend_attachment_physical,
 )
-from tllm.canonical.ptts import DensePageCudaProviderFacts
+from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical_vllm.dense_overlay import (
     VllmDenseAddAdapter,
@@ -1189,10 +1189,11 @@ def _compile_sampler_training(
         ESampRequestCompileOptions(
             timeline=timeline,
             providers=(
-                DensePageCudaProviderFacts(
+                PageBundleProviderFacts(
                     "canonical.cuda_dense_page@1",
-                    device_ordinal,
                     max_live_versions_per_lineage=3,
+                    device_kind=StateDeviceKind.CUDA,
+                    device_ordinal=device_ordinal,
                 ),
             ),
             max_admitted_lineages=runner.max_num_reqs,
@@ -1278,10 +1279,11 @@ def _compile_dense_overlay_deployment(
                 )
             ),
             (
-                DensePageCudaProviderFacts(
+                PageBundleProviderFacts(
                     "canonical.cuda.full_root@1",
-                    device_ordinal,
-                    3,
+                    max_live_versions_per_lineage=3,
+                    device_kind=StateDeviceKind.CUDA,
+                    device_ordinal=device_ordinal,
                 ),
             ),
             max_admitted_lineages=runner.max_num_reqs,
