@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`bea197d`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`86e1326`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,9 +13,9 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 26,841；相对 133,210 净减 106,369（约 79.9%） |
-| 距第一轮 30k 上限 | 当前余量 3,159 行；补齐缺失能力仍须与新栈压缩配套 |
-| 本轮源码差分 | 相对 `7d53caf` 新增 201 / 删除 523 / 净减 322；含 6 行 implementation ID 原样移动，未改变独立数学 |
+| SOURCE_LOC | 26,744；相对 133,210 净减 106,466（约 79.9%） |
+| 距第一轮 30k 上限 | 当前余量 3,256 行；补齐缺失能力仍须与新栈压缩配套 |
+| 本轮源码差分 | 相对 `1a9eca6` 新增 268 / 删除 365 / 净减 97；含 Rust 内联证据净增 155 行、9 行 timing 解析原样移动，无独立数学变更 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
@@ -27,10 +27,10 @@ SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 14,056 |
+| tllm/canonical | 13,752 |
 | tllm/backends + canonical_vllm | 3,360 + 2,853 |
 | tllm/contracts | 2,262 |
-| Rust | 3,225 |
+| Rust | 3,432 |
 | tools / 顶层入口及 stub | 857 / 228 |
 
 ## 下一轮实施顺序与完成条件
@@ -58,6 +58,9 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   ESamp 的 CPU/CUDA task、两者的执行 lifecycle 与 backend session 仍待合并。
 - SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
   保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
+  Rust 现在从结果输入、附加 ordering edge 和 timing 派生唯一 GraphIndex；FTTT、GTTA、
+  In-Place、ESamp 的重复 producer→consumer 边已删除。Python FFI 从共享 dataclass 机械编码，
+  删除第二套 wire DTO 及其逐字段复制，只补封闭 input variant tag。
 - `canonical_vllm/runtime.py` 仍有 1,494 行，直接 import ESamp/In-Place-TTT，
   deployment/execution 类型为两者 union，公共 factory 仅接受这两种 workload。
   `canonical_runtime` 目录虽然已删，workload-specific 编排职责仍有残留。
@@ -92,8 +95,11 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 
 ### 4. 补齐终态核心，直接替换 provisional owner（F，与第 2/3 项按依赖交错实施）
 
-- Rust AER regionization、state hazard/timing、distributed placement/transfer；当前
-  canonical scheduler 是基础，不能据此声称完整 AER 已实现。对应 2、4、6、7、8。
+- Rust AER regionization、完整版本 hazard、distributed placement/transfer 仍待实现。
+  第 3 项已升级为独立枚举：三任务的 64 种有向边集合 × 216 种窗口组合，验证最早可行放置、
+  cycle、数据流依赖和顺序。冲突 effect 若无因果路径或不相交窗口证明则拒绝；这不是
+  exact-version RAW/WAR/WAW oracle。第 4、6、7、8 项仍欠，不能以索引或最早放置冒充 AER。
+  后续直接推进版本/effect、resource facts 与真正的联合 partition/placement，不先精修索引。
 - PageBundle/generational arena 替换 provisional `canonical/ptts/dense_page*`；
   dense_page 冻结禁投，不先做中间态精修。覆盖 admission/COW/multi-root atomic publication、
   ABA/receipt、exact pin/reclaim、CUDA stable address；对应 9–14。
@@ -179,6 +185,12 @@ import/authority gates 通过。第 23 项发布失败注入在替换前后均�
 版本 oracle。In-Place 真 MRv2 GPU smoke 复跑通过：update/trained_rows 各 6，apply_rows 8，
 updated_rows 2，active_lineages/pending_releases/fallback 均为 0；第二次运行确认旧插件错误消失。
 另外三个 GPU smoke 本次未改其执行路径，沿用 `7d53caf` 记录；没有运行吞吐 benchmark。
+
+`86e1326`：主目录重建 native extension 后，完整 pytest 8 passed（26.94s）、Rust 4 passed
+（含 13,824 组独立枚举），strict/basic typing 0/0、import/authority gates 通过。新 oracle
+在旧的显式重复边要求上先失败，再经生产实现修改通过。四个 GPU smoke 全部复跑：
+ESamp loss/update 2、In-Place update/trained_rows 6、CUDA Graph loss/update 4 且地址稳定、
+FTTT loss/update 1 且 version 1；所有执行 fallback 为 0，清理检查通过。没有运行吞吐 benchmark。
 
 所有 Python 使用 `/workspace/pllm/.venv/bin/python`。canonical vLLM 当前代码要求
 `0.27.1`，且限定 in-process/eager 等边界；本轮实测 vLLM runtime 为 0.27.1，发行元数据

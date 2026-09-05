@@ -24,8 +24,8 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `bea197d` on `main` | — | after `e03816d` |
-| Counted production/support source | 26,841 lines | -106,369 lines | -64,485 lines |
+| Commit | `86e1326` on `main` | — | after `e03816d` |
+| Counted production/support source | 26,744 lines | -106,466 lines | -64,582 lines |
 | Pytest collection | 8 items | -1,341 items | -3 items |
 | Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -40,6 +40,35 @@ debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared Graph Index and Codec after `1a9eca6`
+
+Commit `86e1326`: counted source `+268 / -365 / net -97`. Rust inline evidence
+accounts for 155 net added lines; nine timing-lookup lines moved unchanged
+within the Rust scheduler. No independent tensor math changed or moved.
+The old explicit-result-edge requirement and four workloads' duplicate edge
+declarations are gone. One derived index supplies dependencies, windows and
+topological order, without copying semantic tasks/state/effects into another
+graph. Conflicting effects require a causal path or disjoint windows; task
+names no longer silently decide an otherwise ambiguous state order.
+
+Python FFI now mechanically serializes the shared immutable descriptors with
+the standard dataclass/JSON APIs, adding only closed input-variant tags.
+The parallel wire DTO family and manual per-field encoding were deleted;
+Rust remains the semantic validator and Python retains closed FFI decoding.
+
+Evidence 3 now enumerates all 64 directed edge subsets and 216 timing-window
+assignments on three tasks against an independent placement/order oracle,
+including cycles, implicit dataflow, duplicate dependencies and effect-order
+counterexamples. It failed before implementation and passes afterward. The
+visible evidence count remains 16; AER partition/placement, exact-version
+hazards and distributed placement remain missing, not implied by this test.
+
+Validation from main after rebuilding the native extension: repository-venv
+pytest 8 passed in 26.94s, Rust 4 passed, strict/basic typing 0/0, import/authority
+gates passed. All four GPU smokes rerun: ESamp loss/update 2, In-Place updates 6,
+CUDA Graph loss/update 4 with stable addresses, FTTT loss/update 1/version 1.
+Cleanup and zero-fallback checks passed. No throughput benchmark or release.
 
 ### Shared In-Place task state after `7d53caf`
 
