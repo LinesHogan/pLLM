@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from tllm.canonical.ptts.dense_page_planning import DensePageCpuProviderFacts
+from tllm.canonical.ptts.dense_page import DensePageStateProvider, DensePageTransitionBatch, DensePageRoot
 from tllm.canonical.workloads.esamp_request import (
     CanonicalRequestSamplerExecution, ESampRequestWorkload,
 )
@@ -35,7 +36,9 @@ def _reference(source: torch.Tensor, parameters: torch.Tensor) -> torch.Tensor:
     return F.layer_norm(source + residual, (4,)) * scale + shift
 
 
-def test_esamp_predicts_before_training_and_isolates_request_versions() -> None:
+def test_esamp_predicts_before_training_and_isolates_request_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bindings = ESampRequestPackedHiddenBindings(*(
         PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX,
             HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]")
@@ -84,6 +87,27 @@ def test_esamp_predicts_before_training_and_isolates_request_versions() -> None:
                 for resource in bindings.resources)),
         )
         before = [execution.snapshot(ref) for ref in latest]
+        cancelled = execution.start_step(step)
+        execution.execute_anchor(cancelled, AnchorId(0))
+        execution.cancel_step(cancelled)
+
+        def reject_publication(
+            self: DensePageStateProvider, batch: DensePageTransitionBatch,
+        ) -> tuple[DensePageRoot, ...]:
+            raise RuntimeError("injected publication failure")
+
+        with monkeypatch.context() as fault:
+            fault.setattr(DensePageStateProvider, "publish_transition_batch", reject_publication)
+            failed = execution.start_step(step)
+            execution.execute_anchor(failed, AnchorId(0))
+            execution.execute_anchor(failed, AnchorId(1))
+            execution.complete_sampler(failed)
+            with pytest.raises(RuntimeError, match="injected publication failure"):
+                execution.execute_anchor(failed, AnchorId(2))
+        assert execution.free_state_pages == 4
+        for ref, root in zip(latest, before, strict=True):
+            for actual, expected in zip(execution.snapshot(ref), root, strict=True):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         handle = execution.start_step(step)
         execution.execute_anchor(handle, AnchorId(0))
         guidance = execution.sampler_guidance(handle)
@@ -136,6 +160,6 @@ def test_esamp_predicts_before_training_and_isolates_request_versions() -> None:
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
     assert diagnostics.loss_count == diagnostics.update_count == 3
-    assert diagnostics.completed_sampler_pins == 2
+    assert diagnostics.completed_sampler_pins == 4
     assert execution.free_state_pages == 6
     assert execution.plan.fallback_count == 0

@@ -27,6 +27,7 @@ from tllm.canonical.ptts.dense_page_cuda_types import (
     CudaDensePageRelease,
 )
 from tllm.canonical.ptts.request_state import RequestStateDirectory
+from tllm.canonical.ptts.publication import RequestStatePublicationReceipt
 from tllm.canonical.request_sampler_attachment import (
     RequestSamplerAttachmentSpec,
 )
@@ -48,20 +49,18 @@ from tllm.canonical.tensor_layout import (
 )
 from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.esamp_request_task_common import (
-    ESampCpuLossTask,
-    ESampCpuPredictTask,
-    ESampCpuStepContext,
-    ESampCpuTrainTask,
-    ESampCudaLossTask,
-    ESampCudaPredictTask,
-    ESampCudaStepContext,
-    ESampCudaTrainTask,
+    ESampCpuStateKernel,
+    ESampCudaStateKernel,
+    ESampLossTask,
+    ESampPredictTask,
+    ESampStepContext,
+    ESampTrainTask,
+    TensorGradients,
     ESampOptimizationPending,
     ESampOptimized,
     ESampPredicted,
     ESampPredictionPending,
     ESampPublicationPending,
-    ESampPublished,
 )
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions,
@@ -168,7 +167,7 @@ def _require_sampler_anchor_reached(
 
 
 def _completed_step_result(
-    context: ESampCpuStepContext | ESampCudaStepContext,
+    context: ESampStepContext[TensorGradients] | ESampStepContext[CudaDensePageGradientBatch],
     *,
     intervention_beta: float,
     error_message: str,
@@ -177,7 +176,7 @@ def _completed_step_result(
         case (
             ESampPredicted() as predicted,
             ESampOptimized() as optimized,
-            ESampPublished() as published,
+            RequestStatePublicationReceipt() as published,
         ):
             return ESampRequestStepResult(
                 context.step.rows.step_id,
@@ -218,7 +217,7 @@ class CanonicalRequestStepHandle:
 @dataclass(slots=True)
 class _ActiveRequestSamplerStep:
     token: CanonicalRequestStepHandle
-    invocation: TaskGraphInvocation[ESampCpuStepContext]
+    invocation: TaskGraphInvocation[ESampStepContext[TensorGradients]]
     version_pin: DensePageVersionPin
     sampler: _SamplerState
 
@@ -274,9 +273,9 @@ class CanonicalRequestSamplerExecution:
         self._runner = TaskGraphExecution(
             plan,
             (
-                ESampCpuLossTask(kernel_layout),
-                ESampCpuPredictTask(config, kernel_layout, provider),
-                ESampCpuTrainTask(config, directory, provider),
+                ESampLossTask[TensorGradients](kernel_layout, ESAMP_REQUEST_LOSS_IMPLEMENTATION),
+                ESampPredictTask[TensorGradients](config, kernel_layout, ESAMP_REQUEST_PREDICT_IMPLEMENTATION),
+                ESampTrainTask[TensorGradients](config, directory, ESAMP_REQUEST_TRAIN_IMPLEMENTATION),
             ),
         )
         self._generator = torch.Generator(device="cpu")
@@ -388,7 +387,7 @@ class CanonicalRequestSamplerExecution:
         except Exception:
             self._directory.release_transition_lease(transition_lease)
             raise
-        context = ESampCpuStepContext(
+        context = ESampStepContext[TensorGradients](
             step,
             source,
             target,
@@ -397,6 +396,7 @@ class CanonicalRequestSamplerExecution:
             ESampPredictionPending(),
             ESampOptimizationPending(),
             ESampPublicationPending(),
+            ESampCpuStateKernel(self._provider),
         )
         handle = CanonicalRequestStepHandle(self._next_handle_id)
         active = _ActiveRequestSamplerStep(
@@ -591,8 +591,9 @@ class CanonicalRequestCudaStepHandle:
 @dataclass(slots=True)
 class _ActiveCudaRequestSamplerStep:
     token: CanonicalRequestCudaStepHandle
-    invocation: TaskGraphInvocation[ESampCudaStepContext]
+    invocation: TaskGraphInvocation[ESampStepContext[CudaDensePageGradientBatch]]
     sampler: _CudaSamplerState
+    kernel: ESampCudaStateKernel
 
 
 class CanonicalRequestSamplerCudaExecution:
@@ -647,9 +648,9 @@ class CanonicalRequestSamplerCudaExecution:
         self._runner = TaskGraphExecution(
             plan,
             (
-                ESampCudaLossTask(kernel_layout, provider),
-                ESampCudaPredictTask(config, kernel_layout, provider),
-                ESampCudaTrainTask(config, directory, provider),
+                ESampLossTask[CudaDensePageGradientBatch](kernel_layout, ESAMP_REQUEST_CUDA_LOSS_IMPLEMENTATION),
+                ESampPredictTask[CudaDensePageGradientBatch](config, kernel_layout, ESAMP_REQUEST_CUDA_PREDICT_IMPLEMENTATION),
+                ESampTrainTask[CudaDensePageGradientBatch](config, directory, ESAMP_REQUEST_CUDA_TRAIN_IMPLEMENTATION),
             ),
         )
         self._generator = torch.Generator(device=provider.device)
@@ -765,7 +766,8 @@ class CanonicalRequestSamplerCudaExecution:
             except Exception:
                 self._directory.release_transition_lease(transition_lease)
                 raise
-            context = ESampCudaStepContext(
+            kernel = ESampCudaStateKernel(self._provider, state_pin, stream)
+            context = ESampStepContext[CudaDensePageGradientBatch](
                 step,
                 source,
                 target,
@@ -774,8 +776,7 @@ class CanonicalRequestSamplerCudaExecution:
                 ESampPredictionPending(),
                 ESampOptimizationPending(),
                 ESampPublicationPending(),
-                state_pin,
-                stream,
+                kernel,
             )
             handle = CanonicalRequestCudaStepHandle(self._next_handle_id)
             self._next_handle_id += 1
@@ -783,6 +784,7 @@ class CanonicalRequestSamplerCudaExecution:
                 handle,
                 self._runner.start(context),
                 _SamplerPending(),
+                kernel,
             )
             return handle
 
@@ -853,7 +855,7 @@ class CanonicalRequestSamplerCudaExecution:
                 ):
                     completion = torch.cuda.Event(blocking=False)
                     completion.record(stream)
-                    active.invocation.context.stream.wait_event(completion)
+                    active.kernel.stream.wait_event(completion)
                     active.sampler = _CudaSamplerCompleted(stream)
                     self._completed_sampler_pins += 1
                 case _SamplerPending():
@@ -881,7 +883,7 @@ class CanonicalRequestSamplerCudaExecution:
             self._loss_count += len(result.losses)
             self._update_count += len(result.after_refs)
             self._pending_releases.append(
-                self._provider.release_pin(context.state_pin, context.stream)
+                self._provider.release_pin(active.kernel.state_pin, active.kernel.stream)
             )
             self._directory.release_transition_lease(context.transition_lease)
             self._active_handles.pop(handle.handle_id)
@@ -958,14 +960,12 @@ class CanonicalRequestSamplerCudaExecution:
         context = active.invocation.context
         match context.optimization, context.publication:
             case ESampOptimized(gradients=gradients), ESampPublicationPending():
-                if type(gradients) is not CudaDensePageGradientBatch:
-                    raise RuntimeError("CUDA request-sampler gradient token is absent")
                 self._provider.discard_gradients(gradients)
             case _:
                 pass
         self._directory.release_transition_lease(context.transition_lease)
         self._pending_releases.append(
-            self._provider.release_pin(context.state_pin, context.stream)
+            self._provider.release_pin(active.kernel.state_pin, active.kernel.stream)
         )
         self._active_handles.pop(active.token.handle_id)
 

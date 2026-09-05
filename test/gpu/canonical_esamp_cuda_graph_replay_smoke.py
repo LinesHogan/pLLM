@@ -158,6 +158,15 @@ def _run_step(
     execution_stream: torch.cuda.Stream,
     sampler_stream: torch.cuda.Stream,
 ) -> tuple[float, ...]:
+    cancelled = execution.start_step(
+        _step_input(
+            step_id=step_id, identities=identities, hidden_bindings=hidden_bindings,
+            source=source, target=target, producer_stream=execution_stream,
+        ),
+        execution_stream,
+    )
+    execution.execute_anchor(cancelled, AnchorId(0))
+    execution.cancel_step(cancelled)
     handle = execution.start_step(
         _step_input(
             step_id=step_id,
