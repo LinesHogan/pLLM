@@ -24,22 +24,54 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `19c59d5` plus current worktree | — | after `e03816d` |
-| Counted production/support source | 27,163 lines | -106,047 lines | -64,163 lines |
-| Pytest collection | 7 items | -1,342 items | -4 items |
+| Commit | `bea197d` on `main` | — | after `e03816d` |
+| Counted production/support source | 26,841 lines | -106,369 lines | -64,485 lines |
+| Pytest collection | 8 items | -1,341 items | -3 items |
 | Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 15 items | below the 50-item ceiling; not yet the final evidence set | -3 items |
+| Visible `TEST_COUNT` | 16 items | below the 50-item ceiling; not yet the final evidence set | -2 items |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 30, 32, 37, 38 and 39.
+evidence IDs 1, 2, 3, 5, 13, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38 and 39.
 The agreed programmable-inference composition adds target IDs 40/41 to the
-original 39, leaving 26 pending survivor evidence items. Those items are implementation
+original 39, leaving 25 pending survivor evidence items. Those items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared In-Place task state after `7d53caf`
+
+Commit `bea197d`: counted source `+201 / -523 / net -322`, including six
+implementation-ID declaration lines moved unchanged. Independent tensor math
+was neither moved nor changed. CPU/CUDA now use the same task implementations,
+invocation context, transition/result states and publication receipt type.
+The 292-line CUDA task module and its mirrored semantic states were deleted.
+Device bindings retain only provider/pin/stream access and actual storage I/O;
+they do not own another version map. The CUDA submission boundary remains
+fail-stop, and context retains the original issued receipt, not a conversion.
+Provisional dense_page internals were not refactored. Execution lifecycles,
+ESamp task merging and final PageBundle ownership remain unfinished.
+
+Evidence 23 now injects prepublication failure and proves unchanged roots and
+clean retry against the independent multi-target oracle; it passed both before
+and after replacement. New evidence 25 independently checks ESamp seeded
+initialization, gated residual/layernorm, AdamW gradients/moments/steps,
+per-state loss averaging, sample isolation, immutable prediction guidance,
+sampler-before-training ordering and cleanup. This is one added evidence item,
+not a device/workload matrix.
+
+Validation: repository-venv pytest 8 passed in 22.81s, Rust 4 passed, typing
+strict/basic 0/0, import/authority gates passed. Real In-Place MRv2 smoke passed:
+6 updates, 6 trained rows, 8 apply rows, 2 updated rows, zero live lineages,
+pending releases and fallback. Other standalone GPU smoke records remain at
+`7d53caf`; no throughput benchmark was run.
+
+An ignored root `tllm.egg-info` still advertised the retired general plugin.
+It was moved intact to `/tmp/tllm-stale-metadata.sUqZvf/tllm.egg-info`;
+metadata discovery and a second real GPU run confirmed the stale plugin error
+is gone. This generated-artifact cleanup receives no source deletion credit.
 
 ### Shared host boundary and Rust validation after `19c59d5`
 
@@ -68,6 +100,15 @@ Remaining B/F work is substantive: unified ESamp/In-Place transitions,
 backend attachment, PageBundle/AER, closed MP and conditional control remain
 unfinished. Snapshot branches preserve original dirty main and LoRA changes;
 the research draft is neither modified nor committed.
+
+Root integration: `main` fast-forwarded to `7d53caf`; all auxiliary worktrees
+were removed without force after preserving original edits in
+`archive/consolidation-main-20260906` (`865ad4c`) and
+`archive/consolidation-lora-20260906` (`c5b3589`). The LoRA branch also retains
+the same snapshot tree at `781034e`; its semantics are not yet integrated.
+The native extension was rebuilt from the main directory and its import origin
+checked. Main-directory pytest: 7 passed in 28.25s using the repository venv.
+No source changes or deletion credit are attributed to this checkout cleanup.
 
 ### Release-preparation slice after `4cd162f`
 
@@ -397,11 +438,11 @@ Moves are recorded separately and never counted as deletion.
 | Workload | Unique content to retain | Old owner removal gate | Evidence IDs |
 | --- | --- | --- | --- |
 | Dummy | minimum graph/sign/plan/execute declaration | workload compile/owned export oracle restored; generic public factory pending | 20 active |
-| FTTT | edit math, judge, feedback retry | legacy owner removed; canonical host transaction and receipt only | 21 pending; 38 smoke base |
+| FTTT | edit math, judge, feedback retry | legacy owner removed; shared host transaction and receipt | 21, 38 active |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
-| In-Place-TTT | dense fast-weight math and layout | generic request PTTS/overlay | 23, 32 |
+| In-Place-TTT | dense fast-weight math and layout | shared task state complete; generic execution/PTTS pending | 23, 32 active |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
-| ESamp | request math, sampler guidance, random init | request PTTS and public vLLM path | 25, 30, 31, 37 |
+| ESamp | request math, sampler guidance, random init | task/lifecycle unification and MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
 | Recirculation | row selection and replay math | typed replay effect | 27, 35 |
 | OverRIDE | reweight and Adam math | generic sampler/state transition | 28 |

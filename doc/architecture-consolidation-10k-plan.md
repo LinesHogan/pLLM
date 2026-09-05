@@ -3,9 +3,9 @@
 ## 文档地位
 
 2026-09-06 实施交接见[剩余工作清单](architecture-consolidation-handoff.md)：
-代码检查点 `19c59d5` 后的工作区，SOURCE_LOC 27,163，终态 41 项证据尚欠 26 项。
+代码检查点 `bea197d`，SOURCE_LOC 26,841，终态 41 项证据尚欠 25 项。
 旧 runtime/ports/common 和公共 hook/plugin 入口已删除；行数达标不代表功能验收完成。
-历史 worktree 已从 30 个降至 3 个；过时文档与重复打包配置已清理，sdist→wheel 隔离验证通过。
+历史 worktree 已从 30 个降至 1 个，代码已合入主目录 `main`；过时文档与重复打包配置已清理，sdist→wheel 隔离验证通过。
 下文基线与估算保留历史口径；当前完成情况以交接清单和 ledger 的最新检查点为准。
 本轮纳入可编程推理契约的决定见第 10 节；原 39 项证据保留，新增组合边界 40、41。
 

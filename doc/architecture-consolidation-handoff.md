@@ -1,7 +1,7 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`19c59d5` 后的工作区变更，分支 `tranche-b-atomic`。
-工作目录：`/workspace/pllm/.worktrees/tranche-b-atomic`。
+核查日期：2026-09-06。代码检查点：`bea197d`，分支 `main`。
+工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
 
@@ -13,21 +13,21 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 27,163；相对 133,210 净减 106,047（约 79.6%） |
-| 距第一轮 30k 上限 | 当前余量 2,837 行；补齐缺失能力仍须与新栈压缩配套 |
-| 本轮源码差分 | 相对 `19c59d5` 新增 457 / 删除 1,255 / 净减 798；含 100 行原样移动，未改变独立数学 |
+| SOURCE_LOC | 26,841；相对 133,210 净减 106,369（约 79.9%） |
+| 距第一轮 30k 上限 | 当前余量 3,159 行；补齐缺失能力仍须与新栈压缩配套 |
+| 本轮源码差分 | 相对 `7d53caf` 新增 201 / 删除 523 / 净减 322；含 6 行 implementation ID 原样移动，未改变独立数学 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
-| 留存证据基础 | 4 个 Rust tests + 7 个 pytest items + 4 个独立 GPU smoke，共 15 项 |
-| 终态证据债务 | 原 39 项中 24 项待补，加新增组合 40/41，共 26 项待补 |
+| 留存证据基础 | 4 个 Rust tests + 8 个 pytest items + 4 个独立 GPU smoke，共 16 项 |
+| 终态证据债务 | 原 39 项中 23 项待补，加新增组合 40/41，共 25 项待补 |
 
 SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除。移动不作为减量成果。
 当前目录体积用于选择整块处理边界，不能直接当作可删除量：
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 14,378 |
+| tllm/canonical | 14,056 |
 | tllm/backends + canonical_vllm | 3,360 + 2,853 |
 | tllm/contracts | 2,262 |
 | Rust | 3,225 |
@@ -52,7 +52,10 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 - FTTT/GTTA 已删除各自 execution、receipt、completion、compilation/options 包装；
   `compile` 直接返回同一个 `HostExecution`，共享 signed task 执行、快照回滚和 receipt 结算。
   FTTT/GTTA 的数学状态各自保留，不被复制进通用 Context/service locator。
-  ESamp/In-Place 的 CPU/CUDA transition 与 backend session 仍待合并。
+  In-Place 已共用 CPU/CUDA task、step context、transition/result 状态和原始 publication receipt；
+  `cuda_tasks.py` 整块删除，storage binding 只持有现有 provider/pin/stream，不保存另一份版本根。
+  CPU/CUDA publication 的设备操作仍不同，CUDA 提交后失败仍 fail-stop。
+  ESamp 的 CPU/CUDA task、两者的执行 lifecycle 与 backend session 仍待合并。
 - SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
   保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
 - `canonical_vllm/runtime.py` 仍有 1,494 行，直接 import ESamp/In-Place-TTT，
@@ -75,8 +78,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 | Dummy | graph→sign→plan→execute、stride 与 owned export oracle 已补；统一 factory 尚待 B | 20 |
 | FTTT | 已切共享 host execution；独立 Adam/edit、回滚、retry/stop/accept oracle 与 CUDA receipt 通过 | 21, 38 |
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
-| In-Place-TTT | 多 target tail/chunk 数值、原子发布、两请求版本隔离/清理 oracle 已补；CPU/CUDA 合并待 B | 23, 32 |
-| ESamp | 有 request CUDA/sampler 路径；补 request isolation、先预测后训练及 MRv1 证据 | 25, 30, 31, 37 |
+| In-Place-TTT | CPU/CUDA task 状态已共用；数值、发布前失败回滚、版本隔离/清理通过；执行 lifecycle 合并待 B | 23, 32 |
+| ESamp | CPU 独立 gated-residual/layernorm/AdamW、固定 seed、先预测后训练和 sample 隔离已补；CPU/CUDA task 合并、MRv1 仍待完成 | 25, 30, 31, 37 |
 | TLM | 仅 loader/cold facts 与 objective kernel 基础；缺完整 online/offline graph、global LOW_RANK_ADD publication/pin | 11, 24, 33 |
 | ReFT | 旧 owner 已删，canonical owner 缺失；补 LoReFT 数学、publish/skip 和 activation patch | 26, 34 |
 | Recirculation | 旧 recurrence 岛已删，canonical owner 缺失；补 row selection、typed replay effect | 27, 35 |
@@ -108,9 +111,9 @@ PTTS/AER 设计继续以 `doc/research-aer-paged-state.md` 为唯一权威。
 
 ### 5. 补齐证据、发布验证与最终压缩（A/G）
 
-- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,13,19,20,21,22,23,30,32,37,38,39`。
-  pending IDs 是 `4,6–12,14–18,24–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
-- 26 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
+- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,13,19,20,21,22,23,25,30,32,37,38,39`。
+  pending IDs 是 `4,6–12,14–18,24,26–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
+- 25 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
   数值/版本/cleanup contract。禁止为凑 39 写 DTO、mock 调用次数或旧内部结构测试。
 - manifest 最终逐项列出实际文件/命令、observable contract、环境、GPU/MP 要求及替代的
   旧测试来源。训练必须非零 loss/update，执行必须 zero fallback。
@@ -123,19 +126,22 @@ PTTS/AER 设计继续以 `doc/research-aer-paged-state.md` 为唯一权威。
 
 ### 6. 仓库与发布分支整理（G，已执行首轮）
 
-- 30 个 worktree 降至 3 个：27 个干净历史 checkout 已用非 force 的 `git worktree remove`
-  移除，所有分支/提交保留，可从原分支重建。没有删除 dirty checkout 或用户改动。
-- 保留主目录 `/workspace/pllm`：`main` 上有 5 个用户修改文件及未跟踪研究文档。
-  保留 `.worktrees/shared-test-time-lora-runtime`：31 项未提交变更。
-  第三个是本实施目录。发布前仍须逐项归属并整合这两处改动，不能直接覆盖或 reset。
+- 30 个 worktree 降至 1 个：仅保留主目录 `/workspace/pllm`，`main` 已快进至
+  `7d53caf`。辅助 checkout 均以非 force 的 `git worktree remove` 移除，所有分支/提交保留。
+- 原 main 的 5 项修改和 LoRA 的 31 项修改先完整保存为下述快照，再整理 checkout。
+  main 的旧 Program/WorkGraph 删除已由合并代码覆盖；LoRA 数学与进程训练能力仍待吸收，
+  不因归档就视为功能整合完成。研究原稿保持原样、未跟踪。
 - 删除 17 份旧 consumer/Program/PTTS 中间态说明及失效中文镜像，重写 README、文档索引、
   当前架构、验证和 benchmark 指南；Git 历史承担归档。不再维护旧 API 的翻译副本。
 - 已补齐原元数据声明的 Apache-2.0 正文。README 明示实际支持范围与开发状态；
   原历史 benchmark harness 已删，旧 n=16 吞吐不能作为当前 n=1 公共路径的支持证明。
-- 未发布、未打 tag、未推送。功能/架构证据未齐，以及 dirty 分支整合，仍是发布阻碍。
+- 主目录残留的旧 `tllm.egg-info` 会让 vLLM 发现已删除的 general plugin；已移至
+  `/tmp/tllm-stale-metadata.sUqZvf/tllm.egg-info`，可恢复。当前仅发现 `.venv` 的无插件发行元数据，
+  plugin discovery 和真实 GPU smoke 已复验。补充设计原文纳入文档索引，研究原稿保持未跟踪。
+- 未发布、未打 tag、未推送。功能/架构证据未齐和 LoRA 语义整合仍是发布阻碍。
 - 两处改动已保存为可恢复快照：`archive/consolidation-main-20260906` (`865ad4c`)、
   `archive/consolidation-lora-20260906` (`c5b3589`)，包括 LoRA 的四个未跟踪源码/测试文件。
-  原文件和索引未被快照操作修改。LoRA 的 grouped kernel、weighted-CE/shared update、
+  LoRA 原分支另以 `781034e` 提交同一快照树后移除 checkout。grouped kernel、weighted-CE/shared update、
   进程训练边界须按 PTTS/closed MP 语义吸收，不能复制旧 registry、反射或 fallback。
 
 ### 7. 新设计的组合路径与共享边界（未完成）
@@ -165,6 +171,14 @@ FTTT CUDA 重新执行通过：loss/update 各 1、version=1、delta_max=0.01271
 typing 0/0、import/authority gates 通过。四个 GPU smoke 均复跑：ESamp loss/update 2，
 In-Place update 6，CUDA Graph loss/update 4，FTTT loss/update 1；清理正确且 fallback 全为 0。
 FTTT CUDA 初始化也以 issued readiness event 跨流排序，不依赖编译耗时碰巧掩盖竞态。
+合入主目录并从主目录重建 native extension 后，再次运行完整 pytest：7 passed（28.25s）。
+Python 包和 `_core.abi3.so` 的加载路径均已核对为主目录，不依赖被删除 worktree。
+
+`bea197d`：完整 pytest 8 passed（22.81s）、Rust 4 passed、strict/basic typing 0/0，
+import/authority gates 通过。第 23 项发布失败注入在替换前后均通过，第 25 项补独立数学与
+版本 oracle。In-Place 真 MRv2 GPU smoke 复跑通过：update/trained_rows 各 6，apply_rows 8，
+updated_rows 2，active_lineages/pending_releases/fallback 均为 0；第二次运行确认旧插件错误消失。
+另外三个 GPU smoke 本次未改其执行路径，沿用 `7d53caf` 记录；没有运行吞吐 benchmark。
 
 所有 Python 使用 `/workspace/pllm/.venv/bin/python`。canonical vLLM 当前代码要求
 `0.27.1`，且限定 in-process/eager 等边界；本轮实测 vLLM runtime 为 0.27.1，发行元数据
@@ -172,7 +186,7 @@ FTTT CUDA 初始化也以 issued readiness event 跨流排序，不依赖编译�
 运行 GPU 证据前仍需检查环境和设备，不能把历史 smoke 日志视作其他版本的支持范围。
 
 ```bash
-cd /workspace/pllm/.worktrees/tranche-b-atomic
+cd /workspace/pllm
 git status --short --branch
 git ls-files | rg '\.(py|pyi|rs)$' | rg -v '^(test|typings)/' | xargs wc -l
 /workspace/pllm/.venv/bin/python tools/check_import_layers.py

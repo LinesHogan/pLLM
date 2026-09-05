@@ -9,6 +9,7 @@ and historical implementation reports remain available through Git history.
 - [Validation and release checks](guides/validation.md)
 - [Benchmark interpretation](guides/benchmarking.md)
 - [Consolidation plan](architecture-consolidation-10k-plan.md)
+- [Programmable inference design and shared boundaries](programmable-inference-next-design.md)
 - [Current handoff and remaining work](architecture-consolidation-handoff.md)
 - [Deletion and evidence ledger](architecture-consolidation-ledger.md)
 
