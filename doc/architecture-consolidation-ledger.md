@@ -24,8 +24,8 @@ entries below are chronological history, not additional current checkpoints.
 
 | Fact | Value | Cumulative change from `12551b8` | Change since `e03816d` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `4f7e370` on `main` | — | after `e03816d` |
-| Counted production/support source | 26,617 lines | -106,593 lines | -64,709 lines |
+| Commit | `9dfa7e7` on `main` | — | after `e03816d` |
+| Counted production/support source | 26,243 lines | -106,967 lines | -65,083 lines |
 | Pytest collection | 8 items | -1,341 items | -3 items |
 | Rust tests | 4 items | -50 items | -50 items |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -40,6 +40,32 @@ debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared ESamp execution after `4f7e370`
+
+Commit `9dfa7e7`: counted source `+276 / -650 / net -374`; no file moves or
+independent math-kernel changes. CPU/CUDA now use one execution class, handle,
+active-invocation table and admission/anchor/cancel/retire/settlement path.
+The old CUDA execution and handle names have no compatibility aliases.
+Physical admission, pin, capture-pool and stream operations retain their
+device dispatch. Gradient tensors stay in the shared context; a CUDA gradient
+token exists only inside physical submission, removing device-dependent
+context generics and the execution's separate gradient-token cleanup.
+
+Evidence 25/37 cover cancellation after prediction and loss before and after
+replacement. Evidence 37 also retires a request while a sampler read is in
+flight: omitting the sampler-to-execution event wait fails the test; retaining
+the actual completion dependency passes with zero live state/releases.
+The test count remains 16, with 25 final evidence items pending. In-Place
+lifecycle, cross-workload generic execution/backend sessions, PageBundle and
+cross-root settlement remain unfinished; provisional PTTS was not polished.
+
+Repository-venv validation: pytest 8 passed in 28.63s; Rust 4 passed;
+strict/basic typing 0/0 and import/authority gates passed. CUDA Graph has
+4 losses/updates and stable addresses, public ESamp has 2 losses/updates,
+and public In-Place has 6 updates/trained rows and 8 apply rows. Cleanup and
+zero-fallback checks passed. FTTT CUDA is unchanged and not rerun; its last
+record remains at `86e1326`. No throughput benchmark or release.
 
 ### Shared ESamp task state after `86e1326`
 
@@ -498,7 +524,7 @@ Moves are recorded separately and never counted as deletion.
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
 | In-Place-TTT | dense fast-weight math and layout | shared task state complete; generic execution/PTTS pending | 23, 32 active |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
-| ESamp | request math, sampler guidance, random init | shared task/context complete; execution lifecycle and MRv1 pending | 25, 30, 37 active; 31 pending |
+| ESamp | request math, sampler guidance, random init | shared device execution/task/context complete; generic backend sessions and MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
 | Recirculation | row selection and replay math | typed replay effect | 27, 35 |
 | OverRIDE | reweight and Adam math | generic sampler/state transition | 28 |

@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`4f7e370`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`9dfa7e7`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,9 +13,9 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 26,617；相对 133,210 净减 106,593（约 80.0%） |
-| 距第一轮 30k 上限 | 当前余量 3,383 行；补齐缺失能力仍须与新栈压缩配套 |
-| 本轮源码差分 | 相对 `86e1326` 新增 152 / 删除 279 / 净减 127；无原样移动，无独立数学变更 |
+| SOURCE_LOC | 26,243；相对 133,210 净减 106,967（约 80.3%） |
+| 距第一轮 30k 上限 | 当前余量 3,757 行；补齐缺失能力仍须与新栈压缩配套 |
+| 本轮源码差分 | 相对 `4f7e370` 新增 276 / 删除 650 / 净减 374；无文件搬移，无独立数学 kernel 变更 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
@@ -27,7 +27,7 @@ SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 13,625 |
+| tllm/canonical | 13,251 |
 | tllm/backends + canonical_vllm | 3,360 + 2,853 |
 | tllm/contracts | 2,262 |
 | Rust | 3,432 |
@@ -55,9 +55,12 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   In-Place 已共用 CPU/CUDA task、step context、transition/result 状态和原始 publication receipt；
   `cuda_tasks.py` 整块删除，storage binding 只持有现有 provider/pin/stream，不保存另一份版本根。
   CPU/CUDA publication 的设备操作仍不同，CUDA 提交后失败仍 fail-stop。
-  ESamp 的六个 CPU/CUDA task 已合为三个，两个 context 合为一个；删除 `ESampPublished`，
-  直接持有同一 `RequestStatePublicationReceipt`。CUDA invocation/context 引用同一个
-  storage binding，未复制 pin/stream 或版本根。两者的执行 lifecycle 与 backend session 仍待合并。
+  ESamp 的 CPU/CUDA execution、handle、active invocation、task/context 已合并；
+  admission、anchor 推进、cancel/retire/settlement 只保留一条流程。删除独立 CUDA execution，
+  不留兼容别名。context 直接持有共享 publication receipt、梯度 tensor 和原始 pin binding；
+  CUDA gradient token 仅在物理提交内部存在。取消已借出 guidance 的请求时，以 sampler
+  completion event 排序后再释放。设备差异仅在物理 admission/pin/pool 和 stream 操作中分派。
+  In-Place execution lifecycle、跨 workload 的通用执行与 backend session 仍待合并。
 - SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
   保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
   Rust 现在从结果输入、附加 ordering edge 和 timing 派生唯一 GraphIndex；FTTT、GTTA、
@@ -84,7 +87,7 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 | FTTT | 已切共享 host execution；独立 Adam/edit、回滚、retry/stop/accept oracle 与 CUDA receipt 通过 | 21, 38 |
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
 | In-Place-TTT | CPU/CUDA task 状态已共用；数值、发布前失败回滚、版本隔离/清理通过；执行 lifecycle 合并待 B | 23, 32 |
-| ESamp | CPU/CUDA task/context 已共享；独立数学、取消、发布前失败回滚和 retry 通过；执行 lifecycle、公共 generic factory、MRv1 仍待完成 | 25, 30, 31, 37 |
+| ESamp | CPU/CUDA execution/task/context 已共享；独立数学、prediction/loss 后取消、在途 sampler retire、发布前失败和 retry 通过；跨 workload generic factory/backend session、MRv1 仍待完成 | 25, 30, 31, 37 |
 | TLM | 仅 loader/cold facts 与 objective kernel 基础；缺完整 online/offline graph、global LOW_RANK_ADD publication/pin | 11, 24, 33 |
 | ReFT | 旧 owner 已删，canonical owner 缺失；补 LoReFT 数学、publish/skip 和 activation patch | 26, 34 |
 | Recirculation | 旧 recurrence 岛已删，canonical owner 缺失；补 row selection、typed replay effect | 27, 35 |
@@ -201,6 +204,14 @@ typing 0/0、import/authority gates 通过。第 25 项取消与发布前失败�
 Rust 和 In-Place/FTTT 本次未改其执行路径，未复跑，沿用 `86e1326` 记录。
 逻辑目录与物理 provider 的 authority 拆分仍待 PageBundle 替换；此次没有补全跨根原子
 结算或 CUDA 提交失败恢复，也未精修 provisional dense_page。没有运行吞吐 benchmark。
+
+`9dfa7e7`：ESamp lifecycle 合并后，完整 pytest 8 passed（28.63s）、Rust 4 passed，
+strict/basic typing 0/0、import/authority gates 通过。prediction/loss 后取消场景替换前后
+均通过；新增在途 sampler retire 反例在缺少跨流等待时失败，接入真实 completion event 后
+通过。CUDA Graph loss/update 各 4 且地址稳定；公共 ESamp loss/update 各 2；公共 In-Place
+update/trained_rows 各 6、apply_rows 8。live lineage、pending release 和 fallback 检查通过。
+FTTT CUDA 未改、未复跑，沿用 `86e1326`。未运行吞吐 benchmark；PTTS 内部拆分、
+跨根 settlement 和 CUDA 提交 fail-stop 语义未在本次替换中宣称完成。
 
 所有 Python 使用 `/workspace/pllm/.venv/bin/python`。canonical vLLM 当前代码要求
 `0.27.1`，且限定 in-process/eager 等边界；本轮实测 vLLM runtime 为 0.27.1，发行元数据
