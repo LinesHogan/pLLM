@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`519d4ed`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`ccc211e`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,9 +13,9 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 21,789；相对 133,210 净减 111,421（约 83.6%）；低于预测区间不代表功能补齐 |
-| 距第一轮 30k 上限 | 当前余量 8,211 行；补齐缺失能力仍须与新栈压缩配套，不为凑下限增加代码 |
-| 本轮源码差分 | 相对 `70a82d2` 新增 1,011 / 删除 4,561 / 净减 3,550；含新增 arena/planning/math；没有整文件原样移动；AdamW 提取为 118 行私有 tensor 数学，Rust 共用校验从附件迁入 bundle，不作为独立删除成果 |
+| SOURCE_LOC | 20,998；相对 133,210 净减 112,212（约 84.2%）；低于预测区间不代表功能补齐 |
+| 距第一轮 30k 上限 | 当前余量 9,002 行；补齐缺失能力仍须与新栈压缩配套，不为凑下限增加代码 |
+| 本轮源码差分 | 相对 `519d4ed` 新增 572 / 删除 1,363 / 净减 791；包含新增共享 StateExecution 的全部 323 行；没有整文件原样移动；独立 AdamW/fast-weight 数学不变 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
@@ -27,11 +27,11 @@ SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 9,146 |
-| tllm/backends + canonical_vllm | 3,360 + 2,693 |
-| tllm/contracts | 2,141 |
+| tllm/canonical | 8,469 |
+| tllm/backends + canonical_vllm | 3,360 + 2,596 |
+| tllm/contracts | 2,122 |
 | Rust | 3,363 |
-| tools / 顶层入口及 stub | 857 / 229 |
+| tools / 顶层入口及 stub | 859 / 229 |
 
 ## 下一轮实施顺序与完成条件
 
@@ -52,18 +52,19 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 - FTTT/GTTA 已删除各自 execution、receipt、completion、compilation/options 包装；
   `compile` 直接返回同一个 `HostExecution`，共享 signed task 执行、快照回滚和 receipt 结算。
   FTTT/GTTA 的数学状态各自保留，不被复制进通用 Context/service locator。
-  In-Place 已共用 CPU/CUDA execution、handle、task/context 和结算流程；同步 `step` 复用
-  分阶段生命周期，独立 CUDA execution、`cuda_tasks.py` 和镜像 executed/result 状态已删除。
-  active step 从捕获前到 sampler release/finish 持有同一个 context 和原始 publication receipt；
-  context 直接持有共享 PageBundleArena、原始 PagePin 和 PagePublication，不保存另一份版本根。
-  fail-stop 时保留原始 invocation 资源，不清空账目；这不是故障恢复或发布后结算已完成的证明。
-  CUDA 私有写入可在等待完成后 abort；已发布失败必须结算，无法证明完成时 fail-stop 保留资源。
-  ESamp 的 CPU/CUDA execution、handle、active invocation、task/context 已合并；
-  admission、anchor 推进、cancel/retire/settlement 只保留一条流程。删除独立 CUDA execution，
-  不留兼容别名。context 直接持有共享 publication receipt、梯度 tensor 和原始 pin binding；
-  独立 CUDA gradient token、CPU/CUDA publication coordinator 和 storage wrapper 已删除。取消已借出 guidance 的请求时，以 sampler
-  completion event 排序后再释放。设备差异仅在物理 admission/pin/pool 和 stream 操作中分派。
-  两个 workload 各自的双设备 lifecycle 已合并；跨 workload 的通用执行与 backend session 仍待合并。
+  `ccc211e` 删除 ESamp/In-Place 各自 execution、handle、active/sampler lifecycle 和 diagnostics。
+  两者的 CPU/CUDA admission、signed anchor、sampler、cancel、retire、settlement 统一由
+  `StateExecution` 持有；workload 只保留初始化、输入约束、数学 task 和结果。
+  invocation 引用原始 PhysicalPlan 游标；request directory 引用原始 SemanticState；
+  context 持有原始 PagePin、PageWrite、PagePublication 和 PageRelease，不复制版本根。
+  发布前失败清理私有写入；发布后错误携带原始 invocation/receipt，重试 finish 或取消结算
+  不再训练、不再次释放同一 pin。admission 发布前失败恢复容量并允许重试。
+  无法证明 CUDA 完成时仍 fail-stop 保留资源；不声称任意设备故障均可恢复。
+  In-Place 直接消费原始 CapturedParameterOperand，删除 OperandPair→StepInput→Batch→CUDA
+  wrapper 转换链、重复 phase 和 ParameterOverlayPublication；发布凭据只由 arena 签发。
+  backend 删除 predicted/sampled/prepared/transitioned 镜像阶段，以原始游标和 sampler 状态推进；
+  两个 typed active/deployment 分支仍存在，不能宣称 generic factory/session 已完成。
+  ESamp readiness 改为预测结果产生后签发，只由共享 context 持有；延迟写入反例已先失败后通过。
 - SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
   保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
   Rust 现在从结果输入、附加 ordering edge 和 timing 派生唯一 GraphIndex；FTTT、GTTA、
@@ -74,8 +75,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   wire DTO 删除，FFI 机械编码同一结构；Rust 校验 layout 身份、字段存在性和阶段/任务绑定。
   deployment 只保留 compilation 和 signed attachment；execution、hidden/target facts、dtype、
   sampler beta 和参数 digest 不再额外复制。附件相关 Python 重复校验删除，由 Rust 边界负责。
-  第 15 项已补统一证据；这不代表跨 workload executor/factory/session 已通用化。
-- `canonical_vllm/runtime.py` 仍有 1,334 行，直接 import ESamp/In-Place-TTT，
+  第 15 项已补统一证据；这不代表 factory/session 已通用化。
+- `canonical_vllm/runtime.py` 仍有 1,237 行，直接 import ESamp/In-Place-TTT，
   deployment/execution 类型为两者 union，公共 factory 仅接受这两种 workload。
   `canonical_runtime` 目录虽然已删，workload-specific 编排职责仍有残留。
 - 把 workload 编排收进同一 typed executor/host transaction；CPU/CUDA 共享 transition，
@@ -95,8 +96,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 | Dummy | graph→sign→plan→execute、stride 与 owned export oracle 已补；统一 factory 尚待 B | 20 |
 | FTTT | 已切共享 host execution；独立 Adam/edit、回滚、retry/stop/accept oracle 与 CUDA receipt 通过 | 21, 38 |
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
-| In-Place-TTT | CPU/CUDA execution/task/context 已共享；同步/分阶段独立数值、取消重试、一次性结算、发布前失败和版本清理通过；generic factory/backend session 待 B | 23, 32 |
-| ESamp | CPU/CUDA execution/task/context 已共享；独立数学、prediction/loss 后取消、在途 sampler retire、发布前失败和 retry 通过；跨 workload generic factory/backend session、MRv1 仍待完成 | 25, 30, 31, 37 |
+| In-Place-TTT | 与 ESamp 共享 StateExecution；直接消费捕获记录，独立数值、取消、发布前回滚与发布后结算重试通过；generic factory/backend session 待 B | 23, 32 |
+| ESamp | 与 In-Place 共享 StateExecution；独立数学、admission 回滚、取消、发布后结算、跨流 guidance readiness 与清理通过；generic factory/backend session、MRv1 仍待完成 | 25, 30, 31, 37 |
 | TLM | 仅 loader/cold facts 与 objective kernel 基础；缺完整 online/offline graph、global LOW_RANK_ADD publication/pin | 11, 24, 33 |
 | ReFT | 旧 owner 已删，canonical owner 缺失；补 LoReFT 数学、publish/skip 和 activation patch | 26, 34 |
 | Recirculation | 旧 recurrence 岛已删，canonical owner 缺失；补 row selection、typed replay effect | 27, 35 |
@@ -185,6 +186,15 @@ effect、统一有界 trace，以及独立 PyTorch oracle 和真实 Qwen2 最后
 全面性能研究和独立变体实验不纳入本次门槛。第一轮完整后仍须进行 owner 第二轮压缩。
 
 ## 验证记录与复现
+
+`ccc211e`：仓库 `/workspace/pllm/.venv/bin/python` 在沙箱外运行完整 pytest
+12 passed（22.16s），含 CUDA PTTS 和隔离 sdist→wheel；Rust 4 passed，strict/basic typing
+0 errors/0 warnings，import/authority gates 通过，authority 扫描 5 个生产文件。
+四个 GPU smoke 均复跑：公共 ESamp loss/update 2；公共 In-Place update/trained_rows 6、
+apply_rows 8、updated_rows 2；CUDA Graph loss/update 4、地址稳定；FTTT loss/update 1、
+version 1。全部 fallback 为 0、清理通过。admission 容量泄漏、发布后 finish 重试和
+sampler 提前读取三个反例在修复前失败、修复后通过。沙箱内 CUDA 不可见的那次运行
+为 11 passed/1 skipped，不作为完整 GPU 通过记录。没有运行吞吐 benchmark 或发布。
 
 `519d4ed` PageBundle replacement：仓库 `/workspace/pllm/.venv/bin/python` 运行完整
 pytest 12 passed（27.24s），含隔离 sdist→wheel；Rust 4 passed，strict/basic typing 0/0，

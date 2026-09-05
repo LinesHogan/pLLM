@@ -18,9 +18,10 @@ typed workload declaration
 | `tllm/contracts` | Typed graph, state, layout and attachment data |
 | `rust/tllm_core/src/canonical` | Closed codecs, dense IDs, signed scheduling and representation decisions |
 | `tllm/canonical/execution.py` | Execution of signed task/anchor order |
+| `tllm/canonical/state_execution.py` | Shared tensor-state invocation, sampler borrowing, cancellation and settlement |
 | `tllm/canonical/host_runtime.py` | Typed host transaction settlement |
-| `tllm/canonical/ptts` | Current request/global state and provisional dense-page providers |
-| `tllm/canonical/workloads` | Workload declarations, tensor math and current execution implementations |
+| `tllm/canonical/ptts` | One PageBundle arena for versions, field pools, COW, issued receipts, exact pins and completion; request directory only selects lineages |
+| `tllm/canonical/workloads` | Workload declarations, tensor math, initialization and mathematical inputs/outputs |
 | `tllm/canonical_vllm` | Current public MRv2 capture, sampler and dense-overlay integration |
 | `tllm/backends/vllm` | Remaining probe/replay/overlay primitives awaiting consolidation |
 
@@ -41,15 +42,18 @@ workload-maintained copy of the dependency graph.
 
 ## Incomplete Boundaries
 
-The existing task executor and host coordinator are shared foundations.
-The vLLM integration still branches on ESamp and In-Place-TTT, and workload
-execution contains duplicated lifecycle code. Their consolidation remains
-required before claiming one workload-independent execution layer.
+ESamp and In-Place use one StateExecution on CPU/CUDA. Its invocation retains
+the original physical plan, pin, write and publication; settlement does not
+replay training. In-Place math consumes original captured operand records.
+The vLLM factory, deployment and active binding types still branch on these two
+workloads. Their removal remains required before claiming generic integration.
 
-The dense-page providers are provisional. PageBundle/generational state,
-complete AER regionization, distributed placement, closed typed MP and
-workload-independent profiling remain pending. Backend-local overlay version
-storage and callback-based replay contracts must also be replaced.
+PageBundle/generational state is implemented, but captured page-table version
+selection and TLM/global-overlay integration remain pending. Pool address
+stability is not capture-stable version selection. Complete AER regionization,
+distributed placement, closed typed MP and workload-independent profiling also
+remain pending. Backend-local overlay version storage and callback-based
+replay contracts must still be replaced through these same boundaries.
 
 The maintained support matrix is in the [README](../README.md); implementation
 debt and acceptance criteria are in the [handoff](architecture-consolidation-handoff.md).

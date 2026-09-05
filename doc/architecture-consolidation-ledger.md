@@ -22,14 +22,14 @@ Verified on 2026-09-06. See the [implementation handoff](architecture-consolidat
 for outstanding architecture, functionality and evidence work. The narrative
 entries below are chronological history, not additional current checkpoints.
 
-| Fact | Value | Cumulative change from `12551b8` | Change since `70a82d2` checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `519d4ed` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `519d4ed` on `main` | — | after `70a82d2` |
-| Counted production/support source | 21,789 lines | -111,421 lines | -3,550 lines |
-| Pytest collection | 12 items | -1,337 items | +3 items |
+| Commit | `ccc211e` on `main` | — | after `519d4ed` |
+| Counted production/support source | 20,998 lines | -112,212 lines | -791 lines |
+| Pytest collection | 12 items | -1,337 items | unchanged |
 | Rust tests | 4 items | -50 items | unchanged |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 20 items | below the 50-item ceiling; not yet the final evidence set | +3 items |
+| Visible `TEST_COUNT` | 20 items | below the 50-item ceiling; not yet the final evidence set | unchanged |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
@@ -40,6 +40,38 @@ debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared state execution after `519d4ed`
+
+Commit `ccc211e`: counted source `+572 / -1,363 / net -791`, including the
+entire new 323-line StateExecution. No complete files moved unchanged; the
+independent AdamW and dense-fast-weight tensor mathematics were retained.
+Deleted both workload execution/handle/diagnostics implementations and the
+backend's mirrored sampler/transition phases. Workloads share the same original
+PhysicalPlan cursor, SemanticState, arena and issued pin/publication/release.
+In-Place consumes original CapturedParameterOperand records instead of copying
+them into OperandPair, StepInput, Batch and CUDA wrappers. Its duplicate phase
+and non-issued ParameterOverlayPublication were removed as well.
+
+Existing evidence 23/25/37 now includes admission prepublication rollback,
+postpublication output/settlement failure and retry without another update or
+pin release, and a delayed CUDA guidance write. The admission-capacity leak,
+finished-cursor settlement retry and early sampler-read counterexamples failed
+before their fixes. Prediction readiness is issued after producing the result
+and retained only by the shared invocation, not copied into workload state.
+
+Repository-venv full pytest: 12 passed in 22.16s, including CUDA PTTS and isolated
+sdist/wheel. Rust: 4 passed. Strict/basic typing: 0 errors/0 warnings;
+import/authority gates passed, with 5 production files in the authority scan.
+All four GPU smokes reran: ESamp loss/update 2, In-Place updates/trained rows 6
+and apply rows 8, CUDA Graph loss/update 4 and stable addresses, FTTT loss/update
+1 and version 1. Cleanup and zero fallback passed. The sandbox-only run had
+11 passed/1 skipped due to unavailable CUDA; the complete run used the same
+repository venv outside the sandbox. No benchmark, release or research-note edits.
+
+This completes the two existing workloads' shared tensor-state lifecycle, not
+the generic public factory/deployment, global TLM path, AER, MP or composition.
+The evidence total remains 20 active / 21 pending.
 
 ### Shared PageBundle replacement after `70a82d2`
 
@@ -577,6 +609,7 @@ but missing workloads, MRv1, AER/PTTS, closed MP and evidence remain open.
 | E — legacy authority removal | 529 | 73,602 | 988 | -73,073 | active: Program, old WorkGraph, consumers/kit, producer/placement planners, legacy workload facades, native workload/schedule island, old Rust scheduler/recurrence island, backend-region/packed-hidden old hooks, consumer compat island, BaseConsumer dispatch chain and dummy consumer re-export removed |
 | D/E — residual retirement continuation | 111 | 21,856 | 617 | -21,745 | old packages and public hook/plugin path deleted; retained backend state/effects still require canonical consolidation |
 | F — AER/PTTS final core | 1,011 | 4,561 | 0 complete files | -3,550 | active: shared PageBundle replacement; AER, MP, TLM and captured version selection remain pending |
+| B/D — shared state execution continuation | 572 | 1,363 | 0 complete files | -791 | ESamp/In-Place lifecycle and original operand boundary shared; factory/deployment branches remain |
 | G — reachability and final compression | — | — | — | — | pending |
 
 Update this table from tracked physical line counts at each tranche boundary.
@@ -606,9 +639,9 @@ Moves are recorded separately and never counted as deletion.
 | Dummy | minimum graph/sign/plan/execute declaration | workload compile/owned export oracle restored; generic public factory pending | 20 active |
 | FTTT | edit math, judge, feedback retry | legacy owner removed; shared host transaction and receipt | 21, 38 active |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
-| In-Place-TTT | dense fast-weight math and layout | shared device execution/task/context complete; generic backend sessions/PTTS pending | 23, 32 active |
+| In-Place-TTT | dense fast-weight math and layout | shares StateExecution and original captured operands; generic backend factory/session pending | 23, 32 active |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
-| ESamp | request math, sampler guidance, random init | shared device execution/task/context complete; generic backend sessions and MRv1 pending | 25, 30, 37 active; 31 pending |
+| ESamp | request math, sampler guidance, random init | shares StateExecution and issued guidance readiness; generic backend factory/session and MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
 | Recirculation | row selection and replay math | typed replay effect | 27, 35 |
 | OverRIDE | reweight and Adam math | generic sampler/state transition | 28 |

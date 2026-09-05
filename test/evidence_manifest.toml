@@ -190,7 +190,7 @@ group = "workload"
 path = "test/workloads/test_inplace_ttt.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_inplace_ttt.py"
 environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Two targets match independent outer-product updates across a tail/chunk boundary through synchronous and staged execution; cancellation before capture permits retry, finish requires sampler completion and consumed handles reject repeated settlement; injected prepublication failure preserves original roots; one atomic publication, decode isolation between same-ID samples, exact version retirement and zero fallback"
+observable_contract = "Original captured operand records feed two-target independent outer-product updates across a tail/chunk boundary through shared synchronous/staged execution; cancellation before capture permits retry; sampler gates finish; prepublication failure preserves roots; postpublication settlement failure retains original invocation/publication/release and retry does not retrain or release twice; one atomic publication, same-ID sample isolation, exact retirement and zero fallback"
 replaces = "test/core/test_canonical_inplace_ttt_workload_unit.py; no legacy fixtures or internal class assertions"
 
 [[evidence]]
@@ -205,7 +205,7 @@ group = "workload"
 path = "test/workloads/test_esamp.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_esamp.py"
 environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Fixed-seed initialization; independent gated-residual/layernorm and torch.optim.AdamW oracle including per-state row averaging, gradients, moments and steps; cancellation after prediction or loss and injected prepublication failure preserve roots and capacity for retry; consumed cancellation handles rejected; same-ID sample isolation; immutable prediction guidance across publication; training only after sampler completion; exact cleanup and zero fallback"
+observable_contract = "Fixed-seed initialization; independent gated-residual/layernorm and torch.optim.AdamW including row averaging, gradients, moments and steps; cancellation after prediction/loss and prepublication failure preserve roots/capacity; failed admission publication restores capacity and permits retry; postpublication output failure retains original invocation/receipt and finish retries without another update; same-ID sample isolation, immutable guidance, sampler-gated training, exact cleanup and zero fallback"
 replaces = "Historical ESamp base-consumer/per-request training and hidden-storage numerical contracts; no legacy classes, benchmark selection fixtures or mock-count assertions"
 
 [[evidence]]
@@ -279,7 +279,7 @@ requires_gpu = true
 path = "test/gpu/canonical_esamp_cuda_graph_replay_smoke.py"
 command = "/workspace/pllm/.venv/bin/python test/gpu/canonical_esamp_cuda_graph_replay_smoke.py"
 environment = "Repository Python venv with torch and Rust extension; CUDA GPU"
-observable_contract = "Cancellation after prediction or loss permits subsequent training; capture/replay preserves stable addresses, four nonzero losses and updates; retirement of a cancelled in-flight sampler waits for its actual CUDA completion event before releasing state; exact cleanup and zero fallback"
+observable_contract = "Cancellation after prediction or loss permits subsequent training; capture/replay preserves stable addresses, four nonzero losses and updates; delayed prediction writes prove sampler readiness covers the produced result; retirement of a cancelled in-flight sampler waits for its actual CUDA completion event before releasing state; exact cleanup and zero fallback"
 replaces = "Historical ESamp CUDA capture/replay lifecycle smokes; no separate CPU/CUDA task-structure assertions"
 
 [[evidence]]
