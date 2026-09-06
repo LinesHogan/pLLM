@@ -6,14 +6,19 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from tllm.canonical.backend_program import ParameterTargetShape
+from tllm.canonical.backend_program import BackendCompileFacts, CausalTrainBatch, ParameterTargetShape
+from tllm.canonical.backend_attachment import compile_backend_attachment, validate_backend_attachment
 from tllm.canonical.kernels.adamw import AdamWConfig
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PageWrite
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
-from tllm.canonical.workloads.tlm import TLMConfig, TLMMode, TLMTrainBatch, TLMWorkload
+from tllm.canonical.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 from tllm.canonical.workloads.tlm import HfQvModel, HfQvConfig
 from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.backend_attachment import (
+    AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe,
+)
 from tllm.contracts.tensor_layout import TensorDType
 from tllm.contracts.state_representation import StateDeviceKind
 
@@ -22,6 +27,8 @@ class TinyCausalModel:
     device = torch.device("cpu")
     tensor_dtype = TensorDType.FLOAT64
     fingerprint = "a" * 64
+    scale = 1.0
+    model_source = ("tiny", "test")
     targets = tuple(ParameterTargetShape(ParameterTarget(0, ParameterModuleKind.ATTENTION, role), 3, 3)
         for role in (ParameterRole.QUERY_PROJECTION_WEIGHT, ParameterRole.VALUE_PROJECTION_WEIGHT))
 
@@ -33,7 +40,7 @@ class TinyCausalModel:
         self.base = torch.randn(2, 3, 3, generator=generator, dtype=torch.float64)
         self.head = torch.randn(3, 5, generator=generator, dtype=torch.float64)
 
-    def logits(self, batch: TLMTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
+    def logits(self, batch: CausalTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
         hidden = self.embedding[batch.input_ids]
         weights = self.base if factors is None else torch.stack(tuple(
             self.base[index] + factors[2 * index + 1] @ factors[2 * index]
@@ -70,11 +77,15 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version(monke
     config = TLMConfig(optimizer=AdamWConfig(0.01, (0.8, 0.95), 1e-7, 0.1), threshold=0.0)
     execution = _compile(model, config)
     (ref,) = execution.admit(())
-    old_pin = execution.arena.pin_exact((ref,))
+    first, second = RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0)
+    execution.admit((first,))
+    old_pin = execution.directory.inference_pin(first)
+    with pytest.raises(RuntimeError, match="inference requests"):
+        execution.retire(())
     before = execution.arena.snapshot(old_pin, ref)
     reference = tuple(torch.nn.Parameter(value.clone()) for value in model.initial_factors)
     optimizer = torch.optim.AdamW(reference, lr=0.01, betas=(0.8, 0.95), eps=1e-7, weight_decay=0.1, foreach=False)
-    batch = TLMTrainBatch(torch.tensor([[0, 1, 2, 3], [2, 4, 1, 0]]),
+    batch = CausalTrainBatch(torch.tensor([[0, 1, 2, 3], [2, 4, 1, 0]]),
         torch.tensor([[0, 1, -100, 3], [2, 4, 1, 0]]))
     for version in (1, 2):
         loss = _reference(model, reference, batch, config)
@@ -92,6 +103,11 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version(monke
         assert result.publication is not None
         (current,) = result.publication.after_refs
         assert current.version_id == version and result.selected_count == 2
+        if version == 1:
+            execution.admit((second,))
+            second_pin = execution.directory.inference_pin(second)
+        assert execution.directory.inference_pin(first) is old_pin
+        assert old_pin.refs == (ref,)
         actual = execution.snapshot(current)
         for index, parameter in enumerate(reference):
             fields = actual[index * 5:(index + 1) * 5]
@@ -101,7 +117,12 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version(monke
         torch.testing.assert_close(result.loss, loss.detach())
         for actual_old, expected in zip(execution.arena.snapshot(old_pin, ref), before, strict=True):
             torch.testing.assert_close(actual_old, expected)
-    execution.arena.wait_release(execution.arena.release_pin(old_pin))
+    assert second_pin.refs[0].version_id == 1
+    assert execution.diagnostics().inference_pins == 2
+    execution.retire((first, second))
+    assert execution.diagnostics().inference_pins == 0
+    with pytest.raises(RuntimeError, match="pin"):
+        execution.arena.snapshot(old_pin, ref)
     execution.retire(())
     assert execution.diagnostics().active_lineages == 0
     assert execution.diagnostics().update_count == 2
@@ -110,10 +131,23 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version(monke
 
 def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None:
     model = TinyCausalModel()
-    batch = TLMTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
+    batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
-        execution = _compile(model, config)
+        deployment = TLMWorkload(config, model).compile_backend(BackendCompileFacts(
+            BackendPlacementProbe("test.qv@1", "a" * 64, "b" * 64, "c" * 64,
+                AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CPU,
+                0, 1, 1, model.tensor_dtype, 3, 8, (), ()),
+            CanonicalRuntimeFacts(model.device).timeline(("optimizer/adamw@1", "transition/full_root@1")),
+            (PageBundleProviderFacts("test.qv@1", 4),), 2, 32768, 7, model.targets))
+        execution = deployment.execution
+        signed = deployment.attachment
+        first, second = signed.inputs.request.overlay_bindings
+        changed = replace(signed.inputs, request=replace(signed.inputs.request,
+            overlay_bindings=(replace(first, scale=2.0), second)))
+        assert compile_backend_attachment(changed) != signed.decision
+        with pytest.raises(ValueError):
+            validate_backend_attachment(changed, signed.decision)
         execution.admit(())
         anchors = {task.task_symbol: task.anchor_id for task in execution.arena.plan.schedule_decision.tasks}
         timeline = {item.symbol: item.ordinal for item in execution.arena.plan.timeline.anchors}
@@ -151,7 +185,7 @@ def _hf_matches_reference(device: torch.device) -> None:
         2, 4, 0.0, TensorDType.FLOAT32))
     assert tuple((target.input_size, target.output_size) for target in hf.targets) == ((8, 8), (8, 4))
     frozen = tuple(value.clone() for value in hf.initial_factors)
-    batch = TLMTrainBatch(torch.tensor([[1, 2, 3, 4], [2, 3, 4, 0]], device=device),
+    batch = CausalTrainBatch(torch.tensor([[1, 2, 3, 4], [2, 3, 4, 0]], device=device),
         torch.tensor([[1, 2, 3, 4], [2, 3, 4, -100]], device=device),
         torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], device=device))
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None

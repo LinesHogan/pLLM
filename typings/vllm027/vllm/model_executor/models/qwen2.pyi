@@ -20,8 +20,15 @@ class Qwen2MLP(Module):
     forward: Callable[[Qwen2MLP, torch.Tensor], torch.Tensor]
 
 
+class Qwen2Attention(Module):
+    qkv_proj: Qwen2DownProjection
+    q_size: int
+    kv_size: int
+
+
 class Qwen2DecoderLayer(Module):
     mlp: Qwen2MLP
+    self_attn: Qwen2Attention
 
 
 class Qwen2Model(Module):

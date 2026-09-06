@@ -12,7 +12,11 @@ from typing import Protocol
 
 import torch
 
-from tllm.canonical.backend_program import ParameterTargetShape
+from tllm.canonical.backend_attachment import bind_backend_attachment
+from tllm.canonical.backend_program import (
+    BackendCompileFacts, BackendDeployment, BackendRequirements, BackendWorkload,
+    CausalTrainBatch, ParameterTargetShape, TensorStepInput,
+)
 from tllm.canonical.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from tllm.canonical.kernels.tlm_objective import tlm_weighted_selection_objective
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, tensor_dtype
@@ -20,7 +24,8 @@ from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts, co
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.canonical.state_execution import PublishStateTask, StateExecution, StateTaskContext
 from tllm.contracts.request_state import IndexedRequestIdentityBatch
-from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole
+from tllm.contracts.backend_attachment import BackendAttachmentSpec, AttachmentKind, AttachmentTaskRole
+from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterOverlayFieldBinding, ParameterOverlayOperator
 from tllm.contracts.semantic_graph import (
     AnchorId, AnchorSymbol, ExecutionKind, HostPayloadSchemaId, HostServiceId,
     HostServiceInputSource, HostServicePort, ImplementationId, SchedulerTimeline,
@@ -53,13 +58,6 @@ class TLMConfig:
             raise ValueError("TLM objective configuration is not finite or closed")
 
 
-@dataclass(frozen=True, slots=True)
-class TLMTrainBatch:
-    input_ids: torch.Tensor
-    labels: torch.Tensor
-    attention_mask: torch.Tensor | None = None
-
-
 class TLMModel(Protocol):
     """Frozen causal mathematics, with caller-owned q/v factors in target order."""
     @property
@@ -72,7 +70,11 @@ class TLMModel(Protocol):
     def device(self) -> torch.device: ...
     @property
     def fingerprint(self) -> str: ...
-    def logits(self, batch: TLMTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor: ...
+    @property
+    def scale(self) -> float: ...
+    @property
+    def model_source(self) -> tuple[str, str]: ...
+    def logits(self, batch: CausalTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +86,7 @@ class TLMResult:
 
 @dataclass(slots=True)
 class TLMData:
-    batch: TLMTrainBatch
+    batch: CausalTrainBatch | None
     loss: torch.Tensor | None = None
     selected_count: int = 0
 
@@ -96,7 +98,7 @@ _FIELDS = AdamWFields(*(LayoutFieldId(index) for index in range(5)))
 
 
 @dataclass(frozen=True, slots=True)
-class TLMWorkload:
+class TLMWorkload(BackendWorkload[TLMData, TLMResult]):
     config: TLMConfig
     model: TLMModel
 
@@ -105,10 +107,32 @@ class TLMWorkload:
         for index, factor in enumerate(self.model.initial_factors):
             root[5 * index].copy_(factor)
 
-    def rows(self, value: TLMTrainBatch) -> IndexedRequestIdentityBatch:
+    def backend_requirements(self) -> BackendRequirements:
+        return BackendRequirements(parameter_targets=tuple(target.target for target in self.model.targets),
+            model_source=self.model.model_source)
+
+    def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[TLMData, TLMResult]:
+        if facts.targets != self.model.targets or facts.probe.tensor_dtype != self.model.tensor_dtype:
+            raise ValueError("TLM causal model and backend q/v projection facts differ")
+        execution = self.compile(facts.timeline, facts.providers,
+            state_memory_budget_bytes=facts.state_memory_budget_bytes)
+        bindings = tuple(ParameterOverlayFieldBinding(target.target, ParameterOverlayOperator.LOW_RANK_ADD,
+            (LayoutFieldId(index * 10), LayoutFieldId(index * 10 + 5)), self.model.scale)
+            for index, target in enumerate(self.model.targets))
+        attachment = bind_backend_attachment(execution.arena.plan, facts.probe,
+            BackendAttachmentSpec(AttachmentKind.PARAMETER_OVERLAY,
+                ((AttachmentTaskRole.TRANSITION, _UPDATE), (AttachmentTaskRole.PUBLISH, _PUBLISH)),
+                AnchorSymbol("sampler.complete"), _STATE, bindings))
+        return BackendDeployment(execution, attachment)
+
+    def rows(self, value: CausalTrainBatch | TensorStepInput) -> IndexedRequestIdentityBatch:
         return IndexedRequestIdentityBatch(())
 
-    def prepare(self, value: TLMTrainBatch, context: StateTaskContext[TLMData]) -> TLMData:
+    def prepare(self, value: CausalTrainBatch | TensorStepInput, context: StateTaskContext[TLMData]) -> TLMData:
+        if isinstance(value, TensorStepInput):
+            if value.training is None:
+                return TLMData(None, torch.zeros((), device=self.model.device))
+            value = value.training
         if (value.input_ids.ndim != 2 or value.input_ids.shape != value.labels.shape
             or value.input_ids.shape[0] < 1 or value.input_ids.shape[1] < 2
             or value.input_ids.dtype != torch.int64 or value.labels.dtype != torch.int64
@@ -126,7 +150,7 @@ class TLMWorkload:
 
 
     def compile(self, timeline: SchedulerTimeline, providers: tuple[PageBundleProviderFacts, ...],
-        *, state_memory_budget_bytes: int, plan_epoch: int = 1) -> StateExecution[TLMTrainBatch, TLMData, TLMResult]:
+        *, state_memory_budget_bytes: int, plan_epoch: int = 1) -> StateExecution[CausalTrainBatch | TensorStepInput, TLMData, TLMResult]:
         config, model = self.config, self.model
         if not model.targets or len(model.initial_factors) != 2 * len(model.targets):
             raise ValueError("TLM requires one A/B factor pair per q/v target")
@@ -180,6 +204,8 @@ class TLMUpdateTask:
 
     def execute(self, context: StateTaskContext[TLMData]) -> None:
         model, config, data = self.math.model, self.math.config, context.data()
+        if data.batch is None:
+            return
         (ref,) = context.pin.refs
         with (nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream)), torch.inference_mode(False), torch.enable_grad():
             factors = tuple(context.arena.borrow_field(context.pin, ref, LayoutFieldId(5 * index))

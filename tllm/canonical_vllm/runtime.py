@@ -11,7 +11,7 @@ from typing import Generic, Literal, Protocol
 import torch
 
 from tllm.canonical.state_execution import StateInvocation
-from tllm.canonical.backend_program import BackendCompileFacts, BackendDeployment, BackendWorkload, DataT, ResultT, TensorStepInput
+from tllm.canonical.backend_program import BackendCompileFacts, BackendDeployment, BackendWorkload, CausalTrainBatch, DataT, ResultT, TensorStepInput
 from tllm.canonical.cuda_stream import CudaStreamReadiness
 from tllm.contracts.request_state import IndexedRequestIdentityBatch, IndexedRequestIdentityRow
 
@@ -20,9 +20,9 @@ from tllm.canonical.backend_attachment import (
 )
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
-from tllm.canonical_vllm.dense_overlay import (
-    VllmDenseAddAdapter,
-    inspect_dense_add_targets,
+from tllm.canonical_vllm.parameter_overlay import (
+    VllmParameterOverlay,
+    inspect_parameter_targets,
 )
 from tllm.canonical_vllm.hidden_capture import Vllm027EagerPackedHiddenCapture
 from tllm.canonical_vllm.packed_rows import (
@@ -46,7 +46,7 @@ from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.semantic_graph import (
-    AnchorId,
+    AnchorId, HostServiceInputSource, StateScope,
 )
 from tllm.contracts.state_representation import StateDeviceKind
 from tllm.contracts.tensor_layout import TensorDType
@@ -81,8 +81,8 @@ _BACKEND_ABI_FIELDS = (
     "sampler=vllm.v1.worker.gpu.sample.sampler.Sampler",
     "mode=in_process/eager/tp1/pp1/dp1/non_spec",
     "rows=one_logit_per_request",
-    "attachment=shared_plan_v3",
-    "attachments=request_sampler_training|dense_parameter_overlay",
+    "attachment=shared_plan_v4",
+    "attachments=request_sampler_training|parameter_overlay",
 )
 _REQUEST_CAPABILITIES = (
     "backend/vllm_mrv2@1",
@@ -93,6 +93,7 @@ _OVERLAY_CAPABILITIES = (
     "backend/vllm_mrv2@1",
     "operand_capture/mlp_down_projection_pair@1",
     "overlay/dense_add@1",
+    "overlay/low_rank_add@1",
 )
 
 
@@ -113,6 +114,7 @@ class CanonicalVllmConfig:
     seed: int = 0
     trust_remote_code: bool = False
     enable_prefix_caching: bool = False
+    revision: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -168,6 +170,7 @@ class _RunnerSession(Protocol):
     def apply_count(self) -> int: ...
     @property
     def updated_apply_count(self) -> int: ...
+    def stage_training(self, batch: CausalTrainBatch | None) -> None: ...
     def before_execute(self, scheduler_output: SchedulerOutput) -> None: ...
     def prepare_input(self, input_batch: InputBatch) -> None: ...
     def complete_forward(self) -> None: ...
@@ -199,7 +202,7 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
         self._capture = Vllm027EagerPackedHiddenCapture(model=model, resources=resources,
             plan_epoch=attachment.physical.plan_epoch, max_packed_rows=probe.max_packed_rows,
             hidden_size=probe.hidden_size) if resources else None
-        self._dense_adapter = VllmDenseAddAdapter(model,
+        self._overlay = VllmParameterOverlay(model,
             attachment.inputs.request.overlay_bindings) if attachment.inputs.request.overlay_bindings else None
         self._sampler = CanonicalVllm027PostFilterSampler(upstream_sampler, eager=True) if (
             attachment.inputs.request.attachment_kind is AttachmentKind.REQUEST_SAMPLER_TRAINING) else None
@@ -207,6 +210,19 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
         self._next_prompt_index = 0
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
+        self._training: CausalTrainBatch | None = None
+        execution = deployment.execution
+        if execution.directory.state.scope is StateScope.INSTANCE:
+            execution.admit((), torch.cuda.current_stream(execution.device))
+
+    def stage_training(self, batch: CausalTrainBatch | None) -> None:
+        if self._training is not None or self._step is not None:
+            raise RuntimeError("prior canonical training input is still active")
+        if batch is not None and not any(isinstance(item.source, HostServiceInputSource)
+            and item.source.schema == "canonical.causal_tokens@1"
+            for task in self._deployment.attachment.inputs.plan.semantic_graph.tasks for item in task.inputs):
+            raise ValueError("signed workload does not consume causal training input")
+        self._training = batch
 
     @property
     def sampler(self) -> CanonicalVllm027PostFilterSampler:
@@ -216,18 +232,19 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
 
     @property
     def apply_count(self) -> int:
-        return 0 if self._dense_adapter is None else self._dense_adapter.apply_count
+        return 0 if self._overlay is None else self._overlay.apply_count
 
     @property
     def updated_apply_count(self) -> int:
-        return 0 if self._dense_adapter is None else self._dense_adapter.updated_apply_count
+        return 0 if self._overlay is None else self._overlay.updated_apply_count
 
     def before_execute(self, scheduler_output: SchedulerOutput) -> None:
         if self._step is not None:
             raise RuntimeError("prior canonical vLLM step is still active")
         execution = self._deployment.execution
         execution.arena.collect_completed()
-        finished = tuple(self._identities[request_id] for request_id in sorted(scheduler_output.finished_req_ids))
+        finished = tuple(self._identities[request_id] for request_id in sorted(
+            self._identities.keys() & scheduler_output.finished_req_ids))
         if finished:
             execution.retire(finished)
             for identity in finished:
@@ -242,7 +259,8 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
                 raise RuntimeError("canonical vLLM requires sampling n=1")
             pending.append(RequestIdentity(request.req_id, self._next_prompt_index + len(pending), 0))
         if pending:
-            execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
+            if execution.directory.state.scope is StateScope.REQUEST:
+                execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
             for identity in pending:
                 self._identities[identity.request_id] = identity
             self._next_prompt_index += len(pending)
@@ -258,17 +276,29 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
         self._step = step
         if self._capture is not None:
             self._capture.begin(rows.phase_rows)
-        adapter = self._dense_adapter
+        adapter = self._overlay
         if adapter is None:
             return
         execution = self._deployment.execution
         identities = tuple(sorted((binding.identity for binding in requests.bindings),
             key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)))
-        invocation = execution.begin(IndexedRequestIdentityBatch(tuple(
-            IndexedRequestIdentityRow(index, identity) for index, identity in enumerate(identities))),
-            torch.cuda.current_stream(execution.device))
-        step.invocation = invocation
-        adapter.prepare(rows.phase_rows, invocation.cursor.context)
+        stream = torch.cuda.current_stream(execution.device)
+        if execution.directory.state.scope is StateScope.INSTANCE:
+            value = TensorStepInput(rows.phase_rows, rows.sampler_rows, training=self._training)
+            invocation = execution.start_step(value, stream)
+            self._training = None
+            step.invocation = invocation
+            self._advance(invocation, "request.prepare")
+            # Offline publication precedes admission; existing request pins remain unchanged.
+            pending = tuple(identity for identity in identities
+                if not execution.directory.has_inference_pin(identity))
+            if pending:
+                execution.admit(pending, stream)
+        else:
+            invocation = execution.begin(IndexedRequestIdentityBatch(tuple(
+                IndexedRequestIdentityRow(index, identity) for index, identity in enumerate(identities))), stream)
+            step.invocation = invocation
+        adapter.prepare(rows.phase_rows, invocation.cursor.context, execution.directory)
 
     def complete_forward(self) -> None:
         step = self._step
@@ -277,9 +307,10 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
         execution = self._deployment.execution
         stream = torch.cuda.current_stream(execution.device)
         hidden = None if self._capture is None else self._capture.publish()
-        operands = () if self._dense_adapter is None else self._dense_adapter.take_captures()
+        operands = () if self._overlay is None else self._overlay.take_captures()
         phases = {resource.phase for resource in self._deployment.attachment.inputs.probe.hidden_resources}
-        if not operands and not any(row.phase in phases for row in step.rows.phase_rows.rows):
+        if step.invocation is None and not operands and not any(
+            row.phase in phases for row in step.rows.phase_rows.rows):
             if self._capture is not None:
                 self._capture.finish()
             self._step = None
@@ -287,14 +318,13 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
         value = TensorStepInput(step.rows.phase_rows, step.rows.sampler_rows, hidden, operands)
         if step.invocation is None:
             step.invocation = execution.start_step(value, stream)
-        else:
+        elif step.invocation.cursor.context.value is None:
             execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
-        for symbol in ("model.execute", "state.publish"):
-            execution.execute_anchor(step.invocation, self._anchor(symbol))
+        self._advance(step.invocation, "sampler.pre_draw")
         if self._capture is not None:
             self._capture.finish()
-        if self._dense_adapter is not None:
-            self._dense_adapter.clear()
+        if self._overlay is not None:
+            self._overlay.clear()
 
     def begin_sampler(self, model: Qwen2ForCausalLM) -> bool:
         if self._step is None or self._sampler is None:
@@ -326,7 +356,7 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
             return
         execution = self._deployment.execution
         invocation = self._invocation()
-        execution.execute_anchor(invocation, self._anchor("token.commit"))
+        self._advance(invocation, "next.prepare")
         execution.finish_step(invocation)
         self._step = None
         execution.arena.collect_completed()
@@ -336,36 +366,48 @@ class CanonicalVllmSession(Generic[DataT, ResultT]):
             self._sampler.abort_guidance()
         if self._capture is not None:
             self._capture.abort_if_active()
-        if self._dense_adapter is not None:
-            self._dense_adapter.clear()
+        if self._overlay is not None:
+            self._overlay.clear()
         self._deployment.execution.cancel_active()
+        self._training = None
         self._step = None
 
     def retire_all(self) -> None:
         if self._step is not None:
             raise RuntimeError("canonical requests cannot retire during a step")
         identities = tuple(self._identities[request_id] for request_id in sorted(self._identities))
+        execution = self._deployment.execution
+        if execution.directory.state.scope is StateScope.INSTANCE:
+            identities = tuple(identity for identity in identities if execution.directory.has_inference_pin(identity))
         if identities:
             self._deployment.execution.retire(identities)
         self._identities.clear()
-        self._deployment.execution.arena.collect_completed()
+        self._deployment.execution.arena.collect_completed(wait=True)
 
     def close(self) -> None:
         self.abort_active()
         self.retire_all()
+        execution = self._deployment.execution
+        if execution.directory.state.scope is StateScope.INSTANCE:
+            execution.retire(())
         if self._capture is not None:
             self._capture.close()
-        if self._dense_adapter is not None:
-            self._dense_adapter.close()
+        if self._overlay is not None:
+            self._overlay.close()
 
     def _invocation(self) -> StateInvocation[DataT]:
         if self._step is None or self._step.invocation is None:
             raise RuntimeError("model inputs have not started the signed invocation")
         return self._step.invocation
 
-    def _anchor(self, symbol: str) -> AnchorId:
-        return next(AnchorId(anchor.ordinal) for anchor in self._deployment.execution.arena.plan.timeline.anchors
-            if anchor.symbol == symbol)
+    def _advance(self, invocation: StateInvocation[DataT], symbol: str) -> None:
+        execution = self._deployment.execution
+        for anchor in execution.arena.plan.timeline.anchors:
+            if anchor.ordinal > invocation.cursor.last_anchor_id:
+                execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+            if anchor.symbol == symbol:
+                return
+        raise RuntimeError("backend event is absent from the original timeline")
 
 class CanonicalGPUModelRunner(GPUModelRunner):
     """MRv2 runner subclass with one generic canonical attachment slot."""
@@ -422,6 +464,9 @@ class CanonicalGPUModelRunner(GPUModelRunner):
             self.sampler = upstream
         self._canonical_session = None
         self._canonical_upstream_sampler = None
+
+    def stage_canonical_training(self, batch: CausalTrainBatch | None) -> None:
+        self._require_session().stage_training(batch)
 
     def retire_completed_canonical_requests(self) -> None:
         session = self._require_session()
@@ -564,6 +609,7 @@ class CanonicalVllmLlm(Generic[DataT, ResultT]):
         sampling_params: SamplingParams,
         *,
         use_tqdm: bool = False,
+        training: CausalTrainBatch | None = None,
     ) -> list[RequestOutput]:
         if self._closed:
             raise RuntimeError("canonical vLLM handle is closed")
@@ -582,6 +628,7 @@ class CanonicalVllmLlm(Generic[DataT, ResultT]):
             or type(use_tqdm) is not bool
         ):
             raise ValueError("canonical vLLM generate requires non-empty text and n=1")
+        self.runner.stage_canonical_training(training)
         try:
             outputs = self._llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
         except Exception:
@@ -595,6 +642,8 @@ def create_canonical_vllm_llm(
     workload: BackendWorkload[DataT, ResultT],
     config: CanonicalVllmConfig,
 ) -> CanonicalVllmLlm[DataT, ResultT]:
+    if config.enable_prefix_caching and workload.backend_requirements().parameter_targets:
+        raise ValueError("parameter-version overlays do not support shared prefix caching")
     if _VLLM_VERSION != _SUPPORTED_VLLM_VERSION:
         raise RuntimeError("canonical vLLM requires vLLM 0.27.1 exactly")
     mp_env = os.environ.get(_MP_ENV)
@@ -608,6 +657,7 @@ def create_canonical_vllm_llm(
     try:
         llm = LLM(
             model=config.model,
+            revision=config.revision,
             dtype=_model_dtype(config.dtype),
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
@@ -678,12 +728,15 @@ def _compile_vllm_deployment(
     if model.quant_config is not None:
         raise RuntimeError("canonical vLLM requires an unquantized model")
     requirements = workload.backend_requirements()
+    if requirements.model_source is not None and requirements.model_source != (
+        runner.model_config.model, runner.model_config.revision or "main"):
+        raise ValueError("causal training and inference must use the same model source and revision")
     layer_count = len(model.model.layers)
     if any(source.site is not HiddenSite.BLOCK_OUTPUT for source in requirements.hidden_inputs):
         raise ValueError("Qwen2 hidden capture requires block outputs")
     hidden_resources = tuple(sorted((AttachmentHiddenResource(_hidden_binding(source.layer, layer_count), source.phase)
         for source in requirements.hidden_inputs), key=lambda resource: resource.resource_key))
-    targets = inspect_dense_add_targets(model, requirements.parameter_targets, runner.dtype)
+    targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
     probe = _base_probe(runner,
         model_fingerprint=_digest((
             f"model={runner.model_config.model}", f"revision={runner.model_config.revision or ''}",
@@ -695,7 +748,7 @@ def _compile_vllm_deployment(
         hidden_size=model.config.hidden_size, hidden_resources=hidden_resources,
         capabilities=tuple(sorted(set((*_REQUEST_CAPABILITIES, *_OVERLAY_CAPABILITIES)))))
     timeline = CanonicalRuntimeFacts(runner.device).timeline((
-        "state/dense_page_cuda@1", "state/fenced_reclaim@1", "transition/full_root@1"))
+        "state/dense_page_cuda@1", "state/fenced_reclaim@1", "transition/full_root@1", "optimizer/adamw@1"))
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     facts = BackendCompileFacts(probe, timeline, (PageBundleProviderFacts("canonical.page_bundle_cuda@1", 3,
         probe.device_kind, probe.device_ordinal),), runner.max_num_reqs, free_bytes,

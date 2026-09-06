@@ -7,9 +7,10 @@ use super::super::semantic_graph::{
 };
 use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
 use super::types::{
-    AttachmentCompilerInputs, AttachmentHiddenResource, AttachmentKind, AttachmentOverlayStage,
+    AttachmentCompilerInputs, AttachmentHiddenResource, AttachmentKind,
     AttachmentTaskBinding, AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe,
-    HiddenLayerKind, HiddenPhase, HiddenSite, OverlayOperator, StreamDependency, SCHEMA_VERSION,
+    HiddenLayerKind, HiddenPhase, HiddenSite, OverlayOperator, ParameterModuleKind, ParameterRole,
+    StreamDependency, SCHEMA_VERSION,
 };
 
 pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -64,7 +65,7 @@ fn validate_request(
                 return Err("sampler attachment tasks must be compute then transition".to_owned());
             }
         }
-        AttachmentKind::DenseParameterOverlay => {
+        AttachmentKind::ParameterOverlay => {
             if request.task_bindings.len() != 2
                 || request.task_bindings[0].role != AttachmentTaskRole::Transition
                 || request.task_bindings[1].role != AttachmentTaskRole::Publish
@@ -92,7 +93,7 @@ fn validate_request(
     }
     match request.attachment_kind {
         AttachmentKind::RequestSamplerTraining => {
-            if !request.overlay_bindings.is_empty() || !request.overlay_stage_anchors.is_empty() {
+            if !request.overlay_bindings.is_empty() {
                 return Err("request sampler attachment cannot bind overlay fields".to_owned());
             }
             if request.stream_dependencies
@@ -109,7 +110,7 @@ fn validate_request(
                 );
             }
         }
-        AttachmentKind::DenseParameterOverlay => {
+        AttachmentKind::ParameterOverlay => {
             if !probe.hidden_resources.is_empty() {
                 return Err(
                     "hidden/overlay composition is not supported by this attachment".to_owned(),
@@ -124,34 +125,21 @@ fn validate_request(
                     .windows(2)
                     .any(|pair| pair[0].target >= pair[1].target)
                 || bindings.iter().any(|binding| {
-                    binding.operator != OverlayOperator::DenseAdd || binding.fields.len() != 1
+                    !binding.scale.is_finite() || binding.scale <= 0.0 || match binding.operator {
+                        OverlayOperator::DenseAdd => binding.fields.len() != 1 || binding.scale != 1.0
+                            || binding.target.module != ParameterModuleKind::Mlp
+                            || binding.target.role != ParameterRole::DownProjectionWeight,
+                        OverlayOperator::LowRankAdd => binding.fields.len() != 2
+                            || binding.fields[0] == binding.fields[1]
+                            || binding.target.module != ParameterModuleKind::Attention
+                            || !matches!(binding.target.role, ParameterRole::QueryProjectionWeight | ParameterRole::ValueProjectionWeight),
+                    }
                 })
             {
                 return Err(
-                    "dense overlay requires unique targets and one dense field per target"
+                    "parameter overlay requires unique targets and exact operator fields/scaling"
                         .to_owned(),
                 );
-            }
-            let stages = request
-                .overlay_stage_anchors
-                .iter()
-                .map(|stage| &stage.stage)
-                .collect::<Vec<_>>();
-            if stages
-                != vec![
-                    &AttachmentOverlayStage::Pin,
-                    &AttachmentOverlayStage::Apply,
-                    &AttachmentOverlayStage::Capture,
-                    &AttachmentOverlayStage::Transition,
-                    &AttachmentOverlayStage::Publish,
-                    &AttachmentOverlayStage::Release,
-                    &AttachmentOverlayStage::Finish,
-                ]
-            {
-                return Err("dense overlay attachment stages are not closed".to_owned());
-            }
-            for stage in &request.overlay_stage_anchors {
-                require_text(&stage.anchor_symbol, "overlay_stage_anchors.anchor_symbol")?;
             }
         }
     }
@@ -333,7 +321,7 @@ fn validate_request_sampler_training_graph(
     Ok(())
 }
 
-fn validate_dense_parameter_overlay_graph(
+fn validate_parameter_overlay_graph(
     request: &BackendAttachmentRequest,
     graph: &SemanticGraph,
 ) -> Result<(), String> {
@@ -355,8 +343,11 @@ fn validate_dense_parameter_overlay_graph(
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
         .map(|index| &graph.states[index])
         .map_err(|_| "dense overlay state resource is absent from the semantic graph".to_owned())?;
-    if state.scope != StateScope::Request {
-        return Err("dense overlay state differs from semantic graph state".to_owned());
+    if request.overlay_bindings.iter().any(|binding| match binding.operator {
+        OverlayOperator::DenseAdd => state.scope != StateScope::Request,
+        OverlayOperator::LowRankAdd => state.scope != StateScope::Instance,
+    }) {
+        return Err("parameter overlay operator differs from semantic state scope".to_owned());
     }
     let transition = task_for_dense_id(graph, &request.task_bindings[0])?;
     if !transition.effects.iter().any(|effect| {
@@ -394,8 +385,8 @@ fn validate_cross_binding(
         AttachmentKind::RequestSamplerTraining => {
             validate_request_sampler_training_graph(request, probe, graph)?;
         }
-        AttachmentKind::DenseParameterOverlay => {
-            validate_dense_parameter_overlay_graph(request, graph)?;
+        AttachmentKind::ParameterOverlay => {
+            validate_parameter_overlay_graph(request, graph)?;
         }
     }
     let provider = state
@@ -415,15 +406,6 @@ fn validate_cross_binding(
         || sampler_anchor.symbol != request.sampler_anchor_symbol
     {
         return Err("attachment sampler anchor differs from timeline".to_owned());
-    }
-    for stage in &request.overlay_stage_anchors {
-        let anchor = timeline
-            .anchors
-            .get(stage.anchor_id as usize)
-            .ok_or_else(|| "dense overlay stage anchor is outside the timeline".to_owned())?;
-        if anchor.ordinal != stage.anchor_id as u64 || anchor.symbol != stage.anchor_symbol {
-            return Err("dense overlay stage anchor differs from timeline".to_owned());
-        }
     }
     for binding in &request.task_bindings {
         let task = schedule
@@ -447,19 +429,24 @@ fn validate_cross_binding(
                 return Err("attachment task anchors violate sampler timing".to_owned());
             }
         }
-        AttachmentKind::DenseParameterOverlay => {
+        AttachmentKind::ParameterOverlay => {
             let transition = &request.task_bindings[0];
             let publish = &request.task_bindings[1];
-            if request
-                .overlay_stage_anchors
-                .windows(2)
-                .any(|pair| pair[0].anchor_id > pair[1].anchor_id)
-                || request.overlay_stage_anchors[3].anchor_id != transition.anchor_id
-                || request.overlay_stage_anchors[4].anchor_id != publish.anchor_id
-                || request.overlay_stage_anchors[5].anchor_id != request.sampler_anchor_id
-                || transition.anchor_id > publish.anchor_id
-            {
-                return Err("dense overlay task anchors violate publication timing".to_owned());
+            let anchor_id = |symbol: &str| timeline.anchors.iter()
+                .find(|anchor| anchor.symbol == symbol).map(|anchor| anchor.ordinal as u32);
+            let request_state = graph.states.iter().find(|state| state.resource == request.state_resource)
+                .is_some_and(|state| state.scope == StateScope::Request);
+            let supported = if request_state {
+                Some(transition.anchor_id) == anchor_id("model.execute")
+                    && Some(publish.anchor_id) == anchor_id("state.publish")
+            } else {
+                (Some(transition.anchor_id) == anchor_id("request.prepare")
+                    && Some(publish.anchor_id) == anchor_id("request.prepare"))
+                || (Some(transition.anchor_id) == anchor_id("token.commit")
+                    && Some(publish.anchor_id) == anchor_id("token.commit"))
+            };
+            if !supported {
+                return Err("parameter overlay tasks use unsupported backend event timing".to_owned());
             }
         }
     }

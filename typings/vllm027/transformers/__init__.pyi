@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from os import PathLike
+from typing import Self
 
 import torch
 
@@ -11,7 +12,7 @@ class PreTrainedModel(torch.nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> PreTrainedModel: ...
+    ) -> Self: ...
 
 
 class AutoModelForCausalLM:

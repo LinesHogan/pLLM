@@ -155,20 +155,15 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
                 with pytest.raises(ValueError):
                     _core.compile_backend_attachment(json.dumps(payload))
         with pytest.raises(ValueError):
-            _core.compile_backend_attachment(wire.replace('"schema_version":3', '"schema_version":3,"schema_version":3', 1))
+            _core.compile_backend_attachment(wire.replace('"schema_version":4', '"schema_version":4,"schema_version":4', 1))
 
     request = overlay.inputs.request
-    stages = request.overlay_stage_anchors
     for invalid in (
         replace(request, overlay_bindings=(replace(binding, fields=(999,)),)),
         replace(request, overlay_bindings=(replace(binding, fields=(0, 0)),)),
         replace(request, overlay_bindings=(binding, binding)),
+        replace(request, overlay_bindings=(replace(binding, scale=2.0),)),
         replace(request, overlay_bindings=(replace(binding, operator=ParameterOverlayOperator.LOW_RANK_ADD),)),
-        replace(request, overlay_stage_anchors=stages[:-1]),
-        replace(request, overlay_stage_anchors=(replace(stages[0], anchor_id=stages[-1].anchor_id,
-            anchor_symbol=stages[-1].anchor_symbol), *stages[1:])),
-        replace(request, overlay_stage_anchors=(*stages[:3], replace(stages[3],
-            anchor_id=stages[4].anchor_id, anchor_symbol=stages[4].anchor_symbol), *stages[4:])),
     ):
         with pytest.raises(ValueError):
             compile_backend_attachment(replace(overlay.inputs, request=invalid))

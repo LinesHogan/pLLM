@@ -44,6 +44,7 @@ class ParameterOverlayFieldBinding:
     target: ParameterTarget
     operator: ParameterOverlayOperator
     fields: tuple[LayoutFieldId, ...]
+    scale: float = 1.0
 
 @dataclass(frozen=True, slots=True)
 class CapturedParameterOperand:

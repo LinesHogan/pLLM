@@ -7,7 +7,7 @@ from threading import RLock
 
 import torch
 
-from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
+from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_state import IndexedRequestIdentityBatch, RequestStateKey
 from tllm.contracts.semantic_graph import SemanticState, StateScope
@@ -48,6 +48,7 @@ class RequestStateDirectory:
         self.arena = arena
         self.state = state
         self._lineages: dict[RequestStateKey | None, LineageId] = {}
+        self._inference_pins: dict[RequestIdentity, PagePin] = {}
         self._leases: dict[int, RequestStateTransitionLease] = {}
         self._leased_keys: set[RequestStateKey | None] = set()
         self._pending: RequestStateAdmissionBatch | None = None
@@ -57,6 +58,50 @@ class RequestStateDirectory:
     @property
     def active_count(self) -> int:
         return len(self._lineages)
+
+    @property
+    def inference_pin_count(self) -> int:
+        return len(self._inference_pins)
+
+    def admit_inference(self, identities: tuple[RequestIdentity, ...],
+                        stream: torch.cuda.Stream | None = None) -> tuple[StateRef, ...]:
+        """Fix each request to the original instance root visible at admission."""
+        with self._lock:
+            if (self.state.scope is not StateScope.INSTANCE or not identities
+                or len(set(identities)) != len(identities)
+                or any(identity in self._inference_pins for identity in identities)):
+                raise ValueError("instance inference admission requires distinct new requests")
+            refs = self.select(IndexedRequestIdentityBatch(())).refs
+            pending: dict[RequestIdentity, PagePin] = {}
+            try:
+                for identity in identities:
+                    pending[identity] = self.arena.pin_exact(refs, stream)
+            except Exception:
+                for pin in pending.values():
+                    self.arena.release_pin(pin)
+                raise
+            self._inference_pins.update(pending)
+            return refs
+
+    def inference_pin(self, identity: RequestIdentity, stream: torch.cuda.Stream | None = None) -> PagePin:
+        with self._lock:
+            pin = self._inference_pins[identity]
+            if pin.stream != stream:
+                raise ValueError("inference must use its original admission pin stream")
+            return pin
+
+    def has_inference_pin(self, identity: RequestIdentity) -> bool:
+        return identity in self._inference_pins
+
+    def retire_inference(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
+        with self._lock:
+            if not identities or len(set(identities)) != len(identities):
+                raise ValueError("inference retirement requires distinct requests")
+            pins = tuple(self._inference_pins[identity] for identity in identities)
+            for identity, pin in zip(identities, pins, strict=True):
+                self.arena.release_pin(pin)
+                self._inference_pins.pop(identity)
+            return tuple(dict.fromkeys(ref for pin in pins for ref in pin.refs))
 
     def prepare_admission(self, identities: tuple[RequestIdentity, ...],
                           stream: torch.cuda.Stream | None = None) -> RequestStateAdmissionBatch:
@@ -135,6 +180,8 @@ class RequestStateDirectory:
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
+            if self.state.scope is StateScope.INSTANCE and self._inference_pins:
+                raise RuntimeError("instance retirement requires all inference requests to finish")
             keys = self._unique_keys(identities)
             if not keys or self._leased_keys.intersection(keys):
                 raise RuntimeError("request retirement requires keys without an active step")

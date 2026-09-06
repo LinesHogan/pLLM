@@ -134,7 +134,7 @@ class InPlaceTTTWorkload(BackendWorkload[InPlaceTTTData, InPlaceTTTStepBatchResu
         )
         bindings = compiled.state_layout.overlay_bindings
         attachment = bind_backend_attachment(compiled.plan_bundle, facts.probe,
-            BackendAttachmentSpec(AttachmentKind.DENSE_PARAMETER_OVERLAY,
+            BackendAttachmentSpec(AttachmentKind.PARAMETER_OVERLAY,
                 ((AttachmentTaskRole.TRANSITION, _TRANSITION_TASK), (AttachmentTaskRole.PUBLISH, _PUBLISH_TASK)),
                 AnchorSymbol("sampler.complete"), _FAST_WEIGHT_STATE, bindings))
         return BackendDeployment(compiled.execution, attachment)

@@ -6,7 +6,7 @@ use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::CanonicalPlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 3;
+pub(crate) const SCHEMA_VERSION: u64 = 4;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -18,7 +18,7 @@ pub(crate) enum AttachmentTopology {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AttachmentKind {
     RequestSamplerTraining,
-    DenseParameterOverlay,
+    ParameterOverlay,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,18 +37,6 @@ pub(crate) enum AttachmentSamplerStage {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AttachmentCleanupStage {
     RequestFinish,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AttachmentOverlayStage {
-    Pin,
-    Apply,
-    Capture,
-    Transition,
-    Publish,
-    Release,
-    Finish,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,14 +103,6 @@ pub(crate) struct AttachmentTaskBinding {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AttachmentOverlayStageAnchor {
-    pub(crate) stage: AttachmentOverlayStage,
-    pub(crate) anchor_id: u32,
-    pub(crate) anchor_symbol: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct BackendPlacementProbe {
     pub(crate) adapter_id: String,
     pub(crate) backend_abi_digest: String,
@@ -142,7 +122,7 @@ pub(crate) struct BackendPlacementProbe {
     pub(crate) schema_version: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AttachmentCompilerInputs {
     pub(crate) request: BackendAttachmentRequest,
@@ -180,15 +160,16 @@ pub(crate) enum OverlayOperator {
     LowRankAdd,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OverlayBinding {
     pub(crate) target: ParameterTarget,
     pub(crate) operator: OverlayOperator,
     pub(crate) fields: Vec<u32>,
+    pub(crate) scale: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackendAttachmentRequest {
     pub(crate) attachment_kind: AttachmentKind,
@@ -201,7 +182,6 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) cleanup_stage: AttachmentCleanupStage,
     pub(crate) state_resource: String,
     pub(crate) overlay_bindings: Vec<OverlayBinding>,
-    pub(crate) overlay_stage_anchors: Vec<AttachmentOverlayStageAnchor>,
     pub(crate) schema_version: u64,
 }
 

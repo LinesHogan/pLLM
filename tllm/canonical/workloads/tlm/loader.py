@@ -12,9 +12,8 @@ import torch
 if TYPE_CHECKING:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
-from tllm.canonical.backend_program import ParameterTargetShape
+from tllm.canonical.backend_program import CausalTrainBatch, ParameterTargetShape
 from tllm.canonical.ptts.page_bundle import tensor_dtype
-from tllm.canonical.workloads.tlm.workload import TLMTrainBatch
 from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from tllm.contracts.tensor_layout import TensorDType
 
@@ -43,6 +42,8 @@ class HfQvModel:
     def __init__(self, base: Qwen2ForCausalLM, config: HfQvConfig) -> None:
         from peft import LoraConfig, PeftModelForCausalLM, TaskType, get_peft_model
         self.tensor_dtype = config.tensor_dtype
+        self.scale = config.alpha / config.rank
+        self.model_source = (config.model_id, config.revision)
         self.device = next(base.parameters()).device
         targets: list[ParameterTargetShape] = []
         names: list[str] = []
@@ -70,7 +71,7 @@ class HfQvModel:
         self.fingerprint = sha256(json.dumps((asdict(config), tuple(asdict(target) for target in targets)),
             sort_keys=True).encode()).hexdigest()
 
-    def logits(self, batch: TLMTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
+    def logits(self, batch: CausalTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
         from transformers.modeling_outputs import CausalLMOutputWithPast
         arguments = dict(input_ids=batch.input_ids, attention_mask=batch.attention_mask,
             use_cache=False, return_dict=True)
@@ -89,8 +90,8 @@ class HfQvModel:
 
 
     @classmethod
-    def load(cls, config: HfQvConfig) -> HfQvModel:
+    def load(cls, config: HfQvConfig, device: torch.device = torch.device("cpu")) -> HfQvModel:
         from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
         return cls(Qwen2ForCausalLM.from_pretrained(config.model_id, revision=config.revision,
             local_files_only=config.local_files_only, trust_remote_code=config.trust_remote_code,
-            torch_dtype=tensor_dtype(config.tensor_dtype)), config)
+            torch_dtype=tensor_dtype(config.tensor_dtype)).to(device=device, dtype=tensor_dtype(config.tensor_dtype)), config)

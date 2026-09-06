@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
+import torch
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.state_execution import StateExecution
@@ -21,11 +22,19 @@ ResultT = TypeVar("ResultT")
 
 
 @dataclass(frozen=True, slots=True)
+class CausalTrainBatch:
+    input_ids: torch.Tensor
+    labels: torch.Tensor
+    attention_mask: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TensorStepInput:
     rows: PackedPhaseRowBatch
     sampler_rows: PackedSamplerRowBatch
     hidden: PackedHiddenSnapshotBatch | CudaPackedHiddenSnapshotBatch | None = None
     operands: tuple[CapturedParameterOperand, ...] = ()
+    training: CausalTrainBatch | None = None
 
     def __post_init__(self) -> None:
         if self.sampler_rows.row_batch is not self.rows:
@@ -45,6 +54,7 @@ class TensorStepInput:
 class BackendRequirements:
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     parameter_targets: tuple[ParameterTarget, ...] = ()
+    model_source: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)

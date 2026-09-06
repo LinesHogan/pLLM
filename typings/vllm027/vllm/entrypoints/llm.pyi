@@ -13,6 +13,7 @@ class LLM:
         self,
         model: str,
         *,
+        revision: str | None,
         dtype: Literal["bfloat16", "float16", "float32"],
         tensor_parallel_size: Literal[1],
         pipeline_parallel_size: Literal[1],

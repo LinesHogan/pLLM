@@ -16,10 +16,9 @@ from tllm.canonical_vllm.sampler import (
     CanonicalVllm027PostFilterSampler,
     SignedPostFilterGuidance,
 )
-from tllm.canonical_vllm.dense_overlay import (
-    VllmDenseAddAdapter,
-    VllmDenseAddTarget,
-    inspect_dense_add_targets,
+from tllm.canonical_vllm.parameter_overlay import (
+    VllmParameterOverlay,
+    inspect_parameter_targets,
 )
 from tllm.canonical_vllm.runtime import (
     CanonicalVllmConfig,
@@ -37,9 +36,8 @@ __all__ = [
     "Mrv2RequestIdBatch",
     "Mrv2RequestIdBinding",
     "SignedPostFilterGuidance",
-    "VllmDenseAddAdapter",
-    "VllmDenseAddTarget",
-    "inspect_dense_add_targets",
+    "VllmParameterOverlay",
+    "inspect_parameter_targets",
     "Vllm027EagerPackedHiddenCapture",
     "Vllm027Mrv2PackedRowCodec",
     "create_canonical_vllm_llm",

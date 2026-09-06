@@ -22,7 +22,7 @@ from tllm.contracts.state_ref import StateRef
 from tllm.contracts.state_representation import StatePhysicalPlan
 
 
-InputT = TypeVar("InputT")
+InputT = TypeVar("InputT", contravariant=True)
 InputContra = TypeVar("InputContra", contravariant=True)
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
@@ -96,6 +96,7 @@ class StateInvocation(Generic[DataT]):
 @dataclass(frozen=True, slots=True)
 class StateDiagnostics:
     active_lineages: int
+    inference_pins: int
     loss_count: int
     update_count: int
     trained_rows: int
@@ -139,6 +140,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def admit(self, identities: tuple[RequestIdentity, ...],
               stream: torch.cuda.Stream | None = None) -> tuple[StateRef, ...]:
         with self._lock:
+            if self.directory.state.scope is StateScope.INSTANCE and identities:
+                return self.directory.admit_inference(identities, stream)
             batch = self.directory.prepare_admission(identities, stream)
             try:
                 with nullcontext() if stream is None else torch.cuda.stream(stream):
@@ -310,7 +313,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
             if self.directory.state.scope is StateScope.INSTANCE and identities:
-                raise ValueError("instance retirement is not a request lifecycle action")
+                return self.directory.retire_inference(identities)
+            if self.directory.inference_pin_count:
+                raise RuntimeError("instance retirement requires all inference requests to finish")
             keys = ({None} if self.directory.state.scope is StateScope.INSTANCE else
                 {RequestStateKey.project(identity, self.directory.state.key_fields) for identity in identities})
             for invocation in tuple(self._active.values()):
@@ -330,5 +335,5 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def diagnostics(self) -> StateDiagnostics:
         with self._lock:
             self.arena.collect_completed()
-            return StateDiagnostics(self.directory.active_count, self._loss_count, self._update_count,
+            return StateDiagnostics(self.directory.active_count, self.directory.inference_pin_count, self._loss_count, self._update_count,
                 self._trained_rows, self._sampler_count, self.arena.pending_pin_releases, self.plan.fallback_count)

@@ -29,7 +29,7 @@ class AttachmentTopology(StrEnum):
 
 class AttachmentKind(StrEnum):
     REQUEST_SAMPLER_TRAINING = "request_sampler_training"
-    DENSE_PARAMETER_OVERLAY = "dense_parameter_overlay"
+    PARAMETER_OVERLAY = "parameter_overlay"
 
 
 class AttachmentGraphMode(StrEnum):
@@ -42,16 +42,6 @@ class AttachmentSamplerStage(StrEnum):
 
 class AttachmentCleanupStage(StrEnum):
     REQUEST_FINISH = "request_finish"
-
-
-class AttachmentOverlayStage(StrEnum):
-    PIN = "pin"
-    APPLY = "apply"
-    CAPTURE = "capture"
-    TRANSITION = "transition"
-    PUBLISH = "publish"
-    RELEASE = "release"
-    FINISH = "finish"
 
 
 class StreamDependency(StrEnum):
@@ -83,13 +73,6 @@ class AttachmentTaskBinding:
     task_id: TaskId
     implementation_id: ImplementationId
     anchor_id: AnchorId
-
-
-@dataclass(frozen=True, slots=True)
-class AttachmentOverlayStageAnchor:
-    stage: AttachmentOverlayStage
-    anchor_id: AnchorId
-    anchor_symbol: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +116,7 @@ class BackendAttachmentRequest:
     cleanup_stage: AttachmentCleanupStage
     state_resource: str
     overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
-    overlay_stage_anchors: tuple[AttachmentOverlayStageAnchor, ...] = ()
-    schema_version: int = 3
+    schema_version: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +130,7 @@ class BackendAttachmentCompilerInputs:
 class BackendAttachmentDecision:
     request_digest: str
     signature: str
-    schema_version: int = 3
+    schema_version: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +145,7 @@ class BackendAttachmentPhysicalPlan:
     topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     bundle_signature: str
-    schema_version: int = 3
+    schema_version: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,8 +162,6 @@ __all__ = [
     "AttachmentGraphMode",
     "AttachmentKind",
     "AttachmentHiddenResource",
-    "AttachmentOverlayStage",
-    "AttachmentOverlayStageAnchor",
     "AttachmentSamplerStage",
     "AttachmentTaskBinding",
     "AttachmentTaskRole",
