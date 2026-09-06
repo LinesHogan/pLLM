@@ -2,6 +2,15 @@
 
 from dataclasses import dataclass
 from math import prod
+import torch
+
+from tllm.canonical.scheduler import compile_schedule, lower_physical_plan
+from tllm.canonical.state_representation import compile_state_representation, lower_state_physical_plan
+from tllm.canonical.tensor_layout import intern_tensor_layouts
+from tllm.contracts.canonical_compilation import CanonicalPlanBundle
+from tllm.contracts.semantic_graph import SemanticGraph, SchedulerTimeline
+from tllm.contracts.state_representation import StateLayoutRequirement, StateRepresentationRequest
+from tllm.contracts.tensor_layout import TensorLayoutRequest
 
 from tllm.contracts.state_representation import StateDeviceKind, StateProviderPlan, StateRepresentation
 from tllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutBinding, TensorLayoutSpec
@@ -11,6 +20,32 @@ DTYPE_BYTES = {
     TensorDType.BOOL: 1, TensorDType.UINT8: 1, TensorDType.INT32: 4, TensorDType.INT64: 8,
     TensorDType.FLOAT16: 2, TensorDType.BFLOAT16: 2, TensorDType.FLOAT32: 4, TensorDType.FLOAT64: 8,
 }
+
+
+def compile_page_bundle_plan(graph: SemanticGraph, timeline: SchedulerTimeline,
+    layouts: TensorLayoutRequest, providers: tuple["PageBundleProviderFacts", ...],
+    max_admitted_lineages: int, memory_budget_bytes: int, device: torch.device,
+    *, plan_epoch: int = 1) -> CanonicalPlanBundle:
+    """Compile original declarations once; all choices remain Rust-owned."""
+    schedule = compile_schedule(graph, timeline)
+    layout_decision = intern_tensor_layouts(layouts)
+    candidates = tuple(provider.materialize_plan(resource=entry.resource, layout=entry.layout,
+        binding=binding, max_admitted_lineages=max_admitted_lineages)
+        for entry, binding in zip(layouts.layouts, layout_decision.bindings, strict=True)
+        for provider in providers)
+    required = (f"device/{device.type}@1", "state/exact_versions@1")
+    if device.type == "cuda":
+        required += ("state/fenced_reclaim@1",)
+    request = StateRepresentationRequest(memory_budget_bytes, tuple(StateLayoutRequirement(
+        binding.resource, binding.layout_id, binding.layout_namespace, binding.layout_digest,
+        max_admitted_lineages, required) for binding in layout_decision.bindings), candidates)
+    decision = compile_state_representation(request)
+    if any(item.device_kind.value != device.type or item.device_ordinal != (device.index or 0)
+        for item in decision.plans):
+        raise RuntimeError("Rust-selected state placement differs from mathematical specialization")
+    return CanonicalPlanBundle(graph, timeline, schedule,
+        lower_physical_plan(graph, timeline, schedule, plan_epoch=plan_epoch), request, decision,
+        lower_state_physical_plan(request, decision, plan_epoch=plan_epoch), layouts, layout_decision)
 
 
 def page_stride_bytes(field: TensorFieldSpec) -> int:

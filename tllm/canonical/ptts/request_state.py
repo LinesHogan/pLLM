@@ -10,13 +10,13 @@ import torch
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, PageWrite
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_state import IndexedRequestIdentityBatch, RequestStateKey
-from tllm.contracts.semantic_graph import SemanticState
+from tllm.contracts.semantic_graph import SemanticState, StateScope
 from tllm.contracts.state_ref import LineageId, StateRef
 
 
 @dataclass(frozen=True, slots=True)
 class RequestStateAdmissionBatch:
-    keys: tuple[RequestStateKey, ...]
+    keys: tuple[RequestStateKey | None, ...]
     write: PageWrite
 
 
@@ -24,14 +24,14 @@ class RequestStateAdmissionBatch:
 class RequestStateSelectedRow:
     canonical_row_index: int
     identity: RequestIdentity
-    key: RequestStateKey
+    key: RequestStateKey | None
     state_index: int
 
 
 @dataclass(frozen=True, slots=True)
 class RequestStateSelection:
     rows: tuple[RequestStateSelectedRow, ...]
-    keys: tuple[RequestStateKey, ...]
+    keys: tuple[RequestStateKey | None, ...]
     refs: tuple[StateRef, ...]
 
 
@@ -47,9 +47,9 @@ class RequestStateDirectory:
     def __init__(self, arena: PageBundleArena, state: SemanticState) -> None:
         self.arena = arena
         self.state = state
-        self._lineages: dict[RequestStateKey, LineageId] = {}
+        self._lineages: dict[RequestStateKey | None, LineageId] = {}
         self._leases: dict[int, RequestStateTransitionLease] = {}
-        self._leased_keys: set[RequestStateKey] = set()
+        self._leased_keys: set[RequestStateKey | None] = set()
         self._pending: RequestStateAdmissionBatch | None = None
         self._next_lease = 1
         self._lock = RLock()
@@ -90,7 +90,14 @@ class RequestStateDirectory:
 
     def select(self, indexed_rows: IndexedRequestIdentityBatch) -> RequestStateSelection:
         with self._lock:
-            keys: list[RequestStateKey] = []
+            if self.state.scope is StateScope.INSTANCE:
+                try:
+                    ref = self.arena.latest(self._lineages[None])
+                except KeyError as exc:
+                    raise RuntimeError("instance state is not admitted") from exc
+                return RequestStateSelection(tuple(RequestStateSelectedRow(
+                    row.canonical_row_index, row.identity, None, 0) for row in indexed_rows.rows), (None,), (ref,))
+            keys: list[RequestStateKey | None] = []
             refs: list[StateRef] = []
             rows: list[RequestStateSelectedRow] = []
             indices: dict[RequestStateKey, int] = {}
@@ -140,7 +147,11 @@ class RequestStateDirectory:
             self._lineages = lineages
             return refs
 
-    def _unique_keys(self, identities: tuple[RequestIdentity, ...]) -> tuple[RequestStateKey, ...]:
+    def _unique_keys(self, identities: tuple[RequestIdentity, ...]) -> tuple[RequestStateKey | None, ...]:
+        if self.state.scope is StateScope.INSTANCE:
+            if identities:
+                raise ValueError("instance admission/retirement is not a request lifecycle action")
+            return (None,)
         return tuple(dict.fromkeys(RequestStateKey.project(identity, self.state.key_fields) for identity in identities))
 
     def _require_latest(self, selection: RequestStateSelection) -> None:

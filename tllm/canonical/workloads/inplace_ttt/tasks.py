@@ -148,13 +148,3 @@ class InPlaceTTTTransitionTask:
             context.arena.copy_roots(write, tuple(computed[index].target_root for index in changed))
         context.update_count = sum(target.update_count for values in computed for target in values.targets)
         context.trained_rows = sum(target.trained_rows for values in computed for target in values.targets)
-
-
-class InPlaceTTTPublishTask:
-    __slots__ = ("implementation_id",)
-
-    def __init__(self, implementation_id: ImplementationId) -> None:
-        self.implementation_id = implementation_id
-
-    def execute(self, context: StateTaskContext[InPlaceTTTData]) -> None:
-        context.publish()

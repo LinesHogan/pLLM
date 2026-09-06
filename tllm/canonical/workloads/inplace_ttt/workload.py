@@ -6,31 +6,17 @@ from dataclasses import dataclass
 
 import torch
 
-from tllm.canonical.state_execution import StateExecution, StateTaskContext
+from tllm.canonical.state_execution import PublishStateTask, StateExecution, StateTaskContext
 from tllm.canonical.backend_program import BackendCompileFacts, BackendDeployment, BackendRequirements, BackendWorkload, TensorStepInput
 from tllm.canonical.backend_attachment import bind_backend_attachment
 from tllm.canonical.ptts.page_bundle import PageBundleArena
+from tllm.canonical.ptts.page_bundle_planning import compile_page_bundle_plan
 from tllm.canonical.ptts.request_state import RequestStateDirectory
-from tllm.canonical.scheduler import (
-    compile_schedule,
-    lower_physical_plan,
-)
-from tllm.canonical.state_representation import (
-    compile_state_representation,
-    lower_state_physical_plan,
-    validate_state_representation,
-    validate_state_representation_reconstruction,
-)
-from tllm.canonical.tensor_layout import (
-    intern_tensor_layouts,
-    validate_tensor_layouts,
-)
 from tllm.canonical.workloads.inplace_ttt.layout import (
     InPlaceTTTStateLayout,
     build_inplace_ttt_state_layout,
 )
 from tllm.canonical.workloads.inplace_ttt.tasks import (
-    InPlaceTTTPublishTask,
     InPlaceTTTData,
     InPlaceTTTTransitionTask,
     INPLACE_TTT_CUDA_PUBLISH_IMPLEMENTATION,
@@ -78,8 +64,6 @@ from tllm.contracts.semantic_graph import (
 )
 from tllm.contracts.state_representation import (
     StateDeviceKind,
-    StateLayoutRequirement,
-    StateRepresentationRequest,
 )
 from tllm.contracts.tensor_layout import (
     StateTensorLayout,
@@ -273,92 +257,12 @@ class InPlaceTTTWorkload(BackendWorkload[InPlaceTTTData, InPlaceTTTStepBatchResu
             self.config
         )
         graph = self.semantic_graph(execution_parameters_digest)
-        schedule = compile_schedule(graph, options.timeline)
-        physical = lower_physical_plan(
-            graph,
-            options.timeline,
-            schedule,
-            plan_epoch=options.plan_epoch,
-        )
         state_layout = build_inplace_ttt_state_layout(self.config, specialization)
-        layout_request = TensorLayoutRequest(
-            (
-                StateTensorLayout(
-                    str(_FAST_WEIGHT_STATE),
-                    state_layout.tensor_layout,
-                ),
-            )
-        )
-        layout_decision = intern_tensor_layouts(layout_request)
-        validate_tensor_layouts(layout_request, layout_decision)
-        (layout_binding,) = layout_decision.bindings
-        candidates = tuple(
-            provider.materialize_plan(
-                resource=str(_FAST_WEIGHT_STATE),
-                layout=state_layout.tensor_layout,
-                binding=layout_binding,
-                max_admitted_lineages=options.max_admitted_lineages,
-            )
-            for provider in options.providers
-        )
-        match specialization.device_kind:
-            case StateDeviceKind.CPU:
-                required_capabilities = (
-                    "device/cpu@1",
-                    "state/exact_versions@1",
-                    "transition/full_root@1",
-                )
-            case StateDeviceKind.CUDA:
-                required_capabilities = (
-                    "device/cuda@1",
-                    "state/exact_versions@1",
-                    "state/fenced_reclaim@1",
-                    "transition/full_root@1",
-                )
-        representation_request = StateRepresentationRequest(
-            memory_budget_bytes=options.state_memory_budget_bytes,
-            states=(
-                StateLayoutRequirement(
-                    resource=str(_FAST_WEIGHT_STATE),
-                    layout_id=layout_binding.layout_id,
-                    layout_namespace=layout_binding.layout_namespace,
-                    layout_digest=layout_binding.layout_digest,
-                    max_admitted_lineages=options.max_admitted_lineages,
-                    required_capabilities=required_capabilities,
-                ),
-            ),
-            candidates=candidates,
-        )
-        representation = compile_state_representation(representation_request)
-        validate_state_representation(representation_request, representation)
-        validate_state_representation_reconstruction(
-            representation_request,
-            representation,
-            candidates,
-        )
-        state_physical = lower_state_physical_plan(
-            representation_request,
-            representation,
-            plan_epoch=options.plan_epoch,
-        )
-        (selected_provider,) = representation.plans
-        if (
-            selected_provider.device_kind is not specialization.device_kind
-            or selected_provider.device_ordinal != specialization.device_ordinal
-        ):
-            raise RuntimeError("Rust-selected state placement differs from device")
-        plan_bundle = CanonicalPlanBundle(
-            graph,
-            options.timeline,
-            schedule,
-            physical,
-            representation_request,
-            representation,
-            state_physical,
-            layout_request,
-            layout_decision,
-        )
-        arena = PageBundleArena(plan_bundle, candidates)
+        plan_bundle = compile_page_bundle_plan(graph, options.timeline,
+            TensorLayoutRequest((StateTensorLayout(str(_FAST_WEIGHT_STATE), state_layout.tensor_layout),)),
+            options.providers, options.max_admitted_lineages, options.state_memory_budget_bytes,
+            specialization.device, plan_epoch=options.plan_epoch)
+        arena = PageBundleArena(plan_bundle)
         directory = RequestStateDirectory(arena, graph.states[0])
         math = InPlaceTTTMath(self.config, specialization)
         publish_id, transition_id = (
@@ -369,7 +273,7 @@ class InPlaceTTTWorkload(BackendWorkload[InPlaceTTTData, InPlaceTTTStepBatchResu
         sampler_anchor, = (AnchorId(anchor.ordinal) for anchor in options.timeline.anchors
             if anchor.symbol == AnchorSymbol("sampler.complete"))
         execution = StateExecution(arena, directory, math,
-            (InPlaceTTTPublishTask(publish_id), InPlaceTTTTransitionTask(self.config, state_layout, transition_id)),
+            (PublishStateTask[InPlaceTTTData](publish_id), InPlaceTTTTransitionTask(self.config, state_layout, transition_id)),
             sampler_anchor,
         )
         return InPlaceTTTCompilation(execution, plan_bundle, state_layout, math)

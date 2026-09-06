@@ -1,15 +1,14 @@
-"""Canonical TLM cold facts; signed execution is built in later tranches."""
+"""TLM objective and multifactor state over shared signed execution."""
+
+from tllm.canonical.workloads.tlm.workload import TLMConfig, TLMMode, TLMTrainBatch, TLMWorkload
 
 from tllm.canonical.workloads.tlm.loader import (
-    HfPeftQvLoader,
-    HfPeftQvLoaderConfig,
-    QvLoraSpecialization,
-    QvLoraTargetFacts,
+    HfQvConfig,
+    HfQvModel,
 )
 
 __all__ = [
-    "HfPeftQvLoader",
-    "HfPeftQvLoaderConfig",
-    "QvLoraSpecialization",
-    "QvLoraTargetFacts",
+    "TLMConfig", "TLMMode", "TLMTrainBatch", "TLMWorkload",
+    "HfQvConfig",
+    "HfQvModel",
 ]

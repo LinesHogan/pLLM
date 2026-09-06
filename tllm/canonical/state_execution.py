@@ -17,7 +17,7 @@ from tllm.canonical.ptts.request_state import RequestStateDirectory, RequestStat
 from tllm.contracts.request_identity import RequestIdentity
 from tllm.contracts.request_state import IndexedRequestIdentityBatch, RequestStateKey
 from tllm.contracts.sampler import PackedSamplerGuidanceBatch
-from tllm.contracts.semantic_graph import AnchorId, PhysicalPlan
+from tllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, StateScope
 from tllm.contracts.state_ref import StateRef
 from tllm.contracts.state_representation import StatePhysicalPlan
 
@@ -69,6 +69,14 @@ class StateMath(Protocol[InputContra, DataT, ResultCo]):
     def prepare(self, value: InputContra, context: StateTaskContext[DataT]) -> DataT: ...
 
     def output(self, context: StateTaskContext[DataT]) -> ResultCo: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PublishStateTask(Generic[DataT]):
+    implementation_id: ImplementationId
+
+    def execute(self, context: StateTaskContext[DataT]) -> None:
+        context.publish()
 
 
 class _SamplerPhase(Enum):
@@ -301,7 +309,10 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
-            keys = {RequestStateKey.project(identity, self.directory.state.key_fields) for identity in identities}
+            if self.directory.state.scope is StateScope.INSTANCE and identities:
+                raise ValueError("instance retirement is not a request lifecycle action")
+            keys = ({None} if self.directory.state.scope is StateScope.INSTANCE else
+                {RequestStateKey.project(identity, self.directory.state.key_fields) for identity in identities})
             for invocation in tuple(self._active.values()):
                 if keys.intersection(invocation.cursor.context.selection.keys):
                     self.cancel_step(invocation)

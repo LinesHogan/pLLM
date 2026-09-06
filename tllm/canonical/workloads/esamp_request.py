@@ -15,25 +15,10 @@ from tllm.canonical.kernels.low_rank_gated import (
     initialize_low_rank_gated,
 )
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication
+from tllm.canonical.ptts.page_bundle_planning import compile_page_bundle_plan
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.contracts.backend_attachment import (
     BackendAttachmentSpec, AttachmentKind, AttachmentTaskRole,
-)
-from tllm.canonical.scheduler import (
-    compile_schedule,
-    lower_physical_plan,
-    validate_physical_plan,
-    validate_schedule,
-)
-from tllm.canonical.state_representation import (
-    compile_state_representation,
-    lower_state_physical_plan,
-    validate_state_representation,
-    validate_state_representation_reconstruction,
-)
-from tllm.canonical.tensor_layout import (
-    intern_tensor_layouts,
-    validate_tensor_layouts,
 )
 from tllm.canonical.workloads.esamp_request_task_common import (
     ESampLossTask,
@@ -97,8 +82,6 @@ from tllm.contracts.semantic_graph import (
 )
 from tllm.contracts.state_representation import (
     StateDeviceKind,
-    StateLayoutRequirement,
-    StateRepresentationRequest,
 )
 from tllm.contracts.tensor_layout import (
     MutationGranularity,
@@ -428,15 +411,6 @@ class ESampRequestWorkload(BackendWorkload[ESampData, ESampRequestStepResult]):
             self.semantic_graph(),
             execution_parameters_digest=execution_parameters_digest,
         )
-        schedule = compile_schedule(graph, options.timeline)
-        validate_schedule(graph, options.timeline, schedule)
-        physical = lower_physical_plan(
-            graph,
-            options.timeline,
-            schedule,
-            plan_epoch=options.plan_epoch,
-        )
-        validate_physical_plan(graph, options.timeline, schedule, physical)
 
         kernel_layout = LowRankGatedLayout(
             specialization.hidden_size,
@@ -483,61 +457,11 @@ class ESampRequestWorkload(BackendWorkload[ESampData, ESampRequestStepResult]):
                 ),
             ),
         )
-        layout_request = TensorLayoutRequest(
-            (StateTensorLayout(str(_STATE_RESOURCE), tensor_layout),)
-        )
-        layout_decision = intern_tensor_layouts(layout_request)
-        validate_tensor_layouts(layout_request, layout_decision)
-        (binding,) = layout_decision.bindings
-        candidates = tuple(
-            provider.materialize_plan(
-                resource=str(_STATE_RESOURCE),
-                layout=tensor_layout,
-                binding=binding,
-                max_admitted_lineages=options.max_admitted_lineages,
-            )
-            for provider in options.providers
-        )
-        match specialization.device_kind:
-            case StateDeviceKind.CPU:
-                required_state_capabilities = (
-                    "device/cpu@1",
-                    "optimizer/adamw@1",
-                    "state/exact_versions@1",
-                )
-            case StateDeviceKind.CUDA:
-                required_state_capabilities = (
-                    "device/cuda@1",
-                    "optimizer/adamw@1",
-                    "state/exact_versions@1",
-                    "state/fenced_reclaim@1",
-                )
-        representation_request = StateRepresentationRequest(
-            memory_budget_bytes=options.state_memory_budget_bytes,
-            states=(
-                StateLayoutRequirement(
-                    resource=str(_STATE_RESOURCE),
-                    layout_id=binding.layout_id,
-                    layout_namespace=binding.layout_namespace,
-                    layout_digest=binding.layout_digest,
-                    max_admitted_lineages=options.max_admitted_lineages,
-                    required_capabilities=required_state_capabilities,
-                ),
-            ),
-            candidates=candidates,
-        )
-        representation = compile_state_representation(representation_request)
-        validate_state_representation(representation_request, representation)
-        validate_state_representation_reconstruction(
-            representation_request,
-            representation,
-            candidates,
-        )
-        state_physical = lower_state_physical_plan(
-            representation_request,
-            representation,
-            plan_epoch=options.plan_epoch,
-        )
+        plan_bundle = compile_page_bundle_plan(graph, options.timeline,
+            TensorLayoutRequest((StateTensorLayout(str(_STATE_RESOURCE), tensor_layout),)),
+            options.providers, options.max_admitted_lineages, options.state_memory_budget_bytes,
+            torch.device("cpu") if specialization.device_kind is StateDeviceKind.CPU else
+                torch.device("cuda", specialization.device_ordinal), plan_epoch=options.plan_epoch)
         sampler_anchor_ids = tuple(
             AnchorId(anchor.ordinal)
             for anchor in options.timeline.anchors
@@ -545,26 +469,7 @@ class ESampRequestWorkload(BackendWorkload[ESampData, ESampRequestStepResult]):
         )
         if len(sampler_anchor_ids) != 1:
             raise RuntimeError("ESamp timeline requires one sampler.pre_draw anchor")
-        (selected_provider,) = representation.plans
-        if (
-            selected_provider.device_kind is not specialization.device_kind
-            or selected_provider.device_ordinal != specialization.device_ordinal
-        ):
-            raise RuntimeError(
-                "Rust-selected state placement differs from specialization"
-            )
-        plan_bundle = CanonicalPlanBundle(
-            semantic_graph=graph,
-            timeline=options.timeline,
-            schedule_decision=schedule,
-            schedule_physical=physical,
-            state_request=representation_request,
-            state_decision=representation,
-            state_physical=state_physical,
-            tensor_layout_request=layout_request,
-            tensor_layout_decision=layout_decision,
-        )
-        arena = PageBundleArena(plan_bundle, candidates)
+        arena = PageBundleArena(plan_bundle)
         directory = RequestStateDirectory(arena, graph.states[0])
         math = ESampMath(self.config, specialization, kernel_layout,
             torch.Generator(device=arena.device).manual_seed(specialization.initialization_seed))
