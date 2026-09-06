@@ -7,14 +7,11 @@ from hashlib import sha256
 
 import torch
 
-from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from tllm.contracts.packed_hidden import (
     PackedHiddenResourceBinding,
-    PackedHiddenSnapshotBatch,
 )
-from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from tllm.contracts.request_identity import (
     RequestKeyField,
     canonical_request_key_fields,
@@ -229,24 +226,6 @@ class ESampRequestCompileOptions:
 
 
 @dataclass(frozen=True, slots=True)
-class ESampRequestStepInput:
-    rows: PackedPhaseRowBatch
-    sampler_rows: PackedSamplerRowBatch
-    hidden: PackedHiddenSnapshotBatch | CudaPackedHiddenSnapshotBatch
-
-    def __post_init__(self) -> None:
-        match self.hidden:
-            case PackedHiddenSnapshotBatch(row_batch=row_batch):
-                pass
-            case CudaPackedHiddenSnapshotBatch(batch=batch):
-                row_batch = batch.row_batch
-        if self.sampler_rows.row_batch != self.rows or row_batch != self.rows:
-            raise ValueError(
-                "ESamp request step requires one exact packed row provenance"
-            )
-
-
-@dataclass(frozen=True, slots=True)
 class ESampRequestStepResult:
     step_id: int
     guidance: PackedSamplerGuidanceBatch
@@ -271,6 +250,5 @@ __all__ = [
     "ESampRequestConfig",
     "ESampRequestPackedHiddenBindings",
     "ESampRequestSpecialization",
-    "ESampRequestStepInput",
     "ESampRequestStepResult",
 ]

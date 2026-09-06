@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 from tllm.canonical.host_runtime import HostExecution
-from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.fttt.tasks import (
     FTTT_CUDA_LOSS_IMPLEMENTATION,
     FTTT_CUDA_OPTIMIZE_IMPLEMENTATION,
@@ -56,7 +55,7 @@ _PREPARE_TASK = TaskSymbol("prepare")
 _PUBLISH_TASK = TaskSymbol("publish")
 
 
-class FTTTWorkload(CanonicalWorkload):
+class FTTTWorkload:
     """Declare FTTT math/dataflow/effects without physical scheduling policy."""
 
     __slots__ = ("config",)

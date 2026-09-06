@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from tllm.canonical.host_runtime import HostExecution
-from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.gtta.state import (
     GTTADynamicsState, GTTADynamicsSnapshot, GTTAStepContext,
     GTTAPublishTask, GTTAQueryTask, GTTAUpdateTask,
@@ -46,7 +45,7 @@ _QUERY_TASK = TaskSymbol("query")
 _UPDATE_TASK = TaskSymbol("update")
 
 
-class GTTAWorkload(CanonicalWorkload):
+class GTTAWorkload:
     __slots__ = ("config",)
 
     def __init__(self, config: GTTAConfig = GTTAConfig()) -> None:

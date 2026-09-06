@@ -405,6 +405,21 @@ class PageBundleArena:
             self._pins[token.pin_id] = token
             return token
 
+    def borrow_field(self, pin: PagePin, ref: StateRef, field: LayoutFieldId) -> torch.Tensor:
+        """Read-only page view; use on pin.stream and discard before releasing pin.
+
+        Native consumers must not mutate this alias. Private writes use write_field;
+        owned exports use snapshot. The original pin owns completion and reclamation.
+        """
+        with self._lock:
+            self._issued_pin(pin)
+            if ref not in pin.refs:
+                raise RuntimeError("PageBundle root is not held by this pin")
+            root = self.root(ref)
+            if not 0 <= field < len(root.pages):
+                raise ValueError("PageBundle field is outside the signed layout")
+            return self._pools[root.resource].tensor(field, root.pages[field]).detach()
+
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
         with self._lock:
             self._issued_pin(pin)

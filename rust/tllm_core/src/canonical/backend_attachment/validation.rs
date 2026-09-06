@@ -9,7 +9,7 @@ use super::super::state_representation::{StateDeviceKind, StatePhysicalPlan};
 use super::types::{
     AttachmentCompilerInputs, AttachmentHiddenResource, AttachmentKind, AttachmentOverlayStage,
     AttachmentTaskBinding, AttachmentTaskRole, BackendAttachmentRequest, BackendPlacementProbe,
-    HiddenLayerKind, HiddenPhase, HiddenSite, StreamDependency, SCHEMA_VERSION,
+    HiddenLayerKind, HiddenPhase, HiddenSite, OverlayOperator, StreamDependency, SCHEMA_VERSION,
 };
 
 pub(crate) fn require_text(value: &str, label: &str) -> Result<(), String> {
@@ -92,7 +92,7 @@ fn validate_request(
     }
     match request.attachment_kind {
         AttachmentKind::RequestSamplerTraining => {
-            if !request.overlay_field_ids.is_empty() || !request.overlay_stage_anchors.is_empty() {
+            if !request.overlay_bindings.is_empty() || !request.overlay_stage_anchors.is_empty() {
                 return Err("request sampler attachment cannot bind overlay fields".to_owned());
             }
             if request.stream_dependencies
@@ -110,13 +110,27 @@ fn validate_request(
             }
         }
         AttachmentKind::DenseParameterOverlay => {
-            if request.overlay_field_ids.is_empty()
-                || request
-                    .overlay_field_ids
+            if !probe.hidden_resources.is_empty() {
+                return Err(
+                    "hidden/overlay composition is not supported by this attachment".to_owned(),
+                );
+            }
+            if request.stream_dependencies != vec![StreamDependency::TransitionToRelease] {
+                return Err("dense overlay stream dependencies differ from execution".to_owned());
+            }
+            let bindings = &request.overlay_bindings;
+            if bindings.is_empty()
+                || bindings
                     .windows(2)
-                    .any(|pair| pair[0] >= pair[1])
+                    .any(|pair| pair[0].target >= pair[1].target)
+                || bindings.iter().any(|binding| {
+                    binding.operator != OverlayOperator::DenseAdd || binding.fields.len() != 1
+                })
             {
-                return Err("dense overlay attachment requires sorted unique fields".to_owned());
+                return Err(
+                    "dense overlay requires unique targets and one dense field per target"
+                        .to_owned(),
+                );
             }
             let stages = request
                 .overlay_stage_anchors
@@ -323,6 +337,19 @@ fn validate_dense_parameter_overlay_graph(
     request: &BackendAttachmentRequest,
     graph: &SemanticGraph,
 ) -> Result<(), String> {
+    if graph.tasks.iter().any(|task| {
+        task.outputs
+            .iter()
+            .any(|output| output.kind == OutputKind::Sampler)
+            || task
+                .inputs
+                .iter()
+                .any(|input| matches!(input.source, InputSource::Hidden { .. }))
+    }) {
+        return Err(
+            "hidden/sampler/overlay composition is not supported by this attachment".to_owned(),
+        );
+    }
     let state = graph
         .states
         .binary_search_by(|state| state.resource.cmp(&request.state_resource))
@@ -448,13 +475,19 @@ pub(crate) fn validate_inputs(inputs: &AttachmentCompilerInputs) -> Result<(), S
         .iter()
         .find(|layout| layout.resource == inputs.request.state_resource)
         .ok_or_else(|| "attachment state has no tensor layout".to_owned())?;
-    if inputs.request.overlay_field_ids.iter().any(|field| {
-        !layout
-            .layout
-            .fields
-            .iter()
-            .any(|known| known.field_id == u64::from(*field))
-    }) {
+    if inputs
+        .request
+        .overlay_bindings
+        .iter()
+        .flat_map(|binding| &binding.fields)
+        .any(|field| {
+            !layout
+                .layout
+                .fields
+                .iter()
+                .any(|known| known.field_id == u64::from(*field))
+        })
+    {
         return Err("overlay field is absent from the signed tensor layout".to_owned());
     }
     validate_cross_binding(

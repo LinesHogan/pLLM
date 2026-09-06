@@ -11,16 +11,12 @@ through to a "future versions probably look the same" branch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
-from collections.abc import Mapping
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from tllm.contracts.backend_capability import BackendCapability
 from tllm.contracts.hidden_locator import HiddenLocatorCapability
-from tllm.contracts.request_identity import RequestIdentity
-from tllm.contracts.request_identity import RequestFinishedBatch
 from tllm.contracts.typed_replay import TypedLayerReplayHandle
 
 
@@ -62,15 +58,6 @@ def runner_device(runner: object) -> "torch.device":
 
 if TYPE_CHECKING:
     import torch
-    from tllm.backends.vllm.overlay_state import (
-        OverlayChannel,
-        DenseOperandCapture,
-        OverlayStepPlan,
-        OverlayTarget,
-        OverlayVersion,
-        OverlayVersionRef,
-        OverlayVersionStore,
-    )
 
 
 class SamplerStage(Enum):
@@ -91,120 +78,6 @@ class GraphSafety(Enum):
     EAGER_ONLY = auto()
     CAPTURE_SAFE = auto()
     REPLAY_STATEFUL = auto()
-
-
-class DenseOverlayTargetHandle(Protocol):
-    @property
-    def target(self) -> OverlayTarget: ...
-
-    @property
-    def apply_count(self) -> int: ...
-
-    @property
-    def version_count(self) -> int: ...
-
-    @property
-    def capture_expected(self) -> bool: ...
-
-    def has_version(self, ref: OverlayVersionRef) -> bool: ...
-
-    def install_version(
-        self,
-        version: OverlayVersion,
-        tensors: Mapping[str, torch.Tensor],
-    ) -> None: ...
-
-    def retain_versions(self, refs: frozenset[OverlayVersionRef]) -> None: ...
-
-    def prepare_step(self, plan: OverlayStepPlan) -> None: ...
-
-    def clear_step(self) -> None: ...
-
-    def take_capture(self) -> DenseOperandCapture | None: ...
-
-    def restore(self) -> None: ...
-
-
-@dataclass(slots=True, init=False)
-class OverlayBackendState:
-    """Runner-owned installation state shared across overlay store epochs."""
-
-    stores: Mapping[OverlayChannel, OverlayVersionStore]
-    version_handles: dict[OverlayVersionRef, int]
-    request_identities: dict[str, RequestIdentity]
-    attached_requests: set[str]
-    dense_request_ids: set[str]
-    dense_targets: dict[OverlayTarget, DenseOverlayTargetHandle]
-    dense_reported_rows: dict[OverlayTarget, int]
-    dense_targets_validated: bool
-    next_handle_ordinal: int
-
-    def __init__(self) -> None:
-        self.stores = {}
-        self.version_handles = {}
-        self.request_identities = {}
-        self.attached_requests = set()
-        self.dense_request_ids = set()
-        self.dense_targets = {}
-        self.dense_reported_rows = {}
-        self.dense_targets_validated = False
-        self.next_handle_ordinal = 0
-
-    def owns_stores(
-        self, stores: Mapping[OverlayChannel, OverlayVersionStore]
-    ) -> bool:
-        return self.stores.keys() == stores.keys() and all(
-            self.stores[channel] is store for channel, store in stores.items()
-        )
-
-    def rebind(
-        self, stores: Mapping[OverlayChannel, OverlayVersionStore]
-    ) -> None:
-        self.stores = MappingProxyType(dict(stores))
-        self.version_handles.clear()
-        self.request_identities.clear()
-        self.attached_requests.clear()
-        self.dense_request_ids.clear()
-        self.dense_targets.clear()
-        self.dense_reported_rows.clear()
-        self.dense_targets_validated = False
-
-    def allocate_handle_ordinal(self) -> int:
-        self.next_handle_ordinal += 1
-        return self.next_handle_ordinal
-
-
-@dataclass(frozen=True)
-class VersionedParameterOverlayCapabilities:
-    """Generic immutable overlay installation and request-lease support."""
-
-    representations: frozenset[str]
-    scopes: frozenset[str]
-    phases: frozenset[str]
-    pinning: frozenset[str]
-    mixed_versions: bool
-    operand_captures: frozenset[str] = frozenset()
-    graph_safety: GraphSafety = GraphSafety.EAGER_ONLY
-    tensor_parallel_sizes: frozenset[int] = frozenset({1})
-
-    def capability_names(self) -> frozenset[str]:
-        return frozenset(
-            {
-                *(f"parameter_overlay/representation/{value}" for value in self.representations),
-                *(f"parameter_overlay/scope/{value}" for value in self.scopes),
-                *(f"parameter_overlay/phase/{value}" for value in self.phases),
-                *(f"parameter_overlay/pinning/{value}" for value in self.pinning),
-                *(
-                    f"parameter_overlay/operand_capture/{value}"
-                    for value in self.operand_captures
-                ),
-                *(
-                    f"parameter_overlay/tensor_parallel_size/{value}"
-                    for value in self.tensor_parallel_sizes
-                ),
-                f"parameter_overlay/mixed_versions/{str(self.mixed_versions).lower()}",
-            }
-        )
 
 
 @dataclass(frozen=True)
@@ -272,19 +145,12 @@ class BackendCapabilities:
     tuple_sampler_return: bool
     split_execute_and_sample: bool
     graph_safety: GraphSafety = GraphSafety.EAGER_ONLY
-    parameter_overlay: VersionedParameterOverlayCapabilities | None = None
     model_region: ModelRegionCapabilities | None = None
     extensions: frozenset[BackendCapability] = frozenset()
     hidden_locators: frozenset[HiddenLocatorCapability] = frozenset()
 
     def capability_names(self) -> frozenset[str]:
-        parameter_overlay = self.parameter_overlay
         region = self.model_region
-        parameter_names: frozenset[str] = (
-            frozenset()
-            if parameter_overlay is None
-            else parameter_overlay.capability_names()
-        )
         region_names: frozenset[str] = (
             frozenset() if region is None else region.capability_names()
         )
@@ -294,7 +160,7 @@ class BackendCapabilities:
         locator_names = frozenset(
             locator.value for locator in self.hidden_locators
         )
-        return parameter_names | region_names | extension_names | locator_names
+        return region_names | extension_names | locator_names
 
 class RunnerBindingDriver(Protocol):
     """Driver surface retained by a live per-runner binding."""
@@ -308,23 +174,6 @@ class RunnerBindingDriver(Protocol):
     ) -> TypedLayerReplayHandle: ...
 
     def restore_typed_layer_replay(self, *, runtime: Any) -> int: ...
-
-    def consume_parameter_overlay_finished_batch(
-        self,
-        *,
-        runtime: Any,
-        runner: Any,
-        state: OverlayBackendState,
-        batch: RequestFinishedBatch,
-    ) -> int: ...
-
-    def synchronize_parameter_overlays(
-        self,
-        *,
-        runtime: Any,
-        runner: Any,
-        state: OverlayBackendState,
-    ) -> int: ...
 
     def runner_model_layer_count(self, runner: Any) -> int: ...
 
@@ -344,9 +193,6 @@ class RunnerBinding:
     driver: RunnerBindingDriver
     runner: Any
     capabilities: BackendCapabilities
-    parameter_overlay_state: OverlayBackendState = field(
-        default_factory=OverlayBackendState
-    )
     typed_layer_replay_handle: TypedLayerReplayHandle | None = None
     active: bool = True
 
@@ -378,23 +224,6 @@ class BackendDriver(Protocol):
 
     def unbind(self, binding: RunnerBinding) -> None:
         ...
-
-    def consume_parameter_overlay_finished_batch(
-        self,
-        *,
-        runtime: Any,
-        runner: Any,
-        state: OverlayBackendState,
-        batch: RequestFinishedBatch,
-    ) -> int: ...
-
-    def synchronize_parameter_overlays(
-        self,
-        *,
-        runtime: Any,
-        runner: Any,
-        state: OverlayBackendState,
-    ) -> int: ...
 
     def install_typed_layer_replay(
         self,

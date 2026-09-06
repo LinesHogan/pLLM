@@ -27,6 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 AUTHORITY_FILES = (
     Path("tllm/canonical/execution.py"),
     Path("tllm/canonical/state_execution.py"),
+    Path("tllm/canonical/backend_program.py"),
+    Path("tllm/canonical_vllm/runtime.py"),
     Path("tllm/canonical/host_runtime.py"),
     Path("tllm/canonical_vllm/sampler.py"),
 )
@@ -59,6 +61,7 @@ SAMPLER_FILES = frozenset(
 )
 
 CONSUMER_NAMES = (
+    "inplace_ttt",
     "esamp",
     "dummy",
     "recirculation",

@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from tllm.canonical.backend_program import ParameterTargetShape
 
 from tllm.canonical.ptts.page_bundle import PageBundleArena
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -13,7 +14,7 @@ from tllm.canonical.state_representation import compile_state_representation, lo
 from tllm.canonical.tensor_layout import intern_tensor_layouts
 from tllm.canonical.workloads.inplace_ttt import (
     InPlaceTTTCompileOptions, InPlaceTTTConfig, InPlaceTTTSpecialization,
-    InPlaceTTTTargetSpecialization, InPlaceTTTWorkload,
+    InPlaceTTTWorkload,
 )
 from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
 from tllm.contracts.semantic_graph import StateResource, SemanticState, StateScope
@@ -24,7 +25,7 @@ from tllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, Tenso
 def _arena(*, heterogeneous: bool = False) -> PageBundleArena:
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
     compiled = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2)).compile(
-        InPlaceTTTSpecialization((InPlaceTTTTargetSpecialization(target, 3, 2),),
+        InPlaceTTTSpecialization((ParameterTargetShape(target, 3, 2),),
             TensorDType.FLOAT32, torch.device("cpu")),
         InPlaceTTTCompileOptions(
             CanonicalRuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
@@ -69,6 +70,10 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     a, b = admitted.after_refs
     arena.settle(admitted)
     pin = arena.pin_exact((a, b))
+    borrowed = arena.borrow_field(pin, a, LayoutFieldId(0))
+    assert arena.borrow_field(pin, a, LayoutFieldId(0)).data_ptr() == borrowed.data_ptr()
+    with pytest.raises(RuntimeError, match="issued"):
+        arena.borrow_field(replace(pin), a, LayoutFieldId(0))
     old_a, old_b = arena.snapshot(pin, a), arena.snapshot(pin, b)
     update = arena.prepare_transition((a,), fields=((LayoutFieldId(0),),))
     arena.write_field(update, 0, LayoutFieldId(0)).add_(4)
@@ -82,6 +87,11 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     assert arena.root(a).pages[0] != arena.root(new_a).pages[0]
     assert arena.root(a).pages[1:] == arena.root(new_a).pages[1:]
     new_pin = arena.pin_exact((new_a,))
+    assert arena.borrow_field(new_pin, new_a, LayoutFieldId(0)).data_ptr() != borrowed.data_ptr()
+    assert arena.borrow_field(new_pin, new_a, LayoutFieldId(1)).data_ptr() == arena.borrow_field(pin, a, LayoutFieldId(1)).data_ptr()
+    with pytest.raises(RuntimeError, match="held"):
+        arena.borrow_field(pin, new_a, LayoutFieldId(0))
+    torch.testing.assert_close(borrowed, old_a[0])
     torch.testing.assert_close(arena.snapshot(new_pin, new_a)[0], old_a[0] + 4)
     torch.testing.assert_close(arena.snapshot(pin, a)[0], old_a[0])
     torch.testing.assert_close(arena.snapshot(pin, b)[0], old_b[0])
@@ -89,6 +99,8 @@ def test_cpu_request_ptts_admit_cow_publish_pin_retire() -> None:
     arena.retire((new_a, b))
     assert arena.active_lineages == 2
     arena.wait_release(arena.release_pin(pin))
+    with pytest.raises(RuntimeError, match="released"):
+        arena.borrow_field(pin, a, LayoutFieldId(0))
     arena.wait_release(arena.release_pin(new_pin))
     assert arena.active_lineages == 0
     assert arena.free_pages == 6

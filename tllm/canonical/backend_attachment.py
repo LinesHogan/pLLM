@@ -23,13 +23,12 @@ from tllm.contracts.backend_attachment import (
     BackendAttachmentPhysicalPlan,
     BackendAttachmentRequest,
     BackendPlacementProbe,
-    RequestSamplerAttachmentSpec,
+    BackendAttachmentSpec,
     SignedBackendAttachment,
     StreamDependency,
 )
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
-from tllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
-from tllm.contracts.semantic_graph import AnchorId, AnchorSymbol, StateResource, TaskSymbol
+from tllm.contracts.semantic_graph import AnchorId, AnchorSymbol, TaskSymbol
 from tllm.contracts.state_representation import StateDeviceKind
 
 
@@ -217,66 +216,35 @@ def bind_attachment_tasks(
     return tuple(bindings)
 
 
-def compile_request_sampler_attachment(
-    plan: CanonicalPlanBundle, probe: BackendPlacementProbe, spec: RequestSamplerAttachmentSpec,
-) -> SignedBackendAttachment:
-    (sampler,) = tuple(anchor for anchor in plan.timeline.anchors if anchor.symbol == spec.sampler_anchor)
-    request = BackendAttachmentRequest(
-        attachment_kind=AttachmentKind.REQUEST_SAMPLER_TRAINING,
-        packed_row_schema_version=1,
-        task_bindings=bind_attachment_tasks(plan, (
-            (AttachmentTaskRole.COMPUTE, spec.compute_task),
-            (AttachmentTaskRole.TRANSITION, spec.transition_task),
-        )),
-        sampler_anchor_id=AnchorId(sampler.ordinal),
-        sampler_anchor_symbol=sampler.symbol,
-        stream_dependencies=(
-            StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE,
-            StreamDependency.COMPUTE_TO_SAMPLER,
-            StreamDependency.SAMPLER_TO_TRANSITION,
-            StreamDependency.TRANSITION_TO_RELEASE,
-        ),
-        sampler_stage=AttachmentSamplerStage.PACKED_POST_FILTER_EXACT,
-        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH,
-        state_resource=spec.state_resource,
-    )
-    inputs = BackendAttachmentCompilerInputs(request, probe, plan)
-    decision = compile_backend_attachment(inputs)
-    return SignedBackendAttachment(inputs, decision, lower_backend_attachment(inputs, decision))
-
-
-def compile_parameter_overlay_attachment(
-    plan: CanonicalPlanBundle, probe: BackendPlacementProbe,
-    bindings: tuple[ParameterOverlayFieldBinding, ...], state_resource: StateResource,
+def bind_backend_attachment(
+    plan: CanonicalPlanBundle, probe: BackendPlacementProbe, spec: BackendAttachmentSpec,
 ) -> SignedBackendAttachment:
     anchors = {anchor.symbol: anchor for anchor in plan.timeline.anchors}
-    stages = tuple(
-        AttachmentOverlayStageAnchor(stage, AnchorId(anchors[AnchorSymbol(symbol)].ordinal), symbol)
-        for stage, symbol in (
-            (AttachmentOverlayStage.PIN, "request.prepare"),
-            (AttachmentOverlayStage.APPLY, "model.execute"),
-            (AttachmentOverlayStage.CAPTURE, "model.execute"),
-            (AttachmentOverlayStage.TRANSITION, "model.execute"),
-            (AttachmentOverlayStage.PUBLISH, "state.publish"),
-            (AttachmentOverlayStage.RELEASE, "sampler.complete"),
-            (AttachmentOverlayStage.FINISH, "request.finish"),
-        )
+    sampler = anchors[spec.sampler_anchor]
+    stages = ()
+    dependencies = (
+        StreamDependency.HIDDEN_PRODUCER_TO_COMPUTE, StreamDependency.COMPUTE_TO_SAMPLER,
+        StreamDependency.SAMPLER_TO_TRANSITION, StreamDependency.TRANSITION_TO_RELEASE,
     )
+    if spec.kind is AttachmentKind.DENSE_PARAMETER_OVERLAY:
+        dependencies = (StreamDependency.TRANSITION_TO_RELEASE,)
+        stages = tuple(AttachmentOverlayStageAnchor(stage, AnchorId(anchors[AnchorSymbol(symbol)].ordinal), symbol)
+            for stage, symbol in (
+                (AttachmentOverlayStage.PIN, "request.prepare"),
+                (AttachmentOverlayStage.APPLY, "model.execute"),
+                (AttachmentOverlayStage.CAPTURE, "model.execute"),
+                (AttachmentOverlayStage.TRANSITION, "model.execute"),
+                (AttachmentOverlayStage.PUBLISH, "state.publish"),
+                (AttachmentOverlayStage.RELEASE, "sampler.complete"),
+                (AttachmentOverlayStage.FINISH, "request.finish"),
+            ))
     request = BackendAttachmentRequest(
-        attachment_kind=AttachmentKind.DENSE_PARAMETER_OVERLAY,
-        packed_row_schema_version=1,
-        task_bindings=bind_attachment_tasks(plan, (
-            (AttachmentTaskRole.TRANSITION, TaskSymbol("transition")),
-            (AttachmentTaskRole.PUBLISH, TaskSymbol("publish")),
-        )),
-        sampler_anchor_id=AnchorId(anchors[AnchorSymbol("sampler.complete")].ordinal),
-        sampler_anchor_symbol="sampler.complete",
-        stream_dependencies=(StreamDependency.TRANSITION_TO_RELEASE,),
-        sampler_stage=AttachmentSamplerStage.PACKED_POST_FILTER_EXACT,
-        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH,
-        state_resource=state_resource,
-        overlay_field_ids=tuple(field for binding in bindings for field in binding.fields),
-        overlay_stage_anchors=stages,
+        attachment_kind=spec.kind, packed_row_schema_version=1,
+        task_bindings=bind_attachment_tasks(plan, spec.tasks),
+        sampler_anchor_id=AnchorId(sampler.ordinal), sampler_anchor_symbol=sampler.symbol,
+        stream_dependencies=dependencies, sampler_stage=AttachmentSamplerStage.PACKED_POST_FILTER_EXACT,
+        cleanup_stage=AttachmentCleanupStage.REQUEST_FINISH, state_resource=spec.state_resource,
+        overlay_bindings=spec.overlay_bindings, overlay_stage_anchors=stages,
     )
     inputs = BackendAttachmentCompilerInputs(request, probe, plan)
     decision = compile_backend_attachment(inputs)
@@ -285,8 +253,7 @@ def compile_parameter_overlay_attachment(
 
 __all__ = [
     "bind_attachment_tasks",
-    "compile_request_sampler_attachment",
-    "compile_parameter_overlay_attachment",
+    "bind_backend_attachment",
     "compile_backend_attachment",
     "lower_backend_attachment",
     "validate_backend_attachment",

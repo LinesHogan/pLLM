@@ -47,6 +47,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     admitted = arena.publish(write)
     arena.settle(admitted)
     pin = arena.pin_exact(admitted.after_refs, reader)
+    borrowed = arena.borrow_field(pin, admitted.after_refs[0], LayoutFieldId(0))
     original = arena.snapshot(pin, admitted.after_refs[0])
     update = arena.prepare_transition(admitted.after_refs, writer)
     fields = AdamWFields(*(LayoutFieldId(index) for index in range(5)))
@@ -60,6 +61,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     # Old roots must remain live while their original consumer stream still runs.
     with torch.cuda.stream(reader):
         torch.cuda._sleep(100_000_000)
+        consumed = borrowed.clone()
     release = arena.release_pin(pin)
     assert arena.pending_pin_releases == 1
     assert arena.free_pages == 2
@@ -71,6 +73,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     assert arena.free_pages == 4
     arena.require_stable()
     torch.testing.assert_close(original[0], initial[0])
+    torch.testing.assert_close(consumed, initial[0])
     torch.testing.assert_close(result[0], initial[0] - 0.01)
     assert result[2].item() == 1
     arena.retire(publication.after_refs)

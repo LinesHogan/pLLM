@@ -35,7 +35,6 @@ BASIC_CONFIG = "pyrightconfig.json"
 BASELINE_PATH = REPO_ROOT / "tools" / "typing_baseline.json"
 AUTHOR_SURFACE = (
     Path("tllm/backends/vllm/typed_layer_replay.py"),
-    Path("tllm/backends/vllm/overlay_state.py"),
 )
 
 FORBIDDEN_COMPATIBILITY_NAMES = frozenset(

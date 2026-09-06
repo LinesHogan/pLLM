@@ -8,13 +8,13 @@ from contextlib import nullcontext
 import torch
 
 from tllm.canonical.cuda_stream import CudaStreamReadiness
+from tllm.canonical.backend_program import TensorStepInput
 from tllm.canonical.kernels.low_rank_gated import LowRankGatedLayout, low_rank_gated_forward
 from tllm.canonical.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from tllm.canonical.ptts.request_state import RequestStateSelection
 from tllm.canonical.state_execution import StateTaskContext
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestConfig,
-    ESampRequestStepInput,
     ESAMP_EXP_AVG_FIELD,
     ESAMP_EXP_AVG_SQ_FIELD,
     ESAMP_GRADIENT_FIELD,
@@ -61,7 +61,7 @@ ESampOptimization = ESampOptimizationPending | ESampOptimized
 
 @dataclass(slots=True)
 class ESampData:
-    step: ESampRequestStepInput
+    step: TensorStepInput
     source: torch.Tensor
     target: torch.Tensor
     prediction: ESampPrediction
@@ -109,7 +109,7 @@ def selected_training_tensors(
 def build_prediction(
     *,
     config: ESampRequestConfig,
-    step: ESampRequestStepInput,
+    step: TensorStepInput,
     selection: RequestStateSelection,
     training_source: torch.Tensor,
     training_target: torch.Tensor,
@@ -152,6 +152,7 @@ def build_prediction(
             step.sampler_rows,
             pred_hidden,
             tuple(affected_row_ids),
+            config.intervention_beta,
         ),
         training_source,
         training_target,

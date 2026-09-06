@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, TypeVar, overload
 
 if TYPE_CHECKING:
     from vllm import LLM
-    from tllm.canonical.workloads.base import CanonicalWorkload
+    from tllm.canonical.backend_program import BackendWorkload
     from tllm.canonical_vllm.runtime import CanonicalVllmConfig, CanonicalVllmLlm
+
+
+_DataT = TypeVar("_DataT")
+_ResultT = TypeVar("_ResultT")
 
 
 class _EngineOptions(TypedDict, total=False):
@@ -19,6 +23,25 @@ class _EngineOptions(TypedDict, total=False):
     max_lora_rank: int
     max_loras: int
     max_cpu_loras: int
+
+
+@overload
+def make_llm(*, workloads: tuple[BackendWorkload[_DataT, _ResultT], ...] | list[BackendWorkload[_DataT, _ResultT]],
+             canonical_config: CanonicalVllmConfig) -> CanonicalVllmLlm[_DataT, _ResultT]: ...
+
+
+@overload
+def make_llm(
+    model_name: str | None = None,
+    dtype: Literal["auto", "half", "float16", "bfloat16", "float", "float32"] | None = None,
+    gpu_memory_utilization: float | None = None, max_model_len: int | None = None,
+    enable_prefix_caching: bool | None = None, enforce_eager: bool | None = None,
+    seed: int | None = None, worker_extension_cls: str | None = None,
+    max_num_seqs: int | None = None, max_num_batched_tokens: int | None = None,
+    max_cudagraph_capture_size: int | None = None, enable_lora: bool | None = None,
+    max_lora_rank: int | None = None, max_loras: int | None = None, max_cpu_loras: int | None = None,
+    *, workloads: None = None, canonical_config: None = None,
+) -> LLM: ...
 
 
 def make_llm(
@@ -38,12 +61,16 @@ def make_llm(
     max_loras: int | None = None,
     max_cpu_loras: int | None = None,
     *,
-    workloads: tuple[CanonicalWorkload, ...] | list[CanonicalWorkload] | None = None,
+    workloads: tuple[BackendWorkload[_DataT, _ResultT], ...] | list[BackendWorkload[_DataT, _ResultT]] | None = None,
     canonical_config: CanonicalVllmConfig | None = None,
-) -> LLM | CanonicalVllmLlm:
+) -> LLM | CanonicalVllmLlm[_DataT, _ResultT]:
     if workloads is not None:
         if not isinstance(workloads, (tuple, list)) or len(workloads) != 1:
             raise TypeError("canonical make_llm requires one workload")
+        from tllm.canonical.backend_program import BackendWorkload
+
+        if not isinstance(workloads[0], BackendWorkload):
+            raise TypeError("workload does not declare a supported model-backend program")
         if any(
             value is not None
             for value in (

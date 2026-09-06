@@ -6,7 +6,7 @@ use super::super::state_representation::StateDeviceKind;
 use super::super::tensor_layout::TensorDType;
 use super::super::CanonicalPlanBundle;
 
-pub(crate) const SCHEMA_VERSION: u64 = 2;
+pub(crate) const SCHEMA_VERSION: u64 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -150,6 +150,44 @@ pub(crate) struct AttachmentCompilerInputs {
     pub(crate) plan: CanonicalPlanBundle,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParameterModuleKind {
+    Attention,
+    Mlp,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParameterRole {
+    DownProjectionWeight,
+    QueryProjectionWeight,
+    ValueProjectionWeight,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParameterTarget {
+    pub(crate) layer: u32,
+    pub(crate) module: ParameterModuleKind,
+    pub(crate) role: ParameterRole,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OverlayOperator {
+    DenseAdd,
+    LowRankAdd,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OverlayBinding {
+    pub(crate) target: ParameterTarget,
+    pub(crate) operator: OverlayOperator,
+    pub(crate) fields: Vec<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackendAttachmentRequest {
@@ -162,7 +200,7 @@ pub(crate) struct BackendAttachmentRequest {
     pub(crate) sampler_stage: AttachmentSamplerStage,
     pub(crate) cleanup_stage: AttachmentCleanupStage,
     pub(crate) state_resource: String,
-    pub(crate) overlay_field_ids: Vec<u32>,
+    pub(crate) overlay_bindings: Vec<OverlayBinding>,
     pub(crate) overlay_stage_anchors: Vec<AttachmentOverlayStageAnchor>,
     pub(crate) schema_version: u64,
 }

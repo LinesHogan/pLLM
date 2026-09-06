@@ -36,9 +36,11 @@ class CanonicalRuntimeFacts:
                 TimelineAnchor(AnchorSymbol("request.prepare"), 0),
                 TimelineAnchor(AnchorSymbol("model.execute"), 1),
                 TimelineAnchor(AnchorSymbol("state.publish"), 2),
-                TimelineAnchor(AnchorSymbol("sampler.complete"), 3),
-                TimelineAnchor(AnchorSymbol("request.finish"), 4),
-                TimelineAnchor(AnchorSymbol("next.prepare"), 5),
+                TimelineAnchor(AnchorSymbol("sampler.pre_draw"), 3),
+                TimelineAnchor(AnchorSymbol("sampler.complete"), 4),
+                TimelineAnchor(AnchorSymbol("token.commit"), 5),
+                TimelineAnchor(AnchorSymbol("request.finish"), 6),
+                TimelineAnchor(AnchorSymbol("next.prepare"), 7),
             ),
             capabilities=tuple(
                 sorted((compute, "host/service@1", *extra_capabilities))

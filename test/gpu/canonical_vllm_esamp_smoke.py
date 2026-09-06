@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import tllm
 import torch
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 
 from tllm.canonical.workloads.esamp_request import (
     ESampRequestWorkload,
@@ -32,8 +32,6 @@ def main() -> int:
         enable_prefix_caching=False, enforce_eager=True, seed=7,
         max_num_seqs=1, max_num_batched_tokens=64,
     )
-    if not isinstance(plain, LLM):
-        raise RuntimeError("plain public route did not construct vLLM")
     try:
         outputs = plain.generate(
             ["The sky is"], SamplingParams(max_tokens=3, temperature=0.0),
@@ -82,7 +80,7 @@ def main() -> int:
                 ignore_eos=True,
             ),
         )
-        execution = handle.deployment.compilation.execution
+        execution = handle.deployment.execution
         diagnostics = execution.diagnostics()
         if (
             not outputs[0].outputs[0].text

@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 import torch
 
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
+from tllm.canonical.backend_program import BackendCompileFacts, BackendDeployment, BackendRequirements, BackendWorkload, TensorStepInput
+from tllm.canonical.backend_attachment import bind_backend_attachment
 from tllm.canonical.state_execution import StateExecution, StateTaskContext
 from tllm.canonical.kernels.low_rank_gated import (
     LowRankGatedLayout,
@@ -15,7 +17,7 @@ from tllm.canonical.kernels.low_rank_gated import (
 from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.contracts.backend_attachment import (
-    RequestSamplerAttachmentSpec,
+    BackendAttachmentSpec, AttachmentKind, AttachmentTaskRole,
 )
 from tllm.canonical.scheduler import (
     compile_schedule,
@@ -33,7 +35,6 @@ from tllm.canonical.tensor_layout import (
     intern_tensor_layouts,
     validate_tensor_layouts,
 )
-from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.esamp_request_task_common import (
     ESampLossTask,
     ESampPredictTask,
@@ -48,7 +49,7 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions,
     ESampRequestConfig,
     ESampRequestSpecialization,
-    ESampRequestStepInput,
+    ESampRequestPackedHiddenBindings,
     ESampRequestStepResult,
     ESAMP_EXP_AVG_FIELD,
     ESAMP_EXP_AVG_SQ_FIELD,
@@ -63,6 +64,7 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESAMP_STEP_FIELD,
 )
 from tllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from tllm.contracts.request_identity import RequestKeyField
 from tllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
 from tllm.contracts.request_state import (
     IndexedRequestIdentityBatch,
@@ -115,7 +117,7 @@ _TRAIN_TASK = TaskSymbol("train")
 
 
 def _decode_indexed_rows(
-    step: ESampRequestStepInput,
+    step: TensorStepInput,
     *,
     empty_message: str,
 ) -> IndexedRequestIdentityBatch:
@@ -144,10 +146,10 @@ class ESampMath:
             parameters.copy_(initialize_low_rank_gated(self.layout, dtype=parameters.dtype,
                 device=parameters.device, generator=self.generator))
 
-    def rows(self, value: ESampRequestStepInput) -> IndexedRequestIdentityBatch:
+    def rows(self, value: TensorStepInput) -> IndexedRequestIdentityBatch:
         return _decode_indexed_rows(value, empty_message="ESamp requires decode rows")
 
-    def prepare(self, value: ESampRequestStepInput, context: StateTaskContext[ESampData]) -> ESampData:
+    def prepare(self, value: TensorStepInput, context: StateTaskContext[ESampData]) -> ESampData:
         stream = context.pin.stream
         match value.hidden, stream:
             case PackedHiddenSnapshotBatch() as hidden, None:
@@ -179,18 +181,40 @@ class ESampMath:
 
 @dataclass(frozen=True, slots=True)
 class ESampRequestCompilation:
-    execution: StateExecution[ESampRequestStepInput, ESampData, ESampRequestStepResult]
+    execution: StateExecution[TensorStepInput, ESampData, ESampRequestStepResult]
     plan_bundle: CanonicalPlanBundle
     math: ESampMath
 
 
-class ESampRequestWorkload(CanonicalWorkload):
+class ESampRequestWorkload(BackendWorkload[ESampData, ESampRequestStepResult]):
     """Declare ESamp math/dataflow; Rust owns scheduling and representation."""
 
     __slots__ = ("config",)
 
     def __init__(self, config: ESampRequestConfig = ESampRequestConfig()) -> None:
         self.config = config
+
+    def backend_requirements(self) -> BackendRequirements:
+        return BackendRequirements(tuple(HiddenInputSource(layer, HiddenSite.BLOCK_OUTPUT, HiddenPhase.DECODE)
+            for layer in (self.config.source_layer, self.config.target_layer)))
+
+    def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[ESampData, ESampRequestStepResult]:
+        if self.config.key_fields != (RequestKeyField.REQUEST_ID,):
+            raise ValueError("attached ESamp requires request-id state keys")
+        resources = {int(resource.binding.layer): resource.binding for resource in facts.probe.hidden_resources}
+        compiled = self.compile(
+            ESampRequestSpecialization(facts.probe.hidden_size, TensorDType.FLOAT32,
+                facts.initialization_seed, ESampRequestPackedHiddenBindings(
+                    resources[self.config.source_layer], resources[self.config.target_layer]),
+                facts.probe.device_kind, facts.probe.device_ordinal),
+            ESampRequestCompileOptions(facts.timeline, facts.providers,
+                facts.max_admitted_lineages, facts.state_memory_budget_bytes),
+        )
+        attachment = bind_backend_attachment(compiled.plan_bundle, facts.probe,
+            BackendAttachmentSpec(AttachmentKind.REQUEST_SAMPLER_TRAINING,
+                ((AttachmentTaskRole.COMPUTE, _PREDICT_TASK), (AttachmentTaskRole.TRANSITION, _TRAIN_TASK)),
+                AnchorSymbol("sampler.pre_draw"), _STATE_RESOURCE))
+        return BackendDeployment(compiled.execution, attachment)
 
     def semantic_graph(self) -> SemanticGraph:
         cpu_compute = ("compute/cpu@1",)
@@ -379,18 +403,6 @@ class ESampRequestWorkload(CanonicalWorkload):
                 ),
             ),
             execution_parameters_digest=self.config.execution_parameters_digest(),
-        )
-
-    def request_sampler_attachment_spec(
-        self,
-    ) -> RequestSamplerAttachmentSpec:
-        """Expose semantic roles; Rust still owns task and provider selection."""
-
-        return RequestSamplerAttachmentSpec(
-            compute_task=_PREDICT_TASK,
-            transition_task=_TRAIN_TASK,
-            sampler_anchor=AnchorSymbol("sampler.pre_draw"),
-            state_resource=_STATE_RESOURCE,
         )
 
     def compile(

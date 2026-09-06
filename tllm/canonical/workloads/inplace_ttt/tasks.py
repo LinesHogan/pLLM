@@ -125,7 +125,9 @@ class InPlaceTTTTransitionTask:
             (operand for operand in data.operands if operand.identity == row.identity),
             key=lambda operand: operand.target,
         )) for row in context.selection.rows)
-        source_roots = tuple(context.arena.snapshot(context.pin, ref) for ref in context.selection.refs)
+        fields = self._layout.tensor_layout.fields
+        source_roots = tuple(tuple(context.arena.borrow_field(context.pin, ref, field.field_id)
+            for field in fields) for ref in context.selection.refs)
         stream = context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             computed = tuple(

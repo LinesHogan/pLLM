@@ -30,6 +30,11 @@ def test_isolated_wheel_imports_and_executes_rust_codec(tmp_path: Path) -> None:
             name.startswith(("tllm/runtime/", "tllm/ports/", "tllm/common/"))
             for name in archive.namelist()
         )
+        assert not set(archive.namelist()).intersection({
+            "tllm/backends/vllm/overlay_state.py",
+            "tllm/backends/vllm/versioned_parameter_overlay.py",
+            "tllm/backends/vllm/dense_parameter_overlay.py",
+        })
     installed = tmp_path / "installed"
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-deps", "--no-index",

@@ -7,7 +7,6 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTStepBatchResult,
     InPlaceTTTStepResult,
     InPlaceTTTTargetResult,
-    InPlaceTTTTargetSpecialization,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
     InPlaceTTTCompilation,
@@ -21,6 +20,5 @@ __all__ = [
     "InPlaceTTTStepBatchResult",
     "InPlaceTTTStepResult",
     "InPlaceTTTTargetResult",
-    "InPlaceTTTTargetSpecialization",
     "InPlaceTTTWorkload",
 ]

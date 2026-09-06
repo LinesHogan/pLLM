@@ -5,11 +5,12 @@ from dataclasses import replace
 
 import pytest
 import torch
+from tllm.canonical.backend_program import BackendCompileFacts, ParameterTargetShape
 
 from tllm import _core
 from tllm.canonical.backend_attachment import (
-    _inputs_json, compile_backend_attachment, compile_parameter_overlay_attachment,
-    compile_request_sampler_attachment, lower_backend_attachment,
+    _inputs_json, compile_backend_attachment,
+    lower_backend_attachment,
     validate_backend_attachment, validate_backend_attachment_physical,
     validate_backend_attachment_reconstruction,
 )
@@ -17,73 +18,65 @@ from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.tensor_layout import intern_tensor_layouts
 from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
-from tllm.canonical.workloads.esamp_request_types import (
-    ESampRequestCompileOptions, ESampRequestConfig, ESampRequestPackedHiddenBindings,
-    ESampRequestSpecialization,
-)
+from tllm.canonical.workloads.esamp_request_types import ESampRequestConfig
 from tllm.canonical.workloads.inplace_ttt import (
-    InPlaceTTTCompileOptions, InPlaceTTTConfig, InPlaceTTTSpecialization,
-    InPlaceTTTTargetSpecialization, InPlaceTTTWorkload,
+    InPlaceTTTConfig, InPlaceTTTWorkload,
 )
 from tllm.contracts.backend_attachment import (
     AttachmentGraphMode, AttachmentHiddenResource, AttachmentTopology, BackendPlacementProbe,
 )
-from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
+from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterOverlayOperator
 from tllm.contracts.state_representation import StateDeviceKind
 from tllm.contracts.tensor_layout import TensorDType
 from tllm.contracts.semantic_graph import (
-    AnchorId, AnchorSymbol, ImplementationId, SchedulerTimeline, StateResource, TaskId, TimelineAnchor,
+    AnchorId, ImplementationId, TaskId, SemanticGraph, SemanticOutputKind, HostPayloadSchemaId,
 )
 
 
 def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() -> None:
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=2))
-    compiled = workload.compile(
-        InPlaceTTTSpecialization(
-            (InPlaceTTTTargetSpecialization(target, 3, 2),),
-            TensorDType.FLOAT32, torch.device("cpu"),
-        ),
-        InPlaceTTTCompileOptions(
-            CanonicalRuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",)),
-            (PageBundleProviderFacts("test.attachment@1", 2),), 2, 4096,
-        ),
-    )
     probe = BackendPlacementProbe(
         "test.backend@1", "a" * 64, "b" * 64, "c" * 64,
         AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER,
         StateDeviceKind.CPU, 0, 1, 1, TensorDType.FLOAT32, 3, 8, (), (),
     )
-    overlay = compile_parameter_overlay_attachment(
-        compiled.plan_bundle, probe, compiled.state_layout.overlay_bindings,
-        StateResource("dense_fast_weights"),
-    )
-    assert overlay.inputs.plan is compiled.plan_bundle
-    assert overlay.inputs.probe is probe
-    assert overlay.inputs.request.overlay_field_ids == (0,)
-    hidden = ESampRequestPackedHiddenBindings(*(
-        PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX,
-            HiddenSite.BLOCK_OUTPUT, f"model.layers[{layer}]") for layer in (0, 1)
-    ))
+    facts = BackendCompileFacts(probe,
+        CanonicalRuntimeFacts(torch.device("cpu")).timeline(("state/dense_page_cpu@1", "transition/full_root@1")),
+        (PageBundleProviderFacts("test.attachment@1", 2),), 2, 4096, 7,
+        (ParameterTargetShape(target, 3, 2),))
+    overlay_deployment = workload.compile_backend(facts)
+    overlay = overlay_deployment.attachment
+    assert overlay.inputs.plan is overlay_deployment.execution.arena.plan
+    assert overlay.inputs.probe is facts.probe
+    binding, = overlay.inputs.request.overlay_bindings
+    changed_target = replace(overlay.inputs, request=replace(overlay.inputs.request,
+        overlay_bindings=(replace(binding, target=replace(binding.target, layer=1)),)))
+    assert compile_backend_attachment(changed_target) != overlay.decision
+    with pytest.raises(ValueError):
+        validate_backend_attachment(changed_target, overlay.decision)
     esamp = ESampRequestWorkload(ESampRequestConfig(rank=2, source_layer=0, target_layer=1))
-    esamp_compiled = esamp.compile(
-        ESampRequestSpecialization(3, TensorDType.FLOAT32, 7, hidden, StateDeviceKind.CPU, 0),
-        ESampRequestCompileOptions(SchedulerTimeline(tuple(
-            TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate((
-                "model.execute", "sampler.pre_draw", "token.commit", "next.prepare",
-            ))), ("compute/cpu@1", "state/dense_page_cpu@1")),
-            (PageBundleProviderFacts("test.attachment@1", 2),), 2, 4096),
-    )
     sampler_probe = replace(probe, hidden_resources=tuple(
-        AttachmentHiddenResource(binding, HiddenPhase.DECODE) for binding in hidden.resources
-    ))
-    sampler = compile_request_sampler_attachment(
-        esamp_compiled.plan_bundle, sampler_probe, esamp.request_sampler_attachment_spec(),
-    )
-    assert sampler.inputs.plan is esamp_compiled.plan_bundle
+        AttachmentHiddenResource(PackedHiddenResourceBinding(str(source.layer), HiddenLayerKind.INDEX,
+            source.site, f"model.layers[{source.layer}]"), source.phase)
+        for source in esamp.backend_requirements().hidden_inputs))
+    sampler_deployment = esamp.compile_backend(replace(facts, probe=sampler_probe, targets=()))
+    sampler = sampler_deployment.attachment
+    assert sampler.inputs.plan is sampler_deployment.execution.arena.plan
     assert sampler.inputs.probe is sampler_probe
+    with pytest.raises(ValueError, match="composition"):
+        compile_backend_attachment(replace(overlay.inputs, probe=sampler_probe))
+    class UnconsumedSamplerWorkload(InPlaceTTTWorkload):
+        def semantic_graph(self, execution_parameters_digest: str) -> SemanticGraph:
+            graph = super().semantic_graph(execution_parameters_digest)
+            task, other = graph.tasks
+            output, = task.outputs
+            return replace(graph, tasks=(replace(task,
+                outputs=(replace(output, kind=SemanticOutputKind.SAMPLER, schema=HostPayloadSchemaId("")),)), other))
+    with pytest.raises(ValueError, match="composition"):
+        UnconsumedSamplerWorkload(workload.config).compile_backend(facts)
 
     for signed in (overlay, sampler):
         inputs, decision, physical = signed.inputs, signed.decision, signed.physical
@@ -162,13 +155,15 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
                 with pytest.raises(ValueError):
                     _core.compile_backend_attachment(json.dumps(payload))
         with pytest.raises(ValueError):
-            _core.compile_backend_attachment(wire.replace('"schema_version":2', '"schema_version":2,"schema_version":2', 1))
+            _core.compile_backend_attachment(wire.replace('"schema_version":3', '"schema_version":3,"schema_version":3', 1))
 
     request = overlay.inputs.request
     stages = request.overlay_stage_anchors
     for invalid in (
-        replace(request, overlay_field_ids=(999,)),
-        replace(request, overlay_field_ids=(0, 0)),
+        replace(request, overlay_bindings=(replace(binding, fields=(999,)),)),
+        replace(request, overlay_bindings=(replace(binding, fields=(0, 0)),)),
+        replace(request, overlay_bindings=(binding, binding)),
+        replace(request, overlay_bindings=(replace(binding, operator=ParameterOverlayOperator.LOW_RANK_ADD),)),
         replace(request, overlay_stage_anchors=stages[:-1]),
         replace(request, overlay_stage_anchors=(replace(stages[0], anchor_id=stages[-1].anchor_id,
             anchor_symbol=stages[-1].anchor_symbol), *stages[1:])),
@@ -178,7 +173,7 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
         with pytest.raises(ValueError):
             compile_backend_attachment(replace(overlay.inputs, request=invalid))
     # Another in-layout field is a different signed choice, not an out-of-range field.
-    changed_field = replace(overlay.inputs, request=replace(request, overlay_field_ids=(1,)))
+    changed_field = replace(overlay.inputs, request=replace(request, overlay_bindings=(replace(binding, fields=(1,)),)))
     assert compile_backend_attachment(changed_field) != overlay.decision
     with pytest.raises(ValueError):
         validate_backend_attachment(changed_field, overlay.decision)

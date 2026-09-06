@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 
 from tllm.canonical.state_execution import StateExecution, StateTaskContext
+from tllm.canonical.backend_program import BackendCompileFacts, BackendDeployment, BackendRequirements, BackendWorkload, TensorStepInput
+from tllm.canonical.backend_attachment import bind_backend_attachment
 from tllm.canonical.ptts.page_bundle import PageBundleArena
 from tllm.canonical.ptts.request_state import RequestStateDirectory
 from tllm.canonical.scheduler import (
@@ -23,7 +25,6 @@ from tllm.canonical.tensor_layout import (
     intern_tensor_layouts,
     validate_tensor_layouts,
 )
-from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.workloads.inplace_ttt.layout import (
     InPlaceTTTStateLayout,
     build_inplace_ttt_state_layout,
@@ -45,7 +46,7 @@ from tllm.canonical.workloads.inplace_ttt.types import (
     validate_inplace_ttt_step,
 )
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
-from tllm.contracts.parameter_overlay import CapturedParameterOperand
+from tllm.contracts.backend_attachment import BackendAttachmentSpec, AttachmentKind, AttachmentTaskRole
 from tllm.contracts.request_identity import RequestKeyField
 from tllm.contracts.request_state import (
     IndexedRequestIdentityBatch,
@@ -99,20 +100,20 @@ class InPlaceTTTMath:
         # The arena's zero initialization is the mathematical initial state.
         pass
 
-    def rows(self, value: tuple[CapturedParameterOperand, ...]) -> IndexedRequestIdentityBatch:
-        identities = sorted(set(operand.identity for operand in value),
+    def rows(self, value: TensorStepInput) -> IndexedRequestIdentityBatch:
+        identities = sorted(set(row.identity for row in value.rows.rows),
             key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx))
         return IndexedRequestIdentityBatch(tuple(IndexedRequestIdentityRow(index, identity)
             for index, identity in enumerate(identities)))
 
-    def prepare(self, value: tuple[CapturedParameterOperand, ...],
+    def prepare(self, value: TensorStepInput,
                 context: StateTaskContext[InPlaceTTTData]) -> InPlaceTTTData:
-        actual = tuple((operand.identity, operand.target) for operand in value)
+        actual = tuple((operand.identity, operand.target) for operand in value.operands)
         expected = {(row.identity, target) for row in context.selection.rows for target in self.config.targets}
         if len(actual) != len(expected) or set(actual) != expected:
             raise ValueError("captured operands must cover each selected request and target exactly once")
-        validate_inplace_ttt_step(value, self.specialization)
-        return InPlaceTTTData(value)
+        validate_inplace_ttt_step(value.operands, self.specialization)
+        return InPlaceTTTData(value.operands)
 
     def output(self, context: StateTaskContext[InPlaceTTTData]) -> InPlaceTTTStepBatchResult:
         result = context.data().result
@@ -123,19 +124,36 @@ class InPlaceTTTMath:
 
 @dataclass(frozen=True, slots=True)
 class InPlaceTTTCompilation:
-    execution: StateExecution[tuple[CapturedParameterOperand, ...], InPlaceTTTData, InPlaceTTTStepBatchResult]
+    execution: StateExecution[TensorStepInput, InPlaceTTTData, InPlaceTTTStepBatchResult]
     plan_bundle: CanonicalPlanBundle
     state_layout: InPlaceTTTStateLayout
     math: InPlaceTTTMath
 
 
-class InPlaceTTTWorkload(CanonicalWorkload):
+class InPlaceTTTWorkload(BackendWorkload[InPlaceTTTData, InPlaceTTTStepBatchResult]):
     """Declare dense-fast-weight math/effects without physical policy."""
 
     __slots__ = ("config",)
 
     def __init__(self, config: InPlaceTTTConfig) -> None:
         self.config = config
+
+    def backend_requirements(self) -> BackendRequirements:
+        return BackendRequirements(parameter_targets=self.config.targets)
+
+    def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[InPlaceTTTData, InPlaceTTTStepBatchResult]:
+        device = torch.device("cpu") if facts.probe.device_kind is StateDeviceKind.CPU else torch.device("cuda", facts.probe.device_ordinal)
+        compiled = self.compile(
+            InPlaceTTTSpecialization(facts.targets, facts.probe.tensor_dtype, device),
+            InPlaceTTTCompileOptions(facts.timeline, facts.providers,
+                facts.max_admitted_lineages, facts.state_memory_budget_bytes),
+        )
+        bindings = compiled.state_layout.overlay_bindings
+        attachment = bind_backend_attachment(compiled.plan_bundle, facts.probe,
+            BackendAttachmentSpec(AttachmentKind.DENSE_PARAMETER_OVERLAY,
+                ((AttachmentTaskRole.TRANSITION, _TRANSITION_TASK), (AttachmentTaskRole.PUBLISH, _PUBLISH_TASK)),
+                AnchorSymbol("sampler.complete"), _FAST_WEIGHT_STATE, bindings))
+        return BackendDeployment(compiled.execution, attachment)
 
     def semantic_graph(self, execution_parameters_digest: str) -> SemanticGraph:
         return SemanticGraph(

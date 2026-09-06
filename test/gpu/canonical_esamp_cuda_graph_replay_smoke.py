@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 
 from tllm.canonical.state_execution import StateExecution
+from tllm.canonical.backend_program import TensorStepInput
 from tllm.canonical.workloads.esamp_request_task_common import ESampData
 from tllm.canonical.cuda_packed_hidden import CudaPackedHiddenSnapshotBatch
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -22,7 +23,6 @@ from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestConfig,
     ESampRequestPackedHiddenBindings,
     ESampRequestSpecialization,
-    ESampRequestStepInput,
     ESampRequestStepResult,
 )
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
@@ -120,13 +120,13 @@ def _step_input(
     source: torch.Tensor,
     target: torch.Tensor,
     producer_stream: torch.cuda.Stream,
-) -> ESampRequestStepInput:
+) -> TensorStepInput:
     rows = _rows(step_id, identities)
     hidden_by_resource = {
         hidden_bindings.source: source,
         hidden_bindings.target: target,
     }
-    return ESampRequestStepInput(
+    return TensorStepInput(
         rows,
         PackedSamplerRowBatch(
             rows,
@@ -153,7 +153,7 @@ def _step_input(
 
 def _run_step(
     *,
-    execution: StateExecution[ESampRequestStepInput, ESampData, ESampRequestStepResult],
+    execution: StateExecution[TensorStepInput, ESampData, ESampRequestStepResult],
     step_id: int,
     identities: tuple[RequestIdentity, RequestIdentity],
     hidden_bindings: ESampRequestPackedHiddenBindings,
@@ -185,11 +185,11 @@ def _run_step(
         execution_stream,
     )
     def delayed_guidance(rows: PackedSamplerRowBatch, prediction: torch.Tensor,
-                         affected: tuple[int, ...]) -> PackedSamplerGuidanceBatch:
+                         affected: tuple[int, ...], beta: float) -> PackedSamplerGuidanceBatch:
         if affected:
             torch.cuda._sleep(500_000_000)
             prediction.add_(1)
-        return PackedSamplerGuidanceBatch(rows, prediction, affected)
+        return PackedSamplerGuidanceBatch(rows, prediction, affected, beta)
 
     with patch("tllm.canonical.workloads.esamp_request_task_common.PackedSamplerGuidanceBatch", delayed_guidance):
         execution.execute_anchor(handle, AnchorId(0))

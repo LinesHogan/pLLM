@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from tllm.canonical.state_execution import StateSettlementError
+from tllm.canonical.backend_program import TensorStepInput, ParameterTargetShape
 
 
 from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -11,7 +12,7 @@ from tllm.canonical.ptts.page_bundle import PageBundleArena, PagePublication, Pa
 from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
 from tllm.canonical.workloads.inplace_ttt.types import (
     InPlaceTTTCompileOptions, InPlaceTTTConfig,
-    InPlaceTTTSpecialization, InPlaceTTTTargetSpecialization,
+    InPlaceTTTSpecialization,
 )
 from tllm.canonical.workloads.inplace_ttt.workload import (
     InPlaceTTTWorkload,
@@ -21,8 +22,18 @@ from tllm.contracts.parameter_overlay import (
 )
 from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.request_identity import RequestIdentity
+from tllm.contracts.packed_rows import PackedPhaseRowBatch, PackedPhaseRow, PackedSamplerRowBatch
 from tllm.contracts.request_state import IndexedRequestIdentityBatch, IndexedRequestIdentityRow
 from tllm.contracts.tensor_layout import TensorDType
+
+
+def _input(operands: tuple[CapturedParameterOperand, ...]) -> TensorStepInput:
+    selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
+    rows = PackedPhaseRowBatch(1, 0, len(selected), tuple(
+        PackedPhaseRow(index, index, identity.request_id, 0, phase, identity,
+            index if phase is HiddenPhase.DECODE else None)
+        for index, (identity, phase) in enumerate(selected)))
+    return TensorStepInput(rows, PackedSamplerRowBatch(rows, ()), operands=operands)
 
 
 def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
@@ -34,7 +45,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
     config = InPlaceTTTConfig(targets, chunk_size=2, learning_rate=0.3)
     compiled = InPlaceTTTWorkload(config).compile(
         InPlaceTTTSpecialization(
-            tuple(InPlaceTTTTargetSpecialization(target, 3, 2) for target in targets),
+            tuple(ParameterTargetShape(target, 3, 2) for target in targets),
             TensorDType.FLOAT64, torch.device("cpu"),
         ),
         InPlaceTTTCompileOptions(
@@ -73,11 +84,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         with monkeypatch.context() as fault:
             fault.setattr(PageBundleArena, "publish", reject_publication)
             with pytest.raises(RuntimeError, match="injected prepublication failure"):
-                execution.step(step)
+                execution.step(_input(step))
         for actual, expected in zip(execution.snapshot(latest), before, strict=True):
             torch.testing.assert_close(actual, expected)
         if row == 0:
-            result, = execution.step(step).entries
+            result, = execution.step(_input(step)).entries
         else:
             transition, publish = execution.plan.tasks
             rows = IndexedRequestIdentityBatch((IndexedRequestIdentityRow(0, identities[0]),))
@@ -86,7 +97,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
             with pytest.raises(RuntimeError, match="active"):
                 execution.cancel_step(cancelled)
             handle = execution.begin(rows)
-            execution.submit_input(handle, step)
+            execution.submit_input(handle, _input(step))
             assert handle.cursor.context.data().operands is step
             execution.execute_anchor(handle, transition.anchor_id)
             execution.execute_anchor(handle, publish.anchor_id)
@@ -126,11 +137,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
     # The independent outer-product oracle must be visible only to the trained request.
     deltas = 0.3 * desired.transpose(1, 2) @ hidden
     for request_index, identity in enumerate(identities):
-        result, = execution.step(tuple(
+        result, = execution.step(_input(tuple(
             CapturedParameterOperand(identity, target, HiddenPhase.DECODE,
                 hidden[:1], desired[index, :1], bases[index])
             for index, target in enumerate(targets)
-        )).entries
+        ))).entries
         assert result.before_ref == result.after_ref == (latest if request_index == 0 else refs[1])
         assert not result.weight_changed
         for index, target_result in enumerate(result.targets):

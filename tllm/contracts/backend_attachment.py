@@ -8,6 +8,7 @@ from enum import StrEnum
 from tllm.contracts.hidden_locator import HiddenPhase
 from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from tllm.contracts.canonical_compilation import CanonicalPlanBundle
+from tllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from tllm.contracts.semantic_graph import (
     AnchorId,
     ImplementationId,
@@ -112,11 +113,12 @@ class BackendPlacementProbe:
 
 
 @dataclass(frozen=True, slots=True)
-class RequestSamplerAttachmentSpec:
-    compute_task: TaskSymbol
-    transition_task: TaskSymbol
+class BackendAttachmentSpec:
+    kind: AttachmentKind
+    tasks: tuple[tuple[AttachmentTaskRole, TaskSymbol], ...]
     sampler_anchor: AnchorSymbol
     state_resource: StateResource
+    overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,9 +132,9 @@ class BackendAttachmentRequest:
     sampler_stage: AttachmentSamplerStage
     cleanup_stage: AttachmentCleanupStage
     state_resource: str
-    overlay_field_ids: tuple[int, ...] = ()
+    overlay_bindings: tuple[ParameterOverlayFieldBinding, ...] = ()
     overlay_stage_anchors: tuple[AttachmentOverlayStageAnchor, ...] = ()
-    schema_version: int = 2
+    schema_version: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +148,7 @@ class BackendAttachmentCompilerInputs:
 class BackendAttachmentDecision:
     request_digest: str
     signature: str
-    schema_version: int = 2
+    schema_version: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +163,7 @@ class BackendAttachmentPhysicalPlan:
     topology: AttachmentTopology
     graph_mode: AttachmentGraphMode
     bundle_signature: str
-    schema_version: int = 2
+    schema_version: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +174,7 @@ class SignedBackendAttachment:
 
 
 __all__ = [
-    "RequestSamplerAttachmentSpec",
+    "BackendAttachmentSpec",
     "SignedBackendAttachment",
     "AttachmentCleanupStage",
     "AttachmentGraphMode",

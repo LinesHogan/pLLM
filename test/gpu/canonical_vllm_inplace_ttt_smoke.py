@@ -69,7 +69,7 @@ def main() -> int:
                 ignore_eos=True,
             ),
         )
-        execution = handle.deployment.compilation.execution
+        execution = handle.deployment.execution
         diagnostics = execution.diagnostics()
         if (
             any(not output.outputs[0].text for output in outputs)

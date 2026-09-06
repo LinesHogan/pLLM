@@ -33,13 +33,11 @@ class SignedPostFilterGuidance:
     """One dense prediction aligned to a signed packed sampler row space."""
 
     guidance: PackedSamplerGuidanceBatch
-    beta: float
     pred_dense_logits: torch.Tensor
 
     def __post_init__(self) -> None:
         if (
-            self.beta < 0.0
-            or self.pred_dense_logits.ndim != 2
+            self.pred_dense_logits.ndim != 2
             or int(self.pred_dense_logits.shape[0])
             != len(self.guidance.affected_row_ids)
             or self.pred_dense_logits.device != self.guidance.pred_hidden.device
@@ -238,7 +236,7 @@ class CanonicalVllm027PostFilterSampler(Sampler):
             device=processed_logits.device,
             dtype=torch.long,
         )
-        if int(affected_rows.numel()) == 0 or guidance.beta == 0.0:
+        if int(affected_rows.numel()) == 0 or guidance.guidance.beta == 0.0:
             return processed_logits
         survivor_logits = processed_logits.index_select(0, affected_rows)
         predicted_logits = guidance.pred_dense_logits.to(
@@ -248,8 +246,8 @@ class CanonicalVllm027PostFilterSampler(Sampler):
         finite = torch.isfinite(survivor_logits)
         reweighted = torch.where(
             finite,
-            (1.0 + guidance.beta) * survivor_logits
-            - guidance.beta * predicted_logits,
+            (1.0 + guidance.guidance.beta) * survivor_logits
+            - guidance.guidance.beta * predicted_logits,
             survivor_logits,
         )
         output = processed_logits.clone()

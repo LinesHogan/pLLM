@@ -16,10 +16,12 @@ class PackedSamplerGuidanceBatch:
     sampler_rows: PackedSamplerRowBatch
     pred_hidden: torch.Tensor
     affected_row_ids: tuple[int, ...]
+    beta: float = 0.0
 
     def __post_init__(self) -> None:
         if (
-            self.pred_hidden.ndim != 2
+            self.beta < 0.0
+            or self.pred_hidden.ndim != 2
             or int(self.pred_hidden.shape[0]) != len(self.affected_row_ids)
         ):
             raise ValueError(

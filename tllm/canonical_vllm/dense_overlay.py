@@ -7,15 +7,17 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import torch
+from tllm.canonical.backend_program import ParameterTargetShape
+from tllm.canonical.state_execution import DataT, StateTaskContext
+from tllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
+from tllm.contracts.state_ref import StateRef
 from torch.nn import Parameter
 from torch.nn import functional as F
 
 from tllm.contracts.parameter_overlay import (
     CapturedParameterOperand,
     ParameterModuleKind,
-    ParameterOverlayPinnedTensor,
-    ParameterOverlayRowAssignment,
-    ParameterOverlayStepPlan,
+    ParameterOverlayFieldBinding,
     ParameterRole,
     ParameterTarget,
 )
@@ -43,16 +45,9 @@ class _Mlp(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class VllmDenseAddTargetSpec:
-    target: ParameterTarget
-    input_size: int
-    output_size: int
-    dtype: torch.dtype
-
-
-@dataclass(frozen=True, slots=True)
 class _PreparedRows:
-    assignment: ParameterOverlayRowAssignment
+    source: PackedPhaseRow
+    ref: StateRef
     delta: torch.Tensor
     rows: torch.Tensor
 
@@ -71,17 +66,17 @@ class VllmDenseAddTarget:
         "_original_forward",
         "_original_mlp_forward",
         "_prepared",
-        "_target",
+        "_binding",
         "_total_rows",
     )
 
     def __init__(
         self,
-        target: ParameterTarget,
+        binding: ParameterOverlayFieldBinding,
         mlp: _Mlp,
         module: _DenseLinear,
     ) -> None:
-        self._target = target
+        self._binding = binding
         self._mlp = mlp
         self._module = module
         self._original_mlp_forward: _MlpForward = mlp.forward
@@ -98,7 +93,7 @@ class VllmDenseAddTarget:
 
     @property
     def target(self) -> ParameterTarget:
-        return self._target
+        return self._binding.target
 
     @property
     def base_weight(self) -> torch.Tensor:
@@ -122,39 +117,29 @@ class VllmDenseAddTarget:
 
     def prepare(
         self,
-        plan: ParameterOverlayStepPlan,
-        pinned: tuple[ParameterOverlayPinnedTensor, ...],
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
     ) -> None:
-        assignments = tuple(
-            assignment
-            for assignment in plan.assignments
-            if assignment.target == self._target
-        )
-        pinned_by_ref = {
-            value.ref: value
-            for value in pinned
-            if value.target == self._target
-        }
         prepared: list[_PreparedRows] = []
-        for assignment in assignments:
-            try:
-                value = pinned_by_ref[assignment.ref]
-            except KeyError as exc:
-                raise RuntimeError(
-                    "dense-add rows reference an unpinned state root"
-                ) from exc
+        for selected in context.selection.rows:
+            source_rows = tuple(row for row in rows.rows if row.identity == selected.identity)
+            if not source_rows or len({row.phase for row in source_rows}) != 1:
+                raise RuntimeError("dense-add request requires one nonempty packed phase")
+            ref = context.pin.refs[selected.state_index]
+            value = context.arena.borrow_field(context.pin, ref, self._binding.fields[0])
             if (
-                value.tensor.shape != self._module.weight.shape
-                or value.tensor.dtype is not self._module.weight.dtype
-                or value.tensor.device != self._module.weight.device
+                value.shape != self._module.weight.shape
+                or value.dtype is not self._module.weight.dtype
+                or value.device != self._module.weight.device
             ):
                 raise ValueError("dense-add delta differs from target weight shape")
             prepared.append(
                 _PreparedRows(
-                    assignment,
-                    value.tensor,
+                    source_rows[0],
+                    ref,
+                    value,
                     torch.tensor(
-                        assignment.packed_rows,
+                        tuple(row.packed_row_index for row in source_rows),
                         dtype=torch.long,
                         device=self._module.weight.device,
                     ),
@@ -162,7 +147,7 @@ class VllmDenseAddTarget:
             )
         self._prepared = tuple(prepared)
         self._captures = ()
-        self._total_rows = plan.total_rows
+        self._total_rows = rows.total_rows
 
     def forward_mlp(self, mlp_input: torch.Tensor) -> torch.Tensor:
         if self._prepared:
@@ -204,19 +189,17 @@ class VllmDenseAddTarget:
             )
             captures.append(
                 CapturedParameterOperand(
-                    prepared.assignment.identity,
-                    self._target,
-                    prepared.assignment.phase,
+                    prepared.source.identity,
+                    self.target,
+                    prepared.source.phase,
                     selected_hidden.detach().clone(),
                     selected_desired.detach().clone(),
                     self._base_weight,
                 )
             )
-            self._apply_count += len(prepared.assignment.packed_rows)
-            if int(prepared.assignment.ref.version_id) > 0:
-                self._updated_apply_count += len(
-                    prepared.assignment.packed_rows
-                )
+            self._apply_count += prepared.rows.numel()
+            if int(prepared.ref.version_id) > 0:
+                self._updated_apply_count += prepared.rows.numel()
         self._captures = tuple(captures)
         return (output, bias) if tuple_output else output
 
@@ -247,11 +230,12 @@ class VllmDenseAddAdapter:
     def __init__(
         self,
         model: Qwen2ForCausalLM,
-        targets: tuple[ParameterTarget, ...],
+        bindings: tuple[ParameterOverlayFieldBinding, ...],
     ) -> None:
         handles: list[VllmDenseAddTarget] = []
         modules: set[int] = set()
-        for target in targets:
+        for binding in bindings:
+            target = binding.target
             if (
                 target.module is not ParameterModuleKind.MLP
                 or target.role is not ParameterRole.DOWN_PROJECTION_WEIGHT
@@ -267,7 +251,7 @@ class VllmDenseAddAdapter:
             ):
                 raise RuntimeError("vLLM dense-add target is not an exact TP1 weight")
             modules.add(id(module))
-            handles.append(VllmDenseAddTarget(target, mlp, module))
+            handles.append(VllmDenseAddTarget(binding, mlp, module))
         self._targets = tuple(handles)
 
     @property
@@ -284,11 +268,11 @@ class VllmDenseAddAdapter:
 
     def prepare(
         self,
-        plan: ParameterOverlayStepPlan,
-        pinned: tuple[ParameterOverlayPinnedTensor, ...],
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
     ) -> None:
         for target in self._targets:
-            target.prepare(plan, pinned)
+            target.prepare(rows, context)
 
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
         return tuple(
@@ -309,8 +293,9 @@ class VllmDenseAddAdapter:
 def inspect_dense_add_targets(
     model: Qwen2ForCausalLM,
     targets: tuple[ParameterTarget, ...],
-) -> tuple[VllmDenseAddTargetSpec, ...]:
-    specs: list[VllmDenseAddTargetSpec] = []
+    dtype: torch.dtype,
+) -> tuple[ParameterTargetShape, ...]:
+    specs: list[ParameterTargetShape] = []
     modules: set[int] = set()
     for target in targets:
         if (
@@ -327,15 +312,15 @@ def inspect_dense_add_targets(
             or module.tp_size != 1
             or not module.return_bias
             or module.bias is not None
+            or module.weight.dtype is not dtype
         ):
             raise RuntimeError("vLLM dense-add target is not an exact TP1 weight")
         modules.add(id(module))
         specs.append(
-            VllmDenseAddTargetSpec(
+            ParameterTargetShape(
                 target,
                 int(module.weight.shape[1]),
                 int(module.weight.shape[0]),
-                module.weight.dtype,
             )
         )
     return tuple(specs)
@@ -344,6 +329,5 @@ def inspect_dense_add_targets(
 __all__ = [
     "VllmDenseAddAdapter",
     "VllmDenseAddTarget",
-    "VllmDenseAddTargetSpec",
     "inspect_dense_add_targets",
 ]

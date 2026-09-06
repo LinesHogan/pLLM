@@ -12,10 +12,11 @@ from tllm.canonical.workloads.esamp_request import (
     ESampRequestWorkload,
 )
 from tllm.canonical.state_execution import StateSettlementError, StateTaskContext
+from tllm.canonical.backend_program import TensorStepInput
 from tllm.canonical.workloads.esamp_request_task_common import ESampData
 from tllm.canonical.workloads.esamp_request_types import (
     ESampRequestCompileOptions, ESampRequestConfig, ESampRequestPackedHiddenBindings,
-    ESampRequestSpecialization, ESampRequestStepInput, ESampRequestStepResult,
+    ESampRequestSpecialization, ESampRequestStepResult,
 )
 from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from tllm.contracts.packed_hidden import (
@@ -85,7 +86,7 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
             for index, owner in enumerate(owners)
         ))
         tensors = {bindings.source: source[:count], bindings.target: target[:count]}
-        step = ESampRequestStepInput(rows,
+        step = TensorStepInput(rows,
             PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count))),
             PackedHiddenSnapshotBatch(rows, tuple(PackedHiddenSnapshot(resource, tensors[resource])
                 for resource in bindings.resources)),

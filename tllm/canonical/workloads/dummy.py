@@ -7,7 +7,6 @@ from hashlib import sha256
 
 import torch
 
-from tllm.canonical.workloads.base import CanonicalWorkload
 from tllm.canonical.execution import SingleTaskExecution
 from tllm.canonical.scheduler import (
     compile_schedule,
@@ -129,7 +128,7 @@ class _DummyCpuExport:
         )
 
 
-class DummyWorkload(CanonicalWorkload):
+class DummyWorkload:
     """Public Dummy workload backed only by the canonical core."""
 
     __slots__ = ("config", "_implementation")
