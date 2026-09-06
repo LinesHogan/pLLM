@@ -1,9 +1,9 @@
 schema_version = 1
 target_count = 41
 maximum_count = 50
-active_executable_count = 20
-pending_survivor_count = 21
-active_executable_ids = [1, 2, 3, 5, 9, 10, 12, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38, 39]
+active_executable_count = 22
+pending_survivor_count = 19
+active_executable_ids = [1, 2, 3, 5, 9, 10, 11, 12, 13, 15, 19, 20, 21, 22, 23, 24, 25, 30, 32, 37, 38, 39]
 
 # The active count is deliberately not the terminal evidence set.  It records
 # the executable survivor bases left after deleting stale old-stack tests:
@@ -87,6 +87,11 @@ replaces = "Separate admission/factory rollback and multi-lineage publication te
 id = 11
 name = "global_multifactor_adamw_matches_oracle_and_publishes_one_version"
 group = "ptts"
+path = "test/workloads/test_tlm.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_tlm.py::test_global_multifactor_adamw_matches_oracle_and_publishes_one_version"
+environment = "Repository venv; CPU float64"
+observable_contract = "Four q/v factors, gradients, steps and AdamW moments match an independent torch.optim.AdamW model across two updates; all factors publish under one original PagePublication; injected publication failure rolls back all private writes; an old exact pin retains every old factor; retirement and zero fallback"
+replaces = "Retired global LoRA optimizer/version store tests; no independent global lifecycle owner"
 
 [[evidence]]
 id = 12
@@ -197,6 +202,11 @@ replaces = "test/core/test_canonical_inplace_ttt_workload_unit.py; no legacy fix
 id = 24
 name = "tlm_matches_objective_online_offline_graph_and_qv_publication"
 group = "workload"
+path = "test/workloads/test_tlm.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_tlm.py::test_tlm_matches_objective_online_offline_graph_and_qv_publication"
+environment = "Repository venv with transformers and peft; CPU float32/float64 and CUDA float32 when available; current checkpoint ran both CPU and CUDA"
+observable_contract = "Online adapted versus offline base selector and signed pre-model/post-token timing; no-selected branch does not publish; actual tiny Qwen2/PEFT q/v shape facts, loss, gradients and factors match an independently optimized PEFT model; CUDA uses a nondefault stream; template factors never update; shared instance retirement. Not public vLLM/global overlay support"
+replaces = "Canonical TLM cold-foundation test and historical TLM objective/consumer numerical tests without their owner assertions"
 
 [[evidence]]
 id = 25

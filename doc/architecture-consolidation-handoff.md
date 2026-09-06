@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`e03ea16`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`a682264`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,23 +13,23 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 18,676；相对 133,210 净减 114,534（约 86.0%）；低于预测区间不代表功能补齐 |
-| 距第一轮 30k 上限 | 当前余量 11,324 行；补齐缺失能力仍须与新栈压缩配套，不为凑下限增加代码 |
-| 本轮源码差分 | 相对 `ccc211e` 新增 645 / 删除 2,967 / 净减 2,322；包含新 backend_program 全部 87 行；没有整文件原样移动；独立 AdamW/fast-weight 数学不变 |
+| SOURCE_LOC | 18,451；相对 133,210 净减 114,759（约 86.1%）；低于预测区间不代表功能补齐 |
+| 距第一轮 30k 上限 | 当前余量 11,549 行；补齐缺失能力仍须与新栈压缩配套，不为凑下限增加代码 |
+| 本轮源码差分 | 相对 `e03ea16` 新增 365 / 删除 590 / 净减 225；包含 TLM workload 全部 203 行；无整文件原样移动；既有 objective/AdamW 数学复用 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
 | 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend probe/replay primitives、typed_replay 旧契约；overlay_state 已删 |
-| 留存证据基础 | 4 个 Rust tests + 12 个 pytest items + 4 个独立 GPU smoke，共 20 项 |
-| 终态证据债务 | 原 39 项中 19 项待补，加新增组合 40/41，共 21 项待补 |
+| 留存证据基础 | 4 个 Rust tests + 14 个 pytest items + 4 个独立 GPU smoke，共 22 项 |
+| 终态证据债务 | 原 39 项中 17 项待补，加新增组合 40/41，共 19 项待补 |
 
 SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除。移动不作为减量成果。
 当前目录体积用于选择整块处理边界，不能直接当作可删除量：
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 8,523 |
+| tllm/canonical | 8,461 |
 | tllm/backends + canonical_vllm | 1,633 + 1,916 |
-| tllm/contracts | 2,053 |
+| tllm/contracts | 1,890 |
 | Rust | 3,434 |
 | tools / 顶层入口及 stub | 861 / 256 |
 
@@ -85,6 +85,10 @@ MRv1/旧版本结构 probe、typed replay callback 仍待接入共享边界；TL
   In-Place 数学也借用原页，不再先 snapshot 全根。borrow_field 是原 pin 生命周期内的只读借用；
   tensor 不提供硬件只读保护，native consumer 不得原地修改或在 release 后持有别名。
   CPU/CUDA 证据覆盖 COW 页共享、旧版本不变、伪造/释放 pin 拒绝和延迟读取后回收。
+- `a682264` 将 ESamp/In-Place/TLM 的 plan/layout/representation 编译合并到原 PageBundle
+  planning owner，删除重复签名/验证调用链；共享 PublishStateTask，不为 TLM 建 publisher/session。
+  同一目录按原 SemanticState.scope 选择 request key 或 instance 单例，版本仍只由 arena 分配。
+  失去调用者的旧 request-state slot/selection/receipt DTO（163 行）同批删除。
 - 把 workload 编排收进同一 typed executor/host transaction；CPU/CUDA 共享 transition，
   provider 只承载 kernel。压缩 FTTT/GTTA、ESamp、In-Place 的剩余 execution/task 链。
 - 合并 `backends` 与 `canonical_vllm` 的 probe、capture、sampler、overlay mechanics，
@@ -104,7 +108,7 @@ MRv1/旧版本结构 probe、typed replay callback 仍待接入共享边界；TL
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
 | In-Place-TTT | 共享 StateExecution 和 generic backend session；原始捕获记录及页借用、独立数值、取消、发布前回滚与发布后结算重试通过 | 23, 32 |
 | ESamp | 共享 StateExecution 和 generic backend session；独立数学、admission 回滚、取消、发布后结算、跨流 guidance readiness 与清理通过；MRv1 待完成 | 25, 30, 31, 37 |
-| TLM | 仅 loader/cold facts 与 objective kernel 基础；缺完整 online/offline graph、global LOW_RANK_ADD publication/pin | 11, 24, 33 |
+| TLM | 共享 StateExecution 的 instance A/B+AdamW 原子发布、online/offline graph 和实际 HF/PEFT CPU/CUDA 数值已补；公共 global LOW_RANK_ADD/admission pin 待完成 | 11, 24 已补；33 待补 |
 | ReFT | 旧 owner 已删，canonical owner 缺失；补 LoReFT 数学、publish/skip 和 activation patch | 26, 34 |
 | Recirculation | 旧 recurrence 岛已删，canonical owner 缺失；补 row selection、typed replay effect | 27, 35 |
 | OverRIDE | canonical owner 缺失；补 reweight/Adam/state transition/final no-op | 28 |
@@ -132,7 +136,7 @@ MRv1/旧版本结构 probe、typed replay callback 仍待接入共享边界；TL
   CUDA abort 等待已提交私有写入，无法建立完成证明时 fail-stop 保留资源，不声称可恢复。
   附件和 arena 重建共用 Rust `CanonicalPlanBundle::validate`，检查原始 layout/plan 身份与 epoch。
   已补 9/10/12；13 已迁移并通过真实跨流等待，10 含不同布局的 request/instance 原子发布。
-  仍欠 11 的 TLM 多因子数学/发布，以及 14 的跨版本 CUDA Graph page-table 间接寻址。
+  `a682264` 已补 11 的 TLM 多因子数学/发布；14 的跨版本 CUDA Graph page-table 间接寻址仍欠。
   当前 pool 地址稳定不等于 capture-stable version selection，provider 仍声明 `capture_stable=False`。
   不因通用 instance arena 测试通过就声称 TLM/global overlay 公共路径完成；旧 backend overlay
   store 已删，TLM 必须直接接此 arena，不能恢复另一份 global version store。
@@ -152,9 +156,9 @@ PTTS/AER 设计继续以 `doc/research-aer-paged-state.md` 为唯一权威。
 
 ### 5. 补齐证据、发布验证与最终压缩（A/G）
 
-- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,9,10,12,13,15,19,20,21,22,23,25,30,32,37,38,39`。
-  pending IDs 是 `4,6–8,11,14,16–18,24,26–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
-- 21 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
+- `test/evidence_manifest.toml` 的 active IDs 是 `1,2,3,5,9,10,11,12,13,15,19,20,21,22,23,24,25,30,32,37,38,39`。
+  pending IDs 是 `4,6–8,14,16–18,26–29,31,33–36,40,41`，含新增的条件 replay 组合路径。
+- 19 项随真实边界实现补成紧凑 oracle/smoke；现有基础复核是否达到命名所要求的全部
   数值/版本/cleanup contract。禁止为凑 39 写 DTO、mock 调用次数或旧内部结构测试。
 - manifest 最终逐项列出实际文件/命令、observable contract、环境、GPU/MP 要求及替代的
   旧测试来源。训练必须非零 loss/update，执行必须 zero fallback。
@@ -193,6 +197,20 @@ effect、统一有界 trace，以及独立 PyTorch oracle 和真实 Qwen2 最后
 全面性能研究和独立变体实验不纳入本次门槛。第一轮完整后仍须进行 owner 第二轮压缩。
 
 ## 验证记录与复现
+
+`a682264`：仓库 `.venv/bin/python` 跑受影响的 TLM、ESamp、In-Place 和 attachment
+五项证据，5 passed（2.95s）；TLM 含真实 HF/PEFT CPU/CUDA 与非默认 stream。
+另一次 TLM/PageBundle 定向验证 5 passed；strict/basic typing 0/0、import 0/0。
+Rust 未改，不重跑；没有跑全量 pytest、vLLM smoke、wheel 或吞吐测试。
+按用户更新后的 AGENTS.md，后续按真实行为变更选证据，不把每次删除绑定全套测试。
+
+TLM 当前只提供 standalone `compile` 返回共享 StateExecution，未接公共 make_llm。
+HF adapter 通过 functional_call 临时绑定原始因子页，冻结模型模板不更新；不另存 mutable
+LoRA 或 optimizer。当前 dropout=0，未声明的 RNG effect 不支持。下一步直接扩展现有
+parameter-overlay primitive 与签名 field binding 到 q/v LOW_RANK_ADD（含 alpha/rank），
+让 instance 的更新 pin 与 request admission 的固定 inference pin 都由同一 arena 签发。
+generic session 需按原图消费外部训练输入和 prepare/token.commit 时机，不能添 TLM 分支或
+另一套 staged/global session。完成实际 Qwen2/MRv2 公共证据 33 后才更新公共支持矩阵。
 
 `e03ea16`：仓库 `/workspace/pllm/.venv/bin/python` 在沙箱外运行完整 pytest
 12 passed（26.66s），含真实 CUDA 页借用/延迟回收和隔离 sdist→wheel；Rust 4 passed，

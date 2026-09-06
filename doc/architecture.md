@@ -56,7 +56,11 @@ hidden/sampler/overlay programs fail closed; generic integration is not yet
 composition support or public support for every workload.
 
 PageBundle/generational state is implemented, but captured page-table version
-selection and TLM/global-overlay integration remain pending. Pool address
+selection and public TLM/global-overlay integration remain pending. TLM's
+standalone training core now uses the same StateExecution and instance arena
+for q/v factors and AdamW fields, with online/offline timing in the original
+graph. The HF/PEFT adapter binds original factor views into a frozen model
+template; it does not update a second model/optimizer state. Pool address
 stability is not capture-stable version selection. Complete AER regionization,
 distributed placement, closed typed MP and workload-independent profiling also
 remain pending. Backend-local overlay version storage is deleted; global

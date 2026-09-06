@@ -18,6 +18,7 @@ See the [remaining work](doc/architecture-consolidation-handoff.md).
 | FTTT | Typed host feedback and CUDA receipt/stream boundary |
 | Dummy | CPU graph compilation and owned hidden-row export |
 | GTTA | CPU environment scores, FIFO abort/requeue and version rollback |
+| TLM training core | Shared instance-state q/v AdamW and online/offline objective; real HF/PEFT CPU/CUDA numerical oracle |
 
 The public attached vLLM path currently supports ESamp and In-Place-TTT on
 unquantized Qwen2 models, vLLM **0.27.1 MRv2**, eager execution, in process,
@@ -25,7 +26,8 @@ TP1/PP1/DP1, non-speculative decoding and sampling `n=1`.
 The standalone ESamp CUDA Graph test proves its training core; it does not
 establish model-backed vLLM CUDA Graph support.
 
-TLM has loader/objective foundations. Complete TLM, ReFT, Recirculation,
+TLM's public vLLM global overlay and admission pin remain pending; its training
+core currently requires dropout=0. Complete TLM, ReFT, Recirculation,
 OverRIDE, TTRL, MRv1 attachment, typed multiprocessing and final AER/PTTS
 integration remain unfinished. Historical results from deleted implementations
 do not establish support for the current code.

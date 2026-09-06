@@ -22,24 +22,54 @@ Verified on 2026-09-06. See the [implementation handoff](architecture-consolidat
 for outstanding architecture, functionality and evidence work. The narrative
 entries below are chronological history, not additional current checkpoints.
 
-| Fact | Value | Cumulative change from `12551b8` | Change since `ccc211e` checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `e03ea16` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `e03ea16` on `main` | — | after `ccc211e` |
-| Counted production/support source | 18,676 lines | -114,534 lines | -2,322 lines |
-| Pytest collection | 12 items | -1,337 items | unchanged |
+| Commit | `a682264` on `main` | — | after `e03ea16` |
+| Counted production/support source | 18,451 lines | -114,759 lines | -225 lines |
+| Pytest items | 14 items | -1,335 items | +2 TLM evidence items |
 | Rust tests | 4 items | -50 items | unchanged |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
-| Visible `TEST_COUNT` | 20 items | below the 50-item ceiling; not yet the final evidence set | unchanged |
+| Visible `TEST_COUNT` | 22 items | below the 50-item ceiling; not yet the final evidence set | +2 |
 
 The visible `TEST_COUNT` is not the terminal survivor suite.  It is the
 currently executable survivor base after old-stack tests were deleted:
-evidence IDs 1, 2, 3, 5, 9, 10, 12, 13, 15, 19, 20, 21, 22, 23, 25, 30, 32, 37, 38 and 39.
+evidence IDs 1, 2, 3, 5, 9, 10, 11, 12, 13, 15, 19, 20, 21, 22, 23, 24, 25, 30, 32, 37, 38 and 39.
 The agreed programmable-inference composition adds target IDs 40/41 to the
-original 39, leaving 21 pending survivor evidence items. Those items are implementation
+original 39, leaving 19 pending survivor evidence items. Those items are implementation
 debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Shared TLM instance training after `e03ea16`
+
+Commit `a682264`: counted source `+365 / -590 / net -225`, including the
+entire 203-line TLM workload. No complete files moved unchanged. The existing
+TLM objective and AdamW kernels are reused. One StateExecution and PageBundle
+arena now own request and instance lifecycles. TLM borrows q/v factors from
+the original pin and publishes parameter/gradient/step/moments atomically.
+Its declaration also implements its math input/output boundary, without a
+second math wrapper or workload session. In-Place shares the publication task.
+
+The HF/PEFT adapter supplies frozen topology and initialization templates;
+functional_call temporarily binds original arena leaf views and never updates
+another optimizer or version store. Replaced the obsolete cold-facts-only
+loader and duplicate target-shape DTO. Deleted both repeated plan compiler
+chains and 163 lines of dead request-state slot/selection/receipt contracts.
+
+Evidence 11 compares all four factor groups and AdamW fields against independent
+PyTorch updates, including failed publication and exact old pins. Evidence 24
+checks signed online/offline timing and actual tiny Qwen2/PEFT on CPU and CUDA,
+including nondefault CUDA streams and an unchanged model template.
+Repository-venv affected tests: 5 passed in 2.95s; TLM/PageBundle focused run:
+5 passed. Strict/basic typing 0/0 and import gates 0/0. No full pytest, Rust,
+vLLM smoke, wheel or benchmark rerun for this tranche. Updated AGENTS.md removes
+the blanket testing obligations; verification follows changed boundaries.
+
+Public TLM/global LOW_RANK_ADD, request admission pins and training-input
+integration remain pending. Dropout is currently rejected unless zero because
+RNG effects are not yet represented. These are not certified by training-core
+oracles; evidence 33 and the original wider plan remain outstanding.
 
 ### Generic backend and original page borrowing after `ccc211e`
 
@@ -643,6 +673,7 @@ but missing workloads, MRv1, AER/PTTS, closed MP and evidence remain open.
 | F — AER/PTTS final core | 1,011 | 4,561 | 0 complete files | -3,550 | active: shared PageBundle replacement; AER, MP, TLM and captured version selection remain pending |
 | B/D — shared state execution continuation | 572 | 1,363 | 0 complete files | -791 | ESamp/In-Place lifecycle and original operand boundary shared; factory/deployment branches remain |
 | B/D/F — generic backend and page borrowing | 645 | 2,967 | 0 complete files | -2,322 | workload branches, overlay DTO copies and old backend version store deleted; TLM/global still pending |
+| B/C/F — TLM shared instance training | 365 | 590 | 0 complete files | -225 | TLM numerical graph and original factor publication implemented; duplicated compilers and dead state contracts deleted; public global overlay still pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
 Update this table from tracked physical line counts at each tranche boundary.
@@ -674,7 +705,7 @@ Moves are recorded separately and never counted as deletion.
 | FTTT | edit math, judge, feedback retry | legacy owner removed; shared host transaction and receipt | 21, 38 active |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
 | In-Place-TTT | dense fast-weight math and layout | shares StateExecution, generic backend, original operands and borrowed pages | 23, 32 active |
-| TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
+| TLM | loader, objective, q/v LoRA math | shared instance PTTS, actual HF/PEFT and online/offline graph implemented; public global overlay pending | 11, 24 active; 33 pending |
 | ESamp | request math, sampler guidance, random init | shares StateExecution, generic backend and issued guidance readiness; MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
 | Recirculation | row selection and replay math | typed replay effect | 27, 35 |
