@@ -1,6 +1,6 @@
 # 架构精简交接：剩余实施工作
 
-核查日期：2026-09-06。代码检查点：`ccc211e`，分支 `main`。
+核查日期：2026-09-06。代码检查点：`e03ea16`，分支 `main`。
 工作目录：`/workspace/pllm`。
 本文补充[原计划](architecture-consolidation-10k-plan.md)，不修改原计划的历史基线、
 功能要求或验收标准；逐提交减量见 [ledger](architecture-consolidation-ledger.md)。
@@ -13,12 +13,12 @@
 
 | 当前事实 | 核查结果 |
 | --- | --- |
-| SOURCE_LOC | 20,998；相对 133,210 净减 112,212（约 84.2%）；低于预测区间不代表功能补齐 |
-| 距第一轮 30k 上限 | 当前余量 9,002 行；补齐缺失能力仍须与新栈压缩配套，不为凑下限增加代码 |
-| 本轮源码差分 | 相对 `519d4ed` 新增 572 / 删除 1,363 / 净减 791；包含新增共享 StateExecution 的全部 323 行；没有整文件原样移动；独立 AdamW/fast-weight 数学不变 |
+| SOURCE_LOC | 18,676；相对 133,210 净减 114,534（约 86.0%）；低于预测区间不代表功能补齐 |
+| 距第一轮 30k 上限 | 当前余量 11,324 行；补齐缺失能力仍须与新栈压缩配套，不为凑下限增加代码 |
+| 本轮源码差分 | 相对 `ccc211e` 新增 645 / 删除 2,967 / 净减 2,322；包含新 backend_program 全部 87 行；没有整文件原样移动；独立 AdamW/fast-weight 数学不变 |
 | 已删除旧包 | consumers、kit、program、workgraph、schedule、workload、producers、canonical_runtime、runtime、ports、common、core、util |
 | 已删除 Rust 旧 authority | workgraph、schedule、recurrence、execution_plan、placement，以及失去调用者的 shape_specialization/decode_localization/sampler_plan |
-| 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend primitives、overlay_state 和 typed_replay 旧契约 |
+| 尚存主要合并对象 | canonical 编排、canonical_vllm 与 backend probe/replay primitives、typed_replay 旧契约；overlay_state 已删 |
 | 留存证据基础 | 4 个 Rust tests + 12 个 pytest items + 4 个独立 GPU smoke，共 20 项 |
 | 终态证据债务 | 原 39 项中 19 项待补，加新增组合 40/41，共 21 项待补 |
 
@@ -27,11 +27,11 @@ SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除
 
 | 范围 | 行数 |
 | --- | ---: |
-| tllm/canonical | 8,469 |
-| tllm/backends + canonical_vllm | 3,360 + 2,596 |
-| tllm/contracts | 2,122 |
-| Rust | 3,363 |
-| tools / 顶层入口及 stub | 859 / 229 |
+| tllm/canonical | 8,523 |
+| tllm/backends + canonical_vllm | 1,633 + 1,916 |
+| tllm/contracts | 2,053 |
+| Rust | 3,434 |
+| tools / 顶层入口及 stub | 861 / 256 |
 
 ## 下一轮实施顺序与完成条件
 
@@ -41,11 +41,12 @@ SOURCE_LOC 包含 Rust 文件内测试行，减量不全等于生产行为删除
 导出 bootstrap 或注入 worker extension。旧 runtime、MP、ports、common、旧 driver 安装器
 与失效测试/gate 引用同批删除。实际 wheel 已验证不含退役包和 general plugin。
 
-后续不再重复审计这些已删除目录。保留到 backend 的三份文件是 `graph_mode.py` 79 行、
+后续不再重复审计这些已删除目录。当时保留到 backend 的三份文件是 `graph_mode.py` 79 行、
 `overlay_state.py` 486 行、`specialization.py` 52 行，合计 617 行原样移动，不计净删。
-其中 overlay state/version store 和 typed replay callback 仍是待统一对象，不能因搬到
-backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe、replay/overlay primitives
-留待下一项接入统一 typed seam；旧 driver 删除不代表新 MRv1 支持已完成。
+`e03ea16` 已删除 overlay_state、versioned_parameter_overlay、dense_parameter_overlay
+三个无公共调用者的文件（1,556 行），以及旧 protocol 中的 store/handle/lease 能力声明。
+旧 tensor CPU materialization、backend version cache 和 latest/lease 账本没有迁入新模块。
+MRv1/旧版本结构 probe、typed replay callback 仍待接入共享边界；TLM/global 公共路径仍欠。
 
 ### 2. 完成 generic execution 与 backend 的实质合并（B/D）
 
@@ -63,7 +64,7 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   In-Place 直接消费原始 CapturedParameterOperand，删除 OperandPair→StepInput→Batch→CUDA
   wrapper 转换链、重复 phase 和 ParameterOverlayPublication；发布凭据只由 arena 签发。
   backend 删除 predicted/sampled/prepared/transitioned 镜像阶段，以原始游标和 sampler 状态推进；
-  两个 typed active/deployment 分支仍存在，不能宣称 generic factory/session 已完成。
+  `e03ea16` 进一步删除两个 typed active/deployment 分支，backend runtime 不再 import workload。
   ESamp readiness 改为预测结果产生后签发，只由共享 context 持有；延迟写入反例已先失败后通过。
 - SemanticGraph/plan 的 17 个 Python 重复校验已删除；Rust 保持唯一语义校验，FFI codec
   保留封闭类型解析。没有为 AER/MP/replay 新建各自的图或状态 DTO 家族。
@@ -73,12 +74,17 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 - 附件输入收敛为原始 `request/probe/plan` 引用，plan 持有原始 tensor-layout request/decision；
   request 不再复制 probe facts、plan signatures 或 request-key schema。sampler 独立附件模块和
   wire DTO 删除，FFI 机械编码同一结构；Rust 校验 layout 身份、字段存在性和阶段/任务绑定。
-  deployment 只保留 compilation 和 signed attachment；execution、hidden/target facts、dtype、
-  sampler beta 和参数 digest 不再额外复制。附件相关 Python 重复校验删除，由 Rust 边界负责。
-  第 15 项已补统一证据；这不代表 factory/session 已通用化。
-- `canonical_vllm/runtime.py` 仍有 1,237 行，直接 import ESamp/In-Place-TTT，
-  deployment/execution 类型为两者 union，公共 factory 仅接受这两种 workload。
-  `canonical_runtime` 目录虽然已删，workload-specific 编排职责仍有残留。
+  `e03ea16` 的 deployment 仅引用原始 StateExecution 和 signed attachment；不复制 compilation
+  或 overlay mapping。schema 3 签入原始 ParameterOverlayFieldBinding 的 target/operator/fields，
+  修复同 field ID 更换层后签名不变的问题。Rust 拒绝当前尚不支持的 hidden/sampler/overlay 组合。
+- 公共 factory 消费 BackendWorkload；共享 BackendCompileFacts、TensorStepInput 和同一 timeline，
+  runtime 793 行且不再 import ESamp/In-Place。hidden capture 统一按原始签名 resource 捕获；
+  sampler beta 属于原始 guidance。新 workload 仍需实现真正的数学/声明；这不是十项公共支持完成。
+- dense backend 直接消费原始 packed rows、StateTaskContext、PagePin 和签名 field binding，
+  删除 ParameterOverlayPinnedTensor/RowAssignment/StepPlan 及 field_rows 重新打包链。
+  In-Place 数学也借用原页，不再先 snapshot 全根。borrow_field 是原 pin 生命周期内的只读借用；
+  tensor 不提供硬件只读保护，native consumer 不得原地修改或在 release 后持有别名。
+  CPU/CUDA 证据覆盖 COW 页共享、旧版本不变、伪造/释放 pin 拒绝和延迟读取后回收。
 - 把 workload 编排收进同一 typed executor/host transaction；CPU/CUDA 共享 transition，
   provider 只承载 kernel。压缩 FTTT/GTTA、ESamp、In-Place 的剩余 execution/task 链。
 - 合并 `backends` 与 `canonical_vllm` 的 probe、capture、sampler、overlay mechanics，
@@ -96,8 +102,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
 | Dummy | graph→sign→plan→execute、stride 与 owned export oracle 已补；统一 factory 尚待 B | 20 |
 | FTTT | 已切共享 host execution；独立 Adam/edit、回滚、retry/stop/accept oracle 与 CUDA receipt 通过 | 21, 38 |
 | GTTA | canonical host 路径的精确 EMA、FIFO abort/requeue、版本回滚 oracle 已补；统一 factory 待 B | 22 |
-| In-Place-TTT | 与 ESamp 共享 StateExecution；直接消费捕获记录，独立数值、取消、发布前回滚与发布后结算重试通过；generic factory/backend session 待 B | 23, 32 |
-| ESamp | 与 In-Place 共享 StateExecution；独立数学、admission 回滚、取消、发布后结算、跨流 guidance readiness 与清理通过；generic factory/backend session、MRv1 仍待完成 | 25, 30, 31, 37 |
+| In-Place-TTT | 共享 StateExecution 和 generic backend session；原始捕获记录及页借用、独立数值、取消、发布前回滚与发布后结算重试通过 | 23, 32 |
+| ESamp | 共享 StateExecution 和 generic backend session；独立数学、admission 回滚、取消、发布后结算、跨流 guidance readiness 与清理通过；MRv1 待完成 | 25, 30, 31, 37 |
 | TLM | 仅 loader/cold facts 与 objective kernel 基础；缺完整 online/offline graph、global LOW_RANK_ADD publication/pin | 11, 24, 33 |
 | ReFT | 旧 owner 已删，canonical owner 缺失；补 LoReFT 数学、publish/skip 和 activation patch | 26, 34 |
 | Recirculation | 旧 recurrence 岛已删，canonical owner 缺失；补 row selection、typed replay effect | 27, 35 |
@@ -129,7 +135,8 @@ backend 就宣称唯一版本 authority 已达标。MRv1/旧版本结构 probe�
   仍欠 11 的 TLM 多因子数学/发布，以及 14 的跨版本 CUDA Graph page-table 间接寻址。
   当前 pool 地址稳定不等于 capture-stable version selection，provider 仍声明 `capture_stable=False`。
   不因通用 instance arena 测试通过就声称 TLM/global overlay 公共路径完成；旧 backend overlay
-  store 仍须删除，closed MP、其余布局泛化、容量指标与 AER 资源联合规划继续共用此边界。
+  store 已删，TLM 必须直接接此 arena，不能恢复另一份 global version store。
+  closed MP、其余布局泛化、容量指标与 AER 资源联合规划继续共用此边界。
 - 旧 `runtime/mp/port_wire.py` 的反射 transport 已删除；closed typed MP 尚未实现。
   旧 workload RPC 被删除不等于新的 worker reconstruction、prepare/commit/abort、quorum
   已实现；补共享 tensor 生命周期和真实 EngineCore child 路径，对应 16–18、36。
@@ -186,6 +193,18 @@ effect、统一有界 trace，以及独立 PyTorch oracle 和真实 Qwen2 最后
 全面性能研究和独立变体实验不纳入本次门槛。第一轮完整后仍须进行 owner 第二轮压缩。
 
 ## 验证记录与复现
+
+`e03ea16`：仓库 `/workspace/pllm/.venv/bin/python` 在沙箱外运行完整 pytest
+12 passed（26.66s），含真实 CUDA 页借用/延迟回收和隔离 sdist→wheel；Rust 4 passed，
+strict/basic typing 0/0、import 0/0、authority 扫描 7 个生产文件通过。
+页借用最终版本的公共 In-Place GPU smoke：update/trained_rows 6、apply_rows 8、
+updated_rows 2、active_lineages/pending_releases/fallback 0。本批较早的 generic session/schema 3
+版本已通过四个 GPU smoke：ESamp loss/update 2、In-Place 6、CUDA Graph 4 且地址稳定、
+FTTT 1 且 version 1；最终 dense-only 借用和死代码删除后未重跑其余三个 smoke。
+target 签名和未支持 hidden/overlay 组合的反例先失败后通过；页借用 oracle 从缺失接口
+失败后通过 COW、原地址和 issued pin 生命周期检查。未运行吞吐 benchmark、未发布。
+下一项应补 TLM online/offline/global LOW_RANK_ADD 和原 arena admission pin，而非重做
+已完成的 generic backend；AER、MP、条件 replay 和其余 workload 仍为明确功能债务。
 
 `ccc211e`：仓库 `/workspace/pllm/.venv/bin/python` 在沙箱外运行完整 pytest
 12 passed（22.16s），含 CUDA PTTS 和隔离 sdist→wheel；Rust 4 passed，strict/basic typing

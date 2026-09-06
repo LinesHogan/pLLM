@@ -3,9 +3,10 @@
 ## 文档地位
 
 2026-09-06 实施交接见[剩余工作清单](architecture-consolidation-handoff.md)：
-代码检查点 `ccc211e`，SOURCE_LOC 20,998，终态 41 项证据尚欠 21 项。
+代码检查点 `e03ea16`，SOURCE_LOC 18,676，终态 41 项证据尚欠 21 项。
 PageBundle 已替换 13 个旧 PTTS 模块；ESamp/In-Place 共享同一 StateExecution 和原始
-plan/pin/publication，In-Place 捕获记录不再转换为 workload DTO 链。generic factory、TLM/global overlay、
+plan/pin/publication，generic backend factory/session 已移除 workload 分支；dense backend 直接
+借用原 pin 下的页，旧 backend overlay store 已删。TLM/global overlay、
 跨版本 CUDA Graph 间接寻址、AER 和 closed MP 等仍待完成，不能以行数下降宣称终态完成。
 旧 runtime/ports/common 和公共 hook/plugin 入口已删除；行数达标不代表功能验收完成。
 历史 worktree 已从 30 个降至 1 个，代码已合入主目录 `main`；过时文档与重复打包配置已清理，sdist→wheel 隔离验证通过。

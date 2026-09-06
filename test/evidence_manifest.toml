@@ -70,7 +70,7 @@ group = "ptts"
 path = "test/boundary/test_page_bundle.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_page_bundle.py::test_cpu_request_ptts_admit_cow_publish_pin_retire"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "Admission with signed field alignment, partial-field COW with unchanged slot sharing, exact old/new version values, one-lineage updates without cross-request mutation, retire retains old pins and then reclaims all capacity"
+observable_contract = "Admission with signed field alignment, partial-field COW and original page-address sharing, exact borrowed old/new values, forged/wrong-version/released pins cannot borrow; one-lineage updates without cross-request mutation, retire retains old pins and then reclaims all capacity"
 replaces = "Legacy dense producer, request-slot and separate logical/physical publication lifecycle tests"
 
 [[evidence]]
@@ -106,7 +106,7 @@ requires_gpu = true
 path = "test/gpu/test_page_bundle_cuda.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/gpu/test_page_bundle_cuda.py"
 environment = "Repository venv with torch and rebuilt Rust extension; CUDA GPU"
-observable_contract = "Actual CUDA two-root AdamW COW, immutable old values, a delayed original consumer stream blocks reclaim until its issued event completes; no reads after release; forged receipts rejected; full reclaim and stable pool addresses"
+observable_contract = "Actual CUDA two-root AdamW COW, immutable old values; delayed reading of an original borrowed page blocks reclaim until its pin stream event completes; no reads after release; forged receipts rejected; full reclaim and stable pool addresses"
 replaces = "test/gpu/test_canonical_cuda_dense_page_smoke.py; no separate CPU/CUDA state owners"
 
 [[evidence]]
@@ -122,7 +122,7 @@ group = "boundary"
 path = "test/boundary/test_backend_attachment.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_backend_attachment.py"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "Real ESamp and In-Place compilations share original plan/probe facts; exact signed tasks, hidden bindings, overlay field membership and stage ordering; mismatched signed layout rejected; mechanical physical projection and reconstruction reject local drift; missing/unknown/duplicate fields and retired flattened wire rejected. In-layout field roles remain workload bindings, not a new generic semantic selector"
+observable_contract = "Real ESamp and In-Place compile_backend share original plan/probe facts and timeline; schema 3 signs original overlay target/operator/fields and rejects tampering, unsupported compositions and operators; exact tasks, hidden bindings, field membership and stage ordering; mismatched layout and reconstruction drift rejected; missing/unknown/duplicate fields and retired flattened wire rejected. In-layout mathematical field roles remain workload bindings"
 replaces = "test_canonical_backend_attachment_unit.py and test_parameter_overlay_attachment_unit.py; one shared native boundary proof without per-attachment DTO fixture families"
 
 [[evidence]]

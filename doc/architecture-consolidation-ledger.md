@@ -22,10 +22,10 @@ Verified on 2026-09-06. See the [implementation handoff](architecture-consolidat
 for outstanding architecture, functionality and evidence work. The narrative
 entries below are chronological history, not additional current checkpoints.
 
-| Fact | Value | Cumulative change from `12551b8` | Change since `519d4ed` checkpoint |
+| Fact | Value | Cumulative change from `12551b8` | Change since `ccc211e` checkpoint |
 | --- | ---: | ---: | ---: |
-| Commit | `ccc211e` on `main` | — | after `519d4ed` |
-| Counted production/support source | 20,998 lines | -112,212 lines | -791 lines |
+| Commit | `e03ea16` on `main` | — | after `ccc211e` |
+| Counted production/support source | 18,676 lines | -114,534 lines | -2,322 lines |
 | Pytest collection | 12 items | -1,337 items | unchanged |
 | Rust tests | 4 items | -50 items | unchanged |
 | Standalone correctness smokes | 4 items | baseline not fully enumerated | old non-survivor smokes deleted |
@@ -40,6 +40,38 @@ debt tied to their cutover tranche; they must become compact observable
 oracles or public runtime smokes before the corresponding canonical boundary
 is claimed complete, and must not be recreated as legacy wrapper,
 class-hierarchy, registry or mock-call-count tests.
+
+### Generic backend and original page borrowing after `ccc211e`
+
+Commit `e03ea16`: counted source `+645 / -2,967 / net -2,322`, including
+all 87 lines of backend_program. No complete files moved unchanged; tensor
+math kernels unchanged. One BackendWorkload, BackendCompileFacts and
+TensorStepInput boundary replaces workload-specific deployment/session branches.
+The runtime no longer imports workloads. It retains the original execution,
+plan, packed rows, signed field bindings and issued receipts, not mirror owners.
+Attachment schema 3 signs the actual target/operator/fields together; changing
+a target while retaining field IDs now changes the signature. Unsupported
+hidden/sampler/overlay compositions fail closed, not silently unused.
+
+Deleted the unreachable overlay_state, versioned_parameter_overlay and
+dense_parameter_overlay modules (1,556 lines), plus old protocol store and
+lease contracts. No CPU materialization/version-cache substitute was added.
+Dense application consumes original page aliases under the invocation pin;
+ParameterOverlayPinnedTensor/RowAssignment/StepPlan and their packing chain
+are deleted. In-Place math also borrows source pages instead of snapshotting
+the whole root. Native borrowers must not mutate or retain aliases past release.
+
+Repository-venv pytest: 12 passed in 26.66s, including real CUDA borrowed-page
+completion and sdist-to-wheel isolation. Rust: 4 passed. Strict/basic typing
+0/0, import layers 0/0, authority gate passed over 7 production files.
+Public In-Place GPU smoke after page borrowing: 6 updates/trained rows,
+8 applied rows, 2 updated-version rows, no live lineage or fallback.
+Earlier in this same source tranche all four GPU smokes passed: public ESamp
+loss/update 2; In-Place 6; CUDA Graph loss/update 4 with stable addresses;
+FTTT loss/update 1 and version 1. The latter three were not rerun after the
+final dense-only borrowing/dead-overlay deletion. No throughput benchmark or
+publication. TLM/global, AER, MP and conditional replay remain functional debt;
+the 20 active / 21 pending evidence count is unchanged.
 
 ### Shared state execution after `519d4ed`
 
@@ -610,6 +642,7 @@ but missing workloads, MRv1, AER/PTTS, closed MP and evidence remain open.
 | D/E — residual retirement continuation | 111 | 21,856 | 617 | -21,745 | old packages and public hook/plugin path deleted; retained backend state/effects still require canonical consolidation |
 | F — AER/PTTS final core | 1,011 | 4,561 | 0 complete files | -3,550 | active: shared PageBundle replacement; AER, MP, TLM and captured version selection remain pending |
 | B/D — shared state execution continuation | 572 | 1,363 | 0 complete files | -791 | ESamp/In-Place lifecycle and original operand boundary shared; factory/deployment branches remain |
+| B/D/F — generic backend and page borrowing | 645 | 2,967 | 0 complete files | -2,322 | workload branches, overlay DTO copies and old backend version store deleted; TLM/global still pending |
 | G — reachability and final compression | — | — | — | — | pending |
 
 Update this table from tracked physical line counts at each tranche boundary.
@@ -620,7 +653,7 @@ Moves are recorded separately and never counted as deletion.
 | Current owner | Disposition | Unique content that survives | Final owner |
 | --- | --- | --- | --- |
 | `tllm/canonical`, `tllm/contracts` | keep and compress | semantic descriptors, tensor math, FFI DTOs | canonical graph/execution core |
-| `tllm/canonical_runtime` | directory deleted; B remains incomplete | workload-specific branching still exists in canonical_vllm/runtime.py | generic executor/backend seam |
+| `tllm/canonical_runtime` | directory deleted; generic backend branches also replaced | original execution/plan and signed attachment | generic executor/backend seam |
 | `tllm/canonical_vllm` | merge in D | vLLM probes and physical adapter mechanics | `tllm/backends/vllm` |
 | `tllm/runtime` | deleted in current worktree | 617 lines of backend helper content moved; closed MP remains missing | backend primitives, then canonical state/effect consolidation |
 | `tllm/workgraph` | deleted in `3da233b`; temporary recurrence owner subsequently deleted in `07a64d8` | row-selection/replay semantics still to implement | canonical typed replay effect |
@@ -631,6 +664,7 @@ Moves are recorded separately and never counted as deletion.
 | `tllm/ports`, `tllm/common`, `tllm/core`, `tllm/util` | deleted in current worktree | plain engine construction moved into public factory; obsolete helpers removed | canonical contracts and direct public factory |
 | Rust non-canonical graph/schedule | old graph/schedule/recurrence/placement/execution_plan and shape/decode/sampler removed | prefill row planning and batch-phase classification still consumed by adapters | unique backend fact helpers |
 | provisional `canonical/ptts/dense_page*` | deleted in `e996998` | one CPU/CUDA lifecycle and independent AdamW math | shared PageBundleArena; TLM/captured indirection still pending |
+| backend `overlay_state` / `versioned_parameter_overlay` / `dense_parameter_overlay` | deleted in `e03ea16` | dense application borrows original PTTS pages; global LoRA remains pending | same PageBundleArena and thin signed backend primitive |
 
 ## Workload cutover manifest
 
@@ -639,9 +673,9 @@ Moves are recorded separately and never counted as deletion.
 | Dummy | minimum graph/sign/plan/execute declaration | workload compile/owned export oracle restored; generic public factory pending | 20 active |
 | FTTT | edit math, judge, feedback retry | legacy owner removed; shared host transaction and receipt | 21, 38 active |
 | GTTA | environment state/update/query/FIFO | generic host transaction | 22 |
-| In-Place-TTT | dense fast-weight math and layout | shares StateExecution and original captured operands; generic backend factory/session pending | 23, 32 active |
+| In-Place-TTT | dense fast-weight math and layout | shares StateExecution, generic backend, original operands and borrowed pages | 23, 32 active |
 | TLM | loader, objective, q/v LoRA math | global PTTS and online/offline timing | 24, 33 |
-| ESamp | request math, sampler guidance, random init | shares StateExecution and issued guidance readiness; generic backend factory/session and MRv1 pending | 25, 30, 37 active; 31 pending |
+| ESamp | request math, sampler guidance, random init | shares StateExecution, generic backend and issued guidance readiness; MRv1 pending | 25, 30, 37 active; 31 pending |
 | ReFT | loader and LoReFT activation math | signed activation-patch attachment | 26, 34 |
 | Recirculation | row selection and replay math | typed replay effect | 27, 35 |
 | OverRIDE | reweight and Adam math | generic sampler/state transition | 28 |
