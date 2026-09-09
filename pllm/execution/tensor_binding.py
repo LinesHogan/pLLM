@@ -487,10 +487,22 @@ class TensorBinding(Builder[TensorFrame]):
                 if not isinstance(batch, WeightedCEBatch):
                     raise TypeError("weighted training requires its declared weighted-CE input")
                 shared = view.selection.keys == (None,)
-                if shared and batch.keys or not shared and (not batch.keys or len(set(batch.keys)) != len(batch.keys)
-                    or any(key not in view.selection.keys for key in batch.keys)):
+                if shared and batch.keys:
                     raise ValueError("weighted CE keys require distinct co-resident original request states")
-                selected = (0,) if shared else tuple(view.selection.keys.index(key) for key in batch.keys)
+                selected = (0,)
+                if not shared:
+                    if (not batch.keys or len(set(batch.keys)) != len(batch.keys)
+                        or len({key.fields for key in batch.keys}) != 1):
+                        raise ValueError("weighted CE keys require distinct co-resident original request states")
+                    batch_fields = batch.keys[0].fields
+                    # Batch keys name rows under their own projection, independent of
+                    # how the state is keyed (request, prompt/sample, route, ...).
+                    row_states: dict[RequestStateKey, int] = {}
+                    for row, index in zip(view.selection.rows, view.selection.state_indices, strict=True):
+                        row_states.setdefault(RequestStateKey.project(row.identity, batch_fields), index)
+                    selected = tuple(row_states[key] for key in batch.keys if key in row_states)
+                    if len(selected) != len(batch.keys) or len(set(selected)) != len(selected):
+                        raise ValueError("weighted CE keys require distinct co-resident original request states")
                 tensors = (batch.hidden, batch.base_logits, batch.labels, batch.weights)
                 hidden, logits, labels, weights = (tensor.detach().unsqueeze(0) if shared else tensor.detach() for tensor in tensors)
                 root = view.roots[selected[0]]
@@ -852,9 +864,18 @@ class TensorBinding(Builder[TensorFrame]):
                         or any(tensor.ndim < 1 or tensor.shape[0] != len(update.keys) for tensor in update.values)):
                         raise ValueError("request replacement requires distinct original prompt keys and aligned field rows")
                     indices = {key: index for index, key in enumerate(update.keys)}
-                    selected = {index: indices[key] for row, index in zip(selection.rows, selection.state_indices, strict=True)
-                        if (key := RequestStateKey.project(row.identity, (RequestKeyField.PROMPT_IDX,))) in indices
-                        and selection.refs[index].version_id == 0}
+                    selected: dict[int, int] = {}
+                    for row, index in zip(selection.rows, selection.state_indices, strict=True):
+                        if (key := RequestStateKey.project(row.identity, (RequestKeyField.PROMPT_IDX,))) in indices:
+                            if selection.refs[index].version_id != 0:
+                                continue
+                            # Several packed rows of one request share its state; two
+                            # different import values for one root would be ambiguous.
+                            if index in selected:
+                                if selected[index] != indices[key]:
+                                    raise ValueError("one import batch cannot replace a shared request state with two values")
+                                continue
+                            selected[index] = indices[key]
                     data.replacements = tuple((index, tuple(tensor[row] for tensor in update.values)) for index, row in sorted(selected.items()))
                 for index, values in data.replacements:
                     root = batch.roots[index]

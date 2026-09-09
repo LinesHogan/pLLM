@@ -13,6 +13,7 @@ class RequestKeyField(StrEnum):
     REQUEST_ID = "request_id"
     PROMPT_IDX = "prompt_idx"
     SAMPLE_IDX = "sample_idx"
+    ROUTE = "route"
 
 
 def canonical_request_key_fields(
@@ -26,6 +27,7 @@ def canonical_request_key_fields(
             RequestKeyField.REQUEST_ID,
             RequestKeyField.PROMPT_IDX,
             RequestKeyField.SAMPLE_IDX,
+            RequestKeyField.ROUTE,
         )
         if field in fields
     )
@@ -39,3 +41,6 @@ class RequestIdentity:
     request_id: str
     prompt_idx: int
     sample_idx: int
+    # User-computed routing value (regex, discriminator, tenant id); the framework
+    # signs the key declaration and never interprets the value.
+    route: str = ""

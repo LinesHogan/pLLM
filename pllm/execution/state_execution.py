@@ -18,7 +18,6 @@ from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, StateScope, SamplerFeedbackInputSource, TaskSymbol
 from pllm.contracts.state_ref import StateRef
@@ -194,16 +193,23 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 return refs
             batch = self.directory.prepare_admission(identities, stream)
             try:
-                with nullcontext() if stream is None else torch.cuda.stream(stream):
-                    self.math.initialize(self.arena.writable_roots(batch.write))
+                if batch.write is not None:
+                    with nullcontext() if stream is None else torch.cuda.stream(stream):
+                        self.math.initialize(self.arena.writable_roots(batch.write))
                 receipt = self.directory.commit_admission(batch)
             except Exception:
                 self.directory.abort_admission(batch)
                 raise
-            self.arena.settle(receipt)
-            self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=receipt.after_refs,
-                operation_id=receipt.operation_id)
-            return receipt.after_refs
+            if receipt is not None:
+                self.arena.settle(receipt)
+            # One visible ref per unique admitted key, whether created or joined.
+            refs = self.directory.latest_refs(identities)
+            if receipt is None:
+                self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
+            else:
+                self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs,
+                    operation_id=receipt.operation_id)
+            return refs
 
     def begin(self, rows: tuple[PackedPhaseRow, ...],
               stream: torch.cuda.Stream | None = None) -> TaskGraphInvocation[StateTaskContext[DataT]]:
@@ -404,14 +410,30 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 return refs
             if self.directory.inference_pin_count:
                 raise RuntimeError("instance retirement requires all inference requests to finish")
-            keys = ({None} if self.directory.scope is StateScope.INSTANCE else
-                {RequestStateKey.project(identity, self.directory.state.key_fields) for identity in identities})
-            for invocation in tuple(self._active.values()):
-                if keys.intersection(invocation.context.selection.keys):
-                    self.cancel_step(invocation)
+            if self.directory.scope is StateScope.INSTANCE:
+                for invocation in tuple(self._active.values()):
+                    if None in invocation.context.selection.keys:
+                        self.cancel_step(invocation)
+            else:
+                retiring = set(identities)
+                # Only the retiring requests' own steps cancel; requests sharing a
+                # route lineage keep running, and the lineage outlives the last
+                # holder until dormant retirement.
+                for invocation in tuple(self._active.values()):
+                    if any(row.identity in retiring for row in invocation.context.selection.rows):
+                        self.cancel_step(invocation)
             self.arena.collect_completed(wait=True)
             refs = self.directory.retire(identities)
             self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
+            return refs
+
+    def retire_dormant(self) -> tuple[StateRef, ...]:
+        with self._lock:
+            if self._active:
+                raise RuntimeError("dormant retirement requires no active invocation")
+            self.arena.collect_completed(wait=True)
+            refs = self.directory.retire_dormant()
+            self.trace.record(TracePhase.RETIRE, 0, identities=(), refs=refs)
             return refs
 
     def snapshot(self, ref: StateRef, stream: torch.cuda.Stream | None = None) -> tuple[torch.Tensor, ...]:

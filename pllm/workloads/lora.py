@@ -14,7 +14,7 @@ from pllm.config import ExecutionOptions
 from pllm.kernels.paged_linear import PagedRows, TensorRows, paged_workspace
 from pllm.execution.ptts.page_bundle import KernelCapture, PagedKernel
 from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorOutput, Tensors, select_rows, weighted_training_output
-from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.semantic_graph import ImplementationId, SchedulerTimeline, StateScope, TaskImplementationSpec, TaskSymbol, TaskResourceFact, ValueResourceFact
 from pllm.contracts.tensor_layout import LayoutFieldId
 
@@ -38,6 +38,7 @@ class OutputLoRAConfig:
     steps: int = 1
     seed: int = 0
     scope: StateScope = StateScope.INSTANCE
+    key_fields: tuple[RequestKeyField, ...] = (RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX)
     paged: bool = False
 
     def __post_init__(self) -> None:
@@ -46,6 +47,8 @@ class OutputLoRAConfig:
             raise ValueError("output LoRA requires positive rank/steps/scale/rate and a nonnegative seed")
         if self.scope not in (StateScope.INSTANCE, StateScope.REQUEST):
             raise ValueError("output LoRA supports instance or independent request state")
+        if self.scope is StateScope.REQUEST:
+            canonical_request_key_fields(self.key_fields)
 
 
 def _resources(config: OutputLoRAConfig, facts: a.BackendCompileFacts, count: int, rows: int,
@@ -93,7 +96,7 @@ class OutputLoRAWorkload(pllm.Workload):
             "a": lambda m: (m.hidden_size, rank), "b": lambda m: (rank, m.vocab_size)}
         if self.config.scope is StateScope.REQUEST:
             return pllm.RequestState(fields, optimizer=pllm.SGD(self.config.learning_rate), initialize=initialize, namespace="canonical.output_lora@1",
-                keys=(RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX))
+                keys=self.config.key_fields)
         return pllm.InstanceState(fields, optimizer=pllm.SGD(self.config.learning_rate), initialize=initialize, namespace="canonical.output_lora@1")
 
     def reset(self, parameters: Tensors, generator: torch.Generator) -> None:

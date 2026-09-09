@@ -19,6 +19,7 @@ class RequestStateKey:
     request_id: str
     prompt_idx: int
     sample_idx: int
+    route: str = ""
 
     @classmethod
     def project(
@@ -33,6 +34,8 @@ class RequestStateKey:
             raise ValueError("prompt_idx state key requires resolved prompt metadata")
         if RequestKeyField.SAMPLE_IDX in fields and identity.sample_idx < 0:
             raise ValueError("sample_idx state key requires resolved sample metadata")
+        if RequestKeyField.ROUTE in fields and not identity.route:
+            raise ValueError("route state key requires a user-computed route value")
         return cls(
             fields=fields,
             request_id=(
@@ -49,5 +52,10 @@ class RequestStateKey:
                 identity.sample_idx
                 if RequestKeyField.SAMPLE_IDX in fields
                 else -1
+            ),
+            route=(
+                identity.route
+                if RequestKeyField.ROUTE in fields
+                else ""
             ),
         )

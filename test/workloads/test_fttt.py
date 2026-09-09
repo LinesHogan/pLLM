@@ -140,7 +140,8 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             self.votes = votes
 
         def generate(self, prompts, sampling_params, *, use_tqdm, feedback_group, prompt_indices, sample_index, auxiliary=None,
-                     completion_device=None):
+                     completion_device=None, routes=None):
+            assert routes is None
             self.calls.append(prompt_indices)
             entries = tuple(Completion(RequestIdentity(f"request-{sample_index}-{row}", index, sample_index),
                 0, feedback_group, (1,), (r"\boxed{1}" if row < 2 else r"\boxed{2}") if self.votes

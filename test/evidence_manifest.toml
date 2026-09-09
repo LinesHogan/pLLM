@@ -340,7 +340,7 @@ requires_gpu = true
 path = "test/gpu/vllm_inplace_ttt_smoke.py"
 command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_inplace_ttt_smoke.py"
 environment = "Repository .venv; vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager in-process"
-observable_contract = "Two public requests capture operands and update original private fields on both a dense overlay and a request low-rank overlay; externally produced low-rank factors import per request before the first forward, move exactly their own row in a shared batch, reproduce the base model at zero, and leave no active lineages, pending releases or fallback"
+observable_contract = "Two public requests capture operands and update original private fields on both a dense overlay and a request low-rank overlay; externally produced low-rank factors import per request before the first forward, move exactly their own row in a shared batch, reproduce the base model at zero, and leave no active lineages, pending releases or fallback. User-computed route keys share one trained adapter lineage across same-route requests in one batch (three retired requests, two dormant route lineages), require routes at the public API, and clean up at close"
 replaces = "Legacy dense parameter overlay and per-request backend lifecycle smoke"
 
 [[evidence]]
@@ -471,7 +471,7 @@ requires_gpu = true
 path = "test/workloads/test_lora.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_lora.py::test_independent_lora_bmm_and_capture_preserve_keyed_mean_and_private_publication"
 environment = "Repository .venv; CPU and same-GPU ordinary/paged eager/capture on a nondefault stream"
-observable_contract = "Independent serial torch.optim.SGD reference fixes archived per-adapter weighted CE then batch mean and seeded bank reset. Ordinary named Tensor math and explicit native replacements share the original graph; changed Batch sources rejected by specialized kernels. Reordered request keys, mixed update/no-update states, invalid padding, dynamic two-to-one capacity, immutable old pins, publication rollback, original gradient-trace identities and exact cleanup. CUDA uses original arena capture, not an adapter cache; EngineCore integration belongs to evidence 36"
+observable_contract = "Independent serial torch.optim.SGD reference fixes archived per-adapter weighted CE then batch mean and seeded bank reset. Ordinary named Tensor math and explicit native replacements share the original graph; changed Batch sources rejected by specialized kernels. Reordered request keys, mixed update/no-update states, invalid padding, dynamic two-to-one capacity, immutable old pins, publication rollback, original gradient-trace identities and exact cleanup. Route-keyed states join one lineage for same-route requests, isolate distinct routes, keep a holderless route lineage dormant until dormant retirement, and restart fresh on readmission; weighted-CE batch keys resolve through their own row projection. CUDA uses original arena capture, not an adapter cache; EngineCore integration belongs to evidence 36"
 replaces = "Archived independent parameter banks, shape-group trainer bridge, silent capture fallback and per-adapter optimizer orchestration"
 
 [[evidence]]

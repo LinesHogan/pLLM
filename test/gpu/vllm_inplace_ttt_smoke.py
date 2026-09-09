@@ -95,6 +95,75 @@ class ImportedLowRank(pllm.Workload):
             operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
 
 
+@dataclass(frozen=True)
+class RoutedLowRankTTT(pllm.Workload):
+    """Route-keyed per-adapter LoRA; the routing policy below is ordinary host code."""
+
+    @property
+    def factors(self) -> pllm.RequestState:
+        return pllm.RequestState({
+            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+        }, keys=(pllm.RequestKeyField.ROUTE,))
+
+    @pllm.on(pllm.Phase.MODEL_UPDATE)
+    @pllm.overlay(state="factors",
+        targets=(ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT),),
+        operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
+    def transition(self, hidden: Annotated[torch.Tensor, pllm.Operand.INPUT],
+                   desired: Annotated[torch.Tensor, pllm.Operand.TARGET],
+                   base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
+                   a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
+                   b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")]) -> TensorUpdate:
+        output = hidden @ (base + 0.5 * b @ a).T
+        error = output - desired
+        gradient_b = 2 * error.T @ (hidden @ a.T) / hidden.shape[0]
+        gradient_a = 2 * (error @ b).T @ hidden / hidden.shape[0]
+        a.add_(-1e-3 * gradient_a)
+        b.add_(-1e-3 * gradient_b)
+        return TensorUpdate(output, changed=True, update_count=1, trained_rows=hidden.shape[0])
+
+
+def _route(prompt: str) -> str:
+    """The framework signs the key declaration; users compute the value."""
+    import re
+    return "math" if re.search(r"\d|plus|sum", prompt) else "code"
+
+
+def _check_routed(handle: VllmLlm[object, object]) -> dict[str, object]:
+    prompts = ["2 plus 2 is", "The sum of 1 and 1 is", "def main():"]
+    sampling = SamplingParams(max_tokens=2, temperature=0.0, n=1, ignore_eos=True)
+    try:
+        handle.generate(prompts, sampling)
+    except ValueError as exc:
+        if "route" not in str(exc):
+            raise
+    else:
+        raise RuntimeError("route-keyed state accepted generation without routes")
+    outputs = handle.generate(prompts, sampling, routes=tuple(_route(prompt) for prompt in prompts))
+    diagnostics = handle.deployment.execution.diagnostics()
+    # Three retired requests, two route lineages still resident: the two math
+    # prompts shared one adapter, and the dormant pool outlives its requests.
+    if (diagnostics.active_lineages != 2 or diagnostics.update_count < 1
+            or handle.runner.overlay_apply_count < 3
+            or handle.runner.overlay_updated_apply_count < 1
+            or diagnostics.pending_state_releases != 0 or diagnostics.fallback_count != 0):
+        raise RuntimeError("routed overlay lifecycle evidence is incomplete")
+    return {
+        "text": tuple(output.outputs[0].text for output in outputs),
+        "update_count": diagnostics.update_count,
+        "apply_rows": handle.runner.overlay_apply_count,
+        "updated_apply_rows": handle.runner.overlay_updated_apply_count,
+        "active_lineages": diagnostics.active_lineages,
+        "fallback_count": diagnostics.fallback_count,
+        "attachment": handle.deployment.attachment.physical.bundle_signature[:12],
+    }
+
+
+
+    return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_IDX,))
+
+
 def _key(prompt_index: int) -> RequestStateKey:
     return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_IDX,))
 
@@ -252,6 +321,28 @@ def main() -> int:
             raise RuntimeError("public make_llm did not route imported request low-rank overlay")
     try:
         results["imported"] = _check_imported(handle)
+    finally:
+        handle.close()
+
+    routed = pllm.make_llm(
+        workload=RoutedLowRankTTT(),
+        config=ModelConfig(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dtype=VllmDType.BFLOAT16,
+            max_model_len=64,
+            max_num_seqs=3,
+            max_num_batched_tokens=96,
+            gpu_memory_utilization=0.25,
+            seed=7,
+        ),
+    )
+    match routed:
+        case VllmLlm() as handle:
+            pass
+        case _:
+            raise RuntimeError("public make_llm did not route route-keyed overlay")
+    try:
+        results["routed"] = _check_routed(handle)
     finally:
         handle.close()
     print(results)

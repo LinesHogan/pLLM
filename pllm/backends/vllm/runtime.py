@@ -56,7 +56,7 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import (
     AnchorId, ConditionalLayerReplay, SamplerFeedbackInputSource, SchedulerTimeline, StateScope, HiddenInputSource, TokenwiseLayerReplay, TaskId,
 )
@@ -442,6 +442,8 @@ class VllmSession(Generic[DataT, ResultT]):
         execution = self._deployment.execution
         if execution.directory.scope is StateScope.INSTANCE:
             execution.retire(())
+        else:
+            execution.retire_dormant()
         if self._capture is not None:
             self._capture.close()
         if self._overlay is not None:
@@ -856,6 +858,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                           use_tqdm: bool = False,
                           completion_device: torch.device | None = None,
                           edit: Callable[[FeedbackT], StateTensorUpdate[torch.Tensor] | None] | None = None,
+                          routes: tuple[str, ...] | None = None,
                           ) -> Iterator[tuple[CompletionInput, FeedbackT]]:
         """Generate, settle feedback, then retry eligible original prompts within a finite bound.
 
@@ -871,11 +874,13 @@ class VllmLlm(Generic[DataT, ResultT]):
         texts: list[str] = list(prompts)
         indices: tuple[int, ...] = (tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
             if prompt_indices is None else prompt_indices)
+        route_values: list[str] | None = list(routes) if routes is not None else None
         auxiliary: AuxiliaryInput[torch.Tensor] | None = None
         to_worker: Callable[[torch.Tensor], torch.Tensor] = lambda tensor: tensor.to(self.runner.device)
         for attempt in range(max_rounds):
             batch: CompletionInput = self.generate(texts, sampling_params, use_tqdm=use_tqdm, feedback_group=feedback_group,
-                prompt_indices=indices, sample_index=attempt, auxiliary=auxiliary, completion_device=completion_device)
+                prompt_indices=indices, sample_index=attempt, auxiliary=auxiliary, completion_device=completion_device,
+                routes=None if route_values is None else tuple(route_values))
             result = feedback(batch)
             if result is None:
                 raise RuntimeError("completion feedback returned no settled control result")
@@ -918,18 +923,22 @@ class VllmLlm(Generic[DataT, ResultT]):
                 return
             texts = [texts[index] for index in selected]
             indices = tuple(indices[index] for index in selected)
+            if route_values is not None:
+                route_values = [route_values[index] for index in selected]
 
     @overload
     def generate(self, prompts: str | list[str], sampling_params: SamplingParams, *,
                  use_tqdm: bool = False, auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
                  sample_index: int = 0, feedback_group: None = None,
-                 prompt_indices: tuple[int, ...] | None = None, completion_device: torch.device | None = None) -> list[RequestOutput]: ...
+                 prompt_indices: tuple[int, ...] | None = None, completion_device: torch.device | None = None,
+                 routes: tuple[str, ...] | None = None) -> list[RequestOutput]: ...
 
     @overload
     def generate(self, prompts: str | list[str], sampling_params: SamplingParams, *,
                  use_tqdm: bool = False, auxiliary: AuxiliaryInput[torch.Tensor] | None = None,
                  sample_index: int = 0, feedback_group: str,
-                 prompt_indices: tuple[int, ...] | None = None, completion_device: torch.device | None = None) -> CompletionInput: ...
+                 prompt_indices: tuple[int, ...] | None = None, completion_device: torch.device | None = None,
+                 routes: tuple[str, ...] | None = None) -> CompletionInput: ...
 
     def generate(
         self,
@@ -942,6 +951,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         feedback_group: str | None = None,
         prompt_indices: tuple[int, ...] | None = None,
         completion_device: torch.device | None = None,
+        routes: tuple[str, ...] | None = None,
     ) -> list[RequestOutput] | CompletionInput:
         if self._closed:
             raise RuntimeError("vLLM workload handle is closed")
@@ -977,6 +987,16 @@ class VllmLlm(Generic[DataT, ResultT]):
             if prompt_indices is None else prompt_indices)
         if len(indices) != len(texts) or any(type(index) is not int or index < 0 for index in indices):
             raise ValueError("prompt indices must align with the original input prompts")
+        # A route value is user-computed (regex, discriminator, tenant); the signed
+        # graph only declares whether any request state keys on it.
+        signed_route = any(RequestKeyField.ROUTE in state.key_fields
+            for state in self.attachment.inputs.plan.semantic_graph.states)
+        if routes is not None and (
+            not signed_route or len(routes) != len(texts)
+            or any(type(route) is not str or not route for route in routes)):
+            raise ValueError("routes require a signed route-keyed state and one value per prompt")
+        if signed_route and routes is None:
+            raise ValueError("a route-keyed request state requires per-prompt routes")
         groups: dict[int, str] = {}
         for index, prompt in zip(indices, texts, strict=True):
             if groups.setdefault(index, prompt) != prompt:
@@ -988,8 +1008,9 @@ class VllmLlm(Generic[DataT, ResultT]):
         lifetime = ExitStack()
         try:
             request_ids = llm.enqueue(prompts, sampling_params, use_tqdm=use_tqdm)
-            identities = tuple(RequestIdentity(request_id, index, sample_index)
-                for request_id, index in zip(request_ids, indices, strict=True))
+            identities = tuple(RequestIdentity(request_id, index, sample_index, route)
+                for request_id, index, route in zip(request_ids, indices,
+                    routes if routes is not None else ("",) * len(texts), strict=True))
             # Borrow vLLM's exact frontend mapping before completed entries are removed.
             external = {llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
                 for identity in identities}

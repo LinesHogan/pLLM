@@ -209,6 +209,21 @@ retirement are identical to optimizer-produced overlays; only the production
 site differs. Like activation checkpoints, the workload declares the import's
 task workspace through `resource_facts` (the copy needs no owned tensor).
 
+## Routing Keys
+
+Request state keys are a signed declaration; their values can be user-computed.
+Add `RequestKeyField.ROUTE` to a `RequestState`'s `keys` and pass
+`generate(..., routes=(...))` — one routing value per prompt, computed by your own
+host code (a regex, a discriminator score, a tenant id; the framework never
+interprets it). Requests whose keys coincide **join the same lineage**: one
+adapter trained by any of them applies to all, within one batch or across steps.
+Distinct routes stay isolated. A route lineage outlives its last request —
+dormant, still pinned by its key — so an adapter pool persists for the session;
+`max_admitted_lineages` bounds it and session close retires dormant lineages.
+Requests missing a route value are rejected at admission. Auxiliary batch inputs
+(`WeightedCEBatch`) resolve their own key projection per row, so keyed training
+works unchanged over shared lineages.
+
 ## Activation Checkpoints
 
 Declare ordinary `InstanceState` or `RequestState` buffers and an `Activation`

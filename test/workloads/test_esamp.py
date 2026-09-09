@@ -63,7 +63,8 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     )
     config = ESampRequestConfig(
         rank=2, intervention=True, intervention_beta=0.2, learning_rate=0.03,
-        weight_decay=0.1, key_fields=tuple(RequestKeyField),
+        weight_decay=0.1, key_fields=(RequestKeyField.REQUEST_ID, RequestKeyField.PROMPT_IDX,
+            RequestKeyField.SAMPLE_IDX),
     )
     timeline = SchedulerTimeline(
         tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate((

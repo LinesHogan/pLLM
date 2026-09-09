@@ -11,7 +11,7 @@ from threading import RLock
 import torch
 
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import SemanticState, StateScope
@@ -21,7 +21,8 @@ from pllm.contracts.state_ref import LineageId, StateRef
 @dataclass(frozen=True, slots=True)
 class RequestStateAdmissionBatch:
     keys: tuple[RequestStateKey | None, ...]
-    write: PageWrite
+    holds: tuple[tuple[RequestIdentity, RequestStateKey | None], ...]
+    write: PageWrite | None
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,8 @@ class RequestStateDirectory:
         self.arena = arena
         self.state = state
         self._lineages: dict[RequestStateKey | None, LineageId] = {}
+        self._holders: dict[RequestStateKey | None, set[RequestIdentity]] = {}
+        self._identity_holds: dict[RequestIdentity, RequestStateKey | None] = {}
         self._inference_pins: dict[RequestIdentity, PagePin] = {}
         self._leases: dict[RequestStateKey | None, RequestStateSelection] = {}
         self._pending: RequestStateAdmissionBatch | None = None
@@ -113,29 +116,50 @@ class RequestStateDirectory:
             if self._pending is not None:
                 raise RuntimeError("request admission is already pending")
             keys = self._unique_keys(identities)
-            if not keys or any(key in self._lineages for key in keys):
-                raise RuntimeError("request admission requires unadmitted keys")
-            batch = RequestStateAdmissionBatch(keys,
-                self.arena.prepare_admission((str(self.state.resource),) * len(keys), stream))
+            if self.scope is StateScope.INSTANCE:
+                if any(key in self._lineages for key in keys):
+                    raise RuntimeError("request admission requires unadmitted keys")
+                new = keys
+            else:
+                if (not keys or len(set(identities)) != len(identities)
+                    or any(identity in self._identity_holds for identity in identities)):
+                    raise RuntimeError("request admission requires distinct unadmitted requests")
+                # A key already admitted by another request joins its lineage instead.
+                new = tuple(key for key in keys if key not in self._lineages)
+            fields = self.state.key_fields
+            batch = RequestStateAdmissionBatch(new,
+                tuple((identity, RequestStateKey.project(identity, fields)) for identity in identities),
+                self.arena.prepare_admission((str(self.state.resource),) * len(new), stream) if new else None)
             self._pending = batch
             return batch
 
-    def commit_admission(self, batch: RequestStateAdmissionBatch) -> PagePublication:
+    def commit_admission(self, batch: RequestStateAdmissionBatch) -> PagePublication | None:
         with self._lock:
             self._require_admission(batch)
-            lineages = dict(self._lineages)
-            for key, ref in zip(batch.keys, batch.write.after_refs, strict=True):
-                lineages[key] = ref.lineage_id
-            receipt = self.arena.publish(batch.write)
-            self._lineages = lineages
+            receipt = None
+            if batch.write is not None:
+                lineages = dict(self._lineages)
+                for key, ref in zip(batch.keys, batch.write.after_refs, strict=True):
+                    lineages[key] = ref.lineage_id
+                receipt = self.arena.publish(batch.write)
+                self._lineages = lineages
+            for identity, key in batch.holds:
+                self._identity_holds[identity] = key
+                self._holders.setdefault(key, set()).add(identity)
             self._pending = None
             return receipt
 
     def abort_admission(self, batch: RequestStateAdmissionBatch) -> None:
         with self._lock:
             self._require_admission(batch)
-            self.arena.abort(batch.write)
+            if batch.write is not None:
+                self.arena.abort(batch.write)
             self._pending = None
+
+    def latest_refs(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
+        """The visible ref per admitted key, for admissions that joined existing lineages."""
+        with self._lock:
+            return tuple(self.arena.latest(self._lineages[key]) for key in self._unique_keys(identities))
 
     def select(self, rows: tuple[PackedPhaseRow, ...]) -> RequestStateSelection:
         with self._lock:
@@ -185,15 +209,50 @@ class RequestStateDirectory:
             if self.scope is StateScope.INSTANCE and self._inference_pins:
                 raise RuntimeError("instance retirement requires all inference requests to finish")
             keys = self._unique_keys(identities)
-            if not keys or self._leases.keys() & keys:
+            if not keys:
+                raise RuntimeError("request retirement requires keys without an active step")
+            if keys == (None,):
+                releasing = keys
+            else:
+                if any(identity not in self._identity_holds for identity in identities):
+                    raise RuntimeError("request retirement references an unadmitted key")
+                leaving = {key: {identity for identity in identities
+                                 if self._identity_holds[identity] == key} for key in keys}
+                # A route names a routing destination, not one request: its lineage
+                # outlives the last holder until dormant retirement at session close.
+                releasing = tuple(key for key, members in leaving.items()
+                    if members == self._holders.get(key, set())
+                    and (key is None or RequestKeyField.ROUTE not in key.fields))
+            if self._leases.keys() & set(releasing):
                 raise RuntimeError("request retirement requires keys without an active step")
             try:
-                refs = tuple(self.arena.latest(self._lineages[key]) for key in keys)
+                refs = tuple(self.arena.latest(self._lineages[key]) for key in releasing)
             except KeyError as exc:
                 raise RuntimeError("request retirement references an unadmitted key") from exc
-            lineages = {key: lineage for key, lineage in self._lineages.items() if key not in keys}
-            self.arena.retire(refs)
+            if keys != (None,):
+                for identity in identities:
+                    key = self._identity_holds.pop(identity)
+                    self._holders[key].discard(identity)
+            lineages = {key: lineage for key, lineage in self._lineages.items() if key not in releasing}
+            if refs:
+                self.arena.retire(refs)
             self._lineages = lineages
+            for key in releasing:
+                self._holders.pop(key, None)
+            return refs
+
+    def retire_dormant(self) -> tuple[StateRef, ...]:
+        """Retire lineages whose last holder left; session-close cleanup for route pools."""
+        with self._lock:
+            dormant = tuple(key for key, holders in self._holders.items() if not holders)
+            if self._leases.keys() & set(dormant):
+                raise RuntimeError("dormant retirement requires keys without an active step")
+            refs = tuple(self.arena.latest(self._lineages[key]) for key in dormant)
+            if refs:
+                self.arena.retire(refs)
+            for key in dormant:
+                self._lineages.pop(key)
+                self._holders.pop(key)
             return refs
 
     def _unique_keys(self, identities: tuple[RequestIdentity, ...]) -> tuple[RequestStateKey | None, ...]:

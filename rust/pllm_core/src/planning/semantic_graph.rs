@@ -70,6 +70,7 @@ pub(crate) enum RequestKeyField {
     RequestId,
     PromptIdx,
     SampleIdx,
+    Route,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

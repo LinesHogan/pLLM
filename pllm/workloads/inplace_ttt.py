@@ -65,7 +65,8 @@ class InPlaceTTTWorkload(pllm.Workload):
             "tail_input": pllm.Buffer(lambda inputs, outputs: (tail, inputs)),
             "tail_target": pllm.Buffer(lambda inputs, outputs: (tail, outputs)),
             "tail_length": pllm.Buffer((), dtype=torch.int64),
-        }, namespace="canonical.dense_fast_weight.state@1", keys=tuple(pllm.RequestKeyField))
+        }, namespace="canonical.dense_fast_weight.state@1", keys=(pllm.RequestKeyField.REQUEST_ID,
+            pllm.RequestKeyField.PROMPT_IDX, pllm.RequestKeyField.SAMPLE_IDX))
 
     @pllm.on(pllm.Phase.MODEL_UPDATE)
     @pllm.overlay(state="dense_fast_weights", targets=pllm.Config("config.targets"), weight="delta",

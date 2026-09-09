@@ -383,3 +383,64 @@ def test_independent_lora_bmm_and_capture_preserve_keyed_mean_and_private_public
         execution.arena.wait_release(execution.arena.release_pin(old_pin))
         execution.retire(identities)
         assert execution.diagnostics().active_lineages == execution.diagnostics().fallback_count == 0
+
+    # Route keys are user-computed: same-route requests join one lineage, distinct
+    # routes stay isolated, and a holderless route lineage persists dormant until
+    # dormant retirement (session close).
+    routed = OutputLoRAWorkload(OutputLoRAConfig(rank=2, alpha=3.0, learning_rate=0.2, steps=1, seed=11,
+        scope=StateScope.REQUEST, key_fields=(RequestKeyField.ROUTE,)))
+    route_facts = BackendCompileFacts(BackendPlacementProbe("test.sampler@1", "a" * 64, "b" * 64, "c" * 64,
+        AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CPU, 0, 1, 1,
+        TensorDType.FLOAT32, 4, 8, (AttachmentHiddenResource(binding, HiddenPhase.DECODE),), ()),
+        RuntimeFacts(torch.device("cpu")).timeline(),
+        (PageBundleProviderFacts("test.page@1", 8),), 4, 32 * 1024**2, 11, vocab_size=7)
+    route_execution = routed.compile_backend(routed.specialize(route_facts,
+        ExecutionOptions(training_rows=4))).execution
+    math_a = RequestIdentity("r0", 0, 0, "math")
+    math_b = RequestIdentity("r1", 1, 0, "math")
+    code = RequestIdentity("r2", 2, 0, "code")
+    with pytest.raises(ValueError, match="route state key requires"):
+        route_execution.admit((RequestIdentity("r9", 9, 0),))
+    first, = route_execution.admit((math_a,))
+    joined_math, joined_code = route_execution.admit((math_b, code))
+    assert joined_math.lineage_id == first.lineage_id
+    assert joined_code.lineage_id != first.lineage_id
+    assert route_execution.diagnostics().active_lineages == 2
+    math_initial = route_execution.snapshot(first)
+    code_initial = route_execution.snapshot(joined_code)
+    hidden = torch.linspace(-0.4, 0.6, 8).reshape(1, 2, 4)
+    logits = torch.linspace(-1, 1, 14).reshape(1, 2, 7)
+    batch = pllm.WeightedCEBatch.for_prompts(hidden, logits, torch.tensor([[1, 3]]),
+        torch.tensor([[1., 2.]]), (1,))
+    rows = PackedPhaseRowBatch(1, 0, 2, tuple(PackedPhaseRow(index, index, 0, HiddenPhase.DECODE, identity)
+        for index, identity in enumerate((math_b, code))))
+    value = TensorStepInput(rows, PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(2))),
+        PackedHiddenSnapshotBatch(rows, (PackedHiddenSnapshot(binding, torch.ones((2, 4))),)),
+        auxiliary=batch)
+    publication = route_execution.step(value).publication
+    assert publication is not None
+    latest_math = route_execution.arena.latest(first.lineage_id)
+    assert publication.after_refs == (latest_math,) and latest_math.version_id == 1
+    # One request's update is visible to every request sharing its route; the
+    # other route's lineage is untouched.
+    for actual, initial in zip(route_execution.snapshot(latest_math), math_initial, strict=True):
+        assert not torch.equal(actual, initial)
+    for actual, initial in zip(route_execution.snapshot(joined_code), code_initial, strict=True):
+        torch.testing.assert_close(actual, initial)
+    route_execution.retire((math_a,))
+    assert route_execution.diagnostics().active_lineages == 2
+    route_execution.retire((math_b,))
+    assert route_execution.diagnostics().active_lineages == 2, "dormant route lineage persists"
+    route_execution.retire((code,))
+    assert route_execution.diagnostics().active_lineages == 2, "every lineage of a route-keyed state is a route lineage"
+    route_execution.retire_dormant()
+    assert route_execution.diagnostics().active_lineages == 0
+    # A later admission of the same route starts a fresh initialized lineage.
+    fresh, = route_execution.admit((RequestIdentity("r3", 3, 0, "math"),))
+    assert fresh.version_id == 0 and fresh.lineage_id != first.lineage_id
+    for actual, initial in zip(route_execution.snapshot(fresh), math_initial, strict=True):
+        torch.testing.assert_close(actual, initial)
+    route_execution.retire((RequestIdentity("r3", 3, 0, "math"),))
+    route_execution.retire_dormant()
+    diagnostics = route_execution.diagnostics()
+    assert diagnostics.active_lineages == diagnostics.fallback_count == 0
