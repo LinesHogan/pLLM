@@ -1,17 +1,12 @@
 """Cold Python authoring boundary. Reflection stops at the original typed graph."""
 
 from collections.abc import Callable, Mapping
-from collections import Counter
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass, replace
-from dis import get_instructions
 from enum import Enum
-from hashlib import blake2b, sha256
-from inspect import Parameter as SignatureParameter, getclosurevars, signature
-from marshal import dumps
-import sys
-from types import CellType, CodeType, FunctionType, MethodType, ModuleType
+from inspect import Parameter as SignatureParameter, signature
+from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, Generic, TypeVar, cast, get_args, get_origin
 
 import torch
@@ -33,6 +28,7 @@ from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, State, When, native
 from pllm.execution.tensor_binding import Buffer as Buffer, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorPort, Tensors, TensorOutput as TensorOutput, SGD as SGD
+from pllm.execution.freeze import fingerprint, freeze, members as _members
 from pllm.execution.tensor_program import FunctionMath, Roots, InvocationOutput, TensorBatch, autograd_loss
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.host_runtime import (
@@ -195,10 +191,10 @@ class _NativeMath:
     @staticmethod
     def native_methods(functions: Mapping[str, Callable[..., object]]) -> Mapping[str, str]:
         """Freeze code and decorator/source contracts for an explicit native binding."""
-        return {name: boundary_digest(_fingerprint(function, structured=True),
-            tuple((key, _fingerprint(getattr(function, key, None))) for key in (
+        return {name: boundary_digest(fingerprint(function, structured=True),
+            tuple((key, fingerprint(getattr(function, key, None))) for key in (
                 "__pllm_phase__", "__pllm_effect__", "__pllm_gradient__", "__pllm_rows__", "__pllm_hidden__")),
-            tuple((key, _fingerprint(get_args(parameter.annotation)[1]))
+            tuple((key, fingerprint(get_args(parameter.annotation)[1]))
                 for key, parameter in signature(function, eval_str=False).parameters.items()
                 if get_origin(parameter.annotation) is Annotated)) for name, function in functions.items()}
 
@@ -254,13 +250,13 @@ class CompletionWorkload(_NativeMath, _LearningMath[CompletionInput, ContextT, R
         if any(isinstance(shape, Buffer) for shape in definition.fields.values()):
             raise ValueError("completion parameters require tensor shapes, not overlay buffers")
         shapes = cast(Mapping[str, Shape], definition.fields)
-        identity = _fingerprint(owner.loss)
-        b = Builder[ContextT](self.name, boundary_digest(facts, _fingerprint(_values(owner)),
-            _fingerprint(definition), identity, _fingerprint(owner.trained_rows)), Dimensions(facts.hidden_size, 0))
+        identity = fingerprint(owner.loss)
+        b = Builder[ContextT](self.name, boundary_digest(facts, fingerprint(_values(owner)),
+            fingerprint(definition), identity, fingerprint(owner.trained_rows)), Dimensions(facts.hidden_size, 0))
         state = b.state("parameters", tuple(Field(name, shape,
             TensorDType(str(definition.dtype).removeprefix("torch.")), definition.alignment, definition.mutation) for name, shape in shapes.items()),
             namespace=definition.namespace, optimizer=definition.optimizer)
-        update = b.compute("train", function=autograd_loss(_freeze(owner.loss), tuple(shapes), _freeze(owner.trained_rows)),
+        update = b.compute("train", function=autograd_loss(freeze(owner.loss), tuple(shapes), freeze(owner.trained_rows)),
             inputs={"batch": b.input("input", "completions", f"{self.name}.training@1"), "state": state.read()},
             outputs=("control",), changes=state, effect=StateEffectKind.TRANSITION_MAYBE, when=When.HOST_COMPUTE,
             implementations=(native(f"python:{identity}"),),
@@ -269,8 +265,8 @@ class CompletionWorkload(_NativeMath, _LearningMath[CompletionInput, ContextT, R
         b.publish(update, state, output="control", schema=f"{self.name}.result@1", when=When.HOST_COMMIT,
             implementations=(native("canonical.state:publish@1"),))
         generator = torch.Generator(device=facts.device).manual_seed(facts.initialization_seed)
-        initialize_parameters = None if definition.initialize is None else _freeze(definition.initialize)
-        prepare_data, output_data = _freeze(owner.prepare), _freeze(owner.output)
+        initialize_parameters = None if definition.initialize is None else freeze(definition.initialize)
+        prepare_data, output_data = freeze(owner.prepare), freeze(owner.output)
         def initialize(roots: Roots) -> None:
             if initialize_parameters is not None:
                 root, = roots
@@ -333,15 +329,15 @@ class CausalAdapterWorkload(_LearningMath[CausalTrainBatch[torch.Tensor] | None,
                 or down.device != model.device or up.device != model.device
                 or down.dtype != tensor_dtype(model.tensor_dtype) or up.dtype != down.dtype):
                 raise ValueError("causal adapter factors differ from their target shape, device or dtype")
-        identity = _fingerprint(owner.loss)
+        identity = fingerprint(owner.loss)
         values = {key: value for key, value in _values(owner).items() if key != "model"}
-        b = Builder[ContextT](owner.name, boundary_digest(_fingerprint(values), model.fingerprint,
-            model.scale, owner.optimizer, identity, _fingerprint(owner.trained_rows)))
+        b = Builder[ContextT](owner.name, boundary_digest(fingerprint(values), model.fingerprint,
+            model.scale, owner.optimizer, identity, fingerprint(owner.trained_rows)))
         names = tuple(f"factor_{index}" for index in range(len(model.initial_factors)))
         state = b.state("factors", tuple(Field(name, tuple(factor.shape), model.tensor_dtype)
             for name, factor in zip(names, model.initial_factors, strict=True)),
             namespace=owner.namespace, optimizer=owner.optimizer)
-        update = b.compute("update", function=autograd_loss(_freeze(owner.loss), names, _freeze(owner.trained_rows)),
+        update = b.compute("update", function=autograd_loss(freeze(owner.loss), names, freeze(owner.trained_rows)),
             inputs={"batch": b.input("training", "batch", CausalTrainBatch.schema), "state": state.read()},
             outputs=("updated",), changes=state, effect=StateEffectKind.TRANSITION_MAYBE, when=owner.phase.value,
             implementations=(native(f"python:{identity}", f"compute/{facts.device.type}@1",
@@ -357,7 +353,7 @@ class CausalAdapterWorkload(_LearningMath[CausalTrainBatch[torch.Tensor] | None,
             root, = roots
             for index, factor in enumerate(model.initial_factors):
                 root[5 * index].copy_(factor)
-        prepare_data, output_data = _freeze(owner.prepare), _freeze(owner.output)
+        prepare_data, output_data = freeze(owner.prepare), freeze(owner.output)
         limit = next((item for item in facts.timeline.task_resources if item.task == update.symbol), None)
         if limit is not None and (len(limit.input_shapes) != 1 or len(limit.input_shapes[0]) != 2
             or limit.input_shapes[0][0] < 1 or limit.input_shapes[0][1] < 2):
@@ -568,97 +564,6 @@ def _targets(value: object) -> tuple[ParameterTarget, ...]:
     return cast(tuple[ParameterTarget, ...], items)
 
 
-def _fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured: bool = False) -> str:
-    """Sign cold code/config dependencies, never eval annotations or execute code to trace it."""
-    if id(value) in seen:
-        raise ValueError("recursive authoring dependencies require an explicit native binding")
-    seen = seen | {id(value)}
-    if isinstance(value, MethodType):
-        return _fingerprint(value.__func__, seen, structured=structured)
-    if isinstance(value, FunctionType):
-        closure = getclosurevars(value)
-        globals_used = _global_names(value.__code__)
-        if globals_used & {"getattr", "setattr", "hasattr", "globals", "locals", "vars", "eval", "exec", "__import__"}:
-            raise ValueError("reflective mathematics requires an explicit native binding")
-        dependencies = {**{key: value.__globals__[key] for key in globals_used if key in value.__globals__}, **closure.nonlocals}
-        return boundary_digest(sha256(dumps(_code(value.__code__))).hexdigest(),
-            tuple((key, _fingerprint(item, seen, structured=structured)) for key, item in sorted(dependencies.items())),
-            _fingerprint(value.__defaults__, seen, structured=structured), _fingerprint(value.__kwdefaults__, seen, structured=structured))
-    if isinstance(value, ModuleType):
-        if structured and value.__name__ == "re":
-            return boundary_digest(value.__name__, sys.version)
-        if not value.__name__.startswith(("torch", "math")):
-            raise ValueError(f"{value.__name__}: module dependencies require an explicit native binding")
-        return boundary_digest(value.__name__, torch.__version__)
-    if isinstance(value, torch.dtype):
-        return str(value)
-    if isinstance(value, Enum):
-        return boundary_digest(type(value).__qualname__, _fingerprint(value.value, seen))
-    if value is TensorUpdate:
-        return TensorUpdate.__qualname__
-    if structured and is_dataclass(value) and isinstance(value, type):
-        return boundary_digest(value.__module__, value.__qualname__,
-            tuple((item.name, str(item.type)) for item in fields(value)),
-            _fingerprint(value.__init__, seen, structured=True), _fingerprint(getattr(value, "__post_init__", None), seen, structured=True))
-    if isinstance(value, type):
-        if value is torch.Tensor:
-            return value.__qualname__
-        if structured and value in (object, Counter, blake2b):
-            return boundary_digest(value.__module__, value.__qualname__, sys.version)
-        if structured and issubclass(value, Enum):
-            return boundary_digest(value.__module__, value.__qualname__,
-                tuple((name, _fingerprint(member.value, seen, structured=True)) for name, member in value.__members__.items()))
-        raise ValueError("dynamic type dependencies require an explicit native binding")
-    if is_dataclass(value) and not isinstance(value, type):
-        return boundary_digest(type(value).__qualname__, tuple((field.name,
-            _fingerprint(getattr(value, field.name), seen, structured=structured)) for field in fields(value)))
-    if isinstance(value, Mapping):
-        items = cast(Mapping[str, object], value)
-        return boundary_digest(tuple((key, _fingerprint(item, seen, structured=structured)) for key, item in sorted(items.items())))
-    if isinstance(value, (tuple, list)):
-        return boundary_digest(tuple(_fingerprint(item, seen, structured=structured) for item in cast(tuple[object, ...], value)))
-    return boundary_digest(value)
-
-
-def _code(code: CodeType) -> CodeType:
-    return code.replace(co_filename="", co_firstlineno=0, co_linetable=b"", co_consts=tuple(
-        _code(value) if isinstance(value, CodeType) else value for value in code.co_consts))
-
-
-def _global_names(code: CodeType) -> set[str]:
-    names = {str(instruction.argval) for instruction in get_instructions(code) if instruction.opname == "LOAD_GLOBAL"}
-    for value in code.co_consts:
-        if isinstance(value, CodeType):
-            names.update(_global_names(value))
-    return names
-
-
-def _freeze(function: G) -> G:
-    if isinstance(function, MethodType):
-        return cast(G, MethodType(_freeze(function.__func__), function.__self__))
-    if not isinstance(function, FunctionType):
-        raise TypeError("ordinary operations require a Python function; use an explicit native binding")
-    globals_used = _global_names(function.__code__)
-    global_values = dict(function.__globals__)
-    for key in globals_used & global_values.keys():
-        value = global_values[key]
-        global_values[key] = _freeze(value) if isinstance(value, FunctionType) else (
-            value if isinstance(value, (ModuleType, type)) else deepcopy(value))
-    copied = FunctionType(function.__code__, global_values, function.__name__, deepcopy(function.__defaults__),
-        None if function.__closure__ is None else tuple(CellType(_freeze(cell.cell_contents)
-            if isinstance(cell.cell_contents, FunctionType) else deepcopy(cell.cell_contents)) for cell in function.__closure__))
-    copied.__annotations__ = dict(function.__annotations__)
-    copied.__kwdefaults__ = deepcopy(function.__kwdefaults__)
-    return cast(G, copied)
-
-
-def _members(owner: object) -> dict[str, object]:
-    members: dict[str, object] = {}
-    for cls in reversed(type(owner).__mro__):
-        members.update(vars(cls))
-    return members
-
-
 def _values(owner: object) -> dict[str, object]:
     values: dict[str, object] = {name: member for name, member in _members(owner).items() if not name.startswith("__")
         and isinstance(member, (str, int, float, bool, tuple, InstanceState, Activation, Overlay, Recurrence))}
@@ -672,7 +577,7 @@ def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
     memo = {id(value): value for value in borrowed}
     copied = deepcopy(owner, memo)
     for key, value in _values(copied).items():
-        object.__setattr__(copied, key, _freeze(value) if isinstance(value, FunctionType) else deepcopy(value, memo))
+        object.__setattr__(copied, key, freeze(value) if isinstance(value, FunctionType) else deepcopy(value, memo))
     return copied
 
 
@@ -733,9 +638,9 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     continue
                 if isinstance(member, FunctionType):
                     function = cast(Callable[..., torch.Tensor], getattr(owner, name))
-                    helpers.append((name, _fingerprint(function)))
-                    object.__setattr__(owner, name, _freeze(function))
-        bindings = tuple((key, _fingerprint(value)) for key, value in sorted(values.items()))
+                    helpers.append((name, fingerprint(function)))
+                    object.__setattr__(owner, name, freeze(function))
+        bindings = tuple((key, fingerprint(value)) for key, value in sorted(values.items()))
         states: dict[str, State] = {}
         parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = {}
         definitions: list[tuple[str, str]] = helpers
@@ -747,7 +652,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 values[name] = member
         for name, definition in values.items():
             if isinstance(definition, InstanceState):
-                definitions.append((name, _fingerprint(definition)))
+                definitions.append((name, fingerprint(definition)))
                 if definition.optimizer is None:
                     continue
                 shapes: dict[str, Shape] = {}
@@ -757,7 +662,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     shapes[key] = shape
                 state, ports = b.parameters(name, shapes, optimizer=definition.optimizer,
                     namespace=definition.namespace,
-                    initialize=None if definition.initialize is None else _freeze(definition.initialize),
+                    initialize=None if definition.initialize is None else freeze(definition.initialize),
                     scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
                     dtype=TensorDType(str(definition.dtype).removeprefix("torch.")),
                     alignment=definition.alignment, mutation=definition.mutation,
@@ -767,7 +672,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 parameters.update({(name, field): port for field, port in ports.items()})
         for name, effect in values.items():
             if isinstance(effect, Recurrence):
-                definitions.append((name, _fingerprint(effect)))
+                definitions.append((name, fingerprint(effect)))
                 b.recurrence(effect)
                 continue
             if isinstance(effect, Overlay):
@@ -776,7 +681,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     raise ValueError("external overlays require a declared state")
                 buffers = _buffers(definition)
                 applied = (effect.weight,) if effect.operator is ParameterOverlayOperator.DENSE_ADD else effect.factors
-                definitions.append((name, _fingerprint(effect)))
+                definitions.append((name, fingerprint(effect)))
                 b.import_overlay(effect.state, buffers, targets=effect.targets, applied=applied,
                     operator=effect.operator, scale=effect.scale, namespace=definition.namespace,
                     keys=definition.keys if isinstance(definition, RequestState) else (),
@@ -787,7 +692,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             definition = values.get(effect.state)
             if not isinstance(definition, InstanceState):
                 raise ValueError("activation replacement requires a declared state")
-            definitions.append((name, _fingerprint(effect)))
+            definitions.append((name, fingerprint(effect)))
             b.activation_patch(effect.state, _buffers(definition), layers=effect.layers, operator=effect.operator,
                 first_tokens=effect.first_tokens, last_tokens=effect.last_tokens, namespace=definition.namespace,
                 scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
@@ -867,8 +772,8 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                         replay = getattr(replay, part)
                 if replay is not None and not isinstance(replay, ConditionalLayerReplay):
                     raise TypeError("overlay replay requires a conditional layer replay")
-                identity = _fingerprint(transition)
-                transition = _freeze(transition)
+                identity = fingerprint(transition)
+                transition = freeze(transition)
                 def invoke(inputs: Tensors, function: Callable[..., TensorUpdate] = transition,
                            bindings: Mapping[str, str] = bindings_overlay) -> TensorUpdate:
                     return function(**{key: inputs[source] for key, source in bindings.items()})
@@ -903,22 +808,22 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                         else:
                             raise ValueError("batch training inputs must name its batch tensors or own parameters")
                     reset = cast(Callable[[Tensors, torch.Generator], None], getattr(owner, effect.reset))
-                    identity = boundary_digest(_fingerprint(function), _fingerprint(reset), batch_sources, effect)
+                    identity = boundary_digest(fingerprint(function), fingerprint(reset), batch_sources, effect)
                     definitions.append((name, identity))
                     if training is not None:
                         raise ValueError("tensor sampler attachment requires one training operation")
                     state = states[effect.state]
                     training = b.weighted_train(name, state, identity=f"python:{identity}", optimizer=definition.optimizer,
-                        steps=_setting(effect.steps, owner, int), reset=_freeze(reset), function=_invoke(_freeze(function), tuple(batch_sources)),
+                        steps=_setting(effect.steps, owner, int), reset=freeze(reset), function=_invoke(freeze(function), tuple(batch_sources)),
                         arguments=batch_sources), state
                     continue
                 if effect.reset or effect.steps != 1:
                     raise ValueError("multi-step/reset training requires explicit SGD batch parameters")
             inputs = {key: port(source) for key, source in arguments}
-            identity = _fingerprint(function)
-            function = _freeze(function)
+            identity = fingerprint(function)
+            function = freeze(function)
             definitions.append((name, boundary_digest(identity,
-                tuple((key, _fingerprint(source)) for key, source in arguments), _fingerprint(capture_marks))))
+                tuple((key, fingerprint(source)) for key, source in arguments), fingerprint(capture_marks))))
             update: State | None = None
             math: MathContract = MathContract()
             parameter_names = tuple(key for key, source in arguments if isinstance(source, Parameter))
@@ -960,11 +865,11 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 if any(key not in sources or source != sources[key] for key, source in selected_args):
                     raise ValueError("row selector must use the operation's declared inputs")
                 if method not in selectors:
-                    identity_selector = _fingerprint(selector)
+                    identity_selector = fingerprint(selector)
                     definitions.append((method, identity_selector))
                     selectors[method] = b.tensor(f"__{name}_{method}", when=phase.value,
                         identity=f"python:{identity_selector}:{name}:{method}", inputs={key: inputs[key] for key, _ in selected_args})(
-                            _invoke(_freeze(selector), tuple(key for key, _ in selected_args)))
+                            _invoke(freeze(selector), tuple(key for key, _ in selected_args)))
                 key = f"__{domain}"
                 if key in inputs:
                     raise ValueError(f"{key} is reserved for a row-domain input")
