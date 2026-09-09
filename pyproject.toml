@@ -3,7 +3,7 @@ requires = ["maturin>=1.14,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tllm"
+name = "pllm"
 version = "0.1.0"
 description = "Auxiliary-workload compiler middle-end for the vLLM inference engine"
 readme = "README.md"
@@ -11,17 +11,19 @@ requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
+    "cattrs>=25.3,<26",
     "torch>=2.13,<2.14",
+    "triton>=3.7,<3.8",
 ]
 
 [project.optional-dependencies]
-# The public attachment currently supports the exact MRv2 ABI in this release.
+# Both concrete runner adapters target this exact vLLM release.
 vllm027 = ["vllm==0.27.1"]
 test = ["pytest==9.0.3", "maturin>=1.14,<2.0", "pyright==1.1.411"]
 tlm = ["transformers>=5.0,<6", "peft>=0.20,<0.21", "safetensors>=0.4,<1"]
 
 [tool.maturin]
-manifest-path = "rust/tllm_core/Cargo.toml"
+manifest-path = "rust/pllm_core/Cargo.toml"
 python-source = "."
-module-name = "tllm._core"
+module-name = "pllm._core"
 features = ["pyo3/extension-module"]

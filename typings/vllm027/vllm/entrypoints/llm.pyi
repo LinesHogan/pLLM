@@ -29,6 +29,7 @@ class LLM:
         trust_remote_code: bool,
         enable_prefix_caching: bool,
         enable_chunked_prefill: Literal[False],
+        async_scheduling: bool | None = None,
     ) -> None: ...
 
     def generate(
@@ -38,3 +39,16 @@ class LLM:
         *,
         use_tqdm: bool,
     ) -> list[RequestOutput]: ...
+
+    def enqueue(self, prompts: str | list[str], sampling_params: SamplingParams,
+                *, use_tqdm: bool) -> list[str]: ...
+
+    def wait_for_completion(self, output_type: type[RequestOutput],
+                            *, use_tqdm: bool) -> list[RequestOutput]: ...
+
+    def collective_rpc(self, method: Literal["workload_command"], *, timeout: float,
+                       args: tuple[str, str]) -> list[str]: ...
+
+    def sleep(self, level: Literal[0], mode: Literal["keep"]) -> None: ...
+
+    def wake_up(self, tags: list[Literal["scheduling"]]) -> None: ...

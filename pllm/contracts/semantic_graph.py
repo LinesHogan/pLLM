@@ -1,0 +1,394 @@
+"""Shared immutable graph/plan data; Rust owns semantic validation at compilation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Literal, NewType
+
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.state_representation import ExecutionDomainId, StateDeviceKind
+
+
+WorkloadId = NewType("WorkloadId", str)
+TaskSymbol = NewType("TaskSymbol", str)
+ImplementationId = NewType("ImplementationId", str)
+AnchorSymbol = NewType("AnchorSymbol", str)
+TaskId = NewType("TaskId", int)
+AnchorId = NewType("AnchorId", int)
+StateResource = NewType("StateResource", str)
+HostServiceId = NewType("HostServiceId", str)
+HostServicePort = NewType("HostServicePort", str)
+HostPayloadSchemaId = NewType("HostPayloadSchemaId", str)
+
+
+class ExecutionKind(StrEnum):
+    HOST_SERVICE = "host_service"
+    NATIVE_TASK = "native_task"
+
+
+class StateScope(StrEnum):
+    REQUEST = "request"
+    INSTANCE = "instance"
+
+
+class SemanticOutputKind(StrEnum):
+    HOST = "host"
+    TEMPORARY = "temporary"
+    SAMPLER = "sampler"
+
+
+class StateEffectKind(StrEnum):
+    READ = "read"
+    TRANSITION = "transition"
+    TRANSITION_MAYBE = "transition_maybe"
+    UPDATE = "update"
+    UPDATE_MAYBE = "update_maybe"
+    PUBLISH = "publish"
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenInputSource:
+    layer: int
+    site: HiddenSite
+    phase: HiddenPhase
+
+
+
+@dataclass(frozen=True, slots=True)
+class StepIdInputSource:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PackedRowsInputSource:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PackedSamplerRowsInputSource:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SamplerFeedbackInputSource:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class HostServiceInputSource:
+    service: HostServiceId
+    port: HostServicePort
+    schema: HostPayloadSchemaId
+
+
+
+@dataclass(frozen=True, slots=True)
+class StateSelectionInputSource:
+    resource: StateResource
+    phase: HiddenPhase
+
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResultInputSource:
+    task: TaskSymbol
+    output: str
+
+
+
+SemanticInputSource = (
+    HiddenInputSource
+    | StepIdInputSource
+    | PackedRowsInputSource
+    | PackedSamplerRowsInputSource
+    | SamplerFeedbackInputSource
+    | HostServiceInputSource
+    | StateSelectionInputSource
+    | TaskResultInputSource
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticInput:
+    name: str
+    source: SemanticInputSource
+
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticOutput:
+    name: str
+    kind: SemanticOutputKind = SemanticOutputKind.HOST
+    schema: HostPayloadSchemaId = HostPayloadSchemaId("")
+
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticState:
+    resource: StateResource
+    scope: StateScope
+    key_fields: tuple[RequestKeyField, ...]
+
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEffect:
+    resource: StateResource
+    kind: StateEffectKind
+    # None names the invocation's input version, not an implicit mutable latest.
+    version: TaskSymbol | None = None
+
+
+
+@dataclass(frozen=True, slots=True)
+class TimingConstraint:
+    after: AnchorSymbol
+    before: AnchorSymbol
+
+
+
+@dataclass(frozen=True, slots=True)
+class TaskImplementationSpec:
+    implementation_id: ImplementationId
+    execution_kind: ExecutionKind
+    required_capabilities: tuple[str, ...] = ()
+
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionalLayerReplay:
+    """Seed from hidden+residual at layer input; carry each detached block output."""
+
+    layer: int
+    max_iterations: int = 2
+    relative_l2_ppm: int = 10
+    predicate: Literal["weight_updated"] = "weight_updated"
+    rows: Literal["last_scheduled_token"] = "last_scheduled_token"
+    carry: Literal["block_output"] = "block_output"
+    kv: Literal["overwrite_current_slot"] = "overwrite_current_slot"
+    logits: Literal["preserve"] = "preserve"
+    rng: Literal["preserve"] = "preserve"
+    gradient: Literal["detach"] = "detach"
+    cancellation: Literal["between_iterations_restore_kv"] = "between_iterations_restore_kv"
+
+
+@dataclass(frozen=True, slots=True)
+class TokenwiseLayerReplay:
+    """Normal token then mixed upper-layer KV replay, before the next token."""
+
+    source_layer: int
+    destination_layer: int
+    layer_count: int
+    alpha_bits: int
+    beta_bits: int | None
+    ramp_tokens: int = 0
+    enabled: bool = True
+    rows: Literal["prefill"] = "prefill"
+    kv: Literal["overwrite_current_slot"] = "overwrite_current_slot"
+    logits: Literal["normal"] = "normal"
+    rng: Literal["preserve"] = "preserve"
+    gradient: Literal["detach"] = "detach"
+    cancellation: Literal["between_tokens"] = "between_tokens"
+
+
+LossReduction = Literal["none", "sum", "mean", "state_mean", "weighted_state_mean", "weighted_state_mean_then_mean", "custom"]
+
+
+@dataclass(frozen=True, slots=True)
+class MathContract:
+    """Explicit differentiation and row domains of a native mathematical operation."""
+
+    input_gradients: tuple[str, ...] = ()
+    parameter_gradients: tuple[StateResource, ...] = ()
+    detached_inputs: tuple[str, ...] = ()
+    forward_rows: str = ""
+    input_gradient_rows: str = ""
+    parameter_gradient_rows: str = ""
+    update_states: str = ""
+    reduction: LossReduction = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticTask:
+    symbol: TaskSymbol
+    timing: TimingConstraint
+    inputs: tuple[SemanticInput, ...]
+    outputs: tuple[SemanticOutput, ...]
+    implementations: tuple[TaskImplementationSpec, ...]
+    effects: tuple[SemanticEffect, ...] = ()
+    replay: ConditionalLayerReplay | TokenwiseLayerReplay | None = None
+    math: MathContract | None = None
+
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEdge:
+    source: TaskSymbol
+    target: TaskSymbol
+
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticGraph:
+    workload_id: WorkloadId
+    tasks: tuple[SemanticTask, ...]
+    execution_parameters_digest: str
+    states: tuple[SemanticState, ...] = ()
+    edges: tuple[SemanticEdge, ...] = ()
+    schema_version: int = 1
+
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineAnchor:
+    symbol: AnchorSymbol
+    ordinal: int
+
+
+
+@dataclass(frozen=True, slots=True)
+class ValueResourceFact:
+    task: TaskSymbol
+    output: str
+    bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResourceFact:
+    task: TaskSymbol
+    workspace_bytes: int
+    resident_bytes: int = 0
+    # Fixed cold buffers; native bindings define which input axes may be padded.
+    input_shapes: tuple[tuple[int, ...], ...] = ()
+    domains: tuple[ExecutionDomainId, ...] = (ExecutionDomainId(0),)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionDomainFact:
+    worker_id: int
+    device_kind: StateDeviceKind
+    device_ordinal: int
+    capabilities: tuple[str, ...] = ()
+    memory_budget_bytes: int | None = None
+    reserved_bytes: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TransferLinkFact:
+    source: ExecutionDomainId
+    target: ExecutionDomainId
+    cost_per_byte: int
+    anchor_delay: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerTimeline:
+    anchors: tuple[TimelineAnchor, ...]
+    capabilities: tuple[str, ...] = ()
+    schema_version: int = 1
+    value_resources: tuple[ValueResourceFact, ...] = ()
+    task_resources: tuple[TaskResourceFact, ...] = ()
+    memory_budget_bytes: int | None = None
+    reserved_bytes: tuple[int, ...] = ()
+    domains: tuple[ExecutionDomainFact, ...] = ()
+    transfer_links: tuple[TransferLinkFact, ...] = ()
+
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalTask:
+    task_id: TaskId
+    implementation_id: ImplementationId
+    anchor_id: AnchorId
+    domain_id: ExecutionDomainId = ExecutionDomainId(0)
+    release_values: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ValueTransfer:
+    value_id: int
+    source: ExecutionDomainId
+    target: ExecutionDomainId
+    after_task: TaskId
+    before_task: TaskId
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleDecision:
+    graph_digest: str
+    timeline_digest: str
+    tasks: tuple[PhysicalTask, ...]
+    fallback_count: int
+    signature: str
+    region_ends: tuple[int, ...]
+    materialized_values: tuple[int, ...]
+    materialization_bytes: int
+    peak_memory_bytes: int
+    fence_count: int
+    state_plan_digest: str | None
+    schema_version: int = 1
+    transfers: tuple[ValueTransfer, ...] = ()
+    transfer_cost: int = 0
+
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalPlan:
+    plan_epoch: int
+    schedule_signature: str
+    tasks: tuple[PhysicalTask, ...]
+    fallback_count: int
+    region_ends: tuple[int, ...]
+    materialized_values: tuple[int, ...]
+    schema_version: int = 1
+    transfers: tuple[ValueTransfer, ...] = ()
+
+
+
+__all__ = [
+    "ExecutionDomainFact",
+    "ExecutionDomainId",
+    "TransferLinkFact",
+    "ValueTransfer",
+    "ConditionalLayerReplay",
+    "TaskResourceFact",
+    "ValueResourceFact",
+    "AnchorId",
+    "AnchorSymbol",
+    "ExecutionKind",
+    "HiddenInputSource",
+    "HostServiceId",
+    "HostServiceInputSource",
+    "HostServicePort",
+    "HostPayloadSchemaId",
+    "ImplementationId",
+    "PhysicalPlan",
+    "PhysicalTask",
+    "PackedRowsInputSource",
+    "PackedSamplerRowsInputSource",
+    "SamplerFeedbackInputSource",
+    "ScheduleDecision",
+    "SchedulerTimeline",
+    "SemanticEdge",
+    "SemanticEffect",
+    "SemanticGraph",
+    "SemanticInput",
+    "SemanticOutput",
+    "SemanticOutputKind",
+    "SemanticState",
+    "SemanticTask",
+    "StepIdInputSource",
+    "StateEffectKind",
+    "StateResource",
+    "StateScope",
+    "StateSelectionInputSource",
+    "TaskId",
+    "TaskImplementationSpec",
+    "TaskSymbol",
+    "TaskResultInputSource",
+    "TimelineAnchor",
+    "TimingConstraint",
+    "WorkloadId",
+]

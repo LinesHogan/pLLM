@@ -5,6 +5,7 @@ from os import PathLike
 
 import torch
 from transformers import PreTrainedModel
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 
 class Qwen2Projection(torch.nn.Module):
@@ -26,6 +27,8 @@ class Qwen2Model(torch.nn.Module):
 
 class Qwen2ForCausalLM(PreTrainedModel):
     model: Qwen2Model
+
+    def __init__(self, config: Qwen2Config) -> None: ...
 
     @classmethod
     def from_pretrained(

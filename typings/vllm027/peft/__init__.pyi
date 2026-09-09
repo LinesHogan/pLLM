@@ -32,6 +32,8 @@ class PeftModelForCausalLM(Module):
         attention_mask: torch.Tensor | None,
         use_cache: bool,
         return_dict: bool,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
     ) -> object: ...
 
 

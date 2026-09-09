@@ -1,0 +1,16 @@
+[package]
+name = "pllm_core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "pllm_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+isl-rs = "=0.3.1"
+pyo3 = { version = "0.23", features = ["abi3-py311"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

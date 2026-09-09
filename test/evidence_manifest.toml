@@ -1,29 +1,35 @@
 schema_version = 1
-target_count = 41
+target_count = 47
 maximum_count = 50
-active_executable_count = 22
-pending_survivor_count = 19
-active_executable_ids = [1, 2, 3, 5, 9, 10, 11, 12, 13, 15, 19, 20, 21, 22, 23, 24, 25, 30, 32, 37, 38, 39]
+active_executable_count = 47
+selected_execution_count = 50
+pending_survivor_count = 0
+active_executable_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
 
-# The active count is deliberately not the terminal evidence set.  It records
-# the executable survivor bases left after deleting stale old-stack tests:
-# four Rust tests, twelve pytest items and four standalone GPU smokes.
-# The remaining IDs are debt tied to the
-# corresponding cutover tranche; they must be added as compact observable
-# oracles or public runtime smokes, not restored as legacy class-hierarchy or
-# wrapper tests.
+# 26 pytest + 8 Rust + 13 selected runtime commands + 3 benchmark comparisons.
+# Huber is one lifecycle oracle across device/shape inputs. Retire the duplicate
+# in-process FTTT/ReFT combination; 36 keeps its MP retry, 34/42 the component boundaries.
+# LoRA's shared and independent comparisons count separately, although one command runs both.
+# Dummy's duplicate in-process slice is retired: its math/export is covered by 20,
+# shared in-process hidden capture by 30, and its distinct EngineCore boundary by 36.
+# Executable evidence does not imply coverage of unsupported topologies or algorithms.
 
 [[evidence]]
 id = 1
 name = "layout_and_dense_ids_are_canonical_and_tamper_evident"
 group = "rust"
+path = "rust/pllm_core/src/planning/tensor_layout.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml equal_descriptors_share_dense_ids_and_tampering_is_rejected"
+environment = "Rust toolchain; CPU"
+observable_contract = "Equal layout descriptors share dense IDs, distinct descriptors do not; IDs span a dense namespace, namespace changes preserve descriptor digests, and forged IDs fail original decision validation"
+replaces = "Legacy layout interning and duplicate Python layout validator tests"
 
 [[evidence]]
 id = 2
 name = "semantic_graph_closed_codec_rejects_schema_drift"
 group = "rust"
-path = "rust/tllm_core/src/canonical/semantic_graph.rs"
-command = "cargo test --manifest-path rust/tllm_core/Cargo.toml semantic_graph_closed_codec_rejects_schema_drift"
+path = "rust/pllm_core/src/planning/semantic_graph.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml semantic_graph_closed_codec_rejects_schema_drift"
 environment = "Rust toolchain with cached dependencies; CPU"
 observable_contract = "Closed graph codec roundtrip; missing/duplicate/unknown fields and variants rejected; schema and state references checked; semantic changes alter canonical digest"
 replaces = "Python DTO semantic validation and repeated schema fixture tests"
@@ -32,36 +38,61 @@ replaces = "Python DTO semantic validation and repeated schema fixture tests"
 id = 3
 name = "scheduler_matches_exhaustive_small_dag_oracle"
 group = "rust"
-path = "rust/tllm_core/src/canonical/scheduler.rs"
-command = "cargo test --manifest-path rust/tllm_core/Cargo.toml scheduler_matches_exhaustive_small_dag_oracle"
+path = "rust/pllm_core/src/planning/scheduler.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml scheduler_matches_exhaustive_small_dag_oracle"
 environment = "Rust toolchain with cached dependencies; CPU"
-observable_contract = "All 64 directed edge subsets on three tasks across 216 window assignments match independent enumeration of feasible earliest placements and topological orders; result dependencies, duplicate edges, cycles, capability choice, tamper rejection and ambiguous state-effect ordering; not an AER partition or exact-version oracle"
+observable_contract = "All 64 directed edge subsets on three tasks across 216 window assignments match independent feasibility enumeration; placements respect earliest feasible lower bounds and topological orders; result dependencies, duplicate edges, cycles and capability choice; joint AER optimality belongs to evidence 4, exact-version hazards to evidence 7"
 replaces = "Legacy Rust scheduler timing/dependency tests and duplicate explicit producer-to-consumer edge requirements"
 
 [[evidence]]
 id = 4
 name = "aer_matches_bruteforce_partition_oracle"
 group = "rust"
+path = "rust/pllm_core/src/planning/aer.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml aer_matches_bruteforce_partition_oracle"
+environment = "Rust toolchain; CPU"
+observable_contract = "1296 three-task DAG/window/implementation-class/memory-budget combinations match an independent labelled-partition and per-task-placement enumeration; exact lexicographic boundary bytes, region count, anchor-envelope peak memory, dependency boundaries and placement tie-break; conditional replay remains a closed region. This is a single-execution-domain anchor-envelope model, not distributed/capture or PTTS joint optimality"
+replaces = "Provisional per-task earliest-anchor scheduler; no separate semantic or region graph owner"
 
 [[evidence]]
 id = 5
 name = "representation_selection_and_capacity_are_signed_once"
 group = "rust"
+path = "rust/pllm_core/src/planning/state_representation.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml representation_selection_and_capacity_are_signed_once"
+environment = "Rust toolchain; CPU"
+observable_contract = "70 old-read timing, arena entitlement and total-memory-budget combinations match an independent two-resource provider product; reject cheap mutable storage when old versions must survive, account original arena reservation plus workspace/backend bytes in AER peak, and mechanically project/sign the selected state. Fixed candidate capacities and single execution domain only; dynamic pin/completion-derived live-version capacity and distributed placement remain pending"
+replaces = "Independent cheapest-state selection, standalone state compile/lower/validation/reconstruction FFI, duplicate Rust JSON hashing, mirrored Python wire DTOs and Python semantic validation"
 
 [[evidence]]
 id = 6
 name = "physical_plan_is_mechanical_and_reconstruction_is_exact"
 group = "rust"
+path = "rust/pllm_core/src/planning/scheduler.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml physical_plan_is_mechanical_and_reconstruction_is_exact"
+environment = "Rust toolchain; CPU"
+observable_contract = "Resource-constrained AER solution lowers mechanically with the same task record and boundaries; verification evaluates the selected placement once, without enumerating alternatives. A legal nonoptimal witness is preserved; even rehashed invalid timing, duplicate tasks, dependency order or memory claims are rejected. Original physical projection, signature, epoch and local resource drift remain checked; spawned CPU reconstruction is evidence 18"
+replaces = "Duplicate ScheduledTask/PhysicalTask schemas and task-name/anchor-name mirrors; old Rust physical projection fixture coverage"
 
 [[evidence]]
 id = 7
 name = "versioned_state_hazards_and_timing_match_oracle"
 group = "rust"
+path = "rust/pllm_core/src/planning/scheduler.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml versioned_state_hazards_and_timing_match_oracle"
+environment = "Rust toolchain; CPU"
+observable_contract = "144 three-task state-machine executions cover explicit update chains versus stale WAW, RAW producer visibility, mutable WAR versus retained old reads, private transition/publication aliases, maybe-effects and fixed timing; unknown/self/wrong-resource sources, missing/duplicate publication and cycles rejected; original state-plan capability drift invalidates the signed schedule"
+replaces = "Coarse pairwise effect-conflict ordering and ambiguity rejection; no runtime version mirror"
 
 [[evidence]]
 id = 8
 name = "distributed_placement_transfer_matches_small_topology_oracle"
 group = "rust"
+path = "rust/pllm_core/src/planning/scheduler.rs"
+command = "cargo test --manifest-path rust/pllm_core/Cargo.toml distributed_placement_transfer_matches_small_topology_oracle"
+environment = "Rust toolchain; CPU-only topology oracle, no distributed executor required"
+observable_contract = "48 two-domain fanout topologies match independent labelled partition, per-task anchor and domain enumeration: explicit directed-link availability/delay/cost, per-domain reservation/workspace/residency and one shared destination copy. Rehashed transfer/domain/cost tampering and capacity drift are rejected; fixed legal witness reconstruction does not reselect. Domain-local implementation availability and exact provider/domain/device binding are checked. Conservative anchor-envelope planning over direct links only; actual transport, routed transfers and multi-arena commit are not claimed"
+replaces = "Single-domain-only AER placement and globally preselected implementation; extends original graph index, timeline, state provider and signed physical plan without a distributed graph copy"
 
 [[evidence]]
 id = 9
@@ -108,10 +139,11 @@ id = 13
 name = "cuda_ptts_waits_for_exact_fence_before_reclaim"
 group = "ptts"
 requires_gpu = true
+requires_mp = true
 path = "test/gpu/test_page_bundle_cuda.py"
-command = "/workspace/pllm/.venv/bin/python -m pytest -q test/gpu/test_page_bundle_cuda.py"
-environment = "Repository venv with torch and rebuilt Rust extension; CUDA GPU"
-observable_contract = "Actual CUDA two-root AdamW COW, immutable old values; delayed reading of an original borrowed page blocks reclaim until its pin stream event completes; no reads after release; forged receipts rejected; full reclaim and stable pool addresses"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/gpu/test_page_bundle_cuda.py::test_cuda_ptts_waits_for_exact_fence_before_reclaim"
+environment = "Repository .venv with torch and rebuilt Rust extension; CUDA GPU and a same-GPU spawn worker"
+observable_contract = "Actual CUDA two-root AdamW COW, immutable old values, event-gated reclaim and stable addresses. Direct original-slot five-field AdamW capture matches independent torch.optim.AdamW across nonaligned multi-tile fields, 2/1/2 reordered states, NaN padding and authorized zero gradients with momentum/decay; cold capture restoration, read-only rejection and abort preserve original pins. An opt-in shared CUDA provider exports original read pins and exclusive private writes through PyTorch storage IPC, never CPU staging. A real child reads the old page and writes the original private page; exact acknowledgements follow receiving-stream completion, block premature publication/reclaim, and permit commit or abort with full capacity recovery. GPU UUID, storage extent and malformed handle rejection precede import. Same physical GPU only; no EngineCore auxiliary GPU IPC or distributed task execution is claimed"
 replaces = "test/gpu/test_canonical_cuda_dense_page_smoke.py; no separate CPU/CUDA state owners"
 
 [[evidence]]
@@ -119,6 +151,11 @@ id = 14
 name = "cuda_graph_pagebundle_keeps_stable_addresses_across_versions"
 group = "ptts"
 requires_gpu = true
+path = "test/gpu/test_page_bundle_cuda.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/gpu/test_page_bundle_cuda.py::test_cuda_graph_pagebundle_keeps_stable_addresses_across_versions"
+environment = "Repository .venv; real CUDA Graphs on a nondefault stream"
+observable_contract = "One captured gather reads four successive COW versions through stable caller-owned indices/buffers, including an unchanged scalar page and an old pinned root. One captured private gather/compute/scatter graph writes three subsequent versions; only the original PageWrite publishes. In-flight abort waits for CUDA writes and preserves latest. Forged/released pins, consumed writes, stream drift, address drift and scratch aliases are rejected; all original arena capacity is reclaimed. Scratch must be budgeted as AER workspace; no model-wide capture claim"
+replaces = "Address-only require_stable helper; no separate capture version or release ledger"
 
 [[evidence]]
 id = 15
@@ -127,7 +164,7 @@ group = "boundary"
 path = "test/boundary/test_backend_attachment.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_backend_attachment.py"
 environment = "Repository venv with torch and rebuilt Rust extension; CPU"
-observable_contract = "Real ESamp and In-Place compile_backend share original plan/probe facts and timeline; schema 3 signs original overlay target/operator/fields and rejects tampering, unsupported compositions and operators; exact tasks, hidden bindings, field membership and stage ordering; mismatched layout and reconstruction drift rejected; missing/unknown/duplicate fields and retired flattened wire rejected. In-layout mathematical field roles remain workload bindings"
+observable_contract = "Real ESamp and In-Place compile_backend share original plan/probe facts and timeline; schema 4 signs original overlay target/operator/fields/scaling; exact tasks, hidden bindings, field membership and original plan event timing; mismatched layout and reconstruction drift rejected; missing/unknown/duplicate fields rejected. TLM evidence 24 also checks LOW_RANK_ADD scaling tamper. In-layout mathematical field roles remain workload bindings"
 replaces = "test_canonical_backend_attachment_unit.py and test_parameter_overlay_attachment_unit.py; one shared native boundary proof without per-attachment DTO fixture families"
 
 [[evidence]]
@@ -135,18 +172,33 @@ id = 16
 name = "closed_mp_codec_round_trips_registered_payload_and_shared_tensors"
 group = "boundary"
 requires_mp = true
+path = "test/boundary/test_shared_page.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_shared_page.py::test_closed_mp_codec_round_trips_registered_payload_and_shared_tensors"
+environment = "Repository .venv; CPU spawn workers and OS shared file mappings; no GPU or EngineCore"
+observable_contract = "The original signed pool is shared without export-time tensor copies, proven by backing inode equality. Two readers retain one original exact pin across COW and retire until both acknowledge their exact access. Wrong acknowledgement or EOF prevents reuse; malformed compilation, access, resource and offset are rejected. Owned auxiliary mappings reuse original generic inputs, reject peer/inode/extent/FD drift and outlive exporting FDs; completion capture writes the original tensor in identity order, rejecting incomplete or mis-shaped rows. No Python type-path imports or second version ledger"
+replaces = "Legacy reflective tensor wire and independent MP page lifetime ownership"
 
 [[evidence]]
 id = 17
 name = "mp_transaction_commit_abort_and_quorum_failure_are_atomic"
 group = "boundary"
 requires_mp = true
+path = "test/boundary/test_shared_page.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_shared_page.py::test_mp_transaction_commit_abort_and_quorum_failure_are_atomic"
+environment = "Repository .venv; two CPU spawn writers, one original PageBundleArena; no distributed arenas or EngineCore"
+observable_contract = "Workers write distinct private fields of the original multi-root PageWrite. Exclusive grants block new local borrows and duplicate grants; callers discard existing aliases before export. Incomplete quorum cannot publish either root. Full completion permits one atomic publication with the original receipt and immutable old pins. Abort waits for remote writers before reclaim and preserves old roots. Invalid completion retains the uncommitted write, blocks its lineage and rejects commit/abort; consumed and forged writes are rejected. EngineCore command execution remains evidence 36"
+replaces = "Separate worker version stores and MP transaction ledgers; original arena prepare/publish/abort owns the entire visibility boundary"
 
 [[evidence]]
 id = 18
 name = "worker_reconstructs_exact_signed_plan_and_rejects_local_drift"
 group = "boundary"
 requires_mp = true
+path = "test/boundary/test_worker_reconstruction.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_worker_reconstruction.py"
+environment = "Repository .venv, cattrs and rebuilt Rust extension; CPU spawn process with byte-only pipe payloads"
+observable_contract = "The original PlanBundle is decoded without type-path imports; a spawned worker compares the submitted signature and its own provider catalog, reconstructs the original arena, publishes real tensor values and retires them only after the original pin is released. Signature, local capacity, epoch, unknown/duplicate fields, bool-as-int and object-as-array drift are rejected. No worker optimization or fallback; shared tensor IPC and quorum are separate evidence 16/17, while EngineCore remains pending"
+replaces = "Handwritten layout/state/schedule/attachment field mirrors, request identity wire methods, and optimization during plan reconstruction"
 
 [[evidence]]
 id = 19
@@ -155,7 +207,7 @@ group = "boundary"
 path = "test/workloads/test_host_transaction.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_host_transaction.py"
 environment = "Repository venv with torch and Rust extension; CPU"
-observable_contract = "Precommit failure restores actual dynamics and FIFO; postpublish failure returns the original issued receipt without repeating host effects; cloned and double-settled receipts rejected"
+observable_contract = "Precommit failure restores actual dynamics and FIFO; postpublish failure returns the original HostReceipt without repeating host effects; cloned and double-settled receipts rejected. The same bounded trace records prepare/publish/failure/settlement under the original receipt ID, round-trips the closed codec, and drops oldest events at exact capacity. Deterministic host timing excludes incomplete pairs after overflow; no tensor or prompt snapshots"
 replaces = "Duplicated workload-specific receipt and transaction lifecycle tests"
 
 [[evidence]]
@@ -165,7 +217,7 @@ group = "workload"
 path = "test/workloads/test_dummy.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_dummy.py"
 environment = "Repository Python venv with torch and freshly built Rust extension; CPU"
-observable_contract = "Compile a semantic graph, execute its signed Rust plan, skip by stride and export exact bounded rows with ownership isolated from later input mutation; zero fallback"
+observable_contract = "Original TensorStepInput drives host and signed stateless observation paths; decode-only row selection, disabled/stride gating, owned CPU export and configuration/hidden-source tamper rejection. Original bounded trace preserves exact dtype/shape/bytes, NaN/Inf and large integers through its closed codec, rejects oversized snapshots and drops oldest entries. Evidence 36 --dummy-inprocess compares actual selected-layer values to an independent model hook; --dummy-only returns original request/step-linked snapshots from EngineCore with parent CUDA off"
 replaces = "test/core/test_canonical_dummy_workload_unit.py; legacy consumer import removed"
 
 [[evidence]]
@@ -175,7 +227,7 @@ group = "workload"
 path = "test/workloads/test_fttt.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_fttt.py"
 environment = "Repository venv with torch and Rust extension; CPU"
-observable_contract = "Independent feature projection and PyTorch Adam match edit outputs after rollback, two updates, retry/stop/accept settlement and a no-update branch; zero fallback"
+observable_contract = "Independent feature projection and PyTorch Adam match edit outputs after rollback, two updates and retry/stop/accept settlement; public feedback loop preserves original completion and prompt identity, gates update-dependent retries, stops accepted/exhausted requests and regenerates complete TTRL vote groups within a finite bound; zero fallback. Model application of FTTT edit_delta is not covered"
 replaces = "test/core/test_canonical_fttt_workload_unit.py; no consumer hierarchy fixtures"
 
 [[evidence]]
@@ -214,65 +266,115 @@ name = "esamp_predicts_before_training_and_isolates_request_versions"
 group = "workload"
 path = "test/workloads/test_esamp.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_esamp.py"
-environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Fixed-seed initialization; independent gated-residual/layernorm and torch.optim.AdamW including row averaging, gradients, moments and steps; cancellation after prediction/loss and prepublication failure preserve roots/capacity; failed admission publication restores capacity and permits retry; postpublication output failure retains original invocation/receipt and finish retries without another update; same-ID sample isolation, immutable guidance, sampler-gated training, exact cleanup and zero fallback"
+environment = "Repository Python venv with torch and Rust extension; CPU and CUDA"
+observable_contract = "Ordinary ESamp named parameters and fixed-seed initialization; independent gated-residual/layernorm and torch.optim.AdamW for ordinary and paged math, including per-state row averaging, gradients, moments and steps; request-key metadata and input-pin versions, reordered sampler links; incompatible ordinary math rejected by specialized kernels; cancellation and prepublication failure preserve roots/capacity; failed admission publication permits retry; postpublication output failure retains original invocation/receipt without another update; same-ID sample isolation, immutable guidance, sampler-gated training, exact cleanup and zero fallback"
 replaces = "Historical ESamp base-consumer/per-request training and hidden-storage numerical contracts; no legacy classes, benchmark selection fixtures or mock-count assertions"
 
 [[evidence]]
 id = 26
 name = "reft_matches_loreft_math_and_publish_skip_semantics"
 group = "workload"
+path = "test/workloads/test_reft.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_reft.py"
+environment = "Repository .venv, CPU and rebuilt Rust extension"
+observable_contract = "Independent scalar LoReFT math; checkpoint loading, zero initialization, publication/skip, immutable prior pin and rejected replacement rollback. With vLLM installed, the same CPU evidence also checks signed per-request constant addition, reordered original prompt keys, exact prefill row selection, shared published-pin lifetime and partial-write rollback. Evidence 36 edit slices exercise actual FTTT edits in process and EngineCore"
+replaces = "Legacy ReFT consumer math and checkpoint/publication tests"
 
 [[evidence]]
 id = 27
 name = "recirculation_selects_rows_and_replays_typed_effect"
 group = "workload"
+path = "test/workloads/test_recirculation.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_recirculation.py"
+environment = "Repository .venv, CPU and rebuilt Rust extension"
+observable_contract = "Independent serial normal/mix/replay oracle, exact current-slot versus prior-token KV, prefill-only selection, disabled and zero-source branches, ramp and explicit/complementary beta; current-token failure rollback and between-token cancellation preserve completed history; original graph/task/rows and empty-root pin/completion, no dummy state or version ledger"
+replaces = "Historical Recirculation recurrence graph, stage binder and serial reference tests without old runtime ownership assertions"
 
 [[evidence]]
 id = 28
 name = "override_matches_reweight_adam_and_final_noop"
 group = "workload"
+path = "test/workloads/test_override.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_override.py"
+environment = "Repository .venv, CPU/CUDA and rebuilt Rust extension"
+observable_contract = "Independent iterative-head reweight/Adam and shared/request row-domain AdamW oracles on CPU/CUDA; separate forward/dx/dW/update masks, consecutive forward storage/offset borrowing and irregular packing, first-order chains, parameter gradients without publication, update-only zero gradients with nonzero moments/decay, no-update fields/version preservation, sampled-token predicates and early/post-update feedback rejection, invalid mask and unbatched shared gradient-domain rejection; actual-token provenance, immutable old pins, publication rollback, signature/stage tamper and cleanup"
+replaces = "Historical OverRIDE math/sampler workload tests without Program or runtime ownership assertions"
 
 [[evidence]]
 id = 29
 name = "ttrl_matches_reward_update_retry_and_control_quorum"
 group = "workload"
+path = "test/workloads/test_ttrl.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_ttrl.py"
+environment = "Repository .venv; CPU and CUDA with nondefault stream when available; current checkpoint ran both"
+observable_contract = "Normalized boxed majority with stable ties, declared vote/sample selection, independent MSE/Adam and all optimizer fields, original completion/retry/barrier objects in one result, exact arena publication, no-reward/disabled skip, immutable old pin, prepublication abort and postpublication original-receipt finish retry; no independent output queues or version ledger"
+replaces = "Historical TTRL reward, verifier, optimizer and split-output quorum tests; no TTRL runtime/session restored"
 
 [[evidence]]
 id = 30
 name = "public_mrv2_esamp_trains_pins_sampler_and_cleans_request"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_esamp_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_esamp_smoke.py"
+environment = "Repository .venv; vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager model and captured training"
+observable_contract = "Plain inference then attached ESamp through the public factory; two Rust-selected captured tasks execute without eager loss/optimizer, two losses/updates and sampler completions, nonempty output, no active lineages or pending releases, zero fallback"
+replaces = "Legacy plain/canonical routing and ESamp public hidden/sampler/training smoke"
 
 [[evidence]]
 id = 31
 name = "mrv1_adapter_captures_exact_rows_and_sampler_links"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_mrv1_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_mrv1_smoke.py"
+environment = "Repository .venv; vLLM 0.27.1 MRv1, Qwen2.5-0.5B BF16, single GPU, eager synchronous persistent batch, n=1"
+observable_contract = "Actual MRv1 persistent-batch columns independently reproduce 21 packed rows across prefill/decode and widths 2/1, original request IDs and sampler links; six finite-support reweight comparisons, nine losses/updates, three owned completion rows and zero pending roots/fallback. Uses the shared invocation, not a converted MRv2 InputBatch; KV replay is not claimed"
+replaces = "Legacy MRv1 row/sampler adapter tests; no duplicate workload matrix"
 
 [[evidence]]
 id = 32
 name = "public_vllm_dense_overlay_pins_two_request_versions"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_inplace_ttt_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_inplace_ttt_smoke.py"
+environment = "Repository .venv; vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager in-process"
+observable_contract = "Two public requests capture dense operands and update original private fields; six updates/trained rows, eight applied rows including two updated-version rows, no active lineages or pending releases, zero fallback"
+replaces = "Legacy dense parameter overlay and per-request backend lifecycle smoke"
 
 [[evidence]]
 id = 33
 name = "public_vllm_low_rank_overlay_pins_and_releases_global_version"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_tlm_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_tlm_smoke.py --mode online; /workspace/pllm/.venv/bin/python test/gpu/vllm_tlm_smoke.py --mode offline"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B-Instruct BF16, single GPU, eager in-process, dropout=0, no prefix caching"
+observable_contract = "Each mode trains exactly once, publishes one instance version and preserves it across generate calls; online requests keep the pre-update pin, offline requests apply the pre-model publication; 48 real fused-QKV calls per mode match independent PyTorch q/v arithmetic and unchanged k; inference-only call does not train; request pins/releases and close-time instance retirement clean up with zero fallback"
+replaces = "Legacy TLM/global-overlay smoke; one shared public boundary instead of a separate TLM runner/session"
 
 [[evidence]]
 id = 34
 name = "public_vllm_reft_applies_activation_patch"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_reft_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_reft_smoke.py"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager, no prefix caching"
+observable_contract = "One explicit publication patches exactly four selected prefill rows through original admission pins; independent tensor arithmetic, unselected rows and residual preserved; no-update call skips and close retires with zero fallback"
+replaces = "Legacy ReFT activation hook smoke"
 
 [[evidence]]
 id = 35
 name = "public_vllm_recirculation_replays_signed_layer_rows"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_recirculation_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_recirculation_smoke.py"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, FA2, eager in-process, n=1, no prefix caching"
+observable_contract = "8 normal rows and 6 prefill replay rows over two requests; 14 independent PyTorch attention/MLP and current-slot KV comparisons; preserved historical KV and RNG, each next normal token sees its predecessor's replayed KV; decode no-replay, normal output retained and zero owned state roots/fallback"
+replaces = "Legacy prefill recurrence smoke and typed replay callback/binder machinery; uses original model invocation and signed tokenwise effect"
 
 [[evidence]]
 id = 36
@@ -280,16 +382,22 @@ name = "enginecore_mp_executes_closed_plan_and_returns_quorum"
 group = "runtime"
 requires_gpu = true
 requires_mp = true
+path = "test/gpu/enginecore_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/enginecore_smoke.py; /workspace/pllm/.venv/bin/python test/gpu/enginecore_smoke.py --mrv1-captured"
+environment = "Repository .venv; vLLM 0.27.1, Qwen2.5-0.5B, MRv2/eager/FA2 plus MRv1 captured ESamp, TP1/PP1/DP1, actual EngineCore spawn child; final GPU IO slice intentionally initializes frontend CUDA"
+observable_contract = "Frontend planning and default CPU feedback do not initialize CUDA; only the child owns the arena. Original identities and shared inputs are staged under scheduling pause. ESamp trains across slots and calls; CPU completion drives FTTT/TTRL, ReFT and TLM use original shared inputs with real updates. Opt-in CUDA IO preserves a strided offset input's original allocation alias, demonstrated by an ordered pre-launch mutation; ReFT publishes once and changes output. FINISH confirms destination writes; owned CPU/CUDA outputs survive worker shutdown. All fallback counts are zero. State import and CPU IO still perform explicit device copies; cross-GPU transport and distributed consensus are not claimed"
+replaces = "In-process runner reach-through as the sole public routing option; no second MP scheduler/session or parent arena"
 
 [[evidence]]
 id = 37
 name = "cuda_graph_replay_preserves_training_and_zero_fallback"
 group = "runtime"
 requires_gpu = true
-path = "test/gpu/canonical_esamp_cuda_graph_replay_smoke.py"
-command = "/workspace/pllm/.venv/bin/python test/gpu/canonical_esamp_cuda_graph_replay_smoke.py"
+path = "test/gpu/esamp_cuda_graph_replay_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/esamp_cuda_graph_replay_smoke.py"
 environment = "Repository Python venv with torch and Rust extension; CUDA GPU"
-observable_contract = "Cancellation after prediction or loss permits subsequent training; capture/replay preserves stable addresses, four nonzero losses and updates; delayed prediction writes prove sampler readiness covers the produced result; retirement of a cancelled in-flight sampler waits for its actual CUDA completion event before releasing state; exact cleanup and zero fallback"
+observable_contract = "Original arena captures batched production low-rank loss/backward and private AdamW separately. Three replays reorder two original request roots with unequal row counts and change inputs and exact versions without eager math; all losses, gradients, parameters, moments and steps match independent PyTorch. Cold capture leaves private state unchanged; abort preserves latest, old pins stay immutable, buffers stay fixed and publication is outside capture. Rust-selected cold-bound StateExecution runs without eager loss/AdamW, preserving cancellation, sampler readiness, in-flight retirement, cleanup and zero fallback. Insufficient residency or invalid shapes reject binding and reclaim cold pages"
+coverage_gap = "Task capture accepts dynamic row/state counts within signed fixed-buffer bounds; 2 -> 1 -> 2 states and NaN padding have independent loss/gradient checks, followed by common-gradient independent AdamW checks. Public model-backed training is covered by 30 and dynamic EngineCore execution by the --captured-only slice of 36. Automatic sizing, whole-model capture and general signed-region fusion remain unimplemented"
 replaces = "Historical ESamp CUDA capture/replay lifecycle smokes; no separate CPU/CUDA task-structure assertions"
 
 [[evidence]]
@@ -297,6 +405,11 @@ id = 38
 name = "fttt_cuda_host_receipt_crosses_stream_boundary"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/fttt_cuda_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/fttt_cuda_smoke.py"
+environment = "Repository .venv; CUDA GPU, distinct producer and consumer streams, no vLLM model required"
+observable_contract = "Original CompletionInput readiness orders producer hidden rows onto host execution; finite nonzero edit, one loss/update, state version one and settled retry intent, zero fallback"
+replaces = "Legacy FTTT host-service CUDA receipt and stream synchronization smoke"
 
 [[evidence]]
 id = 39
@@ -305,16 +418,90 @@ group = "release"
 path = "test/release/test_wheel.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/release/test_wheel.py"
 environment = "Repository Python venv, maturin, pip and cached Rust build dependencies; no GPU or MP"
-observable_contract = "Fresh sdist builds a non-editable wheel that imports its own Python/native module, declares tensor dependencies, executes Rust layout codec, and contains no residual packages or bootstrap plugin"
+observable_contract = "Fresh sdist builds a non-editable wheel whose Python/stub files exactly match the current source tree; isolated imports cover all eleven workload modules and their own Python/native provenance, CPU factory compiles the original signed plan without CUDA initialization, Rust layout codec executes, required dependencies/license exist, and retired packages/bootstrap plugins are absent"
 replaces = "Legacy package/import probes; original plan evidence 39 had no executable survivor"
 
 [[evidence]]
 id = 40
 name = "learning_publication_conditional_replay_matches_reference"
 group = "workload"
+path = "test/workloads/test_conditional_replay.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_conditional_replay.py"
+environment = "Repository .venv, CPU and rebuilt Rust extension"
+observable_contract = "Shared signed update/publication/replay graph; independent outer-product update and two-iteration recurrence; mixed request update/skip, tail-only publication skips, exact new pin and immutable old pin, KV rollback on failure/cancellation, original postpublish settlement, signed loop bound and cleanup"
+replaces = "New combination boundary 40; no separate replay state owner or callback DTO fixture"
 
 [[evidence]]
 id = 41
 name = "public_conditional_replay_preserves_kv_rng_and_request_isolation"
 group = "runtime"
 requires_gpu = true
+path = "test/gpu/vllm_conditional_replay_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_conditional_replay_smoke.py"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, FlashAttention2, single GPU, eager, no prefix caching"
+observable_contract = "Two request updates and four replay iterations; independent PyTorch attention/MLP and current-slot KV oracle with BF16 operand-rounding bounds; exact historical KV, normal output and CUDA RNG preservation; decode no-update skip, original pin lifecycle and zero fallback"
+replaces = "New combination boundary 41; old callback replay backend and typed_replay contract deleted"
+
+[[evidence]]
+id = 42
+name = "public_sampler_prefilter_add_returns_exact_sampled_feedback"
+group = "runtime"
+requires_gpu = true
+path = "test/gpu/vllm_override_smoke.py"
+command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_override_smoke.py"
+environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager, n=1"
+observable_contract = "Final norm capture and pre-filter delta match independent original-arena arithmetic; stock draw returns exact public tokens via original identity; 4 updates, 6 sampler checks, 12 sampled decode tokens, final iteration has no update. Three real structured completions across a two-request scheduler share one CompletionInput with independent last-norm row comparisons; public host factory FTTT and TTRL each train once on that same batch and retain the original Completion references; cleanup and zero fallback"
+replaces = "One reserve slot for the new pre-filter/actual-token feedback adapter mechanism, not a duplicate per-workload smoke matrix"
+
+[[evidence]]
+id = 43
+name = "output_lora_shared_weighted_ce_matches_sgd_and_original_publication"
+group = "workload"
+path = "test/workloads/test_lora.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_lora.py::test_weighted_ce_shared_update_matches_sgd_and_preserves_original_pins"
+environment = "Repository .venv, CPU and rebuilt Rust extension; EngineCore integration extends evidence 36 via --lora-only"
+observable_contract = "Ordinary named-parameter/Batch/reset Tensor methods match independent torch.optim.SGD with unequal shared row weights, invalid/zero-weight row exclusion, per-batch seeded reset, immutable old pin and failed-publication rollback; original generic shared tensor input roundtrip; inference uses published A/B without another update. Public EngineCore slice confirms two SGD steps, one shared publication and changed real decode sampling probabilities with parent CUDA uninitialized"
+replaces = "Archived local_lora_trainer shared weighted-CE tests, without trainer banks/services; the same batched implementation serves independent state in evidence 44"
+
+[[evidence]]
+id = 44
+name = "independent_lora_bmm_and_capture_preserve_keyed_mean_and_private_publication"
+group = "workload"
+requires_gpu = true
+path = "test/workloads/test_lora.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_lora.py::test_independent_lora_bmm_and_capture_preserve_keyed_mean_and_private_publication"
+environment = "Repository .venv; CPU and same-GPU ordinary/paged eager/capture on a nondefault stream"
+observable_contract = "Independent serial torch.optim.SGD reference fixes archived per-adapter weighted CE then batch mean and seeded bank reset. Ordinary named Tensor math and explicit native replacements share the original graph; changed Batch sources rejected by specialized kernels. Reordered request keys, mixed update/no-update states, invalid padding, dynamic two-to-one capacity, immutable old pins, publication rollback, original gradient-trace identities and exact cleanup. CUDA uses original arena capture, not an adapter cache; EngineCore integration belongs to evidence 36"
+replaces = "Archived independent parameter banks, shape-group trainer bridge, silent capture fallback and per-adapter optimizer orchestration"
+
+[[evidence]]
+id = 45
+name = "public_esamp_equal_work_eager_capture_comparison"
+group = "benchmark"
+requires_gpu = true
+path = "tools/benchmark_esamp.py"
+command = "/workspace/pllm/.venv/bin/python -m tools.benchmark_esamp --batch 8 --tokens 256 --rounds 3"
+environment = "Repository .venv; Qwen2.5-0.5B, vLLM 0.27.1, BF16, n=1, no prefix caching"
+observable_contract = "One comparison runs eager and captured signed training with identical prompts, token budgets, sampling and warmup. Each measured arm performs exact nonzero loss/update counts with zero fallback and cleanup. Cold setup is separate from steady wall time and peak memory. Not comparable to retired n=16 workload numbers"
+replaces = "Retired oversized consumer benchmark; public correctness smokes alone did not provide a maintained performance entry"
+
+[[evidence]]
+id = 46
+name = "public_lora_shared_and_independent_eager_capture_comparison"
+group = "benchmark"
+requires_gpu = true
+path = "tools/benchmark_lora.py"
+command = "/workspace/pllm/.venv/bin/python -m tools.benchmark_lora"
+environment = "Repository .venv; Qwen2.5-0.5B, BF16 inference, FP32 heads, n=1, eight prompts, two training rows per state, rank four"
+observable_contract = "A complete run covers shared and independent state, comparing ordinary/explicit tensor and tensor/paged eager/captured public execution within each scope. Original public WeightedCEBatch input, identical seeds and effective loss/update/row counts, full model generation, original arena publication and cleanup. Reports cold setup, wall/process CPU time, output tokens, allocated baseline and peak. Optional fresh-instance profiling replays the same warmup and measurement rounds, validates the original plan and aggregate work, and reports CUDA kernel/API spans, outer host launch calls, graph-launch subset and memcpy bytes; not pure submission time or temporary-only bounds. Independent numerical reference remains in evidence 43/44"
+replaces = "Standalone serial/batched/captured kernel benchmark that bypassed the public runtime; no benchmark-only production implementation"
+
+[[evidence]]
+id = 47
+name = "independent_agent_huber_adaptation_preserves_frozen_request_adamw"
+group = "workload"
+path = "test/workloads/test_huber.py"
+command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_huber.py"
+environment = "Repository .venv; CPU and CUDA when available, two hidden/rank shapes"
+observable_contract = "Originally adapted independently by gpt-6 without core changes, against frozen reference_huber.py SHA256 e853832ffb6904c5dc8b2868e39af896ffc72b4518ebc3744049315f699b6281. Three unequal/reordered mixed-state updates plus singleton and repeated-single-state updates; the latter borrow original parameter storage with broadcast strides. Pre-update version-gated guidance, per-request Huber loss, gradients and all AdamW fields, immutable old pins, cancellation and cleanup. Ordinary eager only; no native paged/capture or vLLM claim"
+replaces = "One independent adaptation experiment; no additional workload/runtime matrix"

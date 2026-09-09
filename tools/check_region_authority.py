@@ -25,12 +25,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # to legacy compatibility modules: that would turn this focused hard gate into
 # a migration inventory and encourage exemptions.
 AUTHORITY_FILES = (
-    Path("tllm/canonical/execution.py"),
-    Path("tllm/canonical/state_execution.py"),
-    Path("tllm/canonical/backend_program.py"),
-    Path("tllm/canonical_vllm/runtime.py"),
-    Path("tllm/canonical/host_runtime.py"),
-    Path("tllm/canonical_vllm/sampler.py"),
+    Path("rust/pllm_core/src/planning/aer.rs"),
+    Path("rust/pllm_core/src/planning/version_hazards.rs"),
+    Path("rust/pllm_core/src/planning/state_representation.rs"),
+    Path("rust/pllm_core/src/planning/scheduler.rs"),
+    Path("pllm/execution/replay.py"),
+    Path("pllm/execution/execution.py"),
+    Path("pllm/execution/state_execution.py"),
+    Path("pllm/authoring.py"),
+    Path("pllm/backends/vllm/runtime.py"),
+    Path("pllm/execution/host_runtime.py"),
+    Path("pllm/backends/vllm/sampler.py"),
 )
 
 # These are native binding surfaces outside the generic executor.  They must
@@ -38,13 +43,16 @@ AUTHORITY_FILES = (
 # workload names: worker statistics and registered backend primitives may use
 # those names without acquiring physical scheduling authority.
 NATIVE_BINDING_FILES = (
-    Path("tllm/backends/vllm/typed_layer_replay.py"),
+    Path("pllm/worker.py"),
+    Path("pllm/backends/vllm/replay.py"),
+    Path("pllm/backends/vllm/activation.py"),
+    Path("pllm/backends/vllm/parameter_overlay.py"),
 )
 
 PHYSICAL_FILES = frozenset(
     {
-        Path("tllm/canonical/execution.py"),
-        Path("tllm/canonical/state_execution.py"),
+        Path("pllm/execution/execution.py"),
+        Path("pllm/execution/state_execution.py"),
     }
 )
 
@@ -56,7 +64,7 @@ COMPILER_DISPATCH_FILES = frozenset(
 
 SAMPLER_FILES = frozenset(
     {
-        Path("tllm/canonical_vllm/sampler.py"),
+        Path("pllm/backends/vllm/sampler.py"),
     }
 )
 
@@ -95,7 +103,7 @@ def _line_violations(path: Path, source: str) -> list[Violation]:
         source = _production_rust(source)
     violations: list[Violation] = []
     consumer_pattern = re.compile(
-        r"tllm\.consumers|(?<![A-Za-z0-9_])(?:"
+        r"pllm\.consumers|(?<![A-Za-z0-9_])(?:"
         + "|".join(re.escape(name) for name in CONSUMER_NAMES)
         + r")(?![A-Za-z0-9_])",
         re.IGNORECASE,

@@ -1,5 +1,0 @@
-{
-  "comment": "Basic-tier pyright baseline (only-decrease). --rebase refuses total or per-bucket regressions.",
-  "total": 0,
-  "buckets": {}
-}

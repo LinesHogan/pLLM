@@ -1,0 +1,10 @@
+from collections.abc import Callable
+from typing import Generic, ParamSpec
+
+P = ParamSpec("P")
+
+class JITFunction(Generic[P]):
+    def __getitem__(self, grid: tuple[int, ...]) -> Callable[P, None]: ...
+
+def jit(fn: Callable[P, None]) -> JITFunction[P]: ...
+def next_power_of_2(n: int) -> int: ...

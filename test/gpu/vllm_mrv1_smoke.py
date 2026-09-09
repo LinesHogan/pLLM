@@ -1,0 +1,82 @@
+"""Evidence 31: actual MRv1 persistent rows and finite-support sampler intervention."""
+
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import torch
+from vllm import SamplingParams
+
+from pllm import make_llm
+from pllm.workloads.esamp_request import ESampRequestWorkload
+from pllm.workloads.esamp_request import ESampRequestConfig
+from pllm.backends.vllm import mrv1
+from pllm.config import RunnerKind, ModelConfig, VllmDType
+from pllm.backends.vllm.sampler import SamplerGuidance
+
+
+def main() -> None:
+    handle = make_llm(workload=ESampRequestWorkload(ESampRequestConfig(rank=2, intervention=True, intervention_beta=0.2)),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
+            64, 2, 128, 0.25, seed=7, runner=RunnerKind.MRV1))
+    native_rows, native_reweight = mrv1.encode_mrv1_rows, SamplerGuidance._reweight_finite_survivors
+    widths, phases, identities_seen = set(), set(), set()
+    row_checks = sampler_checks = affected_checks = 0
+
+    def inspect_rows(batch, scheduler, logits_indices, identities, **kwargs):
+        nonlocal row_checks
+        result = native_rows(batch, scheduler, logits_indices, identities, **kwargs)
+        expected, links = [], []
+        for request, key in enumerate(batch.req_ids):
+            start, prompt = int(batch.num_computed_tokens_cpu[request]), int(batch.num_prompt_tokens[request])
+            for offset in range(start, start + scheduler.num_scheduled_tokens[key]):
+                expected.append((key, offset, "prefill" if offset < prompt else "decode"))
+            links.append(len(expected) - 1)
+        assert [(row.identity.request_id, row.token_offset, row.phase.value) for row in result.row_batch.rows] == expected
+        assert [link.packed_row_index for link in result.links] == links == logits_indices.tolist()
+        assert all(row.identity is identities[row.request_ordinal] for row in result.row_batch.rows)
+        widths.add(batch.num_reqs)
+        phases.update(row.phase.value for row in result.row_batch.rows)
+        identities_seen.update(identity.prompt_idx for identity in identities)
+        row_checks += len(expected)
+        return result
+
+    def inspect_reweight(logits, guidance):
+        nonlocal sampler_checks, affected_checks
+        expected = logits.clone()
+        for index, row in enumerate(guidance.guidance.affected_row_ids):
+            finite = torch.isfinite(logits[row])
+            expected[row, finite] = (1 + guidance.guidance.beta) * logits[row, finite] - (
+                guidance.guidance.beta * guidance.pred_dense_logits[index, finite].to(logits))
+        actual = native_reweight(logits, guidance)
+        assert torch.equal(torch.isfinite(actual), torch.isfinite(logits))
+        torch.testing.assert_close(actual, expected)
+        sampler_checks += 1
+        affected_checks += len(guidance.guidance.affected_row_ids)
+        return actual
+
+    try:
+        assert isinstance(handle.runner, mrv1.Mrv1Runner)
+        assert handle.attachment.physical.adapter_id == "canonical.vllm_mrv1@1"
+        with patch.object(mrv1, "encode_mrv1_rows", inspect_rows), \
+             patch.object(SamplerGuidance, "_reweight_finite_survivors", staticmethod(inspect_reweight)):
+            batch = handle.generate(["The sky is", "Explain why water freezes at", "The sea is"],
+                SamplingParams(max_tokens=4, temperature=0.8, top_k=7, top_p=0.9, ignore_eos=True, logprobs=2),
+                prompt_indices=(7, 9, 11), feedback_group="mrv1")
+        assert widths == {1, 2} and phases == {"prefill", "decode"} and identities_seen == {7, 9, 11}
+        assert row_checks > 9 and sampler_checks > 0 and affected_checks > 0
+        assert batch.hidden.shape == (3, 896) and torch.isfinite(batch.hidden).all()
+        assert tuple(entry.identity.prompt_idx for entry in batch.completions.entries) == (7, 9, 11)
+        diagnostics = handle.worker_state().diagnostics
+        assert diagnostics.loss_count == diagnostics.update_count == 9
+        assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        print(dict(runner="mrv1", rows=row_checks, sampler_checks=sampler_checks, affected_rows=affected_checks,
+            updates=diagnostics.update_count, completion_rows=3, fallback=0))
+    finally:
+        handle.close()
+
+
+if __name__ == "__main__":
+    main()

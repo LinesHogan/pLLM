@@ -1,17 +1,18 @@
-# Canonical In-Place TTT
+# In-Place TTT
 
-In-Place-TTT now runs only on the clean-room canonical core. Its workload
+In-Place-TTT runs on the shared execution core. Its workload
 declares typed targets, chunk math, request state, effects, and timing; Rust
 selects the implementation and signs schedule, PTTS representation, and the
 parameter-overlay attachment.
 
 ```python
-import tllm
-from tllm.canonical.workloads.inplace_ttt import (
+import pllm
+from vllm import SamplingParams
+from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig, InPlaceTTTWorkload,
 )
-from tllm.canonical_vllm.runtime import CanonicalVllmConfig, CanonicalVllmDType
-from tllm.contracts.parameter_overlay import (
+from pllm import ModelConfig
+from pllm.contracts.parameter_overlay import (
     ParameterModuleKind, ParameterRole, ParameterTarget,
 )
 
@@ -26,17 +27,8 @@ workload = InPlaceTTTWorkload(InPlaceTTTConfig(
     update_prefill=True,
     update_decode=False,
 ))
-llm = tllm.make_llm(
-    workloads=(workload,),
-    canonical_config=CanonicalVllmConfig(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
-        dtype=CanonicalVllmDType.BFLOAT16,
-        max_model_len=512,
-        max_num_seqs=8,
-        max_num_batched_tokens=512,
-        gpu_memory_utilization=0.8,
-    ),
-)
+with pllm.make_llm(ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=workload) as llm:
+    outputs = llm.generate(["Explain matrix multiplication:"], SamplingParams(max_tokens=32))
 ```
 
 Each request owns one `StateRef(LayoutId, LineageId, VersionId)` root containing

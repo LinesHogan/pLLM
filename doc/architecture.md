@@ -15,33 +15,115 @@ typed workload declaration
 
 | Owner | Responsibility |
 | --- | --- |
-| `tllm/contracts` | Typed graph, state, layout and attachment data |
-| `rust/tllm_core/src/canonical` | Closed codecs, dense IDs, signed scheduling and representation decisions |
-| `tllm/canonical/execution.py` | Execution of signed task/anchor order |
-| `tllm/canonical/state_execution.py` | Shared tensor-state invocation, sampler borrowing, cancellation and settlement |
-| `tllm/canonical/backend_program.py` | Workload-neutral cold facts and original packed tensor inputs; deployment references the existing execution and signed attachment |
-| `tllm/canonical/host_runtime.py` | Typed host transaction settlement |
-| `tllm/canonical/ptts` | One PageBundle arena for versions, field pools, COW, issued receipts, exact pins and completion; request directory only selects lineages |
-| `tllm/canonical/workloads` | Workload declarations, tensor math, initialization and mathematical inputs/outputs |
-| `tllm/canonical_vllm` | Current public MRv2 capture, sampler and dense-overlay integration |
-| `tllm/backends/vllm` | Remaining probe/replay primitives awaiting consolidation |
+| `pllm/contracts` | Typed graph, state, layout and attachment data |
+| `rust/pllm_core/src/planning` | Closed codecs, dense IDs, signed scheduling and representation decisions |
+| `pllm/execution/execution.py` | Execution of signed task/anchor order |
+| `pllm/execution/state_execution.py` | Shared tensor-state invocation, sampler borrowing, cancellation and settlement |
+| `pllm/authoring.py` | Original input boundary, declarations, shared compile/bind entry; deployment references the existing execution and signed attachment |
+| `pllm/usage.py` | Cold method/state discovery and signature binding into the original graph; the only authoring reflection boundary |
+| `pllm/execution/host_runtime.py` | Typed host transaction settlement |
+| `pllm/execution/ptts` | One PageBundle arena for versions, COW, pins and completion; directory selects lineages and retains original instance admission pins |
+| `pllm/workloads` | Workload declarations, tensor math, initialization and mathematical inputs/outputs |
+| `pllm/kernels` | Explicit mathematical primitives; no version or execution authority |
+| `pllm/backends/vllm` | Shared MRv1/MRv2 attachment, capture and sampler; parameter/activation patches and MRv2 current-slot replay |
 
-`tllm.make_llm` is the public factory. Without a workload it constructs plain
-vLLM; with a supported canonical workload it installs the instance-owned
+`pllm.make_llm` is the public factory. Without a workload it constructs plain
+vLLM; with a supported workload it installs the instance-owned
 attachment. No residual runtime or process-wide bootstrap plugin is installed.
+
+Workloads return original declarations and `MathBinding`; they do not construct
+executors, arenas or signed attachments. Host bindings share the existing host
+and PTTS owners. `ModelConfig` supplies user capacity limits; specialization
+derives supported kernel shape/resource facts before signing. `KernelCapture`
+centralizes cold-state allocation, capture, entitlement checks and cleanup.
+Internal benchmarks are clients of this same public factory and handle.
+
+All eleven built-ins use shared bindings that construct the original graph. Ordinary
+model methods use `pllm.Workload`; TLM/TTRL use causal/completion learning bindings,
+and FTTT/GTTA use `transaction`. Output LoRA uses ordinary weighted batch SGD.
+The old `authoring.Workload` and per-workload sampler `build` methods are removed.
+ESamp uses ordinary named parameters, prediction and per-state loss. Its explicit
+paged/capture bindings replace computation on that same signed graph; the original
+loss/Adam pair and five-field state remain. LoRA uses the original weighted batch,
+raw named factors, reset and multi-step SGD; `SamplerWorkload` and `LoRAData` are removed.
+Weighted input normalization/reset is a signed preparation task whose original result
+edge feeds training. Its tensors remain in the same invocation frame and are released
+after consumption. ESamp native inputs are packed inside the consuming task, not cached
+across the invocation. Exported losses/gradients remain live through completion in AER.
+Temporary tensor results live only in the original StateTaskContext, keyed by the original
+(task, output). TensorBatch borrows that dictionary; TensorFrame no longer caches results
+or a parallel last value. Rust signs each value's last-use release in PhysicalTask,
+including downstream declared gradient consumers. Execution only applies those releases;
+exported values survive through result construction and settlement.
+Builder references are the internal graph construction API;
+`FunctionMath` and `TensorOperation` bind ordinary mathematical functions to the same
+StateTaskContext. There is no additional task cursor, parameter bank or publication
+owner. AdamW fields and private updates are generated by the shared binding, while
+direct transitions and publication/replay remain separately declared effects.
+The original SemanticTask's optional `MathContract` signs differentiation demands,
+row domains and reduction, with Rust validation of its original input/state references.
+It is not proof of arbitrary tensor math or automatic autograd/fusion. Ordinary host
+functions bind to the original transaction executor, preserving snapshot/restore and
+issued receipts. Workload task classes and hand-built graphs are removed; the full
+mapping and supported compositions are recorded in the authoring guide.
 
 Result inputs imply dependencies directly; explicit `SemanticEdge` values add
 ordering constraints that are not already expressed by dataflow. Rust derives
 one index of predecessors, timing windows and execution order from this graph.
-Overlapping conflicting state effects require a causal path; disjoint windows
-can prove their order. Ambiguous accesses fail closed instead of acquiring an
-accidental order from task names. This is not yet exact-version hazard analysis.
+Exact-version effects bind reads to invocation inputs or original producer tasks.
+Rust derives RAW/WAR/WAW constraints and jointly selects implementations, regions,
+anchors, execution domains and state representations. Signed transfers and resource
+budgets constrain placement. Ambiguous state accesses fail closed; worker validation
+checks the fixed witness without rerunning optimization. Distributed execution of
+these plans remains unsupported by the local executor and arena.
 
 Python serializes these same immutable descriptors at the FFI boundary, adding
 only the closed input-variant tag. There is no second wire DTO hierarchy or
-workload-maintained copy of the dependency graph.
+workload-maintained copy of the dependency graph. EngineCore checks local anchors,
+capabilities and schema, then retains the complete original SchedulerTimeline, including
+value sizes, task residency, reservations and budgets; it does not rebuild a partial timeline.
 
-## Incomplete Boundaries
+## Runtime Boundaries
+
+Resource ownership is separate from a total-process memory guarantee:
+
+| Storage | Existing owner and release boundary | Capacity evidence / limit |
+| --- | --- | --- |
+| Parameters, optimizer fields, private versions | PageBundleArena; exact pins and issued completion receipts gate reuse | Signed layout/provider entitlement; field-level COW |
+| Ordinary saved tensors and packed parameters | Original invocation and sole gradient sink; derivatives are detached and leaves cleared after training, context cleared on settlement/cancel | Built-in ESamp/LoRA/OverRIDE envelopes; custom math must declare its own costs |
+| Bounded exports, dense chunk outputs and activation replacement checks | Original Dummy/transition/update tasks and their existing result edges | Finite-budget built-in formulas; per-target operand row bounds; replacement content checked before any field copy |
+| Hidden, sampler and replay buffers | Backend step/sampler/replay owner; consumer streams order reads; replay preserves the required KV rollback copy | Original timeline reservations and signed row/shape bounds |
+| Row/page mappings | Arena-derived invocation/capture operands; no separate version selection | Shared mapping workspace or fixed capture storage |
+| Capture inputs, scratch and graph pools | KernelCapture; disposable cold admission is aborted, replay results copied only when they must survive reuse | Meta preflight, actual input/scratch check and graph-pool accounting |
+| Shared inputs/completion outputs | Original SharedTensor scopes and receiving completion acknowledgements | Original TensorFieldSpec; shutdown failure retains unconfirmed input ownership |
+| Frozen causal model | HF model/handle; unique tensor storage is counted, successful close drops engine ownership | Resident bytes do not bound HF backward or library scratch |
+| Trace | Bounded event queue; snapshots encode owned CPU bytes, not live tensor/autograd references | At most 32 KiB payload/event; truncated strided tensors use bounded `take`, not a whole-source flatten copy |
+
+Host transactions retain their original reversible snapshot until commit/abort; queue
+and algorithm-history storage belongs to the host service, not to the GPU arena budget.
+Host bindings retain the original immutable facts rather than accepting another set at
+compile time. Completion learning can declare its original task/value timeline; bounded
+TTRL supplies head/MSE/Adam costs and a hidden-row reservation, with pre-prepare row
+admission and consumer-stream lifetime. Text and Python metadata are outside that tensor
+budget. FTTT declares its parameter/moment storage, rollback snapshot, active input and
+training/query/result costs on the original host timeline. The executor admits that plan
+before calling the state constructor. GTTA's growing Python history and external service
+allocations still have no complete heap cost declaration.
+`handle.diagnostics().state_usage` is a frozen snapshot derived directly from the
+original arena roots, field slots, private writes and receipts; it retains none of
+those owners. Logical bytes count each retained/private version, while allocated
+payload bytes count COW-shared field pages once. Reserved padding includes all
+capacity alignment/slack. Free, latest-root, private-only and retiring-only field
+pages are disjoint ownership categories, not measurements of GPU activity; the
+latest-root category takes precedence over private, then retiring references.
+Pinned versions include internal write/publication holds and pending releases.
+Pending receipts include uncollected settled publications, not only unfinished GPU
+work. Capacity-failure counts cover rejected admissions, not transition failures or
+invalid input. `arena.usage()` itself does not collect, synchronize or choose versions;
+the existing execution diagnostics may first perform its normal nonblocking collection.
+Unbounded custom autograd, HF backward, external-library scratch, vLLM model/KV and
+allocator reservations are not proven by the declared AER peak. These remain explicit
+capacity limits of the supported contract, not inferred zero-byte resources.
 
 ESamp and In-Place use one StateExecution on CPU/CUDA. Its invocation retains
 the original physical plan, pin, write and publication; settlement does not
@@ -51,21 +133,70 @@ workload. Dense application borrows arena pages under the original invocation
 pin, using the original signed field binding and packed rows, without a second
 overlay plan or copied tensor bank. Borrowers must not mutate published views
 or use them after pin release; owned external exports still use snapshots.
-Schema 3 binds target, operator and field IDs together. Unsupported combined
-hidden/sampler/overlay programs fail closed; generic integration is not yet
-composition support or public support for every workload.
+The signed attachment binds target, operator, field IDs and scaling together. The duplicate
+seven-stage overlay descriptor is deleted; event advancement consumes the
+original physical plan. Unsupported combined
+hidden/sampler/overlay programs fail closed. The verified update/publication/replay
+composition uses the same signed graph and original state pins, not a second runtime.
 
-PageBundle/generational state is implemented, but captured page-table version
-selection and public TLM/global-overlay integration remain pending. TLM's
-standalone training core now uses the same StateExecution and instance arena
+PageBundle/generational state includes capture-stable indirect field selection.
+Cold graph pools and fixed scratch are resident TaskResourceFact bytes, separate
+from transient workspace. Reads/private writes use original PagePin/PageWrite;
+switching streams orders the previous scratch user before rebinding. Graphs do not
+publish, select versions or reclaim pages. ESamp binds Rust-selected fixed-shape
+loss/AdamW graphs in the original tasks, including public eager-model vLLM execution;
+this is not model-wide capture or automatic region fusion.
+TLM's training and public vLLM overlay use the same StateExecution and instance arena
 for q/v factors and AdamW fields, with online/offline timing in the original
 graph. The HF/PEFT adapter binds original factor views into a frozen model
-template; it does not update a second model/optimizer state. Pool address
-stability is not capture-stable version selection. Complete AER regionization,
-distributed placement, closed typed MP and workload-independent profiling also
-remain pending. Backend-local overlay version storage is deleted; global
-overlay must use this same arena. Callback-based replay contracts still need
-replacement through the shared semantic/effect boundary.
+template; it does not update a second model/optimizer state. The backend borrows
+the same A/B pages for fused q/v application. Original request admission pins
+survive global publication; inference and training never share a mutable latest
+cache. `CausalTrainBatch` is shared by standalone and public input, not converted
+into another workload batch. The public input is consumed once per generate;
+online publishes after token commit, offline before new admission. Same-GPU IPC uses
+original page grants or SharedTensor inputs/outputs and existing completion acknowledgements.
+Distributed plan execution/commit remains outside the current local executor.
+Backend-local overlay storage and the old backend/callback replay
+contracts are deleted. Conditional replay is an original signed SemanticTask;
+its new-version pin and release belong to the same StateTaskContext and arena.
+The backend only snapshots selected decoder inputs/current KV slots and executes
+the native layer.
 
-The maintained support matrix is in the [README](../README.md); implementation
-debt and acceptance criteria are in the [handoff](architecture-consolidation-handoff.md).
+Host and state execution share one task cursor and bounded execution trace.
+`execution.trace.snapshot()` or the public model handle's `trace_snapshot()`
+returns up to 256 metadata events, with explicit overflow counts and the original
+schedule signature. Task IDs resolve through the original graph and physical
+region boundaries; request rows, StateRefs and issued operation/pin/release IDs
+link replay and settlement. Metadata events retain no prompt, tensor or live receipt.
+`snapshot.host_task_times()` reports successful complete calls and host elapsed
+nanoseconds only. It adds no CUDA synchronization; a settled invocation is not
+proof that its deferred device release has completed. `profile_tasks(task_ids)` on
+the original trace or model handle opts selected tasks into CUDA event timing;
+an empty tuple disables future timing. Snapshots expose pending timings
+without waiting and `device_task_times()` reports completed stream spans per
+task/device, including stream waits and contention, not isolated kernel cost.
+Timing events share the metadata queue's bound and oldest-drop policy. Profiling
+adds event launches and must be disabled for uninstrumented performance figures.
+Schema 5 retains original packed rows without duplicate request IDs or decode ordinals.
+Dummy's explicitly enabled snapshots store at most 32 KiB of raw tensor bytes per
+event in the same bounded queue; they may synchronize, and reconstruct independent
+CPU values through event.tensor(). `TraceSelection` on `execution.trace.configure()`
+or `handle.observe()` selects original TaskIds, request identities, iterations and
+names. Tensor and gradient capture are separately opt-in. Math calls `trace.observe`
+with an actual value or computed gradient; trace collection performs no signature
+inspection or automatic gradient discovery.
+ESamp exposes source/target/loss/parameter gradients, output LoRA final-SGD-iteration loss/A/B gradients,
+and both replay forms expose their carry. Filters do not reveal unselected requests
+through a shared value. Large values retain a flat prefix with `source_shape`
+recording the original dimensions; limits are 32 KiB per event and the same queue.
+`kernel_calls` profiles at most 16 selected task calls with Kineto, retaining actual
+CUDA kernel names, devices and durations as KERNEL events. This selects whole tasks,
+not per-request kernel cost, and may synchronize or perturb timing. Kineto's temporary
+buffer spans one task; only persisted results have the trace's event bound.
+Snapshots and profiler startup inside CUDA capture are rejected; explicit snapshots
+after a captured task's replay are supported. No deterministic full-model replay or
+uninstrumented performance claim follows from these observations.
+
+The maintained support matrix is in the [README](../README.md); acceptance criteria
+and explicit exclusions are in the [consolidation plan](architecture-consolidation-10k-plan.md).

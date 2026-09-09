@@ -2,16 +2,12 @@
 
 ## 文档地位
 
-2026-09-06 实施交接见[剩余工作清单](architecture-consolidation-handoff.md)：
-代码检查点 `a682264`，SOURCE_LOC 18,451，终态 41 项证据尚欠 19 项。
-PageBundle 已替换 13 个旧 PTTS 模块；ESamp/In-Place 共享同一 StateExecution 和原始
-plan/pin/publication，generic backend factory/session 已移除 workload 分支；dense backend 直接
-借用原 pin 下的页，旧 backend overlay store 已删。TLM 已补共享 instance 训练与原子发布；公共 global overlay、
-跨版本 CUDA Graph 间接寻址、AER 和 closed MP 等仍待完成，不能以行数下降宣称终态完成。
-旧 runtime/ports/common 和公共 hook/plugin 入口已删除；行数达标不代表功能验收完成。
-历史 worktree 已从 30 个降至 1 个，代码已合入主目录 `main`；过时文档与重复打包配置已清理，sdist→wheel 隔离验证通过。
-下文基线与估算保留历史口径；当前完成情况以交接清单和 ledger 的最新检查点为准。
-本轮纳入可编程推理契约的决定见第 10 节；原 39 项证据保留，新增组合边界 40、41。
+当前职责与接口见 [architecture](architecture.md)、[编写契约](guides/authoring.md)
+和根 README；唯一可执行证据清单是 `test/evidence_manifest.toml`。
+原交接和逐提交 ledger 已退役，不再与当前文档平行维护。
+下文保留历史基线、估算和验收要求；历史目录名不是当前目录设计。
+行数下降、旧目录删除或单条公共路径通过都不代表整个计划完成。
+纳入可编程推理契约的决定见第 10 节；当前证据编号及执行次数以下述现状和 manifest 为准。
 
 本文是从 2026-09-01 起执行的减法计划。它不把 10k 当作倒填配额，而是先根据当前
 代码的可达性、重复职责和待完成功能估算可以删除的范围，再持续向 10k 靠近。
@@ -27,6 +23,255 @@ plan/pin/publication，generic backend factory/session 已移除 workload 分支
 
 [`doc/research-aer-paged-state.md`](research-aer-paged-state.md) 仍是 PTTS/AER 的唯一
 设计权威。该未跟踪研究文档不得因本计划被修改、加入或提交。
+
+## 当前状态与交接（2026-09-09）
+
+本节只维护现状、有效证据和剩余工作，不再累加逐轮执行日志。下文的历史基线、
+终态架构及验收标准仍有效；历史目录名称不是当前目录设计。
+
+### 已完成的架构替换
+
+- 公共入口/import 为 `pllm`，Rust crate 为 `pllm_core`。旧 Python/Rust authority、
+  canonical 包及兼容转发已经删除；持久化 `canonical.*` 身份不随目录名改写。
+- 全部 11 个内置 workload 共用原 SemanticGraph、MathContract、Rust 决策、
+  signed PhysicalPlan、PTTS 根、exact pin 和 issued receipt。没有镜像图、
+  第二版本库或 workload 专属 scheduler/session。
+- `usage.md` 的适用入口全部迁移：7 个普通模型入口为 Dummy、OverRIDE、
+  In-Place-TTT、ReFT、Recirculation、ESamp、Output LoRA；TLM 使用 causal
+  adapter，TTRL 使用 completion loss，FTTT/GTTA 使用原 host transaction 的普通函数。
+  用户不再手写 build、端口字典、prepare/output 或 implementation ID。
+- 加载期反射和依赖冻结限于 `pllm/usage.py`，传输类型擦除限于 codec；执行层 strict。
+  方法、配置、来源和 monkey patch 进入原签名，已绑定数学不读取后来替换的配置。
+  自定义普通数学与显式 kernel 不匹配时拒绝绑定，不静默替换算法。
+- 普通 eager 分别表达 forward/dx/dW/update 行域，冻结参数不截断上游 dx；
+  Parameter(per_row=True) 显式表达共享参数逐行梯度。更新资格独立于零梯度，
+  未授权状态不推进 Adam step/moments/decay。仍限制一个 optimizer state/训练 sink，
+  不支持跨 replay 反传；state_mean 不支持独立 forward/update selector。
+- ESamp/LoRA 的显式 tensor/paged/capture 绑定替换同一签定图的计算。
+  TensorRows/PagedRows 共用矩阵、反向、归约及私有写入接口；原语按布局/方向/容量桶
+  特化，不按 request/version 生成新实现。普通独立行域不自动 lowering 到分页/capture。
+- FTTT/GTTA 的 FIFO、abort/requeue 和 host settlement，TLM 的 online/offline、
+  admission pin 与 immutable publication，TTRL reward/control，以及参数/激活 overlay、
+  条件/tokenwise replay、MRv1/MRv2 和 closed EngineCore 边界保留。支持边界见
+  [编写契约](guides/authoring.md)，不以接口统一声称任意组合受支持。
+
+### 已实施的资源收敛
+
+- 临时结果只有 invocation 的原字典一份。Rust 签定最后使用点及梯度依赖的存活区间，
+  执行按原 value ID 释放；loss/gradient 导出值保留到完成。普通唯一训练 sink 成功后
+  清除导数叶子并 detach 保留结果，包含无训练分支；结果存储、梯度和 staged update 保留。
+  完成/取消清空 context；settlement 失败保留原 receipt 的重试数据。
+- 连续 hidden 行借用原 snapshot；不规则行在消费任务内打包。BF16→FP32 为一次 owned
+  copy，输入登记实际消费 stream，防止 readiness 已满足但读取未完成时 allocator 复用。
+  WeightedCE 全有效普通输入直接借用，无效行和 inference-mode 输入保留必要复制。
+  普通请求参数在选中行全部引用同一状态时使用广播视图，混合状态才打包；导数叶子
+  借用原 pin 的参数存储，不重复计作参数分配。连续采样反馈行也借用原 owned buffer。
+  普通 forward 连续行及梯度 mask 复用切片，删除布尔索引复制；全行输出不再 scatter，
+  部分行只分配一份补零目标。不规则行仍打包，不改变原行域与反传归属。
+- eager/capture 多字段共用逻辑行分组，矩阵直接解引用原行/状态/页槽；删除物理页排序、
+  inverse、矩阵前后行 gather 和每字段按行展开的页号。vector bias/norm 仍需 gather。
+  eager 多字段页槽合并为一次传输，全私有读写槽复用原存储，host 已知计数不再做 GPU cumsum。
+  显式行选择复用原排序做前缀扫描；16384 行内一次 launch，更大容量固定分块。
+- ESamp 显式 LayerNorm 反向直接调用原 PyTorch native 算子，不建 autograd tape；
+  raw/mean/rstd 仍为必要 scratch。分页 eager/capture 共用原页池上的两个融合 Adam 计算 kernel，
+  删除逐字段梯度复制和 optimizer gather/update/scatter；step/bias correction 每状态只计算一次。
+  eager 仍构建 launch 页槽表，其已知工作区改按 96 bytes/state 声明，不再按整份参数复制计费。
+- LoRA 只有一份 reset/加权 CE/多步 SGD 数学；复用 log-softmax/导数存储，
+  固定行权重归一化移出循环。写入 kernel 直接读取 selected/state/slot，覆盖和加法写入
+  都应用 scale。完整覆盖模式删除 reset 的无效 COW；增量更新仍保留 COW。
+  native 绑定共用一个返回出口，不重复查找资源或维护捕获/非捕获绑定包装。
+  共享分页梯度归约直接按原 logical-state 选择写出紧凑结果，删除 LoRA 的整批梯度后置
+  gather；tensor 训练直接保留 BMM 梯度，不再复制完整 identity selection。选中状态顺序、
+  独立归约、结果跨 replay 存活及 pin/receipt 不变；成本声明仍保留原保守上限。
+- 普通/显式 AdamW 共用字段级复制集合：保留 parameter/step/moments 的 COW，
+  跳过随后完整覆盖的旧 gradient，包含 TLM 的每个参数组。删除独立 replace 执行模式，
+  完整覆盖统一使用空复制集合；不减少私有页容量，不改变原 pin/receipt 和取消语义。
+- KernelCapture 使用最终 abort 的 admission 页，删除其冷字段备份；调用者已有私有
+  状态的直接 capture 仍恢复字段。ESamp/LoRA 输入改为延迟工厂，先对全部 capture
+  做无存储 meta 预算检查，再分配 CUDA 输入；真实输入/字段 scratch 在 cold admission 前核对，
+  graph-pool reservation 在 capture 后核算，拒绝时原 arena 回收。
+- vLLM hidden snapshot、采样投影/反馈及 overlay/replay 的已知缓冲进入原 timeline；
+  安装时从原 signed graph/attachment 核对预算下限，MP 保留完整 timeline。
+  全行采样删除 gather/copy-back；参数/激活 patch 直接修改新生成的投影输出；
+  连续低秩/replay 行借用视图，tokenwise 各层共用 sequence 张量，normal 输出不再 clone。
+  输入、residual、原状态页与两种 replay 的 KV 备份时机不变。
+- 输入绑定直接借用原 backend probe，按整批 packed token 行数检查签定容量，
+  不以筛选后的 decode 行数或请求数代替；普通/显式数学和 causal 入口在选择状态前
+  拒绝超限，vLLM 在创建 step/capture 前拒绝。无状态观察也检查签定 hidden 宽度。
+  辅助输入共用原 plan 与 TensorFieldSpec 做提交/feedback 搬运/worker STAGE 前置检查，
+  不先导出、映射或复制到 GPU 再发现超限。LoRA 的准备任务签定 hidden/logits 两个形状，
+  checkpoint 检查原字段布局和 state scope；排队编辑行数不冒充同时驻留状态数，实际
+  cohort 仍由原 arena 准入。causal 显式成本须带 sequences/tokens 上限。
+  dtype 取原布局（token/label 为 int64）；内容与实际状态选择仍由消费端检查。
+- TLM 离线选择在 adapted forward 前归约并释放完整词表 logits，只保留 detached 的
+  每句 loss；数学 oracle 和真实 tiny HF/PEFT CPU/CUDA 检查保留。专属 objective 已从
+  公共 kernels 删除，唯一实现在 TLM workload。完整 HF backward scratch 仍未声明，
+  不把其无界模式或输入形状检查冒充有限显存保证。
+- 冻结 causal 模型的参数/buffer 存储进入原 backend requirements 和 timeline 各 anchor，
+  HF 按唯一 storage 计费，含 meta 声明；共享权重和借用的 factor 模板不重复计费。
+  HF 调用关闭不需要的 KV/hidden-state/attention 输出，不以驻留量代替 backward 成本。
+  handle 成功关闭后清除 engine/runner/execution 引用；shutdown 失败则关闭新工作入口，
+  保留 owner 及未确认的共享输入，待 `close()` 重试成功才回收。
+- 公共 `ExecutionOptions.memory_budget_bytes` 直接约束原 AER timeline，原始事实、
+  workload 成本声明和用户限制取交集；声明不能抹掉已有上限。`None` 不另加限制，
+  零为零容量；有限预算缺少任一 task/output 成本仍由 Rust 拒绝。benchmark 共用
+  `--execution-memory-mib`，同时报告 signed planned peak 与真实 CUDA peak，不把
+  状态容量、捕获容量或未声明的模型/KV/library 内存混作一个保证。
+- 已核对的存储负责方、释放边界和容量证据汇总于 `doc/architecture.md` 的资源表。
+  审计删除了 trace 截断非连续张量前的整源 flatten 复制，改为有界逻辑索引读取；
+  原有事件大小、快照次序及 source shape 不变。CPU/CUDA 的广播、转置、offset 和四种
+  dtype 进入原 Dummy 证据；不新增测试 ID，也不把有限快照预算误当整源打包预算。
+- Dummy、OverRIDE、普通 In-Place-TTT 和 ReFT 在请求有限预算或已有 task 成本时，
+  补齐原 timeline 的 task/output 声明，不改变无界普通使用。worker 从原事实重算下限，
+  拒绝重新签名但少报的 workspace/output。分别覆盖 hidden 打包与导出、head/CE/Adam、
+  chunk/tail/dense 更新及字段有限值检查；dense operand 按目标累计检查 packed-row 上限，
+  ReFT 内容检查移入原 update 任务且在任何字段复制前执行，失败沿原 abort 回收。
+  内置数学修改不能静默继承公式；条件模型 replay、完整 HF backward 和库 scratch
+  仍不在内置有限成本保证内。
+  普通绑定统一核对其公式，删除 Dummy/In-Place-TTT/ReFT 的重复 operations；
+  OverRIDE 只因其额外行域准备边界保留绑定。GTTA 查询删除候选/历史匹配的中间
+  tuple 及 ordinal 包装，稳定排序保持并列顺序，限量结果生成后释放完整排序列表；
+  原历史与 rollback snapshot 没有删除或改换 owner。
+- TTRL 有限 tensor 成本接入原 host timeline：`HostRuntimeFacts` 提供总声明预算与
+  输入行上限；原 completion hidden、head/MSE/Adam 工作区及结果均进入原 task/value
+  事实。prepare 前拒绝超限，CUDA 输入登记消费 stream；修改数学/控制准备不能继承
+  内置公式。host binding 保留原事实，删除 compile 时再传另一套 facts 的入口。
+  五项受影响 host/数学证据通过，另定点复核 source/cost 拒绝；strict/import/authority
+  通过。公共 vLLM 原证据把三条 completion 交给 1 MiB 预算 TTRL，更新一次、声明
+  峰值 183,512 bytes、fallback=0；日志 `outputs/completion-costs-r4ejCZ/public.log`。
+  未增加 evidence ID。文本、Python metadata/history、库 scratch 不属于该 tensor 预算；
+  不把 state capacity 冒充 host 事务总成本。
+- FTTT 的参数/moments、回滚快照、当前 hidden、feature/train/query/result tensor
+  成本也接入原 host timeline。通用 executor 在 Rust 准入后才调用 state_factory，
+  删除声明时先分配状态的入口；输入数量与事务元数据对齐，prepare 在快照前检查行上限。
+  原 FTTT/GTTA/host 三项证据及 1 MiB 预算 CUDA smoke 通过，loss/update/version=1、
+  fallback=0；包含精确预算、少一字节且未构造状态、超限拒绝及原 abort 语义。
+  strict/import/authority 通过，日志 `outputs/host-costs-3E8FP9/`；不新增 evidence ID。
+  队列、文本、judge、Python 历史和库 scratch 不在这个单次执行 tensor 预算内。
+- 公共 diagnostics 的 `state_usage` 从原 arena 直接派生逻辑存活字节、COW 去重后的
+  payload、预留 padding、空闲/当前/私有/退役 field pages、版本/pin/receipt 和准入容量
+  拒绝次数；benchmark 复用这份只读快照。读取不等待、不收集或选择版本，未建镜像
+  资源账本；计数是所有权分类，不把 private/retiring 冒充 GPU 正在运行/已经完成。
+  原 CPU lifecycle、CUDA fence 和 Dummy/codec 三项证据通过，包含快照不触发回收、
+  共享字段只计一次、旧 pin、两类容量拒绝及清理归零。公共普通 ESamp 运行也报告
+  loss/update/rows=6/6/6、30 个空闲字段页和零待释放 owner。
+
+这些是已知 tensor/owner 的收敛，不是任意 autograd、上游库 scratch 或模型/KV 总显存的
+完整容量证明。AER 正确计算已声明预算，不等于成本声明已经完备。
+ESamp/LoRA 的普通数学修改也不再静默继承内置成本公式：specialization 和 worker 绑定
+均核对原数学，修改后须显式提供 resource_facts；自定义成本不绕过 native kernel 的匹配检查。
+
+### 当前证据与测量边界
+
+所有 Python 验证使用 `/workspace/pllm/.venv/bin/python`。环境为
+PyTorch 2.13.0+cu129、vLLM 0.27.1+cu129、Triton 3.7.1、RTX 4090/SM89。
+唯一清单 `test/evidence_manifest.toml` 为 **47 个 ID / 50 次选定执行**，不另建测试体系。
+
+- 本轮集中验收覆盖 26 项 pytest、8 项 Rust、13 条 runtime 和 3 组标准 benchmark，
+  strict 0/0，import/authority 零违规。全量 pytest 后，完整 EngineCore 揭示 checkpoint
+  预检混淆排队行数与同时准入容量；删除该限制后定点复核 ReFT、完整 EngineCore 和
+  release wheel，其余 runtime 及三个 benchmark 均通过。没有提高测试中的并发容量。
+  这完成现有机械门，不替代下述资源完备性与性能研究退出项。日志及执行顺序见
+  `outputs/acceptance-5Uinna/RESULTS.md`；失败记录保留，没有增加 evidence ID。
+  随后的报告字段/arena 可观察性改动使用 `.venv` 定点检查：3 项 pytest（含 CUDA）
+  通过，strict 0/0，短程五臂 LoRA 和普通 ESamp 通过。
+- 随后的四条内置成本改造使用同一 `.venv` 定点复核：四项原 pytest 修正后通过，
+  strict 0/0；原 OverRIDE、In-Place-TTT、ReFT GPU smoke 均在当前环境离线运行，
+  使用 1 GiB 声明预算，分别观察到 4 次更新、6 次更新、1 次发布，fallback 均为零。
+  原测试覆盖精确峰值可准入、少一字节拒绝以及重新签名的少报成本拒绝；没有新增
+  evidence ID 或重跑全矩阵。日志为 `outputs/builtin-costs-Oq8drf/*.log`。
+- Evidence 39 现从 sdist 离线构建优化的 release wheel（`--release`），仅安装到测试
+  临时目录，检查完整 Python 源码集合、native 来源、许可证、11 个 workload 导入及
+  Rust codec。包含本批全部源码的最新候选产物在 `outputs/final-candidate-ZxqFZw/`，
+  同次全量 26 项 pytest（无 skip）、8 项 Rust、strict/import/authority 通过；未重跑
+  GPU runtime/benchmark 矩阵。源码及产物 SHA256 见该目录 `RESULTS.md`，旧候选不再
+  标作当前源码。wheel 隔离检查不初始化 CUDA，真实 GPU 证据使用仓库源码环境；
+  仓库虚拟环境未修改。候选构建不表示已发布或整个计划已经完成。
+- 已有真实边界证据含非零 loss/update、原版本隔离/receipt 和 cleanup/fallback=0：
+  ESamp capture 4 次更新、MRv2、MRv1、EngineCore、dense/activation/低秩 patch、
+  条件及 tokenwise replay。TLM online/offline 各 48 次独立 QKV 对照；
+  OverRIDE update=4、sample checks=6、末轮无更新。修改未涉及的边界不重复铺矩阵。
+  TLM 的 HF/vLLM 必须使用相同来源：离线运行显式给两侧同一缓存 snapshot 路径，
+  不混用仓库 ID 与 vLLM 改写后的路径，也不放宽来源检查。最新 EngineCore TLM 定点
+  检查通过，冻结模型驻留 988,336,000 bytes、loss/update=1、父进程 CUDA 未初始化，
+  关闭后子进程退出且 completion 仍有效；日志 `outputs/resident-close-9aNBjw/run.log`。
+- 冻结 Huber reference：`test/reference_huber.py`，SHA256
+  `e853832ffb6904c5dc8b2868e39af896ffc72b4518ebc3744049315f699b6281`。
+  独立 gpt-6 适配没有修改核心/reference 或放宽容差；CPU/CUDA、重排、不等长更新、
+  全部 Adam 字段、旧 pin、取消与清理通过。仅证明普通 eager，不声称分页/capture/vLLM。
+- 定点优化证据：五字段 Adam capture 的 CUDA 事件由 76/94/118 降到 2；
+  双字段逻辑映射原替换为 23/23/27 事件；本批仅映射构建由 18 降到 17，
+  2/64、8/512、16/2048 states/rows 的保留分配从 3072/17408/68096 降到
+  2048/9216/35328 bytes。这些不是端到端吞吐或完整临时峰值结论。
+- 公共 benchmark 支持 rank、训练行数/比例、shared/request、同步 cohort 的 state groups、
+  显式 capture 容量、独立 profiler 和原输入准备接口。共享键不支持独立到达/部分退休。
+  普通 model workload 默认只测普通实现，不再强制 capture 或非零训练；内部训练对比
+  显式开启两项要求。profiler 已改为新实例重放相同预热及全部测量轮次，核对原计划签名
+  与累计工作量，不再用额外一轮推算多轮。benchmark 显式签定 256 MiB 状态预算，
+  超出可用容量或不足以容纳状态均拒绝，不放宽重建签名检查。
+  当前源码八组 LoRA 比较已完成 **40 个计时臂 / 40 个独立 profiler 臂**，覆盖请求数、
+  训练行数/比例、状态共享、rank、instance/request 及较小显存余量。每臂三轮计时，
+  等工作量、精确签名、非零训练、零 fallback 和 cleanup 全部通过；子进程均已退出。
+  报告 `outputs/study-current-AV1WUw/RESULTS.md` 包含逐臂冷启动、轮次时间、声明峰值、
+  真实分配、API enqueue/wait、GPU 活跃时间、kernel 次数和 memcpy。没有稳定分页
+  吞吐优势，保持普通默认；capture 增量峰值较低不等于总显存更低。压力组通过公开
+  vLLM KV 预留增加约 3.5 GiB 真实分配，不是耗尽测试。GPU 与其他作业共享，短测
+  不构成统计显著性或发布 SLO；全栈 CPU 提交与 host launch 次数仍不能由 kernel 次数代替。
+  后续直接重读 baseline/rows/pressure 的 15 份 trace，旧指标逐项一致；新增 host launch
+  计数合并同线程嵌套 runtime/driver，graph launch 单列。三组均约 14.8 万次 host launch，
+  capture 仅减少约百次；普通基线约 62.5% kernel 时间属于模型 BF16 GEMM，不能据此
+  继续堆 LoRA 融合。公共 benchmark 已记录每轮进程 CPU 时间，与 API/GPU 时间分开；
+  旧矩阵没有该时钟，不能倒推补数。详情 `outputs/cpu-launch-euODct/RESULTS.md`。
+  最新公共有限预算检查在 1 GiB 声明上限下完成五臂等工作量执行；普通路径声明峰值
+  214,105,000 bytes，213,909,504-byte 上限在生成前拒绝。日志在
+  `outputs/finite-aer-ClI0fC/{run,rejected}.log`；这验证声明容量准入，不是总显存压力研究。
+  32 行 LoRA 暴露了 256 MiB 硬编码上限，已改为公开 `--capture-memory-mib`；
+  原 270542404-byte 需求拒绝记录保留，未 fallback 或减少训练量。
+- 较早测量的原始日志保留，但不与当前源码结果平行维护性能结论。逐臂插入 profiler
+  的旧吞吐排除；旧七组矩阵早于 selected-gradient 替换。来源与限制见
+  [benchmarking](guides/benchmarking.md)，不以历史较快数字覆盖当前测量。
+
+### 终态核对与剩余证据
+
+| 要求 | 当前判定与依据 |
+| --- | --- |
+| 第 7.1、9 节：唯一执行路径、旧 authority 删除 | 已实施。当前 owner 表、零 import/authority 违规、原签名重建与完整 workload 证据相互印证；没有兼容栈或第二调度/版本库。 |
+| 第 7.2 节：PTTS/AER | 已实施支持范围内的准入、原子发布、exact pin、ABA、CUDA receipt 与取消/结算；当前 CPU/CUDA 及 8 项 Rust oracle 通过。分布式本地执行仍拒绝。 |
+| 第 7.3 节及 usage 接口 | 11 个内置 workload 经同一公共工厂，普通方法、causal/completion 和 host 事务使用各自适用的共享边界；原 13 条真实 runtime 与近期受影响有限预算路径有证据，不声称任意组合。 |
+| 第 7.4 节及第二轮压缩 | 当前 20,032 行，相对原 133,210 行净减 113,178 行；47 ID / 50 次选定执行，主 worktree 唯一，无活动空壳目录。10k 仍是方向，不以隐藏源码或删语义达到。 |
+| 第 10 节：学习/发布/条件 replay、来源与独立 reference | 原 40/41 组合证据及有界 trace 保留，使用原图、pin、receipt 和 KV/RNG 边界；不是全模型 capture 或跨 replay 反传的声明。 |
+| 下一阶段第 8.1、8.2 节：契约、名称、共享原语替换 | 已实施，普通/分页/capture 复用共享数学，旧展开与搬运实现原子删除。2026-09-09 公开 PyPI `pllm` JSON 查询为 404；仅说明未发现公开项目，不代表名称已注册或账户有发布权限。 |
+| 下一阶段第 8.4 节：性能与候选包 | 八组五臂比较、冷/热及容量观察、主要 kernel/launch 归因和当前源码候选包均有证据。结果不支持分页默认，也不支持继续无依据堆融合；保留普通默认。共享 GPU、短测、旧矩阵无进程 CPU 时钟及未耗尽显存的限制不变，不声称发布 SLO。 |
+| 下一阶段第 8.3 节：独立适配流程 | 数学及生命周期结果已验证，核心未因 Huber 增加专属路径；但旧独立适配过程未保留可核实的重写次数、人类澄清及失败记录。不能从最终源码反推“一次成功”或“零澄清”，这是尚未闭合的过程证据。 |
+
+**资源成本判定：** 已审查原 owner 的保存值、参数打包、行映射、冷捕获和完成/取消/
+失败结算。ESamp、LoRA、Dummy、OverRIDE、普通 In-Place-TTT、ReFT、TTRL、FTTT
+提供已声明 tensor 成本；有限请求缺少任一 task/output 成本时拒绝。`CausalModel` 的
+logits/factor 接口不提供模型内部 forward/backward 成本，模型 replay 和 GTTA/Python
+历史也不能套用上述公式。这些是明确不提供内置有限保证的范围，不是零字节资源。
+保留其无界合法语义，不增设全自动 PyTorch/任意 Python heap 分析器作为完成前置项；
+不把已声明 AER 峰值、用户自定义成本或当前绿色测试当作总进程/总显存证明。
+
+**下一步仅补齐独立适配的可审计过程记录，然后作最终完成声明。** 若旧过程记录无法
+恢复，需要未参与接口设计的人或 agent 重新完成一次现有 reference 的独立接入，记录
+澄清、重写和失败；不修改冻结 reference、不增加核心专属分支、不新增证据 ID。
+当前缺的是这项流程证据，不是再跑同一整套测试、重建候选包或重跑吞吐矩阵。
+不提交、打 tag 或远端发布。
+
+最近一次源码统计口径为 `pllm tools examples rust/pllm_core/src` 下全部实际 .py/.pyi/.rs
+（含未跟踪文件）：**20,032 行**。CPU/host-launch 报告与原 arena 可观察性增加 74 行，
+随后四条内置成本及相关输入边界增加 134 行，不将功能补齐记成净删除。
+随后公共成本绑定去重与 GTTA 查询替换净删 48 行；三个受影响成本路径及 GTTA/host
+原证据定点通过，strict/import/authority 通过，不重复 GPU 矩阵。
+TTRL 成本及原 host 事实绑定增加 64 行，不将这部分功能补齐记成净删除。
+FTTT 成本与准入后初始化增加 35 行。
+普通接口、独立行域、共享分页及资源边界完善相对
+17,922 的增长尚未抵消；低于历史 30k 上限不能代替功能、资源与性能验收。
+
+仓库仅主 worktree，旧生产目录无空壳；失效内部文档/import baseline 已删除。
+本次现状段整理前的可恢复副本在
+`/tmp/pllm-write-audit.Gw2MwA/plan-before-consolidation.md`；
+它不作为另一份维护文档。PTTS/AER 研究原稿未修改、未加入或提交。
 
 ## 1. 当前基线
 
@@ -359,8 +604,8 @@ runtime/class hierarchy assertions。
 39. `isolated_wheel_imports_and_executes_rust_codec`：fresh wheel、隔离目录 import 和 Rust
     codec execution。
 
-当前 `canonical_vllm_esamp_smoke.py`、`canonical_vllm_inplace_ttt_smoke.py` 和
-`canonical_fttt_cuda_smoke.py` 分别是第 30、32、38 项基础。旧 MP/TLM/ReFT/
+当前 `vllm_esamp_smoke.py`、`vllm_inplace_ttt_smoke.py` 和
+`fttt_cuda_smoke.py` 分别是第 30、32、38 项基础。旧 MP/TLM/ReFT/
 Recirculation smoke 只能抽取场景，必须改为新公共入口后才可进入 survivor list。
 
 GTTA 是 CPU host-service workload，Dummy 不拥有 backend，二者不增加 GPU smoke。
@@ -603,3 +848,10 @@ AER 的派生索引/解引用不复制图的事实；PhysicalPlan 只投影已�
   默认不保存 prompt/tensor，详细快照显式开启，缓冲溢出丢最旧事件并计数。
 - 先完成整个第一轮，再做剩余 owner 的第二轮压缩。最终代码回到主目录；旧改动先完整保存
   可恢复快照，只迁入仍有价值的数学和行为，不恢复旧 runtime。不得以阶段提交冒充全部完成。
+
+### 新采样边界的证据决定（2026-09-06）
+
+OverRIDE 引入既有 ESamp post-filter 证据没有覆盖的 pre-filter addition 与实际 sampled-token
+反馈。两者共用原 sampler、packed rows 和 invocation，因此只占一个余量项 42，验证真实
+norm hidden、stock draw 与原身份关联；总目标改为 42，硬上限仍为 50。TTRL 复用现有
+host/arena 边界，第 29 项覆盖其 CPU/CUDA 数学及完整控制结果，不另建 workload GPU smoke。

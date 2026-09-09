@@ -229,5 +229,5 @@ package.json
 package-lock.json
 
 # Rust core build artifacts
-tllm/_core*.so
+pllm/_core*.so
 rust/target/

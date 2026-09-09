@@ -1,303 +1,70 @@
 #!/usr/bin/env python3
-"""Import-layer gate: cross-package imports must follow the declared direction.
+"""Reject runtime imports against the reviewed package dependency direction.
 
-Usage (from the repo root, venv activated)::
-
-    python tools/check_import_layers.py            # check against the baseline
-    python tools/check_import_layers.py --rebase   # record current violations as the baseline
-    python tools/check_import_layers.py --list     # print every violating import
-
-Target direction (a package may import only the packages listed in RULES)::
-
-    contracts ← canonical ← canonical_vllm
-    backends (contracts only); Rust FFI is tllm._core
-
-Two tiers, mirroring tools/check_typing.py:
-  - module-level violations: the red line; any new one fails the gate.
-  - function-local imports: a ledger; still circular at call time, so they are
-    counted separately and must only decrease until R3 eliminates them.
-
-Imports under ``if TYPE_CHECKING:`` are erased at runtime and exempt.
-
-Files directly under ``tllm/`` (the package facade) are exempt. Every new
-subpackage of ``tllm`` must be declared in RULES — undeclared packages fail.
+Top-level public modules and TYPE_CHECKING bodies are exempt. Function-local
+imports follow the same rules as module imports; there is no migration baseline.
 """
 
 from __future__ import annotations
 
-import argparse
 import ast
-import json
-import sys
-from dataclasses import dataclass
+from importlib.util import resolve_name
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PKG_ROOT = REPO_ROOT / "tllm"
-BASELINE_PATH = REPO_ROOT / "tools" / "import_layers_baseline.json"
+PKG_ROOT = REPO_ROOT / "pllm"
 
 # importer package -> allowed internal targets (besides itself).
 RULES: dict[str, frozenset[str]] = {
     "contracts": frozenset(),
-    # Clean-room native core. It consumes only closed contracts and Rust FFI;
-    # legacy runtime/workload layers must never become dependencies.
-    "canonical": frozenset({"contracts"}),
-    # Clean in-process vLLM attachment.  It may consume signed canonical
-    # plans/contracts and Rust FFI, but never the legacy runtime/backends.
-    "canonical_vllm": frozenset({"canonical", "contracts"}),
-    "backends": frozenset({"contracts"}),
+    "execution": frozenset({"contracts", "kernels"}),
+    "kernels": frozenset({"contracts"}),
+    "workloads": frozenset({"authoring", "config", "contracts", "execution", "kernels"}),
+    "backends": frozenset({"authoring", "config", "contracts", "execution"}),
 }
 
-SANCTIONED_EDGES: frozenset[tuple[str, str]] = frozenset(
-)
+def _scan_file(path: Path) -> list[str]:
+    relative = path.relative_to(PKG_ROOT)
+    if len(relative.parts) == 1:
+        return []
+    importer = relative.parts[0]
+    if importer not in RULES:
+        return [f"{path}:1: undeclared pllm package {importer}"]
+    package = ".".join(("pllm", *relative.parent.parts))
+    allowed = RULES[importer] | {importer, "_core"}
+    violations: list[str] = []
 
-EXACT_MODULE_EDGES: frozenset[tuple[str, str]] = frozenset(
-    {
-    }
-)
-
-# Compiled Rust artifact and other top-level extension modules are not packages.
-NON_PACKAGE_MODULES: frozenset[str] = frozenset({"_core"})
-
-
-@dataclass(frozen=True)
-class Violation:
-    importer: str
-    module: str
-    target_pkg: str
-    level: str  # "module" | "local"
-    file: str
-    line: int
-
-    @property
-    def bucket(self) -> str:
-        return f"{self.importer}->{self.target_pkg}"
-
-
-def _module_parts(path: Path) -> list[str]:
-    rel = path.relative_to(PKG_ROOT).with_suffix("")
-    parts = ["tllm", *rel.parts]
-    if parts[-1] == "__init__":
-        parts.pop()
-    return parts
-
-
-def _resolve_from(current: list[str], level: int, module: str | None) -> list[str] | None:
-    """Resolve a relative `from ... import` to absolute module parts."""
-    if level == 0:
-        return module.split(".") if module else None
-    # level 1 = current package; the file itself is one part deep.
-    base = current[: len(current) - level]
-    if not base or base[0] != "tllm":
-        return None
-    return base + (module.split(".") if module else [])
-
-
-def _is_type_checking_block(node: ast.AST) -> bool:
-    if not isinstance(node, ast.If):
-        return False
-    test = node.test
-    if isinstance(test, ast.Name):
-        return test.id == "TYPE_CHECKING"
-    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
-
-
-def _is_allowed_target(
-    importer: str,
-    source_module: str,
-    target_pkg: str,
-    target_module: str,
-) -> bool:
-    """Return whether one resolved cross-package import follows the layer rules."""
-    allowed = RULES.get(importer, "undeclared")
-    if allowed is None:
-        return True
-    if allowed != "undeclared" and target_pkg in allowed:
-        return True
-    if (source_module, target_module) in EXACT_MODULE_EDGES:
-        return True
-    return (importer, target_module) in SANCTIONED_EDGES
-
-
-def _scan_file(path: Path) -> list[Violation]:
-    rel_parts = path.relative_to(PKG_ROOT).parts
-    if len(rel_parts) == 1:
-        return []  # package facade (tllm/__init__.py etc.) is exempt
-    importer = rel_parts[0]
-    allowed = RULES.get(importer, "undeclared")
-    if allowed is None:
-        return []  # leaf packages may import anything
-    current = _module_parts(path)
-    source_module = ".".join(current)
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-    violations: list[Violation] = []
-
-    def visit(node: ast.AST, in_function: bool, type_only: bool = False) -> None:
-        for child in ast.iter_child_nodes(node):
-            if type_only and isinstance(child, (ast.Import, ast.ImportFrom)):
-                continue  # erased at runtime
-            targets: list[list[str] | None] = []
-            if isinstance(child, ast.Import):
-                targets = [alias.name.split(".") for alias in child.names]
-            elif isinstance(child, ast.ImportFrom):
-                targets = [_resolve_from(current, child.level, child.module)]
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, ast.If) and (isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+            or isinstance(node.test, ast.Attribute) and isinstance(node.test.value, ast.Name)
+            and node.test.value.id == "typing" and node.test.attr == "TYPE_CHECKING"):
+            for child in node.orelse:
+                visit(child)
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.Import):
+                targets = [alias.name for alias in node.names]
             else:
-                visit(
-                    child,
-                    in_function or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)),
-                    type_only or _is_type_checking_block(child),
-                )
-                continue
-            for parts in targets:
-                if parts is None or len(parts) < 2 or parts[0] != "tllm":
-                    continue
-                target_pkg = parts[1]
-                if target_pkg == importer or target_pkg in NON_PACKAGE_MODULES:
-                    continue
-                if allowed == "undeclared":
-                    violations.append(
-                        Violation(importer, ".".join(parts), target_pkg, "undeclared", str(path), child.lineno)
-                    )
-                    continue
-                module_name = ".".join(parts)
-                if _is_allowed_target(importer, source_module, target_pkg, module_name):
-                    continue
-                violations.append(
-                    Violation(
-                        importer,
-                        module_name,
-                        target_pkg,
-                        "local" if in_function else "module",
-                        str(path.relative_to(REPO_ROOT)),
-                        child.lineno,
-                    )
-                )
+                target = resolve_name("." * node.level + (node.module or ""), package)
+                targets = [target]
+                if target == "pllm":
+                    targets = [f"pllm.{alias.name}" for alias in node.names
+                        if (PKG_ROOT / alias.name).is_dir() or (PKG_ROOT / f"{alias.name}.py").is_file()]
+            for target in targets:
+                parts = target.split(".")
+                if len(parts) > 1 and parts[0] == "pllm" and parts[1] not in allowed:
+                    violations.append(f"{path}:{node.lineno}: {importer} cannot import {target}")
+        for child in ast.iter_child_nodes(node):
+            visit(child)
 
-    visit(tree, False)
+    visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
     return violations
-
-
-def _collect() -> list[Violation]:
-    violations: list[Violation] = []
-    for path in sorted(PKG_ROOT.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        violations.extend(_scan_file(path))
-    return violations
-
-
-def _buckets(violations: list[Violation], level: str) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for v in violations:
-        if v.level == level:
-            counts[v.bucket] = counts.get(v.bucket, 0) + 1
-    return dict(sorted(counts.items()))
-
-
-def _rules_snapshot() -> dict[str, list[str] | str]:
-    snapshot: dict[str, list[str] | str] = {
-        pkg: ("leaf (any)" if allowed is None else sorted(allowed))
-        for pkg, allowed in sorted(RULES.items())
-    }
-    snapshot["exact_module_edges"] = [
-        f"{source} -> {target}"
-        for source, target in sorted(EXACT_MODULE_EDGES)
-    ]
-    snapshot["sanctioned_edges"] = [
-        f"{source} -> {target}"
-        for source, target in sorted(SANCTIONED_EDGES)
-    ]
-    return snapshot
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rebase", action="store_true", help="record current violations as the new baseline")
-    parser.add_argument("--list", action="store_true", help="print every violating import")
-    args = parser.parse_args()
-
-    violations = _collect()
-    undeclared = [v for v in violations if v.level == "undeclared"]
-    if undeclared:
-        seen = sorted({v.importer for v in undeclared})
-        print(f"error: undeclared tllm subpackage(s) {seen}; add them to RULES in {Path(__file__).name}", file=sys.stderr)
-        return 2
-
-    module_buckets = _buckets(violations, "module")
-    local_buckets = _buckets(violations, "local")
-
-    if args.list:
-        for v in violations:
-            print(f"{v.level:6s} {v.file}:{v.line}  {v.bucket}  ({v.module})")
-        print(f"module-level: {sum(module_buckets.values())}, local: {sum(local_buckets.values())}")
-        return 0
-
-    if args.rebase:
-        if BASELINE_PATH.exists():
-            previous = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
-            for current, old in (
-                (module_buckets, previous["module_level"]),
-                (local_buckets, previous["local_level"]),
-            ):
-                if any(
-                    count > old.get(bucket, 0)
-                    for bucket, count in current.items()
-                ):
-                    print(
-                        "error: --rebase cannot increase import violations",
-                        file=sys.stderr,
-                    )
-                    return 1
-        baseline = {
-            "comment": "Cross-package import baseline (only-decrease). Regenerate with `python tools/check_import_layers.py --rebase`.",
-            "rules": _rules_snapshot(),
-            "module_level": module_buckets,
-            "local_level": local_buckets,
-        }
-        BASELINE_PATH.write_text(json.dumps(baseline, indent=2) + "\n", encoding="utf-8")
-        print(
-            f"rebased {BASELINE_PATH.relative_to(REPO_ROOT)}: "
-            f"module-level {sum(module_buckets.values())}, local {sum(local_buckets.values())}"
-        )
-        return 0
-
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
-    live_rules = _rules_snapshot()
-    if baseline.get("rules") != live_rules:
-        print(
-            "FAIL import-layer rule snapshot differs from the reviewed baseline"
-        )
-        print(
-            "audit the rule change, then run "
-            "`python tools/check_import_layers.py --rebase`"
-        )
-        return 1
-    failed = False
-    for label, current, base in (
-        ("module-level", module_buckets, baseline["module_level"]),
-        ("local", local_buckets, baseline["local_level"]),
-    ):
-        over = [
-            f"  {bucket}: {count} > baseline {base.get(bucket, 0)}"
-            for bucket, count in sorted(current.items())
-            if count > base.get(bucket, 0)
-        ]
-        if over:
-            print(f"FAIL {label} imports ({sum(current.values())} total):")
-            print("\n".join(over))
-            print("run `python tools/check_import_layers.py --list` to see the offending imports")
-            failed = True
-        else:
-            decreased = sum(base.values()) - sum(current.values())
-            print(f"OK   {label} imports: {sum(current.values())} (baseline {sum(base.values())}, decreased by {max(decreased, 0)})")
-    if failed:
-        return 1
-    if sum(module_buckets.values()) + sum(local_buckets.values()) < sum(baseline["module_level"].values()) + sum(
-        baseline["local_level"].values()
-    ):
-        print("hint: baseline improved — consider `python tools/check_import_layers.py --rebase` to lock in the progress")
-    return 0
+    violations = [violation for path in sorted(PKG_ROOT.rglob("*.py")) for violation in _scan_file(path)]
+    print("\n".join(violations) if violations else "OK import layers: zero runtime violations")
+    return int(bool(violations))
 
 
 if __name__ == "__main__":

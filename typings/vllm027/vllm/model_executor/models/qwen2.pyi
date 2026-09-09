@@ -2,6 +2,7 @@ from collections.abc import Callable, Sequence
 
 import torch
 from torch.nn import Module, Parameter
+from vllm.sequence import IntermediateTensors
 
 
 _LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
@@ -20,7 +21,18 @@ class Qwen2MLP(Module):
     forward: Callable[[Qwen2MLP, torch.Tensor], torch.Tensor]
 
 
+class Attention(Module):
+    impl: object
+    kv_cache: torch.Tensor
+    kv_cache_dtype: str
+    kv_sharing_target_layer_name: str | None
+    num_kv_heads: int
+    head_size: int
+    layer_name: str
+
+
 class Qwen2Attention(Module):
+    attn: Attention
     qkv_proj: Qwen2DownProjection
     q_size: int
     kv_size: int
@@ -29,13 +41,23 @@ class Qwen2Attention(Module):
 class Qwen2DecoderLayer(Module):
     mlp: Qwen2MLP
     self_attn: Qwen2Attention
+    forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
 
 
 class Qwen2Model(Module):
     layers: Sequence[Qwen2DecoderLayer]
+    norm: Qwen2Norm
+    forward: Callable[[torch.Tensor | None, torch.Tensor, IntermediateTensors | None, torch.Tensor | None], torch.Tensor | IntermediateTensors]
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+
+
+class Qwen2Norm(Module):
+    def forward(self, hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 class Qwen2ModelConfig:
+    vocab_size: int
     hidden_size: int
 
 

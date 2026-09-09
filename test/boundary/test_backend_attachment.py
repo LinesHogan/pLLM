@@ -2,35 +2,40 @@
 
 import json
 from dataclasses import replace
+from unittest.mock import patch
+from typing import Annotated
 
 import pytest
 import torch
-from tllm.canonical.backend_program import BackendCompileFacts, ParameterTargetShape
+from pllm.authoring import BackendCompileFacts, ParameterTargetShape
+from pllm.execution.tensor_binding import TensorBinding
 
-from tllm import _core
-from tllm.canonical.backend_attachment import (
-    _inputs_json, compile_backend_attachment,
+from pllm import _core, Parameter
+from pllm.execution.backend_attachment import (
+    compile_backend_attachment,
     lower_backend_attachment,
     validate_backend_attachment, validate_backend_attachment_physical,
     validate_backend_attachment_reconstruction,
 )
-from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
-from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
-from tllm.canonical.tensor_layout import intern_tensor_layouts
-from tllm.canonical.workloads.esamp_request import ESampRequestWorkload
-from tllm.canonical.workloads.esamp_request_types import ESampRequestConfig
-from tllm.canonical.workloads.inplace_ttt import (
+from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.tensor_layout import intern_tensor_layouts
+from pllm.workloads.esamp_request import ESampRequestWorkload
+from pllm.workloads.esamp_request import ESampRequestConfig
+from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig, InPlaceTTTWorkload,
 )
-from tllm.contracts.backend_attachment import (
-    AttachmentGraphMode, AttachmentHiddenResource, AttachmentTopology, BackendPlacementProbe,
+from pllm.contracts.backend_attachment import (
+    AttachmentGraphMode, AttachmentHiddenResource, AttachmentTopology, BackendPlacementProbe, SignedBackendAttachment,
 )
-from tllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase
-from tllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterOverlayOperator
-from tllm.contracts.state_representation import StateDeviceKind
-from tllm.contracts.tensor_layout import TensorDType
-from tllm.contracts.semantic_graph import (
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase
+from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
+from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget, ParameterOverlayOperator
+from pllm.contracts.state_representation import StateDeviceKind
+from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.semantic_graph import (
     AnchorId, ImplementationId, TaskId, SemanticGraph, SemanticOutputKind, HostPayloadSchemaId,
 )
 
@@ -44,10 +49,22 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
         StateDeviceKind.CPU, 0, 1, 1, TensorDType.FLOAT32, 3, 8, (), (),
     )
     facts = BackendCompileFacts(probe,
-        CanonicalRuntimeFacts(torch.device("cpu")).timeline(("state/dense_page_cpu@1", "transition/full_root@1")),
-        (PageBundleProviderFacts("test.attachment@1", 2),), 2, 4096, 7,
+        RuntimeFacts(torch.device("cpu")).timeline(("state/dense_page_cpu@1", "transition/full_root@1")),
+        (PageBundleProviderFacts("test.attachment@1", 4),), 2, 4096, 7,
         (ParameterTargetShape(target, 3, 2),))
-    overlay_deployment = workload.compile_backend(facts)
+    with patch.object(PageBundleArena, "__init__", side_effect=AssertionError("planning allocated state")):
+        planned = workload.plan_backend(facts)
+    with patch.object(_core, "compile_state_schedule", side_effect=AssertionError("worker selected a plan")):
+        overlay_deployment = workload.bind_backend(facts, planned)
+    with pytest.raises(ValueError, match="mathematics"):
+        InPlaceTTTWorkload(replace(workload.config, learning_rate=0.5)).bind_backend(facts, planned)
+    annotations = dict(InPlaceTTTWorkload.transition.__annotations__,
+        delta=Annotated[torch.Tensor, Parameter("dense_fast_weights", "tail_input")])
+    with patch.object(InPlaceTTTWorkload.transition, "__annotations__", annotations):
+        with pytest.raises(ValueError, match="mathematics"):
+            workload.bind_backend(facts, planned)
+    with pytest.raises(ValueError, match="worker backend facts"):
+        workload.bind_backend(replace(facts, probe=replace(probe, topology=AttachmentTopology.ENGINE_CORE)), planned)
     overlay = overlay_deployment.attachment
     assert overlay.inputs.plan is overlay_deployment.execution.arena.plan
     assert overlay.inputs.probe is facts.probe
@@ -69,16 +86,20 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
     with pytest.raises(ValueError, match="composition"):
         compile_backend_attachment(replace(overlay.inputs, probe=sampler_probe))
     class UnconsumedSamplerWorkload(InPlaceTTTWorkload):
-        def semantic_graph(self, execution_parameters_digest: str) -> SemanticGraph:
-            graph = super().semantic_graph(execution_parameters_digest)
+        def _build(self, b: TensorBinding) -> None:
+            super()._build(b)
+            graph = b.graph
             task, other = graph.tasks
             output, = task.outputs
-            return replace(graph, tasks=(replace(task,
+            b.graph = replace(graph, tasks=(replace(task,
                 outputs=(replace(output, kind=SemanticOutputKind.SAMPLER, schema=HostPayloadSchemaId("")),)), other))
     with pytest.raises(ValueError, match="composition"):
         UnconsumedSamplerWorkload(workload.config).compile_backend(facts)
 
     for signed in (overlay, sampler):
+        reconstructed = decode_boundary(encode_boundary(signed), SignedBackendAttachment)
+        assert reconstructed == signed
+        validate_backend_attachment_physical(reconstructed.inputs, reconstructed.decision, reconstructed.physical)
         inputs, decision, physical = signed.inputs, signed.decision, signed.physical
         plan, request = inputs.plan, inputs.request
         assert compile_backend_attachment(inputs) == decision
@@ -140,7 +161,7 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
         with pytest.raises(ValueError, match="state representation differs from signed tensor layout"):
             compile_backend_attachment(replace(inputs, plan=replace(plan,
                 tensor_layout_request=other_layouts, tensor_layout_decision=intern_tensor_layouts(other_layouts))))
-        wire = _inputs_json(inputs)
+        wire = encode_boundary(inputs)
         for path, key in (((), "plan"), (("request",), "state_resource"),
                           (("probe",), "model_fingerprint"), (("plan",), "tensor_layout_request")):
             for missing in (True, False):
@@ -155,7 +176,7 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
                 with pytest.raises(ValueError):
                     _core.compile_backend_attachment(json.dumps(payload))
         with pytest.raises(ValueError):
-            _core.compile_backend_attachment(wire.replace('"schema_version":4', '"schema_version":4,"schema_version":4', 1))
+            _core.compile_backend_attachment(wire.replace('"schema_version":7', '"schema_version":7,"schema_version":7', 1))
 
     request = overlay.inputs.request
     for invalid in (
@@ -174,7 +195,9 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
         validate_backend_attachment(changed_field, overlay.decision)
     resource, other = sampler_probe.hidden_resources
     for altered in (replace(resource, phase=HiddenPhase.PREFILL),
-                    replace(resource, binding=replace(resource.binding, layer="-1"))):
+                    *(replace(resource, binding=replace(resource.binding, layer=layer))
+                        for layer in ("-1", "01", str(1 << 63))),
+                    replace(resource, binding=replace(resource.binding, module_path=""))):
         with pytest.raises(ValueError):
             compile_backend_attachment(replace(sampler.inputs,
                 probe=replace(sampler_probe, hidden_resources=(altered, other))))
@@ -184,8 +207,68 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
     assert compile_backend_attachment(changed_module) != sampler.decision
     with pytest.raises(ValueError):
         validate_backend_attachment(changed_module, sampler.decision)
-    old_wire = json.loads(_inputs_json(sampler.inputs))
+    old_wire = json.loads(encode_boundary(sampler.inputs))
     first_hidden = old_wire["probe"]["hidden_resources"][0]
     old_wire["probe"]["hidden_resources"][0] = {**first_hidden["binding"], "phase": first_hidden["phase"]}
     with pytest.raises(ValueError):
         _core.compile_backend_attachment(json.dumps(old_wire))
+
+    # Factory failure must release an already-created engine, before a handle owns it.
+    from importlib.util import find_spec
+    if find_spec("vllm") is not None:
+        import io
+        import os
+        from types import SimpleNamespace
+        import pllm
+        from pllm.backends.vllm import runtime
+        for multiprocessing, message in ((False, "in-process client"), (True, "single-worker quorum")):
+            with io.BytesIO(b"owned engine resource") as resource:
+                engine = SimpleNamespace(llm_engine=SimpleNamespace(engine_core=SimpleNamespace(shutdown=resource.close)),
+                    collective_rpc=lambda *args, **kwargs: ())
+                environment = {"VLLM_ENABLE_V1_MULTIPROCESSING": "1" if multiprocessing else "0",
+                    "VLLM_USE_V2_MODEL_RUNNER": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
+                with patch.dict(os.environ, environment), patch.object(runtime, "LLM", return_value=engine):
+                    with pytest.raises(RuntimeError, match=message):
+                        pllm.make_llm(pllm.ModelConfig("unused-local-model", multiprocessing=multiprocessing),
+                            workload=ESampRequestWorkload())
+                    assert resource.closed
+
+        # A failed shutdown retains the real shared-input FD until close can retry.
+        from weakref import ref
+        from vllm import SamplingParams
+        from pllm.execution.shared_tensor import CpuFileStorage
+        staged = []
+        shutdown_failure = [True]
+        def rpc(*args, **kwargs):
+            command, payload = kwargs["args"]
+            if command == runtime.BackendCommand.STAGE.value:
+                staged.append(decode_boundary(payload, runtime.BackendStage))
+            return ("",)
+        def fail(*args, **kwargs):
+            raise RuntimeError("synthetic engine failure")
+        def shutdown():
+            if shutdown_failure[0]:
+                raise RuntimeError("synthetic shutdown failure")
+        engine = SimpleNamespace(owned=torch.empty(128), collective_rpc=rpc,
+            llm_engine=SimpleNamespace(engine_core=SimpleNamespace(shutdown=shutdown), abort_request=fail,
+                output_processor=SimpleNamespace(request_states={"0": SimpleNamespace(external_req_id="0")})),
+            sleep=lambda **kwargs: None, enqueue=lambda *args, **kwargs: ["0"],
+            wake_up=lambda **kwargs: None, wait_for_completion=fail)
+        owned = ref(engine.owned)
+        handle = runtime.VllmLlm(engine, None, None, overlay, facts)
+        del engine
+        with pytest.raises(RuntimeError, match="synthetic engine failure"):
+            handle.generate(["test"], SamplingParams(max_tokens=1), feedback_group="ownership")
+        shared = staged[0].completion.storage
+        assert isinstance(shared, CpuFileStorage)
+        assert os.fstat(shared.descriptor).st_size == facts.probe.hidden_size * 4
+        assert owned() is not None and handle._pending_input is not None
+        with pytest.raises(RuntimeError, match="closed"):
+            handle.generate(["test"], SamplingParams(max_tokens=1))
+        shutdown_failure[0] = False
+        handle.close()
+        assert handle._llm is handle._runner is handle._deployment is handle._pending_input is None
+        assert owned() is None
+        with pytest.raises(OSError):
+            os.fstat(shared.descriptor)
+        handle.close()

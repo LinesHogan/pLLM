@@ -1,28 +1,56 @@
 """Evidence 19: real host-state rollback and post-publication receipt settlement."""
 
 from dataclasses import replace
+from itertools import count
 
 import pytest
 import torch
+from pllm import make_llm
+import pllm
+from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.trace import TracePhase, TraceSnapshot
+from pllm.execution import trace as trace_module
 
-from tllm.canonical.host_runtime import (
-    CanonicalHostRuntimeFacts, HostExecution, HostReceipt, HostSettlementError, HostTransactionCoordinator,
+from pllm.execution.host_runtime import (
+    HostRuntimeFacts, HostExecution, HostReceipt, HostSettlementError,
 )
-from tllm.canonical.workloads.gtta.environment import GTTAEnvironmentService
-from tllm.canonical.workloads.gtta.types import (
+from pllm.workloads.gtta.environment import GTTAEnvironmentService
+from pllm.workloads.gtta.types import (
     GTTAConfig, GTTAHostRequest, GTTAHostTransaction, GTTAPromptPosition, GTTAQuery, GTTAResult, TrajectoryFeedback,
 )
-from tllm.canonical.workloads.gtta.state import GTTADynamicsSnapshot, GTTAStepContext
-from tllm.canonical.workloads.gtta.workload import GTTAWorkload
+from pllm.workloads.gtta.state import GTTADynamicsSnapshot, GTTADynamicsState, GTTAStepContext
+from pllm.workloads.gtta import state as gtta_math
+from pllm.workloads.gtta.workload import GTTAWorkload
 
 
 def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeypatch: pytest.MonkeyPatch) -> None:
-    execution = GTTAWorkload().compile(CanonicalHostRuntimeFacts(torch.device("cpu")).timeline())
+    clock = count(0, 10)
+    monkeypatch.setattr(trace_module, "monotonic_ns", lambda: next(clock))
     service = GTTAEnvironmentService(GTTAConfig())
     event = TrajectoryFeedback("task", "act", "start", "end", "change", 1.0)
     service.enqueue_feedback(event)
     request = GTTAHostRequest(GTTAQuery(0, "task", ("act",), "start", "", "", 0, GTTAPromptPosition.SUFFIX))
-    coordinator = HostTransactionCoordinator(service, execution)
+    original_state = GTTADynamicsState()
+
+    def update(context: GTTAStepContext) -> None:
+        assert context.dynamics is original_state
+        gtta_math.update(service.config, context)
+
+    def failed_query(context: GTTAStepContext) -> None:
+        assert context.dynamics is original_state and original_state.version == 1
+        raise RuntimeError("query interrupted after update")
+
+    facts = pllm.HostRuntimeFacts(torch.device("cpu"))
+    binding = pllm.transaction("local.dynamics", facts, config=service.config,
+        state_factory=lambda: original_state, service=service, update=update, query=failed_query, publish=gtta_math.publish)
+    assert binding.service is service
+    local = binding.compile()
+    assert local.service is service
+    with pytest.raises(RuntimeError, match="query interrupted"):
+        local.run(request)
+    assert original_state.version == 0 and service.queued_trajectories == 1
+    coordinator = make_llm(workload=GTTAWorkload(service), config=HostRuntimeFacts(torch.device("cpu")))
+    execution = coordinator.execution
     original_service_commit = service.commit
 
     def reject_publication(
@@ -62,6 +90,8 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     assert service.queued_trajectories == 0
     assert execution.diagnostics().state_version == 1
     assert execution.diagnostics().transaction_count == 0
+    phase = [event.phase for event in execution.trace.snapshot().events if event.invocation_id == receipt.receipt_id]
+    assert phase[-3:] == [TracePhase.PREPARED, TracePhase.PUBLISH, TracePhase.FAILED]
     with pytest.raises(RuntimeError, match="not active"):
         execution.commit(replace(receipt))
     execution.commit(receipt)
@@ -72,3 +102,19 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     assert result.update.state_version == 1
     assert execution.diagnostics().transaction_count == 2
     assert execution.diagnostics().fallback_count == 0
+    before = execution.trace.snapshot()
+    assert before.schema_version == 5 and before.dropped == 0
+    assert before.pending_device_timings == 0 and not before.device_task_times()
+    assert before.schedule_signature == execution.plan.schedule_signature
+    assert any(event.phase is TracePhase.ABORT for event in before.events)
+    assert sum(event.phase is TracePhase.SETTLED for event in before.events) == 2
+    assert all(elapsed == calls * 10 for calls, elapsed in before.host_task_times().values())
+    assert decode_boundary(encode_boundary(before), TraceSnapshot) == before
+    for _ in range(60):
+        coordinator.run(request)
+    after = execution.trace.snapshot()
+    assert after.execution_id == before.execution_id and after.process_id == before.process_id
+    assert len(after.events) == after.capacity == 256 and after.dropped > 0
+    assert after.dropped == after.events[0].sequence - 1
+    assert after.events[-1].sequence == after.dropped + after.capacity
+    assert all(elapsed == calls * 10 for calls, elapsed in after.host_task_times().values())

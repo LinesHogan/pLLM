@@ -1,26 +1,32 @@
 """TLM evidence 11/24: independent factor AdamW and causal objective semantics."""
 
 from dataclasses import replace
+from unittest.mock import patch
+from weakref import ref as weakref
 
 import pytest
 import torch
 from torch.nn import functional as F
 
-from tllm.canonical.backend_program import BackendCompileFacts, CausalTrainBatch, ParameterTargetShape
-from tllm.canonical.backend_attachment import compile_backend_attachment, validate_backend_attachment
-from tllm.canonical.kernels.adamw import AdamWConfig
-from tllm.canonical.ptts.page_bundle import PageBundleArena, PageWrite
-from tllm.canonical.ptts.page_bundle_planning import PageBundleProviderFacts
-from tllm.canonical.runtime_facts import CanonicalRuntimeFacts
-from tllm.canonical.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
-from tllm.canonical.workloads.tlm import HfQvModel, HfQvConfig
-from tllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
-from tllm.contracts.request_identity import RequestIdentity
-from tllm.contracts.backend_attachment import (
+from pllm.authoring import BackendCompileFacts, CausalTrainBatch, ParameterTargetShape
+from pllm.contracts.auxiliary import validate_auxiliary
+from pllm.execution.shared_tensor import SharedTensor
+from pllm.execution.backend_attachment import compile_backend_attachment, validate_backend_attachment
+from pllm.kernels.adamw import AdamWConfig
+from pllm.execution.ptts.page_bundle import PageBundleArena, PageWrite
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.contracts.semantic_graph import AnchorId, TaskResourceFact, TaskSymbol
+from test.backend_facts import assert_auxiliary_preflight
+from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
+from pllm.workloads.tlm import HfQvModel, HfQvConfig
+from pllm.contracts.parameter_overlay import ParameterModuleKind, ParameterRole, ParameterTarget
+from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.backend_attachment import (
     AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe,
 )
-from tllm.contracts.tensor_layout import TensorDType
-from tllm.contracts.state_representation import StateDeviceKind
+from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.state_representation import StateDeviceKind
 
 
 class TinyCausalModel:
@@ -40,6 +46,14 @@ class TinyCausalModel:
         self.base = torch.randn(2, 3, 3, generator=generator, dtype=torch.float64)
         self.head = torch.randn(3, 5, generator=generator, dtype=torch.float64)
 
+    def __deepcopy__(self, memo):
+        raise AssertionError("binding must retain the original frozen causal model")
+
+    @property
+    def resident_bytes(self) -> int:
+        return sum(tensor.numel() * tensor.element_size()
+            for tensor in (*self.initial_factors, self.embedding, self.base, self.head))
+
     def logits(self, batch: CausalTrainBatch, factors: tuple[torch.Tensor, ...] | None) -> torch.Tensor:
         hidden = self.embedding[batch.input_ids]
         weights = self.base if factors is None else torch.stack(tuple(
@@ -49,10 +63,16 @@ class TinyCausalModel:
 
 
 def _compile(model: TinyCausalModel, config: TLMConfig):
-    return TLMWorkload(config, model).compile(
-        CanonicalRuntimeFacts(model.device).timeline(("optimizer/adamw@1", "transition/full_root@1")),
+    workload = TLMWorkload(config, model)
+    timeline = RuntimeFacts(model.device).timeline(("optimizer/adamw@1", "transition/full_root@1"))
+    timeline = replace(timeline, reserved_bytes=(model.resident_bytes,) * len(timeline.anchors))
+    return workload.compile_backend(BackendCompileFacts(
+        BackendPlacementProbe("test.tlm@1", "a" * 64, "b" * 64, "c" * 64,
+            AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind(model.device.type),
+            model.device.index or 0, 1, 1, model.tensor_dtype, model.targets[0].input_size, 8, (), ()),
+        timeline,
         (PageBundleProviderFacts("test.tlm@1", 4, StateDeviceKind(model.device.type), model.device.index or 0),),
-        state_memory_budget_bytes=32768)
+        2, 32768, 7, model.targets)).execution
 
 
 def _reference(model, parameters, batch, config):
@@ -76,6 +96,11 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version(monke
     model = TinyCausalModel()
     config = TLMConfig(optimizer=AdamWConfig(0.01, (0.8, 0.95), 1e-7, 0.1), threshold=0.0)
     execution = _compile(model, config)
+    prepare = PageBundleArena.prepare_transition
+    def copied_optimizer_fields(arena, *args, **kwargs):
+        assert kwargs["copy_fields"] == tuple(index for index in range(5 * len(model.initial_factors)) if index % 5 != 1)
+        return prepare(arena, *args, **kwargs)
+    monkeypatch.setattr(PageBundleArena, "prepare_transition", copied_optimizer_fields)
     (ref,) = execution.admit(())
     first, second = RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0)
     execution.admit((first,))
@@ -99,8 +124,16 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version(monke
             with pytest.raises(RuntimeError, match="multifactor"):
                 execution.step(batch)
         assert execution.arena.latest(ref.lineage_id).version_id == version - 1
-        result = execution.step(batch)
+        invocation = execution.start_step(batch)
+        for anchor in execution.arena.plan.timeline.anchors:
+            execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+            if invocation.context.write is not None:
+                assert invocation.context.updated_refs == invocation.context.write.after_refs
+            if anchor.ordinal == execution.sampler_anchor_id:
+                execution.complete_sampler(invocation)
+        result = execution.finish_step(invocation)
         assert result.publication is not None
+        assert invocation.context.updated_refs == result.publication.after_refs
         (current,) = result.publication.after_refs
         assert current.version_id == version and result.selected_count == 2
         if version == 1:
@@ -134,14 +167,31 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
     batch = CausalTrainBatch(torch.tensor([[0, 2, 3]]), torch.tensor([[0, 2, 3]]))
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
-        deployment = TLMWorkload(config, model).compile_backend(BackendCompileFacts(
+        facts = BackendCompileFacts(
             BackendPlacementProbe("test.qv@1", "a" * 64, "b" * 64, "c" * 64,
                 AttachmentTopology.IN_PROCESS, AttachmentGraphMode.EAGER, StateDeviceKind.CPU,
                 0, 1, 1, model.tensor_dtype, 3, 8, (), ()),
-            CanonicalRuntimeFacts(model.device).timeline(("optimizer/adamw@1", "transition/full_root@1")),
-            (PageBundleProviderFacts("test.qv@1", 4),), 2, 32768, 7, model.targets))
+            RuntimeFacts(model.device).timeline(("optimizer/adamw@1", "transition/full_root@1")),
+            (PageBundleProviderFacts("test.qv@1", 4),), 2, 32768, 7, model.targets)
+        limits = TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),))
+        facts = replace(facts, timeline=replace(facts.timeline, task_resources=(limits,),
+            reserved_bytes=(model.resident_bytes,) * len(facts.timeline.anchors)))
+        assert TLMWorkload(config, model).backend_requirements().resident_bytes == model.resident_bytes
+        with pytest.raises(ValueError, match="model residency"):
+            TLMWorkload(config, model).plan_backend(replace(facts, timeline=replace(facts.timeline,
+                reserved_bytes=(model.resident_bytes - 1,) * len(facts.timeline.anchors))))
+        deployment = TLMWorkload(config, model).compile_backend(facts)
         execution = deployment.execution
         signed = deployment.attachment
+        validate_auxiliary(batch, signed.inputs.plan, SharedTensor.describe)
+        assert_auxiliary_preflight(signed, replace(batch, labels=batch.labels.float()))
+        metadata = TinyCausalModel()
+        metadata.device = torch.device("meta")
+        metadata.initial_factors = tuple(torch.empty_like(factor, device="meta") for factor in model.initial_factors)
+        cold = TLMWorkload(config, metadata)
+        assert cold.plan_backend(facts) == signed
+        with pytest.raises(ValueError, match="materialized"):
+            cold.bind_math(facts, signed.inputs.plan)
         first, second = signed.inputs.request.overlay_bindings
         changed = replace(signed.inputs, request=replace(signed.inputs.request,
             overlay_bindings=(replace(first, scale=2.0), second)))
@@ -149,7 +199,17 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         with pytest.raises(ValueError):
             validate_backend_attachment(changed, signed.decision)
         execution.admit(())
-        anchors = {task.task_symbol: task.anchor_id for task in execution.arena.plan.schedule_decision.tasks}
+        for shape in ((2, 3), (1, 4)):
+            tokens = torch.zeros(shape, dtype=torch.int64)
+            oversized = CausalTrainBatch(tokens, tokens)
+            assert_auxiliary_preflight(signed, oversized)
+            with pytest.raises(ValueError, match="signed input bounds"):
+                execution.step(oversized)
+        with pytest.raises(ValueError, match="signed .* input bounds"):
+            TLMWorkload(config, model).plan_backend(replace(facts,
+                timeline=replace(facts.timeline, task_resources=(replace(limits, input_shapes=()),))))
+        anchors = {execution.arena.plan.semantic_graph.tasks[task.task_id].symbol: task.anchor_id
+            for task in execution.arena.plan.schedule_decision.tasks}
         timeline = {item.symbol: item.ordinal for item in execution.arena.plan.timeline.anchors}
         assert anchors["update"] <= anchors["publish"]
         assert (anchors["publish"] < timeline["model.execute"]) == (mode is TLMMode.OFFLINE)
@@ -179,16 +239,38 @@ def _hf_matches_reference(device: torch.device) -> None:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
     torch.manual_seed(17)
     base = Qwen2ForCausalLM(Qwen2Config(vocab_size=11, hidden_size=8, intermediate_size=16,
-        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, attention_dropout=0.0))
+        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, attention_dropout=0.0, tie_word_embeddings=True))
     base.to(device=device, dtype=torch.float32)
     hf = HfQvModel(base, HfQvConfig("tiny.qwen2", "test", True, False,
         2, 4, 0.0, TensorDType.FLOAT32))
+    assert base.model.embed_tokens.weight is base.lm_head.weight
+    assert hf.resident_bytes == sum(tensor.numel() * tensor.element_size()
+        for tensor in (*hf.model.parameters(), *hf.model.buffers()))
+    with torch.device("meta"):
+        metadata = HfQvModel(Qwen2ForCausalLM(base.config), hf.config)
+    assert metadata.resident_bytes == hf.resident_bytes and metadata.fingerprint == hf.fingerprint
     assert tuple((target.input_size, target.output_size) for target in hf.targets) == ((8, 8), (8, 4))
     frozen = tuple(value.clone() for value in hf.initial_factors)
     batch = CausalTrainBatch(torch.tensor([[1, 2, 3, 4], [2, 3, 4, 0]], device=device),
         torch.tensor([[1, 2, 3, 4], [2, 3, 4, -100]], device=device),
         torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], device=device))
     stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    selection_logits = []
+    original_logits = hf.logits
+    original_forward = hf.model.forward
+    def bounded_forward(*args, **kwargs):
+        assert kwargs["output_hidden_states"] is False and kwargs["output_attentions"] is False
+        result = original_forward(*args, **kwargs)
+        assert result.hidden_states is result.attentions is result.past_key_values is None
+        return result
+    def observe_logits(batch, factors):
+        if factors is not None:
+            assert all(tensor() is None for tensor in selection_logits), "full offline logits survived into adapted forward"
+            selection_logits.clear()
+        value = original_logits(batch, factors)
+        if factors is None:
+            selection_logits.append(weakref(value))
+        return value
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
         execution = _compile(hf, config)
@@ -217,7 +299,8 @@ def _hf_matches_reference(device: torch.device) -> None:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            result = execution.step(batch, stream)
+            with patch.object(hf, "logits", observe_logits), patch.object(hf.model, "forward", bounded_forward):
+                result = execution.step(batch, stream)
             torch.testing.assert_close(result.loss, loss.detach())
             (version,) = result.publication.after_refs
             values = execution.snapshot(version, stream)
