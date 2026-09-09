@@ -16,7 +16,8 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.ptts.page_bundle import KernelCapture, PagePublication, PagePin, PageWrite
+from pllm.execution.ptts.page_bundle import PagePublication, PagePin, PageWrite
+from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.kernels.paged_linear import PagedRows, TensorRows
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import StateTaskContext

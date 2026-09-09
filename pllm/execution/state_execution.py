@@ -12,7 +12,8 @@ import torch
 
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
-from pllm.execution.ptts.page_bundle import KernelCapture, PageBundleArena, PageBundleUsage, PagePin, PagePublication, PageRelease, PageWrite
+from pllm.execution.ptts.page_bundle import PageBundleArena, PageBundleUsage, PagePin, PagePublication, PageRelease, PageWrite
+from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
 from pllm.execution.trace import ExecutionTrace, TracePhase

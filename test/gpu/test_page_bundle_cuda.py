@@ -109,7 +109,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
 def _paged_linear_lifecycle():
     from pllm.kernels.paged_gemm import split_linear
     from pllm.kernels.paged_linear import PagedRows, TensorRows
-    from pllm.execution.ptts.page_bundle import PagedKernel
+    from pllm.execution.ptts.page_capture import PagedKernel
 
     for transposed in (False, True):
         pool = torch.randn((4, 7, 129) if transposed else (4, 129, 7), device="cuda")
@@ -299,7 +299,7 @@ def _paged_linear_lifecycle():
 
 
 def _paged_adamw_lifecycle(captured=True):
-    from pllm.execution.ptts.page_bundle import PagedKernel
+    from pllm.execution.ptts.page_capture import PagedKernel
     from pllm.kernels.paged_linear import PagedRows
     for rank in (2, 41):
         arena = PageBundleArena(_plan(rank=rank, memory_bytes=100000))

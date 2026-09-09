@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from pllm import authoring as a
 from pllm.config import ExecutionOptions
 from pllm.kernels.paged_linear import PagedRows, TensorRows, paged_workspace
-from pllm.execution.ptts.page_bundle import KernelCapture, PagedKernel
+from pllm.execution.ptts.page_capture import KernelCapture, PagedKernel
 from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorOutput, Tensors, select_rows, weighted_training_output
 from pllm.contracts.request_identity import RequestKeyField, canonical_request_key_fields
 from pllm.contracts.semantic_graph import ImplementationId, SchedulerTimeline, StateScope, TaskImplementationSpec, TaskSymbol, TaskResourceFact, ValueResourceFact
