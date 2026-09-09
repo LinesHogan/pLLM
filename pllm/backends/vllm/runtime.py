@@ -355,14 +355,27 @@ class VllmSession(Generic[DataT, ResultT]):
         elif step.invocation.context.value is None:
             execution.submit_input(step.invocation, value, CudaStreamReadiness(stream))
         self._advance(step.invocation, "sampler.pre_draw")
+        self._finish_effects()
+
+    def _finish_effects(self) -> None:
+        """End-of-forward lifecycle for every active optional primitive."""
         if self._capture is not None:
             self._capture.finish()
-        if self._overlay is not None:
-            self._overlay.clear()
-        if self._activation is not None:
-            self._activation.clear()
-        if self._replay is not None:
-            self._replay.clear()
+        for effect in (self._overlay, self._activation, self._replay):
+            if effect is not None:
+                effect.clear()
+
+    def _abort_effects(self) -> None:
+        if self._capture is not None:
+            self._capture.abort_if_active()
+        for effect in (self._overlay, self._activation):
+            if effect is not None:
+                effect.clear()
+
+    def _close_effects(self) -> None:
+        for effect in (self._capture, self._overlay, self._activation, self._replay):
+            if effect is not None:
+                effect.close()
 
     def begin_sampler(self, model: Qwen2ForCausalLM) -> bool:
         if self._step is None or self._sampler is None:
@@ -408,12 +421,7 @@ class VllmSession(Generic[DataT, ResultT]):
             self._replay.clear()
         if self._sampler is not None:
             self._sampler.abort_guidance()
-        if self._capture is not None:
-            self._capture.abort_if_active()
-        if self._overlay is not None:
-            self._overlay.clear()
-        if self._activation is not None:
-            self._activation.clear()
+        self._abort_effects()
         self._deployment.execution.cancel_active()
         self._auxiliary = None
         self._step = None
@@ -444,14 +452,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.retire(())
         else:
             execution.retire_dormant()
-        if self._capture is not None:
-            self._capture.close()
-        if self._overlay is not None:
-            self._overlay.close()
-        if self._activation is not None:
-            self._activation.close()
-        if self._replay is not None:
-            self._replay.close()
+        self._close_effects()
 
     def _invocation(self) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         if self._step is None or self._step.invocation is None:
