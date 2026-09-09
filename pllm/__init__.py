@@ -15,6 +15,7 @@ from pllm.authoring import AdamW as AdamW, HiddenSite as HiddenSite, CausalModel
 from pllm.usage import (
     Workload as Workload, Phase as Phase, on as on, hook as hook, export as export, add_logits as add_logits,
     train as train, Config as Config, Hidden as Hidden, Samples as Samples, Parameter as Parameter,
+    Capture as Capture,
     Result as Result, InstanceState as InstanceState, RequestState as RequestState,
     StateIndex as StateIndex, StateVersion as StateVersion, guide_sampling as guide_sampling,
     BaseLogits as BaseLogits, SampledTokens as SampledTokens,
@@ -95,7 +96,7 @@ def make_llm(config: ModelConfig | HostRuntimeFacts, *,
 
 
 __all__ = ["make_llm", "ModelConfig", "ExecutionOptions", "HostRuntimeFacts", "Workload", "Phase", "on", "hook",
-    "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples", "Parameter", "StateIndex", "StateVersion", "Result",
+    "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples", "Parameter", "Capture", "StateIndex", "StateVersion", "Result",
     "InstanceState", "RequestState", "BaseLogits", "SampledTokens", "AdamW", "HiddenSite",
     "overlay", "Operand", "Buffer", "TensorUpdate", "ParameterOverlayOperator", "ParameterTarget", "RequestKeyField", "ConditionalLayerReplay", "differentiate",
     "Activation", "Overlay", "ActivationPatchOperator", "StateScope", "StateTensorUpdate", "load_tensor_fields", "Recurrence",

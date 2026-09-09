@@ -81,6 +81,8 @@ class TaskOutput:
     observations: tuple[Observation, ...] = ()
     gradient_indices: tuple[int, ...] = ()
     loss: torch.Tensor | None = None
+    # Per-lineage memory writes, rows aligned to the gradient/update selection.
+    field_writes: tuple[tuple[LayoutFieldId, torch.Tensor], ...] = ()
 
 
 def autograd_loss(function: Callable[[D, Mapping[str, torch.Tensor]], torch.Tensor | None],
@@ -220,6 +222,17 @@ class TensorOperation(Generic[D]):
                 context.write = context.arena.prepare_transition(tuple(context.pin.refs[i] for i in selected), stream,
                     copy_fields=self.copy_fields)
                 self.optimizer(context.arena.writable_roots(context.write), output.gradients)
+            if output.field_writes:
+                if context.write is None:
+                    raise ValueError("memory writes require the invocation's private transition")
+                roots = context.arena.writable_roots(context.write)
+                for field_id, values in output.field_writes:
+                    if values.shape[0] != len(selected) or values.ndim < 2:
+                        raise ValueError("memory writes require one row per selected lineage")
+                    for root, value in zip(roots, values.unbind(), strict=True):
+                        if root[int(field_id)].shape != value.shape or root[int(field_id)].dtype != value.dtype:
+                            raise ValueError("memory write differs from its signed field shape or dtype")
+                        root[int(field_id)].copy_(value)
             if self.mode == "update" or self.publish:
                 context.publish()
             if self.mode != "read":

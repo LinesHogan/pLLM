@@ -87,6 +87,8 @@ class State:
     declaration: SemanticState
     fields: tuple[Field, ...]
     optimizer: AdamWConfig | None = None
+    # Count of leading optimizer-expanded fields; trailing fields are plain memory.
+    optimizer_fields: int = 0
 
     def read(self, phase: HiddenPhase = HiddenPhase.DECODE) -> StateSelectionInputSource:
         return StateSelectionInputSource(self.declaration.resource, phase)
@@ -139,18 +141,23 @@ class Builder(Generic[D]):
 
     def state(self, name: str, fields: tuple[Field, ...] | None = None, *, namespace: str = "",
               scope: StateScope = StateScope.INSTANCE, keys: tuple[RequestKeyField, ...] = (),
-              optimizer: AdamWConfig | None = None) -> State:
+              optimizer: AdamWConfig | None = None, memory: tuple[Field, ...] = ()) -> State:
         if fields is None:
-            if optimizer is not None:
+            if optimizer is not None or memory:
                 raise ValueError("an optimizer requires declared parameter fields")
             declaration = SemanticState(StateResource(name), scope, keys)
             self.graph = replace(self.graph, states=(*self.graph.states, declaration))
             return State(declaration, ())
+        if memory and any(part.name in {field.name for field in fields} for part in memory):
+            raise ValueError(f"{name}: memory fields duplicate a parameter field")
+        optimizer_fields = 0
         if optimizer is not None:
             fields = tuple(replace(part, name=f"{field.name}.{part.name}",
                 dtype=TensorDType.FLOAT32 if part.name == "step" else field.dtype)
                 for field in fields for part in adam_fields(field.shape,
                     alignment=field.alignment, mutation=field.mutation))
+            optimizer_fields = len(fields)
+        fields = (*fields, *memory)
         if len({field.name for field in fields}) != len(fields):
             raise ValueError(f"{name}: duplicate field name")
         declaration = SemanticState(StateResource(name), scope, keys)
@@ -173,7 +180,7 @@ class Builder(Generic[D]):
             layout = TensorLayoutSpec(namespace or f"{self.graph.workload_id}.{name}@1", tuple(TensorFieldSpec(LayoutFieldId(i), shape,
                 dtype(field), field.alignment, field.mutation) for i, (field, shape) in enumerate(zip(fields, shapes, strict=True))))
             self.layouts = TensorLayoutRequest((*self.layouts.layouts, StateTensorLayout(name, layout)))
-        return State(declaration, fields, optimizer)
+        return State(declaration, fields, optimizer, optimizer_fields)
 
     @staticmethod
     def hidden(layer: int, *, site: HiddenSite = HiddenSite.BLOCK_OUTPUT,
@@ -219,8 +226,9 @@ class Builder(Generic[D]):
             groups = 1
             copy_fields: tuple[LayoutFieldId, ...] | None = None
             if changes is not None and changes.optimizer is not None and optimizer is None:
-                config, groups = changes.optimizer, len(changes.fields) // 5
-                copy_fields = tuple(LayoutFieldId(i) for i in range(len(changes.fields)) if i % 5 != 1)
+                config, groups = changes.optimizer, changes.optimizer_fields // 5
+                copy_fields = tuple(LayoutFieldId(i) for i in range(len(changes.fields))
+                    if i >= changes.optimizer_fields or i % 5 != 1)
                 def update(roots: tuple[tuple[torch.Tensor, ...], ...], gradients: tuple[torch.Tensor, ...]) -> None:
                     apply_adamw(tuple(root[5 * group:5 * group + 5] for root in roots for group in range(groups)),
                         AdamWFields(*(LayoutFieldId(i) for i in range(5))), config, gradients)

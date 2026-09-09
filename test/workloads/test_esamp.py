@@ -275,7 +275,8 @@ def _ordinary_request_distillation() -> None:
 
     class Distillation(pllm.Workload):
         heads = pllm.RequestState({"weight": lambda m: (m.hidden_size, m.hidden_size)},
-            optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1), keys=(RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX))
+            optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1), keys=(RequestKeyField.PROMPT_IDX, RequestKeyField.SAMPLE_IDX),
+            memory={"carry": lambda m: (m.hidden_size,)})
 
         def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("heads")]) -> torch.Tensor:
             return versions > 0
@@ -289,11 +290,12 @@ def _ordinary_request_distillation() -> None:
 
         @pllm.on(pllm.Phase.AFTER_SAMPLE)
         @pllm.train(state="heads", reduction="state_mean")
-        def train(self, source: Annotated[torch.Tensor, pllm.Hidden(0)],
+        def train(self, source: Annotated[torch.Tensor, pllm.Hidden(0), pllm.Capture("heads", "carry")],
                   target: Annotated[torch.Tensor, pllm.Hidden(-1)],
                   weight: Annotated[torch.Tensor, pllm.Parameter("heads", "weight")],
+                  carry: Annotated[torch.Tensor, pllm.Parameter("heads", "carry")],
                   groups: Annotated[torch.Tensor, pllm.StateIndex("heads")]) -> torch.Tensor:
-            prediction = torch.bmm(source.unsqueeze(1), weight).squeeze(1)
+            prediction = torch.bmm(source.unsqueeze(1), weight).squeeze(1) + carry
             losses = (prediction - target).square().mean(1)
             counts = torch.bincount(groups).to(losses)
             return losses.new_zeros(counts.shape).index_add(0, groups, losses) / counts
@@ -316,6 +318,8 @@ def _ordinary_request_distillation() -> None:
         target = torch.linspace(0.7, -0.3, 12, device=device).reshape(3, 4)
         initial = tuple(latest)
         held = execution.arena.pin_exact(initial, stream)
+        # Cross-step memory: carries hold each lineage's last published capture; step 0 reads zeros.
+        carries = [torch.zeros(4, device=device) for _ in identities]
         for step_id, owners in enumerate(((0, 1, 0), (2, 0, 0))):
             rows = PackedPhaseRowBatch(1, step_id, 3, tuple(PackedPhaseRow(i, i, step_id,
                 HiddenPhase.DECODE, identities[owner]) for i, owner in enumerate(owners)))
@@ -337,13 +341,16 @@ def _ordinary_request_distillation() -> None:
                 selected = [index for index, selected_owner in enumerate(owners) if selected_owner == owner]
                 optimizer = optimizers[owner]
                 optimizer.zero_grad()
-                oracle = F.mse_loss(source[selected] @ weights[owner], target[selected])
+                oracle = F.mse_loss(source[selected] @ weights[owner] + carries[owner], target[selected])
                 oracle.backward()
                 optimizer.step()
                 torch.testing.assert_close(loss, oracle.detach())
                 state = optimizer.state[weights[owner]]
+                # Each lineage's memory receives its last selected row's captured source.
+                carries[owner] = source[selected[-1]].clone()
                 for actual, expected_field in zip(execution.snapshot(after, stream), (weights[owner].flatten(),
-                    weights[owner].grad.flatten(), state["step"].to(device), state["exp_avg"].flatten(), state["exp_avg_sq"].flatten()), strict=True):
+                    weights[owner].grad.flatten(), state["step"].to(device), state["exp_avg"].flatten(),
+                    state["exp_avg_sq"].flatten(), carries[owner]), strict=True):
                     torch.testing.assert_close(actual, expected_field)
                 latest[owner] = after
         for ref in initial:

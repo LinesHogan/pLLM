@@ -20,7 +20,7 @@ from pllm.authoring import BackendWorkload, BackendCompileFacts, BackendRequirem
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, ActivationPatchOperator, AttachmentKind
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.tensor_layout import MutationGranularity, TensorDType, TensorLayoutRequest
+from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType, TensorLayoutRequest
 from pllm.contracts.hidden_locator import HiddenSite, HiddenPhase
 from pllm.contracts.parameter_overlay import ParameterTarget, ParameterOverlayFieldBinding, ParameterOverlayOperator
 from pllm.contracts.request_identity import RequestKeyField
@@ -114,6 +114,15 @@ class Parameter:
 
 
 @dataclass(frozen=True)
+class Capture:
+    """Second Annotated marker: on a training task, write this input's value into
+    the state's memory field at publication — the next step reads it as the input
+    version. Per lineage, the last selected row wins."""
+    state: str
+    field: str
+
+
+@dataclass(frozen=True)
 class StateIndex:
     state: str
 
@@ -154,6 +163,8 @@ class InstanceState:
     dtype: torch.dtype = torch.float32
     alignment: int = field(default=16, kw_only=True)
     mutation: MutationGranularity = field(default=MutationGranularity.WHOLE_TENSOR, kw_only=True)
+    # Plain per-lineage tensors carried across steps; never optimizer-managed.
+    memory: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
 
     def __post_init__(self) -> None:
         if self.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
@@ -164,6 +175,13 @@ class InstanceState:
             object.__setattr__(self, "fields", {"value": self.shape})
         if not self.fields:
             raise ValueError("state requires a shape or named fields")
+        if self.memory:
+            if self.optimizer is None:
+                raise ValueError("memory fields ride on the training transition and require an optimizer")
+            if set(self.memory) & set(self.fields):
+                raise ValueError("memory fields duplicate a parameter field")
+            if any(isinstance(shape, Buffer) for shape in self.memory.values()):
+                raise TypeError("memory fields require tensor shapes, not overlay buffers")
 
 
 @dataclass(frozen=True)
@@ -659,7 +677,8 @@ def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
 
 
 def _arguments(function: Callable[..., torch.Tensor | TensorUpdate], hidden: Hidden | None = None,
-               result_type: type[torch.Tensor] | type[TensorUpdate] = torch.Tensor) -> tuple[tuple[str, object], ...]:
+               result_type: type[torch.Tensor] | type[TensorUpdate] = torch.Tensor,
+               captures: dict[str, Capture] | None = None) -> tuple[tuple[str, object], ...]:
     result: list[tuple[str, object]] = []
     unmarked = 0
     for name, parameter in signature(function, eval_str=False).parameters.items():
@@ -675,6 +694,12 @@ def _arguments(function: Callable[..., torch.Tensor | TensorUpdate], hidden: Hid
         if get_origin(annotation) is not Annotated:
             raise TypeError(f"{name}: input source requires Annotated[Tensor, source]; string annotations are not evaluated")
         args: tuple[object, ...] = get_args(annotation)
+        if len(args) == 3 and isinstance(args[2], Capture) and captures is not None:
+            if args[0] is not torch.Tensor:
+                raise TypeError(f"{name}: expected one source on Annotated[Tensor, source]")
+            captures[name] = args[2]
+            result.append((name, args[1]))
+            continue
         if len(args) != 2 or args[0] is not torch.Tensor:
             raise TypeError(f"{name}: expected one source on Annotated[Tensor, source]")
         result.append((name, args[1]))
@@ -736,7 +761,8 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
                     dtype=TensorDType(str(definition.dtype).removeprefix("torch.")),
                     alignment=definition.alignment, mutation=definition.mutation,
-                    keys=definition.keys if isinstance(definition, RequestState) else ())
+                    keys=definition.keys if isinstance(definition, RequestState) else (),
+                    memory=definition.memory)
                 states[name] = state
                 parameters.update({(name, field): port for field, port in ports.items()})
         for name, effect in values.items():
@@ -855,12 +881,16 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 continue
             function = cast(Callable[..., torch.Tensor], getattr(owner, name))
             hidden: object = getattr(member, "__pllm_hidden__", None)
-            arguments = _arguments(function, hidden if isinstance(hidden, Hidden) else None)
+            capture_marks: dict[str, Capture] = {}
+            arguments = _arguments(function, hidden if isinstance(hidden, Hidden) else None,
+                captures=capture_marks if isinstance(effect, _Train) else None)
             if isinstance(effect, _Train):
                 definition = values.get(effect.state)
                 if not isinstance(definition, InstanceState):
                     raise ValueError("training requires a declared optimizer state")
                 if isinstance(definition.optimizer, SGD):
+                    if capture_marks:
+                        raise ValueError("SGD batch training manages its own state writes")
                     if (gradient is not None or forward_rows or effect.update or not effect.reset
                         or effect.reduction != "weighted_state_mean_then_mean" or phase is not Phase.AFTER_SAMPLE):
                         raise ValueError("SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors")
@@ -888,7 +918,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             identity = _fingerprint(function)
             function = _freeze(function)
             definitions.append((name, boundary_digest(identity,
-                tuple((key, _fingerprint(source)) for key, source in arguments))))
+                tuple((key, _fingerprint(source)) for key, source in arguments), _fingerprint(capture_marks))))
             update: State | None = None
             math: MathContract = MathContract()
             parameter_names = tuple(key for key, source in arguments if isinstance(source, Parameter))
@@ -911,6 +941,13 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             if isinstance(effect, _Train):
                 update = states[effect.state]
                 math = replace(math, update_states=parameter_names[0] if parameter_names else "__update_state", reduction=effect.reduction)
+            captures: dict[str, LayoutFieldId] = {}
+            for key, capture in capture_marks.items():
+                if update is None or capture.state != cast(_Train, effect).state:
+                    raise ValueError("memory captures target the task's own training state")
+                if capture.field not in {field.name for field in update.fields[update.optimizer_fields:]}:
+                    raise ValueError(f"{capture.field}: captures name a declared memory field")
+                captures[key] = update.field(capture.field)
             domains = {"forward_rows": forward_rows, "input_gradient_rows": demand.input_rows,
                 "parameter_gradient_rows": demand.parameter_rows, "update_states": effect.update if isinstance(effect, _Train) else ""}
             selectors: dict[str, Call] = {}
@@ -934,7 +971,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 inputs[key] = TaskResultInputSource(selectors[method].symbol, "value")
                 math = replace(math, **{domain: key})
             call = b.tensor(name, inputs=inputs, when=phase.value, identity=f"python:{identity}",
-                update=update, math=math)(_invoke(function, tuple(key for key, _ in arguments)))
+                update=update, math=math, captures=captures)(_invoke(function, tuple(key for key, _ in arguments)))
             if isinstance(effect, _Export):
                 b.export(call, name=_setting(effect.name, owner, str), every=_setting(effect.every, owner, int),
                     max_rows=_setting(effect.max_rows, owner, int), max_cols=_setting(effect.max_cols, owner, int),

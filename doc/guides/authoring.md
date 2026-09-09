@@ -73,6 +73,19 @@ declared timing. This form currently requires unconditional forward/update domai
 Both are nondifferentiable. Explicit `RequestState.keys` remain the original isolation
 keys; omitting them uses request ID. ESamp keeps its request-ID-only backend restriction.
 
+States also carry plain **memory fields**: `InstanceState(..., memory={"carry": shape})`
+declares per-lineage tensors that ride the training transition without optimizer
+expansion (no gradient/moment slots, never Adam-updated). Memory reads
+(`Parameter(state, field)`) see the input version pinned at step start — the previous
+step's published value — so a training operation consumes what it wrote last step.
+Writes are per-row captures: a third annotation marker
+`Annotated[Tensor, source, pllm.Capture(state, field)]` on a training input writes
+each lineage's last selected row value into its memory field as part of the same
+transition and publication. Captures target the task's own training state, require
+declared memory fields, and are detached. Pages are zero-initialized, so the first
+step reads zeros. Cross-request sharing composes from the existing host export/import
+channel or shared route lineages; memory itself never escapes its lineage's pins.
+
 `@guide_sampling(beta=...)` returns post-filter hidden predictions, optionally selected
 by `@on(..., rows=...)`. The binding associates them with original sampler links,
 including reordered links; it does not require vocabulary dimensions. ESamp uses this

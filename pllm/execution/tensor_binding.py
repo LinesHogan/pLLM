@@ -17,7 +17,7 @@ from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.parameter_overlay import ParameterTarget, ParameterOverlayFieldBinding, ParameterOverlayOperator
-from pllm.contracts.tensor_layout import MutationGranularity, TensorDType
+from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -422,19 +422,23 @@ class TensorBinding(Builder[TensorFrame]):
                    initialize: Callable[[Tensors, torch.Generator], None] | None = None,
                    scope: StateScope = StateScope.INSTANCE, dtype: TensorDType = TensorDType.FLOAT32,
                    alignment: int = 16, mutation: MutationGranularity = MutationGranularity.WHOLE_TENSOR,
-                   keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,)) -> tuple[State, dict[str, SemanticInputSource | TensorPort]]:
+                   keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
+                   memory: Mapping[str, Shape] = {}) -> tuple[State, dict[str, SemanticInputSource | TensorPort]]:
         if self.graph.states:
             raise ValueError("ordinary parameters use one instance state with named tensor views")
+        if set(memory) & set(shapes):
+            raise ValueError("memory fields duplicate a parameter field")
         def sizes(model: Dimensions) -> tuple[tuple[int, ...], ...]:
             return tuple(shape(model) if callable(shape) else shape for shape in shapes.values())
         raw = isinstance(optimizer, SGD)
+        memory_fields = tuple(Field(key, shape, dtype, alignment, mutation) for key, shape in memory.items())
         state = self.state(name, tuple(Field(key, shape, dtype, alignment, mutation) for key, shape in shapes.items()) if raw else
             (Field("parameters", lambda m: (sum(prod(shape) for shape in sizes(m)),), dtype, alignment, mutation),),
             namespace=namespace, optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None, scope=scope,
-            keys=keys if scope is StateScope.REQUEST else ())
+            keys=keys if scope is StateScope.REQUEST else (), memory=memory_fields)
         dimensions = self.dimensions
         if dimensions is None:
-            return state, {key: state.read() for key in shapes}
+            return state, {key: state.read() for key in (*shapes, *memory)}
         views: dict[str, Callable[[tuple[torch.Tensor, ...]], torch.Tensor]] = {}
         offset = 0
         for index, (key, shape) in enumerate(zip(shapes, sizes(dimensions), strict=True)):
@@ -444,6 +448,12 @@ class TensorBinding(Builder[TensorFrame]):
                 return root[index] if raw else root[0].narrow(0, start, size).view(shape)
             views[key] = view
             offset += size
+        # Memory fields follow the optimizer-expanded parameter fields.
+        base = len(shapes) if raw else 5
+        for index, key in enumerate(memory):
+            def memory_view(root: tuple[torch.Tensor, ...], index: int = base + index) -> torch.Tensor:
+                return root[index]
+            views[key] = memory_view
         def port(view: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> TensorPort:
             return TensorPort(state.read(), lambda data, batch: view(batch.roots[0]), rowwise=False)
         if scope is StateScope.REQUEST:
@@ -585,8 +595,13 @@ class TensorBinding(Builder[TensorFrame]):
 
     def tensor(self, name: str, *, inputs: Mapping[str, SemanticInputSource | TensorPort],
                when: When = When.BEFORE_SAMPLE, identity: str = "", update: State | None = None,
-               math: MathContract | None = None, output: str = "value") -> Callable[[TensorMath], Call]:
+               math: MathContract | None = None, output: str = "value",
+               captures: Mapping[str, LayoutFieldId] = {}) -> Callable[[TensorMath], Call]:
         sources = {key: value.source if isinstance(value, TensorPort) else value for key, value in inputs.items()}
+        if captures and update is None:
+            raise ValueError("memory captures require the task's own training transition")
+        if any(key not in sources for key in captures):
+            raise ValueError("memory captures must name a declared tensor input")
         if update is not None and not any(isinstance(source, StateSelectionInputSource)
             and source.resource == update.declaration.resource for source in sources.values()):
             if "__update_state" in sources:
@@ -697,6 +712,13 @@ class TensorBinding(Builder[TensorFrame]):
                                     loss_count=len({indices[data.rows[row].identity] for row in rows}) if policy.reduction == "state_mean" else 1,
                                     update_count=len(active), trained_rows=len(rows), observations=training_observations(data, batch,
                                         loss, {key: inputs[key] for key in inputs if isinstance(sources[key], HiddenInputSource)}, rows))
+                                if captures:
+                                    # Each lineage's memory receives its last selected row's value.
+                                    per_lineage = {indices[data.rows[row].identity]: row for row in rows}
+                                    outcome = replace(outcome, field_writes=tuple(
+                                        (field_id, torch.stack(tuple(inputs[key][per_lineage[index]].detach()
+                                            for index in active)))
+                                        for key, field_id in captures.items()))
                         # validate_gradients binds every derivative path to this sole sink.
                         data.derivative_sources.clear()
                         data.parameters = ()
