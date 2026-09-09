@@ -734,7 +734,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 continue
             if not isinstance(effect, Activation):
                 continue
-            definition = values[effect.state]
+            definition = values.get(effect.state)
             if not isinstance(definition, InstanceState):
                 raise ValueError("activation replacement requires a declared state")
             definitions.append((name, _fingerprint(effect)))
@@ -783,7 +783,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     raise ValueError("ordinary overlays update private buffers without cross-operation autograd")
                 if phase is not Phase.MODEL_UPDATE:
                     raise ValueError("parameter overlays require MODEL_UPDATE")
-                definition = values[effect.state]
+                definition = values.get(effect.state)
                 if not isinstance(definition, RequestState):
                     raise ValueError("parameter overlays require a declared request state")
                 buffers = _buffers(definition)
@@ -833,8 +833,10 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             hidden: object = getattr(member, "__pllm_hidden__", None)
             arguments = _arguments(function, hidden if isinstance(hidden, Hidden) else None)
             if isinstance(effect, _Train):
-                definition = values[effect.state]
-                if isinstance(definition, InstanceState) and isinstance(definition.optimizer, SGD):
+                definition = values.get(effect.state)
+                if not isinstance(definition, InstanceState):
+                    raise ValueError("training requires a declared optimizer state")
+                if isinstance(definition.optimizer, SGD):
                     if (gradient is not None or forward_rows or effect.update or not effect.reset
                         or effect.reduction != "weighted_state_mean_then_mean" or phase is not Phase.AFTER_SAMPLE):
                         raise ValueError("SGD batch training requires reset, weighted reduction and AFTER_SAMPLE without inference-row selectors")

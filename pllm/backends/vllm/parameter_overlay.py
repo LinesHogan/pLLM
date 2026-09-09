@@ -113,19 +113,20 @@ class _ParameterModule:
         # The unquantized TP1 projection owns this fresh output, not an input or state page.
         output = base[0] if isinstance(base, tuple) else base
         captures: list[CapturedParameterOperand] = []
+        capturing = self.capture_operands and self.original_mlp_forward is not None
         for item in self.prepared:
             selected = hidden[item.rows] if isinstance(item.rows, slice) else hidden.index_select(0, item.rows)
             if item.binding.operator is ParameterOverlayOperator.DENSE_ADD:
                 delta = F.linear(selected, item.fields[0]) * item.binding.scale
-                if self.capture_operands:
-                    if self.mlp_input is None or self.mlp_input.shape[0] != self.total_rows or not isinstance(item.rows, torch.Tensor):
-                        raise RuntimeError("dense capture requires owned operand rows and the original MLP input")
-                    captures.append(CapturedParameterOperand(item.source.identity, item.binding.target,
-                        item.source.phase, selected.detach(), self.mlp_input.index_select(0, item.rows).detach(),
-                        self.module.weight.detach()))
             else:
                 a, b = item.fields
                 delta = F.linear(F.linear(selected, a), b) * item.binding.scale
+            if capturing:
+                if self.mlp_input is None or self.mlp_input.shape[0] != self.total_rows or not isinstance(item.rows, torch.Tensor):
+                    raise RuntimeError("operand capture requires owned operand rows and the original MLP input")
+                captures.append(CapturedParameterOperand(item.source.identity, item.binding.target,
+                    item.source.phase, selected.detach(), self.mlp_input.index_select(0, item.rows).detach(),
+                    self.module.weight.detach()))
             columns = output[:, item.offset:item.offset + item.size]
             if isinstance(item.rows, slice):
                 columns[item.rows].add_(delta)
@@ -185,22 +186,22 @@ class VllmParameterOverlay:
             resolved.append((source, pin, ref))
         for handle in self._modules:
             prepared: list[_PreparedRows] = []
+            # Operand capture owns per-request rows on MLP targets; shared launches
+            # group only rows reading the exact same admitted root without capture.
+            capturing = handle.capture_operands and handle.mlp is not None
             groups: dict[tuple[ParameterOverlayFieldBinding, StateRef, RequestIdentity | None],
                 tuple[PagePin, list[PackedPhaseRow], int, int]] = {}
             for source, pin, ref in resolved:
                 for binding, offset, size in handle.bindings:
-                    # Dense operand capture remains per request; low-rank math
-                    # can share a launch only for the exact same admitted root.
-                    key = (binding, ref, source[0].identity if binding.operator is ParameterOverlayOperator.DENSE_ADD else None)
+                    key = (binding, ref, source[0].identity if capturing else None)
                     if key not in groups:
                         groups[key] = (pin, [], offset, size)
                     groups[key][1].extend(source)
             for (binding, ref, _), (pin, source, offset, size) in groups.items():
                 packed = tuple(row.packed_row_index for row in source)
-                indices = (slice(packed[0], packed[0] + len(packed))
-                    if binding.operator is ParameterOverlayOperator.LOW_RANK_ADD
-                    and packed == tuple(range(packed[0], packed[0] + len(packed))) else
-                    torch.tensor(packed, dtype=torch.long, device=handle.module.weight.device))
+                indices = (torch.tensor(packed, dtype=torch.long, device=handle.module.weight.device)
+                    if capturing or packed != tuple(range(packed[0], packed[0] + len(packed)))
+                    else slice(packed[0], packed[0] + len(packed)))
                 fields = tuple(context.arena.borrow_field(pin, ref, field) for field in binding.fields)
                 shapes = ([(size, handle.module.weight.shape[1])] if binding.operator is ParameterOverlayOperator.DENSE_ADD
                     else [(fields[0].shape[0], handle.module.weight.shape[1]), (size, fields[0].shape[0])])
@@ -214,7 +215,8 @@ class VllmParameterOverlay:
     def take_captures(self) -> tuple[CapturedParameterOperand, ...]:
         captures: list[CapturedParameterOperand] = []
         for handle in self._modules:
-            expected = sum(item.binding.operator is ParameterOverlayOperator.DENSE_ADD for item in handle.prepared)
+            expected = (len(handle.prepared)
+                if handle.capture_operands and handle.original_mlp_forward is not None else 0)
             if len(handle.captures) != expected:
                 raise RuntimeError("parameter target did not capture every signed operand")
             captures.extend(handle.captures)

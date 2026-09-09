@@ -334,13 +334,13 @@ replaces = "Legacy MRv1 row/sampler adapter tests; no duplicate workload matrix"
 
 [[evidence]]
 id = 32
-name = "public_vllm_dense_overlay_pins_two_request_versions"
+name = "public_vllm_parameter_overlays_pin_two_request_versions"
 group = "runtime"
 requires_gpu = true
 path = "test/gpu/vllm_inplace_ttt_smoke.py"
 command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_inplace_ttt_smoke.py"
 environment = "Repository .venv; vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, single GPU, eager in-process"
-observable_contract = "Two public requests capture dense operands and update original private fields; six updates/trained rows, eight applied rows including two updated-version rows, no active lineages or pending releases, zero fallback"
+observable_contract = "Two public requests capture operands and update original private fields on both a dense overlay and a request low-rank overlay; updates/trained rows and applied rows include updated-version rows on the model-internal target, no active lineages or pending releases, zero fallback"
 replaces = "Legacy dense parameter overlay and per-request backend lifecycle smoke"
 
 [[evidence]]
