@@ -193,8 +193,11 @@ class VllmSession(Generic[DataT, ResultT]):
         self._capture = Vllm027EagerPackedHiddenCapture(model=model, resources=resources,
             plan_epoch=attachment.physical.plan_epoch, max_packed_rows=probe.max_packed_rows,
             hidden_size=probe.hidden_size) if resources else None
-        self._overlay = VllmParameterOverlay(model,
-            attachment.inputs.request.overlay_bindings) if attachment.inputs.request.overlay_bindings else None
+        overlay_bindings = attachment.inputs.request.overlay_bindings
+        self._overlay_import = bool(overlay_bindings) and (
+            plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after == "request.prepare")
+        self._overlay = VllmParameterOverlay(model, overlay_bindings,
+            capture=not self._overlay_import) if overlay_bindings else None
         self._activation = VllmActivationPatch(model, attachment.inputs.request.activation_bindings) if (
             attachment.inputs.request.activation_bindings) else None
         tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
@@ -306,7 +309,7 @@ class VllmSession(Generic[DataT, ResultT]):
         identities = tuple(sorted(requests,
             key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)))
         stream = torch.cuda.current_stream(execution.device)
-        if execution.directory.scope is StateScope.INSTANCE or self._activation is not None:
+        if execution.directory.scope is StateScope.INSTANCE or self._activation is not None or self._overlay_import:
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
             invocation = execution.start_step(value, stream)
             if execution.directory.scope is StateScope.INSTANCE or not self._pending_identities:

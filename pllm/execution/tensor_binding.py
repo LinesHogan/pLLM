@@ -56,6 +56,32 @@ def _flat_gradient(fields: tuple[torch.Tensor, ...]) -> torch.Tensor:
     return fields[0].flatten() if len(fields) == 1 else torch.cat(tuple(value.flatten() for value in fields))
 
 
+def _check_overlay_fields(buffers: Mapping[str, Buffer], applied: tuple[str, ...],
+                          targets: tuple[ParameterTarget, ...], operator: ParameterOverlayOperator,
+                          scale: float) -> None:
+    arity = 1 if operator is ParameterOverlayOperator.DENSE_ADD else 2
+    if (not targets or tuple(sorted(set(targets))) != targets or len(applied) != arity
+        or len(set(applied)) != arity or any(key not in buffers for key in applied)
+        or not isfinite(scale)):
+        raise ValueError("overlay requires ordered unique targets, exact operator fields and a finite scale")
+
+
+def _check_overlay_shapes(buffers: Mapping[str, Buffer], applied: tuple[str, ...],
+                          dimensions: Dimensions, operator: ParameterOverlayOperator) -> None:
+    def shape_of(key: str, inputs: int, outputs: int) -> tuple[int, ...]:
+        buffer = buffers[key]
+        return buffer.shape(inputs, outputs) if callable(buffer.shape) else buffer.shape
+    for inputs, outputs in dimensions.target_shapes:
+        if operator is ParameterOverlayOperator.DENSE_ADD:
+            matched = shape_of(applied[0], inputs, outputs) == (outputs, inputs)
+        else:
+            down, up = (shape_of(key, inputs, outputs) for key in applied)
+            matched = (len(down) == 2 and len(up) == 2 and 1 <= down[0] == up[1]
+                and down[1] == inputs and up[0] == outputs)
+        if not matched or any(buffers[key].dtype not in (None, tensor_dtype(dimensions.dtype)) for key in applied):
+            raise ValueError("overlay fields must match their operator, target shape and dtype")
+
+
 def _gradient_rows(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # Give this consumer its own gradient edge without copying the forward value.
     result = value.view_as(value)
@@ -241,6 +267,7 @@ class TensorBinding(Builder[TensorFrame]):
         self.probe: BackendPlacementProbe | None = None
         self.sample_limit: int | None = None
         self.overlay_targets: tuple[ParameterTarget, ...] = ()
+        self.overlay_import = False
 
     def recurrence(self, effect: Recurrence) -> None:
         if self.host or self.attachment is not None or self.graph.tasks or self.graph.states:
@@ -258,27 +285,12 @@ class TensorBinding(Builder[TensorFrame]):
                           function: Callable[[Tensors], TensorUpdate]) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
-        arity = 1 if operator is ParameterOverlayOperator.DENSE_ADD else 2
-        if (not targets or tuple(sorted(set(targets))) != targets or len(applied) != arity
-            or len(set(applied)) != arity or any(key not in buffers for key in applied)
-            or not isfinite(scale)):
-            raise ValueError("overlay requires ordered unique targets, exact operator fields and a finite scale")
+        _check_overlay_fields(buffers, applied, targets, operator, scale)
         dimensions = self.dimensions
         if dimensions is not None:
             if len(dimensions.target_shapes) != len(targets):
                 raise ValueError("overlay targets differ from backend specialization")
-            def shape_of(key: str, inputs: int, outputs: int) -> tuple[int, ...]:
-                buffer = buffers[key]
-                return buffer.shape(inputs, outputs) if callable(buffer.shape) else buffer.shape
-            for inputs, outputs in dimensions.target_shapes:
-                if operator is ParameterOverlayOperator.DENSE_ADD:
-                    matched = shape_of(applied[0], inputs, outputs) == (outputs, inputs)
-                else:
-                    down, up = (shape_of(key, inputs, outputs) for key in applied)
-                    matched = (len(down) == 2 and len(up) == 2 and 1 <= down[0] == up[1]
-                        and down[1] == inputs and up[0] == outputs)
-                if not matched or any(buffers[key].dtype not in (None, tensor_dtype(dimensions.dtype)) for key in applied):
-                    raise ValueError("overlay fields must match their operator, target shape and dtype")
+            _check_overlay_shapes(buffers, applied, dimensions, operator)
         self.overlay_targets = targets
         state = self.state(state_name, tuple(_buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
             for index in range(len(targets)) for key, buffer in buffers.items()),
@@ -328,6 +340,46 @@ class TensorBinding(Builder[TensorFrame]):
         if replay is not None:
             self.replay(publication, state, replay)
 
+    def _import_update(self, state: State, identity: str) -> Call:
+        """One BEFORE_MODEL import of externally produced field values into private roots."""
+        def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+            with torch.no_grad():
+                if any(not torch.isfinite(source).all() for _, values in data.replacements for source in values):
+                    raise ValueError("replacement tensors differ from the signed layout or finite-value contract")
+                for index, values in data.replacements:
+                    for target, source in zip(batch.roots[index], values, strict=True):
+                        target.copy_(source)
+            return TaskOutput(update_count=len(data.replacements), changed=tuple(index for index, _ in data.replacements))
+        update = self.compute("update", inputs={"parameters": self.input("input", "state", StateTensorUpdate.schema)},
+            outputs=("updated",), changes=state, effect=StateEffectKind.TRANSITION_MAYBE, when=When.BEFORE_MODEL,
+            function=execute, select=lambda data, selection: tuple(index for index, _ in data.replacements),
+            implementations=(native(identity, "transition/full_root@1"),))
+        self.operations[update.symbol] = replace(self.operations[update.symbol], copy_fields=())
+        return update
+
+    def import_overlay(self, state_name: str, buffers: Mapping[str, Buffer], *,
+                       targets: tuple[ParameterTarget, ...], applied: tuple[str, ...], namespace: str,
+                       keys: tuple[RequestKeyField, ...], scope: StateScope,
+                       operator: ParameterOverlayOperator, scale: float) -> None:
+        """Externally produced overlay fields; the model consumption is identical to trained overlays."""
+        if self.graph.tasks or self.graph.states or self.host:
+            raise ValueError("imported overlay requires a sole model state and effect")
+        _check_overlay_fields(buffers, applied, targets, operator, scale)
+        dimensions = self.dimensions
+        if dimensions is not None:
+            if len(dimensions.target_shapes) != len(targets):
+                raise ValueError("overlay targets differ from backend specialization")
+            _check_overlay_shapes(buffers, applied, dimensions, operator)
+        self.overlay_targets = targets
+        self.overlay_import = True
+        state = self.state(state_name, tuple(_buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
+            for index in range(len(targets)) for key, buffer in buffers.items()),
+            namespace=namespace, scope=scope, keys=keys)
+        update = self._import_update(state, "canonical.overlay:import@1")
+        publication = self.publish(update, state, when=When.BEFORE_MODEL)
+        self.overlay(state, update, publication, tuple(ParameterOverlayFieldBinding(target, operator,
+            tuple(state.field(f"{key}_{i}") for key in applied), scale) for i, target in enumerate(targets)))
+
     def activation_patch(self, name: str, buffers: Mapping[str, Buffer], *, layers: tuple[int, ...],
                          operator: ActivationPatchOperator, first_tokens: int, last_tokens: int,
                          scope: StateScope, keys: tuple[RequestKeyField, ...], namespace: str) -> None:
@@ -356,19 +408,7 @@ class TensorBinding(Builder[TensorFrame]):
                         raise ValueError("activation fields differ from the operator's rank and hidden dimensions")
                 if any(field.dtype is not dtype for field in fields):
                     raise ValueError("activation fields differ from the operator's dtype")
-        def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-            with torch.no_grad():
-                if any(not torch.isfinite(source).all() for _, values in data.replacements for source in values):
-                    raise ValueError("replacement tensors differ from the signed layout or finite-value contract")
-                for index, values in data.replacements:
-                    for target, source in zip(batch.roots[index], values, strict=True):
-                        target.copy_(source)
-            return TaskOutput(update_count=len(data.replacements), changed=tuple(index for index, _ in data.replacements))
-        update = self.compute("update", inputs={"parameters": self.input("input", "state", StateTensorUpdate.schema)},
-            outputs=("updated",), changes=state, effect=StateEffectKind.TRANSITION_MAYBE, when=When.BEFORE_MODEL,
-            function=execute, select=lambda data, selection: tuple(index for index, _ in data.replacements),
-            implementations=(native("canonical.activation:import@1", "transition/full_root@1"),))
-        self.operations[update.symbol] = replace(self.operations[update.symbol], copy_fields=())
+        update = self._import_update(state, "canonical.activation:import@1")
         publication = self.publish(update, state, when=When.BEFORE_MODEL)
         self.overlay(state, update, publication, activations=tuple(ActivationPatchBinding(layer,
             tuple(state.field(state.fields[index * width + offset].name) for offset in range(width)),
@@ -788,16 +828,16 @@ class TensorBinding(Builder[TensorFrame]):
                     raise ValueError("tokenwise replay requires only original model rows at its signed epoch")
                 return TensorFrame(value, value.rows.rows)
             return prepare_replay
-        if self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH:
+        if self.attachment is not None and (self.attachment.kind is AttachmentKind.ACTIVATION_PATCH or self.overlay_import):
             def prepare_replacement(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
                 if value.rows.plan_epoch != batch.epoch or value.hidden is not None or value.operands:
-                    raise ValueError("activation input differs from its signed sources or epoch")
+                    raise ValueError("import input differs from its signed sources or epoch")
                 update = value.auxiliary
                 data = TensorFrame(value, value.rows.rows)
                 if update is None:
                     return data
                 if not isinstance(update, StateTensorUpdate):
-                    raise ValueError("activation edits require original state-field tensors")
+                    raise ValueError("state imports require original state-field tensors")
                 if not update.values:
                     return data
                 selection = batch.selection

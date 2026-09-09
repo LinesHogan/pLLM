@@ -148,7 +148,8 @@ class _ParameterModule:
 class VllmParameterOverlay:
     """One hook per physical module, including fused q/v; no version selection."""
 
-    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
+    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ParameterOverlayFieldBinding, ...], *,
+                 capture: bool = True) -> None:
         modules: dict[int, _ParameterModule] = {}
         for binding in bindings:
             module, offset, size, mlp = _locate(model, binding.target)
@@ -157,6 +158,7 @@ class VllmParameterOverlay:
             modules[id(module)].bindings.append((binding, offset, size))
         self._modules = tuple(modules.values())
         for handle in self._modules:
+            handle.capture_operands = capture
             handle.module.forward = handle.forward
             if handle.mlp is not None:
                 handle.mlp.forward = handle.forward_mlp

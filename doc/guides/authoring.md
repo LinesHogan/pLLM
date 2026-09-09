@@ -175,6 +175,40 @@ result provenance. Results expose `entries` with original request/before/after r
 and per-target updates. The ordinary effect supports request-scope dense and
 low-rank overlays, not activation or arbitrary replay composition.
 
+## External Overlays
+
+An overlay's field values need not come from an in-engine update: any host
+computation — a hypernetwork reading request context, a loaded checkpoint — can
+produce them. Declare the same `RequestState` (or `InstanceState`) buffers and an
+`Overlay` property naming the state, targets, operator, factors and scale:
+
+```python
+@dataclass(frozen=True)
+class ShineStyleLoRA(pllm.Workload):
+    @property
+    def factors(self) -> pllm.RequestState:
+        return pllm.RequestState({
+            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+        })
+
+    @property
+    def adapter(self) -> pllm.Overlay:
+        return pllm.Overlay("factors", targets, operator=ParameterOverlayOperator.LOW_RANK_ADD,
+                            factors=("a", "b"), scale=0.5)
+```
+
+Feed the produced tensors as `StateTensorUpdate(values, keys)` via
+`generate(..., auxiliary=..., prompt_indices=...)`; request replacements key on
+the original prompt index and import only into version-zero request state, once.
+The shared binding validates the layout, copies into private roots and publishes
+at `request.prepare`, before the request's first forward — so every row in a
+mixed batch reads its own request's exact pin, and imported zero factors
+reproduce the base model exactly. Application, publication, isolation and
+retirement are identical to optimizer-produced overlays; only the production
+site differs. Like activation checkpoints, the workload declares the import's
+task workspace through `resource_facts` (the copy needs no owned tensor).
+
 ## Activation Checkpoints
 
 Declare ordinary `InstanceState` or `RequestState` buffers and an `Activation`

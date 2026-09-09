@@ -21,6 +21,7 @@ from pllm.usage import (
     overlay as overlay, Operand as Operand, Buffer as Buffer, TensorUpdate as TensorUpdate,
     differentiate as differentiate,
     Activation as Activation,
+    Overlay as Overlay,
     Recurrence as Recurrence,
     transaction as transaction,
     CompletionWorkload as CompletionWorkload,
@@ -97,7 +98,7 @@ __all__ = ["make_llm", "ModelConfig", "ExecutionOptions", "HostRuntimeFacts", "W
     "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples", "Parameter", "StateIndex", "StateVersion", "Result",
     "InstanceState", "RequestState", "BaseLogits", "SampledTokens", "AdamW", "HiddenSite",
     "overlay", "Operand", "Buffer", "TensorUpdate", "ParameterOverlayOperator", "ParameterTarget", "RequestKeyField", "ConditionalLayerReplay", "differentiate",
-    "Activation", "ActivationPatchOperator", "StateScope", "StateTensorUpdate", "load_tensor_fields", "Recurrence",
+    "Activation", "Overlay", "ActivationPatchOperator", "StateScope", "StateTensorUpdate", "load_tensor_fields", "Recurrence",
     "transaction", "HostWorkload", "HostTransactionCoordinator", "TransactionHostBinding", "CompletionInput", "NoHostRequest",
     "CompletionWorkload", "InvocationOutput", "PagePublication", "StateRef", "CausalAdapterWorkload", "CausalModel", "CausalTrainBatch",
     "TensorRows", "PagedRows", "SGD", "Batch", "WeightedCEBatch", "TensorResult"]

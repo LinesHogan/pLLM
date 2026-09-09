@@ -26,6 +26,8 @@ from pllm.contracts.parameter_overlay import (
     ParameterRole,
     ParameterTarget,
 )
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.request_state import RequestStateKey
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,88 @@ class RequestLowRankTTT(pllm.Workload):
         a.add_(-1e-3 * gradient_a)
         b.add_(-1e-3 * gradient_b)
         return TensorUpdate(output, changed=True, update_count=1, trained_rows=hidden.shape[0])
+
+
+@dataclass(frozen=True)
+class ImportedLowRank(pllm.Workload):
+    """Per-request LoRA factors produced outside the engine (e.g. by a hypernetwork)."""
+
+    def resource_facts(self, facts, options):
+        from dataclasses import replace
+        from math import prod
+
+        from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol, ValueResourceFact
+
+        timeline = super().resource_facts(facts, options)
+        if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
+            return timeline
+        # The import copies into roots and checks one original field at a time.
+        layout, = self.declaration(facts).layouts.layouts
+        workspace = 16 * max(prod(field.shape) for field in layout.layout.fields)
+        return replace(timeline,
+            task_resources=(TaskResourceFact(TaskSymbol("publish"), 0),
+                TaskResourceFact(TaskSymbol("update"), workspace)),
+            value_resources=(ValueResourceFact(TaskSymbol("publish"), "publication", 0),
+                ValueResourceFact(TaskSymbol("update"), "updated", 0)))
+
+    @property
+    def factors(self) -> pllm.RequestState:
+        return pllm.RequestState({
+            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+        })
+
+    @property
+    def adapter(self) -> pllm.Overlay:
+        return pllm.Overlay("factors",
+            (ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT),),
+            operator=ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
+
+
+def _key(prompt_index: int) -> RequestStateKey:
+    return RequestStateKey.project(RequestIdentity("", prompt_index, 0), (RequestKeyField.PROMPT_IDX,))
+
+
+def _check_imported(handle: VllmLlm[object, object]) -> dict[str, object]:
+    prompts = ["The sky is", "Water freezes at"]
+    sampling = SamplingParams(max_tokens=2, temperature=0.0, n=1, ignore_eos=True)
+    layout, = handle.attachment.inputs.plan.tensor_layout_request.layouts
+    down_shape, up_shape = (tuple(field.shape) for field in layout.layout.fields[:2])
+    device = handle.device
+    # No import: every row reads its zero-initialized request state, identical to the base model.
+    baseline = tuple(output.outputs[0].text for output in handle.generate(prompts, sampling))
+    if any(not text for text in baseline):
+        raise RuntimeError("imported overlay baseline generation is incomplete")
+    # One batch, one imported request: the second row must keep the exact base outputs.
+    generator = torch.Generator().manual_seed(11)
+    down = torch.randn(down_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
+    up = torch.randn(up_shape, generator=generator).to(device=device, dtype=torch.bfloat16)
+    mixed = handle.generate(prompts, sampling, prompt_indices=(2, 3),
+        auxiliary=pllm.StateTensorUpdate((down.unsqueeze(0), up.unsqueeze(0)), (_key(2),)))
+    mixed_texts = tuple(output.outputs[0].text for output in mixed)
+    if mixed_texts[0] == baseline[0] or mixed_texts[1] != baseline[1]:
+        raise RuntimeError("imported factors must move exactly their own request's outputs")
+    # Imported zero factors are an exact no-op on fresh requests.
+    zeros = (torch.zeros((2, *down_shape), device=device, dtype=torch.bfloat16),
+        torch.zeros((2, *up_shape), device=device, dtype=torch.bfloat16))
+    replayed = handle.generate(prompts, sampling, prompt_indices=(4, 5),
+        auxiliary=pllm.StateTensorUpdate(zeros, (_key(4), _key(5))))
+    replayed_texts = tuple(output.outputs[0].text for output in replayed)
+    if replayed_texts != baseline:
+        raise RuntimeError("imported zero factors must reproduce the base model exactly")
+    diagnostics = handle.deployment.execution.diagnostics()
+    if (diagnostics.update_count != 3 or diagnostics.active_lineages != 0
+            or diagnostics.pending_state_releases != 0 or diagnostics.fallback_count != 0):
+        raise RuntimeError("imported overlay lifecycle evidence is incomplete")
+    return {
+        "text": mixed_texts,
+        "update_count": diagnostics.update_count,
+        "apply_rows": handle.runner.overlay_apply_count,
+        "updated_apply_rows": handle.runner.overlay_updated_apply_count,
+        "active_lineages": diagnostics.active_lineages,
+        "fallback_count": diagnostics.fallback_count,
+        "attachment": handle.deployment.attachment.physical.bundle_signature[:12],
+    }
 
 
 def _check(handle: VllmLlm[object, object], label: str) -> dict[str, object]:
@@ -145,6 +229,29 @@ def main() -> int:
             raise RuntimeError("public make_llm did not route request low-rank overlay")
     try:
         results["low_rank"] = _check(handle, "request low-rank")
+    finally:
+        handle.close()
+
+    imported = pllm.make_llm(
+        workload=ImportedLowRank(),
+        config=ModelConfig(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dtype=VllmDType.BFLOAT16,
+            max_model_len=64,
+            max_num_seqs=2,
+            max_num_batched_tokens=64,
+            gpu_memory_utilization=0.25,
+            seed=7,
+            execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
+        ),
+    )
+    match imported:
+        case VllmLlm() as handle:
+            pass
+        case _:
+            raise RuntimeError("public make_llm did not route imported request low-rank overlay")
+    try:
+        results["imported"] = _check_imported(handle)
     finally:
         handle.close()
     print(results)

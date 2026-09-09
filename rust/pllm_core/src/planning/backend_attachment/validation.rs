@@ -602,8 +602,10 @@ fn validate_cross_binding(
             let supported = if request.attachment_kind == AttachmentKind::ActivationPatch {
                 before_model
             } else if request_state {
-                Some(transition.anchor_id) == anchor_id("model.execute")
-                    && Some(publish.anchor_id) == anchor_id("state.publish")
+                // Publication before the request's first forward is KV-safe; mid-request
+                // updates continue through the model-execute publication path.
+                before_model || (Some(transition.anchor_id) == anchor_id("model.execute")
+                    && Some(publish.anchor_id) == anchor_id("state.publish"))
             } else {
                 before_model || (Some(transition.anchor_id) == anchor_id("token.commit")
                         && Some(publish.anchor_id) == anchor_id("token.commit"))

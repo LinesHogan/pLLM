@@ -391,6 +391,18 @@ class Activation:
     operator: ActivationPatchOperator = ActivationPatchOperator.LOW_RANK_AFFINE
 
 
+@dataclass(frozen=True)
+class Overlay:
+    """Externally produced parameter overlay: field values arrive as a StateTensorUpdate,
+    are imported into private roots and published before the model runs."""
+    state: str
+    targets: tuple[ParameterTarget, ...]
+    weight: str = "value"
+    operator: ParameterOverlayOperator = ParameterOverlayOperator.DENSE_ADD
+    factors: tuple[str, str] = ("a", "b")
+    scale: float = 1.0
+
+
 def _buffers(state: InstanceState) -> dict[str, Buffer]:
     if state.optimizer is not None or state.initialize is not None:
         raise ValueError("buffer effects require zero-initialized state without an optimizer")
@@ -631,7 +643,7 @@ def _members(owner: object) -> dict[str, object]:
 
 def _values(owner: object) -> dict[str, object]:
     values: dict[str, object] = {name: member for name, member in _members(owner).items() if not name.startswith("__")
-        and isinstance(member, (str, int, float, bool, tuple, InstanceState, Activation, Recurrence))}
+        and isinstance(member, (str, int, float, bool, tuple, InstanceState, Activation, Overlay, Recurrence))}
     values.update(vars(owner))
     if is_dataclass(owner) and not isinstance(owner, type):
         values.update((item.name, getattr(owner, item.name)) for item in fields(owner))
@@ -704,7 +716,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         definitions: list[tuple[str, str]] = helpers
         for name, member in members.items():
             if isinstance(member, property) and member.fget is not None and (
-                signature(member.fget, eval_str=False).return_annotation in (InstanceState, RequestState, Activation, Recurrence)):
+                signature(member.fget, eval_str=False).return_annotation in (InstanceState, RequestState, Activation, Overlay, Recurrence)):
                 values[name] = member.__get__(owner)
             elif isinstance(member, InstanceState) and name not in values:
                 values[name] = member
@@ -731,6 +743,18 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             if isinstance(effect, Recurrence):
                 definitions.append((name, _fingerprint(effect)))
                 b.recurrence(effect)
+                continue
+            if isinstance(effect, Overlay):
+                definition = values.get(effect.state)
+                if not isinstance(definition, InstanceState):
+                    raise ValueError("external overlays require a declared state")
+                buffers = _buffers(definition)
+                applied = (effect.weight,) if effect.operator is ParameterOverlayOperator.DENSE_ADD else effect.factors
+                definitions.append((name, _fingerprint(effect)))
+                b.import_overlay(effect.state, buffers, targets=effect.targets, applied=applied,
+                    operator=effect.operator, scale=effect.scale, namespace=definition.namespace,
+                    keys=definition.keys if isinstance(definition, RequestState) else (),
+                    scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE)
                 continue
             if not isinstance(effect, Activation):
                 continue
@@ -1022,5 +1046,5 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
 
 __all__ = ["Workload", "Phase", "on", "hook", "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples",
     "BaseLogits", "SampledTokens", "Parameter", "StateIndex", "StateVersion", "Result", "InstanceState", "RequestState",
-    "overlay", "Operand", "Buffer", "TensorUpdate", "differentiate", "Activation", "Recurrence", "transaction", "CompletionWorkload",
+    "overlay", "Operand", "Buffer", "TensorUpdate", "differentiate", "Activation", "Overlay", "Recurrence", "transaction", "CompletionWorkload",
     "CausalAdapterWorkload", "SGD", "Batch"]

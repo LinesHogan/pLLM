@@ -9,7 +9,7 @@ from typing import Annotated
 from dataclasses import replace
 
 from pllm.execution.state_execution import StateSettlementError
-from pllm.authoring import TensorStepInput, ParameterTargetShape, BackendCompileFacts
+from pllm.authoring import TensorStepInput, ParameterTargetShape, BackendCompileFacts, StateTensorUpdate
 from pllm.contracts.backend_attachment import BackendPlacementProbe, AttachmentTopology, AttachmentGraphMode
 from pllm.contracts.state_representation import StateDeviceKind
 
@@ -22,9 +22,11 @@ from pllm.contracts.parameter_overlay import (
     CapturedParameterOperand, ParameterModuleKind, ParameterRole, ParameterTarget,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
+from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedPhaseRow, PackedSamplerRowBatch
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol, ValueResourceFact
 from test.backend_facts import assert_finite_resources
 
 
@@ -245,3 +247,69 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
         weight = bases[0] + 0.5 * up @ down if request_index == 0 else bases[0]
         torch.testing.assert_close(applied.targets[0].update.output, hidden @ weight.T)
     low_rank.retire(requests)
+
+    # Externally produced factors (a hypernetwork's output) import through the same signed
+    # binding, publication, isolation and retirement rules as optimizer-produced ones.
+    class ImportedOverlay(pllm.Workload):
+        factors = pllm.RequestState({
+            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+        }, dtype=torch.float64)
+
+        def resource_facts(self, facts, options):
+            timeline = super().resource_facts(facts, options)
+            if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
+                return timeline
+            # The import copies into roots and checks one original field at a time.
+            return replace(timeline,
+                task_resources=(TaskResourceFact(TaskSymbol("publish"), 0),
+                    TaskResourceFact(TaskSymbol("update"), 16 * 2 * 3)),
+                value_resources=(ValueResourceFact(TaskSymbol("publish"), "publication", 0),
+                    ValueResourceFact(TaskSymbol("update"), "updated", 0)))
+
+        @property
+        def adapter(self) -> pllm.Overlay:
+            return pllm.Overlay("factors", (targets[0],),
+                                operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD,
+                                factors=("a", "b"), scale=0.5)
+
+    generated = (
+        torch.tensor([[0.3, -0.1, 0.2], [0.05, 0.4, -0.6]], dtype=torch.float64),
+        torch.tensor([[0.7, -0.2], [0.1, 0.5]], dtype=torch.float64),
+    )
+    imported = ImportedOverlay().compile_backend(assert_finite_resources(
+        ImportedOverlay(), replace(facts, targets=facts.targets[:1]))).execution
+    prompts = (RequestIdentity("first", 0, 0), RequestIdentity("second", 1, 0))
+    initial = imported.admit(prompts)
+    rows = PackedPhaseRowBatch(1, 0, 2, tuple(
+        PackedPhaseRow(index, index, 0, HiddenPhase.PREFILL, identity)
+        for index, identity in enumerate(prompts)))
+    keys = tuple(RequestStateKey.project(identity, (RequestKeyField.PROMPT_IDX,)) for identity in prompts)
+    # Only the first prompt has externally produced factors; values batch by key.
+    update = StateTensorUpdate(tuple(tensor.unsqueeze(0) for tensor in generated), keys[:1])
+    publication = imported.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ()),
+        auxiliary=update)).publication
+    assert publication is not None and len(publication.after_refs) == 1
+    imported_ref, = publication.after_refs
+    assert imported_ref.lineage_id == initial[0].lineage_id and imported_ref.version_id == 1
+    for actual, expected in zip(imported.snapshot(imported_ref), generated, strict=True):
+        torch.testing.assert_close(actual, expected)
+    assert imported.arena.latest(initial[1].lineage_id) == initial[1]
+    assert all(not tensor.any() for tensor in imported.snapshot(initial[1]))
+    # A staged batch does not import twice: the published version no longer matches.
+    assert imported.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ()),
+        auxiliary=update)).publication is None
+    # The second prompt imports later, on its own, at its own version.
+    second = StateTensorUpdate(tuple(tensor.unsqueeze(0) for tensor in generated), keys[1:])
+    publication = imported.step(TensorStepInput(rows, PackedSamplerRowBatch(rows, ()),
+        auxiliary=second)).publication
+    assert publication is not None and len(publication.after_refs) == 1
+    second_ref, = publication.after_refs
+    assert second_ref.lineage_id == initial[1].lineage_id and second_ref.version_id == 1
+    for actual, expected in zip(imported.snapshot(second_ref), generated, strict=True):
+        torch.testing.assert_close(actual, expected)
+    assert imported.arena.latest(initial[0].lineage_id) == imported_ref
+    assert imported.retire(prompts) == (imported_ref, second_ref)
+    diagnostics = imported.diagnostics()
+    assert diagnostics.update_count == 2
+    assert diagnostics.active_lineages == diagnostics.pending_state_releases == 0
