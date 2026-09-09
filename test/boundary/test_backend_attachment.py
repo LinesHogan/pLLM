@@ -183,16 +183,21 @@ def test_signed_attachment_binds_exact_tasks_fields_stages_and_rejects_tamper() 
         replace(request, overlay_bindings=(replace(binding, fields=(999,)),)),
         replace(request, overlay_bindings=(replace(binding, fields=(0, 0)),)),
         replace(request, overlay_bindings=(binding, binding)),
-        replace(request, overlay_bindings=(replace(binding, scale=2.0),)),
         replace(request, overlay_bindings=(replace(binding, operator=ParameterOverlayOperator.LOW_RANK_ADD),)),
     ):
         with pytest.raises(ValueError):
             compile_backend_attachment(replace(overlay.inputs, request=invalid))
-    # Another in-layout field is a different signed choice, not an out-of-range field.
-    changed_field = replace(overlay.inputs, request=replace(request, overlay_bindings=(replace(binding, fields=(1,)),)))
-    assert compile_backend_attachment(changed_field) != overlay.decision
-    with pytest.raises(ValueError):
-        validate_backend_attachment(changed_field, overlay.decision)
+    # Another in-layout field, operator arity or scale is a different signed choice, not tampering.
+    for altered in (
+        replace(request, overlay_bindings=(replace(binding, fields=(1,)),)),
+        replace(request, overlay_bindings=(replace(binding, scale=2.0),)),
+        replace(request, overlay_bindings=(replace(binding, operator=ParameterOverlayOperator.LOW_RANK_ADD,
+            fields=(binding.fields[0], binding.fields[0] + 1)),)),
+    ):
+        changed = replace(overlay.inputs, request=altered)
+        assert compile_backend_attachment(changed) != overlay.decision
+        with pytest.raises(ValueError):
+            validate_backend_attachment(changed, overlay.decision)
     resource, other = sampler_probe.hidden_resources
     for altered in (replace(resource, phase=HiddenPhase.PREFILL),
                     *(replace(resource, binding=replace(resource.binding, layer=layer))

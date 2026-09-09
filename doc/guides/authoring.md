@@ -150,7 +150,7 @@ failed settlement retains it only until the original receipt can be settled.
 ## Request Overlays
 
 `@on(Phase.MODEL_UPDATE)` and `@overlay(state=..., targets=..., weight=...)` bind
-a dense additive overlay and its publication together. Declare `RequestState`
+an additive parameter overlay and its publication together. Declare `RequestState`
 without an optimizer: fixed `shape=` uses the default `value` field; named `Buffer`
 fields can resolve `(input_size, output_size)` for each target. Buffer dtype defaults
 to the target model dtype; explicit integer buffers retain their own dtype.
@@ -159,13 +159,21 @@ private buffer views. Only these authorized buffers may be mutated, never the op
 The method returns `TensorUpdate(output, changed=..., update_count=..., trained_rows=...)`.
 Optional `metrics` belong to the algorithm, not the state or replay protocol.
 
+The default operator is `DENSE_ADD`, applying the `weight` field. Pass
+`operator=ParameterOverlayOperator.LOW_RANK_ADD` with `factors=("a", "b")` and a
+finite `scale` to apply `scale * b @ a` instead; the down factor is
+`(rank, input_size)` and the up factor `(output_size, rank)` per target. Operator
+choice is orthogonal to request scope: the same publication, pin and isolation
+rules apply to both. Targets name any located projection; the backend currently
+locates MLP down and attention q/v projections.
+
 `prefill`/`decode` determine update eligibility. Disabled phases only apply the
 existing overlay. `replay=ConditionalLayerReplay(...)` reuses the original published
 version and runs only for `changed` states: tail-buffer changes alone need not replay.
 The shared binding owns target coverage, shape/device checks, root selection and
 result provenance. Results expose `entries` with original request/before/after refs
-and per-target updates. The current ordinary effect supports request DENSE_ADD,
-not low-rank, activation or arbitrary replay composition.
+and per-target updates. The ordinary effect supports request-scope dense and
+low-rank overlays, not activation or arbitrary replay composition.
 
 ## Activation Checkpoints
 

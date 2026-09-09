@@ -203,3 +203,45 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
     torch.testing.assert_close(ordinary.snapshot(initial[1])[0], torch.zeros((2, 3), dtype=torch.float64))
     assert ordinary.arena.plan.semantic_graph.states[0].key_fields == (pllm.RequestKeyField.REQUEST_ID,)
     ordinary.retire(requests)
+
+    # A request-scope low-rank overlay shares the same signed binding, pin and isolation rules.
+    class LowRankOverlay(pllm.Workload):
+        factors = pllm.RequestState({
+            "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
+            "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
+        }, dtype=torch.float64)
+
+        @pllm.on(pllm.Phase.MODEL_UPDATE)
+        @pllm.overlay(state="factors", targets=(targets[0],),
+                      operator=pllm.ParameterOverlayOperator.LOW_RANK_ADD, factors=("a", "b"), scale=0.5)
+        def update(self, x: Annotated[torch.Tensor, pllm.Operand.INPUT],
+                   y: Annotated[torch.Tensor, pllm.Operand.TARGET],
+                   base: Annotated[torch.Tensor, pllm.Operand.WEIGHT],
+                   a: Annotated[torch.Tensor, pllm.Parameter("factors", "a")],
+                   b: Annotated[torch.Tensor, pllm.Parameter("factors", "b")]) -> TensorUpdate:
+            output = x @ (base + 0.5 * b @ a).T
+            a.add_(0.1 * y.T @ x)
+            b.add_(0.2 * y.T @ y)
+            return TensorUpdate(output, changed=True, update_count=1, trained_rows=x.shape[0])
+
+    _, _, specification = LowRankOverlay().declare(replace(facts, targets=facts.targets[:1]))
+    binding, = specification.overlay_bindings
+    assert binding.operator is pllm.ParameterOverlayOperator.LOW_RANK_ADD and binding.scale == 0.5
+    low_rank = LowRankOverlay().compile_backend(replace(facts, targets=facts.targets[:1])).execution
+    initial = low_rank.admit(requests)
+    result = low_rank.step(_input((CapturedParameterOperand(requests[0], targets[0], HiddenPhase.PREFILL,
+        hidden, desired[0], bases[0]),)))
+    updated, = result.entries
+    torch.testing.assert_close(updated.targets[0].update.output, hidden @ bases[0].T)
+    down, up = low_rank.snapshot(updated.after_ref)
+    torch.testing.assert_close(down, 0.1 * desired[0].T @ hidden)
+    torch.testing.assert_close(up, 0.2 * desired[0].T @ desired[0])
+    assert all(not tensor.any() for tensor in low_rank.snapshot(initial[1]))
+    # A phase outside update eligibility applies the exact pinned factors without changing them.
+    for request_index, identity in enumerate(requests):
+        applied, = low_rank.step(_input((CapturedParameterOperand(identity, targets[0], HiddenPhase.DECODE,
+            hidden, desired[0], bases[0]),))).entries
+        assert not applied.changed and applied.targets[0].update.update_count == 0
+        weight = bases[0] + 0.5 * up @ down if request_index == 0 else bases[0]
+        torch.testing.assert_close(applied.targets[0].update.output, hidden @ weight.T)
+    low_rank.retire(requests)

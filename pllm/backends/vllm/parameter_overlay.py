@@ -116,7 +116,7 @@ class _ParameterModule:
         for item in self.prepared:
             selected = hidden[item.rows] if isinstance(item.rows, slice) else hidden.index_select(0, item.rows)
             if item.binding.operator is ParameterOverlayOperator.DENSE_ADD:
-                delta = F.linear(selected, item.fields[0])
+                delta = F.linear(selected, item.fields[0]) * item.binding.scale
                 if self.capture_operands:
                     if self.mlp_input is None or self.mlp_input.shape[0] != self.total_rows or not isinstance(item.rows, torch.Tensor):
                         raise RuntimeError("dense capture requires owned operand rows and the original MLP input")

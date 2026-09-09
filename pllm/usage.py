@@ -453,16 +453,22 @@ class _Overlay:
     state: str
     targets: tuple[ParameterTarget, ...] | Config
     weight: str
+    operator: ParameterOverlayOperator | Config
+    factors: tuple[str, str] | Config
+    scale: float | Config
     prefill: bool | Config
     decode: bool | Config
     replay: ConditionalLayerReplay | Config | None
 
 
 def overlay(*, state: str, targets: tuple[ParameterTarget, ...] | Config, weight: str = "value",
+            operator: ParameterOverlayOperator | Config = ParameterOverlayOperator.DENSE_ADD,
+            factors: tuple[str, str] | Config = ("a", "b"), scale: float | Config = 1.0,
             prefill: bool | Config = True, decode: bool | Config = False,
             replay: ConditionalLayerReplay | Config | None = None) -> Callable[[F], F]:
+    """Apply request-state fields to model parameters; dense uses `weight`, low-rank the factor pair."""
     def decorate(function: F) -> F:
-        setattr(function, "__pllm_effect__", _Overlay(state, targets, weight, prefill, decode, replay))
+        setattr(function, "__pllm_effect__", _Overlay(state, targets, weight, operator, factors, scale, prefill, decode, replay))
         return function
     return decorate
 
@@ -779,7 +785,7 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     raise ValueError("parameter overlays require MODEL_UPDATE")
                 definition = values[effect.state]
                 if not isinstance(definition, RequestState):
-                    raise ValueError("dense overlay requires a declared request state")
+                    raise ValueError("parameter overlays require a declared request state")
                 buffers = _buffers(definition)
                 transition = cast(Callable[..., TensorUpdate], getattr(owner, name))
                 arguments = _arguments(transition, result_type=TensorUpdate)
@@ -794,6 +800,15 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 if set(buffers) & {source.value for source in Operand}:
                     raise ValueError("overlay buffers conflict with reserved operand names")
                 resolved_targets = _targets(_setting(effect.targets, owner, tuple))
+                operator = _setting(effect.operator, owner, ParameterOverlayOperator)
+                scale = _setting(effect.scale, owner, float)
+                if operator is ParameterOverlayOperator.DENSE_ADD:
+                    applied = (effect.weight,)
+                else:
+                    factors = _setting(effect.factors, owner, tuple)
+                    if len(factors) != 2:
+                        raise TypeError("low-rank overlays require two factor field names")
+                    applied = factors
                 replay: object = effect.replay
                 if isinstance(replay, Config):
                     path = replay.name
@@ -807,11 +822,12 @@ class Workload(_NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 def invoke(inputs: Tensors, function: Callable[..., TensorUpdate] = transition,
                            bindings: Mapping[str, str] = bindings_overlay) -> TensorUpdate:
                     return function(**{key: inputs[source] for key, source in bindings.items()})
-                b.dense_overlay(name, effect.state, buffers, targets=resolved_targets,
-                    weight=effect.weight, namespace=definition.namespace, keys=definition.keys,
+                b.parameter_overlay(name, effect.state, buffers, targets=resolved_targets,
+                    applied=applied, namespace=definition.namespace, keys=definition.keys,
                     phases=tuple(p for p, enabled in ((HiddenPhase.PREFILL, effect.prefill), (HiddenPhase.DECODE, effect.decode))
-                        if _setting(enabled, owner, bool)), replay=replay, identity=f"python:{identity}", function=invoke)
-                definitions.append((name, boundary_digest(identity, bindings_overlay)))
+                        if _setting(enabled, owner, bool)), replay=replay, identity=f"python:{identity}",
+                    operator=operator, scale=scale, function=invoke)
+                definitions.append((name, boundary_digest(identity, bindings_overlay, operator, scale, applied)))
                 continue
             function = cast(Callable[..., torch.Tensor], getattr(owner, name))
             hidden: object = getattr(member, "__pllm_hidden__", None)

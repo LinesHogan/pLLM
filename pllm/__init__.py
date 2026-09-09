@@ -27,7 +27,7 @@ from pllm.usage import (
     CausalAdapterWorkload as CausalAdapterWorkload,
     SGD as SGD, Batch as Batch,
 )
-from pllm.contracts.parameter_overlay import ParameterTarget as ParameterTarget
+from pllm.contracts.parameter_overlay import ParameterOverlayOperator as ParameterOverlayOperator, ParameterTarget as ParameterTarget
 from pllm.contracts.request_identity import RequestKeyField as RequestKeyField
 from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay, StateScope as StateScope
 from pllm.contracts.backend_attachment import ActivationPatchOperator as ActivationPatchOperator
@@ -96,7 +96,7 @@ def make_llm(config: ModelConfig | HostRuntimeFacts, *,
 __all__ = ["make_llm", "ModelConfig", "ExecutionOptions", "HostRuntimeFacts", "Workload", "Phase", "on", "hook",
     "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples", "Parameter", "StateIndex", "StateVersion", "Result",
     "InstanceState", "RequestState", "BaseLogits", "SampledTokens", "AdamW", "HiddenSite",
-    "overlay", "Operand", "Buffer", "TensorUpdate", "ParameterTarget", "RequestKeyField", "ConditionalLayerReplay", "differentiate",
+    "overlay", "Operand", "Buffer", "TensorUpdate", "ParameterOverlayOperator", "ParameterTarget", "RequestKeyField", "ConditionalLayerReplay", "differentiate",
     "Activation", "ActivationPatchOperator", "StateScope", "StateTensorUpdate", "load_tensor_fields", "Recurrence",
     "transaction", "HostWorkload", "HostTransactionCoordinator", "TransactionHostBinding", "CompletionInput", "NoHostRequest",
     "CompletionWorkload", "InvocationOutput", "PagePublication", "StateRef", "CausalAdapterWorkload", "CausalModel", "CausalTrainBatch",

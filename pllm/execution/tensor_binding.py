@@ -250,29 +250,44 @@ class TensorBinding(Builder[TensorFrame]):
             implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),))
         self.model_effect(forward, AttachmentKind.MODEL_REPLAY)
 
-    def dense_overlay(self, name: str, state_name: str, buffers: Mapping[str, Buffer], *,
-                      targets: tuple[ParameterTarget, ...], weight: str, namespace: str,
-                      keys: tuple[RequestKeyField, ...], phases: tuple[HiddenPhase, ...],
-                      replay: ConditionalLayerReplay | None, identity: str,
-                      function: Callable[[Tensors], TensorUpdate]) -> None:
+    def parameter_overlay(self, name: str, state_name: str, buffers: Mapping[str, Buffer], *,
+                          targets: tuple[ParameterTarget, ...], applied: tuple[str, ...], namespace: str,
+                          keys: tuple[RequestKeyField, ...], phases: tuple[HiddenPhase, ...],
+                          replay: ConditionalLayerReplay | None, identity: str,
+                          operator: ParameterOverlayOperator, scale: float,
+                          function: Callable[[Tensors], TensorUpdate]) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("ordinary overlay requires a sole request state and model transition")
-        if not targets or tuple(sorted(set(targets))) != targets or weight not in buffers:
-            raise ValueError("overlay requires ordered unique targets and a declared weight field")
+        arity = 1 if operator is ParameterOverlayOperator.DENSE_ADD else 2
+        if (not targets or tuple(sorted(set(targets))) != targets or len(applied) != arity
+            or len(set(applied)) != arity or any(key not in buffers for key in applied)
+            or not isfinite(scale)):
+            raise ValueError("overlay requires ordered unique targets, exact operator fields and a finite scale")
         dimensions = self.dimensions
         if dimensions is not None:
             if len(dimensions.target_shapes) != len(targets):
                 raise ValueError("overlay targets differ from backend specialization")
-            buffer = buffers[weight]
+            def shape_of(key: str, inputs: int, outputs: int) -> tuple[int, ...]:
+                buffer = buffers[key]
+                return buffer.shape(inputs, outputs) if callable(buffer.shape) else buffer.shape
             for inputs, outputs in dimensions.target_shapes:
-                shape = buffer.shape(inputs, outputs) if callable(buffer.shape) else buffer.shape
-                if shape != (outputs, inputs) or buffer.dtype not in (None, tensor_dtype(dimensions.dtype)):
-                    raise ValueError("dense overlay weight must match its target shape and dtype")
+                if operator is ParameterOverlayOperator.DENSE_ADD:
+                    matched = shape_of(applied[0], inputs, outputs) == (outputs, inputs)
+                else:
+                    down, up = (shape_of(key, inputs, outputs) for key in applied)
+                    matched = (len(down) == 2 and len(up) == 2 and 1 <= down[0] == up[1]
+                        and down[1] == inputs and up[0] == outputs)
+                if not matched or any(buffers[key].dtype not in (None, tensor_dtype(dimensions.dtype)) for key in applied):
+                    raise ValueError("overlay fields must match their operator, target shape and dtype")
         self.overlay_targets = targets
         state = self.state(state_name, tuple(_buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
             for index in range(len(targets)) for key, buffer in buffers.items()),
             namespace=namespace, scope=StateScope.REQUEST, keys=keys)
         width = len(buffers)
+        def effective(values: Mapping[str, torch.Tensor]) -> torch.Tensor:
+            if operator is ParameterOverlayOperator.DENSE_ADD:
+                return values[applied[0]] * scale
+            return values[applied[1]] @ values[applied[0]] * scale
         def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
             return tuple(sorted({index for row, index in zip(selection.rows, selection.state_indices, strict=True)
                 if any(operand.identity == row.identity and operand.phase in phases for operand in data.step.operands)}))
@@ -288,7 +303,7 @@ class TensorBinding(Builder[TensorFrame]):
                         if operand.phase in phases:
                             result = function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
                         else:
-                            result = TensorUpdate(operand.hidden @ (operand.base_weight + values[weight]).T)
+                            result = TensorUpdate(operand.hidden @ (operand.base_weight + effective(values)).T)
                         if result.output.shape != operand.desired.shape or result.output.dtype != operand.hidden.dtype or result.output.device != operand.hidden.device:
                             raise ValueError("overlay output differs from its target shape, dtype or device")
                         if min(result.update_count, result.trained_rows) < 0:
@@ -308,8 +323,8 @@ class TensorBinding(Builder[TensorFrame]):
         publication = self.publish(transition, state, implementations=(
             native("canonical.state:cuda_publish_parameter_overlay@1", "compute/cuda@1", "state/fenced_reclaim@1", "transition/full_root@1"),
             native("canonical.state:publish_parameter_overlay@1", "compute/cpu@1", "transition/full_root@1")))
-        self.overlay(state, transition, publication, tuple(ParameterOverlayFieldBinding(target, ParameterOverlayOperator.DENSE_ADD,
-            (state.field(f"{weight}_{i}"),)) for i, target in enumerate(targets)))
+        self.overlay(state, transition, publication, tuple(ParameterOverlayFieldBinding(target, operator,
+            tuple(state.field(f"{key}_{i}") for key in applied), scale) for i, target in enumerate(targets)))
         if replay is not None:
             self.replay(publication, state, replay)
 
