@@ -27,7 +27,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 
 def test_learning_publication_conditional_replay_matches_reference():
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
-    config = InPlaceTTTConfig((target,), chunk_size=2, learning_rate=0.2, replay=ConditionalLayerReplay(0))
+    config = InPlaceTTTConfig((target,), chunk_size=2, learning_rate=0.2, replay=ConditionalLayerReplay((0,)))
     timeline = RuntimeFacts(torch.device("cpu")).timeline(("model/layer_replay@1", "transition/full_root@1"))
     providers = (PageBundleProviderFacts("oracle.cpu@1", 8),)
     workload = InPlaceTTTWorkload(config)
@@ -160,10 +160,25 @@ def test_learning_publication_conditional_replay_matches_reference():
             for event in failed_events)
         assert [event.phase for event in failed_events[-2:]] == [TracePhase.ABORT, TracePhase.SETTLED]
         advance(ToyLayer())
-    altered = InPlaceTTTWorkload(replace(config, replay=ConditionalLayerReplay(0, max_iterations=1))).plan_backend(facts).inputs.plan
+    altered = InPlaceTTTWorkload(replace(config, replay=ConditionalLayerReplay((0,), max_iterations=1))).plan_backend(facts).inputs.plan
     assert altered.schedule_physical.schedule_signature != execution.plan.schedule_signature
     with pytest.raises(ValueError, match="unsupported conditional replay"):
-        InPlaceTTTWorkload(replace(config, replay=ConditionalLayerReplay(0, max_iterations=3))).plan_backend(facts)
+        InPlaceTTTWorkload(replace(config, replay=ConditionalLayerReplay((0,), max_iterations=3))).plan_backend(facts)
+    # A replay range is a sorted unique set, and every replayed layer must be
+    # covered by a signed overlay target.
+    ranged_targets = (target, ParameterTarget(1, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT))
+    ranged_facts = replace(facts, targets=tuple(ParameterTargetShape(item, 2, 2) for item in ranged_targets))
+    ranged = InPlaceTTTWorkload(InPlaceTTTConfig(ranged_targets, chunk_size=2, learning_rate=0.2,
+        replay=ConditionalLayerReplay((0, 1)))).plan_backend(ranged_facts)
+    replay_task, = (task for task in ranged.inputs.plan.semantic_graph.tasks if task.replay is not None)
+    assert replay_task.replay == ConditionalLayerReplay((0, 1))
+    for bad in ((1, 0), (0, 0), ()):
+        with pytest.raises(ValueError, match="sorted|unique|requires"):
+            InPlaceTTTWorkload(InPlaceTTTConfig(ranged_targets, chunk_size=2, learning_rate=0.2,
+                replay=ConditionalLayerReplay(bad))).plan_backend(ranged_facts)
+    with pytest.raises(ValueError, match="published parameter overlay"):
+        InPlaceTTTWorkload(InPlaceTTTConfig(ranged_targets, chunk_size=2, learning_rate=0.2,
+            replay=ConditionalLayerReplay((0, 2)))).plan_backend(ranged_facts)
     execution.retire(identities)
     diagnostics = execution.diagnostics()
     assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0

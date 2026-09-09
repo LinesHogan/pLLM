@@ -168,8 +168,13 @@ rules apply to both. Targets name any located projection; the backend currently
 locates MLP down and attention q/v projections.
 
 `prefill`/`decode` determine update eligibility. Disabled phases only apply the
-existing overlay. `replay=ConditionalLayerReplay(...)` reuses the original published
-version and runs only for `changed` states: tail-buffer changes alone need not replay.
+existing overlay. `replay=ConditionalLayerReplay((22, 23), ...)` names the signed
+ascending set of layers re-run in order for the selected token with the published
+state; each replayed layer overwrites its own current KV slot while layers outside
+the set keep their normal-forward KV — a declared approximation, not a silent one.
+Every replayed layer must be covered by a signed overlay target. Replay reuses the
+original published version and runs only for `changed` states: tail-buffer changes
+alone need not replay.
 The shared binding owns target coverage, shape/device checks, root selection and
 result provenance. Results expose `entries` with original request/before/after refs
 and per-target updates. The ordinary effect supports request-scope dense and

@@ -80,7 +80,7 @@ def _replay(value: object, _target: object) -> ConditionalLayerReplay | Tokenwis
         return None
     if type(value) is not dict:
         raise TypeError("replay effect must be a closed object")
-    if "layer" in value:
+    if "layers" in value:
         return _converter.structure(value, ConditionalLayerReplay)
     return _converter.structure(value, TokenwiseLayerReplay)
 

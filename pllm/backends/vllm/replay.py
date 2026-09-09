@@ -60,30 +60,36 @@ class _ReplayInput:
     row: PackedPhaseRow
     positions: torch.Tensor
     carry: torch.Tensor
-    metadata: FlashAttentionMetadata
-    block: int
-    offset: int
-    original_kv: torch.Tensor
+    metadata: dict[str, FlashAttentionMetadata]
+    slots: tuple[tuple[torch.Tensor, int, int], ...]
+    original_kv: tuple[torch.Tensor, ...]
 
 
 class VllmLayerReplay:
+    """Re-runs the signed ascending layer range per selected token; the hook sits
+    on the range's first layer only, deeper layers are replayed by direct call."""
+
     def __init__(self, model: Qwen2ForCausalLM, effect: ConditionalLayerReplay,
                  overlay: VllmParameterOverlay) -> None:
-        if effect.layer != len(model.model.layers) - 1:
-            raise ValueError("conditional replay currently requires the final Qwen2 layer")
+        layers = model.model.layers
+        if (not effect.layers or tuple(sorted(set(effect.layers))) != effect.layers
+                or effect.layers[-1] >= len(layers)):
+            raise ValueError("conditional replay requires a sorted unique in-range layer set")
         self.effect, self.overlay = effect, overlay
-        self.layer = model.model.layers[effect.layer]
-        attention = self.layer.self_attn.attn
-        if not isinstance(attention.impl, FlashAttentionImpl) or attention.impl.vllm_flash_attn_version != 2:
-            raise ValueError("conditional replay requires FlashAttention2")
-        if (attention.kv_cache_dtype != "auto" or attention.kv_sharing_target_layer_name is not None
-            or attention.num_kv_heads * attention.head_size > model.config.hidden_size):
-            raise ValueError("conditional replay requires unquantized nonshared GQA/MHA KV")
-        self.original: _DecoderForward = self.layer.forward
+        self.layers = tuple(layers[index] for index in effect.layers)
+        for layer in self.layers:
+            attention = layer.self_attn.attn
+            if not isinstance(attention.impl, FlashAttentionImpl) or attention.impl.vllm_flash_attn_version != 2:
+                raise ValueError("conditional replay requires FlashAttention2")
+            if (attention.kv_cache_dtype != "auto" or attention.kv_sharing_target_layer_name is not None
+                or attention.num_kv_heads * attention.head_size > model.config.hidden_size):
+                raise ValueError("conditional replay requires unquantized nonshared GQA/MHA KV")
+        self.originals: tuple[_DecoderForward, ...] = tuple(layer.forward for layer in self.layers)
         self._rows: tuple[PackedPhaseRow, ...] = ()
         self._inputs: tuple[_ReplayInput, ...] = ()
         self._forward_context: ForwardContext | None = None
-        self.layer.forward = self.forward
+        self._materialized = False
+        self.layers[0].forward = self.forward
 
     @property
     def rows(self) -> tuple[PackedPhaseRow, ...]:
@@ -97,7 +103,7 @@ class VllmLayerReplay:
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor,
                 residual: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._rows:
-            return self.original(positions, hidden_states, residual)
+            return self.originals[0](positions, hidden_states, residual)
         context = get_forward_context()
         prepared: list[_ReplayInput] = []
         # Decoder residual addition is in-place; own only the selected token inputs.
@@ -108,12 +114,21 @@ class VllmLayerReplay:
             position = positions[index:index + 1]
             length = int(position.item()) + 1
             sequence = torch.tensor([0, 1, length], dtype=torch.int32, device=carry.device)
-            selected, cache, block, offset = _select_metadata(context, self.layer, row, length, sequence)
-            prepared.append(_ReplayInput(row, position, carry, selected, block, offset,
-                cache[block, :, offset, :]))
-        output = self.original(positions, hidden_states, residual)
-        # Restore the successful normal token on replay failure, not the pre-forward KV.
-        self._inputs = tuple(replace(item, original_kv=item.original_kv.clone()) for item in prepared)
+            metadata: dict[str, FlashAttentionMetadata] = {}
+            slots: list[tuple[torch.Tensor, int, int]] = []
+            originals: list[torch.Tensor] = []
+            for layer in self.layers:
+                selected, cache, block, offset = _select_metadata(context, layer, row, length, sequence)
+                metadata[layer.self_attn.attn.layer_name] = selected
+                slots.append((cache, block, offset))
+                originals.append(cache[block, :, offset, :])
+            prepared.append(_ReplayInput(row, position, carry, metadata, tuple(slots), tuple(originals)))
+        output = self.originals[0](positions, hidden_states, residual)
+        # Views follow the in-place KV writes; deeper layers write their slot only
+        # after this hook returns. Clone at the first replay step — after the normal
+        # forward finished, before any replay write — so restore returns the
+        # successful normal token, not the pre-forward or replayed KV.
+        self._inputs = tuple(prepared)
         self._forward_context = context
         return output
 
@@ -124,29 +139,40 @@ class VllmLayerReplay:
              pin: PagePin, ref: StateRef) -> torch.Tensor:
         if self._forward_context is None:
             raise RuntimeError("replay requires its original normal forward context")
+        if not self._materialized:
+            self._inputs = tuple(replace(item,
+                original_kv=tuple(original.clone() for original in item.original_kv)) for item in self._inputs)
+            self._materialized = True
         item = next(item for item in self._inputs if item.row is row)
-        name = self.layer.self_attn.attn.layer_name
-        context = replace(self._forward_context, attn_metadata={name: item.metadata},
-            slot_mapping={name: item.metadata.slot_mapping}, batch_descriptor=None, is_padding=None)
-        self.overlay.prepare_replay(row, self.effect.layer, arena, pin, ref)
-        try:
-            with override_forward_context(context):
-                hidden, residual = self.original(item.positions, carry.clone(), None)
-                return hidden + residual
-        finally:
-            self.overlay.clear()
+        hidden = carry.clone()
+        residual: torch.Tensor | None = None
+        for index, layer in enumerate(self.layers):
+            name = layer.self_attn.attn.layer_name
+            metadata = item.metadata[name]
+            context = replace(self._forward_context, attn_metadata={name: metadata},
+                slot_mapping={name: metadata.slot_mapping}, batch_descriptor=None, is_padding=None)
+            self.overlay.prepare_replay(row, self.effect.layers[index], arena, pin, ref)
+            try:
+                with override_forward_context(context):
+                    hidden, residual = self.originals[index](item.positions, hidden, residual)
+            finally:
+                self.overlay.clear()
+        if residual is None:
+            raise RuntimeError("replayed layers did not return their residual chain")
+        return hidden + residual
 
     def restore(self) -> None:
-        cache = self.layer.self_attn.attn.kv_cache
         for item in self._inputs:
-            cache[item.block, :, item.offset, :].copy_(item.original_kv)
+            for (cache, block, offset), original in zip(item.slots, item.original_kv, strict=True):
+                cache[block, :, offset, :].copy_(original)
 
     def clear(self) -> None:
         self._rows, self._inputs, self._forward_context = (), (), None
+        self._materialized = False
 
     def close(self) -> None:
         self.clear()
-        self.layer.forward = self.original
+        self.layers[0].forward = self.originals[0]
 
 
 class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):

@@ -50,8 +50,8 @@ def attachment_buffer_bytes(probe: BackendPlacementProbe, graph: SemanticGraph,
         buffers += rows * (width * (2 * hidden + 3 * rank) + 8)
     for task in graph.tasks:
         match task.replay:
-            case ConditionalLayerReplay():
-                buffers += rows * (3 * width * hidden + 32) + 16 * width * hidden
+            case ConditionalLayerReplay(layers=replayed):
+                buffers += len(replayed) * (rows * (3 * width * hidden + 32) + 16 * width * hidden)
             case TokenwiseLayerReplay(layer_count=layers):
                 # Embeddings, retained normal outputs/cat, mix/carry, one KV slot per layer.
                 buffers += 3 * width * rows * hidden + 16 * width * hidden + layers * (2 * width * hidden + 32)

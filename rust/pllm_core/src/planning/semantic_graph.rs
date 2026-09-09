@@ -141,7 +141,7 @@ pub(crate) struct ImplementationCandidate {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConditionalLayerReplay {
-    pub(crate) layer: u32,
+    pub(crate) layers: Vec<u32>,
     pub(crate) max_iterations: u32,
     pub(crate) relative_l2_ppm: u32,
     pub(crate) predicate: String,
@@ -347,6 +347,11 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
         }
     }
     if let Some(LayerReplay::Conditional(replay)) = &task.replay {
+        if replay.layers.is_empty()
+            || replay.layers.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(format!("{}: replay layers must be sorted and unique", task.symbol));
+        }
         if replay.max_iterations == 0
             || replay.max_iterations > 2
             || replay.relative_l2_ppm > 1_000_000

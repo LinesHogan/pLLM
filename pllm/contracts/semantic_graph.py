@@ -159,9 +159,14 @@ class TaskImplementationSpec:
 
 @dataclass(frozen=True, slots=True)
 class ConditionalLayerReplay:
-    """Seed from hidden+residual at layer input; carry each detached block output."""
+    """Seed from hidden+residual at the first replayed layer; carry each detached block output.
 
-    layer: int
+    `layers` is the signed ascending set of layers re-run, in order, for the
+    selected token with the published state; each replayed layer overwrites its
+    own current KV slot. Layers outside the set keep their normal-forward KV —
+    a declared approximation, not a silent one."""
+
+    layers: tuple[int, ...]
     max_iterations: int = 2
     relative_l2_ppm: int = 10
     predicate: Literal["weight_updated"] = "weight_updated"

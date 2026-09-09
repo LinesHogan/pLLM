@@ -466,8 +466,11 @@ fn validate_cross_binding(
                 .effects
                 .iter()
                 .any(|effect| effect.resource == request.state_resource)
-            || !request.overlay_bindings.iter().any(|binding| {
-                binding.target.layer == replay.layer
+            || !replay.layers.iter().all(|layer| {
+                request
+                    .overlay_bindings
+                    .iter()
+                    .any(|binding| binding.target.layer == *layer)
             })
             || task.timing.after != "state.publish"
             || task.timing.before != "sampler.pre_draw"

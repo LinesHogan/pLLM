@@ -439,7 +439,7 @@ requires_gpu = true
 path = "test/gpu/vllm_conditional_replay_smoke.py"
 command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_conditional_replay_smoke.py"
 environment = "Repository .venv, vLLM 0.27.1 MRv2, Qwen2.5-0.5B BF16, FlashAttention2, single GPU, eager, no prefix caching"
-observable_contract = "Two request updates and four replay iterations; independent PyTorch attention/MLP and current-slot KV oracle with BF16 operand-rounding bounds; exact historical KV, normal output and CUDA RNG preservation; decode no-update skip, original pin lifecycle and zero fallback"
+observable_contract = "Two update steps (per-target: four updates) and four replay iterations over the signed (22, 23) layer range; independent chained PyTorch attention/MLP oracle and per-layer current-slot KV checks with BF16 operand-rounding bounds; exact historical KV, normal output and CUDA RNG preservation; decode no-update skip, original pin lifecycle and zero fallback"
 replaces = "New combination boundary 41; old callback replay backend and typed_replay contract deleted"
 
 [[evidence]]
