@@ -26,7 +26,6 @@ from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedPhaseRow, PackedSamplerRowBatch
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol, ValueResourceFact
 from test.backend_facts import assert_finite_resources
 
 
@@ -250,22 +249,13 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions(
 
     # Externally produced factors (a hypernetwork's output) import through the same signed
     # binding, publication, isolation and retirement rules as optimizer-produced ones.
+    # The framework derives the zero workspace of its own canonical import/publish tasks;
+    # memory-constrained planning needs no user-declared facts for them.
     class ImportedOverlay(pllm.Workload):
         factors = pllm.RequestState({
             "a": pllm.Buffer(lambda inputs, outputs: (2, inputs)),
             "b": pllm.Buffer(lambda inputs, outputs: (outputs, 2)),
         }, dtype=torch.float64)
-
-        def resource_facts(self, facts, options):
-            timeline = super().resource_facts(facts, options)
-            if not timeline.task_resources and timeline.memory_budget_bytes is None and options.memory_budget_bytes is None:
-                return timeline
-            # The import copies into roots and checks one original field at a time.
-            return replace(timeline,
-                task_resources=(TaskResourceFact(TaskSymbol("publish"), 0),
-                    TaskResourceFact(TaskSymbol("update"), 16 * 2 * 3)),
-                value_resources=(ValueResourceFact(TaskSymbol("publish"), "publication", 0),
-                    ValueResourceFact(TaskSymbol("update"), "updated", 0)))
 
         @property
         def adapter(self) -> pllm.Overlay:

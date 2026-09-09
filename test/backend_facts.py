@@ -78,11 +78,12 @@ def assert_finite_resources(workload, facts):
     with pytest.raises(ValueError):
         workload.plan_backend(replace(exact, timeline=replace(exact.timeline, memory_budget_bytes=peak - 1)))
     largest = max(bounded.timeline.task_resources, key=lambda item: item.workspace_bytes)
-    lowered = replace(bounded, timeline=replace(bounded.timeline, task_resources=tuple(
-        replace(item, workspace_bytes=item.workspace_bytes - 1) if item is largest else item
-        for item in bounded.timeline.task_resources)))
-    with pytest.raises(ValueError, match="workspace|envelope"):
-        workload.bind_backend(lowered, workload.plan_backend(lowered))
+    if largest.workspace_bytes:
+        lowered = replace(bounded, timeline=replace(bounded.timeline, task_resources=tuple(
+            replace(item, workspace_bytes=item.workspace_bytes - 1) if item is largest else item
+            for item in bounded.timeline.task_resources)))
+        with pytest.raises(ValueError, match="workspace|envelope"):
+            workload.bind_backend(lowered, workload.plan_backend(lowered))
     for value in bounded.timeline.value_resources:
         if value.bytes:
             lowered = replace(bounded, timeline=replace(bounded.timeline, value_resources=tuple(

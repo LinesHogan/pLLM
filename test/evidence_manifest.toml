@@ -247,7 +247,7 @@ group = "workload"
 path = "test/workloads/test_inplace_ttt.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_inplace_ttt.py"
 environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Original captured operand records feed two-target independent outer-product updates across a tail/chunk boundary through shared synchronous/staged execution; cancellation before capture permits retry; sampler gates finish; prepublication failure preserves roots; postpublication settlement failure retains original invocation/publication/release and retry does not retrain or release twice; one atomic publication, same-ID sample isolation, exact retirement and zero fallback"
+observable_contract = "Original captured operand records feed two-target independent outer-product updates across a tail/chunk boundary through shared synchronous/staged execution; cancellation before capture permits retry; sampler gates finish; prepublication failure preserves roots; postpublication settlement failure retains original invocation/publication/release and retry does not retrain or release twice; one atomic publication, same-ID sample isolation, exact retirement and zero fallback; memory-constrained planning of the external-import channel derives the framework-owned import/publish workspace and value facts without user declarations"
 replaces = "test/core/test_canonical_inplace_ttt_workload_unit.py; no legacy fixtures or internal class assertions"
 
 [[evidence]]

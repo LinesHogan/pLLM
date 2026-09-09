@@ -29,7 +29,7 @@ from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.contracts.packed_hidden import PackedHiddenSnapshotBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import ParameterTarget, CapturedParameterOperand
-from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, SemanticGraph, StateScope
+from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline, SemanticGraph, StateScope, TaskResourceFact, ValueResourceFact
 from pllm.contracts.auxiliary import (AuxiliaryInput as AuxiliaryInput, CausalTrainBatch as CausalTrainBatch,
     StateTensorUpdate as StateTensorUpdate, WeightedCEBatch as WeightedCEBatch, map_auxiliary as map_auxiliary)
 from pllm.config import ExecutionOptions
@@ -158,6 +158,40 @@ class BackendDeployment(Generic[DataT, ResultT]):
             raise ValueError("backend deployment requires the original execution plan")
 
 
+_ZERO_WORKSPACE_IMPLEMENTATIONS = frozenset({
+    # Framework-owned canonical import/publish tasks: copies land directly in allocated
+    # private pages and publication moves metadata, so their derived workspace is zero.
+    "canonical.overlay:import@1", "canonical.activation:import@1",
+    "canonical.state:publish@1", "canonical.state:publish_parameter_overlay@1",
+    "canonical.state:cuda_publish_parameter_overlay@1",
+})
+
+
+def derive_framework_resources(graph: SemanticGraph, timeline: SchedulerTimeline) -> SchedulerTimeline:
+    """Fill resource facts for framework-owned canonical tasks the timeline omits.
+
+    Memory-constrained AER requires a fact per task and per output; users cost their own
+    mathematics, never the framework's import/publish plumbing (whose copies land directly
+    in allocated private pages and whose receipts are host metadata).
+    """
+    canonical = tuple(task for task in graph.tasks
+        if task.implementations and all(
+            implementation.implementation_id in _ZERO_WORKSPACE_IMPLEMENTATIONS
+            for implementation in task.implementations))
+    if not canonical:
+        return timeline
+    known_tasks = {fact.task for fact in timeline.task_resources}
+    known_values = {(fact.task, fact.output) for fact in timeline.value_resources}
+    tasks = tuple(TaskResourceFact(task.symbol, 0) for task in canonical if task.symbol not in known_tasks)
+    values = tuple(ValueResourceFact(task.symbol, output.name, 0) for task in canonical
+        for output in task.outputs if (task.symbol, output.name) not in known_values)
+    if not tasks and not values:
+        return timeline
+    return replace(timeline,
+        task_resources=tuple(sorted((*timeline.task_resources, *tasks), key=lambda fact: fact.task)),
+        value_resources=tuple(sorted((*timeline.value_resources, *values), key=lambda fact: (fact.task, fact.output))))
+
+
 class BackendAuthoring(ABC):
     @abstractmethod
     def backend_requirements(self) -> BackendRequirements: ...
@@ -182,6 +216,7 @@ class BackendAuthoring(ABC):
             *(("compute/explicit_math@1",) if options.explicit_math else ())))))
         timeline = replace(timeline, capabilities=capabilities, memory_budget_bytes=min(budgets, default=None))
         graph, layouts, attachment = self.declare(replace(facts, timeline=timeline))
+        timeline = derive_framework_resources(graph, timeline)
         buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
         reserved = (tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
             if buffers else timeline.reserved_bytes)
@@ -194,7 +229,7 @@ class BackendAuthoring(ABC):
 
     def plan_backend(self, facts: BackendCompileFacts) -> SignedBackendAttachment:
         graph, layouts, attachment = self.declare(facts)
-        plan = compile_page_bundle_plan((graph, layouts), facts.timeline, facts.providers,
+        plan = compile_page_bundle_plan((graph, layouts), derive_framework_resources(graph, facts.timeline), facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
             facts.state_memory_budget_bytes, facts.device)
         return bind_backend_attachment(plan, facts.probe, attachment)
@@ -222,7 +257,8 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
 
     def bind_backend(self, facts: BackendCompileFacts, attachment: SignedBackendAttachment) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.inputs.plan
-        if attachment.inputs.probe != facts.probe or plan.timeline != facts.timeline:
+        if (attachment.inputs.probe != facts.probe
+            or plan.timeline != derive_framework_resources(plan.semantic_graph, facts.timeline)):
             raise ValueError("worker backend facts differ from the original signed attachment")
         if (plan.state_decision.reserved_bytes > facts.state_memory_budget_bytes
             or any(item.max_admitted_lineages > facts.max_admitted_lineages for item in plan.state_request.states)):
