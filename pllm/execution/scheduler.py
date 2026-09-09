@@ -1,4 +1,4 @@
-"""Closed FFI for clean-room semantic scheduling and physical lowering."""
+"""Closed FFI for clean-room semantic scheduling, layout interning and physical lowering."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_representation import StatePhysicalPlan, StateProviderPlan, StateRepresentationRequest, StateRepresentationDecision
 from pllm.execution.codec import encode_boundary, decode_boundary
 from pllm.contracts.semantic_graph import PhysicalPlan, ScheduleDecision, SchedulerTimeline, SemanticGraph
+from pllm.contracts.tensor_layout import TensorLayoutDecision, TensorLayoutRequest
 
 
 def validate_plan_bundle(plan: PlanBundle,
@@ -90,8 +91,24 @@ def validate_physical_plan(
 
 
 
+def intern_tensor_layouts(request: TensorLayoutRequest) -> TensorLayoutDecision:
+    return decode_boundary(_core.intern_tensor_layouts(encode_boundary(request)), TensorLayoutDecision)
+
+
+def validate_tensor_layouts(
+    request: TensorLayoutRequest,
+    decision: TensorLayoutDecision,
+) -> None:
+    _core.validate_tensor_layouts(
+        encode_boundary(request),
+        encode_boundary(decision),
+    )
+
+
 __all__ = [
     "compile_state_schedule",
+    "intern_tensor_layouts",
+    "validate_tensor_layouts",
     "compile_schedule",
     "lower_physical_plan",
     "validate_physical_plan",

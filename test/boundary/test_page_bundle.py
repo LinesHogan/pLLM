@@ -14,7 +14,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.scheduler import compile_state_schedule
-from pllm.execution.tensor_layout import intern_tensor_layouts
+from pllm.execution.scheduler import intern_tensor_layouts
 from pllm.workloads.inplace_ttt import (
     InPlaceTTTConfig,
     InPlaceTTTWorkload,

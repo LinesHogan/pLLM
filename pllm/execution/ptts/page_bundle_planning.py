@@ -6,7 +6,7 @@ import mmap
 import torch
 
 from pllm.execution.scheduler import compile_state_schedule
-from pllm.execution.tensor_layout import intern_tensor_layouts
+from pllm.execution.scheduler import intern_tensor_layouts
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import SemanticGraph, SchedulerTimeline
 from pllm.contracts.state_representation import StateLayoutRequirement, StateRepresentationRequest
