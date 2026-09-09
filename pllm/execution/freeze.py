@@ -16,17 +16,18 @@ from dataclasses import fields, is_dataclass
 from dis import get_instructions
 from enum import Enum
 from hashlib import blake2b, sha256
-from inspect import getclosurevars
+from inspect import getclosurevars, signature
 from marshal import dumps
 import sys
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
-from typing import TypeVar, cast
+from typing import Annotated, TypeVar, cast, get_args, get_origin
 
 import torch
 
 from pllm.execution.codec import boundary_digest
 
 G = TypeVar("G", bound=Callable[..., object])
+C = TypeVar("C")
 
 
 def fingerprint(value: object, seen: frozenset[int] = frozenset(), *, structured: bool = False) -> str:
@@ -119,3 +120,49 @@ def members(owner: object) -> dict[str, object]:
     for cls in reversed(type(owner).__mro__):
         result.update(vars(cls))
     return result
+
+
+def owner_values(owner: object, marker_types: tuple[type, ...]) -> dict[str, object]:
+    """Authoring values: scalar/class-level markers plus instance and dataclass fields."""
+    result: dict[str, object] = {name: member for name, member in members(owner).items() if not name.startswith("__")
+        and isinstance(member, (str, int, float, bool, tuple, *marker_types))}
+    result.update(vars(owner))
+    if is_dataclass(owner) and not isinstance(owner, type):
+        result.update((item.name, getattr(owner, item.name)) for item in fields(owner))
+    return result
+
+
+def owner_snapshot(owner: C, marker_types: tuple[type, ...], borrowed: tuple[object, ...] = ()) -> C:
+    """Deep-copy the owner, freezing its function values so signed math cannot drift."""
+    memo = {id(value): value for value in borrowed}
+    copied = deepcopy(owner, memo)
+    for key, value in owner_values(copied, marker_types).items():
+        object.__setattr__(copied, key, freeze(value) if isinstance(value, FunctionType) else deepcopy(value, memo))
+    return copied
+
+
+class NativeMath:
+    """Cold signing of explicitly native mathematics shared by structured workloads."""
+
+    @staticmethod
+    def native_methods(functions: Mapping[str, Callable[..., object]]) -> Mapping[str, str]:
+        """Freeze code and decorator/source contracts for an explicit native binding."""
+        return {name: boundary_digest(fingerprint(function, structured=True),
+            tuple((key, fingerprint(getattr(function, key, None))) for key in (
+                "__pllm_phase__", "__pllm_effect__", "__pllm_gradient__", "__pllm_rows__", "__pllm_hidden__")),
+            tuple((key, fingerprint(get_args(parameter.annotation)[1]))
+                for key, parameter in signature(function, eval_str=False).parameters.items()
+                if get_origin(parameter.annotation) is Annotated)) for name, function in functions.items()}
+
+    def require_native_methods(self, reference: Mapping[str, str], *,
+                               resource_declaration: Callable[..., object] | None = None) -> None:
+        """Reject inherited kernel/cost assumptions after ordinary mathematics changes."""
+        if resource_declaration is not None:
+            declaration = getattr(self, "resource_facts")
+            if (declaration.__func__ if isinstance(declaration, MethodType) else declaration) is not resource_declaration:
+                return
+        current = self.native_methods({name: getattr(self, name) for name in reference})
+        for name, signed in reference.items():
+            if current[name] != signed:
+                contract = "resource_facts declaration" if resource_declaration is not None else "native implementation"
+                raise ValueError(f"{name}: customized mathematics require an explicit matching {contract}")

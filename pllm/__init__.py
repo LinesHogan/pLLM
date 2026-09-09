@@ -24,12 +24,14 @@ from pllm.usage import (
     Activation as Activation,
     Overlay as Overlay,
     Recurrence as Recurrence,
-    transaction as transaction,
-    CompletionWorkload as CompletionWorkload,
-    CausalAdapterWorkload as CausalAdapterWorkload,
     SGD as SGD, Batch as Batch,
 )
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator as ParameterOverlayOperator, ParameterTarget as ParameterTarget
+from pllm.learning import (
+    transaction as transaction,
+    CompletionWorkload as CompletionWorkload,
+    CausalAdapterWorkload as CausalAdapterWorkload,
+)
 from pllm.contracts.request_identity import RequestKeyField as RequestKeyField
 from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay, StateScope as StateScope
 from pllm.contracts.backend_attachment import ActivationPatchOperator as ActivationPatchOperator

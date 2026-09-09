@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CODEC = ROOT / "pllm/execution/codec.py"
-COLD_AUTHORING = {ROOT / "pllm/usage.py", ROOT / "pllm/execution/freeze.py"}
+COLD_AUTHORING = {ROOT / "pllm/usage.py", ROOT / "pllm/execution/freeze.py", ROOT / "pllm/learning.py"}
 FORBIDDEN = {"Any", "object", "cast", "getattr", "setattr", "hasattr"}
 
 
