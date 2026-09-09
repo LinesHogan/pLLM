@@ -8,6 +8,7 @@ reports are not maintained alongside the current architecture.
 - [Current architecture and ownership](architecture.md)
 - [Ask your agent to write a workload: inputs and workflow](guides/agent-workloads.md)
 - [Workload authoring contract](guides/authoring.md)
+- [Glossary: one meaning per term](glossary.md)
 - [Validation and release checks](guides/validation.md)
 - [Benchmark interpretation](guides/benchmarking.md)
 - [Consolidation plan](architecture-consolidation-10k-plan.md)
