@@ -28,7 +28,7 @@ ESamp/LoRA 显式分页与 capture 替换同一签定图的计算，共享 Tenso
 
 本文补充[可编程推理设计](programmable-inference-next-design.md)，重点收敛开发方式与
 性能实现边界，不复制其控制流、KV/RNG、trace 或研究评价规范。PTTS/AER 仍以
-[原研究文档](research-aer-paged-state.md)为唯一设计权威；本文不修改该原稿。
+[原研究文档](../research-aer-paged-state.md)为唯一设计权威；本文不修改该原稿。
 
 2026-09-07 衔接：当前编写接口按本文第 2、4、5、6 节设计，入口见
 [workload authoring](../reference/authoring-contract.md)。全部 11 个内置 workload 已使用同一 builder，
@@ -93,7 +93,7 @@ Agent 交付物应紧凑：源码差分、所依据的 reference、验证结果�
 
 ## 4. 给 Agent 的契约材料
 
-使用入口现为[让你的 Agent 编写 Workload](guides/agent-workloads.md)：包含用户必要信息、
+使用入口现为[让你的 Agent 编写 Workload](../guides/agent-workloads.md)：包含用户必要信息、
 可复制委托模板、按算法选择的真实范例和 agent 交付约定；API 仍以编写契约为准。
 
 第一版只需一个短入口，链接权威 API、维护中的真实范例和可执行检查；暂不建设 agent

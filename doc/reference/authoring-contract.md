@@ -1,11 +1,35 @@
 # 负载创作契约
 
 本文是 PLLM 负载创作的**完整契约**：每一条能力边界与禁止事项都在这里。
+这是一份**参考文档**，不是教程：条款按主题组织、供查证用，不按学习路径展开。
 如果你是第一次写负载，请先做[教程](../tutorials/00_quickstart.ipynb)和
 [使用指南](../guides/write-a-workload.md)；要把需求交给编码代理，见
-[代理指南](../guides/agent-workloads.md)。本文按主题组织，供查证用。
+[代理指南](../guides/agent-workloads.md)。
 
-普通负载使用 `import pllm` 的普通张量方法。[Dummy](../../pllm/workloads/dummy.py)、
+## 如何使用这份契约
+
+按你正在做的事定位小节。每节开头有一段引子，说明这节约束什么、为什么存在、
+违反会怎样；引子只负责导航，条款本身才是契约。术语以[词汇表](glossary.md)为准。
+
+| 你在做的事 | 读这几节 |
+| --- | --- |
+| 写普通张量负载（Dummy / OverRIDE / Huber 风格） | [张量方法与状态](#张量方法与状态)、[训练与梯度](#训练与梯度) |
+| 采样引导、logits 加法、有界导出 | [采样引导、logits 与导出](#采样引导logits-与导出) |
+| 参数 overlay、更新后条件 replay（In-Place-TTT 风格） | [请求 Overlay](#请求-overlay) |
+| 用宿主计算（超网络 / checkpoint）产出 overlay 或激活字段 | [外部 Overlay](#外部-overlay)、[激活检查点](#激活检查点) |
+| 让多个请求按路由键共享适配器 | [路由键](#路由键) |
+| 逐 token prefill 循环（Recirculation） | [逐 Token 循环](#逐-token-循环) |
+| 外部加权批量训练、多步 SGD（Output LoRA 风格） | [加权批量训练](#加权批量训练) |
+| 自定义数据流、写原生数学、结构化宿主事务 | [高级数据流](#高级数据流)、[编写原生数学](#编写原生数学) |
+| completion / reward 驱动学习（TTRL） | [Completion 学习](#completion-学习) |
+| 因果适配器（TLM） | [因果适配器](#因果适配器) |
+| 改运行时、加原语、声明资源成本、排查有限准入失败 | [原语与资源契约](#原语与资源契约) |
+| 排查签名不匹配 / worker 重建失败 | [采样引导、logits 与导出](#采样引导logits-与导出)末尾的冷绑定器段落 |
+| 查某个内置负载用了哪些声明 | [全负载覆盖](#全负载覆盖) |
+| 确认某项优化是否已有证据支撑 | [证据与边界](#证据与边界) |
+
+**内置负载与共享入口。** 普通负载使用 `import pllm` 的普通张量方法。
+[Dummy](../../pllm/workloads/dummy.py)、
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用
@@ -18,6 +42,13 @@
 Tensor 方法表达请求内低秩学习与持久 AdamW，不需要改动核心。
 
 ## 张量方法与状态
+
+本节约束最普通的负载形态：`import pllm` 的 Tensor 方法如何声明输入来源、
+如何声明状态、这些值的生命周期与可写性。它存在的原因是：普通数学拿到的
+输入与参数视图都是借来的只读值——把它们当普通 PyTorch 张量原地修改、
+或假设它们随 Python 对象存活，就越过了签名边界。违反本节的典型后果是
+绑定失败（输入歧义、字符串注解）或读写了不属于你的版本。
+写 Dummy / OverRIDE / Huber 风格负载时先读本节。
 
 ```python
 import torch
@@ -42,14 +73,26 @@ class CenteredHidden(pllm.Workload):
 优化器和可选初始化器。它们可以声明在类上、实例上，或形状依赖配置/模型维度时
 声明为带类型的 property。当 `optimizer=None` 时字段就是布局本身：准入时初始化、
 任何任务（包括观测）都可读、可通过外部通道导入、永不更新 —— 这是同一种状态的
-冻结形态。请求状态默认按真实请求 ID 隔离。它不因 Python 对象析构而回收：
-生命周期由原始 PTTS pin 与完成管理。实例参数就是声明的形状；请求参数会多出
-一个操作行轴。普通实现显式打包这些视图 —— 这**不是原生分页 GEMM**。
-输入与参数视图是借来的只读值；普通数学不得原地修改它们。
-形状/dtype 声明不证明任意 Python 副作用是自由的。
+冻结形态。
+
+请求状态默认按真实请求 ID 隔离。它不因 Python 对象析构而回收：
+生命周期由原始 PTTS pin 与完成管理。
+
+实例参数就是声明的形状；请求参数会多出一个操作行轴。普通实现显式打包这些
+视图 —— 这**不是原生分页 GEMM**。输入与参数视图是借来的只读值；普通数学
+不得原地修改它们。形状/dtype 声明不证明任意 Python 副作用是自由的。
 优化器写入仍走原始私有版本。
 
 ## 训练与梯度
+
+本节约束训练声明：`@train` 如何选择状态与更新资格、`@differentiate` 如何
+保留导数边、梯度如何归约、结果如何存储与释放。核心原则是「声明即授权」：
+只有被 update 掩码选中的原始状态会被写，其余一律只读；归约方式由声明决定，
+绑定不会发明归一化。最容易踩的坑：空 update 与零梯度仍会推进 Adam 步数；
+`StateVersion` 永远不是 latest。本节所有导数规则都是调用局部、一阶的，
+不是穿透 vLLM 或跨越 replay/发布边界的全模型反向传播。
+
+### `@train`：状态资格与更新掩码
 
 `@train(state=..., update=...)` 绑定一个标量 loss 和一个可选的状态资格选择器；
 `@on(phase, rows=...)` 独立选择它的前向行。选择器是具名 Tensor 方法，
@@ -61,6 +104,8 @@ OverRIDE 用 `on(..., rows=...)` 表达它原先的训练子集。
 空的 update 选择保留所有字段与版本；被授权的零梯度仍会推进 Adam 步数、
 动量与衰减，包括空前向调用。标量函数自己拥有归约；绑定不会发明归一化。
 
+### 按状态归约与 `StateIndex` / `StateVersion`
+
 `@train(state=..., reduction="state_mean")` 改为返回每个原始选中状态一个均值 loss。
 绑定器对它们求**和**再微分，而不是跨状态求均值；loss 与优化器在原始图中
 分阶段成为独立任务，保持声明的时机。这个形式目前要求无条件的
@@ -68,6 +113,8 @@ forward/update 域。`StateIndex` 给出每行在本次调用内的状态索引�
 `StateVersion` 给出该行的原始输入 pin 版本 —— 永远不是 latest 或优化器步数。
 两者都不可微。显式的 `RequestState.keys` 仍是原始隔离键；省略则按请求 ID。
 ESamp 保留其仅请求 ID 的后端限制。
+
+### Memory 字段
 
 状态还可以携带普通 **memory 字段**：`InstanceState(..., memory={"carry": shape})`
 声明跟随训练迁移、但不参与优化器展开的每 lineage 张量（没有梯度/动量槽，
@@ -80,6 +127,8 @@ pin 住的输入版本 —— 上一步发布的值 —— 所以训练操作消
 所以第一步读到的是零。跨请求共享由已有的宿主导出/导入通道或共享 route
 lineage 组合而成；memory 本身永远不逃离其 lineage 的 pin。
 
+### `@differentiate` 与导数边
+
 `@differentiate(inputs=("features",), parameters=False)` 在该操作保留选中输入的
 导数边，同时冻结参数导数。上游方法用 `parameters=True`，`@train` 通过声明的边
 消费它们的 `Result` 输入。其他输入被 detach。这是单次调用内的一阶 autograd，
@@ -89,6 +138,7 @@ lineage 组合而成；memory 本身永远不逃离其 lineage 的 pin。
 步数/动量/衰减语义。显式标记的外部浮动输入的梯度以
 `result.input_gradients[(operation, argument)]` 返回，按该操作的行序。
 中间结果边直接传播导数，不需要单独的梯度 DTO。
+
 `differentiate(input_rows="dx", parameter_rows="dw", ...)` 独立掩码声明的导数边，
 不改变前向值。选择器使用原始行，不是前向压实后的位置。对共享状态，按行的
 参数导数要求 `Parameter(state, field, per_row=True)` —— 一个逻辑
@@ -98,6 +148,7 @@ lineage 组合而成；memory 本身永远不逃离其 lineage 的 pin。
 loss 方法只收到选中行，空前向集不调用。有界导出有各自的行限制，
 不接受这些行选择器。采样 token 谓词只在采样完成之后、签名更新之前执行；
 更早的反馈读取、有效果的辅助读取和更新后读取都会被拒绝。
+
 `result.parameter_gradients` 把原始输入 `StateRef` 映射到扁平梯度，即使该状态
 被排除在发布之外。多字段扁平化是显式的检查成本；
 `result.parameter_gradient_fields` 按声明的字段序借用原始的自持有梯度张量，
@@ -108,6 +159,9 @@ loss 方法只收到选中行，空前向集不调用。有界导出有各自的
 不规则行打包。整行结果无需 scatter；部分结果用一个零填充目标恢复原位。
 导数掩码作用于每个消费者一条独立 PyTorch 梯度边，不需要参数尺寸的前向副本，
 也不改变另一个消费者的梯度。原始选择拥有其共享只读恒等索引。
+
+### 结果存储、释放与活性
+
 结果张量共享本次调用的原始 `(task, output)` 存储。Rust 规划它们的最后使用 —
 — 包括下游声明的梯度消费者 —— 并在原始物理任务上签名释放 ID。Python 只
 应用这些释放；导出的值存续到完成。没有单独的 TensorFrame 结果缓存或 Python
@@ -117,6 +171,12 @@ loss 方法只收到选中行，空前向集不调用。有界导出有各自的
 receipt 能结算为止。
 
 ## 采样引导、logits 与导出
+
+本节约束负载与采样器/导出的接口，以及冷绑定器的签名与传输规则。前半部分
+（`@guide_sampling`、`@add_logits`、`@export`、`Config`）是写负载时用的声明面；
+后半部分（函数替换、指纹、冻结、EngineCore 按引用传输）决定「改数学」的代价：
+改动函数体或受检依赖会重新签名，多进程 worker 重建时签名必须与驱动端逐字节
+相等。排查签名不匹配、函数替换不生效、worker 重建失败时回到本节末尾。
 
 `@guide_sampling(beta=...)` 返回过滤后的 hidden 预测，可由 `@on(..., rows=...)`
 选择。绑定把它们关联到原始采样器链接（包括重排的链接）；不要求词表维度。
@@ -142,6 +202,13 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 高级绑定。
 
 ## 请求 Overlay
+
+本节约束由引擎内更新产出的加性参数 overlay：状态怎么声明、哪些 buffer 可以
+被原地修改、更新何时发布、replay 重跑哪些层。它存在的原因是 overlay 直接
+作用于模型执行，所以可写集合被显式收窄——只有被授权的 buffer 可以原地修改，
+操作数永远不行。`ConditionalLayerReplay` 是声明过的近似，不是静默近似：
+每个被重放的层必须被签名的 overlay target 覆盖，否则绑定失败。
+写 In-Place-TTT 风格负载时读本节。
 
 `@on(Phase.MODEL_UPDATE)` 和 `@overlay(state=..., targets=..., weight=...)` 把
 一个加性参数 overlay 与它的发布绑定在一起。声明不带优化器的 `RequestState`：
@@ -171,6 +238,11 @@ token 按序以发布后的状态重跑这些层；每个被重放的层覆盖�
 稠密与低秩 overlay，不支持激活或任意 replay 组合。
 
 ## 外部 Overlay
+
+本节约束字段值来自引擎之外的 overlay（超网络、加载的 checkpoint）。
+它与[请求 Overlay](#请求-overlay) 的差别只有产出地点：应用、发布、隔离与
+退役规则完全相同。关键点：导入只发生一次（只进版本零的请求状态），按原始
+prompt 索引作键；之后混合批次中的每一行读到的是自己请求的精确 pin。
 
 overlay 的字段值不必来自引擎内更新：任何宿主计算 —— 读请求上下文的
 超网络、加载的 checkpoint —— 都可以产出它们。声明同样的 `RequestState`
@@ -203,6 +275,11 @@ class ShineStyleLoRA(pllm.Workload):
 
 ## 路由键
 
+本节约束请求状态的隔离键如何由用户计算：route 值相同的请求加入同一 lineage，
+不同 route 保持隔离。框架从不解释 route 值——它是你的宿主代码的产物。
+两个容易忽略的后果：休眠 lineage 仍然存活并占用 `max_admitted_lineages`
+额度；缺少 route 值的请求在准入时被拒。
+
 请求状态键是签名声明；键值可以由用户计算。给 `RequestState` 的 `keys` 加上
 `RequestKeyField.ROUTE`，并传 `generate(..., routes=(...))` —— 每个 prompt 一个
 路由值，由你自己的宿主代码计算（一个正则、一个判别器分数、一个租户 id；
@@ -215,6 +292,11 @@ lineage。缺少 route 值的请求在准入时被拒。辅助批输入（`Weigh
 
 ## 激活检查点
 
+本节约束激活修改（ReFT 风格）：以外部 `StateTensorUpdate` 作为 `auxiliary=`
+替换检查点字段。它与外部 overlay 同族：共享绑定负责校验检查点、选择根、
+拷贝私有字段并在模型执行前发布；缺失的更新不发布，既有推理 pin 继续看到
+它们精确的旧版本。
+
 声明普通的 `InstanceState` 或 `RequestState` buffer 和一个 `Activation`
 property，命名状态、层、首个/末个 prefill token 与支持的算子。
 `LOW_RANK_AFFINE` 每层使用 weight/bias/rotation 字段；`ADD` 使用一个 FP32 向量。
@@ -226,6 +308,11 @@ Buffer 形状回调收到激活的输入/输出宽度。以原始 `pllm.StateTen
 
 ## 逐 Token 循环
 
+本节约束 `Recurrence` —— 既有的独立逐 token prefill 效果。它自成一体：
+不需要 RequestState、hidden 捕获、外部训练输入、build 或 prepare 方法；
+代价是不能与普通训练/激活操作混合（绑定时失败），纯宿主执行没有模型
+replay 能力。
+
 在 `pllm.Workload` 上声明 `pllm.Recurrence(source_layer=..., destination_layer=...,
 alpha=..., beta=..., ramp_tokens=..., enabled=...)` 作为类/实例属性或带类型的
 property。负层索引对真实模型解析。`beta=None` 使用互补的目标权重；源在混合前
@@ -235,6 +322,12 @@ property。负层索引对真实模型解析。`beta=None` 使用互补的目标
 在绑定时失败；纯宿主执行没有模型 replay 能力。
 
 ## 加权批量训练
+
+本节约束 Output LoRA 形态的负载：具名 SGD 状态、外部 `WeightedCEBatch` 输入、
+reset 与多步训练。这条路径把「外部数据喂入 + 实例/请求共享状态 + 多步 SGD」
+组合在一起，边界多于普通训练：缺批次的含义、发布时机、`copy_fields` 语义、
+`resource_facts` 的继承规则都在这里。改 LoRA 数学或接捕获/分页内核之前，
+先读本节末尾的原生替换与成本声明规则。
 
 [Output LoRA](../../pllm/workloads/lora.py) 声明具名字段状态（`SGD(lr)` 与
 初始化器）、一个普通的 `@add_logits` 预测，以及一个 `AFTER_SAMPLE` 方法（
@@ -251,6 +344,7 @@ reduction="weighted_state_mean_then_mean")`）。reset 方法接收具名局部�
 绑定对齐原始键，拒绝出界输入，掩码非正权重/词表外标签。每个选中状态必须有
 有效行。训练张量有领先的选中状态轴，共享状态时是单例。每个状态返回一个归一化
 loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独立按状态 Adam 归约。
+
 缺批次意味着没有 reset、没有私有写、没有发布。成功训练在所有步之后发布一次；
 取消/失败保留原始 pin 状态。归一化/reset 在原始图的 `__train_prepare` 任务中
 于采样前运行，不在调用准备期。其结果边喂给 `train`；同一帧拥有归一化张量直到
@@ -278,6 +372,11 @@ SGD 与加权批次，不支持持久动量、任意外部 DTO、推理行选择
 
 ## 高级数据流
 
+本节约束绕过结构化入口、直接继承 `BackendWorkload` 的高级创作。读它的前提是
+前面各节的结构化入口表达不了你的数据流。这里的声明直接构成语义图：`Call` /
+`When` 命名依赖与时机窗口，绑定不做函数体检查也不自动追踪——所以声明必须
+描述数学函数的真实访问，撒谎不会被当场发现，但会产生错误的计划。
+
 自定义高级数据流：继承 `a.BackendWorkload[Data, Result]`，从 `declare` 返回原始
 图/布局/附着，带原生 `bind_math` 与 `backend_requirements`。旧的 `a.Workload`
 build 包装已移除。新的局部操作获得基于负载/名字的 ID，除非绑定了显式实现。
@@ -293,6 +392,12 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 `state.version(publication)` 显式读生产者的版本，永远不是 latest。
 
 ## 编写原生数学
+
+本节约束原生数学绑定（`bind_math` / `FunctionMath` / `TaskOutput`）与结构化
+宿主事务（`pllm.transaction`）。这是负载数学与执行层的接缝：流排序、捕获、
+私有分配、回滚与发布仍留在原始执行层，原生函数只拿到借来的操作数与显式
+授权的迁移根。空梯度与零梯度的区别、预算与成本声明的失败模式都在这里。
+给 FTTT / GTTA 这类宿主事务、或 ESamp / LoRA 的捕获内核写数学时读本节。
 
 高级 `BackendWorkload.bind_math(facts, plan)` 返回原始 `MathBinding`。其
 `FunctionMath` 提供初始化、输入行选择、准备与结果构造；负载不构造执行器。
@@ -339,6 +444,12 @@ Python 堆成本声明。
 
 ## Completion 学习
 
+本节约束 `CompletionWorkload`：实例作用域、从原始 completion 输入学习。
+绑定包揽了输入检查、Adam 字段、autograd、私有写与发布，负载只写
+prepare/loss/output 三个函数；代价是没有请求状态、没有跨调用反向、
+没有自动捕获。注意标量配置在绑定时快照——之后 monkey patch 只影响
+新绑定的执行。
+
 继承 `pllm.CompletionWorkload[Data, Result]`，从原始 `CompletionInput` 做实例
 作用域学习。`parameters` 声明为带具名形状、优化器与可选初始化的
 `InstanceState`。`prepare` 计算算法的结构化上下文；`loss(data, parameters)`
@@ -366,6 +477,12 @@ prepare/loss/output 数学必须提供自己的 `resource_facts(facts)`，而不
 `binding.compile()`，不是编译期另一套事实。
 
 ## 因果适配器
+
+本节约束 `CausalAdapterWorkload`（TLM）：冻结的因果模型 + 有序低秩 A/B 因子 +
+声明阶段的优化器更新。数学契约与 [Completion 学习](#completion-学习) 相同，
+差别在模型事实与资源声明：基座模型与初始化模板必须不可变、按身份保留；
+`resident_bytes` 与 `update.input_shapes` 决定有限计划能否准入。
+模型句柄的关闭语义也在本节末尾。
 
 继承 `pllm.CausalAdapterWorkload[Data, Result]`，带冻结的 `pllm.CausalModel`、
 优化器和设为 `BEFORE_MODEL` 或 `AFTER_SAMPLE` 的 `phase`。它使用与 completion
@@ -399,6 +516,15 @@ backward scratch 成本声明：其无界模式不是有限内存保证，Rust �
 
 ## 原语与资源契约
 
+本节约束框架最底层的三件事：输入容量与预检、显式原生原语
+（`TensorRows` / `PagedRows` / 捕获）、资源事实与内存预算。它存在的原因是
+性能路径的每一条捷径都有对应的显式声明义务：**捕获不等于直接页表 GEMM**；
+缺失任务成本意味着无界执行，而不是推断出的安全；原始 timeline、资源事实与
+用户限制三者求交，任何声明都不能放松既有限制。改运行时、加原语、写成本
+声明、排查有限准入失败时读本节；只写普通负载可以跳过。
+
+### 输入容量与预检
+
 后端绑定输入使用原始探针的 `max_packed_rows`：该上限计入所有打包的模型 token，
 包括 prefill，不是选中的 decode 行或去重请求数。超容量输入在状态选择前被拒；
 分阶段提交在被拒时取消其既有调用。vLLM 在打开步或捕获前检查。无状态后端
@@ -407,6 +533,8 @@ backward scratch 成本声明：其无界模式不是有限内存保证，Rust �
 排队请求；原始 arena 仍在其额度内准入每个活跃队列。缺失任务成本仍意味着无界
 执行，而不是推断出的安全；形状/dtype 检查不证明任意用户数学的 scratch 成本。
 纯宿主观测没有后端探针。
+
+### 原语目录与 `MathContract`
 
 [PLLM 设计](../design/pllm-next-stage-design.md) 区分普通数学执行与显式高性能
 原语绑定。`compute` 是不透明的原生操作；`a.ops` 放维护中的原语绑定。当前目录
@@ -424,6 +552,8 @@ backward scratch 成本声明：其无界模式不是有限内存保证，Rust �
 是不同算法，不是调度选择。Output LoRA 的独立路径使用按适配器加权归一化后再
 跨适配器取均值；迁移时不得变成一个全局加权均值。
 
+### `TensorRows` / `PagedRows`：显式张量与分页操作
+
 显式张量与分页数学现在共享 `pllm.TensorRows` / `pllm.PagedRows` 操作：
 `linear`、`input_gradient`、`parameter_gradient`、`values`、`reduce` 与 `write`。
 `TensorRows(packed_fields, row_state_indices)` 用显式张量打包；整数第二参数表示
@@ -433,6 +563,8 @@ backward scratch 成本声明：其无界模式不是有限内存保证，Rust �
 残差/loss/反向表达式。Output LoRA 对张量/分页 eager 与捕获使用同一个显式
 reset/加权 CE/多步 SGD 循环；其原先独立的 `weighted_lora.py` 实现已移除。
 普通 Tensor 方法声明图与输入；这些显式原生替换绑定同一张图。
+
+### 分页捕获实现（`paged=True`）
 
 逻辑参数在绑定选择实现前一直留在原始图中。张量实现借用或打包视图；其捕获的
 训练仍做 arena gather/scatter。**捕获不等于直接页表 GEMM。** ESamp 与共享/独立
@@ -445,6 +577,8 @@ Output LoRA 额外在配置中接受 `paged=True`。该签名实现直接在原�
 两档归约容量桶，不用请求身份、版本或单行数。小归约用直接 FMA，而不是填充到
 完整点积 tile。长内维窄输出用共享的 split-inner 内核与 FP32 部分归约，直接读
 同一授权槽/活跃映射。不使用负载专属 GPU 实现或逐 token 矩阵拷贝。
+
+### 分页视图、选择与写
 
 高级 `batch.paged(fields, row_state_indices)` 每字段返回一个视图，借用来自原始
 精确 pin 或私有写的不可变调用局部映射操作数。`linear`、`input_gradient`、
@@ -471,6 +605,9 @@ loss 则从原始 arena 的稳定槽表推导设备映射，替换前有原始�
 偏置/范数读取仍 gather。ESamp 的显式 LayerNorm 导数调用同一原生 PyTorch
 反向算子，不构造 autograd 磁带；原始输入、均值与逆标准差仍是必要 scratch。
 普通用户函数保留正常 autograd 语义，不 gather 矩阵参数。
+
+### 分页 AdamW 与分页写
+
 `PagedRows.adamw(fields, gradients, config)` 接受参数/梯度/步数/一阶动量/二阶
 动量顺序的五个原始 FP32 字段和连续 `[states, parameters]` 梯度。只有原始私有槽
 可被更新；过滤计算行不改变写权限。ESamp 分页 eager 与 Adam 捕获共享一个
@@ -484,13 +621,21 @@ loss 则从原始 arena 的稳定槽表推导设备映射，替换前有原始�
 写入。写内核直接读选中状态与原始槽（包括跨步选择），没有中间选中槽张量。
 缩放对替换写与加性写都适用。显式 LoRA 循环复用 log-softmax 存储做 CE 导数，
 并把固定行归一化提升到 SGD 迭代之外。LoRA 在其既有捕获行状态输入中排除零权重
-行；eager 过滤用已算出的有效行数，不全活跃批次不重组。直接 `arena.capture_kernel`
-在返回前恢复调用方自有私有字段。框架 `KernelCapture.bind` 使用一次性准入页并在
-捕获后中止它们，不分配字段备份。KernelCapture 输入工厂接受设备；它们必须在
-meta 与 CUDA 上产出相同的去重缓冲形状/dtype。所有捕获都在分配任何捕获输入缓冲
-前，对照原始签名驻留预算在 meta 上量尺寸。真实输入存储与字段 scratch 在冷准入前
-再检查；图池预留在捕获后检查，被拒时回收冷页。真实 replay、跨流排序、发布与
-中止仍归原始 arena，无字段 gather 缓冲。`resource_facts(facts, options)` 返回从
+行；eager 过滤用已算出的有效行数，不全活跃批次不重组。
+
+### 捕获准入（KernelCapture）
+
+直接 `arena.capture_kernel` 在返回前恢复调用方自有私有字段。框架
+`KernelCapture.bind` 使用一次性准入页并在捕获后中止它们，不分配字段备份。
+KernelCapture 输入工厂接受设备；它们必须在 meta 与 CUDA 上产出相同的去重缓冲
+形状/dtype。所有捕获都在分配任何捕获输入缓冲前，对照原始签名驻留预算在 meta
+上量尺寸。真实输入存储与字段 scratch 在冷准入前再检查；图池预留在捕获后检查，
+被拒时回收冷页。真实 replay、跨流排序、发布与中止仍归原始 arena，无字段
+gather 缓冲。
+
+### 资源事实与内存预算
+
+`resource_facts(facts, options)` 返回从
 `facts.timeline` 派生的 SchedulerTimeline，带原始任务/值资源事实，不是另一张
 成本图。`ExecutionOptions(memory_budget_bytes=...)` 约束该原始 AER 计划。原始
 timeline、返回的资源事实与用户限制三者求交：任何声明都不能放松或擦除既有限制。
@@ -498,7 +643,9 @@ timeline、返回的资源事实与用户限制三者求交：任何声明都不
 都有显式成本。该限制覆盖声明的状态、驻留、预留、工作区与存活结果字节，不覆盖
 未声明的 vLLM 模型/KV、分配器或外部库成本。它区别于 arena 容量
 （`state_memory_bytes`）与每任务捕获容量。ESamp 还声明普通张量打包/保存的
-中间量、谓词、Adam 工作区与导出的 loss/梯度存储。ESamp 与 LoRA 在拒绝资金不足
+中间量、谓词、Adam 工作区与导出的 loss/梯度存储。
+
+ESamp 与 LoRA 在拒绝资金不足
 的任务/输出事实时复用其声明公式，并在调用时强制签名的行/状态容量。Dummy、
 OverRIDE、普通 In-Place-TTT 与 ReFT 在请求有限预算（或任务成本已存在）时额外
 提供内置任务/输出成本。无界普通用法不变。它们的 worker 绑定从原始事实重算最小
@@ -508,7 +655,9 @@ OverRIDE、普通 In-Place-TTT 与 ReFT 在请求有限预算（或任务成本�
 条件 In-Place-TTT 与 Recirculation 模型 replay、完整 HF backward 与外部库
 scratch 没有内置完整成本声明。这些路径的有限使用需要显式声明；这些公式都不是
 总 GPU 内存保证。自定义声明为其改动的数学拥有成本声称；签名图和继承检查都不
-证明任意 autograd/库 scratch 的界。原生源/目标打包在消费任务内进行；预测只打包
+证明任意 autograd/库 scratch 的界。
+
+原生源/目标打包在消费任务内进行；预测只打包
 合格采样行。训练结果是导出的图值，所以 AER 保留其存储到完成，不止到优化器消费。
 连续 hidden 行借用原始快照（包括跨步列）；不规则行仍打包。vLLM 为每个资源创建
 一个自持有的 FP32 快照，并跨原始 timeline 预留其最大容量；worker 重建保留该
@@ -539,6 +688,10 @@ backward 把重复行贡献求和进同一原始导数叶。这些叶别名 pin 
 
 ## 全负载覆盖
 
+本节是速查表：十一个内置负载各自使用了哪些声明与数学需求。用它快速定位
+「我要的效果有没有现成范例」。注意可表达不等于支持任意组合：后端能力检查
+仍拒绝不支持的组合。
+
 | 负载 | 声明与数学需求 |
 | --- | --- |
 | Dummy | 无状态；选中 hidden 行、结果与有界观测 |
@@ -561,6 +714,10 @@ backward 把重复行贡献求和进同一原始导数叶。这些叶别名 pin 
 任意跨负载组合。
 
 ## 证据与边界
+
+本节约束证据纪律：哪些声称已有编号证据支撑，哪些不被既有实验蕴含。
+改优化实现前先固定独立参考；对输出、梯度、优化器状态、无更新、隔离、
+取消与结算扩展现有证据，不要重建负载/运行时矩阵。
 
 人类作者与编码代理使用同一契约和维护中的源码范例。不要为了让优化通过对比而
 改动独立参考。对输出、梯度、优化器状态、无更新、隔离、取消与结算扩展现有证据；

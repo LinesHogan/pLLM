@@ -21,7 +21,7 @@
 5. 测试按真实 evidence item 计数，整个仓库不得超过 50 项；
 6. 10k 是长期压缩方向，不是牺牲类型、功能或重新制造巨型文件的硬指标。
 
-[`doc/research-aer-paged-state.md`](research-aer-paged-state.md) 仍是 PTTS/AER 的唯一
+[`doc/research-aer-paged-state.md`](../research-aer-paged-state.md) 仍是 PTTS/AER 的唯一
 设计权威。该未跟踪研究文档不得因本计划被修改、加入或提交。
 
 ## 当前状态与交接（2026-09-09）
@@ -53,7 +53,7 @@
 - FTTT/GTTA 的 FIFO、abort/requeue 和 host settlement，TLM 的 online/offline、
   admission pin 与 immutable publication，TTRL reward/control，以及参数/激活 overlay、
   条件/tokenwise replay、MRv1/MRv2 和 closed EngineCore 边界保留。支持边界见
-  [编写契约](guides/authoring.md)，不以接口统一声称任意组合受支持。
+  [编写契约](../reference/authoring-contract.md)，不以接口统一声称任意组合受支持。
 
 ### 已实施的资源收敛
 
@@ -229,7 +229,7 @@ PyTorch 2.13.0+cu129、vLLM 0.27.1+cu129、Triton 3.7.1、RTX 4090/SM89。
   原 270542404-byte 需求拒绝记录保留，未 fallback 或减少训练量。
 - 较早测量的原始日志保留，但不与当前源码结果平行维护性能结论。逐臂插入 profiler
   的旧吞吐排除；旧七组矩阵早于 selected-gradient 替换。来源与限制见
-  [benchmarking](guides/benchmarking.md)，不以历史较快数字覆盖当前测量。
+  [benchmarking](../guides/benchmarking.md)，不以历史较快数字覆盖当前测量。
 
 ### 终态核对与剩余证据
 

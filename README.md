@@ -1,8 +1,15 @@
 # PLLM
 
-可编程的张量负载，与 LLM 推理并肩运行。算法只声明数学、数据流、状态与效果；
-Rust 签名出唯一的执行计划，托管运行时负责版本、发布、捕获与完成。
-框架不认识任何算法名 —— 约束只来自形状、dtype、依赖、效果、设备与容量。
+PyTorch 会训练，vLLM 会推理。但如果你想让模型在**服务的同时继续学习**——
+观测中间层激活、按请求叠 LoRA、在 decode 的间隙更新参数——你会发现两边都不
+管这段路：训练框架不认识 KV cache，推理引擎不认识优化器。
+
+PLLM 补上这段路。算法只声明数学、数据流、状态与效果；Rust 签名出唯一的
+执行计划，托管运行时负责版本、发布、捕获与完成。框架不认识任何算法名——
+约束只来自形状、dtype、依赖、效果、设备与容量。
+
+第一次来？先跑下面的[五分钟起步](#五分钟起步)，再到[教程](#教程从基础到场景)
+按兴趣分流。
 
 ## 五分钟起步
 
@@ -27,8 +34,12 @@ with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2)))
 
 ## 教程：从基础到场景
 
-最好的入门路径是 `doc/tutorials/` 下的六篇中文 notebook，按顺序读，
-每一篇都可在 GPU 上直接执行（环境准备见[安装](#安装)）：
+入门路径是 `doc/tutorials/` 下的中文 notebook，读法和 PyTorch 官方教程一样：
+**边跑边改**。每篇从一个能跑的最小例子出发，逐步加概念，最后落到完整场景。
+主线六篇按顺序读，跑完 00 之后就可以按兴趣分流——做算法的继续 01–05，
+想搞清框架内部机制的直接跳系统向支线（纯 CPU 即可运行）：
+
+**算法向（GPU 环境，见[安装](#安装)）**
 
 | 教程 | 你会学到什么 |
 | --- | --- |
@@ -39,13 +50,17 @@ with make_llm(config, workload=ESampRequestWorkload(ESampRequestConfig(rank=2)))
 | [04 三种循环](doc/tutorials/04_loops.ipynb) | 层间重放、逐步 hidden 再循环、跨请求会话循环（memory + Capture） |
 | [05 decode 时在线训练](doc/tutorials/05_decode_training.ipynb) | 跨步与跨请求的训练目标：当前步、下一步、上一 VIP 请求终态，全靠输入声明组合 |
 
-教程的读法假设你像读 PyTorch/CUDA 教程一样**边跑边改**：每篇从一个能跑的
-最小例子出发，逐步加概念，最后落到完整场景。
+**系统向（内部机制，纯 CPU 可运行）**
+
+| 教程 | 你会学到什么 |
+| --- | --- |
+| [签名编译管线](doc/tutorials/internals/01_signed_compilation.ipynb) | 声明如何变成签名计划 |
+| [托管状态与页 arena](doc/tutorials/internals/02_state_arena.ipynb) | 版本、COW、pin、预算 |
+| [进程边界](doc/tutorials/internals/03_process_boundary.ipynb) | 按引用传输与签名复核 |
 
 ## 自己写负载
 
-把需求交给编码代理？先看[负载需求模板与代理指南](doc/guides/agent-workloads.md)：
-要提供什么、参考哪些例子、代理应该交付什么。
+一个负载就是一个声明，不是运行时钩子：
 
 ```python
 import torch
@@ -59,10 +74,13 @@ class CenteredHidden(pllm.Workload):
         return hidden - hidden.mean(dim=-1, keepdim=True)
 ```
 
-这段代码声明的是捕获与一个输出效果，不是运行时钩子或图节点。完整的
+这段代码声明的是捕获与一个输出效果。完整的
 [负载创作契约](doc/reference/authoring-contract.md) 涵盖参数作用域、注解输入、
 选择、一阶梯度边、激活检查点与带条件重放的请求 overlay；按任务的写法见
 [使用指南](doc/README.md#使用指南任务导向)。
+
+打算把需求交给编码代理？先看[负载需求模板与代理指南](doc/guides/agent-workloads.md)：
+要提供什么、参考哪些例子、代理应该交付什么。
 
 ## 内置算法
 
@@ -80,8 +98,8 @@ class CenteredHidden(pllm.Workload):
 | GTTA | CPU 环境评分与事务化更新 |
 | TTRL | 多数奖励学习与重试/栅栏输出 |
 
-全部内置算法使用同一套图、签名计划与执行所有者。新算法实现的是
-[创作契约](doc/reference/authoring-contract.md)，而不是自己的执行器或 arena。
+它们没有特权：全部内置算法使用同一套图、签名计划与执行所有者。新算法实现的
+是[创作契约](doc/reference/authoring-contract.md)，而不是自己的执行器或 arena。
 见[架构与支持边界](doc/design/architecture.md)与
 [In-Place-TTT 语义](doc/design/inplace-ttt.md)。
 
@@ -98,21 +116,22 @@ python -m pip install -e ".[vllm027,test]"
 
 当前后端面向未量化的 Qwen2 模型与 vLLM 0.27.1：默认 MRv2，TP1/PP1/DP1，
 非投机执行，采样 `n=1`。MRv1 支持共享附着路径但不支持 KV 重放。
-`multiprocessing=True` 是 EngineCore 生产部署路径：负载按**引用**传输 ——
-类坐标（模块 + 限定名）、模块摘要与冻结字段值，从不序列化函数体 ——
-worker 进程重新导入、重建并重新绑定，安装时其编译签名必须与驱动端签名计划
-逐字节相等。内置负载与用户负载走同一条路（内置即最佳实践参考）。代价是
-一条纪律：workload 类必须可导入（不能是 `__main__`/notebook 里的临时类）、
-是冻结 dataclass、字段可封闭传输（原始配置值、typed contract、模块级函数引用
-或 WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
+本仓库的本地环境是 PyTorch 2.13/CUDA 12.9 与 vLLM 0.27.1+cu129——请选择
+相互匹配的 wheel，不要假设任意上游 CUDA 变体都兼容。仅 CPU 开发可安装
+`.[test]`。不安装任何全局 vLLM 插件。
+
+`multiprocessing=True` 是 EngineCore 生产部署路径：负载按**引用**传输——
+类坐标（模块 + 限定名）、模块摘要与冻结字段值，从不序列化函数体——worker
+进程重新导入、重建并重新绑定，安装时其编译签名必须与驱动端签名计划逐字节
+相等。内置负载与用户负载走同一条路（内置即最佳实践参考）。代价是一条纪律：
+workload 类必须可导入（不能是 `__main__`/notebook 里的临时类）、是冻结
+dataclass、字段可封闭传输（原始配置值、typed contract、模块级函数引用或
+WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
 
 `ExecutionOptions(capture=True)` 捕获的是受支持的训练内核，不是整个模型。
 模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
-错误，不是静默退回 eager。Overlay 不能使用共享前缀缓存。本仓库的本地
-环境是 PyTorch 2.13/CUDA 12.9 与 vLLM 0.27.1+cu129 —— 请选择相互匹配的
-wheel，不要假设任意上游 CUDA 变体都兼容。仅 CPU 开发可安装 `.[test]`。
-不安装任何全局 vLLM 插件。
+错误，不是静默退回 eager。Overlay 不能使用共享前缀缓存。
 
 ## 基准
 
@@ -127,6 +146,12 @@ wheel，不要假设任意上游 CUDA 变体都兼容。仅 CPU 开发可安装 
 它不再是脱离框架的内核微基准。[测量细节](doc/guides/benchmarking.md)说明了
 负载构成、限制与历史对比的注意事项。
 
+## 下一步去哪
+
+- 想写自己的负载 → [使用指南](doc/README.md#使用指南任务导向)（任务导向）
+- 想查某条声明的精确边界 → [负载创作契约](doc/reference/authoring-contract.md)与[词汇表](doc/reference/glossary.md)
+- 想理解架构与所有权 → [设计说明](doc/README.md#设计说明解释导向)
+- 想做验证与发布检查 → [验证指南](doc/guides/validation.md)
+
 开发使用 `/workspace/pllm/.venv/bin/python`。
-[验证指南](doc/guides/validation.md)列出聚焦检查与发布门禁；
 [文档索引](doc/README.md)汇总维护中的设计文档。
