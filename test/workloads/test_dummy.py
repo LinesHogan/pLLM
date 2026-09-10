@@ -211,3 +211,34 @@ def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> 
             return first + second
     with pytest.raises(TypeError, match="multiple Tensor inputs"):
         Ambiguous().backend_requirements()
+
+    # A frozen state — declared once, initialized at admission — is readable from an
+    # observation without ever becoming an update target, and the signed export sees it.
+    class FrozenEncoder(pllm.Workload):
+        encoder = pllm.InstanceState({"weight": lambda model: (4, model.hidden_size)},
+            dtype=torch.float32,
+            initialize=lambda tensors, generator: tensors["weight"].copy_(torch.eye(4)))
+
+        @pllm.on(pllm.Phase.OBSERVE)
+        @pllm.hook(0)
+        @pllm.export(name="features", every=1, max_rows=2, max_cols=4)
+        def encode(self, hidden: torch.Tensor,
+                   weight: Annotated[torch.Tensor, pllm.Parameter("encoder", "weight")]) -> torch.Tensor:
+            return hidden @ weight.T
+
+    from test.backend_facts import backend_facts
+    from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+    frozen_facts = backend_facts(4, (binding,), RuntimeFacts(torch.device("cpu")).timeline(),
+        PageBundleProviderFacts("test.plain@1", 4, StateDeviceKind.CPU), max_lineages=2)
+    frozen_exec = FrozenEncoder().compile_backend(frozen_facts).execution
+    identity = RequestIdentity("req", 0, 0)
+    frozen_exec.admit(())
+    frozen_exec.admit((identity,))
+    row_batch = PackedPhaseRowBatch(1, 0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.DECODE, identity),))
+    source = (torch.arange(4, dtype=torch.float32) + 1).unsqueeze(0)
+    frozen_exec.step(TensorStepInput(row_batch, PackedSamplerRowBatch(row_batch, ()),
+        PackedHiddenSnapshotBatch(row_batch, (PackedHiddenSnapshot(binding, source),))))
+    events = [event.tensor() for event in frozen_exec.trace.snapshot().events if event.tensor_name == "features"]
+    assert len(events) == 1 and torch.allclose(events[0][0], source)
+    assert frozen_exec.diagnostics().fallback_count == 0
+    frozen_exec.retire((identity,))

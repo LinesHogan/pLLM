@@ -399,6 +399,9 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         states: dict[str, State] = {}
         parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = {}
         definitions: list[tuple[str, str]] = helpers
+        # Method-overlay states are created by parameter_overlay with their own buffer layout.
+        overlay_states = {effect.state for member in members.values()
+            if isinstance((effect := getattr(member, "__pllm_effect__", None)), _Overlay)}
         for name, member in members.items():
             if isinstance(member, property) and member.fget is not None and (
                 signature(member.fget, eval_str=False).return_annotation in (InstanceState, RequestState, Activation, Overlay, Recurrence)):
@@ -408,12 +411,16 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         for name, definition in values.items():
             if isinstance(definition, InstanceState):
                 definitions.append((name, fingerprint(definition)))
-                if definition.optimizer is None:
+                if name in overlay_states:
                     continue
+                if any(isinstance(shape, Buffer) for shape in definition.fields.values()):
+                    if definition.optimizer is not None:
+                        raise TypeError("optimizer parameters require tensor shapes, not overlay buffers")
+                    continue  # Overlay/Activation buffer states are built by their effect branches.
                 shapes: dict[str, Shape] = {}
                 for key, shape in definition.fields.items():
                     if isinstance(shape, Buffer):
-                        raise TypeError("optimizer parameters require tensor shapes, not overlay buffers")
+                        raise TypeError("tensor states require tensor shapes, not overlay buffers")
                     shapes[key] = shape
                 state, ports = b.parameters(name, shapes, optimizer=definition.optimizer,
                     namespace=definition.namespace,

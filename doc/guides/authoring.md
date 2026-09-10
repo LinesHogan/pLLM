@@ -42,6 +42,9 @@ Use evaluated annotations; the binder never evaluates annotation strings.
 `InstanceState` and `RequestState` declare a single `shape=` or named fields,
 dtype, optimizer and optional initializer. Declare them on the class, instance,
 or a typed property when shapes depend on configuration/model dimensions.
+With `optimizer=None` the fields are the layout directly: initialized at
+admission, readable from any task (including observations), importable through
+the external channel, and never updated — the frozen form of the same state.
 Request state defaults to actual request ID isolation. It is not reclaimed by
 Python object destruction: original PTTS pins and completion govern its lifetime.
 Instance parameters have their declared shapes; request parameters add an

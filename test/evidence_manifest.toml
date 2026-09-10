@@ -217,7 +217,7 @@ group = "workload"
 path = "test/workloads/test_dummy.py"
 command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_dummy.py"
 environment = "Repository Python venv with torch and freshly built Rust extension; CPU"
-observable_contract = "Original TensorStepInput drives host and signed stateless observation paths; decode-only row selection, disabled/stride gating, owned CPU export and configuration/hidden-source tamper rejection. Original bounded trace preserves exact dtype/shape/bytes, NaN/Inf and large integers through its closed codec, rejects oversized snapshots and drops oldest entries. Evidence 36 --dummy-inprocess compares actual selected-layer values to an independent model hook; --dummy-only returns original request/step-linked snapshots from EngineCore with parent CUDA off"
+observable_contract = "Original TensorStepInput drives host and signed stateless observation paths; decode-only row selection, disabled/stride gating, owned CPU export and configuration/hidden-source tamper rejection. An observation may read a frozen state (no optimizer: initialized at admission, never updated) through a declared non-versioned read effect; the signed export sees the initialized values exactly. Original bounded trace preserves exact dtype/shape/bytes, NaN/Inf and large integers through its closed codec, rejects oversized snapshots and drops oldest entries. Evidence 36 --dummy-inprocess compares actual selected-layer values to an independent model hook; --dummy-only returns original request/step-linked snapshots from EngineCore with parent CUDA off"
 replaces = "test/core/test_canonical_dummy_workload_unit.py; legacy consumer import removed"
 
 [[evidence]]

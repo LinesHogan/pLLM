@@ -487,11 +487,22 @@ fn validate_cross_binding(
             let mut signed = probe.hidden_resources.iter().map(attachment_hidden_key).collect::<Result<Vec<_>, _>>()?;
             hidden.sort_unstable();
             signed.sort_unstable();
-            if graph.tasks.len() != 1 || !graph.states.is_empty() || !state.representations.is_empty()
-                || task.replay.is_some() || !task.effects.is_empty() || hidden != signed
+            if graph.tasks.len() != 1
+                || task.effects.iter().any(|effect| {
+                    effect.kind != StateEffectKind::Read || effect.version.is_some()
+                })
+                || task.replay.is_some() || hidden != signed
                 || task.outputs.iter().any(|output| output.kind != OutputKind::Host)
                 || task.timing.after != "state.publish" || task.timing.before != "sampler.pre_draw"
-                || task.inputs.iter().any(|input| !matches!(input.source, InputSource::Hidden { .. } | InputSource::StepId))
+                || task.inputs.iter().any(|input| match &input.source {
+                    InputSource::Hidden { .. } | InputSource::StepId => false,
+                    InputSource::StateSelection { resource, .. } => !task.effects.iter().any(|effect| {
+                        effect.kind == StateEffectKind::Read
+                            && effect.version.is_none()
+                            && &effect.resource == resource
+                    }),
+                    _ => true,
+                })
             {
                 return Err("observation must read its original hidden inputs without changing model state".into());
             }
@@ -512,7 +523,13 @@ fn validate_cross_binding(
             validate_parameter_overlay_graph(request, graph)?;
         }
     }
-    if !matches!(request.attachment_kind, AttachmentKind::ModelReplay | AttachmentKind::Observation) {
+    if request.attachment_kind == AttachmentKind::Observation {
+        if state.representations.iter().any(|provider| {
+            provider.device_kind != probe.device_kind || provider.device_ordinal != probe.device_ordinal
+        }) {
+            return Err("attachment placement differs from selected state provider".to_owned());
+        }
+    } else if request.attachment_kind != AttachmentKind::ModelReplay {
     let provider = state
         .representations
         .binary_search_by(|provider| provider.resource.cmp(&request.state_resource))

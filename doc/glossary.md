@@ -24,7 +24,8 @@ One meaning per term; the signing and execution boundaries use exactly these wor
 
 - **State** — the only mutable thing: named, versioned tensor fields under a declared layout.
   Produced three ways with identical consumption: optimizer updates, hypernetwork/external
-  import, checkpoint loading.
+  import, checkpoint loading. With no optimizer the state is frozen: initialized at
+  admission, readable anywhere (observations included), never updated.
 - **Lineage** — one logical state's version chain. Instance scope has one lineage; request
   scope has one per admitted key. Lineages are never merged or split by execution.
 - **Memory field** — a plain per-lineage field that rides the training transition without

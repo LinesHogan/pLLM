@@ -418,7 +418,7 @@ class TensorBinding(Builder[TensorFrame]):
     def sampled_tokens() -> TensorPort:
         return _feedback(lambda feedback: feedback.sampled_tokens)
 
-    def parameters(self, name: str, shapes: Mapping[str, Shape], *, optimizer: AdamWConfig | SGD, namespace: str = "",
+    def parameters(self, name: str, shapes: Mapping[str, Shape], *, optimizer: AdamWConfig | SGD | None, namespace: str = "",
                    initialize: Callable[[Tensors, torch.Generator], None] | None = None,
                    scope: StateScope = StateScope.INSTANCE, dtype: TensorDType = TensorDType.FLOAT32,
                    alignment: int = 16, mutation: MutationGranularity = MutationGranularity.WHOLE_TENSOR,
@@ -428,9 +428,12 @@ class TensorBinding(Builder[TensorFrame]):
             raise ValueError("ordinary parameters use one instance state with named tensor views")
         if set(memory) & set(shapes):
             raise ValueError("memory fields duplicate a parameter field")
+        if memory and optimizer is None:
+            raise ValueError("memory fields ride on the training transition and require an optimizer")
         def sizes(model: Dimensions) -> tuple[tuple[int, ...], ...]:
             return tuple(shape(model) if callable(shape) else shape for shape in shapes.values())
-        raw = isinstance(optimizer, SGD)
+        # Without an optimizer the fields are the layout directly: readable, importable, never updated.
+        raw = not isinstance(optimizer, AdamWConfig)
         memory_fields = tuple(Field(key, shape, dtype, alignment, mutation) for key, shape in memory.items())
         state = self.state(name, tuple(Field(key, shape, dtype, alignment, mutation) for key, shape in shapes.items()) if raw else
             (Field("parameters", lambda m: (sum(prod(shape) for shape in sizes(m)),), dtype, alignment, mutation),),
