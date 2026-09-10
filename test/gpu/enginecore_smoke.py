@@ -78,6 +78,28 @@ def _gpu_shared_input() -> None:
     print("EngineCore GPU IPC: original strided input alias, publication=1, owned CUDA completion survives close, fallback=0")
 
 
+def _user_reference_workload() -> None:
+    """A user workload in an importable module enters EngineCore by reference, unchanged."""
+    from examples.huber import HuberWorkload
+    assert not torch.cuda.is_initialized()
+    handle = pllm.make_llm(workload=HuberWorkload(2),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
+            64, 2, 128, 0.25, seed=7, multiprocessing=True))
+    try:
+        initial = handle.worker_state()
+        assert initial.process_id != os.getpid()
+        outputs = handle.generate(["The sky is", "Water freezes at"],
+            SamplingParams(max_tokens=4, temperature=0.0, ignore_eos=True))
+        assert len(outputs) == 2
+        finished = handle.worker_state().diagnostics
+        assert finished.loss_count == finished.update_count > 0
+        assert finished.active_lineages == finished.pending_state_releases == finished.fallback_count == 0
+        print(f"user workload by reference: child={initial.process_id} "
+            f"loss={finished.loss_count} fallback={finished.fallback_count}")
+    finally:
+        handle.close()
+
+
 def _dummy_export(multiprocessing: bool = True) -> None:
     if multiprocessing:
         assert not torch.cuda.is_initialized()
@@ -386,6 +408,7 @@ def main() -> int:
     _fttt_activation_retry()
     _captured_esamp()
     _dummy_export()
+    _user_reference_workload()
     _gpu_shared_input()
     return 0
 
@@ -404,6 +427,8 @@ if __name__ == "__main__":
         _fttt_activation_retry()
     elif sys.argv[1:] == ["--dummy-only"]:
         _dummy_export()
+    elif sys.argv[1:] == ["--user-only"]:
+        _user_reference_workload()
     elif sys.argv[1:] == ["--tlm-only"]:
         _tlm_shared_input()
     else:

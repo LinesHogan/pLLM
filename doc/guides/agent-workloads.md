@@ -62,8 +62,9 @@ loss 按 token、请求还是共享状态归一化。可以说“所有行参与
 
 不要因为范例含高级资源绑定，就把它的全部内部 imports 复制进一个普通 workload。
 当前普通训练仅支持单优化器状态／单训练终点，`state_mean` 要求无条件 forward/update；
-replay、模型锚点和组合有后端限制。自定义 Python workload 默认走进程内公共工厂，
-EngineCore 不序列化任意用户函数。遇到不支持的要求，给出具体缺口并请用户选择，
+replay、模型锚点和组合有后端限制。自定义 Python workload 默认走进程内公共工厂；
+EngineCore 多进程下按引用传递（可导入的冻结 dataclass 类 + 封闭字段值，函数体从不序列化），
+driver 会逐字节复核 worker 重建出的编译签名。遇到不支持的要求，给出具体缺口并请用户选择，
 不静默改算法或 fallback。完整边界见[编写契约](../reference/authoring-contract.md)。
 
 ## Agent 的最小交付

@@ -1,6 +1,6 @@
 """Evidence 18: a spawned worker consumes the exact plan, without selection."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import multiprocessing as mp
 from multiprocessing.connection import Connection
@@ -8,8 +8,10 @@ from multiprocessing.connection import Connection
 import pytest
 import torch
 
+import pllm
 from pllm import make_llm
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.workloads.dummy import DummyWorkload
 from pllm.execution.execution import TaskGraphExecution
 from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
@@ -27,6 +29,43 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId
+
+
+def doubled_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    from pllm.workloads.override import cross_entropy
+    return cross_entropy(logits, labels) * 2
+
+
+class PlainProbe(pllm.Workload):
+    """Not a frozen dataclass: EngineCore reference transport rejects it with guidance."""
+
+
+@dataclass(frozen=True, slots=True)
+class FakeTransportConfig:
+    value: int
+
+
+class FakeTransport:
+    """WorkerTransportable test double; rebuild proves the worker-side hook ran."""
+
+    def __init__(self, config: FakeTransportConfig) -> None:
+        self.config = config
+
+    def transport_payload(self) -> FakeTransportConfig:
+        return self.config
+
+    @classmethod
+    def transport_payload_type(cls) -> type[FakeTransportConfig]:
+        return FakeTransportConfig
+
+    @classmethod
+    def transport_rebuild(cls, payload: FakeTransportConfig, *, device: torch.device, seed: int) -> "FakeTransport":
+        return cls(FakeTransportConfig(payload.value + seed))
+
+
+@dataclass(frozen=True)
+class TransportHolder(DummyWorkload):
+    extra: FakeTransport = FakeTransport(FakeTransportConfig(1))
 
 
 def _worker(connection: Connection, expected_signature: str) -> None:
@@ -61,26 +100,36 @@ def _worker(connection: Connection, expected_signature: str) -> None:
 
 def test_worker_reconstructs_exact_signed_plan_and_rejects_local_drift() -> None:
     from examples.centered_hidden import centered_hidden
-    from pllm.worker import encode_workload
-    from pllm.workloads.dummy import DummyConfig, DummyWorkload
-    from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload, cross_entropy
+    from examples.huber import HuberWorkload
+    from pllm.worker import decode_workload, encode_workload
+    from pllm.contracts.workload_reference import WorkloadReference
     from pllm.workloads.esamp_request import ESampRequestWorkload
     from pllm.workloads.lora import OutputLoRAWorkload
-    assert decode_boundary(encode_workload(DummyWorkload()), DummyConfig) == DummyConfig()
-    assert decode_boundary(encode_workload(OverRIDEWorkload()), OverRIDEConfig) == OverRIDEConfig()
-    def custom_objective(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return cross_entropy(logits, labels) * 0
-    for custom in (centered_hidden(), replace(DummyWorkload(), export_name="custom"),
-                   replace(OverRIDEWorkload(), objective=custom_objective)):
-        with pytest.raises(ValueError, match="local tensor replacements"):
-            encode_workload(custom)
+    from pllm.workloads.override import OverRIDEWorkload
+    # Built-ins and user workloads travel identically: class coordinates plus frozen fields.
+    # Module-level function replacements are imported by the worker and re-signed there.
+    for workload in (DummyWorkload(), OverRIDEWorkload(), ESampRequestWorkload(), OutputLoRAWorkload(),
+                     HuberWorkload(3), centered_hidden(), replace(DummyWorkload(), export_name="custom"),
+                     replace(OverRIDEWorkload(), objective=doubled_cross_entropy),
+                     TransportHolder(extra=FakeTransport(FakeTransportConfig(2)))):
+        restored = decode_workload(encode_workload(workload), device=torch.device("cpu"), seed=0)
+        assert type(restored) is type(workload)
+        if isinstance(workload, TransportHolder):
+            assert isinstance(restored, TransportHolder)
+            assert restored.extra.config == FakeTransportConfig(2)
+        else:
+            assert restored == workload
     class CustomESamp(ESampRequestWorkload):
         pass
-    class CustomLoRA(OutputLoRAWorkload):
-        pass
-    for custom in (CustomESamp(), CustomLoRA()):
-        with pytest.raises(ValueError, match="custom native"):
+    for custom in (PlainProbe(), CustomESamp()):
+        with pytest.raises(ValueError, match="cannot import|frozen dataclass"):
             encode_workload(custom)
+    with pytest.raises(ValueError, match="closure or local"):
+        encode_workload(replace(DummyWorkload(), transform=lambda hidden: hidden))
+    reference = decode_boundary(encode_workload(DummyWorkload()), WorkloadReference)
+    tampered = encode_boundary(replace(reference, module_digest="0" * 64))
+    with pytest.raises(ValueError, match="differs from the driver"):
+        decode_workload(tampered, device=torch.device("cpu"), seed=0)
     execution = make_llm(workload=TTRLWorkload(TTRLConfig(rank=2)),
         config=HostRuntimeFacts(torch.device("cpu"), hidden_size=4))
     plan = execution.arena.plan

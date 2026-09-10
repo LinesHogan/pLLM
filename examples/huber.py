@@ -1,6 +1,7 @@
 """Independent request-local low-rank Huber learning with persistent AdamW."""
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Annotated
 
 import torch
@@ -12,9 +13,11 @@ def initialize(parameters: Mapping[str, torch.Tensor], generator: torch.Generato
     parameters["b"].normal_(0.0, 0.02, generator=generator)
 
 
+@dataclass(frozen=True)
 class HuberWorkload(pllm.Workload):
-    def __init__(self, rank: int = 2) -> None:
-        self.rank = rank
+    """Best-practice user workload: a frozen dataclass, so EngineCore transports it by reference."""
+
+    rank: int = 2
 
     @property
     def adapter(self) -> pllm.RequestState:

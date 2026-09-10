@@ -68,3 +68,24 @@ def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("head")]) ->
 - 要在 decode 途中训练、看 loss → [训练与观测](training-and-observation.md)
 - 要改模型参数（LoRA 式） → [Overlay 与重放](overlays-and-replay.md)
 - 每条声明的精确边界 → [创作契约](../reference/authoring-contract.md)
+
+## 生产部署：EngineCore 多进程（mp=1）
+
+默认 `multiprocessing=False`，负载与引擎同进程 —— notebook 和随手脚本都走这里。
+`ModelConfig(multiprocessing=True)` 把负载送进 EngineCore 子进程。传输方式是
+**按引用 + 签名复核**，从不序列化函数体：
+
+- 驱动端把负载编码为类坐标（模块 + 限定名）、模块源码摘要和冻结字段值；
+- worker 进程 `import` 同一模块、用字段值重建实例、重新冷绑定；
+- 安装时 worker 的编译签名必须与驱动端签名计划**逐字节相等**，不等就拒绝 ——
+  所以"两个进程里跑的是不是同一份数学"是校验问题，不是信任问题。
+
+纪律只有三条，报错会指明具体缺哪条：
+
+1. **类必须可导入**：写在 `.py` 模块里，不能是 `__main__`/notebook/函数局部；
+2. **必须是冻结 dataclass**（无字段也行：`@dataclass(frozen=True)`）；
+3. **字段可封闭传输**：原始配置值、typed contract 声明、模块级函数（按引用），
+   或实现 `WorkerTransportable` 的对象（如 TLM 的 meta 模型模板）。字段里夹了
+   lambda、活模型或文件句柄会被拒绝并点名字段。
+
+模块必须 import-safe：spawn 会重新导入，模块顶层不能有 GPU 工作。

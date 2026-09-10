@@ -81,7 +81,7 @@ class OverRIDEWorkload(pllm.Workload):
                    b: TensorBinding) -> a.MathBinding[a.TensorStepInput, TensorFrame, TensorOutput]:
         if not plan.timeline.task_resources:
             return pllm.Workload.operations(self, facts, plan, b)
-        self.require_resources(plan, self.resource_facts(facts, pllm.ExecutionOptions()))
+        self.require_resources(plan, self.minimum_resources(facts, plan))
         prepare_frame = b.bind_prepare()
         def prepare(value: a.TensorStepInput, batch: a.TensorBatch) -> TensorFrame:
             data = prepare_frame(value, batch)

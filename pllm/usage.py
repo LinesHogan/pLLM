@@ -10,7 +10,6 @@ from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 import torch
 
 from pllm.authoring import BackendWorkload, BackendCompileFacts, BackendRequirements, TensorStepInput
-from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, ActivationPatchOperator, AttachmentKind
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType, TensorLayoutRequest
@@ -736,7 +735,7 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
     def operations(self, facts: BackendCompileFacts, plan: PlanBundle,
                    b: TensorBinding) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         if plan.timeline.task_resources:
-            self.require_resources(plan, self.resource_facts(facts, ExecutionOptions()))
+            self.require_resources(plan, self.minimum_resources(facts, plan))
         return MathBinding(self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan))
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:

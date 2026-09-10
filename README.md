@@ -98,8 +98,13 @@ python -m pip install -e ".[vllm027,test]"
 
 当前后端面向未量化的 Qwen2 模型与 vLLM 0.27.1：默认 MRv2，TP1/PP1/DP1，
 非投机执行，采样 `n=1`。MRv1 支持共享附着路径但不支持 KV 重放。
-`multiprocessing=True` 会为封闭的内置负载定义启用 EngineCore；任意用户
-Python 类不会在 worker 里被序列化或动态导入。
+`multiprocessing=True` 是 EngineCore 生产部署路径：负载按**引用**传输 ——
+类坐标（模块 + 限定名）、模块摘要与冻结字段值，从不序列化函数体 ——
+worker 进程重新导入、重建并重新绑定，安装时其编译签名必须与驱动端签名计划
+逐字节相等。内置负载与用户负载走同一条路（内置即最佳实践参考）。代价是
+一条纪律：workload 类必须可导入（不能是 `__main__`/notebook 里的临时类）、
+是冻结 dataclass、字段可封闭传输（原始配置值、typed contract、模块级函数引用
+或 WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
 
 `ExecutionOptions(capture=True)` 捕获的是受支持的训练内核，不是整个模型。
 模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的

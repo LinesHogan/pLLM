@@ -109,8 +109,9 @@ def test_esamp_predicts_before_training_and_isolates_request_versions(
     with pytest.raises(ValueError, match="bindings"):
         workload.bind_math(replace(facts, probe=replace(facts.probe,
             hidden_resources=facts.probe.hidden_resources[:1])), plan)
-    # Rebinding config must not change an already bound execution's mathematics.
-    workload.config = replace(config, intervention_beta=0.9, learning_rate=0.9)
+    # Frozen dataclasses block plain rebinding; drive the drift behind the freeze to
+    # prove an already bound execution keeps its own signed mathematics.
+    object.__setattr__(workload, "config", replace(config, intervention_beta=0.9, learning_rate=0.9))
     execution = replace(binding, tasks=tuple(reversed(binding.tasks))).bind(
         PageBundleArena(plan), next(AnchorId(item.ordinal)
             for item in plan.timeline.anchors if item.symbol == "sampler.pre_draw"))

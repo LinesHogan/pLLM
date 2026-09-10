@@ -104,3 +104,25 @@ class HfQvModel:
         return cls(Qwen2ForCausalLM.from_pretrained(config.model_id, revision=config.revision,
             local_files_only=config.local_files_only, trust_remote_code=config.trust_remote_code,
             torch_dtype=tensor_dtype(config.tensor_dtype)).to(device=device, dtype=tensor_dtype(config.tensor_dtype)), config)
+
+    def transport_payload(self) -> HfQvConfig:
+        if self.device.type != "meta":
+            raise ValueError("EngineCore field 'model': live models are not transported; build the template "
+                "with HfQvModel.load(config, device='meta') and the worker materializes it on its own device")
+        return self.config
+
+    @classmethod
+    def transport_payload_type(cls) -> type[HfQvConfig]:
+        return HfQvConfig
+
+    @classmethod
+    def transport_rebuild(cls, payload: HfQvConfig, *, device: torch.device, seed: int) -> HfQvModel:
+        generator = torch.cuda.default_generators[device.index or 0]
+        cpu_state, gpu_state = torch.random.get_rng_state(), generator.get_state()
+        try:
+            torch.random.set_rng_state(torch.Generator().manual_seed(seed).get_state())
+            generator.manual_seed(seed)
+            return cls.load(payload, device)
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            generator.set_state(gpu_state)

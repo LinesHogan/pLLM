@@ -27,6 +27,7 @@ T = TypeVar("T")
 E = TypeVar("E", bound=StrEnum)
 _converter = Converter(forbid_extra_keys=True, detailed_validation=False)
 _converter.register_unstructure_hook(torch.device, str)
+_converter.register_structure_hook(torch.device, lambda value, _target: torch.device(_primitive(value, str)))
 
 
 class _TensorHooks(Protocol):

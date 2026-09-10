@@ -78,12 +78,11 @@ def _resources(config: ESampRequestConfig, facts: a.BackendCompileFacts, states:
             ValueResourceFact(TaskSymbol("train"), "publication", 0)))
 
 
+@dataclass(frozen=True)
 class ESampRequestWorkload(pllm.Workload):
     name = "esamp.request"
     state_name = "request_distiller"
-
-    def __init__(self, config: ESampRequestConfig = ESampRequestConfig()) -> None:
-        self.config = config
+    config: ESampRequestConfig = ESampRequestConfig()
 
     @property
     def request_distiller(self) -> pllm.RequestState:

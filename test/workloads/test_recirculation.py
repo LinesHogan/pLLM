@@ -38,9 +38,10 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
     plain = PlainRecurrence().compile_backend(facts).execution
     execution = RecirculationWorkload(config).compile_backend(facts).execution
     assert plain.arena.plan.semantic_graph.tasks == execution.arena.plan.semantic_graph.tasks
-    from pllm.worker import encode_workload
-    restored = decode_boundary(encode_workload(RecirculationWorkload(config)), RecirculationConfig)
-    assert RecirculationWorkload(restored).declare(facts) == RecirculationWorkload(config).declare(facts)
+    from pllm.worker import decode_workload, encode_workload
+    restored = decode_workload(encode_workload(RecirculationWorkload(config)), device=torch.device("cpu"), seed=0)
+    assert isinstance(restored, RecirculationWorkload)
+    assert restored.declare(facts) == RecirculationWorkload(config).declare(facts)
     assert decode_boundary(encode_boundary(execution.arena.plan), PlanBundle) == execution.arena.plan
     identities = (RequestIdentity("prefill", 0, 0), RequestIdentity("decode", 1, 0))
     rows = PackedPhaseRowBatch(1, 1, 4, tuple(PackedPhaseRow(i, int(i == 3),
