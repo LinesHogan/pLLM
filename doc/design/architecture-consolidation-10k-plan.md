@@ -2,7 +2,7 @@
 
 ## 文档地位
 
-当前职责与接口见 [architecture](architecture.md)、[编写契约](guides/authoring.md)
+当前职责与接口见 [architecture](architecture.md)、[编写契约](../reference/authoring-contract.md)
 和根 README；唯一可执行证据清单是 `test/evidence_manifest.toml`。
 原交接和逐提交 ledger 已退役，不再与当前文档平行维护。
 下文保留历史基线、估算和验收要求；历史目录名不是当前目录设计。
@@ -117,7 +117,7 @@
   零为零容量；有限预算缺少任一 task/output 成本仍由 Rust 拒绝。benchmark 共用
   `--execution-memory-mib`，同时报告 signed planned peak 与真实 CUDA peak，不把
   状态容量、捕获容量或未声明的模型/KV/library 内存混作一个保证。
-- 已核对的存储负责方、释放边界和容量证据汇总于 `doc/architecture.md` 的资源表。
+- 已核对的存储负责方、释放边界和容量证据汇总于 `doc/design/architecture.md` 的资源表。
   审计删除了 trace 截断非连续张量前的整源 flatten 复制，改为有界逻辑索引读取；
   原有事件大小、快照次序及 source shape 不变。CPU/CUDA 的广播、转置、offset 和四种
   dtype 进入原 Dummy 证据；不新增测试 ID，也不把有限快照预算误当整源打包预算。

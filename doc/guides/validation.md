@@ -1,11 +1,10 @@
-# Validation and Release Checks
+# 验证与发布检查
 
-Run from the repository root. This checkout uses
-`/workspace/pllm/.venv/bin/python`, including when working in a worktree.
-During implementation, select checks for the changed boundary; the complete
-list is a release gate, not a mandatory rerun after every edit.
+从仓库根目录运行。本检出使用
+`/workspace/pllm/.venv/bin/python`，在 worktree 中工作时也用同一个。
+实现期间按改动边界选择检查；完整清单是发布门禁，不是每次编辑后都要重跑。
 
-## CPU, Rust and Static Checks
+## CPU、Rust 与静态检查
 
 ```bash
 python -m maturin develop --offline
@@ -16,17 +15,16 @@ python tools/check_region_authority.py
 python tools/check_typing.py
 ```
 
-Use the activated repository virtualenv for these commands. The offline native
-build requires cached Rust dependencies. One strict config covers the maintained
-implementation, benchmark scenarios and examples, with zero errors/warnings.
-CUDA tests skipped on a CPU-only host are not GPU evidence.
-The import gate requires zero runtime violations, including function-local imports.
-There is no baseline/rebase workflow; dependency rules are reviewed directly in the checker.
+这些命令使用激活的仓库虚拟环境。离线原生构建需要缓存的 Rust 依赖。
+一份严格配置覆盖维护中的实现、基准场景与示例，要求零错误零警告。
+在仅 CPU 主机上被跳过的 CUDA 测试不算 GPU 证据。导入门禁要求零运行时
+违规，包括函数局部导入。没有 baseline/rebase 工作流；依赖规则直接在检查器
+里评审。
 
-## GPU Boundaries
+## GPU 边界
 
-Run sequentially on a compatible CUDA host with vLLM 0.27.1 and the
-Qwen/Qwen2.5-0.5B-Instruct checkpoint available:
+在有 vLLM 0.27.1 与 Qwen/Qwen2.5-0.5B-Instruct checkpoint 的兼容 CUDA 主机上
+顺序运行：
 
 ```bash
 python test/gpu/vllm_esamp_smoke.py
@@ -44,31 +42,27 @@ python test/gpu/enginecore_smoke.py
 python test/gpu/enginecore_smoke.py --mrv1-captured
 ```
 
-The first scenario runs plain inference followed by attached ESamp in one
-process. Training must have nonzero loss/update counts, request state must be
-cleaned up and fallback must be zero. The CUDA Graph scenario covers the
-training core, not a vLLM capture-mode support matrix.
+第一个场景在一个进程内先跑纯推理再跑附着的 ESamp。训练必须有非零
+loss/update 计数，请求状态必须清理干净，回退必须为零。CUDA Graph 场景覆盖
+训练核心，不是 vLLM 捕获模式的支持矩阵。
 
-## Release Gate
+## 发布门禁
 
-Evidence 39, collected by pytest, builds an sdist, builds an optimized release wheel from that
-extracted source archive and installs it in an isolated directory. It verifies
-Python/native-module provenance, executes the Rust codec and checks tensor
-dependencies, license packaging and absence of retired packages/plugins.
+证据 39 由 pytest 收集：构建 sdist，从解出的源码归档构建优化发布 wheel 并
+装进隔离目录。它验证 Python/原生模块出处，执行 Rust 编解码并检查张量依赖、
+许可证打包与已退役包/插件的缺席。
 
-Build distribution artifacts from the repository root:
+从仓库根目录构建发行产物：
 
 ```bash
 python -m maturin build --release
 python -m maturin sdist
 ```
 
-Wheel success alone does not authorize a release. Before tagging or publishing,
-complete the [consolidation acceptance](../architecture-consolidation-10k-plan.md), all selected
-39 original evidence contracts, composition evidence 40/41 and sampler-feedback
-evidence 42, shared/independent LoRA evidence 43/44, and performance comparisons
-45/46 and independent adaptation evidence 47 (26 pytest, 8 Rust, 13 runtime commands and 3 benchmark comparisons;
-50 selected executions), plus the runtime boundaries and 30k source
-ceiling. The original 22k–30k interval was an estimate, not a minimum size to fill.
-No throughput or unsupported topology claim may be inferred from a short
-correctness smoke. This gate does not authorize commits, tagging or publishing.
+wheel 成功本身不授权发布。打 tag 或发布前，完成
+[整体验收](../design/architecture-consolidation-10k-plan.md)：全部选中的 39 项
+原始证据契约、组合证据 40/41 与采样反馈证据 42、共享/独立 LoRA 证据 43/44、
+性能对比 45/46 与独立适配证据 47（26 个 pytest、8 个 Rust、13 条运行时命令与
+3 个基准对比；50 次选中执行），外加运行时边界与 30k 源码上限。原先的
+22k–30k 区间是估计，不是要填满的最小尺寸。不能从短正确性冒烟推断吞吐或
+不支持拓扑的声称。这个门禁不授权提交、打 tag 或发布。

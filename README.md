@@ -60,8 +60,9 @@ class CenteredHidden(pllm.Workload):
 ```
 
 这段代码声明的是捕获与一个输出效果，不是运行时钩子或图节点。完整的
-[负载创作契约](doc/guides/authoring.md) 涵盖参数作用域、注解输入、选择、
-一阶梯度边、激活检查点与带条件重放的请求 overlay。
+[负载创作契约](doc/reference/authoring-contract.md) 涵盖参数作用域、注解输入、
+选择、一阶梯度边、激活检查点与带条件重放的请求 overlay；按任务的写法见
+[使用指南](doc/README.md#使用指南任务导向)。
 
 ## 内置算法
 
@@ -80,8 +81,9 @@ class CenteredHidden(pllm.Workload):
 | TTRL | 多数奖励学习与重试/栅栏输出 |
 
 全部内置算法使用同一套图、签名计划与执行所有者。新算法实现的是
-[创作契约](doc/guides/authoring.md)，而不是自己的执行器或 arena。
-见[架构与支持边界](doc/architecture.md)与 [In-Place-TTT 语义](doc/inplace-ttt.md)。
+[创作契约](doc/reference/authoring-contract.md)，而不是自己的执行器或 arena。
+见[架构与支持边界](doc/design/architecture.md)与
+[In-Place-TTT 语义](doc/design/inplace-ttt.md)。
 
 ## 安装
 

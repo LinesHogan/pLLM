@@ -31,7 +31,7 @@ ESamp/LoRA 显式分页与 capture 替换同一签定图的计算，共享 Tenso
 [原研究文档](research-aer-paged-state.md)为唯一设计权威；本文不修改该原稿。
 
 2026-09-07 衔接：当前编写接口按本文第 2、4、5、6 节设计，入口见
-[workload authoring](guides/authoring.md)。全部 11 个内置 workload 已使用同一 builder，
+[workload authoring](../reference/authoring-contract.md)。全部 11 个内置 workload 已使用同一 builder，
 模型数学与 host 普通函数分别绑定原执行 owner；`MathContract` 已加入原签名图，
 普通函数与显式原语绑定区分。共享/独立 LoRA 的归约与 capture、TLM 的 online/offline
 时序、FTTT/GTTA 的原 transaction/receipt 不因编写接口统一而改成一种算法模板。

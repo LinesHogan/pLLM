@@ -48,23 +48,23 @@ loss 按 token、请求还是共享状态归一化。可以说“所有行参与
 
 | 需求 | 契约入口 | 维护中的范例 |
 | --- | --- | --- |
-| hidden 观察、普通数学／函数替换 | [Tensor methods](authoring.md#tensor-methods-and-state) | [Dummy](../../pllm/workloads/dummy.py)、[局部替换](../../examples/centered_hidden.py) |
-| 请求独立训练、采样引导 | [状态与梯度](authoring.md#tensor-methods-and-state) | [Huber](../../examples/huber.py)、[ESamp](../../pllm/workloads/esamp_request.py) |
-| 实例共享头、实际采样反馈与选择性更新 | [Tensor methods](authoring.md#tensor-methods-and-state) | [OverRIDE](../../pllm/workloads/override.py) |
-| 共享／独立 LoRA、外部 batch、多步 SGD | [Weighted batch training](authoring.md#weighted-batch-training) | [Output LoRA](../../pllm/workloads/lora.py) |
-| 参数 overlay、更新后条件 replay | [Request overlays](authoring.md#request-overlays) | [In-Place-TTT](../../pllm/workloads/inplace_ttt.py) |
-| 激活修改／外部字段发布 | [Activation checkpoints](authoring.md#activation-checkpoints) | [ReFT](../../pllm/workloads/reft.py) |
-| 逐 token prefill replay | [Tokenwise recurrence](authoring.md#tokenwise-recurrence) | [Recirculation](../../pllm/workloads/recirculation.py) |
-| 完整因果模型训练适配 | [Causal adapters](authoring.md#causal-adapters) | [TLM](../../pllm/workloads/tlm/workload.py) |
-| completion／reward 驱动训练 | [Completion learning](authoring.md#completion-learning) | [TTRL](../../pllm/workloads/ttrl.py) |
-| judge、环境查询、队列与事务 | [Write mathematics：host 事务](authoring.md#write-mathematics) | [FTTT](../../pllm/workloads/fttt/workload.py)、[GTTA](../../pllm/workloads/gtta/workload.py) |
-| 显式分页／反向／capture 优化 | [原语与资源契约](authoring.md#gradients-and-pllm-primitives) | ESamp、Output LoRA 中的显式绑定 |
+| hidden 观察、普通数学／函数替换 | [Tensor methods](../reference/authoring-contract.md#张量方法与状态) | [Dummy](../../pllm/workloads/dummy.py)、[局部替换](../../examples/centered_hidden.py) |
+| 请求独立训练、采样引导 | [状态与梯度](../reference/authoring-contract.md#张量方法与状态) | [Huber](../../examples/huber.py)、[ESamp](../../pllm/workloads/esamp_request.py) |
+| 实例共享头、实际采样反馈与选择性更新 | [Tensor methods](../reference/authoring-contract.md#张量方法与状态) | [OverRIDE](../../pllm/workloads/override.py) |
+| 共享／独立 LoRA、外部 batch、多步 SGD | [Weighted batch training](../reference/authoring-contract.md#加权批量训练) | [Output LoRA](../../pllm/workloads/lora.py) |
+| 参数 overlay、更新后条件 replay | [Request overlays](../reference/authoring-contract.md#请求-overlay) | [In-Place-TTT](../../pllm/workloads/inplace_ttt.py) |
+| 激活修改／外部字段发布 | [Activation checkpoints](../reference/authoring-contract.md#激活检查点) | [ReFT](../../pllm/workloads/reft.py) |
+| 逐 token prefill replay | [Tokenwise recurrence](../reference/authoring-contract.md#逐-token-循环) | [Recirculation](../../pllm/workloads/recirculation.py) |
+| 完整因果模型训练适配 | [Causal adapters](../reference/authoring-contract.md#因果适配器) | [TLM](../../pllm/workloads/tlm/workload.py) |
+| completion／reward 驱动训练 | [Completion learning](../reference/authoring-contract.md#completion-学习) | [TTRL](../../pllm/workloads/ttrl.py) |
+| judge、环境查询、队列与事务 | [Write mathematics：host 事务](../reference/authoring-contract.md#编写原生数学) | [FTTT](../../pllm/workloads/fttt/workload.py)、[GTTA](../../pllm/workloads/gtta/workload.py) |
+| 显式分页／反向／capture 优化 | [原语与资源契约](../reference/authoring-contract.md#原语与资源契约) | ESamp、Output LoRA 中的显式绑定 |
 
 不要因为范例含高级资源绑定，就把它的全部内部 imports 复制进一个普通 workload。
 当前普通训练仅支持单优化器状态／单训练终点，`state_mean` 要求无条件 forward/update；
 replay、模型锚点和组合有后端限制。自定义 Python workload 默认走进程内公共工厂，
 EngineCore 不序列化任意用户函数。遇到不支持的要求，给出具体缺口并请用户选择，
-不静默改算法或 fallback。完整边界见[编写契约](authoring.md)。
+不静默改算法或 fallback。完整边界见[编写契约](../reference/authoring-contract.md)。
 
 ## Agent 的最小交付
 
