@@ -1,0 +1,43 @@
+{
+  "seconds": 47.97351134940982,
+  "measurements": [
+    {
+      "function": "analyze_region_program",
+      "seconds": 0.2924592085182667
+    },
+    {
+      "function": "analyze_region_payload",
+      "seconds": 0.9174284860491753
+    },
+    {
+      "function": "validate_region_payload",
+      "seconds": 0.0342525951564312
+    },
+    {
+      "function": "explore_region_schedules",
+      "seconds": 20.607589703053236
+    },
+    {
+      "function": "explore_region_streams",
+      "seconds": 7.270754087716341
+    },
+    {
+      "function": "analyze_region_payload",
+      "seconds": 0.9831619560718536
+    },
+    {
+      "function": "analyze_region_payload",
+      "seconds": 3.856088314205408
+    },
+    {
+      "function": "analyze_region_payload",
+      "seconds": 10.796821493655443
+    },
+    {
+      "function": "analyze_region_payload",
+      "seconds": 2.9843057096004486
+    }
+  ],
+  "candidate_count": 8,
+  "cuda_initialized": false
+}

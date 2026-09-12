@@ -1,0 +1,126 @@
+{
+  "recorded_at_utc": "2026-09-12T09:33:36.014033+00:00",
+  "baseline": "kernel-contract-results.json",
+  "scope": "Retire legacy Order source compatibility; keep a single data-only source and reference execution path.",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "deleted": [
+    "Python OrderType and ValueType",
+    "Rust Type::Order",
+    "without_resource_orders conversion",
+    "reference Order and RuntimeValue",
+    "linear token use-count validation",
+    "optional mathematical/structural value IDs and corresponding filters"
+  ],
+  "migration": "Reject legacy Order source in Python decoding and Rust parsing, including valid, duplicated, dropped, stale and bank-contained Order values. Reconstruct from algorithm builders and replan; do not strip signed artifacts.",
+  "preserved": [
+    "source operations and indexed resource accesses",
+    "RAW/WAR/WAW and effect boundaries",
+    "pure Map and While-condition restrictions",
+    "SSA closure and type checking",
+    "PTTS pins, publication versions, COW and completion",
+    "physical alias rejection",
+    "worker reconstruction and selection"
+  ],
+  "checks": {
+    "release": {
+      "command": "env -u CONDA_PREFIX VIRTUAL_ENV=/workspace/pllm/.venv /workspace/pllm/.venv/bin/python -m maturin develop --release --offline",
+      "result": "rebuilt and installed",
+      "log_sha256": "c1cdeb87cf2981122ed2f1161a1968f685583a3d200072d828cf714cd89b05cb"
+    },
+    "rust": {
+      "command": "cargo test --manifest-path rust/pllm_core/Cargo.toml --offline",
+      "result": "18 passed",
+      "log_sha256": "96cf5a9f23acb914fc0dafc6ccd7798c3f1424f6cfec4e90b8d41b443b09c8fe"
+    },
+    "cpu": {
+      "command": "CUDA_VISIBLE_DEVICES='' /workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_*.py test/boundary/test_native_kernel_streams.py test/boundary/test_vllm_region_kernels.py test/boundary/test_import_only_planning.py test/boundary/test_worker_reconstruction.py",
+      "result": "369 passed, 61 skipped",
+      "log_sha256": "d9548277f1276c37ff03183d6d2b0e746a6b5ddcb38b0985256b6c3361bf7e8c"
+    },
+    "cuda_and_recurrence": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_pages.py::test_cuda_region_uses_original_stream_and_completion_receipts test/boundary/test_region_native.py::test_native_effects_in_scan_use_exact_original_versions_and_owned_stream test/boundary/test_region_payload.py::test_heterogeneous_fields_and_counter_publish_atomically 'test/boundary/test_region_tensor_borrow.py::test_swiglu_uses_original_weights_without_matrix_copies_and_owns_returned_views[cuda:0]' test/boundary/test_native_kernel_streams.py test/boundary/test_vllm_region_kernels.py test/boundary/test_region_model_proposals.py test/workloads/test_recirculation.py",
+      "result": "15 passed; includes CPU parameter cases and the CPU recurrence oracle",
+      "log_sha256": "def1e99a21beec5e81e8e1bd02597ae9af579510b9f36ecc41d5a6229a296e9a"
+    },
+    "typing": {
+      "command": "/workspace/pllm/.venv/bin/python tools/check_typing.py",
+      "result": "0 errors, 0 warnings, 0 informations",
+      "log_sha256": "f552d237ad0bd249c05f97eb62dbc65d2d0e4a5fe2346608e10fb7838dba9ed1"
+    }
+  },
+  "initial_cpu_run": {
+    "result": "3 failed, 366 passed, 61 skipped",
+    "cause": "Three fixture migrations retained an old snapshot input or alias token, or removed a resource declaration sharing its name with a token. Fixed fixtures, preserved assertions, reran entire CPU group.",
+    "log_sha256": "3e2dc946a65c4bc902b9576b25304ffacdbef19e009358835efdd3d8702fa17c"
+  },
+  "gates": {
+    "import_layers": "passed",
+    "region_authority": "passed",
+    "diff": "passed"
+  },
+  "recirculation_analysis_comparison": {
+    "source": "recirculation-data-source.json",
+    "source_sha256": "27ecbc05f777e45ffa060ea34d2ef8999054df258369b8d60668360d366f66f8",
+    "reference": "/tmp/pllm-data-ports-analysis.json",
+    "all_fields_equal": true,
+    "before_sha256": "b5beb454ddcd28c7842e186055efbb93e61a834d6663ee5bd458fb8b4cf5f48d",
+    "after_sha256": "b5beb454ddcd28c7842e186055efbb93e61a834d6663ee5bd458fb8b4cf5f48d",
+    "field_sha256": {
+      "aliases": "47ca0f915e72b3314bc68738cc4e60c82ac649e6ed442f3e166992293d0ed94b",
+      "arguments": "f2f991d74dfbb2edf7f4475dcb7d82989de00a71e44bb11d4a6fbb49442577b6",
+      "candidates": "258e94fb08e1f1eac9f1cd9361649efb34847c0333822dc4bce0d56385d00662",
+      "data_dependencies": "f46cde2ac9b264f33c764d9d399feb5e8e91ac1ba9c3beabed3f820ab9fdbcb5",
+      "dependencies": "939ccfd10ded255ac8e033d5899e855388e07a1073156e0f5bb6de3dcb58978e",
+      "diagnostics": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "domain": "d63d55c8e29cb2bd615ea966b246c7f6e1b4357b00fa5a7e0dd86f8fb92980bc",
+      "effect_dependencies": "25c280ef70a954f8c7a3269ca9f28eeb843c861947ae79ba695356e213d4db6a",
+      "exact_provenance": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+      "program_digest": "4ed60c1693d932071f3cb49b3fa793cbf772f84c1675a754608e7c2d2d7d2604",
+      "reference_schedule": "4f6c190bb1e03a2320990be4fe67c1e148f9f7f04a7da67040059837ae724d60",
+      "resource_dependencies": "5447ec2de78e4fa47e41608c0febeedaf546a0fb7c6f52b6cc2e395a5f09911b",
+      "results": "52b714763264b5681890c9e46cd34aa4dd593d682dc89f935e081ca4064e23c5",
+      "scalar_values": "5dea2439f7b2d72b4acab132cdcf194ab9b352f379b220917e82c5ad0d685d07",
+      "statements": "e5e0551e43e7d905f465011cee53297b66eac93359845a344b0f516dce07d096",
+      "value_consumers": "57879fec40a7543bd1580cb9e731673f7d2c47f7b4b87eea6ad6343267e928f0",
+      "value_sources": "ec88acf8d9f4fc4a1dbf205381c79b596cef5515fb6629e4969590f95efbf64a",
+      "values": "54508a702e5d61918a921d500846ddd7a03e5406d474956f12665bd4e296c993"
+    }
+  },
+  "full_model_checks_repeated": false,
+  "aligned_throughput_checked": false,
+  "files": {
+    "pllm/contracts/region_composition.py": "336c81a9779528f539b9362034e296bf875f1b81f0938db3c93508fdcf759b67",
+    "pllm/contracts/region_program.py": "198f9973372f639e1be3536d540007c90bafdc3f517a1ae866b0345cafc1f50e",
+    "pllm/execution/codec.py": "c158a188f1b2c79e80dda0d75287470044e4be55daf7e61262b4b5e8738e3e54",
+    "pllm/execution/exported_resources.py": "8d67a85c853518d41e810b1fa1506ca2f63aaa0e637bfccab518a4ae99e158d0",
+    "pllm/execution/region_reference.py": "734cc12e4121ebae5d64307249402b3840d55c20d2c11ed4c4a0a42896c61933",
+    "rust/pllm_core/src/planning/aer.rs": "6fd64342d7669020d08db0ec3704c627c3055be2a2f964254ae0385a4f3a228b",
+    "rust/pllm_core/src/planning/backend_attachment/validation.rs": "d48d9815711d5395b363b0a419ebcef992254e30591135758898c550232d9147",
+    "rust/pllm_core/src/planning/region_control.rs": "22ad5eb694c38bb6a089905b983639d1b5dc76231c2e50d1410eb7065a199da4",
+    "rust/pllm_core/src/planning/region_dependence.rs": "6e17d991b453e5786167a926eb65f9c76addb9a5170272715dedfc24418673d0",
+    "rust/pllm_core/src/planning/region_imports.rs": "e7fb962cd19e4486285b4c7cb2155c304695fb3d7cb2813026accfda63bab42b",
+    "rust/pllm_core/src/planning/region_program.rs": "51f5256cf70bb8cdc24f75f2e3e7183d61a3e2aa5c9499739bd57ad248c64357",
+    "test/boundary/test_native_kernel_streams.py": "4280476bc2a64a17a19aa5dff15e0f2e3ef660df93034c75bfdf150cf2d37af1",
+    "test/boundary/test_region_borrows.py": "43f7aadec177d4427a57b8d3c28dfbb802d24df7e03f10db022fdb9f0f001d0a",
+    "test/boundary/test_region_codec.py": "5ce059b016cf4196fe9e30dda0b47bc7070c3198e59b5a21aee219ba246c73f9",
+    "test/boundary/test_region_composition.py": "7f846967fee7d4c57a40496302030c7e7fad0c234379b7235738180362618ff1",
+    "test/boundary/test_region_control.py": "8bc60955ba6f256834fc6c00f995c0cad68585fe642b90db765f85feb7fbbbcf",
+    "test/boundary/test_region_external.py": "b6a55b46c06f940735754f11b7bab897094cc2356ba7775aa942b846e39bfd9c",
+    "test/boundary/test_region_indexed_access.py": "00caec2c7088b210f5298806b8d3f93bda273838cfb9636f2e3e8f70966b196c",
+    "test/boundary/test_region_multistate.py": "bdf42d0706fb54ba399eee40dab1a33e6d5c2d7b2433bc47c6f12a1f5256e87d",
+    "test/boundary/test_region_native.py": "6070410e859dc2149978ee1d682eb9e186194e384659e7586fc75c86314a52e2",
+    "test/boundary/test_region_outlining.py": "7798695738c43942677fe2870862f73bde0b312b8e8ac54c394c97a860b8b05f",
+    "test/boundary/test_region_outlining_selection.py": "6428be445b677d4fe83edb2ea248742c35d33b16136c0a1670df33c9eeb8e8a6",
+    "test/boundary/test_region_pages.py": "b02b09700e385a96d809ee51e2f3452c2aea5ab9f5b5aaa59327fc9754cc9927",
+    "test/boundary/test_region_payload.py": "e8453df2db3320a7a1a8dc9979cf4688f9e9a257e9b234c7069e6f916f9df5ad",
+    "test/boundary/test_region_program.py": "00be9abb97fef1f213a6fa3b4598f5dab4561fb545819c784851b9dac6191c0d",
+    "test/boundary/test_region_retention.py": "4de9b15a70b0ef721dabd9a6fa6ee8ff22862cfff6b317786a89a5053e33fd9a",
+    "test/boundary/test_region_scan.py": "f7a9ec45a4a63e8785aa30d7982f6c615c9d87d71a80e9bdd866418b482b2f03",
+    "test/boundary/test_region_schedule.py": "12160673ccab823fedda6e5161bd0f42b53a0f8899113bb43247069e35079254",
+    "test/boundary/test_region_sizes.py": "f10bcdfe09d6a5604a314ef3505b78cc659f2bf72ce894dec0e1ca8a852f31e7",
+    "test/boundary/test_region_tensor_borrow.py": "e03733abde83e12d393ba49344cad64f8e1e74913f85c13196f7ed1680f7aaba",
+    "test/boundary/test_region_tiling.py": "a38c6b0622d5e2aa40173979f822fa5f8c0cf279b72a98b23d206348a988a102",
+    "test/boundary/test_vllm_region_kernels.py": "0a35a21e703ba0ac6c751d7e0578720aa3cf63f2b19d7730f4a1b873d9a41f55"
+  },
+  "production_line_change": -292
+}

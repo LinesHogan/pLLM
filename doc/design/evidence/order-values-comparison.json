@@ -1,0 +1,13 @@
+{
+  "before_values": 193,
+  "after_values": 129,
+  "removed_order_values": 64,
+  "before_statement_ports": 200,
+  "after_statement_ports": 136,
+  "mathematical_sources_equal": true,
+  "resource_accesses_equal": true,
+  "dependencies_equal": true,
+  "reference_equal": true,
+  "statement_count": 28,
+  "all_candidates_legal": true
+}

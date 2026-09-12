@@ -1,0 +1,87 @@
+{
+  "recorded_at_utc": "2026-09-12T12:37:23.382473+00:00",
+  "baseline": "source-verifier-results.json",
+  "scope": "Use existing native source outlining directly; normalize reference schedules at source analysis so policy checks do not lower routing accessors.",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "removed": [
+    "derive_call_outline Python transformation",
+    "map_outline_region Python recursive replacement",
+    "Python construction followed by complete native reconstruction/validation round-trip",
+    "routing-accessor lowering used only to canonicalize a serial-policy reference"
+  ],
+  "preserved": [
+    "original frontier and escaping values",
+    "native validation of supplied artifacts",
+    "local Torch graph replay and access facts",
+    "pure all-tensor and control-boundary restrictions",
+    "full-domain serial and numerical policy"
+  ],
+  "comparison": {
+    "before": "outlining-authority-before.json",
+    "after": "outlining-authority-after.json",
+    "source_and_results_equal": true,
+    "native_calls_before": [
+      3,
+      3
+    ],
+    "native_calls_after": [
+      1,
+      1
+    ],
+    "encoded_input_bytes_before": [
+      7767,
+      8199
+    ],
+    "encoded_input_bytes_after": [
+      1568,
+      1573
+    ],
+    "scope": "Inputs only; the new native entry returns an encoded complete result. These figures are not total bidirectional bytes, memory or throughput."
+  },
+  "normalization_fix": "Initial zero-length parametric regressions exposed noncanonical reference text at analysis output. Reused the existing native normalization there; no accessor lowering or relaxed comparison was restored.",
+  "checks": {
+    "release": {
+      "command": "env -u CONDA_PREFIX VIRTUAL_ENV=/workspace/pllm/.venv /workspace/pllm/.venv/bin/python -m maturin develop --release --offline",
+      "result": "rebuilt and installed",
+      "log_sha256": "2a03db51e53ecbeb4013a3fa7b1e7cc6ce3e3091c5f4c685c80bd81107d47df4"
+    },
+    "rust": {
+      "command": "cargo test --manifest-path rust/pllm_core/Cargo.toml --offline",
+      "result": "20 passed",
+      "log_sha256": "cfb959dfae0a84577b7ffdd0529cd79ffa6794abd03a042f41038eed15c95f02"
+    },
+    "cpu": {
+      "command": "CUDA_VISIBLE_DEVICES='' /workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_outlining.py test/boundary/test_region_outlining_selection.py test/boundary/test_region_rewrite_combinations.py test/boundary/test_tensor_compilation.py test/boundary/test_region_selection.py test/boundary/test_region_sizes.py test/boundary/test_region_schedule.py test/boundary/test_region_tiling.py",
+      "result": "142 passed, 22 skipped",
+      "log_sha256": "ae481454fd6d0985860a0e2aa0671511572051db6b3e179f31f6091621ec416b"
+    },
+    "cuda_and_outlining": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_model_proposals.py test/boundary/test_region_outlining.py",
+      "result": "16 passed; before final reference normalization",
+      "log_sha256": "967ece40eff2a0e4b66813490fa99a8d6d859c480f96abde41ed87aeab75b2a1"
+    },
+    "serial_policy": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_tensor_compilation.py::test_zero_length_tuning_compiles_once_for_other_legal_scan_lengths test/boundary/test_region_outlining_selection.py::test_outlining_remains_symbolic_and_zero_sample_does_not_bypass_numerical_policy",
+      "result": "3 passed; CPU/CUDA zero-length tuning after reference normalization",
+      "log_sha256": "0cc0e233c49e381f878171e0bbda9046cc0f2e019442fdfbdb7d7c929ab9e2f6"
+    },
+    "typing": {
+      "command": "/workspace/pllm/.venv/bin/python tools/check_typing.py",
+      "result": "0 errors, 0 warnings, 0 informations",
+      "log_sha256": "f552d237ad0bd249c05f97eb62dbc65d2d0e4a5fe2346608e10fb7838dba9ed1"
+    }
+  },
+  "gates": {
+    "import_layers": "passed",
+    "region_authority": "passed",
+    "diff": "passed"
+  },
+  "full_model_checks_repeated": false,
+  "aligned_throughput_checked": false,
+  "files": {
+    "pllm/contracts/region_outlining.py": "b97f832bca6561c04798b9ddaf0ea2e202fc1c6398d3fe439cf1473da4e22fb3",
+    "pllm/execution/region_outlining.py": "c83941c83662ad1aa23fff8aa2a7470fcb821f1cec51c45e506deeb6d440231d",
+    "pllm/execution/region_optimization.py": "2885b2eb5eb9420c506be745528505ca9e1c309422ae0714abe88ec2bfd44ccb",
+    "rust/pllm_core/src/planning/region_dependence.rs": "e6cb61a7cf021f43c4bef7b9c6b102448fca80e075294896a81f0af0b9bdda02"
+  }
+}

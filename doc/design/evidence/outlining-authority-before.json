@@ -1,0 +1,1069 @@
+[
+  {
+    "calls": [
+      {
+        "input_bytes": 1530,
+        "name": "validate_region_program"
+      },
+      {
+        "input_bytes": 1732,
+        "name": "validate_region_program"
+      },
+      {
+        "input_bytes": 4505,
+        "name": "validate_region_outlining"
+      }
+    ],
+    "escape": false,
+    "result": {
+      "body": {
+        "arguments": [
+          {
+            "name": "a",
+            "type": {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                3
+              ]
+            }
+          },
+          {
+            "name": "b",
+            "type": {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                3,
+                128
+              ]
+            }
+          },
+          {
+            "name": "c",
+            "type": {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                128,
+                2
+              ]
+            }
+          }
+        ],
+        "operations": [
+          {
+            "function": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+            "inputs": [
+              "a",
+              "b"
+            ],
+            "op": "call",
+            "outputs": [
+              {
+                "name": "ab",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    4,
+                    128
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "function": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+            "inputs": [
+              "ab",
+              "c"
+            ],
+            "op": "call",
+            "outputs": [
+              {
+                "name": "out",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    4,
+                    2
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "yields": [
+          "out"
+        ]
+      },
+      "function": {
+        "accesses": [],
+        "inputs": [
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              4,
+              3
+            ]
+          },
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              3,
+              128
+            ]
+          },
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              128,
+              2
+            ]
+          }
+        ],
+        "name": "f1cd7027357b92b46a7ef32a36d4934354dc127d808f679a19b14788e2509c06",
+        "outputs": [
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              4,
+              2
+            ]
+          }
+        ],
+        "resources": []
+      },
+      "program": {
+        "constraints": [],
+        "entry": {
+          "block": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    4,
+                    3
+                  ]
+                }
+              },
+              {
+                "name": "b",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    3,
+                    128
+                  ]
+                }
+              },
+              {
+                "name": "c",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    128,
+                    2
+                  ]
+                }
+              }
+            ],
+            "operations": [
+              {
+                "function": "f1cd7027357b92b46a7ef32a36d4934354dc127d808f679a19b14788e2509c06",
+                "inputs": [
+                  "a",
+                  "b",
+                  "c"
+                ],
+                "op": "call",
+                "outputs": [
+                  {
+                    "name": "out",
+                    "type": {
+                      "device": "cpu",
+                      "dtype": "torch.float64",
+                      "kind": "tensor",
+                      "shape": [
+                        4,
+                        2
+                      ]
+                    }
+                  }
+                ]
+              }
+            ],
+            "yields": [
+              "out"
+            ]
+          }
+        },
+        "functions": [
+          {
+            "accesses": [],
+            "inputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  3
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  3,
+                  128
+                ]
+              }
+            ],
+            "name": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+            "outputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  128
+                ]
+              }
+            ],
+            "resources": []
+          },
+          {
+            "accesses": [],
+            "inputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  128
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  128,
+                  2
+                ]
+              }
+            ],
+            "name": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+            "outputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  2
+                ]
+              }
+            ],
+            "resources": []
+          },
+          {
+            "accesses": [],
+            "inputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  3
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  3,
+                  128
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  128,
+                  2
+                ]
+              }
+            ],
+            "name": "f1cd7027357b92b46a7ef32a36d4934354dc127d808f679a19b14788e2509c06",
+            "outputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  2
+                ]
+              }
+            ],
+            "resources": []
+          }
+        ],
+        "parameters": [],
+        "resources": []
+      }
+    },
+    "source": {
+      "constraints": [],
+      "entry": {
+        "block": {
+          "arguments": [
+            {
+              "name": "a",
+              "type": {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  3
+                ]
+              }
+            },
+            {
+              "name": "b",
+              "type": {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  3,
+                  128
+                ]
+              }
+            },
+            {
+              "name": "c",
+              "type": {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  128,
+                  2
+                ]
+              }
+            }
+          ],
+          "operations": [
+            {
+              "function": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+              "inputs": [
+                "a",
+                "b"
+              ],
+              "op": "call",
+              "outputs": [
+                {
+                  "name": "ab",
+                  "type": {
+                    "device": "cpu",
+                    "dtype": "torch.float64",
+                    "kind": "tensor",
+                    "shape": [
+                      4,
+                      128
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "function": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+              "inputs": [
+                "ab",
+                "c"
+              ],
+              "op": "call",
+              "outputs": [
+                {
+                  "name": "out",
+                  "type": {
+                    "device": "cpu",
+                    "dtype": "torch.float64",
+                    "kind": "tensor",
+                    "shape": [
+                      4,
+                      2
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "yields": [
+            "out"
+          ]
+        }
+      },
+      "functions": [
+        {
+          "accesses": [],
+          "inputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                3
+              ]
+            },
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                3,
+                128
+              ]
+            }
+          ],
+          "name": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+          "outputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                128
+              ]
+            }
+          ],
+          "resources": []
+        },
+        {
+          "accesses": [],
+          "inputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                128
+              ]
+            },
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                128,
+                2
+              ]
+            }
+          ],
+          "name": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+          "outputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                2
+              ]
+            }
+          ],
+          "resources": []
+        }
+      ],
+      "parameters": [],
+      "resources": []
+    }
+  },
+  {
+    "calls": [
+      {
+        "input_bytes": 1535,
+        "name": "validate_region_program"
+      },
+      {
+        "input_bytes": 1904,
+        "name": "validate_region_program"
+      },
+      {
+        "input_bytes": 4760,
+        "name": "validate_region_outlining"
+      }
+    ],
+    "escape": true,
+    "result": {
+      "body": {
+        "arguments": [
+          {
+            "name": "a",
+            "type": {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                3
+              ]
+            }
+          },
+          {
+            "name": "b",
+            "type": {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                3,
+                128
+              ]
+            }
+          },
+          {
+            "name": "c",
+            "type": {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                128,
+                2
+              ]
+            }
+          }
+        ],
+        "operations": [
+          {
+            "function": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+            "inputs": [
+              "a",
+              "b"
+            ],
+            "op": "call",
+            "outputs": [
+              {
+                "name": "ab",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    4,
+                    128
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "function": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+            "inputs": [
+              "ab",
+              "c"
+            ],
+            "op": "call",
+            "outputs": [
+              {
+                "name": "out",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    4,
+                    2
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "yields": [
+          "ab",
+          "out"
+        ]
+      },
+      "function": {
+        "accesses": [],
+        "inputs": [
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              4,
+              3
+            ]
+          },
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              3,
+              128
+            ]
+          },
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              128,
+              2
+            ]
+          }
+        ],
+        "name": "61a09eb90700743e2065d3b0a03161d783db0789966e802c701d2bd32104ceb0",
+        "outputs": [
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              4,
+              128
+            ]
+          },
+          {
+            "device": "cpu",
+            "dtype": "torch.float64",
+            "kind": "tensor",
+            "shape": [
+              4,
+              2
+            ]
+          }
+        ],
+        "resources": []
+      },
+      "program": {
+        "constraints": [],
+        "entry": {
+          "block": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    4,
+                    3
+                  ]
+                }
+              },
+              {
+                "name": "b",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    3,
+                    128
+                  ]
+                }
+              },
+              {
+                "name": "c",
+                "type": {
+                  "device": "cpu",
+                  "dtype": "torch.float64",
+                  "kind": "tensor",
+                  "shape": [
+                    128,
+                    2
+                  ]
+                }
+              }
+            ],
+            "operations": [
+              {
+                "function": "61a09eb90700743e2065d3b0a03161d783db0789966e802c701d2bd32104ceb0",
+                "inputs": [
+                  "a",
+                  "b",
+                  "c"
+                ],
+                "op": "call",
+                "outputs": [
+                  {
+                    "name": "ab",
+                    "type": {
+                      "device": "cpu",
+                      "dtype": "torch.float64",
+                      "kind": "tensor",
+                      "shape": [
+                        4,
+                        128
+                      ]
+                    }
+                  },
+                  {
+                    "name": "out",
+                    "type": {
+                      "device": "cpu",
+                      "dtype": "torch.float64",
+                      "kind": "tensor",
+                      "shape": [
+                        4,
+                        2
+                      ]
+                    }
+                  }
+                ]
+              }
+            ],
+            "yields": [
+              "out",
+              "ab"
+            ]
+          }
+        },
+        "functions": [
+          {
+            "accesses": [],
+            "inputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  3
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  3,
+                  128
+                ]
+              }
+            ],
+            "name": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+            "outputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  128
+                ]
+              }
+            ],
+            "resources": []
+          },
+          {
+            "accesses": [],
+            "inputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  128
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  128,
+                  2
+                ]
+              }
+            ],
+            "name": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+            "outputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  2
+                ]
+              }
+            ],
+            "resources": []
+          },
+          {
+            "accesses": [],
+            "inputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  3
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  3,
+                  128
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  128,
+                  2
+                ]
+              }
+            ],
+            "name": "61a09eb90700743e2065d3b0a03161d783db0789966e802c701d2bd32104ceb0",
+            "outputs": [
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  128
+                ]
+              },
+              {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  2
+                ]
+              }
+            ],
+            "resources": []
+          }
+        ],
+        "parameters": [],
+        "resources": []
+      }
+    },
+    "source": {
+      "constraints": [],
+      "entry": {
+        "block": {
+          "arguments": [
+            {
+              "name": "a",
+              "type": {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  4,
+                  3
+                ]
+              }
+            },
+            {
+              "name": "b",
+              "type": {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  3,
+                  128
+                ]
+              }
+            },
+            {
+              "name": "c",
+              "type": {
+                "device": "cpu",
+                "dtype": "torch.float64",
+                "kind": "tensor",
+                "shape": [
+                  128,
+                  2
+                ]
+              }
+            }
+          ],
+          "operations": [
+            {
+              "function": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+              "inputs": [
+                "a",
+                "b"
+              ],
+              "op": "call",
+              "outputs": [
+                {
+                  "name": "ab",
+                  "type": {
+                    "device": "cpu",
+                    "dtype": "torch.float64",
+                    "kind": "tensor",
+                    "shape": [
+                      4,
+                      128
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "function": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+              "inputs": [
+                "ab",
+                "c"
+              ],
+              "op": "call",
+              "outputs": [
+                {
+                  "name": "out",
+                  "type": {
+                    "device": "cpu",
+                    "dtype": "torch.float64",
+                    "kind": "tensor",
+                    "shape": [
+                      4,
+                      2
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "yields": [
+            "out",
+            "ab"
+          ]
+        }
+      },
+      "functions": [
+        {
+          "accesses": [],
+          "inputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                3
+              ]
+            },
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                3,
+                128
+              ]
+            }
+          ],
+          "name": "d683a711a3fecd6da216bd18d7fff5ad61af63f880ddaf2fcfbbc62067c4f6dd",
+          "outputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                128
+              ]
+            }
+          ],
+          "resources": []
+        },
+        {
+          "accesses": [],
+          "inputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                128
+              ]
+            },
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                128,
+                2
+              ]
+            }
+          ],
+          "name": "c38aae0a12721fd510f06baa6741ebf2a382a3896a448479cacdc72b89709f0e",
+          "outputs": [
+            {
+              "device": "cpu",
+              "dtype": "torch.float64",
+              "kind": "tensor",
+              "shape": [
+                4,
+                2
+              ]
+            }
+          ],
+          "resources": []
+        }
+      ],
+      "parameters": [],
+      "resources": []
+    }
+  }
+]

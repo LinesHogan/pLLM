@@ -1,0 +1,81 @@
+{
+  "recorded_at_utc": "2026-09-12T13:22:43.684471+00:00",
+  "baseline": "outlining-authority-results.json",
+  "scope": "Separate fixed Scan inputs from recurrence carry and remove their per-iteration result wiring.",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "semantics": {
+    "inputs": "carry followed by invariants fixed inputs",
+    "body_arguments": "index followed by all inputs",
+    "body_results": "next carry followed by collected values",
+    "outputs": "final carry and collected banks",
+    "default": "invariants=0 preserves all-carry source meaning"
+  },
+  "migration": "Old source can be decoded with zero invariants; changed source and lowered-control schemas require derived plans/signatures to be regenerated.",
+  "producer_migrations": [
+    "DecoderSource coordinates are fixed inputs",
+    "TokenwiseRegion metadata is fixed input and rows are collected without carry",
+    "TensorScan invariants and sequence banks no longer become final outputs"
+  ],
+  "comparison": {
+    "artifact": "scan-invariants-comparison.json",
+    "sha256": "24157dca97947d542e801b85c7d70418d2fb0ae14892c14b78714cc37debeb10",
+    "unused_outputs_and_body_returns_removed": 30,
+    "all_analysis_fields_except_source_digest_equal": true,
+    "values": 85,
+    "statements": 28
+  },
+  "storage_validation": "Affine and dynamic scans at zero/one/multiple iterations compared CPU/CUDA results, unchanged inputs and observed storage against capacity. Observer scope includes known caller-owned roots; these are subtracted when comparing against the region new-storage budget.",
+  "checks": {
+    "release": {
+      "command": "env -u CONDA_PREFIX VIRTUAL_ENV=/workspace/pllm/.venv /workspace/pllm/.venv/bin/python -m maturin develop --release --offline",
+      "result": "rebuilt and installed",
+      "log_sha256": "7483068f5b1414dc7004125c72d5000a576fe858020e7f96e1902ad63dd1f188"
+    },
+    "rust": {
+      "command": "cargo test --manifest-path rust/pllm_core/Cargo.toml --offline",
+      "result": "20 passed",
+      "log_sha256": "4b9f2aebc7de37373048a9ed3694a2add6957d41cc3bb57c881257ebe2ea8919"
+    },
+    "cpu": {
+      "command": "CUDA_VISIBLE_DEVICES='' /workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_*.py test/boundary/test_tensor_compilation.py test/boundary/test_tensor_rewrite_search.py test/boundary/test_import_only_planning.py test/boundary/test_worker_reconstruction.py",
+      "result": "419 passed, 78 skipped",
+      "log_sha256": "2ed1d869f2c69478770c8eb3859b79432f6a2a9b1d9de25d4d0a21e162f49da9"
+    },
+    "cuda_and_scan": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_scan.py test/boundary/test_region_model_proposals.py",
+      "result": "29 passed; includes CPU cases",
+      "log_sha256": "d706d1c8b468e84bc8300c44c6f72548d97fa90ad0d51e7541024ed27e9995fd"
+    },
+    "recirculation": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_recirculation.py",
+      "result": "1 passed",
+      "log_sha256": "4ebbd71fb2ba020b9b6e2c4811b34c503a69a0b641f4fb8fc4c19394fe277015"
+    },
+    "typing": {
+      "command": "/workspace/pllm/.venv/bin/python tools/check_typing.py",
+      "result": "0 errors, 0 warnings, 0 informations",
+      "log_sha256": "f552d237ad0bd249c05f97eb62dbc65d2d0e4a5fe2346608e10fb7838dba9ed1"
+    }
+  },
+  "gates": {
+    "import_layers": "passed",
+    "region_authority": "passed",
+    "diff": "passed"
+  },
+  "full_model_checks_repeated": false,
+  "aligned_throughput_checked": false,
+  "files": {
+    "pllm/contracts/region_program.py": "73576a038e1aedaaa7d2da00eef03f82bf83669e0192a95fa267bd3103a1a164",
+    "pllm/contracts/control_instructions.py": "6e46161a64bbf01ad9734ff329d63eba5070e0df38afaedc8cfc9797bd92f6d5",
+    "pllm/execution/region_control.py": "a9e80dbd0e46908b0d69bf3d882512fd7d7627c1de50d7f97b823060714b090a",
+    "pllm/execution/region_reference.py": "9500bec7a2c90043d137f28ffdd364b7d1c10934c72d711fe53f0bab3ef4896c",
+    "pllm/execution/decoder_region.py": "d1978753583cf8a62d1cb8cb38314286575d0b976281d7c701c3fbca413f24d9",
+    "pllm/execution/tokenwise_region.py": "507120b6f085452f63bce1d4cb4450359c258c7f8c68926112bf0d712c4bfa84",
+    "pllm/execution/tensor_scan.py": "9a4832f6512060a735d8ad3c3f8ac130e7b76f70f687e3594606dc0817e71a1a",
+    "rust/pllm_core/src/planning/region_program.rs": "ae64ea114b9a8e5850dcff4d1cb5f43e5be238f27fc2e16574f463d266e1d2fa",
+    "rust/pllm_core/src/planning/region_dependence.rs": "068ec1f92134c0919f0a18beb92f590f1aec7147a21bbdd3c424c49904617350",
+    "rust/pllm_core/src/planning/region_control.rs": "2f41cc9039977e933151295312d6ecd702ed03202ad7060ecc5d759f14524603",
+    "rust/pllm_core/src/planning/region_scratch.rs": "f5ab35575431b6924e2e358cdbd93e5584749e6e6ba23c85f357936d22865b8b",
+    "test/boundary/test_region_scan.py": "705031bc6658b4c516fada8a0dcdfa768de2f0452109d55b8b860cb26737302f"
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "recorded_at_utc": "2026-09-12T09:43:43.640357+00:00",
+  "baseline": "order-retirement-results.json",
+  "scope": "Consolidate serial payload derivation and reuse fully source-validated parallel payloads during AER selection and plan installation.",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "removed_repeated_work": [
+    "separate payload validation round-trip for parallel RegionExecutionPlan",
+    "independent AER payload derivation before full stream-plan validation",
+    "empty retention relation derivation after storage/capacity validation",
+    "separate reference storage derivation before candidate-zero validation"
+  ],
+  "authority": {
+    "serial": "region_payload::derive",
+    "parallel": "region_streams::validate reconstructs and compares the full nested payload before use",
+    "reference": "candidate zero must match original imports and reference schedule after source-derived payload validation",
+    "runtime": "original function binding, dynamic sizes, owners and completion checks remain"
+  },
+  "comparison": {
+    "before": "payload-authority-before.json",
+    "after": "payload-authority-after.json",
+    "before_sha256": "35ddd38e807abb3cb43bf4cfa24ecce5aeef475c5abb32b9df978fe2e0dae419",
+    "after_sha256": "50c41cba0f518edb599b6a61d920d907a6d05995463ffd2006fac983a63ec564",
+    "equal_fields": [
+      "source",
+      "proposal",
+      "request",
+      "selection"
+    ],
+    "native_calls_before": [
+      {
+        "encoded_bytes": 5983,
+        "name": "validate_region_payload"
+      },
+      {
+        "encoded_bytes": 7412,
+        "name": "validate_region_streams"
+      }
+    ],
+    "native_calls_after": [
+      {
+        "encoded_bytes": 7412,
+        "name": "validate_region_streams"
+      }
+    ],
+    "scope": "Small grid installation fixture with synthetic ranking samples. Counts and encoded input bytes are not throughput or cold-start acceptance."
+  },
+  "checks": {
+    "release": {
+      "command": "env -u CONDA_PREFIX VIRTUAL_ENV=/workspace/pllm/.venv /workspace/pllm/.venv/bin/python -m maturin develop --release --offline",
+      "result": "rebuilt and installed after final reference-storage cleanup",
+      "log_sha256": "4e54397cf0b7e4c3c7711d0f6913decfb0b599310f3f932d0663641f52648c47"
+    },
+    "rust": {
+      "command": "cargo test --manifest-path rust/pllm_core/Cargo.toml --offline",
+      "result": "18 passed after final reference-storage cleanup",
+      "log_sha256": "f48947260e754e32fabcecde574b990bd80750fc207c0ab1fd8e0ab17890ef9a"
+    },
+    "cpu_main": {
+      "command": "CUDA_VISIBLE_DEVICES='' /workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_stream_selection.py test/boundary/test_region_streams.py test/boundary/test_region_selection.py test/boundary/test_region_retention.py test/boundary/test_region_capacity.py test/boundary/test_region_parametric_selection.py test/boundary/test_region_outlining_selection.py test/boundary/test_import_only_planning.py",
+      "result": "44 passed, 19 skipped; before final reference-storage cleanup",
+      "log_sha256": "8627ca52e79e099ccec4adc31304113f4219df414f00ae93c98e2184605bccda"
+    },
+    "cuda_and_worker": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_stream_selection.py test/boundary/test_region_model_proposals.py",
+      "result": "4 passed, including one CPU rejection test; before final reference-storage cleanup",
+      "log_sha256": "02061fee110ae45ffdcd2c211e030a6f7989dbbe293b3a74b06e87093cbea197"
+    },
+    "final_reference_cleanup": {
+      "command": "CUDA_VISIBLE_DEVICES='' /workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_stream_selection.py::test_aer_checks_concurrent_peak_before_ranking_and_rejects_changed_physical_evidence test/boundary/test_region_selection.py -k 'not real_cold_tuning'",
+      "result": "10 passed, 1 skipped, 2 deselected",
+      "log_sha256": "b2595a5aa9e2b317d62db0d1f3a2b9c40f3d588ea5825934541caf9d366040ea"
+    },
+    "typing": {
+      "command": "/workspace/pllm/.venv/bin/python tools/check_typing.py",
+      "result": "0 errors, 0 warnings, 0 informations",
+      "log_sha256": "f552d237ad0bd249c05f97eb62dbc65d2d0e4a5fe2346608e10fb7838dba9ed1"
+    }
+  },
+  "gates": {
+    "import_layers": "passed",
+    "region_authority": "passed",
+    "diff": "passed"
+  },
+  "full_model_checks_repeated": false,
+  "aligned_throughput_checked": false,
+  "final_files": {
+    "pllm/execution/region_execution.py": "a7b916aa7c4dd3158cad3ba0aa0fd03c04b8a145d9c3f5b89837fe6b02c6c98f",
+    "rust/pllm_core/src/planning/aer.rs": "c8ceed264d4f944e94ffd41565f93cbc6761f5ec6e019db18f8e37aa0abd85cb",
+    "rust/pllm_core/src/planning/region_payload.rs": "60fb42daeec785b470ea283a14f8de4cd652c3de6d06c289720a5fca3d7ace5c",
+    "test/boundary/test_region_stream_selection.py": "5b41945c5ba2ec79e40ea9080dc7025340a1a85f18f867aa4b0799a0d76566f5"
+  }
+}

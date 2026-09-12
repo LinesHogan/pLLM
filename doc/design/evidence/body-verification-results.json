@@ -1,0 +1,75 @@
+{
+  "recorded_at_utc": "2026-09-12T09:51:34.316033+00:00",
+  "baseline": "payload-authority-results.json",
+  "scope": "Check function bodies once with their outer signature as a constraint; remove repeated whole-body checks during lexical inlining.",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "removed": [
+    "second full traversal with an augmented imports table",
+    "native whole-Program copy for aggregate-declaration validation",
+    "per-call and per-name-collision source verification inside already-checked inlining",
+    "extra verification just to recover validated declaration output types"
+  ],
+  "preserved": [
+    "outer signature and resource/access checks",
+    "original import scope; outer declaration cannot be called or imported recursively",
+    "SSA closure and typed result checks",
+    "public inline_region source verification",
+    "final composed Program verification",
+    "alias/duplicate-return and fresh-name behavior",
+    "worker native reconstruction and installation"
+  ],
+  "comparison": {
+    "artifact": "body-verification-comparison.json",
+    "sha256": "646748eab84c95483d2cfff4a7ca98b4b0aaedec822eee1421ec73ca1d92de6b",
+    "fixture": "Three-layer DecoderSource and original decoder_partition_bodies descriptors",
+    "source_and_expanded_program_unchanged": true,
+    "verify_calls_before": 8,
+    "verify_calls_after": 4,
+    "scope": "Composition call counts, not full-model planning or throughput acceptance."
+  },
+  "checks": {
+    "release": {
+      "command": "env -u CONDA_PREFIX VIRTUAL_ENV=/workspace/pllm/.venv /workspace/pllm/.venv/bin/python -m maturin develop --release --offline",
+      "result": "rebuilt and installed; subsequent Rust edits added only unit tests",
+      "log_sha256": "03e3eed15cfe3a58f90032a8a09b9b810cda26fda5180e74f5d1f569e6a66749"
+    },
+    "rust": {
+      "command": "cargo test --manifest-path rust/pllm_core/Cargo.toml --offline",
+      "result": "19 passed",
+      "log_sha256": "1620613277e6f678bb66c73fda5181f1d9fb56f87b072f16faee68aa53015db7"
+    },
+    "cpu": {
+      "command": "CUDA_VISIBLE_DEVICES='' /workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_composition.py test/boundary/test_region_program.py test/boundary/test_region_sizes.py test/boundary/test_region_scan.py test/boundary/test_exported_resources.py test/boundary/test_import_only_planning.py test/boundary/test_worker_reconstruction.py",
+      "result": "108 passed, 1 skipped",
+      "log_sha256": "72f1f2ae4493f45db9f5ac55c6eb6683d5b4f953e1c22b4e73c864fdc3a107b0"
+    },
+    "cuda_worker": {
+      "command": "/workspace/pllm/.venv/bin/python -m pytest -q test/boundary/test_region_model_proposals.py",
+      "result": "1 passed",
+      "log_sha256": "7f09a0d1cbb358dfde167050789fbf97de078539faafbc63078eac40d19217f9"
+    },
+    "typing": {
+      "command": "/workspace/pllm/.venv/bin/python tools/check_typing.py",
+      "result": "0 errors, 0 warnings, 0 informations",
+      "log_sha256": "f552d237ad0bd249c05f97eb62dbc65d2d0e4a5fe2346608e10fb7838dba9ed1"
+    }
+  },
+  "gates": {
+    "import_layers": "passed",
+    "region_authority": "passed",
+    "diff": "passed"
+  },
+  "full_model_checks_repeated": false,
+  "aligned_throughput_checked": false,
+  "files": {
+    "pllm/contracts/region_program.py": "73f523003386cc73efa73a7ed646e56a7a9c552ed248024bf8d25a0b706c9343",
+    "pllm/contracts/region_composition.py": "12a2bb3ac65fca17a71d17019a81ebd59555e792f54f8dcf6ae1fb5a32498949",
+    "rust/pllm_core/src/planning/region_program.rs": "e365fd47e65913897bea73dfe5e27caaf08bfc9aeb154c552d2df0ccdd12d5c1",
+    "rust/pllm_core/src/planning/backend_attachment/validation.rs": "0a147c780d45afc0e44c62045c941b7cc8cc19007e852ae85b91cd883b1e61d7",
+    "test/boundary/test_region_composition.py": "3f592df5507adc5c5573323a4e7cb4486082261399b5f86911497084d9b7b8d1"
+  },
+  "rust_production_sha256": {
+    "rust/pllm_core/src/planning/region_program.rs": "31dbbbd01f59eee45c6e5b45149169ee92317080fb79251f5fcb645b4f3ec558",
+    "rust/pllm_core/src/planning/backend_attachment/validation.rs": "0a147c780d45afc0e44c62045c941b7cc8cc19007e852ae85b91cd883b1e61d7"
+  }
+}

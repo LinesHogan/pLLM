@@ -1,0 +1,134 @@
+{
+  "completed_at_utc": "2026-09-12T08:50:46.431602+00:00",
+  "closure_status": "complete_for_this_architecture_migration",
+  "overall_plan_complete": false,
+  "source_tree_sha256": "277076d934a391fc64a6e81d86b2b3f79ea3d01c3f00cb52668dcbd4fa3245dc",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "torch": "2.13.0+cu129",
+  "vllm": "0.27.1+cu129",
+  "validation": {
+    "rust": {
+      "passed": 18,
+      "failed": 0,
+      "command": "cargo test --manifest-path rust/pllm_core/Cargo.toml --offline"
+    },
+    "region_cpu_and_worker": {
+      "passed": 368,
+      "skipped": 57,
+      "failed": 0,
+      "seconds": 121.7,
+      "command": "CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest -q test/boundary/test_region_*.py test/boundary/test_import_only_planning.py test/boundary/test_worker_reconstruction.py"
+    },
+    "recirculation_cpu": {
+      "passed": 1,
+      "failed": 0,
+      "command": ".venv/bin/python -m pytest -q test/workloads/test_recirculation.py"
+    },
+    "qwen": {
+      "command": ".venv/bin/python -m test.gpu.vllm_recirculation_smoke",
+      "exit_code": 0,
+      "result": {
+        "normal_rows": 8,
+        "replay_rows": 6,
+        "numerical_comparisons": 14,
+        "owned_state_roots": 0,
+        "fallback": 0,
+        "source_bodies": 2,
+        "selected": 8,
+        "measured_ns": [
+          599747150,
+          602814940,
+          774260412,
+          613517785,
+          795636819,
+          679782559,
+          771863140,
+          611023304,
+          597529797,
+          785903225,
+          601145673,
+          779341247,
+          606693120,
+          789812787
+        ]
+      }
+    },
+    "enginecore": {
+      "command": ".venv/bin/python -m test.gpu.enginecore_smoke --recirculation-only",
+      "exit_code": 0,
+      "result": {
+        "engine_core": true,
+        "selected": 10,
+        "measured_ns": [
+          602533267,
+          609331878,
+          799072706,
+          623123457,
+          793719611,
+          789679400,
+          782658690,
+          605218609,
+          605516886,
+          790907294,
+          599003678,
+          794389651,
+          614559027,
+          810601599
+        ],
+        "parallel_candidates": [
+          2,
+          4,
+          6,
+          9,
+          11,
+          13
+        ],
+        "transformed_candidates": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "kernel_imports": [
+          "vllm.fused_add_rms_norm@1",
+          "vllm.export-kernel@1",
+          "vllm.export-kernel@1"
+        ],
+        "source_bodies": 2,
+        "replay_rows": 12,
+        "parent_cuda": false,
+        "fallback": 0
+      }
+    },
+    "typing": "passed",
+    "import_layers": "passed",
+    "region_authority": "passed",
+    "diff_check": "passed"
+  },
+  "source_interface": {
+    "legacy_projection_exact": true,
+    "legacy_order_declarations": 108,
+    "current_order_declarations": 0,
+    "legacy_scan_input_counts": [
+      9,
+      12,
+      10
+    ],
+    "current_scan_input_counts": [
+      5,
+      9,
+      7
+    ],
+    "initial_analysis_values": 193,
+    "current_analysis_values": 89,
+    "statement_templates": 28,
+    "all_analysis_fields_equal_except_source_digest": true
+  },
+  "limits": [
+    "Qwen timings are short smoke measurements, not aligned throughput acceptance",
+    "Full architecture simplification and legacy producer retirement remain incomplete",
+    "General model frontends, global chunk/layer execution, full device accounting and tutorial updates remain incomplete"
+  ]
+}
