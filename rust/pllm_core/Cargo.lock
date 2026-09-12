@@ -86,8 +86,6 @@ dependencies = [
 [[package]]
 name = "isl-rs"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ffbe47f00150a69fd7ac8053db449d09346f53bfa1c6ab0b3c80e7f3a73eada"
 dependencies = [
  "fs_extra",
  "libc",

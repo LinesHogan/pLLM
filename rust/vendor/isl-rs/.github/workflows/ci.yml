@@ -1,0 +1,45 @@
+name: CI
+
+on:
+    push:
+        branches:
+        - main
+    pull_request:
+
+jobs:
+  Lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - nightly
+    steps:
+      - uses: actions/checkout@v1
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: rustfmt
+      - name: Run tests
+        run: |
+          cargo fmt --check
+
+  Regressions:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - nightly
+    steps:
+      - uses: actions/checkout@v1
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: rustfmt
+      - name: Run tests
+        run: |
+          git submodule update --init --recursive
+          cargo test 
