@@ -23,6 +23,8 @@ from pllm.contracts.state_representation import (
 )
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.contracts.region_imports import RegionTensorImport
+from pllm.contracts.region_composition import RegionFunctionBody
 
 
 class AttachmentTopology(StrEnum):
@@ -78,6 +80,17 @@ class AttachmentTaskBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class CausalModelDomain:
+    requests: int
+    layers: int
+    positions: int
+
+    def __post_init__(self) -> None:
+        if any(type(size) is not int or not 0 < size < 2**63 for size in (self.requests, self.layers, self.positions)):
+            raise ValueError("causal model domain requires positive bounded index extents")
+
+
+@dataclass(frozen=True, slots=True)
 class BackendPlacementProbe:
     adapter_id: str
     backend_abi_digest: str
@@ -94,7 +107,10 @@ class BackendPlacementProbe:
     max_packed_rows: int
     hidden_resources: tuple[AttachmentHiddenResource, ...]
     capabilities: tuple[str, ...]
-    schema_version: int = 1
+    schema_version: int = 2
+    causal_domain: CausalModelDomain | None = None
+    region_imports: tuple[RegionTensorImport, ...] = ()
+    region_bodies: tuple[RegionFunctionBody, ...] = ()
 
 
 class ActivationPatchOperator(StrEnum):

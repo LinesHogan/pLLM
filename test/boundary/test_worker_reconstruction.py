@@ -101,7 +101,7 @@ def _worker(connection: Connection, expected_signature: str) -> None:
 def test_worker_reconstructs_exact_signed_plan_and_rejects_local_drift() -> None:
     from examples.centered_hidden import centered_hidden
     from examples.huber import HuberWorkload
-    from pllm.worker import decode_workload, encode_workload
+    from pllm.workload_transport import decode_workload, encode_workload
     from pllm.contracts.workload_reference import WorkloadReference
     from pllm.workloads.esamp_request import ESampRequestWorkload
     from pllm.workloads.lora import OutputLoRAWorkload

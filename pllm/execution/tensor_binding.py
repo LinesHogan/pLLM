@@ -256,13 +256,53 @@ def _port(source: SemanticInputSource | TensorPort) -> TensorPort:
             raise ValueError("unsupported ordinary tensor input; use an explicit native binding")
 
 
+@dataclass(frozen=True, slots=True)
+class OverlayTransition:
+    """Request/target adaptation shared by source and explicitly lowered math.
+
+    Replacing this immutable callable during binding changes only the imported
+    mathematics. The original TensorOperation still owns private-page access.
+    """
+
+    buffers: tuple[str, ...]
+    targets: tuple[ParameterTarget, ...]
+    phases: tuple[HiddenPhase, ...]
+    effective: Callable[[Tensors], torch.Tensor]
+    function: Callable[[Tensors], TensorUpdate]
+
+    def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        operands = {(operand.identity, operand.target): operand for operand in data.step.operands}
+        changed: set[int] = set()
+        with torch.no_grad():
+            for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True):
+                results: list[OverlayTargetResult] = []
+                for target_index, target in enumerate(self.targets):
+                    operand = operands[row.identity, target]
+                    values = dict(zip(self.buffers, batch.roots[index][len(self.buffers) * target_index:len(self.buffers) * (target_index + 1)], strict=True))
+                    if operand.phase in self.phases:
+                        result = self.function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
+                    else:
+                        result = TensorUpdate(operand.hidden @ (operand.base_weight + self.effective(values)).T)
+                    if result.output.shape != operand.desired.shape or result.output.dtype != operand.hidden.dtype or result.output.device != operand.hidden.device:
+                        raise ValueError("overlay output differs from its target shape, dtype or device")
+                    if min(result.update_count, result.trained_rows) < 0:
+                        raise ValueError("overlay update counters must be nonnegative")
+                    results.append(OverlayTargetResult(target, result))
+                    if result.changed:
+                        changed.add(index)
+                data.entries.append(OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results)))
+        return TaskOutput(changed=tuple(sorted(changed)),
+            update_count=sum(target.update.update_count for entry in data.entries for target in entry.targets),
+            trained_rows=sum(target.update.trained_rows for entry in data.entries for target in entry.targets))
+
+
 class TensorBinding(Builder[TensorFrame]):
     """Authoring projections only; tensor results remain invocation-local."""
 
     def __init__(self, name: str, digest: str, dimensions: Dimensions | None = None, *, host: bool = False) -> None:
         super().__init__(name, digest, dimensions)
         self.host = host
-        self.initializers: list[Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = []
+        self.initializers: dict[str, Callable[[tuple[torch.Tensor, ...], torch.Generator], None]] = {}
         self.weighted_training = False
         self.probe: BackendPlacementProbe | None = None
         self.sample_limit: int | None = None
@@ -295,7 +335,6 @@ class TensorBinding(Builder[TensorFrame]):
         state = self.state(state_name, tuple(_buffer_field(f"{key}_{index}", buffer, lambda m, i=index: m.target_shapes[i])
             for index in range(len(targets)) for key, buffer in buffers.items()),
             namespace=namespace, scope=StateScope.REQUEST, keys=keys)
-        width = len(buffers)
         def effective(values: Mapping[str, torch.Tensor]) -> torch.Tensor:
             if operator is ParameterOverlayOperator.DENSE_ADD:
                 return values[applied[0]] * scale
@@ -303,33 +342,9 @@ class TensorBinding(Builder[TensorFrame]):
         def select(data: TensorFrame, selection: RequestStateSelection) -> tuple[int, ...]:
             return tuple(sorted({index for row, index in zip(selection.rows, selection.state_indices, strict=True)
                 if any(operand.identity == row.identity and operand.phase in phases for operand in data.step.operands)}))
-        def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
-            operands = {(operand.identity, operand.target): operand for operand in data.step.operands}
-            changed: set[int] = set()
-            with torch.no_grad():
-                for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True):
-                    results: list[OverlayTargetResult] = []
-                    for target_index, target in enumerate(targets):
-                        operand = operands[row.identity, target]
-                        values = dict(zip(buffers, batch.roots[index][width * target_index:width * (target_index + 1)], strict=True))
-                        if operand.phase in phases:
-                            result = function({**values, "input": operand.hidden, "target": operand.desired, "weight": operand.base_weight})
-                        else:
-                            result = TensorUpdate(operand.hidden @ (operand.base_weight + effective(values)).T)
-                        if result.output.shape != operand.desired.shape or result.output.dtype != operand.hidden.dtype or result.output.device != operand.hidden.device:
-                            raise ValueError("overlay output differs from its target shape, dtype or device")
-                        if min(result.update_count, result.trained_rows) < 0:
-                            raise ValueError("overlay update counters must be nonnegative")
-                        results.append(OverlayTargetResult(target, result))
-                        if result.changed:
-                            changed.add(index)
-                    data.entries.append(OverlayEntry(row.identity, batch.selection.refs[index], batch.after_refs[index], tuple(results)))
-            return TaskOutput(changed=tuple(sorted(changed)),
-                update_count=sum(target.update.update_count for entry in data.entries for target in entry.targets),
-                trained_rows=sum(target.update.trained_rows for entry in data.entries for target in entry.targets))
         transition = self.compute(name, inputs={"operands": self.input("parameter.operands", "dense_pairs", "canonical.dense_operand_pairs@1")},
             outputs=("transition",), changes=state, effect=StateEffectKind.TRANSITION_MAYBE, when=When.MODEL_UPDATE,
-            function=execute, select=select,
+            function=OverlayTransition(tuple(buffers), targets, phases, effective, function), select=select,
             implementations=(native(identity + ":cpu", "compute/cpu@1", "transition/full_root@1"),
                 native(identity + ":cuda", "compute/cuda@1", "state/fenced_reclaim@1", "transition/full_root@1")))
         publication = self.publish(transition, state, implementations=(
@@ -339,6 +354,15 @@ class TensorBinding(Builder[TensorFrame]):
             tuple(state.field(f"{key}_{i}") for key in applied), scale) for i, target in enumerate(targets)))
         if replay is not None:
             self.replay(publication, state, replay)
+
+    def lower_overlay(self, name: str, function: Callable[[Tensors], TensorUpdate]) -> None:
+        """Bind explicit native math after its author has verified the source contract."""
+        symbol = TaskSymbol(name)
+        operation = self.operations[symbol]
+        if not isinstance(operation.function, OverlayTransition):
+            raise ValueError("overlay lowering requires an original overlay transition")
+        self.operations[symbol] = replace(operation,
+            function=replace(operation.function, function=function))
 
     def _import_update(self, state: State, identity: str) -> Call:
         """One BEFORE_MODEL import of externally produced field values into private roots."""
@@ -471,7 +495,7 @@ class TensorBinding(Builder[TensorFrame]):
         if initialize is not None:
             def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
                 initialize({key: view(root) for key, view in views.items()}, generator)
-            self.initializers.append(init)
+            self.initializers[str(state.declaration.resource)] = init
         return state, {key: port(view) for key, view in views.items()}
 
     def weighted_train(self, name: str, state: State, *, identity: str, optimizer: SGD, steps: int,

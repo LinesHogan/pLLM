@@ -92,7 +92,7 @@ def make_llm(config: ModelConfig | HostRuntimeFacts, *,
     from pllm.backends.vllm.runtime import create_vllm_llm
     definition = None
     if config.multiprocessing:
-        from pllm.worker import encode_workload
+        from pllm.workload_transport import encode_workload
         definition = encode_workload(workload)
     return create_vllm_llm(workload, config, definition=definition)
 

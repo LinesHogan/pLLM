@@ -1,33 +1,26 @@
-"""Closed serialization of the original contracts, never Python type paths."""
+"""Torch graph/storage adapters and compatibility exports of the shared codec."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import torch
-from enum import StrEnum
-from hashlib import sha256
 from pathlib import Path
-from typing import Protocol, TypeVar, cast, get_origin
+from typing import Protocol, cast
 from uuid import UUID
 
-from cattrs import Converter
-from cattrs.errors import ForbiddenExtraKeysError
-from cattrs.strategies import configure_tagged_union
+from torch._ops import OpOverload
+from torch import _decomp
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
-from pllm.contracts.semantic_graph import (
-    ConditionalLayerReplay, TokenwiseLayerReplay,
-    HiddenInputSource, HostServiceInputSource, PackedRowsInputSource, PackedSamplerRowsInputSource,
-    SamplerFeedbackInputSource, SemanticInputSource, StateSelectionInputSource, StepIdInputSource, TaskResultInputSource,
+from pllm.contracts.codec import (
+    boundary_digest as boundary_digest, decode_boundary as decode_boundary, encode_boundary as encode_boundary,
+    boundary_scalar as _primitive,
 )
-
-
-T = TypeVar("T")
-E = TypeVar("E", bound=StrEnum)
-_converter = Converter(forbid_extra_keys=True, detailed_validation=False)
-_converter.register_unstructure_hook(torch.device, str)
-_converter.register_structure_hook(torch.device, lambda value, _target: torch.device(_primitive(value, str)))
 
 
 class _TensorHooks(Protocol):
@@ -38,83 +31,336 @@ def register_gradient_hook(tensor: torch.Tensor, hook: Callable[[torch.Tensor], 
     cast(_TensorHooks, tensor).register_hook(hook)
 
 
-def _primitive(value: object, target: type[T]) -> T:
-    if target is float and type(value) is int:
-        return cast(T, float(value))
-    if type(value) is not target:
-        raise TypeError("boundary scalar has the wrong type")
-    return cast(T, value)
+TensorFunction = Callable[..., tuple[torch.Tensor, ...]]
 
 
-for _type in (str, int, float, bool):
-    _converter.register_structure_hook(_type, _primitive)
+class _FunctionalExport(Protocol):
+    def run_decompositions(self, decomp_table: dict[object, object]) -> torch.export.ExportedProgram: ...
+
+    @property
+    def range_constraints(self) -> dict[object, object]: ...
 
 
-def _enum(value: object, target: type[E]) -> E:
-    return target(_primitive(value, str))
+class _TensorDecompositions(Protocol):
+    def get_decompositions(self, aten_ops: tuple[OpOverload, ...]) -> dict[object, object]: ...
 
 
-_converter.register_structure_hook(StrEnum, _enum)
-
-# Keep cattrs' typed tuple handler, but reject iterable objects that are not JSON arrays.
-_tuple_handler = _converter.get_structure_hook(tuple)
+class _TensorCompiler(Protocol):
+    def compile(self, function: TensorFunction, *, fullgraph: bool, dynamic: bool) -> TensorFunction: ...
 
 
-def _array(value: object, target: object) -> object:
-    if type(value) is not list:
-        raise TypeError("boundary sequence must be a JSON array")
-    return _tuple_handler(value, target)
+def check_static_export(program: torch.export.ExportedProgram) -> None:
+    if cast(_FunctionalExport, program).range_constraints:
+        raise ValueError("tensor cell import requires static export shapes; symbolic constraints cannot be discarded")
 
 
-_converter.register_structure_hook_func(lambda target: get_origin(target) is tuple, _array)
+def functionalize_export(program: torch.export.ExportedProgram) -> torch.export.ExportedProgram:
+    """Functionalize mutations; retain an already functional core ATen graph.
 
-_input_tags: dict[type[object], str] = {
-    HiddenInputSource: "hidden", StepIdInputSource: "step_id", PackedRowsInputSource: "packed_rows",
-    PackedSamplerRowsInputSource: "packed_sampler_rows", SamplerFeedbackInputSource: "sampler_feedback",
-    HostServiceInputSource: "host_service", StateSelectionInputSource: "state_selection", TaskResultInputSource: "result",
-}
-configure_tagged_union(SemanticInputSource, _converter, tag_generator=_input_tags.__getitem__, tag_name="kind")
+    Apart from redundant tracing, AOT's RNG preservation initializes CUDA even
+    for fake inputs. Pure source import must work in a driver without a device
+    execution context. The same ATen check is applied again by the importer.
+    """
+    try:
+        for node in program.graph.nodes:
+            if node.op == "call_function":
+                target: object = node.target
+                check_functional_aten(target)
+                # Composite ATen operators still need the existing canonical
+                # decomposition (for example numpy_T and matmul).
+                if torch.Tag.core not in cast(list[torch.Tag], getattr(target, "tags")):
+                    break
+            elif node.op not in ("placeholder", "output"):
+                break
+        else:
+            return program
+    except ValueError:
+        pass
+    # Tuple-valued splits otherwise leave Python getitem nodes in a functional
+    # export (notably SwiGLU and QKV projections). Use PyTorch's alias-preserving
+    # view decompositions, so the existing tensor-only importer sees the actual
+    # storage views. Do not admit arbitrary Python callables into the graph.
+    splits = (torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default)
+    decompositions = cast(_TensorDecompositions, _decomp).get_decompositions(splits)
+    return cast(_FunctionalExport, program).run_decompositions(decompositions)
 
 
-def _replay(value: object, _target: object) -> ConditionalLayerReplay | TokenwiseLayerReplay | None:
-    if value is None:
+def check_functional_aten(target: object) -> None:
+    if not isinstance(target, OpOverload):
+        raise ValueError(f"export requires ATen operators, got {target}")
+    schema: object = getattr(cast(object, target), "_schema")
+    if not isinstance(schema, torch.FunctionSchema):
+        raise ValueError("export operator has no supported schema")
+    if target.namespace != "aten" or schema.is_mutable:
+        raise ValueError(f"export contains a nonfunctional or external operator: {target}")
+    if torch.Tag.nondeterministic_seeded in target.tags:
+        raise ValueError("export RNG needs explicit instance-addressed inputs")
+
+
+def tensor_graph_outputs(graph: torch.fx.GraphModule, args: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    values: object = graph(*args)
+    if not isinstance(values, tuple):
+        raise ValueError("export requires a flat tensor result tuple")
+    result: list[torch.Tensor] = []
+    for value in cast(tuple[object, ...], values):
+        if not isinstance(value, torch.Tensor):
+            raise ValueError("export outputs must be tensors")
+        result.append(value)
+    return tuple(result)
+
+
+def compile_tensor_function(function: TensorFunction) -> TensorFunction:
+    return cast(_TensorCompiler, torch).compile(function, fullgraph=True, dynamic=False)
+
+
+class _TorchRandom(Protocol):
+    def fork_rng(self, devices: list[int]) -> AbstractContextManager[None]: ...
+
+
+def preserve_torch_rng(devices: list[int]) -> AbstractContextManager[None]:
+    """Typed adapter for PyTorch's CPU/device RNG isolation context."""
+    return cast(_TorchRandom, torch.random).fork_rng(devices)
+
+
+def matmul_node_arguments(node: torch.fx.Node) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    """Narrow FX's dynamic ATen arguments; matrix shape rules live in the pass."""
+    if node.op != "call_function" or node.target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default):
         return None
-    if type(value) is not dict:
-        raise TypeError("replay effect must be a closed object")
-    if "layers" in value:
-        return _converter.structure(value, ConditionalLayerReplay)
-    return _converter.structure(value, TokenwiseLayerReplay)
+    args: tuple[object, ...] = node.args
+    if node.kwargs or len(args) != 2:
+        return None
+    left, right = args
+    if not isinstance(left, torch.fx.Node) or not isinstance(right, torch.fx.Node):
+        return None
+    return left, right
 
 
-_converter.register_structure_hook(ConditionalLayerReplay | TokenwiseLayerReplay | None, _replay)
+def tensor_node_metadata(node: torch.fx.Node) -> FakeTensor | None:
+    value: object = node.meta.get("val")
+    return value if isinstance(value, FakeTensor) else None
 
 
-def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result = dict(pairs)
-    if len(result) != len(pairs):
-        raise ValueError("duplicate boundary field")
+def tensor_graph_result_nodes(graph: torch.fx.GraphModule) -> tuple[torch.fx.Node, ...]:
+    output = next(node for node in graph.graph.nodes if node.op == "output")
+    values: object = output.args[0]
+    if not isinstance(values, tuple) or not all(isinstance(v, torch.fx.Node) for v in cast(tuple[object, ...], values)):
+        raise ValueError("tensor access import requires flat tensor graph outputs")
+    return cast(tuple[torch.fx.Node, ...], values)
+
+
+def refresh_tensor_metadata(graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """Replay only fake tensor semantics on a private graph, including aliases."""
+    result = deepcopy(graph)
+    inputs: list[FakeTensor] = []
+    for node in result.graph.nodes:
+        node.meta.pop("tensor_meta", None)
+        if node.op == "placeholder":
+            value = tensor_node_metadata(node)
+            if value is None:
+                raise ValueError("tensor metadata propagation needs fake input tensors")
+            inputs.append(value)
+    FakeTensorProp(result, inputs[0].fake_mode if inputs else None).propagate_dont_convert_inputs(*inputs)
     return result
 
 
-def _nonfinite(value: str) -> object:
-    raise ValueError("non-finite boundary scalar: " + value)
+@dataclass(frozen=True, slots=True)
+class TensorGraphCall:
+    graph: torch.fx.GraphModule
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+    output_positions: tuple[int, ...]
 
 
-def encode_boundary(value: object) -> str:
-    return json.dumps(_converter.unstructure(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+def inline_tensor_graphs(inputs: tuple[tuple[str, FakeTensor], ...], calls: tuple[TensorGraphCall, ...],
+                         outputs: tuple[str, ...]) -> torch.fx.GraphModule:
+    """Copy functional operators in order, then prove internal layout guards.
+
+    This never executes user Python or allocates real tensors. The resulting
+    FX graph still uses the original ATen kernels; backend fusion is separate.
+    """
+    graph = torch.fx.Graph()
+    values: dict[str, torch.fx.Node] = {}
+    mode = FakeTensorMode()
+    for index, (name, sample) in enumerate(inputs):
+        node = graph.placeholder(f"arg_{index}")
+        with mode:
+            node.meta["val"] = torch.empty_strided(tuple(sample.shape), tuple(sample.stride()),
+                                                   dtype=sample.dtype, device=sample.device)
+        values[name] = node
+    guards: list[tuple[str, FakeTensor]] = []
+    for call in calls:
+        placeholders = tuple(n for n in call.graph.graph.nodes if n.op == "placeholder")
+        bindings = {node: values[name] for node, name in zip(placeholders, call.inputs, strict=True)}
+        for node, mapped in bindings.items():
+            sample = tensor_node_metadata(node)
+            if sample is None:
+                raise ValueError("call composition requires tensor input metadata")
+            guards.append((mapped.name, sample))
+        for node in call.graph.graph.nodes:
+            if node.op == "call_function":
+                check_functional_aten(node.target)
+                if node.is_impure():
+                    raise ValueError("call composition contains an undeclared effect")
+                bindings[node] = graph.node_copy(node, lambda argument: bindings[argument])
+            elif node.op not in ("placeholder", "output"):
+                raise ValueError("call composition requires functional tensor graphs")
+        raw = tensor_graph_result_nodes(call.graph)
+        for name, position in zip(call.outputs, call.output_positions, strict=True):
+            original = raw[position]
+            mapped = bindings[original]
+            values[name] = mapped
+            sample = tensor_node_metadata(original)
+            if sample is None:
+                raise ValueError("call composition requires tensor output metadata")
+            guards.append((mapped.name, sample))
+    graph.output(tuple(values[name] for name in outputs))
+    result = refresh_tensor_metadata(torch.fx.GraphModule(torch.nn.Module(), graph))
+    nodes = {n.name: n for n in result.graph.nodes}
+    for name, expected in guards:
+        actual = tensor_node_metadata(nodes[name])
+        if actual is None or (tuple(actual.shape), tuple(actual.stride()), actual.dtype, actual.device) != (
+                tuple(expected.shape), tuple(expected.stride()), expected.dtype, expected.device):
+            raise ValueError("composed graph does not satisfy an original call layout guard")
+    return result
 
 
-def boundary_digest(*values: object) -> str:
-    """Bind original typed parameters and cold facts with the same closed encoding."""
-    return sha256(encode_boundary(values).encode("utf-8")).hexdigest()
+def replace_matmul_nodes(graph: torch.fx.GraphModule, inner_name: str, outer_name: str,
+                         operands: tuple[str, str, str], *, right_associated: bool
+                         ) -> tuple[torch.fx.GraphModule, tuple[str, str]]:
+    """Mechanically rebuild a checked two-product site on a private FX graph."""
+    result = deepcopy(graph)
+    nodes = {n.name: n for n in result.graph.nodes}
+    inner, outer = nodes[inner_name], nodes[outer_name]
+    inner_target, outer_target = inner.target, outer.target
+    if (not isinstance(inner_target, OpOverload) or not isinstance(outer_target, OpOverload)
+        or inner_target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default)
+        or outer_target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default)):
+        raise ValueError("matmul rewrite requires two imported matrix products")
+    inner_operator = cast(OpOverload, inner_target)
+    outer_operator = cast(OpOverload, outer_target)
+    a, b, c = (nodes[name] for name in operands)
+    if tuple(inner.users) != (outer,):
+        raise ValueError("matmul rewrite cannot erase a shared intermediate")
+
+    def product(left: torch.fx.Node, right: torch.fx.Node, target: OpOverload) -> torch.fx.Node:
+        lv, rv = tensor_node_metadata(left), tensor_node_metadata(right)
+        if lv is None or rv is None:
+            raise ValueError("matmul rewrite requires exported fake tensor metadata")
+        node = result.graph.call_function(target, (left, right))
+        # Evaluate metadata only. Do not allocate real tensors or carry over
+        # stale intermediate shapes/ATen traces from the deleted product.
+        with lv.fake_mode:
+            node.meta["val"] = torch.mm(lv, rv)
+        return node
+
+    with result.graph.inserting_before(outer):
+        first = product(b, c, inner_operator) if right_associated else product(a, b, inner_operator)
+        final = product(a, first, outer_operator) if right_associated else product(first, c, outer_operator)
+    outer.replace_all_uses_with(final)
+    result.graph.erase_node(outer)
+    result.graph.erase_node(inner)
+    result.graph.lint()
+    result.recompile()
+    # Replacing the final product also changes storage aliases of downstream
+    # views. Updating only the two new products leaves their metadata stale.
+    return refresh_tensor_metadata(result), (first.name, final.name)
 
 
-def decode_boundary(payload: str, target: type[T]) -> T:
-    """The caller supplies a statically bound type, never a type named by payload."""
-    try:
-        return _converter.structure(json.loads(payload, object_pairs_hook=_object, parse_constant=_nonfinite), target)
-    except (TypeError, AttributeError, KeyError, ValueError, ForbiddenExtraKeysError) as exc:
-        raise ValueError("invalid closed boundary payload") from exc
+def batch_matmul_nodes(graph: torch.fx.GraphModule, names: tuple[str, ...]
+                       ) -> tuple[torch.fx.GraphModule, tuple[str, ...]]:
+    """Pack independent rank-two products on a private imported FX graph.
+
+    Requiring every operand before the first product makes this local rewrite
+    topologically valid without an extra graph scheduler. Shape/type/layout
+    guards and original-source evidence are checked by the mathematical pass.
+    """
+    result = deepcopy(graph)
+    nodes = {node.name: node for node in result.graph.nodes}
+    if len(names) < 2 or len(set(names)) != len(names) or any(name not in nodes for name in names):
+        raise ValueError("matrix batching requires distinct source products")
+    products = tuple(nodes[name] for name in names)
+    ordered = tuple(result.graph.nodes)
+    if tuple(sorted(products, key=ordered.index)) != products:
+        raise ValueError("matrix batching must preserve the source product order")
+    arguments: list[tuple[torch.fx.Node, torch.fx.Node]] = []
+    available = set(ordered[:ordered.index(products[0])])
+    for product in products:
+        pair = matmul_node_arguments(product)
+        if pair is None or any(value not in available for value in pair):
+            raise ValueError("matrix batching operands must be available before all source products")
+        arguments.append(pair)
+    with result.graph.inserting_before(products[0]):
+        left = result.graph.call_function(torch.ops.aten.stack.default, ([pair[0] for pair in arguments], 0))
+        right = result.graph.call_function(torch.ops.aten.stack.default, ([pair[1] for pair in arguments], 0))
+        batch = result.graph.call_function(torch.ops.aten.bmm.default, (left, right))
+        outputs = tuple(result.graph.call_function(torch.ops.aten.select.int, (batch, 0, index))
+                        for index in range(len(products)))
+    for product, output in zip(products, outputs, strict=True):
+        product.replace_all_uses_with(output)
+        result.graph.erase_node(product)
+    result.graph.lint()
+    result.recompile()
+    return refresh_tensor_metadata(result), tuple(node.name for node in (left, right, batch, *outputs))
+
+
+class _SliceBounds(Protocol):
+    start: object
+    stop: object
+    step: object
+
+
+def _tensor_graph_search_key(graph: torch.fx.GraphModule, *, ordered: bool) -> str:
+    references: dict[torch.fx.Node, object] = {}
+
+    def argument(value: object) -> object:
+        if isinstance(value, torch.fx.Node):
+            return references[value]
+        if value is None or type(value) in (str, bool, int):
+            return value
+        if type(value) is float:
+            return {"float": value.hex()}
+        if type(value) is complex:
+            return {"complex": (value.real.hex(), value.imag.hex())}
+        if isinstance(value, (tuple, list)):
+            return {"tuple" if isinstance(value, tuple) else "list": tuple(
+                argument(v) for v in cast(tuple[object, ...] | list[object], value))}
+        if isinstance(value, dict):
+            fields = cast(dict[object, object], value)
+            if any(type(key) is not str for key in fields):
+                raise ValueError("tensor graph keyword arguments need string keys")
+            return {"dict": {cast(str, key): argument(v) for key, v in fields.items()}}
+        if isinstance(value, slice):
+            bounds = cast(_SliceBounds, value)
+            return {"slice": (argument(bounds.start), argument(bounds.stop), argument(bounds.step))}
+        if isinstance(value, (torch.dtype, torch.device, torch.layout, torch.memory_format)):
+            return {"torch_literal": str(value)}
+        raise ValueError("unsupported literal in tensor rewrite search key")
+
+    descriptors: list[object] = []
+    for node in graph.graph.nodes:
+        descriptor = (node.op, str(node.target), argument(node.args), argument(node.kwargs))
+        references[node] = {"node": len(descriptors)} if ordered else {"expression": boundary_digest(descriptor)}
+        descriptors.append(descriptor)
+    return boundary_digest(tuple(descriptors) if ordered else tuple(sorted(boundary_digest(d) for d in descriptors)))
+
+
+def tensor_graph_structure_digest(graph: torch.fx.GraphModule) -> str:
+    """Search key retaining operation order, exact sharing and the output ABI.
+
+    Generated node names are ignored. This is not algebraic evidence and never
+    substitutes for imported storage/access facts or their source digests.
+    """
+    return _tensor_graph_search_key(graph, ordered=True)
+
+
+def tensor_graph_expression_digest(graph: torch.fx.GraphModule) -> str:
+    """Prune paths that return to source expressions, ignoring independent order.
+
+    This includes all operations with multiplicity and ordered output values.
+    It is only a pruning key within the guarded private-intermediate rewrite
+    family, not an alias analysis or a general equivalence checker.
+    """
+    return _tensor_graph_search_key(graph, ordered=False)
 
 
 def load_tensor_fields(path: Path, fields: tuple[str, ...]) -> tuple[torch.Tensor, ...]:

@@ -297,6 +297,8 @@ pub(crate) struct Timeline {
     pub(crate) domains: Vec<ExecutionDomainFact>,
     #[serde(default)]
     pub(crate) transfer_links: Vec<TransferLinkFact>,
+    #[serde(default)]
+    pub(crate) region_policy: super::region_selection::Policy,
 }
 
 pub(crate) fn decode_graph(payload: &str) -> Result<SemanticGraph, String> {

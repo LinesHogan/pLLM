@@ -16,7 +16,7 @@ from pllm.execution.tensor_program import (
     TaskOutput as TaskOutput, TensorBatch as TensorBatch, TensorOperation as TensorOperation,
 )
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment, validate_backend_attachment_physical
+from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment, derive_attachment_resources, validate_backend_attachment_physical
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding as MathBinding, StateExecution, StateTaskContext as StateTaskContext
@@ -223,6 +223,9 @@ class BackendAuthoring(ABC):
         return facts.timeline
 
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
+        from pllm.contracts.region_selection import RegionSelectionPolicy
+        facts = replace(facts, timeline=replace(facts.timeline,
+            region_policy=RegionSelectionPolicy(options.allow_numerical_transforms, options.schedule_policy)))
         if options.state_memory_bytes:
             if options.state_memory_bytes > facts.state_memory_budget_bytes:
                 raise ValueError("requested state capacity exceeds available backend memory")
@@ -235,13 +238,15 @@ class BackendAuthoring(ABC):
         capabilities = tuple(sorted(set((*timeline.capabilities,
             *(("compute/cuda_graph@1",) if options.capture else ()),
             *(("compute/explicit_math@1",) if options.explicit_math else ())))))
-        timeline = replace(timeline, capabilities=capabilities, memory_budget_bytes=min(budgets, default=None))
+        timeline = replace(timeline, capabilities=capabilities, memory_budget_bytes=min(budgets, default=None),
+                           region_policy=facts.timeline.region_policy)
         graph, layouts, attachment = self.declare(replace(facts, timeline=timeline))
         timeline = derive_framework_resources(graph, timeline)
         buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
         reserved = (tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
             if buffers else timeline.reserved_bytes)
-        return replace(facts, timeline=replace(timeline, reserved_bytes=reserved))
+        timeline = derive_attachment_resources(facts.probe, graph, replace(timeline, reserved_bytes=reserved))
+        return replace(facts, timeline=timeline)
 
     @abstractmethod
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
@@ -250,7 +255,8 @@ class BackendAuthoring(ABC):
 
     def plan_backend(self, facts: BackendCompileFacts) -> SignedBackendAttachment:
         graph, layouts, attachment = self.declare(facts)
-        plan = compile_page_bundle_plan((graph, layouts), derive_framework_resources(graph, facts.timeline), facts.providers,
+        timeline = derive_attachment_resources(facts.probe, graph, derive_framework_resources(graph, facts.timeline))
+        plan = compile_page_bundle_plan((graph, layouts), timeline, facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
             facts.state_memory_budget_bytes, facts.device)
         return bind_backend_attachment(plan, facts.probe, attachment)
@@ -289,7 +295,8 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
     def bind_backend(self, facts: BackendCompileFacts, attachment: SignedBackendAttachment) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.inputs.plan
         if (attachment.inputs.probe != facts.probe
-            or plan.timeline != derive_framework_resources(plan.semantic_graph, facts.timeline)):
+            or plan.timeline != derive_attachment_resources(facts.probe, plan.semantic_graph,
+                derive_framework_resources(plan.semantic_graph, facts.timeline))):
             raise ValueError("worker backend facts differ from the original signed attachment")
         if (plan.state_decision.reserved_bytes > facts.state_memory_budget_bytes
             or any(item.max_admitted_lineages > facts.max_admitted_lineages for item in plan.state_request.states)):

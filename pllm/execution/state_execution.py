@@ -20,8 +20,9 @@ from pllm.execution.trace import ExecutionTrace, TracePhase
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
-from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, StateScope, SamplerFeedbackInputSource, TaskSymbol
+from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, SamplerFeedbackInputSource, TaskSymbol
 from pllm.contracts.state_ref import StateRef
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.state_representation import StatePhysicalPlan
 
 
@@ -47,10 +48,11 @@ class StateTaskContext(Generic[DataT]):
     invocation_id: int
     value: DataT | None = None
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]())
-    write: PageWrite | None = None
-    publication: PagePublication | None = None
-    release: PageRelease | None = None
-    publication_settled: bool = False
+    # These collections replace the single-write lifecycle. Every entry is an
+    # original arena-issued capability; no independently mutable latest map.
+    page_writes: dict[PageWrite, None] = field(default_factory=lambda: dict[PageWrite, None]())
+    page_publications: dict[PagePublication, bool] = field(default_factory=lambda: dict[PagePublication, bool]())
+    page_pins: dict[PagePin, PageRelease | None] = field(default_factory=lambda: dict[PagePin, PageRelease | None]())
     guidance: PackedSamplerGuidanceBatch | None = None
     loss: torch.Tensor | None = None
     guidance_ready: CudaStreamReadiness | None = None
@@ -62,8 +64,6 @@ class StateTaskContext(Generic[DataT]):
     trained_rows: int = 0
     replay: LayerReplayPrimitive | TokenwiseReplayPrimitive | None = None
     updated_refs: tuple[StateRef, ...] = ()
-    published_pin: PagePin | None = None
-    published_release: PageRelease | None = None
     replay_started: bool = False
     cancel_requested: Event = field(default_factory=Event)
 
@@ -72,29 +72,125 @@ class StateTaskContext(Generic[DataT]):
             raise RuntimeError("state invocation requires its input")
         return self.value
 
+    def __post_init__(self) -> None:
+        self.page_pins[self.pin] = None
+
+    @property
+    def write(self) -> PageWrite | None:
+        if len(self.page_writes) > 1:
+            raise RuntimeError("legacy write access requires a single private transition")
+        return next(iter(self.page_writes), None)
+
+    @write.setter
+    def write(self, token: PageWrite | None) -> None:
+        if token is None:
+            pending = self.write
+            if pending is not None:
+                del self.page_writes[pending]
+        else:
+            if self.page_writes:
+                raise RuntimeError("legacy write access cannot replace a private transition")
+            self.page_writes[token] = None
+
+    @property
+    def publication(self) -> PagePublication | None:
+        return next(reversed(self.page_publications), None)
+
+    @property
+    def release(self) -> PageRelease | None:
+        return self.page_pins[self.pin]
+
+    @property
+    def published_pin(self) -> PagePin | None:
+        return next((pin for pin in reversed(self.page_pins) if pin is not self.pin), None)
+
+    @property
+    def published_release(self) -> PageRelease | None:
+        pin = self.published_pin
+        return None if pin is None else self.page_pins[pin]
+
+    @property
+    def publication_settled(self) -> bool:
+        return bool(self.page_publications) and all(self.page_publications.values())
+
+    def current_owned_ref(self, original: StateRef) -> StateRef:
+        if original not in self.pin.refs:
+            raise ValueError("state lineage is outside this invocation's original pin")
+        current = original
+        for receipt in self.page_publications:
+            for before, after in zip(receipt.before_refs, receipt.after_refs, strict=True):
+                if before == current:
+                    current = after
+        return current
+
+    def check_page_execution(self) -> None:
+        if self.release is not None:
+            raise RuntimeError("state invocation has already released its original pin")
+        if self.cancel_requested.is_set():
+            raise RuntimeError("state invocation was cancelled")
+
+    def prepare_owned_write(self, sources: tuple[StateRef, ...],
+                            fields: tuple[tuple[LayoutFieldId, ...], ...]) -> PageWrite:
+        self.check_page_execution()
+        authorized = {self.current_owned_ref(ref) for ref in self.pin.refs}
+        if not set(sources) <= authorized:
+            raise ValueError("transition must extend this invocation's exact owned versions")
+        token = self.arena.prepare_transition(sources, self.pin.stream, fields=fields, copy_fields=())
+        self.page_writes[token] = None
+        return token
+
+    def publish_owned_write(self, token: PageWrite) -> PagePublication:
+        self.check_page_execution()
+        if token not in self.page_writes:
+            raise ValueError("publication requires this invocation's original private write")
+        receipt = self.arena.publish(token)
+        self.page_publications[receipt] = False
+        del self.page_writes[token]
+        self.trace.record(TracePhase.PUBLISH, self.invocation_id, refs=receipt.after_refs,
+            operation_id=receipt.operation_id)
+        return receipt
+
+    def settle_owned_publication(self, receipt: PagePublication) -> None:
+        if receipt not in self.page_publications:
+            raise ValueError("settlement requires this invocation's original receipt")
+        if not self.page_publications[receipt]:
+            self.arena.settle(receipt)
+            self.page_publications[receipt] = True
+
+    def abort_owned_writes(self) -> None:
+        for token in tuple(self.page_writes):
+            self.arena.abort(token)
+            del self.page_writes[token]
+
+    def release_owned_pin(self, pin: PagePin) -> None:
+        if pin not in self.page_pins:
+            raise ValueError("release requires this invocation's original pin")
+        if self.page_pins[pin] is None:
+            self.page_pins[pin] = self.arena.release_pin(pin)
+
     def publish(self) -> None:
-        if self.write is not None:
+        token = self.write
+        if token is not None:
             if self.publication is not None:
-                raise RuntimeError("state invocation already owns its publication receipt")
-            self.publication = self.arena.publish(self.write)
-            self.write = None
-            self.trace.record(TracePhase.PUBLISH, self.invocation_id, refs=self.publication.after_refs,
-                operation_id=self.publication.operation_id)
+                raise RuntimeError("legacy state invocation already owns its publication receipt")
+            self.publish_owned_write(token)
 
     def borrow_published(self, refs: tuple[StateRef, ...]) -> PagePin:
-        if self.publication is None or not set(refs).issubset(self.publication.after_refs):
-            raise ValueError("published borrow requires this invocation's original receipt")
-        if self.published_pin is None:
-            self.published_pin = self.arena.pin_exact(self.publication.after_refs, self.pin.stream)
-        elif not set(refs).issubset(self.published_pin.refs):
-            raise ValueError("invocation already borrowed a different publication selection")
-        return self.published_pin
+        self.check_page_execution()
+        if not refs or not all(any(ref in receipt.after_refs for receipt in self.page_publications) for ref in refs):
+            raise ValueError("published borrow requires this invocation's original receipts")
+        for pin, release in self.page_pins.items():
+            if release is None and set(refs) <= set(pin.refs):
+                return pin
+        pin = self.arena.pin_exact(refs, self.pin.stream)
+        self.page_pins[pin] = None
+        return pin
 
 
 class StateMath(Protocol[InputContra, DataT, ResultCo]):
     """Input validation and tensor mathematics, never invocation ownership."""
 
-    def initialize(self, roots: tuple[tuple[torch.Tensor, ...], ...], /) -> None: ...
+    def initialize(self, roots: tuple[tuple[torch.Tensor, ...], ...], resources: tuple[str, ...], /) -> None: ...
 
     def rows(self, value: InputContra, /) -> tuple[PackedPhaseRow, ...]: ...
 
@@ -118,9 +214,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
         for capture in self.captures:
             capture.bind(arena)
         states = arena.plan.semantic_graph.states
-        if len(states) > 1:
-            raise ValueError("tensor execution requires one logical state with any number of fields")
-        return StateExecution(arena, RequestStateDirectory(arena, states[0] if states else None),
+        return StateExecution(arena, RequestStateDirectory(arena, states),
             self.math, self.tasks, sampler_anchor_id)
 
 
@@ -179,6 +273,21 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def state_plan(self) -> StatePhysicalPlan:
         return self.arena.plan.state_physical
 
+    def implementation(self, identity: ImplementationId) -> TaskGraphImplementation[StateTaskContext[DataT]]:
+        matches = tuple(item for item in self._runner.implementations if item.implementation_id == identity)
+        if len(matches) != 1:
+            raise ValueError("implementation must name one original physical task")
+        return matches[0]
+
+    def rebind_implementation(self, implementation: TaskGraphImplementation[StateTaskContext[DataT]]) -> None:
+        """Install a locally verified lowering while no original invocation is active."""
+        with self._lock:
+            if self._active:
+                raise RuntimeError("cannot rebind a physical task during an active invocation")
+            original = self.implementation(implementation.implementation_id)
+            self._runner.implementations = tuple(implementation if item is original else item
+                                                for item in self._runner.implementations)
+
     @property
     def device(self) -> torch.device:
         return self.arena.device
@@ -186,17 +295,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def admit(self, identities: tuple[RequestIdentity, ...],
               stream: torch.cuda.Stream | None = None) -> tuple[StateRef, ...]:
         with self._lock:
-            if self.directory.state is None:
+            if not self.directory.states:
                 return ()
-            if self.directory.scope is StateScope.INSTANCE and identities:
-                refs = self.directory.admit_inference(identities, stream)
-                self.trace.record(TracePhase.ADMIT, 0, identities=identities, refs=refs)
-                return refs
             batch = self.directory.prepare_admission(identities, stream)
             try:
                 if batch.write is not None:
                     with nullcontext() if stream is None else torch.cuda.stream(stream):
-                        self.math.initialize(self.arena.writable_roots(batch.write))
+                        self.math.initialize(self.arena.writable_roots(batch.write),
+                            tuple(str(key.resource) for key in batch.keys))
                 receipt = self.directory.commit_admission(batch)
             except Exception:
                 self.directory.abort_admission(batch)
@@ -273,6 +379,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             if anchor_id > self.sampler_anchor_id and context.sampler_phase is not _SamplerPhase.COMPLETE:
                 raise RuntimeError("later anchors require sampler completion")
             try:
+                context.check_page_execution()
                 invocation.execute_anchor(anchor_id, context.pin.stream)
             except Exception as exc:
                 self._failed(invocation, context, exc)
@@ -344,9 +451,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         with self._lock:
             context = self._context(invocation)
             self._order_sampler(invocation, context.sampler_stream)
-            if context.write is not None:
-                self.arena.abort(context.write)
-                context.write = None
+            context.abort_owned_writes()
             self.trace.record(TracePhase.ABORT, invocation.invocation_id)
             self._release(invocation, context)
 
@@ -356,6 +461,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 self.cancel_step(invocation)
 
     def _failed(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT], exc: Exception) -> None:
+        context.cancel_requested.set()
         self.trace.record(TracePhase.FAILED, invocation.invocation_id,
             operation_id=None if context.publication is None else context.publication.operation_id)
         if context.publication is not None:
@@ -364,13 +470,10 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         raise exc
 
     def _release(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT]) -> None:
-        if context.published_pin is not None and context.published_release is None:
-            context.published_release = self.arena.release_pin(context.published_pin)
-        if context.release is None:
-            context.release = self.arena.release_pin(context.pin)
-        if context.publication is not None and not context.publication_settled:
-            self.arena.settle(context.publication)
-            context.publication_settled = True
+        for pin in context.page_pins:
+            context.release_owned_pin(pin)
+        for receipt in context.page_publications:
+            context.settle_owned_publication(receipt)
         self.directory.release_transition_lease(context.selection)
         self._active.pop(invocation.invocation_id)
         context.value = None
@@ -378,8 +481,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         context.loss = None
         context.guidance = context.sampler_feedback = None
         context.guidance_ready = None
+        release = context.release
+        if release is None:
+            raise RuntimeError("state settlement requires the original pin release")
         self.trace.record(TracePhase.SETTLED, invocation.invocation_id, pin_id=context.pin.pin_id,
-            release_id=context.release.release_id,
+            release_id=release.release_id,
             operation_id=None if context.publication is None else context.publication.operation_id)
         if context.publication is not None or invocation.finished:
             self._loss_count += context.loss_count
@@ -399,23 +505,19 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
-            if self.directory.state is None:
+            if not self.directory.states:
                 if self._active:
                     raise RuntimeError("stateless requests cannot retire during an invocation")
                 self.arena.collect_completed(wait=True)
                 self.trace.record(TracePhase.RETIRE, 0, identities=identities)
                 return ()
-            if self.directory.scope is StateScope.INSTANCE and identities:
-                refs = self.directory.retire_inference(identities)
-                self.trace.record(TracePhase.RETIRE, 0, identities=identities, refs=refs)
-                return refs
-            if self.directory.inference_pin_count:
+            if not identities and self.directory.inference_pin_count:
                 raise RuntimeError("instance retirement requires all inference requests to finish")
-            if self.directory.scope is StateScope.INSTANCE:
+            if not identities:
                 for invocation in tuple(self._active.values()):
-                    if None in invocation.context.selection.keys:
+                    if any(address.key is None for address in invocation.context.selection.addresses):
                         self.cancel_step(invocation)
-            else:
+            elif self.directory.request_states:
                 retiring = set(identities)
                 # Only the retiring requests' own steps cancel; requests sharing a
                 # route lineage keep running, and the lineage outlives the last

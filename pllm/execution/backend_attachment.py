@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 
 from pllm import _core
 from pllm.execution.codec import decode_boundary, encode_boundary
+from pllm.execution.region_replay import replay_region_workspace_bytes
+from pllm.execution.decoder_region import decoder_region_workspace_bytes
+from pllm.execution.tokenwise_region import compile_tokenwise_region, compile_tokenwise_source, tokenwise_attachment_bytes
+from pllm.contracts.region_program import TensorType
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
 from pllm.contracts.backend_attachment import (
     AttachmentCleanupStage,
     AttachmentKind,
@@ -20,7 +26,10 @@ from pllm.contracts.backend_attachment import (
     StreamDependency,
 )
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.semantic_graph import AnchorId, ConditionalLayerReplay, SemanticGraph, TaskSymbol, TokenwiseLayerReplay
+from pllm.contracts.semantic_graph import (
+    AnchorId, ConditionalLayerReplay, SchedulerTimeline, SemanticGraph, TaskResourceFact, TaskSymbol,
+    TokenwiseLayerReplay, ValueResourceFact,
+)
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 
@@ -52,12 +61,59 @@ def attachment_buffer_bytes(probe: BackendPlacementProbe, graph: SemanticGraph,
         match task.replay:
             case ConditionalLayerReplay(layers=replayed):
                 buffers += len(replayed) * (rows * (3 * width * hidden + 32) + 16 * width * hidden)
-            case TokenwiseLayerReplay(layer_count=layers):
-                # Embeddings, retained normal outputs/cat, mix/carry, one KV slot per layer.
-                buffers += 3 * width * rows * hidden + 16 * width * hidden + layers * (2 * width * hidden + 32)
+                buffers += replay_region_workspace_bytes(hidden, width)
+                buffers += decoder_region_workspace_bytes(hidden, width)
+            case TokenwiseLayerReplay():
+                buffers += tokenwise_attachment_bytes(hidden, width, rows)
             case None:
                 pass
     return buffers
+
+
+def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGraph,
+                                timeline: SchedulerTimeline) -> SchedulerTimeline:
+    """Fund native region candidates through the original AER workspace facts.
+
+    The current tokenwise attachment is one standalone task. Its adapter keeps
+    embeddings and output concatenation in reserved_bytes; the task workspace
+    pays for the region's tensors and recovery lifetimes at its scheduled anchor.
+    """
+    tasks = tuple(task for task in graph.tasks if isinstance(task.replay, TokenwiseLayerReplay))
+    if not tasks:
+        return timeline
+    if len(graph.tasks) != 1 or graph.states or timeline.domains or timeline.transfer_links:
+        raise ValueError("tokenwise attachment costs require the original standalone single-device task")
+    task, = tasks
+    effect = task.replay
+    if not isinstance(effect, TokenwiseLayerReplay) or probe.causal_domain is None:
+        raise ValueError("tokenwise attachment requires its original model domain")
+    tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value,
+        "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}")
+    existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
+    if existing is not None:
+        region = compile_tokenwise_source(tensor, probe.max_packed_rows, probe.causal_domain, effect,
+            source_imports=probe.region_imports, function_bodies=probe.region_bodies)
+        region.within_payload_budget(existing.workspace_bytes)
+        task_facts = timeline.task_resources
+    else:
+        region = compile_tokenwise_region(tensor, probe.max_packed_rows, probe.causal_domain, effect, timeline.region_policy,
+            stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
+            source_imports=probe.region_imports, function_bodies=probe.region_bodies)
+        maximum, = region.payload_limits
+        available = maximum.bytes
+        if timeline.memory_budget_bytes is not None:
+            available = min(available, timeline.memory_budget_bytes - max(timeline.reserved_bytes, default=0)
+                - sum(fact.resident_bytes for fact in timeline.task_resources)
+                - sum(fact.bytes for fact in timeline.value_resources))
+        funded, = region.within_payload_budget(max(0, available)).payload_limits
+        task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes))
+    # The output lives in the original adapter's concatenation reservation;
+    # the outer task runner does not allocate a second copy of this value.
+    known = {(fact.task, fact.output) for fact in timeline.value_resources}
+    values = (*timeline.value_resources, *tuple(ValueResourceFact(task.symbol, output.name, 0)
+        for output in task.outputs if (task.symbol, output.name) not in known))
+    return replace(timeline, task_resources=tuple(sorted(task_facts, key=lambda fact: fact.task)),
+        value_resources=tuple(sorted(values, key=lambda fact: (fact.task, fact.output))))
 
 
 def compile_backend_attachment(

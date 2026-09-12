@@ -10,7 +10,7 @@ from typing import Generic, TypeVar
 import torch
 
 from pllm.contracts.backend_attachment import (
-    ActivationPatchBinding, AttachmentKind, AttachmentTaskRole, BackendAttachmentSpec,
+    ActivationPatchBinding, AttachmentKind, AttachmentTaskRole, BackendAttachmentSpec, BackendPlacementProbe,
 )
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
@@ -36,6 +36,8 @@ from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.state_execution import StateTaskContext, PublishStateTask
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import ReplayStateTask, TokenwiseReplayTask, REPLAY_IMPLEMENTATION
+from pllm.execution.region_replay import ConditionalReplayRegion
+from pllm.contracts.region_program import TensorType
 
 D = TypeVar("D")
 
@@ -223,7 +225,7 @@ class Builder(Generic[D]):
                 HostPayloadSchemaId(schemas.get(output, ""))) for output in outputs), implementations, effects, replay, math)
         self.graph = replace(self.graph, tasks=tuple(sorted((*self.graph.tasks, task), key=lambda item: item.symbol)))
         if function is not None:
-            groups = 1
+            groups = changes.optimizer_fields // 5 if changes is not None and changes.optimizer is not None else 1
             copy_fields: tuple[LayoutFieldId, ...] | None = None
             if changes is not None and changes.optimizer is not None and optimizer is None:
                 config, groups = changes.optimizer, changes.optimizer_fields // 5
@@ -266,7 +268,8 @@ class Builder(Generic[D]):
             functions.append(replace(self.operations[task.symbol], implementation_id=identity, version=version))
         return tuple(functions)
 
-    def bind_all(self, plan: PlanBundle | None = None) -> tuple[TaskGraphImplementation[StateTaskContext[D]], ...]:
+    def bind_all(self, plan: PlanBundle | None = None, *,
+                 model_probe: BackendPlacementProbe | None = None) -> tuple[TaskGraphImplementation[StateTaskContext[D]], ...]:
         functions: list[TaskGraphImplementation[StateTaskContext[D]]] = list(self.bind(plan))
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
@@ -277,9 +280,26 @@ class Builder(Generic[D]):
             identity = task.implementations[0].implementation_id if plan is None else next(
                 item.implementation_id for item in plan.schedule_physical.tasks if graph.tasks[item.task_id] is task)
             if isinstance(task.replay, ConditionalLayerReplay):
-                functions.append(ReplayStateTask[D](task, identity))
+                if plan is None or self.dimensions is None:
+                    raise ValueError("conditional replay requires a specialized backend plan")
+                placements = {(r.device_kind.value, r.device_ordinal) for r in plan.state_physical.representations}
+                if len(placements) != 1:
+                    raise ValueError("conditional replay requires one original state device")
+                kind, ordinal = next(iter(placements))
+                tensor = TensorType((1, self.dimensions.hidden_size), "torch." + self.dimensions.dtype.value,
+                    "cpu" if kind == "cpu" else f"cuda:{ordinal}")
+                functions.append(ReplayStateTask[D](task, ConditionalReplayRegion(tensor, task.replay), identity))
             elif isinstance(task.replay, TokenwiseLayerReplay):
-                functions.append(TokenwiseReplayTask[D](task, identity))
+                if plan is None or model_probe is None or model_probe.causal_domain is None:
+                    raise ValueError("tokenwise replay requires a specialized backend plan and model layout")
+                tensor = TensorType((1, model_probe.hidden_size), "torch." + model_probe.tensor_dtype.value,
+                    "cpu" if model_probe.device_kind.value == "cpu" else f"cuda:{model_probe.device_ordinal}")
+                workspace = next((fact.workspace_bytes for fact in plan.timeline.task_resources if fact.task == task.symbol), None)
+                if workspace is None:
+                    raise ValueError("tokenwise replay requires its original signed task workspace")
+                functions.append(TokenwiseReplayTask[D].bind(task, tensor, model_probe.max_packed_rows,
+                    model_probe.causal_domain, identity, plan.timeline.region_policy, workspace,
+                    source_imports=model_probe.region_imports, function_bodies=model_probe.region_bodies))
             elif any(effect.kind is StateEffectKind.PUBLISH for effect in task.effects):
                 functions.append(PublishStateTask[D](identity))
             else:

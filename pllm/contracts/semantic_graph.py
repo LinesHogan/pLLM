@@ -9,6 +9,7 @@ from typing import Literal, NewType
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.state_representation import ExecutionDomainId, StateDeviceKind
+from pllm.contracts.region_selection import RegionSelectionPolicy
 
 
 WorkloadId = NewType("WorkloadId", str)
@@ -299,6 +300,7 @@ class SchedulerTimeline:
     reserved_bytes: tuple[int, ...] = ()
     domains: tuple[ExecutionDomainFact, ...] = ()
     transfer_links: tuple[TransferLinkFact, ...] = ()
+    region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
 
 
 

@@ -700,10 +700,13 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
 
     def _functions(self, b: TensorBinding, device: torch.device, seed: int) -> FunctionMath[TensorStepInput, TensorFrame, TensorOutput]:
         generator = torch.Generator(device=device).manual_seed(seed)
-        def initialize(roots: Roots) -> None:
-            for root in roots:
-                for init in b.initializers:
-                    init(root, generator)
+        def initializer(resource: str) -> Callable[[Roots], None]:
+            init = b.initializers.get(resource)
+            def initialize(roots: Roots) -> None:
+                if init is not None:
+                    for root in roots:
+                        init(root, generator)
+            return initialize
         def output(data: TensorFrame, invocation: InvocationOutput) -> TensorOutput:
             return invocation.value
         if b.graph.states:
@@ -717,7 +720,8 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             if b.attachment is not None and b.attachment.kind is AttachmentKind.ACTIVATION_PATCH:
                 return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             return value.rows.request_rows if b.overlay_targets else value.rows.decode_rows
-        return FunctionMath(initialize, rows, b.bind_prepare(), output)
+        return FunctionMath({str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
+            rows, b.bind_prepare(), output)
 
     def bind_math(self, facts: BackendCompileFacts, plan: PlanBundle) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         owner = _snapshot(self)
@@ -736,7 +740,8 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                    b: TensorBinding) -> MathBinding[TensorStepInput, TensorFrame, TensorOutput]:
         if plan.timeline.task_resources:
             self.require_resources(plan, self.minimum_resources(facts, plan))
-        return MathBinding(self._functions(b, facts.device, facts.initialization_seed), b.bind_all(plan))
+        return MathBinding(self._functions(b, facts.device, facts.initialization_seed),
+            b.bind_all(plan, model_probe=facts.probe))
 
     def declare_host(self, facts: HostRuntimeFacts) -> TensorHostBinding[TensorStepInput, TensorFrame, TensorOutput]:
         b = TensorBinding(self.name, boundary_digest(getattr(self, "config", ()), facts.hidden_size, facts.initialization_seed),

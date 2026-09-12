@@ -26,10 +26,12 @@ from pllm.workloads.esamp_request import ESampRequestConfig
 from pllm.workloads.tlm import HfQvConfig, HfQvModel, TLMConfig, TLMWorkload
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
+from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
 from pllm.config import ExecutionOptions, RunnerKind, ModelConfig, VllmDType
 from pllm.backends.vllm.runtime import BackendCommand, VllmLlm
 from pllm.contracts.backend_attachment import ActivationPatchOperator, AttachmentTopology
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.region_imports import BorrowedTensorImport, ExportedTensorImport, FunctionalKernelImport, NativeKernelImport
 from pllm.execution.trace import TracePhase, TraceSelection
 from pllm.contracts.semantic_graph import StateScope
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
@@ -286,6 +288,53 @@ def _independent_lora_input() -> None:
         handle.close()
 
 
+def _recirculation_schedules() -> None:
+    assert not torch.cuda.is_initialized()
+    handle = pllm.make_llm(workload=RecirculationWorkload(RecirculationConfig(
+        source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)),
+        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
+            64, 2, 64, 0.25, seed=7, multiprocessing=True))
+    try:
+        selection = handle.region_selection
+        assert selection is not None and len(selection.candidates) > 1
+        imports = handle.attachment.inputs.probe.region_imports
+        assert any(isinstance(item, ExportedTensorImport) for item in imports)
+        assert any(isinstance(item, BorrowedTensorImport) for item in imports)
+        assert any(isinstance(item, FunctionalKernelImport) and item.implementation.startswith("vllm.export-kernel@1:") for item in imports)
+        assert len(handle.attachment.inputs.probe.region_bodies) == 2
+        assert all(candidate.feasible and candidate.median_ns is not None for candidate in selection.candidates)
+        parallel_candidates = tuple(index for index, candidate in enumerate(selection.candidates)
+            if any(limit.bytes > next(device.peak_bytes_upper_bound for device in candidate.payload.devices
+                                      if device.device == limit.device) for limit in candidate.peak_bytes))
+        assert parallel_candidates, "the model catalog must carry funded concurrent scratch through EngineCore"
+        transformed_candidates = tuple(index for index, candidate in enumerate(selection.candidates)
+            if candidate.changed_functions)
+        assert transformed_candidates, "the worker must measure source-derived tensor implementations"
+        assert handle.trace_snapshot().events == ()
+        prompts = ["The sky is", "Water freezes at"]
+        sampling = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
+        first = handle.generate(prompts, sampling)
+        second = handle.generate(prompts, sampling)
+        tokens = lambda results: tuple(tuple(output.outputs[0].token_ids) for output in results)
+        assert tokens(first) == tokens(second) and all(len(ids) == 2 for ids in tokens(first))
+        replay = tuple(event for event in handle.trace_snapshot().events if event.phase is TracePhase.REPLAY)
+        assert replay and {event.row.identity.prompt_idx for event in replay} == {0, 1, 2, 3}
+        diagnostics = handle.worker_state().diagnostics
+        assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
+        assert not torch.cuda.is_initialized()
+        print(dict(engine_core=True, selected=selection.selected,
+            measured_ns=tuple(candidate.median_ns for candidate in selection.candidates),
+            parallel_candidates=parallel_candidates,
+            transformed_candidates=transformed_candidates,
+            kernel_imports=tuple(kernel.implementation.split(":")[0] for kernel in handle.attachment.inputs.probe.region_imports
+                                 if isinstance(kernel, (NativeKernelImport, FunctionalKernelImport))),
+            source_bodies=len(handle.attachment.inputs.probe.region_bodies),
+            replay_rows=len(replay),
+            parent_cuda=False, fallback=0))
+    finally:
+        handle.close()
+
+
 def _fttt_activation_retry() -> None:
     handle = pllm.make_llm(workload=ActivationWorkload(ActivationConfig((23,), rank=1,
         first_tokens=0, last_tokens=1, operator=ActivationPatchOperator.ADD, scope=StateScope.REQUEST)),
@@ -425,6 +474,8 @@ if __name__ == "__main__":
         _independent_lora_input()
     elif sys.argv[1:] == ["--edit-only"]:
         _fttt_activation_retry()
+    elif sys.argv[1:] == ["--recirculation-only"]:
+        _recirculation_schedules()
     elif sys.argv[1:] == ["--dummy-only"]:
         _dummy_export()
     elif sys.argv[1:] == ["--user-only"]:

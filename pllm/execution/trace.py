@@ -171,10 +171,10 @@ class ExecutionTrace:
         self._execution_id = uuid4().hex
         self._events: deque[tuple[TraceEvent, tuple[torch.cuda.Event, torch.cuda.Event] | None]] = deque(maxlen=capacity)
         self._timed_tasks: frozenset[TaskId] = frozenset()
-        self._selection = TraceSelection()
-        self._kernel_calls = 0
-        self._sequence = 0
-        self._dropped = 0
+        self._selection: TraceSelection = TraceSelection()
+        self._kernel_calls: int = 0
+        self._sequence: int = 0
+        self._dropped: int = 0
         self._lock = Lock()
 
     def configure(self, selection: TraceSelection) -> None:
@@ -182,6 +182,25 @@ class ExecutionTrace:
             raise ValueError("observation selection is outside the original physical plan")
         with self._lock:
             self._selection, self._kernel_calls = selection, selection.kernel_calls
+
+    @contextmanager
+    def private(self) -> Generator[None, None, None]:
+        """Record isolated cold calls without changing the public observation log.
+
+        The caller must own an idle execution for the whole scope. The recorder
+        identity stays unchanged, including its effect namespace in Region IR.
+        """
+        with self._lock:
+            saved = (self._events, self._sequence, self._dropped, self._timed_tasks, self._selection, self._kernel_calls)
+            self._events = deque(maxlen=self._events.maxlen)
+            self._sequence = self._dropped = self._kernel_calls = 0
+            self._timed_tasks, self._selection = frozenset(), TraceSelection()
+        try:
+            yield
+        finally:
+            with self._lock:
+                (self._events, self._sequence, self._dropped, self._timed_tasks,
+                 self._selection, self._kernel_calls) = saved
 
     @property
     def observing(self) -> bool:

@@ -3,6 +3,8 @@ from collections.abc import Callable, Sequence
 import torch
 from torch.nn import Module, Parameter
 from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.attention import Attention
 
 
 _LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
@@ -18,17 +20,8 @@ class Qwen2DownProjection(Module):
 
 class Qwen2MLP(Module):
     down_proj: Qwen2DownProjection
-    forward: Callable[[Qwen2MLP, torch.Tensor], torch.Tensor]
 
-
-class Attention(Module):
-    impl: object
-    kv_cache: torch.Tensor
-    kv_cache_dtype: str
-    kv_sharing_target_layer_name: str | None
-    num_kv_heads: int
-    head_size: int
-    layer_name: str
+    def forward(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
 class Qwen2Attention(Module):
@@ -37,23 +30,23 @@ class Qwen2Attention(Module):
     q_size: int
     kv_size: int
 
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor: ...
+
 
 class Qwen2DecoderLayer(Module):
     mlp: Qwen2MLP
     self_attn: Qwen2Attention
+    input_layernorm: RMSNorm
+    post_attention_layernorm: RMSNorm
     forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
 
 
 class Qwen2Model(Module):
     layers: Sequence[Qwen2DecoderLayer]
-    norm: Qwen2Norm
+    norm: RMSNorm
     forward: Callable[[torch.Tensor | None, torch.Tensor, IntermediateTensors | None, torch.Tensor | None], torch.Tensor | IntermediateTensors]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor: ...
-
-
-class Qwen2Norm(Module):
-    def forward(self, hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 class Qwen2ModelConfig:

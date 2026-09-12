@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 
 class VllmDType(StrEnum):
@@ -23,8 +24,12 @@ class ExecutionOptions:
     explicit_math: bool = False
     state_memory_bytes: int = 0  # Zero uses the backend's observed available capacity.
     memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
+    allow_numerical_transforms: bool = True
+    schedule_policy: Literal["auto", "serial"] = "auto"
 
     def __post_init__(self) -> None:
+        if self.schedule_policy not in ("auto", "serial"):
+            raise ValueError("schedule_policy must be auto or serial")
         if (self.training_rows < 1 or self.capture_memory_bytes < 1 or self.state_memory_bytes < 0
             or self.memory_budget_bytes is not None and self.memory_budget_bytes < 0):
             raise ValueError("training rows/capture capacity must be positive and memory limits nonnegative")

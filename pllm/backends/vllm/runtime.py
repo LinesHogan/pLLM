@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, overload
 from types import TracebackType
 
@@ -23,6 +24,11 @@ from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionCapture, CompletionInput
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.trace import ExecutionTrace, TraceSelection, TraceSnapshot, TRACE_SCHEMA_VERSION
+from pllm.execution.tokenwise_tuning import TokenwiseTuning
+from pllm.execution.tokenwise_region import compile_tokenwise_region
+from pllm.contracts.region_program import TensorType
+from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
+from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, CompletionFeedback, FinishReason, RetryAction
 
 from pllm.execution.backend_attachment import (
@@ -33,6 +39,8 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.replay import VllmLayerReplay, VllmTokenwiseReplay
+from pllm.backends.vllm.region_kernels import qwen_region_kernels
+from pllm.backends.vllm.region_layers import VllmDecoderBodies
 from pllm.backends.vllm.parameter_overlay import (
     VllmParameterOverlay,
     inspect_parameter_targets,
@@ -52,6 +60,7 @@ from pllm.contracts.backend_attachment import (
     AttachmentKind,
     AttachmentTopology,
     BackendPlacementProbe,
+    CausalModelDomain,
     SignedBackendAttachment,
 )
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
@@ -95,6 +104,7 @@ _BACKEND_ABI_FIELDS = (
     "rows=one_logit_per_request",
     "attachment=shared_plan_v7",
     "attachments=sampler_training|parameter_overlay|activation_patch",
+    "model=causal_indexed_layer@5",
 )
 _REQUEST_CAPABILITIES = (
     "producer/packed_hidden@1",
@@ -157,6 +167,10 @@ class _RunnerSession(Protocol):
     def retire_all(self) -> None: ...
     def close(self) -> None: ...
     def diagnostics(self) -> StateDiagnostics: ...
+    def begin_tuning(self, proposals: tuple[RegionScheduleProposal, ...]) -> int: ...
+    def tuning_candidate(self, index: int) -> None: ...
+    def finish_tuning(self, samples: tuple[tuple[int, ...], ...]) -> RegionSelection: ...
+    def abort_tuning(self) -> None: ...
     @property
     def attachment(self) -> SignedBackendAttachment: ...
 
@@ -204,11 +218,14 @@ class VllmSession(Generic[DataT, ResultT]):
         self._replay: VllmLayerReplay | VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
             task, = tasks
+            if probe.causal_domain is None or probe.causal_domain.layers != len(model.model.layers):
+                raise ValueError("backend replay requires its signed causal model domain")
             if isinstance(task.replay, ConditionalLayerReplay) and self._overlay is not None:
-                self._replay = VllmLayerReplay(model, task.replay, self._overlay)
+                self._replay = VllmLayerReplay(model, task.replay, self._overlay, probe.causal_domain)
             elif isinstance(task.replay, TokenwiseLayerReplay):
                 self._replay = VllmTokenwiseReplay(model, task, deployment.execution,
-                    attachment.inputs.request.task_bindings[0].anchor_id)
+                    attachment.inputs.request.task_bindings[0].anchor_id, source_imports=probe.region_imports,
+                    function_bodies=probe.region_bodies)
             else:
                 raise ValueError("backend replay does not match its signed primitives")
         self._sampler = sampler
@@ -217,11 +234,14 @@ class VllmSession(Generic[DataT, ResultT]):
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
         self._auxiliary: AuxiliaryInput[torch.Tensor] | None = None
+        self._tuning: TokenwiseTuning[TensorStepInput, DataT, ResultT] | None = None
         execution = deployment.execution
         if execution.directory.scope is StateScope.INSTANCE:
             execution.admit((), torch.cuda.current_stream(execution.device))
 
     def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None:
+        if self._tuning is not None and batch is not None:
+            raise ValueError("private native tuning cannot consume user auxiliary input")
         if self._auxiliary is not None or self._step is not None or self._pending_identities or self._identities:
             raise RuntimeError("prior canonical training input is still active")
         validate_auxiliary(batch, self._deployment.attachment.inputs.plan, SharedTensor.describe)
@@ -237,6 +257,47 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def diagnostics(self) -> StateDiagnostics:
         return self._deployment.execution.diagnostics()
+
+    def _require_tuning_idle(self) -> None:
+        if self._step is not None or self._identities or self._pending_identities or self._auxiliary is not None:
+            raise RuntimeError("native tuning requires all original requests to finish and retire")
+
+    def begin_tuning(self, proposals: tuple[RegionScheduleProposal, ...]) -> int:
+        self._require_tuning_idle()
+        if self._tuning is not None or self._next_step_id != 0:
+            raise RuntimeError("native tuning is only available before the first request")
+        if (not isinstance(self._replay, VllmTokenwiseReplay)
+            or self.attachment.inputs.plan.semantic_graph.states
+            or self.attachment.inputs.plan.timeline.region_policy.schedule_policy == "serial"):
+            return 0
+        identity = self.attachment.inputs.request.task_bindings[0].implementation_id
+        tuning = TokenwiseTuning(self._deployment.execution, identity, proposals,
+            stream_lanes=2 if REGION_STREAMS_CAPABILITY in self.attachment.inputs.probe.capabilities else 1)
+        if tuning.count == 1:
+            tuning.abort()
+            return 0
+        self._tuning = tuning
+        return tuning.count
+
+    def tuning_candidate(self, index: int) -> None:
+        self._require_tuning_idle()
+        if self._tuning is None:
+            raise RuntimeError("native tuning has not started")
+        self._tuning.candidate(index)
+
+    def finish_tuning(self, samples: tuple[tuple[int, ...], ...]) -> RegionSelection:
+        self._require_tuning_idle()
+        if self._tuning is None:
+            raise RuntimeError("native tuning has not started")
+        result = self._tuning.finish(samples)
+        self._tuning = None
+        return result
+
+    def abort_tuning(self) -> None:
+        self._require_tuning_idle()
+        if self._tuning is not None:
+            self._tuning.abort()
+            self._tuning = None
 
     @property
     def sampler(self) -> SamplerGuidance:
@@ -281,6 +342,8 @@ class VllmSession(Generic[DataT, ResultT]):
         return self._next_step_id
 
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
+        if self._tuning is not None:
+            self._tuning.record_rows(rows.row_batch.rows)
         if self._step is not None:
             raise RuntimeError("canonical input preparation overlaps a step")
         if rows.step_id != self._next_step_id or rows.plan_epoch != self.attachment.physical.plan_epoch:
@@ -329,7 +392,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._activation is not None:
             self._activation.prepare(rows.row_batch, invocation.context, execution.directory)
         if isinstance(self._replay, VllmLayerReplay):
-            self._replay.prepare(rows.row_batch)
+            self._replay.prepare(rows.row_batch, invocation.context)
             invocation.context.replay = self._replay
 
     def complete_forward(self) -> None:
@@ -447,6 +510,7 @@ class VllmSession(Generic[DataT, ResultT]):
     def close(self) -> None:
         self.abort_active()
         self.retire_all()
+        self.abort_tuning()
         execution = self._deployment.execution
         if execution.directory.scope is StateScope.INSTANCE:
             execution.retire(())
@@ -705,6 +769,10 @@ class BackendCommand(StrEnum):
     PROFILE = "profile_tasks"
     OBSERVE = "observe"
     DETACH = "detach"
+    TUNE_BEGIN = "tune_begin"
+    TUNE_CANDIDATE = "tune_candidate"
+    TUNE_FINISH = "tune_finish"
+    TUNE_ABORT = "tune_abort"
 
 
 @dataclass(frozen=True, slots=True)
@@ -742,6 +810,63 @@ class VllmLlm(Generic[DataT, ResultT]):
     _closed: bool = False
     _next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
+    region_selection: RegionSelection | None = None
+
+    def tune_native_schedules(self) -> None:
+        if (self.attachment.inputs.plan.timeline.region_policy.schedule_policy == "serial"
+            or not any(isinstance(task.replay, TokenwiseLayerReplay)
+                       for task in self.attachment.inputs.plan.semantic_graph.tasks)):
+            return
+        task = next(task for task in self.attachment.inputs.plan.semantic_graph.tasks
+                    if isinstance(task.replay, TokenwiseLayerReplay))
+        probe = self.attachment.inputs.probe
+        if not isinstance(task.replay, TokenwiseLayerReplay) or probe.causal_domain is None:
+            raise ValueError("native tuning requires its signed causal model domain")
+        tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value, str(self._facts.device))
+        budget = next(fact.workspace_bytes for fact in self.attachment.inputs.plan.timeline.task_resources
+                      if fact.task == task.symbol)
+        proposals = compile_tokenwise_region(tensor, probe.max_packed_rows, probe.causal_domain, task.replay,
+            self.attachment.inputs.plan.timeline.region_policy,
+            stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
+            source_imports=probe.region_imports, function_bodies=probe.region_bodies).within_payload_budget(budget).candidate_proposals
+        count = decode_boundary(self.command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals), timeout=600.0), int)
+        if not count:
+            return
+        prompt_index = self._next_prompt_index
+        completed = False
+        try:
+            probe = self.attachment.inputs.probe
+            if probe.causal_domain is None or probe.causal_domain.positions < 2:
+                raise ValueError("native prefill tuning requires room for a prompt and one output")
+            length = min(8, probe.max_packed_rows, probe.causal_domain.positions - 1)
+            prompt = " ".join("a" for _ in range(length))
+            sampling = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
+            baseline: tuple[tuple[int, ...], ...] | None = None
+            samples: list[list[int]] = [[] for _ in range(count)]
+            # Warm every candidate before scoring any of them. Rotate the
+            # measurement order so the reference is not always timed first.
+            # Candidate binding and RPC stay outside completed generate time.
+            for trial in range(3):
+                for offset in range(count):
+                    index = (offset + trial) % count
+                    self.command(BackendCommand.TUNE_CANDIDATE, encode_boundary(index), timeout=600.0)
+                    started = perf_counter_ns()
+                    outputs = self.generate([prompt], sampling)
+                    finished = perf_counter_ns() - started
+                    tokens = tuple(tuple(output.token_ids) for request in outputs for output in request.outputs)
+                    if baseline is None:
+                        baseline = tokens
+                    elif tokens != baseline:
+                        raise RuntimeError("native schedule changed the private sample's greedy output")
+                    if trial:
+                        samples[index].append(finished)
+            self.region_selection = decode_boundary(self.command(BackendCommand.TUNE_FINISH,
+                encode_boundary(tuple(tuple(elapsed) for elapsed in samples)), timeout=600.0), RegionSelection)
+            completed = True
+        finally:
+            if not completed and not self._closed:
+                self.command(BackendCommand.TUNE_ABORT)
+            self._next_prompt_index = prompt_index
 
     def _require_llm(self) -> LLM:
         if self._closed or self._llm is None:
@@ -795,8 +920,8 @@ class VllmLlm(Generic[DataT, ResultT]):
             raise RuntimeError("the execution and arena belong to the EngineCore child")
         return self._deployment
 
-    def command(self, command: BackendCommand, payload: str = "") -> str:
-        replies = self._require_llm().collective_rpc("workload_command", timeout=30.0, args=(command.value, payload))
+    def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> str:
+        replies = self._require_llm().collective_rpc("workload_command", timeout=timeout, args=(command.value, payload))
         if len(replies) != 1:
             self._shutdown()
             raise RuntimeError("canonical worker quorum differs from the signed single-worker topology")
@@ -1170,6 +1295,7 @@ def create_vllm_llm(
             deployment = workload.compile_backend(facts)
             runner.attach_workload(deployment)
             handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
+        handle.tune_native_schedules()
         construction.pop_all()
         return handle
 
@@ -1209,7 +1335,7 @@ def probe_backend(
     hidden_resources = tuple(sorted((AttachmentHiddenResource(_hidden_binding(source, layer_count), source.phase)
         for source in requirements.hidden_inputs), key=lambda resource: resource.resource_key))
     targets = inspect_parameter_targets(model, requirements.parameter_targets, runner.dtype)
-    replay_capabilities = ("model/layer_replay@1", "model/tokenwise_replay@1") if runner.runner_kind is RunnerKind.MRV2 else ()
+    replay_capabilities = ("model/layer_replay@1", "model/tokenwise_replay@1", REGION_STREAMS_CAPABILITY) if runner.runner_kind is RunnerKind.MRV2 else ()
     probe = _base_probe(runner,
         model_fingerprint=_digest((
             f"model={runner.model_config.model}", f"revision={runner.model_config.revision or ''}",
@@ -1220,9 +1346,18 @@ def probe_backend(
             *(f"activation_layer={layer}" for layer in requirements.activation_layers),
             *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in targets),
         )),
-        hidden_size=model.config.hidden_size, hidden_resources=hidden_resources,
+        hidden_size=model.config.hidden_size, layer_count=layer_count, hidden_resources=hidden_resources,
         capabilities=tuple(sorted(set((*_REQUEST_CAPABILITIES, *_OVERLAY_CAPABILITIES, *replay_capabilities,
             f"backend/vllm_{runner.runner_kind.value}@1")))))
+    if runner.runner_kind is RunnerKind.MRV2:
+        probe = replace(probe, region_imports=qwen_region_kernels(model.model.norm,
+            TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), layer_count))
+        if (probe.causal_domain is not None and not requirements.hidden_inputs
+            and not requirements.parameter_targets and not requirements.activation_layers):
+            bodies = VllmDecoderBodies.inspect(tuple(model.model.layers),
+                TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), probe.causal_domain, probe.max_packed_rows)
+            if bodies is not None:
+                probe = replace(probe, region_bodies=bodies.definitions, region_imports=(*probe.region_imports, *bodies.imports))
     observed = RuntimeFacts(runner.device).timeline((
         "state/dense_page_cuda@1", "state/fenced_reclaim@1", "transition/full_root@1", "optimizer/adamw@1",
         *replay_capabilities,
@@ -1270,6 +1405,7 @@ def _base_probe(
     *,
     model_fingerprint: str,
     hidden_size: int,
+    layer_count: int,
     hidden_resources: tuple[AttachmentHiddenResource, ...],
     capabilities: tuple[str, ...],
 ) -> BackendPlacementProbe:
@@ -1301,6 +1437,7 @@ def _base_probe(
         max_packed_rows=runner.max_num_tokens,
         hidden_resources=hidden_resources,
         capabilities=capabilities,
+        causal_domain=CausalModelDomain(runner.max_num_reqs, layer_count, runner.model_config.max_model_len),
     )
 
 

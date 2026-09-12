@@ -1,0 +1,329 @@
+"""Bind region effects to the original PTTS and backend invocation capabilities."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
+from math import prod
+from typing import Protocol
+
+import torch
+
+from pllm.contracts.region_program import (
+    AccessMode, AffineIndex, resolve_extent, bind_sizes, BankType, BorrowedResource, DataType, ExternalResource,
+    Function, Program, Resource, TensorType,
+)
+from pllm.contracts.state_ref import LineageId, StateRef
+from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport
+from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
+from pllm.execution.region_values import Bank, Data, check_data
+from pllm.execution.paged_access import PagedResourceView, validate_paged_views
+from pllm.execution.tensor_borrow import ReadonlyTensorView, validate_readonly_views
+from pllm.execution.host_borrow import HostResourceView, validate_host_views
+
+
+class RegionPageOwner(Protocol):
+    """Implemented by the original StateTaskContext, including its failure path."""
+
+    @property
+    def arena(self) -> PageBundleArena: ...
+    @property
+    def pin(self) -> PagePin: ...
+    def current_owned_ref(self, original: StateRef) -> StateRef: ...
+    def check_page_execution(self) -> None: ...
+    def prepare_owned_write(self, sources: tuple[StateRef, ...],
+                            fields: tuple[tuple[LayoutFieldId, ...], ...]) -> PageWrite: ...
+    def publish_owned_write(self, token: PageWrite) -> PagePublication: ...
+    def settle_owned_publication(self, receipt: PagePublication) -> None: ...
+    def borrow_published(self, refs: tuple[StateRef, ...]) -> PagePin: ...
+    def release_owned_pin(self, pin: PagePin) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResourcePageCell:
+    resource: str
+    indices: tuple[int, ...]
+    original: StateRef
+    fields: tuple[LayoutFieldId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PagedResourceBinding:
+    """Bind a verified view to the original invocation, without owning its KV."""
+
+    view: PagedResourceView
+    owner: RegionPageOwner
+
+
+@dataclass(frozen=True, slots=True)
+class ReadonlyResourceBinding:
+    view: ReadonlyTensorView
+    owner: RegionPageOwner
+
+
+@dataclass(frozen=True, slots=True)
+class HostResourceBinding:
+    view: HostResourceView
+    owner: RegionPageOwner
+
+
+def _tensor_types(type_: DataType, sizes: Mapping[str, int]) -> Iterator[TensorType]:
+    if isinstance(type_, TensorType):
+        yield type_
+    elif isinstance(type_, BankType):
+        for _ in range(resolve_extent(type_.size, sizes)):
+            yield from _tensor_types(type_.element, sizes)
+    else:
+        raise ValueError("page payloads require tensors or banks of tensors")
+
+
+def _tensors(value: Data) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, Bank):
+        for element in value.elements:
+            yield from _tensors(element)
+    else:
+        raise ValueError("page payload contains a non-tensor value")
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalFunction:
+    """One invocation's imported endpoint, borrowing the backend's original owner."""
+
+    declaration: Function
+    function: Callable[[tuple[Data, ...]], tuple[Data, ...]]
+    implementation: NativeKernelImport | None = None
+
+    def __post_init__(self) -> None:
+        if self.implementation is not None and self.implementation.declaration != self.declaration:
+            raise ValueError("external kernel implementation differs from its source declaration")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundResourceAccess:
+    resource: str
+    mode: AccessMode
+    ranges: tuple[tuple[int, int], ...]
+
+
+class RegionResources:
+    """Immutable page mappings and external endpoints, without resource ownership.
+
+    Binding names cannot prove independence: different logical cells must have
+    distinct physical lineages. Multiple fields in one cell publish atomically.
+    """
+
+    def __init__(self, program: Program, owner: RegionPageOwner,
+                 cells: tuple[ResourcePageCell, ...], externals: tuple[ExternalFunction, ...] = (), *,
+                 sizes: Mapping[str, int] = {}, borrows: tuple[PagedResourceBinding | ReadonlyResourceBinding | HostResourceBinding, ...] = (),
+                 tensor_borrows: tuple[BorrowedTensorImport, ...] = ()) -> None:
+        sizes = bind_sizes(program, sizes)
+        self._sizes = sizes
+        owner.check_page_execution()
+        resources = {r.name: r for r in program.resources if isinstance(r, Resource)}
+        mappings: dict[tuple[str, tuple[int, ...]], ResourcePageCell] = {}
+        lineages: set[LineageId] = set()
+        for cell in cells:
+            if cell.resource not in resources:
+                raise ValueError("page binding names an undeclared resource")
+            spec = resources[cell.resource]
+            if len(cell.indices) != len(spec.domain) or any(type(i) is not int or not 0 <= i < n
+                    for i, n in zip(cell.indices, spec.domain, strict=True)):
+                raise ValueError("page binding lies outside the logical resource domain")
+            key = (cell.resource, cell.indices)
+            if key in mappings or cell.original.lineage_id in lineages:
+                raise ValueError("logical resource cells alias the same physical lineage")
+            if cell.original not in owner.pin.refs:
+                raise ValueError("page binding is outside the invocation's original pin")
+            types = tuple(t for type_ in spec.payload for t in _tensor_types(type_, sizes))
+            if (not cell.fields or len(types) != len(cell.fields) or cell.fields != tuple(sorted(set(cell.fields)))
+                or any(type(f) is not int or f < 0 or f >= len(owner.arena.root(cell.original).pages) for f in cell.fields)):
+                raise ValueError("page payload fields must be complete, nonempty and ordered")
+            for field, type_ in zip(cell.fields, types, strict=True):
+                # The issued pin validates membership; inspect only metadata.
+                value = owner.arena.borrow_field(owner.pin, cell.original, field)
+                check_data(value, type_, self._sizes)
+            mappings[key] = cell
+            lineages.add(cell.original.lineage_id)
+        if len(mappings) != sum(prod(r.domain) for r in resources.values()):
+            raise ValueError("page bindings must cover every logical resource cell")
+        self._resources = program.resources
+        self._owner = owner
+        self._cells = mappings
+        self._types = {r.name: r.payload for r in resources.values()}
+        borrowed = {r.name: r for r in program.resources if isinstance(r, BorrowedResource)}
+        views = {binding.view.resource.name: binding.view for binding in borrows}
+        if len(views) != len(borrows) or set(views) != set(borrowed):
+            raise ValueError("borrowed resource proofs must be complete and exact")
+        if any(binding.owner is not owner or binding.view.resource != borrowed[binding.view.resource.name] for binding in borrows):
+            raise ValueError("borrowed resource proof belongs to different source storage or invocation")
+        if views:
+            paged = tuple(binding.view for binding in borrows if isinstance(binding, PagedResourceBinding))
+            readonly = tuple(binding.view for binding in borrows if isinstance(binding, ReadonlyResourceBinding))
+            host = tuple(binding.view for binding in borrows if isinstance(binding, HostResourceBinding))
+            validate_paged_views(paged, owner.arena.allocation_ranges)
+            validate_readonly_views(readonly, paged, owner.arena.allocation_ranges)
+            validate_host_views(host)
+        self._borrows = views
+        external_names = {r.name for r in program.resources if isinstance(r, (ExternalResource, BorrowedResource))}
+        expected = {f.name: f for f in program.functions if external_names.intersection(f.resources)}
+        self._external_declarations = expected
+        self._tensor_borrows = {item.declaration.name: item for item in tensor_borrows}
+        if len(self._tensor_borrows) != len(tensor_borrows):
+            raise ValueError("tensor borrowing repeats a source declaration")
+        for item in tensor_borrows:
+            item.validate()
+            if (expected.get(item.declaration.name) != item.declaration
+                or not isinstance(views.get(item.declaration.resources[0]), ReadonlyTensorView)):
+                raise ValueError("tensor borrowing requires its declared original read-only resource")
+        expected = {name: function for name, function in expected.items() if name not in self._tensor_borrows}
+        functions = {f.declaration.name: f for f in externals}
+        if len(functions) != len(externals) or set(functions) != set(expected):
+            raise ValueError("external function bindings must be complete and exact")
+        for name, function in functions.items():
+            if function.declaration != expected[name]:
+                raise ValueError("external function differs from its source declaration")
+        self._externals = functions
+
+    def validate(self, program: Program, sizes: Mapping[str, int] = {}) -> None:
+        if self._sizes != bind_sizes(program, sizes):
+            raise ValueError("resource bindings belong to different size parameters")
+        if self._resources != program.resources:
+            raise ValueError("resource bindings belong to different source resources")
+        names = {r.name for r in program.resources if isinstance(r, (ExternalResource, BorrowedResource))}
+        if self._external_declarations != {f.name: f for f in program.functions if names.intersection(f.resources)}:
+            raise ValueError("external bindings belong to different source declarations")
+        self._owner.check_page_execution()
+
+    def scope(self) -> AbstractContextManager[None]:
+        stream = self._owner.pin.stream
+        return nullcontext() if stream is None else torch.cuda.stream(stream)
+
+    def validate_readonly_tuning(self, program: Program, sizes: Mapping[str, int]) -> None:
+        """Repeated evaluation may borrow state, but cannot invoke owner effects."""
+        self.validate(program, sizes)
+        if self._externals or any(not isinstance(view, ReadonlyTensorView) for view in self._borrows.values()):
+            raise ValueError("tensor tuning requires original readonly tensor resources without external callbacks")
+
+    def validate_stream(self, stream: torch.cuda.Stream) -> None:
+        if self._owner.pin.stream != stream:
+            raise ValueError("physical lane zero must use the original PTTS pin stream")
+
+    def validate_native_kernels(self, implementations: Mapping[str, NativeKernelImport | None]) -> None:
+        for name, endpoint in self._externals.items():
+            if name not in implementations or endpoint.implementation != implementations[name]:
+                raise ValueError("external endpoint differs from the imported native kernel execution contract")
+
+    def validate_tensor_borrows(self, implementations: Mapping[str, BorrowedTensorImport]) -> None:
+        if implementations != self._tensor_borrows:
+            raise ValueError("tensor borrows differ from their original source bindings")
+
+    def borrow_tensor(self, implementation: BorrowedTensorImport, inputs: tuple[Data, ...]) -> torch.Tensor:
+        self.before_statement()
+        function = implementation.declaration
+        if self._tensor_borrows.get(function.name) != implementation:
+            raise ValueError("tensor borrow has no matching original source binding")
+        indices: list[int] = []
+        for value, type_ in zip(inputs, function.inputs, strict=True):
+            check_data(value, type_, self._sizes)
+            if type(value) is not int:
+                raise ValueError("tensor borrowing requires integer resource coordinates")
+            indices.append(value)
+        self.bind_accesses(function, inputs)
+        view = self._borrows[function.resources[0]]
+        if not isinstance(view, ReadonlyTensorView):
+            raise ValueError("tensor borrowing requires original read-only tensor storage")
+        value = view.tensor(tuple(indices), implementation.field)
+        check_data(value, function.outputs[0], self._sizes)
+        if not value.is_contiguous():
+            raise ValueError("tensor borrow requires the declared contiguous layout")
+        return value
+
+    def before_statement(self) -> None:
+        self._owner.check_page_execution()
+
+    def bind_accesses(self, declaration: Function, inputs: tuple[Data, ...]) -> tuple[BoundResourceAccess, ...]:
+        if not declaration.accesses:
+            return ()
+        def index(expression: AffineIndex) -> int:
+            value = expression.constant
+            for term in expression.terms:
+                operand = inputs[term.argument]
+                if type(operand) is not int:
+                    raise ValueError("resource access requires its original integer operands")
+                product = operand * term.coefficient
+                value += product
+                if not -(2**63) <= product < 2**63 or not -(2**63) <= value < 2**63:
+                    raise ValueError("resource access arithmetic exceeds the signed index range")
+            return value
+        resources = {resource.name: resource for resource in self._resources}
+        result: list[BoundResourceAccess] = []
+        for access in declaration.accesses:
+            ranges = tuple((index(interval.lower), index(interval.upper)) for interval in access.ranges)
+            domain = resources[access.resource].domain
+            if any(not 0 <= lower <= upper <= size for (lower, upper), size in zip(ranges, domain, strict=True)):
+                raise ValueError("native resource access lies outside its declared logical domain")
+            view = self._borrows.get(access.resource)
+            if view is not None:
+                view.check(access.mode, ranges)
+            result.append(BoundResourceAccess(access.resource, access.mode, ranges))
+        return tuple(result)
+
+    def external(self, declaration: Function, inputs: tuple[Data, ...],
+                 implementation: NativeKernelImport | None = None) -> tuple[Data, ...]:
+        self.before_statement()
+        function = self._externals.get(declaration.name)
+        if function is None or function.declaration != declaration:
+            raise ValueError("call has no matching external resource binding")
+        if function.implementation != implementation:
+            raise ValueError("external endpoint differs from the imported native kernel execution contract")
+        for value, type_ in zip(inputs, declaration.inputs, strict=True):
+            check_data(value, type_, self._sizes)
+        self.bind_accesses(declaration, inputs)
+        return function.function(inputs)
+
+    def _cell(self, resource: str, indices: tuple[int, ...]) -> ResourcePageCell:
+        if any(type(index) is not int for index in indices):
+            raise ValueError("logical resource indices must be integers")
+        try:
+            return self._cells[(resource, indices)]
+        except KeyError as error:
+            raise ValueError("logical resource index is out of bounds") from error
+
+    def snapshot(self, resource: str, indices: tuple[int, ...]) -> tuple[Data, ...]:
+        self.before_statement()
+        cell = self._cell(resource, indices)
+        current = self._owner.current_owned_ref(cell.original)
+        pin = self._owner.pin if current == cell.original else self._owner.borrow_published((current,))
+        try:
+            with self.scope():
+                # A functional exported call can return an input view. Owned
+                # copies keep such results valid after the page pin is released.
+                tensors = iter(tuple(self._owner.arena.borrow_field(pin, current, field).detach().clone()
+                                     for field in cell.fields))
+            def assemble(type_: DataType) -> Data:
+                if isinstance(type_, BankType):
+                    return Bank(tuple(assemble(type_.element) for _ in range(resolve_extent(type_.size, self._sizes))))
+                return next(tensors)
+            return tuple(assemble(type_) for type_ in self._types[resource])
+        finally:
+            if pin is not self._owner.pin:
+                self._owner.release_owned_pin(pin)
+
+    def publish(self, resource: str, indices: tuple[int, ...], values: tuple[Data, ...]) -> None:
+        self.before_statement()
+        cell = self._cell(resource, indices)
+        for value, type_ in zip(values, self._types[resource], strict=True):
+            check_data(value, type_, self._sizes)
+        current = self._owner.current_owned_ref(cell.original)
+        token = self._owner.prepare_owned_write((current,), (cell.fields,))
+        with self.scope():
+            for field, tensor in zip(cell.fields, (t for value in values for t in _tensors(value)), strict=True):
+                self._owner.arena.write_field(token, 0, field).copy_(tensor)
+        receipt = self._owner.publish_owned_write(token)
+        # The original owner records settlement before reclaim can proceed. If
+        # settlement fails, its ordinary failure path retains this exact receipt.
+        self._owner.settle_owned_publication(receipt)

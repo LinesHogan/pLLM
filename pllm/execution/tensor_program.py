@@ -116,8 +116,8 @@ class InvocationOutput:
 
 
 def _read(context: StateTaskContext[D], version: Literal["input", "private", "published"] = "input") -> TensorBatch:
-    fields = context.arena.plan.tensor_layout_request.layouts
-    width = len(fields[0].layout.fields) if fields else 0
+    if version != "input" and (len(context.selection.groups) > 1 or len(context.page_publications) > 1):
+        raise ValueError("multiple resources or publications require explicit Region snapshot sources")
     refs = context.pin.refs
     access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
     if version == "private" and context.write is not None:
@@ -133,7 +133,8 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         access = tuple(pin if ref in versions else context.pin for ref in context.pin.refs)
     roots = tuple(tuple(context.arena.borrow_field(token, ref, LayoutFieldId(i)) if isinstance(token, PagePin)
         else context.arena.write_field(token, token.after_refs.index(ref), LayoutFieldId(i))
-        for i in range(width)) for token, ref in zip(access, refs, strict=True))
+        for i in range(len(context.arena.root(original).pages)))
+        for token, ref, original in zip(access, refs, context.pin.refs, strict=True))
     return TensorBatch(context.selection, roots, refs, context.pin.stream,
         context.sampler_feedback, epoch=context.arena.plan.state_physical.plan_epoch,
         observing=context.trace.observing,
@@ -143,10 +144,17 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
 
 @dataclass(frozen=True, slots=True)
 class FunctionMath(Generic[I, D, R]):
-    initialize: Callable[[Roots], None]
+    initializers: Mapping[str, Callable[[Roots], None]]
     rows: Callable[[I], tuple[PackedPhaseRow, ...]]
     prepare_data: Callable[[I, TensorBatch], D]
     output_data: Callable[[D, InvocationOutput], R]
+
+    def initialize(self, roots: Roots, resources: tuple[str, ...]) -> None:
+        if len(roots) != len(resources) or not set(resources) <= self.initializers.keys():
+            raise ValueError("state initialization requires a named initializer for every root")
+        for resource in dict.fromkeys(resources):
+            self.initializers[resource](tuple(root for root, name in zip(roots, resources, strict=True)
+                if name == resource))
 
     def prepare(self, value: I, context: StateTaskContext[D]) -> D:
         with (nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream)), torch.inference_mode(False):

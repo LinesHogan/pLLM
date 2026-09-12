@@ -109,6 +109,21 @@ pub(crate) struct AttachmentTaskBinding {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct CausalModelDomain {
+    pub(crate) requests: u64,
+    pub(crate) layers: u64,
+    pub(crate) positions: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RegionFunctionBody {
+    pub declaration: super::super::region_program::Function,
+    pub program: super::super::region_program::Program,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BackendPlacementProbe {
     pub(crate) adapter_id: String,
     pub(crate) backend_abi_digest: String,
@@ -126,6 +141,12 @@ pub(crate) struct BackendPlacementProbe {
     pub(crate) hidden_resources: Vec<AttachmentHiddenResource>,
     pub(crate) capabilities: Vec<String>,
     pub(crate) schema_version: u64,
+    #[serde(default)]
+    pub(crate) causal_domain: Option<CausalModelDomain>,
+    #[serde(default)]
+    pub(super) region_imports: Vec<super::super::region_imports::TensorImport>,
+    #[serde(default)]
+    pub(super) region_bodies: Vec<RegionFunctionBody>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

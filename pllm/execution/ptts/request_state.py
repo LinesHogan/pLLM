@@ -1,4 +1,4 @@
-"""Request-key selection and exclusive transition leases over one PageBundle arena."""
+"""Qualified request keys and atomic leases over the original PageBundle arena."""
 
 from __future__ import annotations
 
@@ -14,51 +14,115 @@ from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublic
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.request_state import RequestStateKey
-from pllm.contracts.semantic_graph import SemanticState, StateScope
+from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
 from pllm.contracts.state_ref import LineageId, StateRef
 
 
 @dataclass(frozen=True, slots=True)
+class StateAddress:
+    resource: StateResource
+    key: RequestStateKey | None
+
+
+@dataclass(frozen=True, slots=True)
 class RequestStateAdmissionBatch:
-    keys: tuple[RequestStateKey | None, ...]
-    holds: tuple[tuple[RequestIdentity, RequestStateKey | None], ...]
+    keys: tuple[StateAddress, ...]
+    holds: tuple[tuple[RequestIdentity, StateAddress], ...]
     write: PageWrite | None
+    inference_pins: tuple[tuple[RequestIdentity, PagePin], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSelection:
+    resource: StateResource
+    keys: tuple[RequestStateKey | None, ...]
+    refs: tuple[StateRef, ...]
+    # Indices into the containing selection's flat refs, aligned to its rows.
+    state_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True)
 class RequestStateSelection:
     rows: tuple[PackedPhaseRow, ...]
-    keys: tuple[RequestStateKey | None, ...]
-    refs: tuple[StateRef, ...]
-    state_indices: tuple[int, ...]
+    groups: tuple[ResourceSelection, ...]
+
+    @cached_property
+    def refs(self) -> tuple[StateRef, ...]:
+        return tuple(ref for group in self.groups for ref in group.refs)
+
+    @cached_property
+    def addresses(self) -> tuple[StateAddress, ...]:
+        return tuple(StateAddress(group.resource, key) for group in self.groups for key in group.keys)
+
+    def for_resource(self, resource: StateResource) -> ResourceSelection:
+        for group in self.groups:
+            if group.resource == resource:
+                return group
+        raise KeyError(resource)
+
+    def _sole_group(self) -> ResourceSelection:
+        if len(self.groups) != 1:
+            raise ValueError("state access must name a resource in a multi-state selection")
+        return self.groups[0]
+
+    @property
+    def keys(self) -> tuple[RequestStateKey | None, ...]:
+        return self._sole_group().keys if self.groups else ()
+
+    @property
+    def state_indices(self) -> tuple[int, ...]:
+        return self._sole_group().state_indices if self.groups else ()
 
     @cached_property
     def row_states(self) -> Mapping[RequestIdentity, int]:
         return MappingProxyType({row.identity: index for row, index in zip(self.rows, self.state_indices, strict=True)})
 
-    def ref_for(self, identity: RequestIdentity) -> StateRef:
-        return self.refs[self.row_states[identity]]
+    def ref_for(self, identity: RequestIdentity, resource: StateResource | None = None) -> StateRef:
+        group = self._sole_group() if resource is None else self.for_resource(resource)
+        for row, index in zip(self.rows, group.state_indices, strict=True):
+            if row.identity == identity:
+                return self.refs[index]
+        raise KeyError(identity)
 
 
 class RequestStateDirectory:
-    """Own key-to-lineage relations, never another latest-version map."""
+    """One resource-qualified key-to-lineage map; versions remain in the arena."""
 
-    def __init__(self, arena: PageBundleArena, state: SemanticState | None) -> None:
-        if state not in arena.plan.semantic_graph.states and (state is not None or arena.plan.semantic_graph.states):
-            raise ValueError("directory requires its original semantic state, or a stateless graph")
-        self.arena = arena
-        self.state = state
-        self._lineages: dict[RequestStateKey | None, LineageId] = {}
-        self._holders: dict[RequestStateKey | None, set[RequestIdentity]] = {}
-        self._identity_holds: dict[RequestIdentity, RequestStateKey | None] = {}
+    def __init__(self, arena: PageBundleArena, state: SemanticState | tuple[SemanticState, ...] | None) -> None:
+        states = state if isinstance(state, tuple) else () if state is None else (state,)
+        if (len(set(s.resource for s in states)) != len(states)
+            or any(s not in arena.plan.semantic_graph.states for s in states)
+            or not states and arena.plan.semantic_graph.states):
+            raise ValueError("directory requires its original semantic states, or a stateless graph")
+        self.arena, self.states = arena, states
+        self._lineages: dict[StateAddress, LineageId] = {}
+        self._holders: dict[StateAddress, set[RequestIdentity]] = {}
+        self._identity_holds: dict[tuple[StateResource, RequestIdentity], StateAddress] = {}
         self._inference_pins: dict[RequestIdentity, PagePin] = {}
-        self._leases: dict[RequestStateKey | None, RequestStateSelection] = {}
+        self._leases: dict[StateAddress, RequestStateSelection] = {}
         self._pending: RequestStateAdmissionBatch | None = None
         self._lock = RLock()
 
     @property
+    def state(self) -> SemanticState | None:
+        if len(self.states) > 1:
+            raise ValueError("directory state access requires a resource name")
+        return self.states[0] if self.states else None
+
+    @property
     def scope(self) -> StateScope | None:
-        return None if self.state is None else self.state.scope
+        scopes = {s.scope for s in self.states}
+        if len(scopes) > 1:
+            raise ValueError("mixed state scopes require resource-specific access")
+        return next(iter(scopes), None)
+
+    @property
+    def request_states(self) -> tuple[SemanticState, ...]:
+        return tuple(s for s in self.states if s.scope is StateScope.REQUEST)
+
+    @property
+    def instance_states(self) -> tuple[SemanticState, ...]:
+        return tuple(s for s in self.states if s.scope is StateScope.INSTANCE)
 
     @property
     def active_count(self) -> int:
@@ -67,26 +131,6 @@ class RequestStateDirectory:
     @property
     def inference_pin_count(self) -> int:
         return len(self._inference_pins)
-
-    def admit_inference(self, identities: tuple[RequestIdentity, ...],
-                        stream: torch.cuda.Stream | None = None) -> tuple[StateRef, ...]:
-        """Fix each request to the original instance root visible at admission."""
-        with self._lock:
-            if (self.scope is not StateScope.INSTANCE or not identities
-                or len(set(identities)) != len(identities)
-                or any(identity in self._inference_pins for identity in identities)):
-                raise ValueError("instance inference admission requires distinct new requests")
-            refs = self.select(()).refs
-            pending: dict[RequestIdentity, PagePin] = {}
-            try:
-                for identity in identities:
-                    pending[identity] = self.arena.pin_exact(refs, stream)
-            except Exception:
-                for pin in pending.values():
-                    self.arena.release_pin(pin)
-                raise
-            self._inference_pins.update(pending)
-            return refs
 
     def inference_pin(self, identity: RequestIdentity, stream: torch.cuda.Stream | None = None) -> PagePin:
         with self._lock:
@@ -98,38 +142,48 @@ class RequestStateDirectory:
     def has_inference_pin(self, identity: RequestIdentity) -> bool:
         return identity in self._inference_pins
 
-    def retire_inference(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
-        with self._lock:
-            if not identities or len(set(identities)) != len(identities):
-                raise ValueError("inference retirement requires distinct requests")
-            pins = tuple(self._inference_pins[identity] for identity in identities)
-            for identity, pin in zip(identities, pins, strict=True):
-                self.arena.release_pin(pin)
-                self._inference_pins.pop(identity)
-            return tuple(dict.fromkeys(ref for pin in pins for ref in pin.refs))
+    def _addresses(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateAddress, ...]:
+        return tuple(StateAddress(state.resource, key) for state in self.states
+            for key in ((None,) if state.scope is StateScope.INSTANCE else
+                tuple(dict.fromkeys(RequestStateKey.project(identity, state.key_fields) for identity in identities))))
 
     def prepare_admission(self, identities: tuple[RequestIdentity, ...],
                           stream: torch.cuda.Stream | None = None) -> RequestStateAdmissionBatch:
         with self._lock:
-            if self.state is None:
+            if not self.states:
                 raise RuntimeError("stateless graph has no state to admit")
             if self._pending is not None:
                 raise RuntimeError("request admission is already pending")
-            keys = self._unique_keys(identities)
-            if self.scope is StateScope.INSTANCE:
-                if any(key in self._lineages for key in keys):
-                    raise RuntimeError("request admission requires unadmitted keys")
-                new = keys
+            if len(set(identities)) != len(identities):
+                raise RuntimeError("request admission requires distinct unadmitted requests")
+            addresses = self._addresses(identities)
+            if not identities:
+                new = tuple(key for key in addresses if key.key is None)
+                if not new or any(key in self._lineages for key in new):
+                    raise RuntimeError("instance admission requires unadmitted keys")
+                holds: tuple[tuple[RequestIdentity, StateAddress], ...] = ()
+                instances: tuple[StateRef, ...] = ()
             else:
-                if (not keys or len(set(identities)) != len(identities)
-                    or any(identity in self._identity_holds for identity in identities)):
+                if any((s.resource, identity) in self._identity_holds for s in self.request_states for identity in identities):
                     raise RuntimeError("request admission requires distinct unadmitted requests")
-                # A key already admitted by another request joins its lineage instead.
-                new = tuple(key for key in keys if key not in self._lineages)
-            fields = self.state.key_fields
-            batch = RequestStateAdmissionBatch(new,
-                tuple((identity, RequestStateKey.project(identity, fields)) for identity in identities),
-                self.arena.prepare_admission((str(self.state.resource),) * len(new), stream) if new else None)
+                new = tuple(key for key in addresses if key.key is not None and key not in self._lineages)
+                holds = tuple((identity, StateAddress(s.resource, RequestStateKey.project(identity, s.key_fields)))
+                    for s in self.request_states for identity in identities)
+                instances = tuple(self._latest(key) for key in addresses if key.key is None)
+                if instances and any(identity in self._inference_pins for identity in identities):
+                    raise ValueError("instance inference admission requires distinct new requests")
+            write = self.arena.prepare_admission(tuple(str(key.resource) for key in new), stream) if new else None
+            pins: list[tuple[RequestIdentity, PagePin]] = []
+            try:
+                for identity in identities if instances else ():
+                    pins.append((identity, self.arena.pin_exact(instances, stream)))
+            except Exception:
+                for _, pin in pins:
+                    self.arena.release_pin(pin)
+                if write is not None:
+                    self.arena.abort(write)
+                raise
+            batch = RequestStateAdmissionBatch(new, holds, write, tuple(pins))
             self._pending = batch
             return batch
 
@@ -144,8 +198,9 @@ class RequestStateDirectory:
                 receipt = self.arena.publish(batch.write)
                 self._lineages = lineages
             for identity, key in batch.holds:
-                self._identity_holds[identity] = key
+                self._identity_holds[key.resource, identity] = key
                 self._holders.setdefault(key, set()).add(identity)
+            self._inference_pins.update(batch.inference_pins)
             self._pending = None
             return receipt
 
@@ -154,100 +209,101 @@ class RequestStateDirectory:
             self._require_admission(batch)
             if batch.write is not None:
                 self.arena.abort(batch.write)
+            for _, pin in batch.inference_pins:
+                self.arena.release_pin(pin)
             self._pending = None
 
+    def _latest(self, key: StateAddress) -> StateRef:
+        try:
+            return self.arena.latest(self._lineages[key])
+        except KeyError as exc:
+            message = "instance state is not admitted" if key.key is None else "request selection references an unadmitted key"
+            raise RuntimeError(message) from exc
+
     def latest_refs(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
-        """The visible ref per admitted key, for admissions that joined existing lineages."""
         with self._lock:
-            return tuple(self.arena.latest(self._lineages[key]) for key in self._unique_keys(identities))
+            return tuple(self._latest(key) for key in self._addresses(identities))
 
     def select(self, rows: tuple[PackedPhaseRow, ...]) -> RequestStateSelection:
         with self._lock:
-            if self.state is None:
-                return RequestStateSelection((), (), (), ())
-            if self.scope is StateScope.INSTANCE:
-                try:
-                    ref = self.arena.latest(self._lineages[None])
-                except KeyError as exc:
-                    raise RuntimeError("instance state is not admitted") from exc
-                return RequestStateSelection(rows, (None,), (ref,), (0,) * len(rows))
-            keys: list[RequestStateKey | None] = []
-            refs: list[StateRef] = []
-            state_indices: list[int] = []
-            indices: dict[RequestStateKey, int] = {}
-            for row in rows:
-                key = RequestStateKey.project(row.identity, self.state.key_fields)
-                if key not in indices:
-                    try:
-                        ref = self.arena.latest(self._lineages[key])
-                    except KeyError as exc:
-                        raise RuntimeError("request selection references an unadmitted key") from exc
-                    indices[key] = len(keys)
-                    keys.append(key)
-                    refs.append(ref)
-                state_indices.append(indices[key])
-            if not rows:
+            if not rows and self.request_states and not self.instance_states:
                 raise ValueError("request selection requires rows")
-            return RequestStateSelection(rows, tuple(keys), tuple(refs), tuple(state_indices))
+            groups: list[ResourceSelection] = []
+            offset = 0
+            for state in self.states:
+                if state.scope is StateScope.INSTANCE:
+                    keys: tuple[RequestStateKey | None, ...] = (None,)
+                    positions = (offset,) * len(rows)
+                else:
+                    projected = tuple(RequestStateKey.project(row.identity, state.key_fields) for row in rows)
+                    keys = tuple(dict.fromkeys(projected))
+                    indices = {key: offset + i for i, key in enumerate(keys)}
+                    positions = tuple(indices[key] for key in projected)
+                refs = tuple(self._latest(StateAddress(state.resource, key)) for key in keys)
+                groups.append(ResourceSelection(state.resource, keys, refs, positions))
+                offset += len(refs)
+            return RequestStateSelection(rows if self.states else (), tuple(groups))
 
     def acquire_transition_lease(self, selection: RequestStateSelection) -> None:
         with self._lock:
             self._require_latest(selection)
-            if self._leases.keys() & selection.keys:
+            if self._leases.keys() & selection.addresses:
                 raise RuntimeError("request transition lease overlaps an active step")
-            self._leases.update((key, selection) for key in selection.keys)
+            self._leases.update((key, selection) for key in selection.addresses)
 
     def release_transition_lease(self, selection: RequestStateSelection) -> None:
         with self._lock:
-            if any(self._leases.get(key) is not selection for key in selection.keys):
+            if any(self._leases.get(key) is not selection for key in selection.addresses):
                 raise RuntimeError("request transition selection is not the active lease")
-            for key in selection.keys:
+            for key in selection.addresses:
                 self._leases.pop(key)
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         with self._lock:
-            if self.scope is StateScope.INSTANCE and self._inference_pins:
-                raise RuntimeError("instance retirement requires all inference requests to finish")
-            keys = self._unique_keys(identities)
-            if not keys:
-                raise RuntimeError("request retirement requires keys without an active step")
-            if keys == (None,):
-                releasing = keys
+            if len(set(identities)) != len(identities):
+                raise ValueError("retirement requires distinct requests")
+            addresses = self._addresses(identities)
+            if not identities:
+                if self._inference_pins:
+                    raise RuntimeError("instance retirement requires all inference requests to finish")
+                releasing = tuple(key for key in addresses if key.key is None)
+                if not releasing:
+                    raise RuntimeError("request retirement requires keys without an active step")
+                pins: tuple[PagePin, ...] = ()
+                leaving: tuple[StateAddress, ...] = ()
             else:
-                if any(identity not in self._identity_holds for identity in identities):
+                if any((s.resource, identity) not in self._identity_holds for s in self.request_states for identity in identities):
                     raise RuntimeError("request retirement references an unadmitted key")
-                leaving = {key: {identity for identity in identities
-                                 if self._identity_holds[identity] == key} for key in keys}
-                # A route names a routing destination, not one request: its lineage
-                # outlives the last holder until dormant retirement at session close.
-                releasing = tuple(key for key, members in leaving.items()
-                    if members == self._holders.get(key, set())
-                    and (key is None or RequestKeyField.ROUTE not in key.fields))
+                pins = tuple(self._inference_pins[identity] for identity in identities) if self.instance_states else ()
+                leaving = tuple(key for key in addresses if key.key is not None)
+                members = {key: {identity for identity in identities
+                    if self._identity_holds[key.resource, identity] == key} for key in leaving}
+                releasing = tuple(key for key in leaving if members[key] == self._holders.get(key, set())
+                    and key.key is not None and RequestKeyField.ROUTE not in key.key.fields)
             if self._leases.keys() & set(releasing):
                 raise RuntimeError("request retirement requires keys without an active step")
-            try:
-                refs = tuple(self.arena.latest(self._lineages[key]) for key in releasing)
-            except KeyError as exc:
-                raise RuntimeError("request retirement references an unadmitted key") from exc
-            if keys != (None,):
-                for identity in identities:
-                    key = self._identity_holds.pop(identity)
-                    self._holders[key].discard(identity)
-            lineages = {key: lineage for key, lineage in self._lineages.items() if key not in releasing}
+            refs = tuple(self._latest(key) for key in releasing)
             if refs:
                 self.arena.retire(refs)
-            self._lineages = lineages
+            if pins:
+                for identity, pin in zip(identities, pins, strict=True):
+                    self.arena.release_pin(pin)
+                    self._inference_pins.pop(identity)
+            for state in self.request_states:
+                for identity in identities:
+                    key = self._identity_holds.pop((state.resource, identity))
+                    self._holders[key].discard(identity)
             for key in releasing:
+                self._lineages.pop(key)
                 self._holders.pop(key, None)
-            return refs
+            return tuple(dict.fromkeys((*refs, *(ref for pin in pins for ref in pin.refs))))
 
     def retire_dormant(self) -> tuple[StateRef, ...]:
-        """Retire lineages whose last holder left; session-close cleanup for route pools."""
         with self._lock:
             dormant = tuple(key for key, holders in self._holders.items() if not holders)
             if self._leases.keys() & set(dormant):
                 raise RuntimeError("dormant retirement requires keys without an active step")
-            refs = tuple(self.arena.latest(self._lineages[key]) for key in dormant)
+            refs = tuple(self._latest(key) for key in dormant)
             if refs:
                 self.arena.retire(refs)
             for key in dormant:
@@ -255,17 +311,10 @@ class RequestStateDirectory:
                 self._holders.pop(key)
             return refs
 
-    def _unique_keys(self, identities: tuple[RequestIdentity, ...]) -> tuple[RequestStateKey | None, ...]:
-        if self.state is None:
-            return ()
-        if self.scope is StateScope.INSTANCE:
-            if identities:
-                raise ValueError("instance admission/retirement is not a request lifecycle action")
-            return (None,)
-        return tuple(dict.fromkeys(RequestStateKey.project(identity, self.state.key_fields) for identity in identities))
-
     def _require_latest(self, selection: RequestStateSelection) -> None:
-        for key, ref in zip(selection.keys, selection.refs, strict=True):
+        if selection != self.select(selection.rows):
+            raise RuntimeError("request transition selection is stale or differs from its resources")
+        for key, ref in zip(selection.addresses, selection.refs, strict=True):
             if self._lineages.get(key) != ref.lineage_id or self.arena.latest(ref.lineage_id) != ref:
                 raise RuntimeError("request transition selection is stale")
 

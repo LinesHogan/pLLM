@@ -286,6 +286,12 @@ class PageBundleArena:
     def pool_addresses(self) -> tuple[int, ...]:
         return tuple(address for pools in self._pools.values() for address in pools.addresses)
 
+    @property
+    def allocation_ranges(self) -> tuple[tuple[str, int, int], ...]:
+        """Allocation metadata, including spare COW pages and alignment padding."""
+        return tuple((str(tensor.device), tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
+                     for pools in self._pools.values() for tensor in pools.tensors)
+
     def usage(self) -> PageBundleUsage:
         """Read original owners without waiting, collecting or retaining tensors/receipts.
 

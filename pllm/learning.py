@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import ClassVar, Generic, TypeVar, cast
 
 import torch
@@ -16,6 +17,7 @@ import torch
 from pllm.authoring import BackendWorkload, BackendCompileFacts, BackendRequirements, CausalModel, CausalTrainBatch, TensorStepInput
 from pllm.contracts.backend_attachment import BackendAttachmentSpec
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.region_program import TensorType
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -25,6 +27,7 @@ from pllm.execution.declaration import Builder, Dimensions, Field, Shape, When, 
 from pllm.execution.tensor_binding import Buffer, Tensors
 from pllm.execution.tensor_program import FunctionMath, Roots, InvocationOutput, TensorBatch, autograd_loss
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.region_adamw import AdamWRegion
 from pllm.execution.host_runtime import (
     HostWorkload, HostRuntimeFacts, TensorHostBinding, HostTaskState,
     HostTransactionService, TransactionHostBinding, CompletionInput,
@@ -112,10 +115,16 @@ class CompletionWorkload(NativeMath, _LearningMath[CompletionInput, ContextT, Re
         state = b.state("parameters", tuple(Field(name, shape,
             TensorDType(str(definition.dtype).removeprefix("torch.")), definition.alignment, definition.mutation) for name, shape in shapes.items()),
             namespace=definition.namespace, optimizer=definition.optimizer)
+        layout, = b.layouts.layouts
+        device = "cpu" if facts.device.type == "cpu" else f"cuda:{facts.device.index or 0}"
+        optimizer = AdamWRegion(tuple(TensorType(field.shape, "torch." + field.dtype.value, device)
+            for field in layout.layout.fields[::5]), definition.optimizer)
         update = b.compute("train", function=autograd_loss(freeze(owner.loss), tuple(shapes), freeze(owner.trained_rows)),
             inputs={"batch": b.input("input", "completions", f"{self.name}.training@1"), "state": state.read()},
             outputs=("control",), changes=state, effect=StateEffectKind.TRANSITION_MAYBE, when=When.HOST_COMPUTE,
-            implementations=(native(f"python:{identity}"),),
+            implementations=(native("region.completion_adamw@1:" + boundary_digest(
+                identity, optimizer.program, optimizer.capacity, optimizer.copy_workspace_bytes)),),
+            optimizer=optimizer.writeback,
             math=MathContract(parameter_gradients=(state.declaration.resource,), detached_inputs=("batch",),
                 forward_rows="batch", parameter_gradient_rows="batch", update_states="state", reduction="custom"))
         b.publish(update, state, output="control", schema=f"{self.name}.result@1", when=When.HOST_COMMIT,
@@ -138,9 +147,13 @@ class CompletionWorkload(NativeMath, _LearningMath[CompletionInput, ContextT, Re
                 value.readiness.order_on(batch.stream)
                 value.hidden.record_stream(batch.stream)
             return prepare_data(value)
+        timeline = owner.resource_facts(facts)
+        timeline = replace(timeline, task_resources=tuple(
+            replace(fact, workspace_bytes=fact.workspace_bytes + optimizer.copy_workspace_bytes)
+            if fact.task == update.symbol else fact for fact in timeline.task_resources))
         return TensorHostBinding(b.graph, b.layouts,
-            MathBinding(FunctionMath(initialize, lambda value: (), prepare, output_data), b.bind_all()),
-            facts, AnchorSymbol("host.compute.end"), owner.resource_facts(facts))
+            MathBinding(FunctionMath({str(state.declaration.resource): initialize}, lambda value: (), prepare, output_data), b.bind_all()),
+            facts, AnchorSymbol("host.compute.end"), timeline)
 
 
 class CausalAdapterWorkload(_LearningMath[CausalTrainBatch[torch.Tensor] | None, ContextT, ResultT],
@@ -237,7 +250,7 @@ class CausalAdapterWorkload(_LearningMath[CausalTrainBatch[torch.Tensor] | None,
             if isinstance(value, TensorStepInput) and value.rows.total_rows > facts.probe.max_packed_rows:
                 raise ValueError("packed input exceeds the signed backend row capacity")
             return ()
-        return b, FunctionMath(initialize, rows, prepare, output_data)
+        return b, FunctionMath({str(state.declaration.resource): initialize}, rows, prepare, output_data)
 
     def declare(self, facts: BackendCompileFacts) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         builder, _ = self._binding(facts)

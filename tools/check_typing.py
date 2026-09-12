@@ -7,17 +7,28 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CODEC = ROOT / "pllm/execution/codec.py"
+CONTRACT_CODEC = ROOT / "pllm/contracts/codec.py"
+GRAPH_ADAPTER = ROOT / "pllm/execution/module_graph.py"
+COMPILER_ADAPTER = ROOT / "pllm/backends/torch_inductor.py"
 COLD_AUTHORING = {ROOT / "pllm/usage.py", ROOT / "pllm/execution/freeze.py", ROOT / "pllm/learning.py",
     # The by-reference transport boundary: class coordinates resolve through getattr/importlib.
-    ROOT / "pllm/worker.py", ROOT / "pllm/contracts/workload_reference.py"}
-DYNAMIC_IMPORT = {CODEC, ROOT / "pllm/worker.py"}
+    ROOT / "pllm/workload_transport.py", ROOT / "pllm/contracts/workload_reference.py",
+    # Worker RPC erases the reconstructed workload's generic payload types.
+    ROOT / "pllm/worker.py"}
+DYNAMIC_IMPORT = {CODEC, ROOT / "pllm/workload_transport.py"}
 FORBIDDEN = {"Any", "object", "cast", "getattr", "setattr", "hasattr"}
 
 
 def main() -> int:
     violations: list[str] = []
     for path in sorted((ROOT / "pllm").rglob("*.py")):
-        if path == CODEC:
+        # FX graph arguments and Module.forward are dynamically typed upstream.
+        # Keep those checks at the graph import boundary, outside scheduling.
+        # The shared contract codec is the sole dynamic schema adapter; source
+        # contracts and semantic rules themselves retain the ordinary strict gate.
+        # Inductor lowering artifacts also expose dynamic upstream types;
+        # only this pinned backend inspects them, through a typed result ABI.
+        if path in (CODEC, CONTRACT_CODEC, GRAPH_ADAPTER, COMPILER_ADAPTER):
             continue
         source = path.read_text()
         for node in ast.walk(ast.parse(source)):
