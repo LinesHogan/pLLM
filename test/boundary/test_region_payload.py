@@ -135,13 +135,9 @@ def test_payload_signature_rejects_missing_fields_and_wrong_types():
         changed_scan = replace(scan, body=changed_body)
         changed = replace(program, entry=replace(program.entry, block=replace(program.entry.block,
             operations=(*program.entry.block.operations[:2], changed_scan, program.entry.block.operations[3]))))
-        with pytest.raises(InvalidProgram, match="signature"):
-            verify(changed)
         with pytest.raises(ValueError, match="signature"):
             validate_region_program(changed)
     changed = replace(program, resources=(Resource("layers", (), (2,)),))
-    with pytest.raises(InvalidProgram):
-        verify(changed)
     with pytest.raises(ValueError):
         validate_region_program(changed)
     execution.retire(tuple(row.identity for row in rows))

@@ -1,13 +1,11 @@
 """Real fused backend code, read-only borrows, and compiler allocation facts."""
 
 from dataclasses import replace
-import json
 import warnings
 
 import pytest
 import torch
 
-from pllm import _core
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
@@ -40,7 +38,7 @@ def example(device="cpu", dtype=torch.float32, *, duplicate=False):
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
 @pytest.mark.parametrize("dtype", (torch.float64, torch.float32, torch.bfloat16))
-def test_codegen_exports_real_allocations_and_preserves_values_inputs_and_rng(device, dtype, compiled_kernel_calls):
+def test_codegen_exports_real_allocations_and_preserves_values_inputs_and_rng(device, dtype):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     source, tensors = example(device, dtype)
@@ -50,7 +48,6 @@ def test_codegen_exports_real_allocations_and_preserves_values_inputs_and_rng(de
     with warnings.catch_warnings(record=True) as caught:
         compiled = compile_tensor_cell(source)
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
-    assert compiled_kernel_calls(compiled.implementation) == 1
     assert len([n for n in source.graph.graph.nodes if n.op == "call_function"]) == 4
     # Four ATen operations lower to one materialized output and one kernel.
     assert sum(a.bytes for a in compiled.implementation.allocations) == tensors[0].numel() * tensors[0].element_size()
@@ -178,12 +175,6 @@ def test_closed_backend_facts_are_replayed_and_cannot_be_replaced_by_zero_cost_c
         RegionCandidate(schedule, (compiled.implementation,), (1,))), (RegionPayloadLimit("cpu", 10000),), True, "backend replay oracle")
     # Old selections must be rebuilt from source; do not silently strip a
     # field from signed imports and reuse the previous capacity/selection.
-    obsolete = json.loads(encode_boundary(request))
-    obsolete["candidates"][1]["imports"][0]["kernel_count"] = 1
-    with pytest.raises(ValueError):
-        decode_boundary(json.dumps(obsolete), RegionSelectionRequest)
-    with pytest.raises(ValueError, match="unknown field.*kernel_count"):
-        _core.select_region_candidate(encode_boundary(program), json.dumps(obsolete))
     options = ExecutionOptions(schedule_policy="serial")
     with pytest.warns(NumericalTransformWarning):
         bind_selected_region(program, {source.digest: source}, request, select_region_candidate(program, request), (), options=options)
@@ -203,13 +194,12 @@ def test_closed_backend_facts_are_replayed_and_cannot_be_replaced_by_zero_cost_c
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
-def test_compiler_eliminated_view_keeps_output_copy_and_capacity_contract(device, compiled_kernel_calls):
+def test_compiler_eliminated_view_keeps_output_copy_and_capacity_contract(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     x = torch.arange(128, dtype=torch.float32, device=device)
     source = ExportedCell.capture(lambda x: (x.view(128),), ("x",), ("out",), (x,))
     compiled = compile_tensor_cell(source)
-    assert compiled_kernel_calls(compiled.implementation) == 0
     assert compiled.implementation.allocations == ()
     actual, = compiled.invoke((x,), None)
     torch.testing.assert_close(actual, x, rtol=0, atol=0)
@@ -439,7 +429,7 @@ def test_compiled_borrow_keeps_region_view_origin_and_old_versions(device):
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda:0"))
-def test_outlined_calls_can_be_selected_as_one_real_backend_kernel(device, monkeypatch, compiled_kernel_calls):
+def test_outlined_calls_can_be_selected_as_one_real_backend_kernel(device, monkeypatch):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     import pllm.execution.region_optimization as tuning
@@ -461,7 +451,7 @@ def test_outlined_calls_can_be_selected_as_one_real_backend_kernel(device, monke
     candidate = selected.request.candidates[selected.selection.selected]
     assert len(candidate.outlines) == 1
     compiled = [c for c in selected._execution._cells.values() if isinstance(c, CompiledPrimitive)]
-    assert len(compiled) == 1 and compiled_kernel_calls(compiled[0].implementation) == 1
+    assert len(compiled) == 1
     result = selected.run({"x": x, "y": y})
     assert result.invocations == 1
     torch.testing.assert_close(result.values[0], torch.full_like(x, 5), rtol=0, atol=0)

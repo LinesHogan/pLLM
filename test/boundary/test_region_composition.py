@@ -8,7 +8,7 @@ import torch
 from pllm.backends.vllm.region_layers import VllmDecoderBodies, decoder_partition_bodies
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_program import BankType, Block, BorrowedResource, Call, Constant, Function, Map, Program, Region, ScalarType, SizeParameter, TensorType, Value, verify
+from pllm.contracts.region_program import BankType, Block, BorrowedResource, Call, Constant, Function, Map, Program, Region, ScalarType, SizeParameter, TensorType, Value
 from pllm.execution.module_graph import ModuleCallBinding
 from pllm.execution.region_compilation import analyze_region_program, lower_region_schedule
 
@@ -65,8 +65,7 @@ def test_data_ports_preserve_effects_and_reject_effectful_maps():
 
     original = external_program()
     assert original.entry.block.arguments == ()
-    for check in (verify, validate_region_program):
-        check(original)
+    validate_region_program(original)
     events = []
     def call(inputs):
         events.append(len(events) + 1)
@@ -80,9 +79,8 @@ def test_data_ports_preserve_effects_and_reject_effectful_maps():
     forbidden = Program(Region(Block((),
         (Map((), (Value("out", BankType(ScalarType.INT, 2)),), 2, body),), ("out",))),
         original.functions, original.resources)
-    for check in (verify, validate_region_program):
-        with pytest.raises(ValueError, match="pure region"):
-            check(forbidden)
+    with pytest.raises(ValueError, match="pure region"):
+        validate_region_program(forbidden)
 
 
 def test_decoder_imports_custom_readonly_modules_without_suffix_class_rules():

@@ -46,9 +46,8 @@ def test_external_resource_codec_and_verifiers_reject_snapshot_and_unknown_field
     block = program.entry.block
     invalid = replace(program, entry=replace(program.entry, block=replace(block, operations=(
         Snapshot((), (Value("x", I),), "first"), block.operations[1]))))
-    for validate in (verify, validate_region_program):
-        with pytest.raises(ValueError, match="external resources require imported calls"):
-            validate(invalid)
+    with pytest.raises(ValueError, match="external resources require imported calls"):
+        validate_region_program(invalid)
 
 
 def test_different_external_names_do_not_prove_backend_alias_separation():

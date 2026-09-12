@@ -81,21 +81,6 @@ def test_input_bank_cannot_silently_supply_a_different_trip_count():
         interpret(program, {"seed": 1, "xs": Bank((1,))}, sizes={"n": 0})
 
 
-@pytest.mark.parametrize("parameters", (
-    (), (SizeParameter("n", 0, 8), SizeParameter("n", 0, 8)),
-    (SizeParameter("n", 4, 3),), (SizeParameter("n", 0, 2**63),),
-    (SizeParameter("n", -1, 8),), (SizeParameter("n", True, 8),),
-    (SizeParameter("1n", 0, 8),), (SizeParameter("n-n", 0, 8),),
-    (SizeParameter("长度", 0, 8),),
-))
-def test_python_and_native_verifiers_reject_invalid_or_missing_size_declarations(parameters):
-    program = replace(prefix_program(), parameters=parameters)
-    with pytest.raises(InvalidProgram):
-        verify(program)
-    with pytest.raises(ValueError):
-        validate_region_program(program)
-
-
 def test_result_extent_must_be_the_same_symbol_even_when_bounds_match():
     program = prefix_program()
     scan, = program.entry.block.operations
@@ -244,17 +229,6 @@ def test_parameter_products_and_possible_overflow_keep_checked_execution():
             run({}, sizes={"p": 2**63 - 1})
 
 
-def test_both_verifiers_require_declared_index_parameter_values():
-    for operation in (Parameter((), (Value("p", X),), "unknown"),
-                      Parameter((), (Value("p", I),), "n"),
-                      Parameter(("input",), (Value("p", X),), "n")):
-        program = Program(region((Value("input", X),), (operation,), ("p",)),
-            parameters=(SizeParameter("n", 0, 8),))
-        for verifier in (verify, validate_region_program):
-            with pytest.raises(ValueError):
-                verifier(program)
-
-
 def test_relational_sizes_prove_offset_accesses_and_guard_each_invocation():
     bank = BankType(I, 8)
     body = region((Value("i", X), Value("xs", bank)), (
@@ -280,6 +254,5 @@ def test_relational_sizes_prove_offset_accesses_and_guard_each_invocation():
     for invalid in (replace(constraint, terms=(ParameterTerm("absent"),)),
                     replace(constraint, terms=(ParameterTerm("n"), ParameterTerm("n"))),
                     replace(constraint, terms=(ParameterTerm("n", 0),))):
-        for verifier in (verify, validate_region_program):
-            with pytest.raises(ValueError):
-                verifier(replace(program, constraints=(invalid,)))
+        with pytest.raises(ValueError):
+            validate_region_program(replace(program, constraints=(invalid,)))

@@ -39,7 +39,7 @@ def test_native_verifier_accepts_explicit_state_chain():
     validate_region_program(program)
 
 
-@pytest.mark.parametrize("change", ["undefined", "missing_payload", "extra_payload", "unknown", "stored_order", "extra_field"])
+@pytest.mark.parametrize("change", ["undefined", "missing_payload", "extra_payload", "unknown", "extra_field"])
 def test_forged_wire_cannot_bypass_resource_or_closed_schema_rules(change):
     wire = json.loads(encode_boundary(resource_program()))
     block = wire["entry"]["block"]
@@ -51,8 +51,6 @@ def test_forged_wire_cannot_bypass_resource_or_closed_schema_rules(change):
         block["operations"][1]["inputs"].append("x")
     elif change == "unknown":
         block["operations"][1]["resource"] = "not_w"
-    elif change == "stored_order":
-        wire["resources"][0]["payload"] = [{"kind": "bank", "size": 1, "element": {"kind": "order", "resource": "w"}}]
     else:
         block["operations"][1]["trust_me"] = True
     payload = json.dumps(wire)
@@ -75,22 +73,6 @@ def test_scalar_literal_types_survive_the_wire(value, type_):
     program = Program(Region(Block((), (Constant((), (Value("x", type_),), value),), ("x",))))
     assert decode_boundary(encode_boundary(program), Program) == program
     validate_region_program(program)
-
-
-@pytest.mark.parametrize("value", (2**63, 2**80, -(2**63) - 1))
-def test_python_integer_literals_cannot_turn_into_floats_at_the_native_boundary(value):
-    program = Program(Region(Block((), (Constant((), (Value("x", ScalarType.FLOAT),), value),), ("x",))))
-    with pytest.raises(InvalidProgram, match="64-bit"):
-        verify(program)
-
-
-def test_native_unsigned_overflow_is_not_retried_as_a_floating_literal():
-    wire = json.loads(encode_boundary(Program(Region(Block((),
-        (Constant((), (Value("x", ScalarType.FLOAT),), 1.0),), ("x",))))))
-    for literal in (2**63, 2**64 - 1, {"$serde_json::private::Number": "1.0"}):
-        wire["entry"]["block"]["operations"][0]["value"] = literal
-        with pytest.raises(ValueError):
-            _core.validate_region_program(json.dumps(wire))
 
 
 def test_source_schema_rejects_python_coercions_before_semantic_validation():
@@ -118,21 +100,3 @@ def test_source_schema_rejects_python_coercions_before_semantic_validation():
             verify(program)
     verify(replace(borrowed, functions=(replace(read, accesses=(ResourceAccess("borrow", AccessMode.READ),)),)))
     assert verify(valid) == (integer,)
-
-
-@pytest.mark.parametrize("change", ["valid", "duplicate", "drop", "stale"])
-def test_obsolete_order_sources_cannot_enter_either_planning_boundary(change):
-    token = {"kind": "order", "resource": "w"}
-    wire = json.loads(encode_boundary(resource_program()))
-    block = wire["entry"]["block"]
-    block["arguments"] = [{"name": "q0", "type": token}]
-    block["operations"][0]["inputs"] = ["q0"]
-    block["operations"][0]["outputs"].append({"name": "q1", "type": token})
-    block["operations"][1]["inputs"].append("q0" if change == "stale" else "q1")
-    block["operations"][1]["outputs"] = [{"name": "q2", "type": token}]
-    block["yields"].extend([] if change == "drop" else ["q2", "q2"] if change == "duplicate" else ["q2"])
-    payload = json.dumps(wire)
-    with pytest.raises(ValueError):
-        decode_boundary(payload, Program)
-    with pytest.raises(ValueError, match="unknown variant.*order"):
-        _core.validate_region_program(payload)

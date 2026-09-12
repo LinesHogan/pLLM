@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_program import (
-    AccessMode, BorrowedResource, Call, Constant, Function, Program, ResourceAccess, ScalarType, TensorType, Value, verify,
+    AccessMode, BorrowedResource, Call, Constant, Function, Program, ResourceAccess, ScalarType, TensorType, Value,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
@@ -130,9 +130,8 @@ def test_borrowed_schedule_uses_original_storage_and_rejects_unproved_accesses()
     torch.testing.assert_close(cache[2, 0, 0], torch.full((2,), 11.), rtol=0, atol=0)
     assert not invocation.context.page_publications
     invalid = replace(program, functions=(replace(program.functions[0], accesses=()), program.functions[1]))
-    for verifier in (verify, validate_region_program):
-        with pytest.raises(ValueError, match="explicit indexed accesses"):
-            verifier(invalid)
+    with pytest.raises(ValueError, match="explicit indexed accesses"):
+        validate_region_program(invalid)
     execution.cancel_step(invocation)
     with pytest.raises(RuntimeError, match="released"):
         runner.run({}, pages=pages)

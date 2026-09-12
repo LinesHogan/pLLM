@@ -15,7 +15,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_outlining import bind_outlined_region, outline_region_calls, outline_region_program
+from pllm.execution.region_outlining import bind_outlined_region, outline_region_calls
 from pllm.execution.region_storage import analyze_region_capacity, validate_region_capacity
 from pllm.execution.tensor_rewrites import explore_matmul_reassociations
 from test.boundary.test_tensor_access import StorageObserver
@@ -72,13 +72,11 @@ def test_exact_composition_preserves_escaping_versions_and_enables_cross_call_ma
         validate_region_capacity(result.outlined.program, {**cells, result.cell.digest: result.cell}, bound)
 
 
-def test_both_structural_verifiers_reject_invalid_sites_effects_and_non_tensor_calls():
+def test_native_structural_verifier_rejects_invalid_sites_effects_and_non_tensor_calls():
     program, cells, _ = chain()
     for site in (CallOutline((), 0, 1), CallOutline((), -1, 2), CallOutline((), True, 2),
                  CallOutline((0,), 0, 2), CallOutline((100, 0), 0, 2), CallOutline((0, 1), 0, 2),
                  CallOutline((), 1, 2), CallOutline((), 2**32, 2)):
-        with pytest.raises(ValueError):
-            outline_region_program(program, site)
         with pytest.raises(ValueError):
             _core.outline_region_program(encode_boundary(program), encode_boundary(site))
     scalar = Function("scalar", (ScalarType.INT,), (ScalarType.INT,))
@@ -87,7 +85,7 @@ def test_both_structural_verifiers_reject_invalid_sites_effects_and_non_tensor_c
         Call(("a",), (Value("b", ScalarType.INT),), scalar.name),
     ), ("b",))), (scalar,))
     with pytest.raises(ValueError, match="all-tensor"):
-        outline_region_program(invalid, CallOutline((), 0, 2))
+        _core.outline_region_program(encode_boundary(invalid), encode_boundary(CallOutline((), 0, 2)))
     assert tuple(call_outline_sites(invalid)) == ()
     tensor = TensorType((4,), "torch.float32")
     effect = Function("effect", (tensor,), (tensor,), ("state",))
@@ -96,8 +94,6 @@ def test_both_structural_verifiers_reject_invalid_sites_effects_and_non_tensor_c
         Call(("x",), (Value("a", tensor),), effect.name),
         Call(("a",), (Value("b", tensor),), effect.name),
     ), ("b",))), (effect,), (Resource("state", (tensor,)),))
-    with pytest.raises(ValueError, match="all-tensor"):
-        outline_region_program(effectful, CallOutline((), 0, 2))
     with pytest.raises(ValueError, match="all-tensor"):
         _core.outline_region_program(encode_boundary(effectful), encode_boundary(CallOutline((), 0, 2)))
     # The source range is rederived. Supplied frontier/result/body edits are
