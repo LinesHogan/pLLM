@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_program import (
-    AccessMode, AccessRange, AffineIndex, Call, Constant, ExternalResource, Function, If,
+    AccessMode, AccessRange, AffineIndex, Call, Constant, Coordinate, ExternalResource, Function, If,
     IndexTerm, Program, Resource, ResourceAccess, ScalarType, Scan, TensorType, Value, verify,
 )
 from pllm.execution.region_compilation import (
@@ -31,7 +31,8 @@ def source(tensor):
     write = Function("write", (X,), (), ("layers",), (ResourceAccess("layers", AccessMode.WRITE, (CELL,)),))
     prefix = Function("prefix", (X,), (tensor,), ("layers",), (ResourceAccess("layers", AccessMode.READ, (PREFIX,)),))
     program = Program(region((), (
-        Constant((), (Value("zero", X),), 0), Constant((), (Value("one", X),), 1), Constant((), (Value("two", X),), 2),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)), Coordinate((), (Value("one", X),), AffineIndex(1)),
+        Coordinate((), (Value("two", X),), AffineIndex(2)),
         Call(("zero",), (Value("old", tensor),), read.name),
         Call(("one",), (), write.name),
         Call(("zero",), (), write.name),
@@ -183,7 +184,7 @@ def test_conditional_nested_effects_project_to_the_cells_they_can_touch(enabled)
     branch = region((), (Scan((), (), 2, outer),), ())
     skip = region((), (), ())
     program = Program(region((Value("enabled", ScalarType.BOOL),), (
-        Constant((), (Value("zero", X),), 0), Constant((), (Value("one", X),), 1),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)), Coordinate((), (Value("one", X),), AffineIndex(1)),
         If(("enabled",), (), branch, skip),
         Call(("one",), (Value("other", tensor),), read.name),
         Call(("zero",), (Value("changed", tensor),), read.name),

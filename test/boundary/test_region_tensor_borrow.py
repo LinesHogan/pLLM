@@ -8,7 +8,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from pllm.contracts.region_imports import BorrowedTensorImport
 from pllm.contracts.region_program import (
-    AccessMode, Block, BorrowedResource, Call, Constant, Function, If,
+    AccessMode, AffineIndex, Block, BorrowedResource, Call, Constant, Coordinate, Function, If,
     Program, Region, ResourceAccess, ScalarType, TensorType, Value,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -58,7 +58,7 @@ def test_swiglu_uses_original_weights_without_matrix_copies_and_owns_returned_vi
     index = ScalarType.INDEX
     resource = BorrowedResource("weights", (1,))
     program = Program(Region(Block((Value("hidden", h),), (
-        Constant((), (Value("zero", index),), 0),
+        Coordinate((), (Value("zero", index),), AffineIndex(0)),
         Call(("zero",), (Value("gw", g),), load_gate.declaration.name),
         Call(("zero",), (Value("dw", d),), load_down.declaration.name),
         Call(("hidden", "gw", "dw"), (Value("result", out), Value("slice", view_type)), cell.digest),
@@ -114,7 +114,7 @@ def test_borrow_through_atomic_control_cannot_escape_as_a_mutable_weight_alias()
     tensor, index = TensorType((8, 8), "torch.float32"), ScalarType.INDEX
     load = reader("model.weight", tensor, 0)
     branch = Region(Block((), (
-        Constant((), (Value("zero", index),), 0),
+        Coordinate((), (Value("zero", index),), AffineIndex(0)),
         Call(("zero",), (Value("w", tensor),), load.declaration.name),
     ), ("w",)))
     resource = BorrowedResource("weights", (1,))

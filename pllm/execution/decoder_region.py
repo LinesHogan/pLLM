@@ -10,8 +10,8 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.region_program import (
-    AccessMode, AccessRange, AffineIndex, BankType, Block, BorrowedResource, Call, Constant, ExternalResource, Function, If,
-    IndexTerm, Op, Parameter, Program, ResourceAccess, Region, Scalar, ScalarKind, ScalarType, Scan, Select, SizeParameter, TensorType, Value,
+    AccessMode, AccessRange, AffineIndex, BankType, Block, BorrowedResource, Call, Coordinate, ExternalResource, Function,
+    IndexTerm, Op, Parameter, Program, ResourceAccess, Region, ScalarType, Scan, Select, SizeParameter, TensorType, Value,
 )
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies
@@ -114,56 +114,86 @@ class DecoderSource:
             self.first = decoder_layer_function(tensor, domain, residual=False)
             self.next = decoder_layer_function(tensor, domain, residual=True)
 
-        def tapped(prefix: str, ordinal: str, hidden: str, residual: str, old: tuple[str, ...]) -> tuple[tuple[Op, ...], tuple[str, ...]]:
-            if addition is None:
-                return (), ()
-            operations: list[Op] = []
-            results: list[str] = []
-            args = (Value("hidden", tensor), Value("residual", tensor), Value("old", tensor))
-            present = Region(Block(args, (Call(("hidden", "residual"), (Value("sum", tensor),), addition.digest),), ("sum",)))
-            absent = Region(Block(args, (), ("old",)))
-            for n, (layer, previous) in enumerate(zip(taps, old, strict=True)):
-                target, condition, result = (f"{prefix}_{name}{n}" for name in ("target", "matches", "tap"))
-                operations.extend((Constant((), (Value(target, index),), layer),
-                    Scalar((ordinal, target), (Value(condition, ScalarType.BOOL),), ScalarKind.EQUAL),
-                    If((condition, hidden, residual, previous), (Value(result, tensor),), present, absent)))
-                results.append(result)
-            return tuple(operations), tuple(results)
-
         coordinates = (Value("row", index), Value("request", index), Value("token", index), Value("layer_ids", layer_ids), Value("positions", positions))
         entry = (*coordinates, Value("seed", tensor))
-        initial_taps, initial_names = tapped("initial", "first_layer", "hidden0", "residual0", ("seed",) * len(taps))
+        contiguous = layers == tuple(range(layers[0], layers[0] + len(layers)))
         operations: list[Op] = [
-            Constant((), (Value("first_layer", index),), layers[0]),
+            Coordinate((), (Value("first_layer", index),), AffineIndex(layers[0])),
             Call(("row", "request", "token", "first_layer", "positions", "seed"),
                 (Value("hidden0", tensor), Value("residual0", tensor)), self.first.name),
-            *initial_taps,
         ]
-        returned = ("hidden0", "residual0", *initial_names)
+        # Tap hits are constructor-known positions: a tap on the first layer is
+        # computed at entry, and any other tap starts as the seed passthrough.
+        # No Constant/EQUAL/If predicates are materialized for static facts.
+        current = ["hidden0", "residual0"]
+        for n, layer in enumerate(taps):
+            name = f"initial_tap{n}"
+            if layer == layers[0]:
+                assert addition is not None
+                operations.append(Call(("hidden0", "residual0"), (Value(name, tensor),), addition.digest))
+                current.append(name)
+            else:
+                current.append("seed")
+        returned = tuple(current)
         declarations = [self.first]
         if len(layers) > 1:
-            carry = (Value("hidden", tensor), Value("residual", tensor),
-                     *(Value(f"tap{i}", tensor) for i in range(len(taps))))
-            tap_ops, tap_names = tapped("next", "layer", "hidden1", "residual1", tuple(f"tap{i}" for i in range(len(taps))))
-            layer_index: tuple[Op, ...] = (
-                Constant((), (Value("base", index),), layers[0] + 1),
-                Scalar(("index", "base"), (Value("layer", index),), ScalarKind.ADD),
-            ) if layers == tuple(range(layers[0], layers[0] + len(layers))) else (
-                Constant((), (Value("one", index),), 1),
-                Scalar(("index", "one"), (Value("ordinal", index),), ScalarKind.ADD),
-                Select(("layer_ids", "ordinal"), (Value("layer", index),)),
-            )
-            body = Region(Block((Value("index", index), *carry, *coordinates), (
-                *layer_index,
-                Call(("row", "request", "token", "layer", "positions", "hidden", "residual"),
-                     (Value("hidden1", tensor), Value("residual1", tensor)), self.next.name),
-                *tap_ops,
-            ), ("hidden1", "residual1", *tap_names)))
-            results = tuple(Value("final_" + value.name, value.type) for value in carry)
-            operations.append(Scan(("hidden0", "residual0", *initial_names, *tuple(value.name for value in coordinates)),
-                                   results, len(layers) - 1, body, invariants=len(coordinates)))
-            returned = tuple(value.name for value in results)
             declarations.append(self.next)
+            hits: dict[int, int] = {}
+            for n, layer in enumerate(taps):
+                position = layers.index(layer)
+                if position:
+                    hits[position - 1] = n
+            slot_names = ("hidden", "residual", *(f"tap{n}" for n in range(len(taps))))
+
+            def layer_ops(cursor: str | None, offset: int, prefix: str = "") -> tuple[Op, ...]:
+                # "layer" for a segment-local cursor with the segment's global
+                # offset folded into the affine constant; cursor=None is an
+                # unrolled single iteration whose position is a constant.
+                layer, ordinal = f"{prefix}layer", f"{prefix}ordinal"
+                terms = () if cursor is None else (IndexTerm(0),)
+                inputs = () if cursor is None else (cursor,)
+                if contiguous:
+                    return (Coordinate(inputs, (Value(layer, index),),
+                        AffineIndex(layers[0] + 1 + offset, terms)),)
+                return (Coordinate(inputs, (Value(ordinal, index),), AffineIndex(offset + 1, terms)),
+                    Select(("layer_ids", ordinal), (Value(layer, index),)))
+
+            total = len(layers) - 1
+            i = 0
+            segment = 0
+            while i < total:
+                if i in hits:
+                    # Unrolled tap iteration: hidden/residual advance once and
+                    # the hit tap slot becomes this layer's addition result.
+                    prefix = f"u{segment}_"
+                    hidden, residual = f"{prefix}hidden", f"{prefix}residual"
+                    operations.extend(layer_ops(None, i, prefix))
+                    operations.append(Call(("row", "request", "token", f"{prefix}layer", "positions", current[0], current[1]),
+                        (Value(hidden, tensor), Value(residual, tensor)), self.next.name))
+                    n = hits[i]
+                    tap = f"u{segment}_tap{n}"
+                    assert addition is not None
+                    operations.append(Call((hidden, residual), (Value(tap, tensor),), addition.digest))
+                    current = [hidden, residual, *current[2:]]
+                    current[2 + n] = tap
+                    i += 1
+                else:
+                    j = i
+                    while j < total and j not in hits:
+                        j += 1
+                    # A tap-free run: tap slots pass through the body unchanged.
+                    body = Region(Block((Value("index", index), *(Value(name, tensor) for name in slot_names), *coordinates), (
+                        *layer_ops("index", i),
+                        Call(("row", "request", "token", "layer", "positions", "hidden", "residual"),
+                             (Value("hidden1", tensor), Value("residual1", tensor)), self.next.name),
+                    ), ("hidden1", "residual1", *slot_names[2:])))
+                    outputs = tuple(Value(f"s{segment}_{name}", tensor) for name in slot_names)
+                    operations.append(Scan((*current, *tuple(value.name for value in coordinates)),
+                                           outputs, j - i, body, invariants=len(coordinates)))
+                    current = [value.name for value in outputs]
+                    i = j
+                segment += 1
+            returned = tuple(current)
         if addition is not None:
             declarations.append(addition.declaration)
         self.program = Program(Region(Block(entry, tuple(operations), returned)), tuple(declarations),

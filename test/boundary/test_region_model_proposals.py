@@ -14,7 +14,7 @@ from pllm.backends.vllm.runtime import BackendCommand, VllmSession, WorkloadMode
 from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, CausalModelDomain, SignedBackendAttachment
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.region_program import Block, BorrowedResource, Constant, Program, Region, ScalarType, TensorType, Value
+from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Constant, Coordinate, Program, Region, ScalarType, TensorType, Value
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
 from pllm.contracts.region_imports import CompiledTensorImport, ExportedTensorImport
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
@@ -61,7 +61,7 @@ def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(m
     inlined = inline_region(borrowed.program, (h, r, layer), "norm")
     body = RegionFunctionBody(decoder_normalize_function(tensor, 3), Program(Region(Block(
         (Value("row", ScalarType.INDEX), h, r),
-        (Constant((), (layer,), 3), *inlined.operations),
+        (Coordinate((), (layer,), AffineIndex(3)), *inlined.operations),
         (inlined.results[0].name,))), borrowed.program.functions, (context, weights)))
     body.validate()
     imports = import_region_functions(borrowed.program, local_sources)

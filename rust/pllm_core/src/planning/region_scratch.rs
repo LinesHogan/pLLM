@@ -109,7 +109,7 @@ impl Context<'_> {
                     // its COW storage and reclaim remain in the PTTS budget.
                     Ok(memory)
                 },
-                Operation::Constant { .. } | Operation::Parameter { .. } | Operation::Scalar { .. }
+                Operation::Constant { .. } | Operation::Parameter { .. } | Operation::Coordinate { .. } | Operation::Scalar { .. }
                     | Operation::Select { .. } | Operation::Update { .. } => Ok(Memory::default()),
                 _ => Err("structured storage requires imported tensor calls; PTTS payloads keep their original budget".into()),
             },

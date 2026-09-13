@@ -7,7 +7,7 @@ import torch
 from pllm.contracts.control_instructions import (
     ControlAction, ControlBlock, ControlIf, ControlPrimitive, ControlScan, ControlStep, ControlWhile,
 )
-from pllm.contracts.region_program import Call, Constant, Op, Parameter, Program, Publish, Resource, Scalar, ScalarKind, Select, Snapshot, Update, resolve_extent
+from pllm.contracts.region_program import Call, Constant, Coordinate, Op, Parameter, Program, Publish, Resource, Scalar, ScalarKind, Select, Snapshot, Update, resolve_extent
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_resources import RegionResources
@@ -94,6 +94,14 @@ class RegionActions:
             return (op.value,)
         if isinstance(op, Parameter):
             return (sizes[op.parameter],)
+        if isinstance(op, Coordinate):
+            value = op.affine.constant
+            for term in op.affine.terms:
+                operand = ins[term.argument]
+                if type(operand) is not int:
+                    raise ValueError("coordinate operands must be integers")
+                value += term.coefficient * operand
+            return (value,)
         if isinstance(op, Call):
             function = self._cells[op.function]
             if not isinstance(function, ExportedCell):

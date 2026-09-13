@@ -248,3 +248,50 @@ def test_external_effect_contents_are_observable_by_a_later_snapshot():
     assert result.resources["rng"] == (8,)
     with pytest.raises(ValueError, match="arity"):
         interpret(program, {}, resources={"rng": (7,)}, functions={"sample": lambda args: (21,)})
+
+
+def test_coordinates_declare_affine_indices_and_reject_malformed_terms():
+    import json
+    from pllm.contracts.codec import _converter
+    from pllm.contracts.region_program import AffineIndex, Coordinate, IndexTerm, Op
+    bank = BankType(I, 8)
+    declared = Program(region((Value("w", bank),), (
+        Coordinate((), (Value("two", X),), AffineIndex(2)),
+        Coordinate(("two",), (Value("twice", X),), AffineIndex(0, (IndexTerm(0, 2),))),
+        Select(("w", "twice"), (Value("x", I),)),
+    ), ("x",)))
+    verify(declared)
+    op = declared.entry.block.operations[1]
+    wire = json.loads(json.dumps(_converter.unstructure(op, Op)))
+    assert _converter.structure(wire, Op) == op
+    assert interpret(declared, {"w": Bank(tuple(range(8)))}).values == (4,)
+
+    def coordinate(constant, terms, inputs=("two",), result=X):
+        return Coordinate(inputs, (Value("c", result),), AffineIndex(constant, terms))
+
+    base = (Coordinate((), (Value("two", X),), AffineIndex(2)),)
+    for malformed in (
+        coordinate(0, (IndexTerm(1),)),                    # term past the input list
+        coordinate(0, (IndexTerm(0, 0),)),                 # zero coefficient
+        coordinate(0, (IndexTerm(0), IndexTerm(0, 2))),    # duplicate argument
+        coordinate(0, (IndexTerm(0),), result=I),          # non-index result
+    ):
+        with pytest.raises(InvalidProgram):
+            verify(Program(region((), (*base, malformed), ("two",))))
+    # Non-index operands are rejected as well.
+    boolean = Program(region((Value("flag", B),), (
+        Coordinate(("flag",), (Value("c", X),), AffineIndex(0, (IndexTerm(0),))),
+    ), ("c",)))
+    with pytest.raises(InvalidProgram):
+        verify(boolean)
+
+
+def test_coordinate_operands_must_stay_affine_at_analysis():
+    from pllm.contracts.region_program import AffineIndex, Coordinate, IndexTerm
+    from pllm.execution.region_compilation import analyze_region_program
+    dynamic = Program(region((Value("w", BankType(X, 4)), Value("at", X)), (
+        Select(("w", "at"), (Value("v", X),)),
+        Coordinate(("v",), (Value("c", X),), AffineIndex(0, (IndexTerm(0),))),
+    ), ("c",)))
+    with pytest.raises(ValueError, match="affine"):
+        analyze_region_program(dynamic, optimize=False)

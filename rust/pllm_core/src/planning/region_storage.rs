@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
 use super::region_bindings::{tables, AccessTable};
-use super::region_dependence::{analyze, canonical_schedule, closure, context, isl, legal, map_text, read_schedule, ValueSite};
+use super::region_dependence::{analyze, canonical_schedule, closure, context, isl, legal, map_text, read_schedule, set_text, ValueSite};
 use super::region_program::{Operation, Program, Type};
 use super::region_imports::{tensor_bytes, TensorImport};
 use super::semantic_graph::{canonical_ascii_json, digest};
@@ -101,7 +101,38 @@ pub(super) fn derive(program: &Program, schedule_map: &str, imports: &[TensorImp
     super::region_cache::memoized(&STORAGE, key, || derive_storage(program, &schedule, imports))
 }
 
-fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport]) -> Result<StorageAnalysis> {
+/// Storage attribution facts that never mention a schedule. Candidate
+/// schedules over the same source share one provenance derivation; only the
+/// live-range envelope at the end is specialized per schedule.
+#[derive(Clone)]
+struct Provenance {
+    domain: String,
+    dependencies: String,
+    program_digest: String,
+    imports_digest: String,
+    roots: Vec<StorageRoot>,
+    borrowed_storages: String,
+    input_storages: String,
+    retained_storages: String,
+    value_storage: String,
+    storage_consumers: String,
+    routes_tables: Vec<AccessTable>,
+    retained_tables: Vec<AccessTable>,
+    consumers: String,
+    retained: String,
+    inputs: String,
+    births: String,
+}
+
+fn provenance(program: &Program, imports: &[TensorImport]) -> Result<Provenance> {
+    thread_local! {
+        static PROVENANCE: RefCell<VecDeque<(String, Provenance)>> = const { RefCell::new(VecDeque::new()) };
+    }
+    let key = digest(&canonical_ascii_json(&(program, imports))?);
+    super::region_cache::memoized(&PROVENANCE, key, || derive_provenance(program, imports))
+}
+
+fn derive_provenance(program: &Program, imports: &[TensorImport]) -> Result<Provenance> {
     let analysis = analyze(program, false)?;
     if !analysis.exact_provenance {
         return Err("storage composition requires exact tensor value provenance".into());
@@ -122,10 +153,6 @@ fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport
         functions.insert(function.name.as_str(), import);
     }
     let ctx = context()?;
-    let domain = isl(UnionSet::read_from_str(&ctx, &analysis.domain))?;
-    let dependencies = isl(UnionMap::read_from_str(&ctx, &analysis.dependencies))?;
-    let schedule = read_schedule(&ctx, schedule_map)?;
-    legal(&domain, &dependencies, &schedule)?;
     let sources = isl(UnionMap::read_from_str(&ctx, &analysis.value_sources))?;
     let tensor_names = analysis.values.iter().filter(|v| tensor_leaf(&v.type_).is_some())
         .map(tuple).collect::<Vec<_>>();
@@ -224,7 +251,6 @@ fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport
     { return Err("storage charges do not give every tensor leaf one bounded attribution".into()); }
     let consumers = isl(isl(isl(routes.copy())?.reverse())?.apply_range(
         isl(UnionMap::read_from_str(&ctx, &analysis.value_consumers))?))?;
-    let last_uses = isl(isl(isl(consumers.copy())?.apply_range(isl(schedule.copy())?))?.lexmax())?;
     let result_names = analysis.results.iter().filter(|&&id| tensor_leaf(&analysis.values[id].type_).is_some())
         .map(|&id| tuple(&analysis.values[id])).collect::<Vec<_>>();
     let retained = isl(isl(isl(isl(routes.copy())?.intersect_domain(
@@ -234,24 +260,66 @@ fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport
     // A call can return a bank whose element coordinates do not occur in the
     // producing statement's iteration tuple. Bound those coordinates by the
     // original root domain before assigning its allocation time.
-    let births = isl(isl(isl(UnionMap::read_from_str(&ctx, &union(&births)))?
-        .intersect_domain(root_domains))?.apply_range(isl(schedule.copy())?))?;
-    let after_birth = isl(isl(isl(births.copy())?.lex_le_union_map(isl(schedule.copy())?))?.union(
-        isl(UnionMap::from_domain_and_range(inputs, isl(domain.copy())?))?))?;
-    let before_release = isl(isl(isl(last_uses.copy())?.lex_ge_union_map(isl(schedule.copy())?))?.union(
-        isl(UnionMap::from_domain_and_range(isl(isl(retained.copy())?.domain())?, isl(domain.copy())?))?))?;
+    let births = isl(isl(UnionMap::read_from_str(&ctx, &union(&births)))?
+        .intersect_domain(root_domains))?;
+    let retained_text = map_text(&retained)?;
+    let consumers_text = map_text(&consumers)?;
+    Ok(Provenance {
+        domain: analysis.domain, dependencies: analysis.dependencies,
+        program_digest: analysis.program_digest,
+        imports_digest: digest(&canonical_ascii_json(&imports)?),
+        roots: roots.into_values().collect(),
+        borrowed_storages,
+        input_storages,
+        retained_storages: retained_text.clone(),
+        value_storage: map_text(&routes)?,
+        storage_consumers: consumers_text.clone(),
+        routes_tables: tables(routes, &ctx, 'V', true)?,
+        retained_tables: tables(isl(retained.copy())?, &ctx, 'V', true)?,
+        consumers: consumers_text,
+        retained: retained_text,
+        inputs: set_text(&inputs)?,
+        births: map_text(&births)?,
+    })
+}
+
+fn derive_storage(program: &Program, schedule_map: &str, imports: &[TensorImport]) -> Result<StorageAnalysis> {
+    let provenance = provenance(program, imports)?;
+    let ctx = context()?;
+    let domain = isl(UnionSet::read_from_str(&ctx, &provenance.domain))?;
+    let dependencies = isl(UnionMap::read_from_str(&ctx, &provenance.dependencies))?;
+    let schedule = read_schedule(&ctx, schedule_map)?;
+    legal(&domain, &dependencies, &schedule)?;
+    let last_uses = isl(isl(isl(UnionMap::read_from_str(&ctx, &provenance.consumers))?
+        .apply_range(isl(schedule.copy())?))?.lexmax())?;
+    let retained = isl(UnionMap::read_from_str(&ctx, &provenance.retained))?;
+    let inputs = isl(UnionSet::read_from_str(&ctx, &provenance.inputs))?;
+    let births = isl(isl(UnionMap::read_from_str(&ctx, &provenance.births))?
+        .apply_range(isl(schedule.copy())?))?;
+    // Compare value times against the universe of the time space, not the
+    // schedule's image: comparison pieces stay free of image constraints.
+    // Joining the bounded times back through the schedule still restricts the
+    // envelope to times that actually occur, so the live relation is unchanged.
+    let times = isl(isl(isl(schedule.copy())?.range())?.universe())?;
+    let after_birth = isl(isl(isl(births.copy())?.lex_le_union_map(isl(isl(times.copy())?.identity())?))?
+        .union(isl(UnionMap::from_domain_and_range(inputs, isl(times.copy())?))?))?;
+    let before_release = isl(isl(isl(last_uses.copy())?.lex_ge_union_map(isl(isl(times.copy())?.identity())?))?
+        .union(isl(UnionMap::from_domain_and_range(isl(isl(retained.copy())?.domain())?, times))?))?;
     // Include even unused outputs during their producing call. Equal-time
     // calls share a conservative envelope, matching strict-< frame releases.
-    let live = isl(isl(after_birth.intersect(before_release))?.union(
+    let live_t = isl(after_birth.intersect(before_release))?;
+    let live = isl(isl(live_t.apply_range(isl(isl(schedule.copy())?.reverse())?))?.union(
         isl(isl(births.copy())?.apply_range(isl(isl(schedule.copy())?.reverse())?))?))?;
     let mut result = StorageAnalysis {
-        program_digest: analysis.program_digest, schedule_map: map_text(&schedule)?,
-        imports_digest: digest(&canonical_ascii_json(&imports)?), roots: roots.into_values().collect(),
-        input_storages, borrowed_storages, live_storages: map_text(&live)?, allocation_times: map_text(&births)?,
-        retained_storages: map_text(&retained)?,
-        value_storage: map_text(&routes)?, storage_consumers: map_text(&consumers)?,
-        routes: tables(routes, &ctx, 'V', true)?, births: tables(births, &ctx, 'V', false)?,
-        last_uses: tables(last_uses, &ctx, 'V', false)?, retained: tables(retained, &ctx, 'V', true)?,
+        program_digest: provenance.program_digest, schedule_map: map_text(&schedule)?,
+        imports_digest: provenance.imports_digest, roots: provenance.roots,
+        input_storages: provenance.input_storages,
+        borrowed_storages: provenance.borrowed_storages,
+        live_storages: map_text(&live)?, allocation_times: map_text(&births)?,
+        retained_storages: provenance.retained_storages,
+        value_storage: provenance.value_storage, storage_consumers: provenance.storage_consumers,
+        routes: provenance.routes_tables, births: tables(births, &ctx, 'V', false)?,
+        last_uses: tables(last_uses, &ctx, 'V', false)?, retained: provenance.retained_tables,
         signature: String::new(),
     };
     result.signature = digest(&canonical_ascii_json(&result)?);

@@ -8,7 +8,7 @@ import torch
 from pllm.backends.vllm.region_layers import VllmDecoderBodies, decoder_partition_bodies
 from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
-from pllm.contracts.region_program import BankType, Block, BorrowedResource, Call, Constant, Function, Map, Program, Region, ScalarType, SizeParameter, TensorType, Value
+from pllm.contracts.region_program import AffineIndex, BankType, Block, BorrowedResource, Call, Constant, Coordinate, Function, Map, Program, Region, ScalarType, SizeParameter, TensorType, Value
 from pllm.execution.module_graph import ModuleCallBinding
 from pllm.execution.region_compilation import analyze_region_program, lower_region_schedule
 
@@ -191,7 +191,7 @@ def test_model_source_exposes_kv_before_feed_forward_without_weakening_causality
     index = ScalarType.INDEX
     position = TensorType((1,), "torch.int64")
     source = Program(Region(Block((Value("x", tensor), Value("position", position)), (
-        Constant((), (Value("zero", index),), 0), Constant((), (Value("one", index),), 1),
+        Coordinate((), (Value("zero", index),), AffineIndex(0)), Coordinate((), (Value("one", index),), AffineIndex(1)),
         Call(("zero", "zero", "zero", "zero", "position", "x"),
              (Value("h0", tensor), Value("r0", tensor)), function.name),
         Call(("one", "zero", "one", "zero", "position", "x"),

@@ -76,7 +76,7 @@ fn concurrent_action(action: &Action, program: &Program, imports: &[TensorImport
             })
         },
         Action::Primitive { operation } => matches!(operation, Operation::Constant { .. } | Operation::Parameter { .. }
-            | Operation::Scalar { .. } | Operation::Select { .. } | Operation::Update { .. }),
+            | Operation::Coordinate { .. } | Operation::Scalar { .. } | Operation::Select { .. } | Operation::Update { .. }),
         Action::If { then_block, else_block } => then_block.steps.iter().chain(&else_block.steps)
             .all(|step| concurrent_action(&step.action, program, imports, retained)),
         Action::While { condition, body, .. } => condition.steps.iter().chain(&body.steps)

@@ -22,7 +22,7 @@ from pllm.contracts.control_instructions import (
     ControlAction, ControlPrimitive, ControlIf, ControlWhile, ControlScan, ControlMap, ControlBlock,
 )
 from pllm.contracts.region_program import (
-    AccessMode, BankType, BorrowedResource, Call, Constant, DataType, ExternalResource, If, Map, Op, Parameter, Publish, Resource, ResourceType,
+    AccessMode, BankType, BorrowedResource, Call, Constant, Coordinate, DataType, ExternalResource, If, Map, Op, Parameter, Publish, Resource, ResourceType,
     ParameterTerm, Region, Scalar, ScalarKind, ScalarType, Scan, Select, SizeParameter, Snapshot, TensorType, Update, While,
 )
 from pllm.contracts.region_imports import BorrowedTensorImport, CompiledTensorImport, ExportedTensorImport, FunctionalKernelImport, NativeKernelImport, NativeTensorImport, RegionTensorImport
@@ -203,7 +203,7 @@ def _region_wire(value: Region) -> dict[str, object]:
 
 _converter.register_unstructure_hook(Region, _region_wire)
 _region_op_tags: dict[type[object], str] = {
-    Constant: "constant", Parameter: "parameter", Scalar: "scalar", Call: "call", Select: "select", Update: "update",
+    Constant: "constant", Parameter: "parameter", Coordinate: "coordinate", Scalar: "scalar", Call: "call", Select: "select", Update: "update",
     Snapshot: "snapshot", Publish: "publish", Scan: "scan", Map: "map", If: "if", While: "while",
 }
 configure_tagged_union(Op, _converter, tag_generator=_region_op_tags.__getitem__, tag_name="op")

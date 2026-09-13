@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_program import (
-    BankType, Block, Call, Constant, If, InvalidProgram, Program, Publish,
+    AffineIndex, BankType, Block, Call, Constant, Coordinate, If, InvalidProgram, Program, Publish,
     Region, Resource, ScalarType, Scan, SizeParameter, Snapshot, Value, verify,
 )
 from pllm.execution.codec import encode_boundary
@@ -150,7 +150,7 @@ def test_scan_collects_snapshots_through_original_page_owner(count, dynamic):
     tensor = cell.declaration.inputs[0]
     args = (Value("marker", I),)
     body = region((Value("i", X), *args), (
-        Constant((), (Value("zero", X),), 0),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)),
         Snapshot(("zero",), (Value("old", tensor),), "layers"),
         Call(("old",), (Value("new", tensor),), cell.digest),
         Publish(("new", "zero"), (), "layers"),

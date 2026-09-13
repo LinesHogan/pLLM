@@ -62,6 +62,21 @@ class Parameter(Operation):
     parameter: str
 
 
+@dataclass(frozen=True, slots=True)
+class Coordinate(Operation):
+    """Declare an affine index value: constant + sum(coefficient * input).
+
+    Terms reference this op's inputs by position, the same convention as
+    resource access ranges referencing call inputs. Inputs must be in-scope
+    index values: block arguments, loop cursors, Parameter results or other
+    Coordinates. The combined value must stay within the checked index range
+    over the enclosing domain; out-of-range or non-affine operands are
+    rejected at verification/analysis, not silently degraded.
+    """
+
+    affine: AffineIndex
+
+
 class ScalarKind(StrEnum):
     ADD = "add"
     SUB = "sub"
@@ -134,7 +149,7 @@ class While(Operation):
     body: Region
 
 
-Op: TypeAlias = Constant | Parameter | Scalar | Call | Select | Update | Snapshot | Publish | Scan | Map | If | While
+Op: TypeAlias = Constant | Parameter | Coordinate | Scalar | Call | Select | Update | Snapshot | Publish | Scan | Map | If | While
 
 
 @dataclass(frozen=True, slots=True)

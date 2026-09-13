@@ -43,6 +43,12 @@ Scan 现在区分真正的 carry 与固定输入，DecoderSource、tokenwise 和
 已删除固定输入的逐轮返回接线。同一 recirculation 的六个 Scan 减少 30 个无用
 输出；除源摘要外，全部分析字段保持一致。
 
+坐标与 tap 分支随后完成静态化：`Coordinate` 直接声明仿射下标，Constant/Scalar
+的仿射恢复路径已删除；构造期可判定的 tap If 全部展开或分段，recirculation 源
+If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次推导、候选共享）
+与按调度特化的生存期 envelope，修复了 24 层配置下候选 payload 推导越过 ISL
+操作配额的问题；详见下文对应小节。
+
 ## 这轮具体收掉了什么
 
 | 原问题 | 当前实现 |
@@ -360,6 +366,38 @@ GPU/动态 Scan/worker 集合 **29 项通过**，原 recirculation 回归 **1 �
 覆盖输出、更新/重放次数、原状态、取消和清理。Rust **20 项通过**，release 重建
 及 typing、import layers、region authority、diff 门禁通过。本次未重复完整模型
 或对齐吞吐验收。源与分析对照见 [Scan 固定输入记录](evidence/scan-invariants-results.json)。
+
+## Coordinate 直接声明、tap 静态化与存储推导复用
+
+坐标改为 `Coordinate` 操作直接声明 `AffineIndex`（常数加按位置引用输入的
+系数项）：验证器拒绝越界、非仿射操作数和重复项；Rust 依赖分析设直达分支，
+原 Constant int→affine 与 Scalar combine 恢复路径已删除，删除后这些位置是
+普通语句，不退化为 opaque。decoder、tokenwise 与区域组合构造器已全部迁移，
+`Scalar` 只保留真正的动态标量与布尔谓词。
+
+构造期可判定的 tap 分支同时静态化：命中首层的 tap 在构造期展开为加法调用，
+其余 tap 的命中迭代是构造期常量，层 Scan 在 tap 层处分段、命中迭代展开为
+单段直写。recirculation 源 If 从 10 降为 2（仅保留按请求资格的真动态分支）。
+三层对照源语法树为 24 Call、19 Coordinate、6 Scan、2 If，分析语句 28→18、
+值 85→61、诊断清零；新旧源参考执行的调用序列、效果事件与数值逐字段相等。
+
+存储归属推导按调度相关性拆分：provenance（源分析、来源传递闭包、存储路由、
+消费者、保留集、出生映射）与调度无关，对每个（源, 导入）推导一次并缓存，
+候选调度共享；只有生存期 envelope 按调度特化。envelope 的字典序比较改在
+时间空间全集上进行、再经 schedule 接回实际时间，最终关系与原表述相同。
+真实规模（24 层、64 packed row）配置下，tap 展开结构使调度片从 60 涨到 84、
+最胖串行候选调度文本 34.6KB，旧推导在第 4 个串行候选上越过 20M ISL 操作
+配额，`make_llm` 即失败；修复后 4 个候选全部在配额内完成，派生 payload 与
+旧表述逐字节一致，envelope 中间关系从约 7000 片降到约 100 片。小配置的
+语句数下降（28→18）不能外推到真实配置，以真实配置为准。
+
+验收：Rust **21 项通过**，release 扩展已重建安装；CPU 边界回归 **376 项通过、
+63 项跳过**（含其余边界文件共 481 项通过、99 项跳过）；原 recirculation
+回归 1 项通过；Qwen recirculation smoke 通过：8 个正常行、6 个 replay 行、
+14 次独立数值比较、零 fallback，13 个候选完成测量；EngineCore recirculation
+检查通过：候选全部完成测量、并行与变换候选存在、重复请求得到 replay 行、
+零 fallback。typing、import layers、region authority、diff 门禁通过。执行
+对照见 [坐标与 tap 迁移对照](evidence/coordinate-tap-comparison.json)。
 
 ## 最近完整收口的验收基线
 

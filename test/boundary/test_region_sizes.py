@@ -7,7 +7,7 @@ import pytest
 
 from pllm import _core
 from pllm.contracts.region_program import (
-    BankType, Call, Constant, Function, If, InvalidProgram, Map, Parameter, ParameterTerm, Program, Scalar, ScalarKind,
+    AffineIndex, BankType, Call, Constant, Coordinate, Function, If, IndexTerm, InvalidProgram, Map, Parameter, ParameterTerm, Program, Scalar, ScalarKind,
     ScalarType, Scan, Select, SizeConstraint, SizeParameter, Value, verify,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -169,10 +169,9 @@ def test_parameter_offsets_route_bank_elements_in_affine_and_dynamic_regions(mon
     bank, output = BankType(I, 32), BankType(I, "n")
     body = region((Value("i", X), Value("xs", bank)), (
         Parameter((), (Value("prefix", X),), "prefix"),
-        Scalar(("prefix", "i"), (Value("position", X),), ScalarKind.ADD),
-        Constant((), (Value("two", X),), 2),
-        Scalar(("position", "two"), (Value("doubled", X),), ScalarKind.MUL),
-        Scalar(("doubled", "prefix"), (Value("index", X),), ScalarKind.SUB),
+        Coordinate(("prefix", "i"), (Value("position", X),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
+        Coordinate(("position",), (Value("doubled", X),), AffineIndex(0, (IndexTerm(0, 2),))),
+        Coordinate(("doubled", "prefix"), (Value("index", X),), AffineIndex(0, (IndexTerm(0), IndexTerm(1, -1)))),
         Select(("xs", "index"), (Value("selected", I),)),
     ), ("selected",))
     entry = region((Value("xs", bank),), (
@@ -218,7 +217,7 @@ def test_parameter_products_and_possible_overflow_keep_checked_execution():
 
     overflow = Program(region((), (
         Parameter((), (Value("p", X),), "p"),
-        Constant((), (Value("one", X),), 1),
+        Coordinate((), (Value("one", X),), AffineIndex(1)),
         Scalar(("p", "one"), (Value("unused", X),), ScalarKind.ADD),
     ), ("p",)), parameters=(SizeParameter("p", 0, 2**63 - 1),))
     analysis, runner = bind_reference_schedule(overflow)
@@ -233,7 +232,7 @@ def test_relational_sizes_prove_offset_accesses_and_guard_each_invocation():
     bank = BankType(I, 8)
     body = region((Value("i", X), Value("xs", bank)), (
         Parameter((), (Value("prefix", X),), "prefix"),
-        Scalar(("prefix", "i"), (Value("position", X),), ScalarKind.ADD),
+        Coordinate(("prefix", "i"), (Value("position", X),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
         Select(("xs", "position"), (Value("x", I),)),
     ), ("x",))
     constraint = SizeConstraint((ParameterTerm("prefix"), ParameterTerm("n")), 8)

@@ -12,7 +12,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from pllm.contracts.region_imports import BorrowedTensorImport, RegionTensorImport
 from pllm.contracts.region_payload import RegionPayload
 from pllm.contracts.region_proposal import RegionScheduleProposal
-from pllm.contracts.region_program import Block, BorrowedResource, Constant, Program, Region, ScalarType, TensorType
+from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Coordinate, Program, Region, ScalarType, TensorType
 from pllm.contracts.region_streams import RegionStreamExploration
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
@@ -35,7 +35,7 @@ def test_import_only_planner_roundtrip_matches_local_graphs_without_initializing
     value, coordinate = block.arguments
     assert coordinate.type is ScalarType.INDEX
     program = replace(body.program, entry=Region(Block((value,),
-        (Constant((), (coordinate,), 0), *block.operations), block.yields)))
+        (Coordinate((), (coordinate,), AffineIndex(0)), *block.operations), block.yields)))
     imports = import_region_functions(program, functions)
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     expected = analyze_region_payload(program, schedule, functions)

@@ -7,7 +7,7 @@ import torch
 
 from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_program import (
-    BankType, Call, Constant, Map, Program, Scalar, ScalarKind, ScalarType,
+    AffineIndex, BankType, Call, Constant, Coordinate, IndexTerm, Map, Program, Scalar, ScalarKind, ScalarType,
     Scan, Select, TensorType, Update, Value,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -161,8 +161,7 @@ def test_tampered_sources_and_lifetimes_rejected_before_execution(cell):
 
 def test_reverse_map_rematerializes_indices_and_constants():
     body = region((Value("i", X),), (
-        Constant((), (Value("two", X),), 2),
-        Scalar(("i", "two"), (Value("twice", X),), ScalarKind.MUL),
+        Coordinate(("i",), (Value("twice", X),), AffineIndex(0, (IndexTerm(0, 2),))),
     ), ("twice",))
     program = Program(region((), (Map((), (Value("ys", BankType(X, 7)),), 7, body),), ("ys",)))
     analysis = analyze_region_program(program)

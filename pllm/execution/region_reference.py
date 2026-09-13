@@ -15,7 +15,7 @@ import torch
 from pllm.execution.region_values import Bank, Data, check_data, copy_data
 
 from pllm.contracts.region_program import (
-    BankType, Call, Constant, DataType, If, Map, Parameter, Program, Resource, Publish,
+    BankType, Call, Constant, Coordinate, DataType, If, Map, Parameter, Program, Resource, Publish,
     Region, Scalar, ScalarKind, Scan, Select, Snapshot,
     Update, verify, bind_sizes, resolve_extent,
 )
@@ -143,6 +143,14 @@ def interpret(program: Program, inputs: Mapping[str, Data], *,
                 result = (op.value,)
             elif isinstance(op, Parameter):
                 result = (sizes[op.parameter],)
+            elif isinstance(op, Coordinate):
+                value = op.affine.constant
+                for term in op.affine.terms:
+                    operand = ins[term.argument]
+                    if type(operand) is not int:
+                        raise ValueError("coordinate operands must be integers")
+                    value += term.coefficient * operand
+                result = (value,)
             elif isinstance(op, Scalar):
                 result = _scalar(op, ins)
             elif isinstance(op, (Select, Update)):

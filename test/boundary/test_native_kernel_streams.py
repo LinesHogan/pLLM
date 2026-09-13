@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_imports import KernelAllocation, NativeKernelImport, RegionTensorImport
-from pllm.contracts.region_program import AccessMode, BorrowedResource, Call, Constant, Function, Program, ResourceAccess, ScalarType, TensorType, Value
+from pllm.contracts.region_program import AccessMode, AffineIndex, BorrowedResource, Call, Coordinate, Function, Program, ResourceAccess, ScalarType, TensorType, Value
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import index_cell
@@ -105,7 +105,7 @@ def test_external_kernel_borrows_original_weights_and_requires_matching_local_ab
     function = Function("test.readonly.kernel", (index,), (tensor,), (weights.name,),
         (ResourceAccess(weights.name, AccessMode.READ, (index_cell(0),)),))
     program = Program(region((), (
-        Constant((), (Value("zero", index),), 0), Constant((), (Value("one", index),), 1),
+        Coordinate((), (Value("zero", index),), AffineIndex(0)), Coordinate((), (Value("one", index),), AffineIndex(1)),
         Call(("zero",), (Value("a", tensor),), function.name),
         Call(("one",), (Value("b", tensor),), function.name),
     ), ("a", "b")), (function,), (weights,))

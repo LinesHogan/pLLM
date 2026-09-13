@@ -3,7 +3,7 @@
 from dataclasses import dataclass, replace
 
 from pllm.contracts.region_program import (
-    Block, Call, Constant, Function, If, Map, Op, Program, Region, Scalar, ScalarKind,
+    AffineIndex, Block, Call, Coordinate, Function, If, Map, Op, Program, Region, Scalar, ScalarKind,
     ScalarType, Scan, Value, While, verify,
 )
 
@@ -70,7 +70,7 @@ def select_function_bodies(bodies: tuple[RegionFunctionBody, ...], *, selector: 
             return Region(Block(arguments, inlined.operations, tuple(value.name for value in inlined.results)))
         middle = (start + stop) // 2
         return Region(Block(arguments, (
-            Constant((), (split,), middle),
+            Coordinate((), (split,), AffineIndex(middle)),
             Scalar((selector, split.name), (before,), ScalarKind.LESS),
             If((before.name, *(value.name for value in arguments)), results, select(start, middle), select(middle, stop)),
         ), tuple(value.name for value in results)))

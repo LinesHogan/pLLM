@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_program import (
-    AccessMode, BorrowedResource, Call, Constant, Function, Program, ResourceAccess, ScalarType, TensorType, Value,
+    AccessMode, AffineIndex, BorrowedResource, Call, Coordinate, Function, Program, ResourceAccess, ScalarType, TensorType, Value,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionRequest
@@ -35,7 +35,8 @@ def source():
     read = Function("read", (X, X, X), (tensor,), ("kv",), (ResourceAccess("kv", AccessMode.READ, ranges),))
     write = Function("write", (X, X, X), (), ("kv",), (ResourceAccess("kv", AccessMode.WRITE, ranges),))
     return Program(region((), (
-        Constant((), (Value("zero", X),), 0), Constant((), (Value("one", X),), 1), Constant((), (Value("token", X),), 4),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)), Coordinate((), (Value("one", X),), AffineIndex(1)),
+        Coordinate((), (Value("token", X),), AffineIndex(4)),
         Call(("zero", "zero", "token"), (Value("old", tensor),), read.name),
         Call(("one", "zero", "token"), (), write.name),
         Call(("zero", "zero", "token"), (), write.name),
@@ -57,7 +58,7 @@ def test_readonly_tensor_borrows_allow_shared_reads_and_reject_writable_aliases(
     read = Function("weights.read", (X,), (tensor,), ("weights",), (
         ResourceAccess("weights", AccessMode.READ, (index_cell(0),)),))
     program = Program(region((), (
-        Constant((), (Value("zero", X),), 0), Constant((), (Value("one", X),), 1),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)), Coordinate((), (Value("one", X),), AffineIndex(1)),
         Call(("zero",), (Value("a", tensor),), read.name),
         Call(("one",), (Value("b", tensor),), read.name),
     ), ("a", "b")), (read,), (KV, weights))

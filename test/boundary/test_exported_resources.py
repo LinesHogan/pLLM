@@ -6,7 +6,7 @@ import torch
 from pllm.contracts.region_composition import inline_function_bodies
 from pllm.contracts.region_imports import BorrowedTensorImport, CompiledTensorImport
 from pllm.contracts.region_selection import RegionPayloadLimit
-from pllm.contracts.region_program import Block, BorrowedResource, Call, Constant, Program, Region, ScalarType, Value
+from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, Call, Coordinate, Program, Region, ScalarType, Value
 from pllm.execution.exported_region import import_exported_region
 from pllm.execution.exported_resources import borrow_exported_inputs
 from pllm.execution.module_graph import exported_parameter_fields
@@ -44,7 +44,7 @@ def test_export_parameters_and_buffers_borrow_original_storage_through_the_regio
     declaration = body.declaration
     outputs = tuple(Value(f"out{i}", type_) for i, type_ in enumerate(declaration.outputs))
     wrapper = Program(Region(Block((Value("x", declaration.inputs[0]),), (
-        Constant((), (Value("layer", ScalarType.INDEX),), 0),
+        Coordinate((), (Value("layer", ScalarType.INDEX),), AffineIndex(0)),
         Call(("x", "layer"), outputs, declaration.name),
     ), tuple(value.name for value in outputs))), (declaration,), (resource,))
     program = inline_function_bodies(wrapper, (body,))

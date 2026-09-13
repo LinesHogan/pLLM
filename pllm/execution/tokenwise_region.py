@@ -13,8 +13,8 @@ import torch
 
 from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region
 from pllm.contracts.region_program import (
-    AccessMode, AccessRange, AffineIndex, BankType, Block, BorrowedResource, Call, Constant, Function, If, Op,
-    Parameter, ParameterTerm, Program, Region, ResourceAccess, Scalar, ScalarKind, ScalarType, Scan, Select,
+    AccessMode, AccessRange, AffineIndex, BankType, Block, BorrowedResource, Call, Coordinate, Function, If, IndexTerm, Op,
+    Parameter, ParameterTerm, Program, Region, ResourceAccess, ScalarType, Scan, Select,
     SizeConstraint, SizeParameter, TensorType, Value,
 )
 from pllm.contracts.backend_attachment import CausalModelDomain
@@ -117,7 +117,7 @@ class TokenwiseRegion:
         parameters: list[SizeParameter] = []
         constraints: list[SizeConstraint] = []
         arguments = [Value("normal_layers", normal_layers), Value("replay_layers", replay_layers)]
-        operations: list[Op] = [Constant((), (Value("base0", index),), 0)]
+        operations: list[Op] = [Coordinate((), (Value("base0", index),), AffineIndex(0))]
         rows: list[str] = []
         for request in range(domain.requests):
             count = SizeParameter(f"tokens{request}", 0, min(max_rows, domain.positions))
@@ -129,9 +129,9 @@ class TokenwiseRegion:
             invariants = (Value("eligible", flags), Value("normal_layers", normal_layers), Value("replay_layers", replay_layers),
                      Value("base", index), Value("prefix", index))
             body = Region(Block((Value("token", index), *invariants), (
-                Constant((), (Value("request", index),), request),
-                Scalar(("base", "token"), (Value("row", index),), ScalarKind.ADD),
-                Scalar(("prefix", "token"), (Value("offset", index),), ScalarKind.ADD),
+                Coordinate((), (Value("request", index),), AffineIndex(request)),
+                Coordinate(("base", "token"), (Value("row", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
+                Coordinate(("prefix", "token"), (Value("offset", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
                 Select(("eligible", "token"), (Value("enabled", boolean),)),
                 Call(("row", "request", "offset"),
                     (Value("positions", positions), Value("seed", tensor)), self.begin.name),
@@ -147,7 +147,7 @@ class TokenwiseRegion:
                 Parameter((), (Value(count.name, index),), count.name),
                 Scan((f"eligible{request}", "normal_layers", "replay_layers", f"base{request}", prefix.name),
                     outputs, count.name, body, invariants=len(invariants)),
-                Scalar((f"base{request}", count.name), (Value(f"base{request + 1}", index),), ScalarKind.ADD),
+                Coordinate((f"base{request}", count.name), (Value(f"base{request + 1}", index),), AffineIndex(0, (IndexTerm(0), IndexTerm(1)))),
             ))
             rows.append(outputs[-1].name)
         constraints.append(SizeConstraint(tuple(ParameterTerm(f"tokens{request}") for request in range(domain.requests)), max_rows))

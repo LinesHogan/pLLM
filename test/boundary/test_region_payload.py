@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_program import (
-    Call, Constant, InvalidProgram, Program, Publish, Resource, ScalarType,
+    AffineIndex, Call, Coordinate, InvalidProgram, Program, Publish, Resource, ScalarType,
     Scan, Snapshot, Value, verify,
 )
 from pllm.contracts.tensor_layout import LayoutFieldId
@@ -28,13 +28,13 @@ def payload_program(cell, rounds):
         return tuple(Value(f"{prefix}{i}", type_) for i, type_ in enumerate(types))
     old, new, initial, final = (values(prefix) for prefix in ("old", "new", "initial", "final"))
     body = region((Value("i", X),), (
-        Constant((), (Value("zero", X),), 0),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)),
         Snapshot(("zero",), (*old,), "layers"),
         Call(tuple(v.name for v in old), new, cell.digest),
         Publish((*tuple(v.name for v in new), "zero"), (), "layers"),
     ), ())
     return Program(region((), (
-        Constant((), (Value("zero", X),), 0),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)),
         Snapshot(("zero",), (*initial,), "layers"),
         Scan((), (), rounds, body),
         Snapshot(("zero",), (*final,), "layers"),

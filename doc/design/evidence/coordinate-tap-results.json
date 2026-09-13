@@ -1,0 +1,91 @@
+{
+  "recorded_at_utc": "2026-09-13T06:34:42.514404+00:00",
+  "baseline": "decoder-source-results.json",
+  "scope": "Declare coordinates directly as Coordinate(AffineIndex), delete the Constant/Scalar affine recovery path, and staticize constructor-decidable tap branches without changing execution.",
+  "python": "/workspace/pllm/.venv/bin/python",
+  "changes": [
+    "Coordinate op declares AffineIndex(constant, IndexTerm terms over own inputs); verifier and analysis hard-reject non-affine or out-of-range operands instead of degrading to opaque",
+    "Rust Constant int->affine and Scalar combine recovery deleted; remaining Constants/Scalars are ordinary statements (checked int/index arithmetic keeps may_trap diagnostics)",
+    "initial taps expanded at construction (hit at first layer emits the addition call, otherwise the seed passes through)",
+    "layer Scan segmented at constructor-known tap positions; hit iterations unrolled with constant layer coordinates, global offsets folded into Coordinate affine constants",
+    "tokenwise eligibility If kept as a genuinely dynamic predicate; recirculation source If count 10 -> 2",
+    "storage attribution split into schedule-independent provenance (derived once per (program, imports), memoized) plus a per-schedule live-range envelope",
+    "envelope lexicographic comparisons run against the universe of the time space and join back through the schedule; the live relation is unchanged"
+  ],
+  "preserved": [
+    "reference execution: call count and name sequence, resource effect events, and returned values field-equal to the pre-migration source",
+    "Select/Update index proofs, resource reads/writes, dependencies, candidates and reference order on the archived data source",
+    "deliberate checked-arithmetic rejection behavior for non-affine coordinate operands",
+    "derived payloads byte-identical across the storage reformulation on all schedule candidates"
+  ],
+  "source_comparison": {
+    "artifact": "coordinate-tap-comparison.json",
+    "sha256": "7c594317d68621ab1912348a910cf6c025b8577c1039a5b524862256f240cc8c",
+    "counts": {
+      "before": {
+        "call": 26,
+        "constant": 19,
+        "if": 10,
+        "parameter": 4,
+        "scalar": 18,
+        "scan": 6,
+        "select": 2,
+        "statements": 28,
+        "values": 85
+      },
+      "after": {
+        "call": 24,
+        "coordinate": 19,
+        "if": 2,
+        "parameter": 4,
+        "scan": 6,
+        "select": 2,
+        "statements": 18,
+        "values": 61
+      }
+    },
+    "reference_execution_equivalence": {
+      "call_count_equal": true,
+      "call_name_sequence_equal": true,
+      "calls": 52,
+      "effect_events": 99,
+      "effect_events_equal": true,
+      "values_equal": true
+    }
+  },
+  "real_size_config_accounting": {
+    "config": "24 layers, 64 packed rows, taps at layers 22/23 (Qwen2.5-0.5B recirculation smoke)",
+    "statements": {
+      "before": 83,
+      "after": 84
+    },
+    "values": {
+      "before": 125,
+      "after": 147
+    },
+    "schedule_pieces": {
+      "before": 60,
+      "after": 84
+    },
+    "fattest_serial_candidate_schedule_bytes": {
+      "before": 25637,
+      "after": 34646
+    },
+    "note": "unrolled tap iterations add entry-level schedule pieces; the small-config statement reduction (28->18) does not extrapolate to the real config",
+    "storage_fix": "previously the 4th serial candidate's payload derivation exceeded the 20M cumulative ISL operation quota inside make_llm; after provenance reuse plus universe-time comparisons all 4 candidates complete within quota with byte-identical payloads, envelope intermediates ~7000 -> ~100 pieces"
+  },
+  "acceptance": {
+    "rust_tests": 21,
+    "cpu_boundary_subset": "376 passed, 63 skipped",
+    "cpu_boundary_full": "481 passed, 99 skipped",
+    "recirculation_workload": "1 passed",
+    "qwen_recirculation_smoke": "8 normal rows, 6 replay rows, 14 independent numerical comparisons, zero fallback, 13 candidates measured",
+    "enginecore_recirculation": "all candidates measured, parallel and transformed candidates present, replay rows on repeated requests, zero fallback",
+    "gates": [
+      "check_typing",
+      "check_import_layers",
+      "check_region_authority",
+      "git diff --check"
+    ]
+  }
+}

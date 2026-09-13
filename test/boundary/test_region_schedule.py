@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from pllm.contracts.region_program import (
-    BankType, Block, Call, Constant, Function, If, Program, Publish,
+    AffineIndex, BankType, Block, Call, Constant, Coordinate, Function, If, IndexTerm, Program, Publish,
     Region, Resource, Scalar, ScalarKind, ScalarType, Scan, Select, Snapshot, Update, Value,
 )
 from pllm.execution.region_compilation import (
@@ -84,7 +84,7 @@ def test_missing_collapsed_reversed_and_multivalued_witnesses_are_rejected(sched
 def test_old_bank_reads_do_not_accidentally_become_reads_of_the_new_version():
     bank = BankType(I, 2)
     program = Program(region((Value("w", bank),), (
-        Constant((), (Value("zero", X),), 0),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)),
         Select(("w", "zero"), (Value("old", I),)),
         Call(("old",), (Value("new", I),), "update"),
         Update(("w", "zero", "new"), (Value("next_bank", bank),)),
@@ -177,8 +177,7 @@ def test_proven_branches_can_move_but_checked_arithmetic_keeps_a_boundary():
 def test_affine_scaled_indices_are_analyzed_but_unknown_indices_stay_opaque():
     bank = BankType(I, 8)
     body = region((Value("i", X), Value("w", bank)), (
-        Constant((), (Value("two", X),), 2),
-        Scalar(("i", "two"), (Value("even", X),), ScalarKind.MUL),
+        Coordinate(("i",), (Value("even", X),), AffineIndex(0, (IndexTerm(0, 2),))),
         Select(("w", "even"), (Value("x", I),)),
         Call(("x",), (Value("next", I),), "f"),
         Update(("w", "even", "next"), (Value("out", bank),)),
@@ -195,9 +194,8 @@ def test_affine_scaled_indices_are_analyzed_but_unknown_indices_stay_opaque():
 
 
 def test_unproven_resource_index_cannot_move_after_an_unrelated_publication():
-    program = Program(region((Value("index", X),), (
+    program = Program(region((Value("index", X), Value("new", I)), (
         Snapshot(("index",), (Value("old", I),), "a"),
-        Constant((), (Value("new", I),), 9),
         Publish(("new",), (), "b"),
     ), ()), resources=(Resource("a", (I,), (3,)), Resource("b", (I,))))
     assert analyze_region_program(program).statements[0].opaque
@@ -206,8 +204,7 @@ def test_unproven_resource_index_cannot_move_after_an_unrelated_publication():
 
 
 def test_potential_integer_overflow_preserves_its_order_relative_to_effects():
-    program = Program(region((Value("x", I),), (
-        Constant((), (Value("one", I),), 1),
+    program = Program(region((Value("x", I), Value("one", I)), (
         Scalar(("x", "one"), (Value("result", I),), ScalarKind.ADD),
         Publish(("one",), (), "w"),
     ), ("result",)), resources=(Resource("w", (I,)),))

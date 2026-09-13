@@ -8,7 +8,7 @@ import torch
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.region_program import (
-    Call, Constant, Program, Publish, Resource, ScalarType, Scan,
+    AffineIndex, Call, Coordinate, Program, Publish, Resource, ScalarType, Scan,
     Snapshot, Value,
 )
 from pllm.contracts.request_identity import RequestIdentity
@@ -39,8 +39,8 @@ def page_program(cell, rounds=8):
         Scan((), (), 2, layer),
     ), ())
     return Program(region((), (
-        Constant((), (Value("zero", X),), 0),
-        Constant((), (Value("one", X),), 1),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)),
+        Coordinate((), (Value("one", X),), AffineIndex(1)),
         Snapshot(("zero",), (Value("old", tensor),), "layers"),
         Scan((), (), rounds, chunk),
         Snapshot(("zero",), (Value("first", tensor),), "layers"),

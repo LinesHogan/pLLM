@@ -136,8 +136,12 @@
           ],
           "operations": [
             {
+              "affine": {
+                "constant": 0,
+                "terms": []
+              },
               "inputs": [],
-              "op": "constant",
+              "op": "coordinate",
               "outputs": [
                 {
                   "name": "base0",
@@ -146,8 +150,7 @@
                     "name": "index"
                   }
                 }
-              ],
-              "value": 0
+              ]
             },
             {
               "inputs": [],
@@ -238,8 +241,12 @@
                   ],
                   "operations": [
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": []
+                      },
                       "inputs": [],
-                      "op": "constant",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "request",
@@ -248,16 +255,27 @@
                             "name": "index"
                           }
                         }
-                      ],
-                      "value": 0
+                      ]
                     },
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": [
+                          {
+                            "argument": 0,
+                            "coefficient": 1
+                          },
+                          {
+                            "argument": 1,
+                            "coefficient": 1
+                          }
+                        ]
+                      },
                       "inputs": [
                         "base",
                         "token"
                       ],
-                      "kind": "add",
-                      "op": "scalar",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "row",
@@ -269,12 +287,24 @@
                       ]
                     },
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": [
+                          {
+                            "argument": 0,
+                            "coefficient": 1
+                          },
+                          {
+                            "argument": 1,
+                            "coefficient": 1
+                          }
+                        ]
+                      },
                       "inputs": [
                         "prefix",
                         "token"
                       ],
-                      "kind": "add",
-                      "op": "scalar",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "offset",
@@ -336,8 +366,12 @@
                       ]
                     },
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": []
+                      },
                       "inputs": [],
-                      "op": "constant",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "normal_first_layer",
@@ -346,8 +380,7 @@
                             "name": "index"
                           }
                         }
-                      ],
-                      "value": 0
+                      ]
                     },
                     {
                       "function": "decoder.layer_entry@1:708252fa8ce8592a5c7666e13a402a7bdaec46040b6210f9d72887f6fa8c1964",
@@ -388,259 +421,12 @@
                       ]
                     },
                     {
-                      "inputs": [],
-                      "op": "constant",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_target0",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        }
-                      ],
-                      "value": 2
-                    },
-                    {
+                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
                       "inputs": [
-                        "normal_first_layer",
-                        "normal_initial_target0"
-                      ],
-                      "kind": "equal",
-                      "op": "scalar",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_matches0",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "bool"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "else_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [],
-                          "yields": [
-                            "old"
-                          ]
-                        }
-                      },
-                      "inputs": [
-                        "normal_initial_matches0",
                         "normal_hidden0",
-                        "normal_residual0",
-                        "seed"
+                        "normal_residual0"
                       ],
-                      "op": "if",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_tap0",
-                          "type": {
-                            "device": "cpu",
-                            "dtype": "torch.float32",
-                            "kind": "tensor",
-                            "shape": [
-                              1,
-                              4
-                            ]
-                          }
-                        }
-                      ],
-                      "then_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [
-                            {
-                              "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                              "inputs": [
-                                "hidden",
-                                "residual"
-                              ],
-                              "op": "call",
-                              "outputs": [
-                                {
-                                  "name": "sum",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ]
-                            }
-                          ],
-                          "yields": [
-                            "sum"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "inputs": [],
-                      "op": "constant",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_target1",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        }
-                      ],
-                      "value": 0
-                    },
-                    {
-                      "inputs": [
-                        "normal_first_layer",
-                        "normal_initial_target1"
-                      ],
-                      "kind": "equal",
-                      "op": "scalar",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_matches1",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "bool"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "else_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [],
-                          "yields": [
-                            "old"
-                          ]
-                        }
-                      },
-                      "inputs": [
-                        "normal_initial_matches1",
-                        "normal_hidden0",
-                        "normal_residual0",
-                        "seed"
-                      ],
-                      "op": "if",
+                      "op": "call",
                       "outputs": [
                         {
                           "name": "normal_initial_tap1",
@@ -654,76 +440,7 @@
                             ]
                           }
                         }
-                      ],
-                      "then_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [
-                            {
-                              "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                              "inputs": [
-                                "hidden",
-                                "residual"
-                              ],
-                              "op": "call",
-                              "outputs": [
-                                {
-                                  "name": "sum",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ]
-                            }
-                          ],
-                          "yields": [
-                            "sum"
-                          ]
-                        }
-                      }
+                      ]
                     },
                     {
                       "body": {
@@ -830,26 +547,19 @@
                           ],
                           "operations": [
                             {
-                              "inputs": [],
-                              "op": "constant",
-                              "outputs": [
-                                {
-                                  "name": "base",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
+                              "affine": {
+                                "constant": 1,
+                                "terms": [
+                                  {
+                                    "argument": 0,
+                                    "coefficient": 1
                                   }
-                                }
-                              ],
-                              "value": 1
-                            },
-                            {
+                                ]
+                              },
                               "inputs": [
-                                "index",
-                                "base"
+                                "index"
                               ],
-                              "kind": "add",
-                              "op": "scalar",
+                              "op": "coordinate",
                               "outputs": [
                                 {
                                   "name": "layer",
@@ -898,359 +608,21 @@
                                   }
                                 }
                               ]
-                            },
-                            {
-                              "inputs": [],
-                              "op": "constant",
-                              "outputs": [
-                                {
-                                  "name": "next_target0",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                }
-                              ],
-                              "value": 2
-                            },
-                            {
-                              "inputs": [
-                                "layer",
-                                "next_target0"
-                              ],
-                              "kind": "equal",
-                              "op": "scalar",
-                              "outputs": [
-                                {
-                                  "name": "next_matches0",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "bool"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "else_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [],
-                                  "yields": [
-                                    "old"
-                                  ]
-                                }
-                              },
-                              "inputs": [
-                                "next_matches0",
-                                "hidden1",
-                                "residual1",
-                                "tap0"
-                              ],
-                              "op": "if",
-                              "outputs": [
-                                {
-                                  "name": "next_tap0",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ],
-                              "then_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [
-                                    {
-                                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                                      "inputs": [
-                                        "hidden",
-                                        "residual"
-                                      ],
-                                      "op": "call",
-                                      "outputs": [
-                                        {
-                                          "name": "sum",
-                                          "type": {
-                                            "device": "cpu",
-                                            "dtype": "torch.float32",
-                                            "kind": "tensor",
-                                            "shape": [
-                                              1,
-                                              4
-                                            ]
-                                          }
-                                        }
-                                      ]
-                                    }
-                                  ],
-                                  "yields": [
-                                    "sum"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "inputs": [],
-                              "op": "constant",
-                              "outputs": [
-                                {
-                                  "name": "next_target1",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                }
-                              ],
-                              "value": 0
-                            },
-                            {
-                              "inputs": [
-                                "layer",
-                                "next_target1"
-                              ],
-                              "kind": "equal",
-                              "op": "scalar",
-                              "outputs": [
-                                {
-                                  "name": "next_matches1",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "bool"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "else_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [],
-                                  "yields": [
-                                    "old"
-                                  ]
-                                }
-                              },
-                              "inputs": [
-                                "next_matches1",
-                                "hidden1",
-                                "residual1",
-                                "tap1"
-                              ],
-                              "op": "if",
-                              "outputs": [
-                                {
-                                  "name": "next_tap1",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ],
-                              "then_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [
-                                    {
-                                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                                      "inputs": [
-                                        "hidden",
-                                        "residual"
-                                      ],
-                                      "op": "call",
-                                      "outputs": [
-                                        {
-                                          "name": "sum",
-                                          "type": {
-                                            "device": "cpu",
-                                            "dtype": "torch.float32",
-                                            "kind": "tensor",
-                                            "shape": [
-                                              1,
-                                              4
-                                            ]
-                                          }
-                                        }
-                                      ]
-                                    }
-                                  ],
-                                  "yields": [
-                                    "sum"
-                                  ]
-                                }
-                              }
                             }
                           ],
                           "yields": [
                             "hidden1",
                             "residual1",
-                            "next_tap0",
-                            "next_tap1"
+                            "tap0",
+                            "tap1"
                           ]
                         }
                       },
-                      "count": 2,
+                      "count": 1,
                       "inputs": [
                         "normal_hidden0",
                         "normal_residual0",
-                        "normal_initial_tap0",
+                        "seed",
                         "normal_initial_tap1",
                         "row",
                         "request",
@@ -1262,7 +634,7 @@
                       "op": "scan",
                       "outputs": [
                         {
-                          "name": "normal_final_hidden",
+                          "name": "normal_s0_hidden",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -1274,7 +646,7 @@
                           }
                         },
                         {
-                          "name": "normal_final_residual",
+                          "name": "normal_s0_residual",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -1286,7 +658,7 @@
                           }
                         },
                         {
-                          "name": "normal_final_tap0",
+                          "name": "normal_s0_tap0",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -1298,7 +670,85 @@
                           }
                         },
                         {
-                          "name": "normal_final_tap1",
+                          "name": "normal_s0_tap1",
+                          "type": {
+                            "device": "cpu",
+                            "dtype": "torch.float32",
+                            "kind": "tensor",
+                            "shape": [
+                              1,
+                              4
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "affine": {
+                        "constant": 2,
+                        "terms": []
+                      },
+                      "inputs": [],
+                      "op": "coordinate",
+                      "outputs": [
+                        {
+                          "name": "normal_u1_layer",
+                          "type": {
+                            "kind": "scalar",
+                            "name": "index"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "function": "decoder.layer_with_residual@1:708252fa8ce8592a5c7666e13a402a7bdaec46040b6210f9d72887f6fa8c1964",
+                      "inputs": [
+                        "row",
+                        "request",
+                        "offset",
+                        "normal_u1_layer",
+                        "positions",
+                        "normal_s0_hidden",
+                        "normal_s0_residual"
+                      ],
+                      "op": "call",
+                      "outputs": [
+                        {
+                          "name": "normal_u1_hidden",
+                          "type": {
+                            "device": "cpu",
+                            "dtype": "torch.float32",
+                            "kind": "tensor",
+                            "shape": [
+                              1,
+                              4
+                            ]
+                          }
+                        },
+                        {
+                          "name": "normal_u1_residual",
+                          "type": {
+                            "device": "cpu",
+                            "dtype": "torch.float32",
+                            "kind": "tensor",
+                            "shape": [
+                              1,
+                              4
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
+                      "inputs": [
+                        "normal_u1_hidden",
+                        "normal_u1_residual"
+                      ],
+                      "op": "call",
+                      "outputs": [
+                        {
+                          "name": "normal_u1_tap0",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -1315,8 +765,8 @@
                       "function": "decoder.final_norm@1:41d9220c43e27a12e515ca83a9683d2be93f43b6af03b8f27daf4ec6101f3c5c",
                       "inputs": [
                         "row",
-                        "normal_final_hidden",
-                        "normal_final_residual"
+                        "normal_u1_hidden",
+                        "normal_u1_residual"
                       ],
                       "op": "call",
                       "outputs": [
@@ -1415,8 +865,8 @@
                         "row",
                         "request",
                         "positions",
-                        "normal_final_tap0",
-                        "normal_final_tap1",
+                        "normal_u1_tap0",
+                        "normal_s0_tap1",
                         "offset",
                         "replay_layers"
                       ],
@@ -1527,8 +977,12 @@
                               "outputs": []
                             },
                             {
+                              "affine": {
+                                "constant": 1,
+                                "terms": []
+                              },
                               "inputs": [],
-                              "op": "constant",
+                              "op": "coordinate",
                               "outputs": [
                                 {
                                   "name": "replay_first_layer",
@@ -1537,8 +991,7 @@
                                     "name": "index"
                                   }
                                 }
-                              ],
-                              "value": 1
+                              ]
                             },
                             {
                               "function": "decoder.layer_entry@1:708252fa8ce8592a5c7666e13a402a7bdaec46040b6210f9d72887f6fa8c1964",
@@ -1659,26 +1112,19 @@
                                   ],
                                   "operations": [
                                     {
-                                      "inputs": [],
-                                      "op": "constant",
-                                      "outputs": [
-                                        {
-                                          "name": "base",
-                                          "type": {
-                                            "kind": "scalar",
-                                            "name": "index"
+                                      "affine": {
+                                        "constant": 2,
+                                        "terms": [
+                                          {
+                                            "argument": 0,
+                                            "coefficient": 1
                                           }
-                                        }
-                                      ],
-                                      "value": 2
-                                    },
-                                    {
+                                        ]
+                                      },
                                       "inputs": [
-                                        "index",
-                                        "base"
+                                        "index"
                                       ],
-                                      "kind": "add",
-                                      "op": "scalar",
+                                      "op": "coordinate",
                                       "outputs": [
                                         {
                                           "name": "layer",
@@ -1749,7 +1195,7 @@
                               "op": "scan",
                               "outputs": [
                                 {
-                                  "name": "replay_final_hidden",
+                                  "name": "replay_s0_hidden",
                                   "type": {
                                     "device": "cpu",
                                     "dtype": "torch.float32",
@@ -1761,7 +1207,7 @@
                                   }
                                 },
                                 {
-                                  "name": "replay_final_residual",
+                                  "name": "replay_s0_residual",
                                   "type": {
                                     "device": "cpu",
                                     "dtype": "torch.float32",
@@ -1824,12 +1270,24 @@
               ]
             },
             {
+              "affine": {
+                "constant": 0,
+                "terms": [
+                  {
+                    "argument": 0,
+                    "coefficient": 1
+                  },
+                  {
+                    "argument": 1,
+                    "coefficient": 1
+                  }
+                ]
+              },
               "inputs": [
                 "base0",
                 "tokens0"
               ],
-              "kind": "add",
-              "op": "scalar",
+              "op": "coordinate",
               "outputs": [
                 {
                   "name": "base1",
@@ -1929,8 +1387,12 @@
                   ],
                   "operations": [
                     {
+                      "affine": {
+                        "constant": 1,
+                        "terms": []
+                      },
                       "inputs": [],
-                      "op": "constant",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "request",
@@ -1939,16 +1401,27 @@
                             "name": "index"
                           }
                         }
-                      ],
-                      "value": 1
+                      ]
                     },
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": [
+                          {
+                            "argument": 0,
+                            "coefficient": 1
+                          },
+                          {
+                            "argument": 1,
+                            "coefficient": 1
+                          }
+                        ]
+                      },
                       "inputs": [
                         "base",
                         "token"
                       ],
-                      "kind": "add",
-                      "op": "scalar",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "row",
@@ -1960,12 +1433,24 @@
                       ]
                     },
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": [
+                          {
+                            "argument": 0,
+                            "coefficient": 1
+                          },
+                          {
+                            "argument": 1,
+                            "coefficient": 1
+                          }
+                        ]
+                      },
                       "inputs": [
                         "prefix",
                         "token"
                       ],
-                      "kind": "add",
-                      "op": "scalar",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "offset",
@@ -2027,8 +1512,12 @@
                       ]
                     },
                     {
+                      "affine": {
+                        "constant": 0,
+                        "terms": []
+                      },
                       "inputs": [],
-                      "op": "constant",
+                      "op": "coordinate",
                       "outputs": [
                         {
                           "name": "normal_first_layer",
@@ -2037,8 +1526,7 @@
                             "name": "index"
                           }
                         }
-                      ],
-                      "value": 0
+                      ]
                     },
                     {
                       "function": "decoder.layer_entry@1:708252fa8ce8592a5c7666e13a402a7bdaec46040b6210f9d72887f6fa8c1964",
@@ -2079,259 +1567,12 @@
                       ]
                     },
                     {
-                      "inputs": [],
-                      "op": "constant",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_target0",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        }
-                      ],
-                      "value": 2
-                    },
-                    {
+                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
                       "inputs": [
-                        "normal_first_layer",
-                        "normal_initial_target0"
-                      ],
-                      "kind": "equal",
-                      "op": "scalar",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_matches0",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "bool"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "else_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [],
-                          "yields": [
-                            "old"
-                          ]
-                        }
-                      },
-                      "inputs": [
-                        "normal_initial_matches0",
                         "normal_hidden0",
-                        "normal_residual0",
-                        "seed"
+                        "normal_residual0"
                       ],
-                      "op": "if",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_tap0",
-                          "type": {
-                            "device": "cpu",
-                            "dtype": "torch.float32",
-                            "kind": "tensor",
-                            "shape": [
-                              1,
-                              4
-                            ]
-                          }
-                        }
-                      ],
-                      "then_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [
-                            {
-                              "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                              "inputs": [
-                                "hidden",
-                                "residual"
-                              ],
-                              "op": "call",
-                              "outputs": [
-                                {
-                                  "name": "sum",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ]
-                            }
-                          ],
-                          "yields": [
-                            "sum"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "inputs": [],
-                      "op": "constant",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_target1",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        }
-                      ],
-                      "value": 0
-                    },
-                    {
-                      "inputs": [
-                        "normal_first_layer",
-                        "normal_initial_target1"
-                      ],
-                      "kind": "equal",
-                      "op": "scalar",
-                      "outputs": [
-                        {
-                          "name": "normal_initial_matches1",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "bool"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "else_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [],
-                          "yields": [
-                            "old"
-                          ]
-                        }
-                      },
-                      "inputs": [
-                        "normal_initial_matches1",
-                        "normal_hidden0",
-                        "normal_residual0",
-                        "seed"
-                      ],
-                      "op": "if",
+                      "op": "call",
                       "outputs": [
                         {
                           "name": "normal_initial_tap1",
@@ -2345,76 +1586,7 @@
                             ]
                           }
                         }
-                      ],
-                      "then_region": {
-                        "block": {
-                          "arguments": [
-                            {
-                              "name": "hidden",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "residual",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            },
-                            {
-                              "name": "old",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.float32",
-                                "kind": "tensor",
-                                "shape": [
-                                  1,
-                                  4
-                                ]
-                              }
-                            }
-                          ],
-                          "operations": [
-                            {
-                              "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                              "inputs": [
-                                "hidden",
-                                "residual"
-                              ],
-                              "op": "call",
-                              "outputs": [
-                                {
-                                  "name": "sum",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ]
-                            }
-                          ],
-                          "yields": [
-                            "sum"
-                          ]
-                        }
-                      }
+                      ]
                     },
                     {
                       "body": {
@@ -2521,26 +1693,19 @@
                           ],
                           "operations": [
                             {
-                              "inputs": [],
-                              "op": "constant",
-                              "outputs": [
-                                {
-                                  "name": "base",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
+                              "affine": {
+                                "constant": 1,
+                                "terms": [
+                                  {
+                                    "argument": 0,
+                                    "coefficient": 1
                                   }
-                                }
-                              ],
-                              "value": 1
-                            },
-                            {
+                                ]
+                              },
                               "inputs": [
-                                "index",
-                                "base"
+                                "index"
                               ],
-                              "kind": "add",
-                              "op": "scalar",
+                              "op": "coordinate",
                               "outputs": [
                                 {
                                   "name": "layer",
@@ -2589,359 +1754,21 @@
                                   }
                                 }
                               ]
-                            },
-                            {
-                              "inputs": [],
-                              "op": "constant",
-                              "outputs": [
-                                {
-                                  "name": "next_target0",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                }
-                              ],
-                              "value": 2
-                            },
-                            {
-                              "inputs": [
-                                "layer",
-                                "next_target0"
-                              ],
-                              "kind": "equal",
-                              "op": "scalar",
-                              "outputs": [
-                                {
-                                  "name": "next_matches0",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "bool"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "else_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [],
-                                  "yields": [
-                                    "old"
-                                  ]
-                                }
-                              },
-                              "inputs": [
-                                "next_matches0",
-                                "hidden1",
-                                "residual1",
-                                "tap0"
-                              ],
-                              "op": "if",
-                              "outputs": [
-                                {
-                                  "name": "next_tap0",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ],
-                              "then_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [
-                                    {
-                                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                                      "inputs": [
-                                        "hidden",
-                                        "residual"
-                                      ],
-                                      "op": "call",
-                                      "outputs": [
-                                        {
-                                          "name": "sum",
-                                          "type": {
-                                            "device": "cpu",
-                                            "dtype": "torch.float32",
-                                            "kind": "tensor",
-                                            "shape": [
-                                              1,
-                                              4
-                                            ]
-                                          }
-                                        }
-                                      ]
-                                    }
-                                  ],
-                                  "yields": [
-                                    "sum"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "inputs": [],
-                              "op": "constant",
-                              "outputs": [
-                                {
-                                  "name": "next_target1",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                }
-                              ],
-                              "value": 0
-                            },
-                            {
-                              "inputs": [
-                                "layer",
-                                "next_target1"
-                              ],
-                              "kind": "equal",
-                              "op": "scalar",
-                              "outputs": [
-                                {
-                                  "name": "next_matches1",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "bool"
-                                  }
-                                }
-                              ]
-                            },
-                            {
-                              "else_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [],
-                                  "yields": [
-                                    "old"
-                                  ]
-                                }
-                              },
-                              "inputs": [
-                                "next_matches1",
-                                "hidden1",
-                                "residual1",
-                                "tap1"
-                              ],
-                              "op": "if",
-                              "outputs": [
-                                {
-                                  "name": "next_tap1",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.float32",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1,
-                                      4
-                                    ]
-                                  }
-                                }
-                              ],
-                              "then_region": {
-                                "block": {
-                                  "arguments": [
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "old",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    }
-                                  ],
-                                  "operations": [
-                                    {
-                                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
-                                      "inputs": [
-                                        "hidden",
-                                        "residual"
-                                      ],
-                                      "op": "call",
-                                      "outputs": [
-                                        {
-                                          "name": "sum",
-                                          "type": {
-                                            "device": "cpu",
-                                            "dtype": "torch.float32",
-                                            "kind": "tensor",
-                                            "shape": [
-                                              1,
-                                              4
-                                            ]
-                                          }
-                                        }
-                                      ]
-                                    }
-                                  ],
-                                  "yields": [
-                                    "sum"
-                                  ]
-                                }
-                              }
                             }
                           ],
                           "yields": [
                             "hidden1",
                             "residual1",
-                            "next_tap0",
-                            "next_tap1"
+                            "tap0",
+                            "tap1"
                           ]
                         }
                       },
-                      "count": 2,
+                      "count": 1,
                       "inputs": [
                         "normal_hidden0",
                         "normal_residual0",
-                        "normal_initial_tap0",
+                        "seed",
                         "normal_initial_tap1",
                         "row",
                         "request",
@@ -2953,7 +1780,7 @@
                       "op": "scan",
                       "outputs": [
                         {
-                          "name": "normal_final_hidden",
+                          "name": "normal_s0_hidden",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -2965,7 +1792,7 @@
                           }
                         },
                         {
-                          "name": "normal_final_residual",
+                          "name": "normal_s0_residual",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -2977,7 +1804,7 @@
                           }
                         },
                         {
-                          "name": "normal_final_tap0",
+                          "name": "normal_s0_tap0",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -2989,7 +1816,85 @@
                           }
                         },
                         {
-                          "name": "normal_final_tap1",
+                          "name": "normal_s0_tap1",
+                          "type": {
+                            "device": "cpu",
+                            "dtype": "torch.float32",
+                            "kind": "tensor",
+                            "shape": [
+                              1,
+                              4
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "affine": {
+                        "constant": 2,
+                        "terms": []
+                      },
+                      "inputs": [],
+                      "op": "coordinate",
+                      "outputs": [
+                        {
+                          "name": "normal_u1_layer",
+                          "type": {
+                            "kind": "scalar",
+                            "name": "index"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "function": "decoder.layer_with_residual@1:708252fa8ce8592a5c7666e13a402a7bdaec46040b6210f9d72887f6fa8c1964",
+                      "inputs": [
+                        "row",
+                        "request",
+                        "offset",
+                        "normal_u1_layer",
+                        "positions",
+                        "normal_s0_hidden",
+                        "normal_s0_residual"
+                      ],
+                      "op": "call",
+                      "outputs": [
+                        {
+                          "name": "normal_u1_hidden",
+                          "type": {
+                            "device": "cpu",
+                            "dtype": "torch.float32",
+                            "kind": "tensor",
+                            "shape": [
+                              1,
+                              4
+                            ]
+                          }
+                        },
+                        {
+                          "name": "normal_u1_residual",
+                          "type": {
+                            "device": "cpu",
+                            "dtype": "torch.float32",
+                            "kind": "tensor",
+                            "shape": [
+                              1,
+                              4
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "function": "887fe2070ef5c8e6014f4fb484734ac63db740e5f60dd9caf8a62169cafc8aa9",
+                      "inputs": [
+                        "normal_u1_hidden",
+                        "normal_u1_residual"
+                      ],
+                      "op": "call",
+                      "outputs": [
+                        {
+                          "name": "normal_u1_tap0",
                           "type": {
                             "device": "cpu",
                             "dtype": "torch.float32",
@@ -3006,8 +1911,8 @@
                       "function": "decoder.final_norm@1:41d9220c43e27a12e515ca83a9683d2be93f43b6af03b8f27daf4ec6101f3c5c",
                       "inputs": [
                         "row",
-                        "normal_final_hidden",
-                        "normal_final_residual"
+                        "normal_u1_hidden",
+                        "normal_u1_residual"
                       ],
                       "op": "call",
                       "outputs": [
@@ -3106,8 +2011,8 @@
                         "row",
                         "request",
                         "positions",
-                        "normal_final_tap0",
-                        "normal_final_tap1",
+                        "normal_u1_tap0",
+                        "normal_s0_tap1",
                         "offset",
                         "replay_layers"
                       ],
@@ -3218,8 +2123,12 @@
                               "outputs": []
                             },
                             {
+                              "affine": {
+                                "constant": 1,
+                                "terms": []
+                              },
                               "inputs": [],
-                              "op": "constant",
+                              "op": "coordinate",
                               "outputs": [
                                 {
                                   "name": "replay_first_layer",
@@ -3228,8 +2137,7 @@
                                     "name": "index"
                                   }
                                 }
-                              ],
-                              "value": 1
+                              ]
                             },
                             {
                               "function": "decoder.layer_entry@1:708252fa8ce8592a5c7666e13a402a7bdaec46040b6210f9d72887f6fa8c1964",
@@ -3350,26 +2258,19 @@
                                   ],
                                   "operations": [
                                     {
-                                      "inputs": [],
-                                      "op": "constant",
-                                      "outputs": [
-                                        {
-                                          "name": "base",
-                                          "type": {
-                                            "kind": "scalar",
-                                            "name": "index"
+                                      "affine": {
+                                        "constant": 2,
+                                        "terms": [
+                                          {
+                                            "argument": 0,
+                                            "coefficient": 1
                                           }
-                                        }
-                                      ],
-                                      "value": 2
-                                    },
-                                    {
+                                        ]
+                                      },
                                       "inputs": [
-                                        "index",
-                                        "base"
+                                        "index"
                                       ],
-                                      "kind": "add",
-                                      "op": "scalar",
+                                      "op": "coordinate",
                                       "outputs": [
                                         {
                                           "name": "layer",
@@ -3440,7 +2341,7 @@
                               "op": "scan",
                               "outputs": [
                                 {
-                                  "name": "replay_final_hidden",
+                                  "name": "replay_s0_hidden",
                                   "type": {
                                     "device": "cpu",
                                     "dtype": "torch.float32",
@@ -3452,7 +2353,7 @@
                                   }
                                 },
                                 {
-                                  "name": "replay_final_residual",
+                                  "name": "replay_s0_residual",
                                   "type": {
                                     "device": "cpu",
                                     "dtype": "torch.float32",
@@ -3515,12 +2416,24 @@
               ]
             },
             {
+              "affine": {
+                "constant": 0,
+                "terms": [
+                  {
+                    "argument": 0,
+                    "coefficient": 1
+                  },
+                  {
+                    "argument": 1,
+                    "coefficient": 1
+                  }
+                ]
+              },
               "inputs": [
                 "base1",
                 "tokens1"
               ],
-              "kind": "add",
-              "op": "scalar",
+              "op": "coordinate",
               "outputs": [
                 {
                   "name": "base2",
@@ -4483,52 +3396,52 @@
         }
       ]
     },
-    "statements": 28,
-    "values": 85
+    "statements": 18,
+    "values": 61
   },
   "before": {
     "scans": [
       {
-        "body_results": 6,
-        "carry": 5,
+        "body_results": 1,
+        "carry": 0,
         "inputs": 5,
-        "invariants": 0,
-        "outputs": 6
+        "invariants": 5,
+        "outputs": 1
       },
       {
-        "body_results": 9,
-        "carry": 9,
+        "body_results": 4,
+        "carry": 4,
         "inputs": 9,
-        "invariants": 0,
-        "outputs": 9
+        "invariants": 5,
+        "outputs": 4
       },
       {
-        "body_results": 7,
-        "carry": 7,
+        "body_results": 2,
+        "carry": 2,
         "inputs": 7,
-        "invariants": 0,
-        "outputs": 7
+        "invariants": 5,
+        "outputs": 2
       },
       {
-        "body_results": 6,
-        "carry": 5,
+        "body_results": 1,
+        "carry": 0,
         "inputs": 5,
-        "invariants": 0,
-        "outputs": 6
+        "invariants": 5,
+        "outputs": 1
       },
       {
-        "body_results": 9,
-        "carry": 9,
+        "body_results": 4,
+        "carry": 4,
         "inputs": 9,
-        "invariants": 0,
-        "outputs": 9
+        "invariants": 5,
+        "outputs": 4
       },
       {
-        "body_results": 7,
-        "carry": 7,
+        "body_results": 2,
+        "carry": 2,
         "inputs": 7,
-        "invariants": 0,
-        "outputs": 7
+        "invariants": 5,
+        "outputs": 2
       }
     ],
     "source": {
@@ -5224,49 +4137,6 @@
                               }
                             },
                             {
-                              "name": "row",
-                              "type": {
-                                "kind": "scalar",
-                                "name": "index"
-                              }
-                            },
-                            {
-                              "name": "request",
-                              "type": {
-                                "kind": "scalar",
-                                "name": "index"
-                              }
-                            },
-                            {
-                              "name": "token",
-                              "type": {
-                                "kind": "scalar",
-                                "name": "index"
-                              }
-                            },
-                            {
-                              "name": "layer_ids",
-                              "type": {
-                                "element": {
-                                  "kind": "scalar",
-                                  "name": "index"
-                                },
-                                "kind": "bank",
-                                "size": 3
-                              }
-                            },
-                            {
-                              "name": "positions",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.int64",
-                                "kind": "tensor",
-                                "shape": [
-                                  1
-                                ]
-                              }
-                            },
-                            {
                               "name": "hidden",
                               "type": {
                                 "device": "cpu",
@@ -5311,6 +4181,49 @@
                                 "shape": [
                                   1,
                                   4
+                                ]
+                              }
+                            },
+                            {
+                              "name": "row",
+                              "type": {
+                                "kind": "scalar",
+                                "name": "index"
+                              }
+                            },
+                            {
+                              "name": "request",
+                              "type": {
+                                "kind": "scalar",
+                                "name": "index"
+                              }
+                            },
+                            {
+                              "name": "token",
+                              "type": {
+                                "kind": "scalar",
+                                "name": "index"
+                              }
+                            },
+                            {
+                              "name": "layer_ids",
+                              "type": {
+                                "element": {
+                                  "kind": "scalar",
+                                  "name": "index"
+                                },
+                                "kind": "bank",
+                                "size": 3
+                              }
+                            },
+                            {
+                              "name": "positions",
+                              "type": {
+                                "device": "cpu",
+                                "dtype": "torch.int64",
+                                "kind": "tensor",
+                                "shape": [
+                                  1
                                 ]
                               }
                             }
@@ -5726,11 +4639,6 @@
                             }
                           ],
                           "yields": [
-                            "row",
-                            "request",
-                            "token",
-                            "layer_ids",
-                            "positions",
                             "hidden1",
                             "residual1",
                             "next_tap0",
@@ -5740,62 +4648,19 @@
                       },
                       "count": 2,
                       "inputs": [
+                        "normal_hidden0",
+                        "normal_residual0",
+                        "normal_initial_tap0",
+                        "normal_initial_tap1",
                         "row",
                         "request",
                         "offset",
                         "normal_layers",
-                        "positions",
-                        "normal_hidden0",
-                        "normal_residual0",
-                        "normal_initial_tap0",
-                        "normal_initial_tap1"
+                        "positions"
                       ],
-                      "invariants": 0,
+                      "invariants": 5,
                       "op": "scan",
                       "outputs": [
-                        {
-                          "name": "normal_final_row",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        },
-                        {
-                          "name": "normal_final_request",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        },
-                        {
-                          "name": "normal_final_token",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        },
-                        {
-                          "name": "normal_final_layer_ids",
-                          "type": {
-                            "element": {
-                              "kind": "scalar",
-                              "name": "index"
-                            },
-                            "kind": "bank",
-                            "size": 3
-                          }
-                        },
-                        {
-                          "name": "normal_final_positions",
-                          "type": {
-                            "device": "cpu",
-                            "dtype": "torch.int64",
-                            "kind": "tensor",
-                            "shape": [
-                              1
-                            ]
-                          }
-                        },
                         {
                           "name": "normal_final_hidden",
                           "type": {
@@ -6125,6 +4990,30 @@
                                       }
                                     },
                                     {
+                                      "name": "hidden",
+                                      "type": {
+                                        "device": "cpu",
+                                        "dtype": "torch.float32",
+                                        "kind": "tensor",
+                                        "shape": [
+                                          1,
+                                          4
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "name": "residual",
+                                      "type": {
+                                        "device": "cpu",
+                                        "dtype": "torch.float32",
+                                        "kind": "tensor",
+                                        "shape": [
+                                          1,
+                                          4
+                                        ]
+                                      }
+                                    },
+                                    {
                                       "name": "row",
                                       "type": {
                                         "kind": "scalar",
@@ -6164,30 +5053,6 @@
                                         "kind": "tensor",
                                         "shape": [
                                           1
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
                                         ]
                                       }
                                     }
@@ -6265,11 +5130,6 @@
                                     }
                                   ],
                                   "yields": [
-                                    "row",
-                                    "request",
-                                    "token",
-                                    "layer_ids",
-                                    "positions",
                                     "hidden1",
                                     "residual1"
                                   ]
@@ -6277,60 +5137,17 @@
                               },
                               "count": 1,
                               "inputs": [
+                                "replay_hidden0",
+                                "replay_residual0",
                                 "row",
                                 "request",
                                 "offset",
                                 "layer_ids",
-                                "positions",
-                                "replay_hidden0",
-                                "replay_residual0"
+                                "positions"
                               ],
-                              "invariants": 0,
+                              "invariants": 5,
                               "op": "scan",
                               "outputs": [
-                                {
-                                  "name": "replay_final_row",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_request",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_token",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_layer_ids",
-                                  "type": {
-                                    "element": {
-                                      "kind": "scalar",
-                                      "name": "index"
-                                    },
-                                    "kind": "bank",
-                                    "size": 2
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_positions",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.int64",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1
-                                    ]
-                                  }
-                                },
                                 {
                                   "name": "replay_final_hidden",
                                   "type": {
@@ -6373,11 +5190,6 @@
                     }
                   ],
                   "yields": [
-                    "eligible",
-                    "normal_layers",
-                    "replay_layers",
-                    "base",
-                    "prefix",
                     "normal_output"
                   ]
                 }
@@ -6390,56 +5202,9 @@
                 "base0",
                 "prefix0"
               ],
-              "invariants": 0,
+              "invariants": 5,
               "op": "scan",
               "outputs": [
-                {
-                  "name": "final0_eligible",
-                  "type": {
-                    "element": {
-                      "kind": "scalar",
-                      "name": "bool"
-                    },
-                    "kind": "bank",
-                    "size": "tokens0"
-                  }
-                },
-                {
-                  "name": "final0_normal_layers",
-                  "type": {
-                    "element": {
-                      "kind": "scalar",
-                      "name": "index"
-                    },
-                    "kind": "bank",
-                    "size": 3
-                  }
-                },
-                {
-                  "name": "final0_replay_layers",
-                  "type": {
-                    "element": {
-                      "kind": "scalar",
-                      "name": "index"
-                    },
-                    "kind": "bank",
-                    "size": 2
-                  }
-                },
-                {
-                  "name": "final0_base",
-                  "type": {
-                    "kind": "scalar",
-                    "name": "index"
-                  }
-                },
-                {
-                  "name": "final0_prefix",
-                  "type": {
-                    "kind": "scalar",
-                    "name": "index"
-                  }
-                },
                 {
                   "name": "rows0",
                   "type": {
@@ -7063,49 +5828,6 @@
                               }
                             },
                             {
-                              "name": "row",
-                              "type": {
-                                "kind": "scalar",
-                                "name": "index"
-                              }
-                            },
-                            {
-                              "name": "request",
-                              "type": {
-                                "kind": "scalar",
-                                "name": "index"
-                              }
-                            },
-                            {
-                              "name": "token",
-                              "type": {
-                                "kind": "scalar",
-                                "name": "index"
-                              }
-                            },
-                            {
-                              "name": "layer_ids",
-                              "type": {
-                                "element": {
-                                  "kind": "scalar",
-                                  "name": "index"
-                                },
-                                "kind": "bank",
-                                "size": 3
-                              }
-                            },
-                            {
-                              "name": "positions",
-                              "type": {
-                                "device": "cpu",
-                                "dtype": "torch.int64",
-                                "kind": "tensor",
-                                "shape": [
-                                  1
-                                ]
-                              }
-                            },
-                            {
                               "name": "hidden",
                               "type": {
                                 "device": "cpu",
@@ -7150,6 +5872,49 @@
                                 "shape": [
                                   1,
                                   4
+                                ]
+                              }
+                            },
+                            {
+                              "name": "row",
+                              "type": {
+                                "kind": "scalar",
+                                "name": "index"
+                              }
+                            },
+                            {
+                              "name": "request",
+                              "type": {
+                                "kind": "scalar",
+                                "name": "index"
+                              }
+                            },
+                            {
+                              "name": "token",
+                              "type": {
+                                "kind": "scalar",
+                                "name": "index"
+                              }
+                            },
+                            {
+                              "name": "layer_ids",
+                              "type": {
+                                "element": {
+                                  "kind": "scalar",
+                                  "name": "index"
+                                },
+                                "kind": "bank",
+                                "size": 3
+                              }
+                            },
+                            {
+                              "name": "positions",
+                              "type": {
+                                "device": "cpu",
+                                "dtype": "torch.int64",
+                                "kind": "tensor",
+                                "shape": [
+                                  1
                                 ]
                               }
                             }
@@ -7565,11 +6330,6 @@
                             }
                           ],
                           "yields": [
-                            "row",
-                            "request",
-                            "token",
-                            "layer_ids",
-                            "positions",
                             "hidden1",
                             "residual1",
                             "next_tap0",
@@ -7579,62 +6339,19 @@
                       },
                       "count": 2,
                       "inputs": [
+                        "normal_hidden0",
+                        "normal_residual0",
+                        "normal_initial_tap0",
+                        "normal_initial_tap1",
                         "row",
                         "request",
                         "offset",
                         "normal_layers",
-                        "positions",
-                        "normal_hidden0",
-                        "normal_residual0",
-                        "normal_initial_tap0",
-                        "normal_initial_tap1"
+                        "positions"
                       ],
-                      "invariants": 0,
+                      "invariants": 5,
                       "op": "scan",
                       "outputs": [
-                        {
-                          "name": "normal_final_row",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        },
-                        {
-                          "name": "normal_final_request",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        },
-                        {
-                          "name": "normal_final_token",
-                          "type": {
-                            "kind": "scalar",
-                            "name": "index"
-                          }
-                        },
-                        {
-                          "name": "normal_final_layer_ids",
-                          "type": {
-                            "element": {
-                              "kind": "scalar",
-                              "name": "index"
-                            },
-                            "kind": "bank",
-                            "size": 3
-                          }
-                        },
-                        {
-                          "name": "normal_final_positions",
-                          "type": {
-                            "device": "cpu",
-                            "dtype": "torch.int64",
-                            "kind": "tensor",
-                            "shape": [
-                              1
-                            ]
-                          }
-                        },
                         {
                           "name": "normal_final_hidden",
                           "type": {
@@ -7964,6 +6681,30 @@
                                       }
                                     },
                                     {
+                                      "name": "hidden",
+                                      "type": {
+                                        "device": "cpu",
+                                        "dtype": "torch.float32",
+                                        "kind": "tensor",
+                                        "shape": [
+                                          1,
+                                          4
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "name": "residual",
+                                      "type": {
+                                        "device": "cpu",
+                                        "dtype": "torch.float32",
+                                        "kind": "tensor",
+                                        "shape": [
+                                          1,
+                                          4
+                                        ]
+                                      }
+                                    },
+                                    {
                                       "name": "row",
                                       "type": {
                                         "kind": "scalar",
@@ -8003,30 +6744,6 @@
                                         "kind": "tensor",
                                         "shape": [
                                           1
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "hidden",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "name": "residual",
-                                      "type": {
-                                        "device": "cpu",
-                                        "dtype": "torch.float32",
-                                        "kind": "tensor",
-                                        "shape": [
-                                          1,
-                                          4
                                         ]
                                       }
                                     }
@@ -8104,11 +6821,6 @@
                                     }
                                   ],
                                   "yields": [
-                                    "row",
-                                    "request",
-                                    "token",
-                                    "layer_ids",
-                                    "positions",
                                     "hidden1",
                                     "residual1"
                                   ]
@@ -8116,60 +6828,17 @@
                               },
                               "count": 1,
                               "inputs": [
+                                "replay_hidden0",
+                                "replay_residual0",
                                 "row",
                                 "request",
                                 "offset",
                                 "layer_ids",
-                                "positions",
-                                "replay_hidden0",
-                                "replay_residual0"
+                                "positions"
                               ],
-                              "invariants": 0,
+                              "invariants": 5,
                               "op": "scan",
                               "outputs": [
-                                {
-                                  "name": "replay_final_row",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_request",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_token",
-                                  "type": {
-                                    "kind": "scalar",
-                                    "name": "index"
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_layer_ids",
-                                  "type": {
-                                    "element": {
-                                      "kind": "scalar",
-                                      "name": "index"
-                                    },
-                                    "kind": "bank",
-                                    "size": 2
-                                  }
-                                },
-                                {
-                                  "name": "replay_final_positions",
-                                  "type": {
-                                    "device": "cpu",
-                                    "dtype": "torch.int64",
-                                    "kind": "tensor",
-                                    "shape": [
-                                      1
-                                    ]
-                                  }
-                                },
                                 {
                                   "name": "replay_final_hidden",
                                   "type": {
@@ -8212,11 +6881,6 @@
                     }
                   ],
                   "yields": [
-                    "eligible",
-                    "normal_layers",
-                    "replay_layers",
-                    "base",
-                    "prefix",
                     "normal_output"
                   ]
                 }
@@ -8229,56 +6893,9 @@
                 "base1",
                 "prefix1"
               ],
-              "invariants": 0,
+              "invariants": 5,
               "op": "scan",
               "outputs": [
-                {
-                  "name": "final1_eligible",
-                  "type": {
-                    "element": {
-                      "kind": "scalar",
-                      "name": "bool"
-                    },
-                    "kind": "bank",
-                    "size": "tokens1"
-                  }
-                },
-                {
-                  "name": "final1_normal_layers",
-                  "type": {
-                    "element": {
-                      "kind": "scalar",
-                      "name": "index"
-                    },
-                    "kind": "bank",
-                    "size": 3
-                  }
-                },
-                {
-                  "name": "final1_replay_layers",
-                  "type": {
-                    "element": {
-                      "kind": "scalar",
-                      "name": "index"
-                    },
-                    "kind": "bank",
-                    "size": 2
-                  }
-                },
-                {
-                  "name": "final1_base",
-                  "type": {
-                    "kind": "scalar",
-                    "name": "index"
-                  }
-                },
-                {
-                  "name": "final1_prefix",
-                  "type": {
-                    "kind": "scalar",
-                    "name": "index"
-                  }
-                },
                 {
                   "name": "rows1",
                   "type": {
@@ -9269,23 +7886,17 @@
     "statements": 28,
     "values": 85
   },
-  "equal_analysis_fields": {
-    "aliases": true,
-    "arguments": true,
-    "candidates": true,
-    "data_dependencies": true,
-    "dependencies": true,
-    "diagnostics": true,
-    "domain": true,
-    "effect_dependencies": true,
-    "exact_provenance": true,
-    "reference_schedule": true,
-    "resource_dependencies": true,
-    "results": true,
-    "scalar_values": true,
-    "statements": true,
-    "value_consumers": true,
-    "value_sources": true,
-    "values": true
+  "notes": [
+    "scan segmentation at constructor-known tap layers: the single carry Scan",
+    "splits into tap-free segments plus unrolled tap iterations; invariant",
+    "coordinates stay trailing inputs; unchanged tap slots yield their arguments."
+  ],
+  "reference_execution_equivalence": {
+    "call_count_equal": true,
+    "call_name_sequence_equal": true,
+    "calls": 52,
+    "effect_events": 99,
+    "effect_events_equal": true,
+    "values_equal": true
   }
 }

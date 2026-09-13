@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::region_program::{
-    self, AccessMode, AffineIndex, Extent, Literal, Operation, Program, Region,
+    self, AccessMode, AffineIndex, Extent, Operation, Program, Region,
     ScalarKind, ScalarType, Type, Value,
 };
 use super::semantic_graph::{canonical_ascii_json, digest};
@@ -679,44 +679,38 @@ impl Builder {
                 })
                 .collect::<Vec<_>>();
             match op {
-                Operation::Constant { value, .. } => {
-                    if let Literal::Int(value) = value {
-                        outputs[0].affine = Some(Affine::constant(*value));
-                    } else {
-                        // Integers are supplied by affine accessors. Other
-                        // literals use the existing primitive action, so the
-                        // runtime needs no separate source-AST literal lookup.
-                        self.statement(program, op, &op_path, extents, &op_time, &inputs, &outputs, false)?;
-                    }
+                Operation::Constant { .. } => {
+                    // Affine index values are declared by Coordinate; literals
+                    // are ordinary primitive statements.
+                    self.statement(program, op, &op_path, extents, &op_time, &inputs, &outputs, false)?;
                 }
                 Operation::Parameter { parameter, .. } => {
                     let mut value = Affine::constant(0);
                     value.parameters.insert(parameter.clone(), 1);
                     outputs[0].affine = Some(value);
                 }
-                Operation::Scalar { kind, .. } => {
-                    let affine = inputs[0].affine.as_ref().and_then(|a| {
-                        inputs[1]
-                            .affine
-                            .as_ref()
-                            .and_then(|b| a.combine(b, kind, extents, program))
-                    });
-                    if affine.is_some() {
-                        outputs[0].affine = affine;
-                    } else {
-                        let may_trap = matches!(
-                            self.values[outputs[0].id].type_,
-                            Type::Scalar {
-                                name: ScalarType::Index | ScalarType::Int
-                            }
-                        );
-                        if may_trap {
-                            self.diagnostics.push(format!("operation {op_path:?}: checked integer arithmetic remains an opaque boundary"));
+                Operation::Coordinate { affine, .. } => {
+                    // Direct affine declaration: no literal/scalar recovery.
+                    // Non-affine or out-of-range operands are a hard error.
+                    let value = Affine::from_access(affine, &inputs, extents, program)
+                        .ok_or("coordinate operands must stay affine within the checked index range")?;
+                    outputs[0].affine = Some(value);
+                }
+                Operation::Scalar { .. } => {
+                    // Checked integer arithmetic stays an opaque boundary;
+                    // affine forms must be declared with Coordinate.
+                    let may_trap = matches!(
+                        self.values[outputs[0].id].type_,
+                        Type::Scalar {
+                            name: ScalarType::Index | ScalarType::Int
                         }
-                        self.statement(
-                            program, op, &op_path, extents, &op_time, &inputs, &outputs, may_trap,
-                        )?;
+                    );
+                    if may_trap {
+                        self.diagnostics.push(format!("operation {op_path:?}: checked integer arithmetic remains an opaque boundary"));
                     }
+                    self.statement(
+                        program, op, &op_path, extents, &op_time, &inputs, &outputs, may_trap,
+                    )?;
                 }
                 Operation::Scan { count, body, .. } | Operation::Map { count, body, .. } => {
                     let carry = if let Operation::Scan { invariants, .. } = op { inputs.len() - invariants } else { 0 };
@@ -996,7 +990,7 @@ pub(super) fn canonical_schedule(text: &str) -> Result<String> {
     let ctx = context()?;
     map_text(&read_schedule(&ctx, text)?)
 }
-fn set_text(set: &UnionSet) -> Result<String> {
+pub(super) fn set_text(set: &UnionSet) -> Result<String> {
     owned_string(unsafe { isl_union_set_to_str(set.ptr) })
 }
 pub(super) fn closure(mut map: UnionMap) -> Result<(UnionMap, bool)> {

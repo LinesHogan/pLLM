@@ -160,6 +160,11 @@ pub(super) enum Operation {
         outputs: Vec<Value>,
         parameter: String,
     },
+    Coordinate {
+        inputs: Vec<String>,
+        outputs: Vec<Value>,
+        affine: AffineIndex,
+    },
     Scalar {
         inputs: Vec<String>,
         outputs: Vec<Value>,
@@ -224,6 +229,9 @@ impl Operation {
                 inputs, outputs, ..
             }
             | Self::Parameter {
+                inputs, outputs, ..
+            }
+            | Self::Coordinate {
                 inputs, outputs, ..
             }
             | Self::Scalar {
@@ -467,6 +475,34 @@ impl Verifier<'_> {
                     require(
                         self.parameters.contains_key(parameter.as_str()),
                         "parameter value requires a declared size parameter",
+                    )?;
+                }
+                Operation::Coordinate { affine, .. } => {
+                    require(
+                        outs == [scalar(ScalarType::Index)],
+                        "coordinate requires one index result",
+                    )?;
+                    require(
+                        affine
+                            .terms
+                            .iter()
+                            .all(|term| term.argument < ins.len() && term.coefficient != 0),
+                        "coordinate terms must reference inputs with nonzero coefficients",
+                    )?;
+                    require(
+                        affine
+                            .terms
+                            .iter()
+                            .all(|term| ins[term.argument] == scalar(ScalarType::Index)),
+                        "coordinate inputs must be index values",
+                    )?;
+                    let mut arguments: Vec<usize> =
+                        affine.terms.iter().map(|term| term.argument).collect();
+                    arguments.sort_unstable();
+                    arguments.dedup();
+                    require(
+                        arguments.len() == affine.terms.len(),
+                        "coordinate terms must reference distinct inputs",
                     )?;
                 }
                 Operation::Scalar { kind, .. } => {
@@ -894,5 +930,91 @@ mod tests {
             body.block.yields[0] = "i".into();
         }
         assert!(verify(&program).is_err());
+    }
+
+    #[test]
+    fn coordinates_declare_checked_affine_index_values() {
+        let index = || Value {
+            name: String::new(),
+            type_: scalar(ScalarType::Index),
+        };
+        let mut named = |name: &str| {
+            let mut value = index();
+            value.name = name.into();
+            value
+        };
+        let program = |operations: Vec<Operation>| Program {
+            parameters: vec![SizeParameter {
+                name: "n".into(),
+                minimum: 0,
+                maximum: 8,
+            }],
+            constraints: vec![],
+            functions: vec![],
+            resources: vec![],
+            entry: Region {
+                block: Block {
+                    arguments: vec![],
+                    operations,
+                    yields: vec!["c".into()],
+                },
+            },
+        };
+        let parameter = Operation::Parameter {
+            inputs: vec![],
+            outputs: vec![named("p")],
+            parameter: "n".into(),
+        };
+        let coordinate = |constant: i64, terms: Vec<IndexTerm>| Operation::Coordinate {
+            inputs: vec!["p".into()],
+            outputs: vec![named("c")],
+            affine: AffineIndex { constant, terms },
+        };
+        verify(&program(vec![
+            parameter.clone(),
+            coordinate(3, vec![IndexTerm { argument: 0, coefficient: 2 }]),
+        ]))
+        .unwrap();
+        // A constant-only coordinate takes no inputs.
+        verify(&program(vec![Operation::Coordinate {
+            inputs: vec![],
+            outputs: vec![named("c")],
+            affine: AffineIndex { constant: 3, terms: vec![] },
+        }]))
+        .unwrap();
+        for bad in [
+            // Out-of-range term reference.
+            coordinate(0, vec![IndexTerm { argument: 1, coefficient: 1 }]),
+            // Zero coefficient is a malformed declaration, not a dropped term.
+            coordinate(0, vec![IndexTerm { argument: 0, coefficient: 0 }]),
+            // Duplicate references must be merged by the constructor.
+            coordinate(0, vec![
+                IndexTerm { argument: 0, coefficient: 1 },
+                IndexTerm { argument: 0, coefficient: 2 },
+            ]),
+        ] {
+            assert!(verify(&program(vec![parameter.clone(), bad])).is_err());
+        }
+        // Non-index operands and results are rejected.
+        let mut wrong_result = coordinate(0, vec![IndexTerm { argument: 0, coefficient: 1 }]);
+        if let Operation::Coordinate { outputs, .. } = &mut wrong_result {
+            outputs[0].type_ = scalar(ScalarType::Int);
+        }
+        assert!(verify(&program(vec![parameter.clone(), wrong_result])).is_err());
+        let mut wrong_input = program(vec![
+            Operation::Constant {
+                inputs: vec![],
+                outputs: vec![{
+                    let mut value = named("p");
+                    value.type_ = scalar(ScalarType::Int);
+                    value
+                }],
+                value: Literal::Int(1),
+            },
+            coordinate(0, vec![IndexTerm { argument: 0, coefficient: 1 }]),
+        ]);
+        assert!(verify(&wrong_input).is_err());
+        wrong_input.entry.block.yields.clear();
+        assert!(verify(&wrong_input).is_err());
     }
 }

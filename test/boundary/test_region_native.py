@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from pllm.contracts.region_program import (
-    BankType, Call, Constant, Function, If, Program, Publish, Resource,
+    AffineIndex, BankType, Call, Coordinate, Function, If, Program, Publish, Resource,
     ScalarType, Scan, Snapshot, TensorType, Value, While,
 )
 from pllm.execution.exported_cell import ExportedCell
@@ -85,7 +85,7 @@ def test_native_mutation_cannot_overwrite_ssa_inputs_or_leave_borrowed_outputs()
 def native_page_program(tensor, count, dynamic):
     function = Function("native.test.page_update", (X,), (tensor,), ("layers",))
     body = region((Value("i", X),), (
-        Constant((), (Value("zero", X),), 0),
+        Coordinate((), (Value("zero", X),), AffineIndex(0)),
         Call(("zero",), (Value("old", tensor),), function.name),
     ), ("old",))
     outputs = (Value("old_values", BankType(tensor, count)),)

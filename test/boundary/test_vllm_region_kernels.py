@@ -12,7 +12,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from pllm.backends.vllm.region_kernels import VllmRmsNormKernel
 from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, CausalModelDomain
 from pllm.contracts.region_imports import NativeKernelImport
-from pllm.contracts.region_program import BorrowedResource, Call, Constant, Program, ScalarType, TensorType, Value
+from pllm.contracts.region_program import AffineIndex, BorrowedResource, Call, Constant, Coordinate, Program, ScalarType, TensorType, Value
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -47,7 +47,7 @@ def test_model_norm_contract_binds_actual_kernel_on_both_original_streams(dtype)
         context, weights = BorrowedResource("context", (2,)), BorrowedResource("weights", (4,))
         index = ScalarType.INDEX
         program = Program(region((Value("h", tensor), Value("r", tensor)), (
-            Constant((), (Value("zero", index),), 0), Constant((), (Value("one", index),), 1),
+            Coordinate((), (Value("zero", index),), AffineIndex(0)), Coordinate((), (Value("one", index),), AffineIndex(1)),
             Call(("zero", "h", "r"), (Value("a", tensor),), function.name),
             Call(("one", "h", "r"), (Value("b", tensor),), function.name),
         ), ("a", "b")), (function,), (context, weights))
