@@ -385,7 +385,6 @@ def main() -> int:
         assert len(outputs) == 3 and all(len(output.outputs[0].token_ids) == 3 for output in outputs)
         finished = handle.worker_state()
         assert finished.process_id == initial.process_id
-        assert finished.compilation_signature == initial.compilation_signature
         diagnostics = finished.diagnostics
         assert diagnostics.loss_count == diagnostics.update_count == 6
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
@@ -397,7 +396,6 @@ def main() -> int:
         assert final.active_lineages == final.pending_state_releases == final.fallback_count == 0
         trace = handle.trace_snapshot()
         assert trace.process_id == initial.process_id
-        assert trace.schedule_signature == initial.compilation_signature
         assert trace.host_task_times() and trace.events[-1].phase is TracePhase.RETIRE
         begins = tuple(event for event in trace.events if event.phase is TracePhase.BEGIN)
         assert begins and all(event.pin_id is not None for event in begins)

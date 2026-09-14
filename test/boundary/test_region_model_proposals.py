@@ -11,6 +11,7 @@ import torch
 from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm.backends.vllm.replay import VllmTokenwiseReplay
 from pllm.backends.vllm.runtime import BackendCommand, VllmSession, WorkloadModelRunner
+from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, CausalModelDomain, SignedBackendAttachment
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
@@ -72,6 +73,9 @@ def test_worker_tunes_and_installs_parallel_model_proposal_with_original_owner(m
         region_imports=imports, region_bodies=(body,))
     facts = BackendCompileFacts(probe, RuntimeFacts(device).timeline(capabilities), (), 1, 0, 0, layer_count=3)
     workload = RecirculationWorkload()
+    # The measured tuning protocol below is the explicit opt-in: specialize so
+    # the arena reservation funds every measured candidate, not the reference only.
+    facts = workload.specialize(facts, ExecutionOptions(tuning="measured"))
     # The driver receives only the signed-source descriptors. It has neither
     # OriginalNorm's class nor its graph/parameter objects, and never owns CUDA.
     script = """
@@ -79,6 +83,7 @@ import sys
 from unittest.mock import patch
 import torch
 from pllm.authoring import BackendCompileFacts
+from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendPlacementProbe
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
@@ -88,11 +93,13 @@ from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.recirculation import RecirculationWorkload
 probe = decode_boundary(sys.stdin.read(), BackendPlacementProbe)
 facts = BackendCompileFacts(probe, RuntimeFacts(torch.device('cuda:0')).timeline(probe.capabilities), (), 1, 0, 0, layer_count=3)
+workload = RecirculationWorkload()
+facts = workload.specialize(facts, ExecutionOptions(tuning="measured"))
 assert not torch.cuda.is_initialized()
 def forbidden(*args, **kwargs):
     raise AssertionError('driver must not bind an executor, allocate pages, or import model graphs')
 with patch.object(RegionInstructionExecution, '__init__', forbidden), patch.object(PageBundleArena, '__init__', forbidden), patch.object(ExportedCell, 'from_export', forbidden):
-    planned = RecirculationWorkload().plan_backend(facts)
+    planned = workload.plan_backend(facts)
 assert not torch.cuda.is_initialized()
 print(encode_boundary(planned))
 """
