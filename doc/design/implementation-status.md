@@ -461,6 +461,38 @@ smoke 以 `tuning="measured"` 保留实测路径的跨进程覆盖。证据见
 [启发式选择结果](evidence/heuristic-selection-results.json)（T3 原始设计）
 与[默认路径消除结果](evidence/t4-followup-elimination-results.json)。
 
+## 跨请求保序提升的调度搜索（T4 定向后续 ①）
+
+③ 把目录推导移出默认路径后，调度搜索只服务实测 opt-in 路径；它的成本是
+ISL 系数 ILP，变量数随语句数增长（真实 84 语句配置 636 个变量）。真实负载
+的结构是一个请求的语句组在程序顶层复制 R 次：path[0] 分组、尾部路径与
+extent 仅差 size 参数后缀（tokens0/tokens1、prefix0/prefix1 完整成族），且
+全部跨请求依赖（trace、packing 行）都从小请求号指向大请求号。
+
+据此只对一个请求副本做调度搜索，再按 Θ(S_r(i), p) = (r, φ_r(i, p)) 保序
+提升：请求序号作为最外层时间维，所有跨请求依赖被严格满足。半问题 = 请求 0
+语句 + 其余请求参数的存在性投影，由未改动的 `schedule_candidates` 求解；
+提升是对半调度 map 的文本重写，重新读入、与全域相交后由精确的全域
+`legal()` 裁决——任何结构不匹配或检查失败都回退全域搜索并记录诊断，正确性
+没有任何放松。该思路先在 docs/lift_prototype.py 上以 2/3 请求验证精确，再落入
+正式 explore 路径（analyze 的 optimize 分支）。
+
+效果（同一真实 84 语句配置）：analyze optimize 分支的搜索 8.6-9s → 0.24s，
+`explore_region_schedules` 17.37s → 8.31s（残余为全域 window 构造与精确序
+比对，不属于本步范围）。目录组成：参考、isl-locality、isl-parallel 与 window
+候选保留；tile 候选对复制型程序消失（提升树的最外层请求带不可置换）——实测
+安装候选不变（13 个，parallel (2,4,6,9)、transformed (8,9)）。
+
+验收：新增 Rust 钉住测试（共享原子资源上的两个参数化副本：提升生效、无回退、
+三个候选均过 legal()）；cargo 22 项通过；CPU 全套 612 项通过，2 项失败为
+test_inplace_region 的 CUDA 位级数值比较，在提升前构建上同样失败（本机 GPU
+数值问题，且默认路径不进入改动代码）；typing / layers / authority 全绿；
+Qwen 默认路径 smoke 与 EngineCore `--recirculation-only` 实测 smoke 均绿
+（selected 5，13 候选全部可行，fallback 0）。顺带修复两处既有问题：
+test_region_model_proposals 补上 measured opt-in 的资金储备（③ 遗留，CUDA
+专属测试），enginecore smoke 移除对 3441c8b 已删除签名字段的断言。证据见
+[跨请求提升结果](evidence/t4-followup-lift-results.json)。
+
 ## 调度目录去重的单站点收敛（T4 关账）
 
 语义去重原来分散在两处：window 族逐构造对参考和基各跑一次全域

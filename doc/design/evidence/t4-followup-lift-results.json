@@ -1,0 +1,34 @@
+{
+  "date": "2026-09-15",
+  "scope": "T4 follow-up step 1: the cross-request order-preserving lift is implemented in the real explore path (rust region_dependence analyze optimize branch); serves the measured opt-in path only, since step 3 removed catalog derivation from the default path",
+  "structural_basis": {
+    "observation": "Real workloads replicate one request's statement structure R times at the program top level: path[0] groups with identical tails, extents equal modulo size-parameter rename, size parameters forming complete trailing-digit families (tokens0/tokens1, prefix0/prefix1)",
+    "lift": "schedule one replica and map Theta(S_r(i), p) = (r, phi_r(i, p)): the request index becomes the outermost time dimension, so every cross-request dependency (all point from lower to higher request indices) is satisfied strictly",
+    "half_problem": "request-0 statements plus existential projection of the other requests' parameters; solved by the unchanged schedule_candidates (ISL coefficient ILP shrinks from 636 to 60+ variables on the real config)",
+    "soundness": "the lifted map is re-read, intersected with the full domain, and checked by the exact full-domain legal(); legal() is the sole arbiter and any structural miss or check failure falls back to the full-domain search with a diagnostic. Nothing relaxes validity",
+    "prototype": "docs/lift_prototype.py verified exactness at 2 and 3 requests before this implementation (0.23s/0.37s vs 8.6s/>10min full search)"
+  },
+  "changes": {
+    "rust/pllm_core/src/planning/region_dependence.rs": "analyze optimize branch tries lifted_schedule_candidates first: replication_groups detection (path groups + extent/param families), half-domain restriction via set list filtering + project_out of suffix>0 params, textual per-request lift of each half candidate, full-domain legal() check, schedule tree rebuilt from the lifted map; fallback to full-domain schedule_candidates on Err with diagnostic; pinning test replicated_requests_lift_the_schedule_search (two parametric replicas on a shared atomic resource: lift fires, no fallback, all three candidates legal)"
+  },
+  "results_qwen_recirculation_measured_path": {
+    "config": "Qwen2.5-0.5B, 2 requests x 24 layers x 64 positions, bf16, real probe imports/bodies (84 statements)",
+    "analyze_optimize_seconds": {"before_class": "8.6-9 (search inside explore)", "after": 0.24},
+    "explore_region_schedules_seconds": {"before": 17.37, "after": 8.31},
+    "residual": "8.1s is the full-domain window/merge machinery (window construction + exact order comparison), not the schedule search; attacking it is outside step 1",
+    "catalog_composition": "reference, isl-locality, isl-parallel and window candidates preserved; tile candidates drop for replicated programs (the lifted tree's outer request band is not permutable); measured install candidates unchanged: 13 candidates, parallel (2,4,6,9), transformed (8,9)"
+  },
+  "acceptance": {
+    "cargo_test": "22 passed (incl. the new pinning test)",
+    "pytest_full_cpu": "612 passed, 2 failed — both test_inplace_region bitwise CUDA cases fail identically on the pre-lift build (1e-7-level GPU numerics on this machine, unrelated to planning; the default path never enters the changed code)",
+    "typing": "0 errors",
+    "import_layers": "OK",
+    "region_authority": "OK",
+    "qwen_smoke_default": "8 normal rows, 6 replay rows, 14 numerical comparisons, reference install, fallback 0",
+    "enginecore_smoke_measured": "selected 5, 13 candidates all feasible with measurements, parallel (2,4,6,9), transformed (8,9), 12 replay rows, fallback 0"
+  },
+  "pre_existing_fixes_landed_with_this_step": [
+    "test/boundary/test_region_model_proposals.py: latent funding gap from step 3 — the measured tuning protocol now specializes with ExecutionOptions(tuning=measured) so the arena reservation funds every measured candidate (CUDA-only test, fails identically on the pre-lift build)",
+    "test/gpu/enginecore_smoke.py: dropped assertions against BackendWorkerState.compilation_signature and TraceSnapshot.schedule_signature, fields deliberately removed by 3441c8b (completes the signature-layer removal)"
+  ]
+}

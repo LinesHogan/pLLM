@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CStr;
 
-use isl_rs::{Context, DimType, Map, Options, ScheduleConstraints, Set, UnionMap, UnionSet, Val};
+use isl_rs::{Context, DimType, Map, Options, Schedule, ScheduleConstraints, Set, UnionMap, UnionSet, Val};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -1115,7 +1115,22 @@ pub(super) fn analyze(program: &Program, optimize: bool) -> Result<Analysis> {
             let ctx = context()?;
             let domain = isl(UnionSet::read_from_str(&ctx, &analysis.domain))?;
             let dependencies = isl(UnionMap::read_from_str(&ctx, &analysis.dependencies))?;
-            schedule_candidates(&ctx, &domain, &dependencies)
+            // Programs replicating one request per top-level group are
+            // scheduled on a single replica and lifted order-preservingly.
+            // Any structural miss or check failure falls back to the exact
+            // full-domain search.
+            match lifted_schedule_candidates(&ctx, &analysis.statements, &domain, &dependencies) {
+                Ok(Some(lifted)) => Ok(lifted),
+                Ok(None) => schedule_candidates(&ctx, &domain, &dependencies),
+                Err(error) => {
+                    let (candidates, mut diagnostics) =
+                        schedule_candidates(&ctx, &domain, &dependencies)?;
+                    diagnostics.push(format!(
+                        "lifted schedule derivation fell back to full-domain search: {error}"
+                    ));
+                    Ok((candidates, diagnostics))
+                },
+            }
         })?;
         analysis.candidates.extend(candidates);
         analysis.diagnostics.extend(diagnostics);
@@ -1339,6 +1354,209 @@ fn schedule_candidates(ctx: &Context, domain: &UnionSet, dependencies: &UnionMap
     Ok((candidates, diagnostics))
 }
 
+// Split a union map/set text into per-piece strings at "; " boundaries. ISL
+// prints disjuncts of one map as separate pieces in union text; constraint
+// expressions themselves never contain the separator. Text fragility is not a
+// soundness risk here: the lifted result is read back and checked by the exact
+// full-domain legal(), and any failure falls back to the full-domain search.
+fn text_pieces(text: &str) -> Result<Vec<String>> {
+    let open = text.find('{').ok_or("ISL text has no opening brace")?;
+    let close = text.rfind('}').ok_or("ISL text has no closing brace")?;
+    Ok(text[open + 1..close]
+        .split("; ")
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+// Statement groups that replicate one request's structure: same program-tree
+// path tails and extents in each group, differing only in the request's size
+// parameter suffix. Returns the groups ordered by request plus, per request,
+// the parameter renames to apply to request 0's text.
+fn replication_groups(
+    statements: &[Statement],
+    parameters: &[String],
+) -> Option<(Vec<Vec<usize>>, Vec<Vec<(String, String)>>)> {
+    let mut by_parent: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for statement in statements {
+        let (&parent, _) = statement.path.split_first()?;
+        by_parent.entry(parent).or_default().push(statement.id);
+    }
+    if by_parent.len() < 2 {
+        return None;
+    }
+    let mut groups = by_parent.into_values().collect::<Vec<_>>();
+    groups.sort_by_key(|group| group[0]);
+    let size = groups[0].len();
+    if size == 0 || groups.iter().any(|group| group.len() != size)
+        || groups.iter().map(Vec::len).sum::<usize>() != statements.len()
+    {
+        return None;
+    }
+    let requests = groups.len();
+    let by_id: BTreeMap<usize, &Statement> = statements.iter().map(|s| (s.id, s)).collect();
+    let tails = |group: &[usize]| group.iter().map(|id| by_id[id].path[1..].to_vec()).collect::<Vec<_>>();
+    if (1..requests).any(|r| tails(&groups[r]) != tails(&groups[0])) {
+        return None;
+    }
+    // Size parameter families: base names carrying a trailing request index.
+    // Every parameter must belong to a complete family (one member per
+    // request) or be request-independent.
+    let mut families: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+    for name in parameters {
+        let digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        let suffix = &name[digits.len()..];
+        if suffix.is_empty() {
+            continue;
+        }
+        let index: usize = suffix.parse().ok()?;
+        if index >= requests {
+            return None;
+        }
+        families.entry(digits).or_insert_with(|| vec![None; requests])[index] = Some(name.as_str());
+    }
+    if families.values().any(|members| members.iter().any(Option::is_none)) {
+        return None;
+    }
+    let mut renames = vec![Vec::new(); requests];
+    for members in families.values() {
+        let first = members[0]?;
+        for (r, member) in members.iter().enumerate().skip(1) {
+            renames[r].push((first.to_string(), (*member)?.to_string()));
+        }
+    }
+    // Extent names are the bare parameter names; ISL text adds the __size_
+    // prefix. Check extents against request 0's with bare names renamed.
+    for r in 1..requests {
+        let extent_renames = renames[r].iter()
+            .map(|(from, to)| (from.trim_start_matches("__size_"), to.trim_start_matches("__size_")))
+            .collect::<Vec<_>>();
+        for (k, id) in groups[r].iter().enumerate() {
+            let expected = by_id[&groups[0][k]].extents.iter()
+                .map(|extent| match extent {
+                    Extent::Fixed(value) => Extent::Fixed(*value),
+                    Extent::Parameter(name) => Extent::Parameter(extent_renames.iter()
+                        .find_map(|(from, to)| (*from == name.as_str()).then(|| to.to_string()))
+                        .unwrap_or_else(|| name.clone())),
+                })
+                .collect::<Vec<_>>();
+            if by_id[id].extents != expected {
+                return None;
+            }
+        }
+    }
+    Some((groups, renames))
+}
+
+// Schedule one request's replica and lift order-preservingly:
+// Theta(S_r(i), p) = (r, phi(i, p_0->p_r)). All cross-request dependencies
+// must point from lower to higher request indices; the outermost time
+// dimension then satisfies them strictly. The full-domain legal() check is
+// the exact arbiter — nothing here relaxes validity.
+fn lifted_schedule_candidates(
+    ctx: &Context,
+    statements: &[Statement],
+    domain: &UnionSet,
+    dependencies: &UnionMap,
+) -> Result<Option<(Vec<ScheduleCandidate>, Vec<String>)>> {
+    let space = isl(domain.get_space())?;
+    let parameters = (0..isl(space.dim(DimType::Param))?)
+        .map(|i| isl(space.get_dim_name(DimType::Param, i as u32)).map(str::to_string))
+        .collect::<Result<Vec<_>>>()?;
+    let Some((groups, renames)) = replication_groups(statements, &parameters) else {
+        return Ok(None);
+    };
+    let requests = groups.len();
+    // Restrict the scheduling problem to request 0's statements and project
+    // out the other requests' parameters (an existential relaxation; the
+    // lifted result is still checked against the full problem).
+    let r0: BTreeSet<String> = groups[0].iter().map(|id| format!("S{id}")).collect();
+    let list = isl(domain.get_set_list())?;
+    let mut half_domain = isl(UnionSet::empty(isl(domain.get_space())?))?;
+    for i in 0..isl(list.n_set())? {
+        let set = isl(list.get_at(i))?;
+        if r0.contains(isl(set.get_tuple_name())?) {
+            half_domain = isl(half_domain.add_set(set))?;
+        }
+    }
+    let mut half_dependencies = isl(isl(isl(dependencies.copy())?
+        .intersect_domain(isl(half_domain.copy())?))?
+        .intersect_range(isl(half_domain.copy())?))?;
+    for (index, name) in parameters.iter().enumerate().rev() {
+        let digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        let suffix = &name[digits.len()..];
+        if !suffix.is_empty() && suffix.parse::<usize>().map_or(false, |r| r > 0) {
+            half_domain = isl(half_domain.project_out(DimType::Param, index as u32, 1))?;
+            half_dependencies = isl(half_dependencies.project_out(DimType::Param, index as u32, 1))?;
+        }
+    }
+    let (half_candidates, mut diagnostics) = schedule_candidates(ctx, &half_domain, &half_dependencies)?;
+    if half_candidates.is_empty() {
+        return Err("replicated program yielded no half-schedule candidates".into());
+    }
+    let position: BTreeMap<usize, usize> = groups[0].iter().enumerate()
+        .map(|(k, id)| (*id, k)).collect();
+    let param_decl = if parameters.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] -> ", parameters.join(","))
+    };
+    let mut candidates = Vec::new();
+    for half in &half_candidates {
+        let mut pieces = Vec::new();
+        for piece in text_pieces(&half.schedule_map)? {
+            // piece: S{id}[dims] -> [times] (: constraints)?
+            let statement_end = piece.find('[').ok_or("schedule piece has no tuple")?;
+            let statement: usize = piece[1..statement_end].parse()
+                .map_err(|_| "schedule piece statement id is not numeric".to_string())?;
+            let &k = position.get(&statement)
+                .ok_or("half schedule maps a statement outside request 0")?;
+            let rest = &piece[statement_end..];
+            let (head, constraints) = match rest.split_once(" : ") {
+                Some((head, constraints)) => (head, Some(constraints)),
+                None => (rest, None),
+            };
+            let (iter, times) = head.rsplit_once("] -> [")
+                .ok_or("schedule piece has no time tuple")?;
+            let dims = &iter[1..];
+            let times = times.strip_suffix(']')
+                .ok_or("schedule piece time tuple is not closed")?;
+            for r in 0..requests {
+                let mut times = times.to_string();
+                let mut constraints = constraints.map(str::to_string);
+                if r > 0 {
+                    for (from, to) in &renames[r] {
+                        times = times.replace(from.as_str(), to);
+                        constraints = constraints.map(|text| text.replace(from.as_str(), to));
+                    }
+                }
+                let mut lifted = format!("S{}[{}] -> [{}, {}]", groups[r][k], dims, r, times);
+                if let Some(constraints) = constraints {
+                    lifted.push_str(&format!(" : {constraints}"));
+                }
+                pieces.push(lifted);
+            }
+        }
+        ctx.reset_operations();
+        let text = format!("{param_decl}{{ {} }}", pieces.join("; "));
+        let map = isl(isl(UnionMap::read_from_str(ctx, &text))?
+            .intersect_domain(isl(domain.copy())?))?;
+        legal(domain, dependencies, &map)?;
+        let schedule = isl(isl(Schedule::from_domain(isl(domain.copy())?))?
+            .insert_partial_schedule(isl(isl(map.copy())?.as_multi_union_pw_aff())?))?;
+        candidates.push(ScheduleCandidate {
+            source: half.source.clone(),
+            schedule_map: map_text(&map)?,
+            schedule_tree: schedule_text(&schedule)?,
+        });
+    }
+    diagnostics.push(format!(
+        "schedule search lifted one {}-statement request replica across {requests} requests",
+        groups[0].len()));
+    Ok(Some((candidates, diagnostics)))
+}
+
 #[pyfunction]
 #[pyo3(signature = (program_json, optimize = true))]
 fn analyze_region_program(program_json: &str, optimize: bool) -> PyResult<String> {
@@ -1471,6 +1689,50 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replicated_requests_lift_the_schedule_search() {
+        let integer = json!({"kind": "scalar", "name": "int"});
+        let index = json!({"kind": "scalar", "name": "index"});
+        let replica = |count: &str| json!({"op": "scan", "inputs": [], "outputs": [],
+            "count": count, "body": {"block": {
+                "arguments": [{"name": "i", "type": index}],
+                "yields": [],
+                "operations": [
+                    {"op": "snapshot", "resource": "w", "inputs": [], "outputs": [{"name": "x", "type": integer}]},
+                    {"op": "publish", "resource": "w", "inputs": ["x"], "outputs": []}
+                ]
+            }}});
+        let mut program: Program = serde_json::from_value(json!({
+            "functions": [],
+            "resources": [{"kind": "state", "name": "w", "payload": [integer], "domain": []}],
+            "entry": {"block": {
+                "arguments": [],
+                "yields": [],
+                "operations": [replica("tokens0"), replica("tokens1")]
+            }}
+        })).unwrap();
+        program.parameters = vec![
+            region_program::SizeParameter { name: "tokens0".into(), minimum: 1, maximum: 8 },
+            region_program::SizeParameter { name: "tokens1".into(), minimum: 1, maximum: 8 },
+        ];
+        // The shared atomic resource orders every instance across both
+        // request replicas; cross-request conflicts point low to high, so the
+        // order-preserving lift is exact here.
+        let analysis = analyze(&program, true).unwrap();
+        assert_eq!(analysis.statements.len(), 4);
+        assert!(analysis.diagnostics.iter().any(|d| d.contains(
+            "schedule search lifted one 2-statement request replica across 2 requests")));
+        assert!(!analysis.diagnostics.iter().any(|d| d.contains("fell back")));
+        assert_eq!(analysis.candidates.len(), 3);
+        let ctx = context().unwrap();
+        let domain = isl(UnionSet::read_from_str(&ctx, &analysis.domain)).unwrap();
+        let deps = isl(UnionMap::read_from_str(&ctx, &analysis.dependencies)).unwrap();
+        for candidate in &analysis.candidates {
+            let map = isl(UnionMap::read_from_str(&ctx, &candidate.schedule_map)).unwrap();
+            legal(&domain, &deps, &map).unwrap();
+        }
+    }
 
     #[test]
     fn schedule_edge_reduction_preserves_parameterized_reachability() {
