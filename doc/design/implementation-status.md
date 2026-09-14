@@ -453,6 +453,24 @@ Qwen smoke 改跑默认启发式路径（参考候选正确安装、14 次独立
 EngineCore smoke 以 `tuning="measured"` 保留实测路径的跨进程覆盖。证据见
 [启发式选择结果](evidence/heuristic-selection-results.json)。
 
+## 调度目录去重的单站点收敛（T4 关账）
+
+语义去重原来分散在两处：window 族逐构造对参考和基各跑一次全域
+`equivalent_order`，目录 merge 再做全对语义比对。现收敛到 merge 单一站点：
+window/tile 族按构造器忠实枚举（含与参考等价的产物），merge 先做文本过滤，
+再对幸存候选跑精确序比对；每个族的回合拉取到首个不同候选为止，重复不消耗
+轮转回合，因此目录顺序与旧实现逐项一致。去重总次数由各族的发射上限结构性
+有界，无需人工预算。tile 恒等构造器规则（size ≥ extent 时等价于基）经评估
+拒绝：真实配置层段 extent 21 大于全部 tile size，永不触发。
+
+T4 其余条款按本计划"收益不明显则不合并"关账（用户决策 2026-09-14）：基线
+复测显示原验收锚点（explore 20.6s + payload 18.6s，共 48s）已被 T1 结构性
+修复兑现，当前同一真实配置共 7.7s；剩余大头是 tile/window 候选的 payload
+（1.0-2.3s），恰是串行 (a,m) envelope 摘要不适用的非阶段主序调度，T4.4 够不到；
+T4.3 的 compute_schedule 目标只剩 0.35s。验收：真实配置 8 个候选 schedule
+map 逐字节一致、streams 签名一致。证据见
+[T4 去重收敛结果](evidence/t4-structural-dedup-results.json)。
+
 ## 最近完整收口的验收基线
 
 Python/pytest 环境统一为 `/workspace/pllm/.venv/bin/python`。CPU 集合在独立进程中

@@ -1,7 +1,7 @@
 """Automatic ISL band tiling keeps source versions, tails and storage bounds."""
 
 from dataclasses import replace
-from itertools import groupby, zip_longest
+from itertools import groupby
 
 import pytest
 import torch
@@ -27,9 +27,9 @@ from test.boundary.test_tensor_access import StorageObserver
 def test_lazy_catalog_matches_complete_family_merge_including_ties(limit):
     program = grid_program(9, 7)
     source = analyze_region_program(program)
-    families = (source.candidates[1:],
-        explore_region_windows(program, sizes=(2, 4), depth=1, max_candidates=limit - 1).candidates,
-        explore_region_tiling(program, max_candidates=limit - 1).candidates)
+    streams = [iter(source.candidates[1:]),
+        iter(explore_region_windows(program, sizes=(2, 4), depth=1, max_candidates=limit - 1).candidates),
+        iter(explore_region_tiling(program, max_candidates=limit - 1).candidates)]
     def order(candidate):
         instances = preview_region_schedule(program, candidate.schedule_map)
         # Equal-time groups retain simultaneity; arbitrary ordering inside a
@@ -38,17 +38,27 @@ def test_lazy_catalog_matches_complete_family_merge_including_ties(limit):
                      for _, group in groupby(instances, key=lambda point: point.time))
     expected = [source.candidates[0]]
     orders = [order(expected[0])]
-    for row in zip_longest(*families):
-        for candidate in row:
-            if candidate is None:
+    # Each family turn pulls until one distinct order arrives; duplicates do
+    # not consume the turn. This mirrors the shared catalog merge exactly.
+    live = [True] * len(streams)
+    while any(live) and len(expected) < limit:
+        advanced = False
+        for index, stream in enumerate(streams):
+            if not live[index]:
                 continue
-            relation = order(candidate)
-            if relation not in orders:
+            for candidate in stream:
+                relation = order(candidate)
+                if relation in orders:
+                    continue
                 expected.append(candidate)
                 orders.append(relation)
-                if len(expected) == limit:
-                    break
-        if len(expected) == limit:
+                advanced = True
+                break
+            else:
+                live[index] = False
+            if len(expected) == limit:
+                break
+        if not advanced:
             break
     assert explore_region_schedules(program, max_candidates=limit).candidates == tuple(expected)
 

@@ -183,21 +183,22 @@ fn window_candidates<'a>(source: &'a Analysis, sizes: &'a [u64], depth: usize,
         loop {
             let (size, base) = choices.next()?;
             ctx.reset_operations();
+            // Enumerate constructor-faithful windows. Semantic duplicates of the
+            // reference or the base are the shared catalog merge's job: it holds
+            // the exact (budgeted) order comparison with the reference first.
             let build = (|| {
                 let candidate = isl(UnionMap::read_from_str(ctx, &base.schedule_map))?;
                 let map = window(&reference, &candidate, size, depth, ctx)?;
                 legal(&domain, &dependencies, &map)?;
-                if equivalent_order(&map, &reference)? || equivalent_order(&map, &candidate)?
-                { return Ok(None); }
                 let schedule = isl(isl(Schedule::from_domain(isl(domain.copy())?))?
                     .insert_partial_schedule(isl(isl(map.copy())?.as_multi_union_pw_aff())?))?;
-                Ok::<_, String>(Some(ScheduleCandidate {
+                Ok::<_, String>(ScheduleCandidate {
                     source: format!("{}-window-{size}-depth-{depth}", base.source),
                     schedule_map: map_text(&map)?, schedule_tree: schedule_text(&schedule)?,
-                }))
+                })
             })();
             match build {
-                Ok(Some(candidate)) if seen.insert(candidate.schedule_map.clone()) => {
+                Ok(candidate) if seen.insert(candidate.schedule_map.clone()) => {
                     emitted += 1;
                     return Some(Ok(candidate));
                 },
@@ -258,6 +259,11 @@ fn derive_schedules(program: &Program, max_candidates: u64) -> Result<Exploratio
     if max_candidates == 1 { return Ok(result); }
     let ctx = context()?;
     let mut schedules = vec![isl(UnionMap::read_from_str(&ctx, &result.candidates[0].schedule_map))?];
+    // Semantic uniqueness lives only in this merge. Text equality filters
+    // identical maps for free; the exact order comparison is the fallback for
+    // textually distinct survivors. Every family is emission-capped, so the
+    // total number of comparisons is structurally bounded.
+    let mut seen: BTreeSet<String> = result.candidates.iter().map(|c| c.schedule_map.clone()).collect();
     let mut global = source.candidates.iter().skip(1).cloned().map(Ok);
     let mut windows = window_candidates(&source, &[2, 4], 1, max_candidates - 1, &ctx)?;
     let mut tiles = tile_candidates(&source, &[2, 4, 8, 16], max_candidates - 1, &ctx)?;
@@ -266,36 +272,43 @@ fn derive_schedules(program: &Program, max_candidates: u64) -> Result<Exploratio
     loop {
         let mut advanced = false;
         for family in &mut families {
-            // Errors do not consume a family's turn or successful-candidate
-            // budget. The eager implementation filtered them before merging.
+            // A family's turn yields one distinct candidate: duplicates and
+            // errors keep pulling without consuming the turn. This preserves
+            // the catalog's round-robin merge order exactly.
             let candidate = loop {
                 match family.next() {
                     Some(Err(error)) => {
                         if !result.diagnostics.contains(&error) { result.diagnostics.push(error); }
                     },
-                    Some(Ok(candidate)) => break Some(candidate),
+                    Some(Ok(candidate)) => {
+                        if !seen.contains(&candidate.schedule_map) {
+                            ctx.reset_operations();
+                            let distinct = (|| {
+                                let map = isl(UnionMap::read_from_str(&ctx, &candidate.schedule_map))?;
+                                for previous in &schedules {
+                                    if equivalent_order(&map, previous)? { return Ok(None); }
+                                }
+                                Ok::<_, String>(Some(map))
+                            })();
+                            match distinct {
+                                Ok(Some(map)) => {
+                                    seen.insert(candidate.schedule_map.clone());
+                                    schedules.push(map);
+                                    break Some(candidate);
+                                },
+                                Ok(None) => {},
+                                Err(error) => result.diagnostics.push(
+                                    format!("schedule catalog candidate discarded: {error}")),
+                            }
+                        }
+                    },
                     None => break None,
                 }
             };
             let Some(candidate) = candidate else { continue; };
             advanced = true;
-            ctx.reset_operations();
-            let distinct = (|| {
-                let map = isl(UnionMap::read_from_str(&ctx, &candidate.schedule_map))?;
-                for previous in &schedules {
-                    if equivalent_order(&map, previous)? { return Ok(None); }
-                }
-                Ok::<_, String>(Some(map))
-            })();
-            match distinct {
-                Ok(Some(map)) => {
-                    schedules.push(map);
-                    result.candidates.push(candidate);
-                    if result.candidates.len() as u64 >= max_candidates { return Ok(result); }
-                },
-                Ok(None) => {},
-                Err(error) => result.diagnostics.push(format!("schedule catalog candidate discarded: {error}")),
-            }
+            result.candidates.push(candidate);
+            if result.candidates.len() as u64 >= max_candidates { return Ok(result); }
         }
         if !advanced { return Ok(result); }
     }

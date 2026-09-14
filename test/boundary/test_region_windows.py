@@ -9,7 +9,7 @@ from pllm.contracts.backend_attachment import CausalModelDomain
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionPolicy, RegionSelectionRequest, RegionTuningSize
-from pllm.execution.region_compilation import analyze_region_program, analyze_region_retention, explore_region_windows, lower_region_schedule
+from pllm.execution.region_compilation import analyze_region_program, analyze_region_retention, explore_region_schedules, lower_region_schedule
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_optimization import select_region_candidate
 from pllm.execution.region_schedule import RegionScheduleExecution
@@ -22,9 +22,10 @@ def test_bounded_model_window_is_eligible_when_faster_unbounded_candidate_exceed
     region = TokenwiseRegion(TensorType((1, 4), "torch.float32"), 8, CausalModelDomain(1, 3, 8),
         Recurrence().effect(3), lambda a, b, i: a + b)
     analysis = analyze_region_program(region.program)
-    windows = explore_region_windows(region.program, sizes=(2,), max_candidates=1)
-    assert windows.candidates and not windows.diagnostics
-    candidate, = windows.candidates
+    # Window families enumerate constructor-faithfully; the shared catalog's
+    # merge holds semantic dedup and keeps the genuinely windowed candidate.
+    catalog = explore_region_schedules(region.program)
+    candidate = next(candidate for candidate in catalog.candidates if "-window-2-" in candidate.source)
     bound = analyze_region_retention(region.program, candidate.schedule_map, region.retained)
     assert bound.allocations[0].peak_instances_upper_bound == 2
     runner = RegionScheduleExecution(region.program, lower_region_schedule(region.program, candidate.schedule_map))
