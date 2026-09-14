@@ -1,0 +1,43 @@
+{
+  "date": "2026-09-14",
+  "scope": "T4 follow-up step 3 (default-path elimination): the default heuristic path no longer explores the schedule catalog, derives non-reference payloads, or builds stream candidates",
+  "structural_theorem": {
+    "claim": "Static catalog ranking is a constant function, so the default path provably installs the reference schedule.",
+    "premises": [
+      "logical traffic upper bounds are schedule-independent: input-storage read instance counts x root bytes plus statement-domain instance counts x per-call profile facts; the derivation (aer.rs derive_region_tensor_memory logical terms) never reads the schedule map",
+      "catalog candidates share the source imports and carry no rewrite evidence, so rewrite flops are structurally zero on every catalog"
+    ],
+    "consequence": "any source-first static cost over these facts ties across candidates and selects the reference; the T3 ranking functions (heuristic_candidate_cost, heuristic_default_proposal) and the tuning_flop_byte_ratio constant are retired instead of kept as dead generality",
+    "test_pin": "test_recirculation asserts every measured-mode catalog proposal's logical (read, write) bytes equal the reference's"
+  },
+  "changes": {
+    "contracts/region_selection.py": "RegionSelectionPolicy gains tuning: Literal[heuristic, measured] = heuristic (rides the signed timeline so worker-side re-derivation matches the driver); heuristic_candidate_cost deleted",
+    "config.py": "ExecutionOptions.tuning kept (default heuristic); tuning_flop_byte_ratio deleted",
+    "authoring.py": "specialize passes options.tuning into the region policy",
+    "execution/tokenwise_region.py": "compile_tokenwise_region explores the catalog, derives serial payloads and stream plans only when policy.tuning == measured; heuristic keeps compile_tokenwise_source's reference-only region; heuristic_default_proposal deleted",
+    "backends/vllm/runtime.py": "tune_native_schedules takes no arguments and reads the signed region policy as the single source of the mode; heuristic returns before any compile/measurement",
+    "rust/pllm_core/region_selection.rs": "Policy mirror gains tuning (TuningPolicy::Heuristic default) so signed timelines decode",
+    "funding": "heuristic mode reserves the reference peak only; measured mode keeps the max-across-candidates reservation the measured install path relies on"
+  },
+  "cold_start_qwen_recirculation": {
+    "config": "Qwen2.5-0.5B, 2 requests x 24 layers x 64 positions, bf16, real probe imports/bodies (84 statements)",
+    "compile_tokenwise_region_seconds": {"before": 46.6, "after": 2.1},
+    "make_llm_seconds": {"before": 82.6, "after": 36.7},
+    "remainder": "2.1s is the shared compile_tokenwise_source: reference provenance + reference payload on the 84-statement program"
+  },
+  "acceptance": {
+    "pytest_full_cpu": "508 passed, 0 failed",
+    "cargo_test": "21 passed",
+    "typing": "0 errors",
+    "import_layers": "OK",
+    "region_authority": "OK",
+    "qwen_smoke_default": "reference installed without cold measurement; 8 normal rows, 6 replay rows, 14 numerical comparisons, region_selection None",
+    "enginecore_smoke_measured": "full measured protocol intact: selected 7, 13 samples, parallel candidates (2,4,6,9), transformed (8,9)"
+  },
+  "deletions": [
+    "heuristic_candidate_cost (contracts/region_selection.py)",
+    "heuristic_default_proposal (execution/tokenwise_region.py)",
+    "ExecutionOptions.tuning_flop_byte_ratio",
+    "test_heuristic_candidate_cost_uses_existing_facts_without_measurement"
+  ]
+}

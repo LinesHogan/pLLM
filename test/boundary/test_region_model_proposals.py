@@ -18,7 +18,7 @@ from pllm.contracts.region_program import AffineIndex, Block, BorrowedResource, 
 from pllm.contracts.region_composition import RegionFunctionBody, inline_region
 from pllm.contracts.region_imports import CompiledTensorImport, ExportedTensorImport
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
-from pllm.contracts.region_selection import RegionSelection
+from pllm.contracts.region_selection import RegionSelection, RegionSelectionPolicy
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.contracts.state_representation import StateDeviceKind
@@ -121,7 +121,8 @@ print(encode_boundary(planned))
     with pytest.raises(ValueError, match="differs from its source function"):
         task.region.bind_functions({graph.digest: replace(graph, digest="0" * 64)})
     execution.rebind_implementation(replace(task, region=task.region.bind_functions({graph.digest: graph})))
-    source = compile_tokenwise_region(tensor, 4, probe.causal_domain, workload.config.effect(3), stream_lanes=2,
+    source = compile_tokenwise_region(tensor, 4, probe.causal_domain, workload.config.effect(3),
+        RegionSelectionPolicy(tuning="measured"), stream_lanes=2,
         source_imports=imports, function_bodies=(body,))
     parallel = next(proposal for proposal in source.candidate_proposals
         if proposal.stream_plan is not None and proposal.stream_plan.pipeline_depth == 2)

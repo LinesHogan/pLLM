@@ -9,7 +9,7 @@ import torch
 from pllm import _core
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_selection import (
-    RegionCandidate, RegionPayloadLimit, RegionSelection, RegionSelectionRequest, heuristic_candidate_cost,
+    RegionCandidate, RegionPayloadLimit, RegionSelection, RegionSelectionRequest,
 )
 from pllm.execution.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
@@ -87,19 +87,6 @@ def test_selection_requires_the_reference_as_candidate_zero():
         select_region_candidate(program, replace(request, candidates=tuple(replace(c, elapsed_ns=()) for c in request.candidates)))
     with pytest.raises(ValueError, match="positive measured"):
         select_region_candidate(program, replace(request, candidates=(replace(request.candidates[0], elapsed_ns=(0,)),)))
-
-
-def test_heuristic_candidate_cost_uses_existing_facts_without_measurement():
-    assert heuristic_candidate_cost(1000, 0, 1) == 1000.0
-    assert heuristic_candidate_cost(8448 + 7936, 0, 2) == 16384.0
-    assert heuristic_candidate_cost(1000, 200, 1, flop_byte_ratio=10) == 1020.0
-    assert heuristic_candidate_cost(1000, 200, 4, flop_byte_ratio=10) == 1005.0
-    assert heuristic_candidate_cost(0, 0, 1) == 0.0
-    for args in ((-1, 0, 1), (0, -1, 1), (0, 0, 0)):
-        with pytest.raises(ValueError, match="nonnegative facts"):
-            heuristic_candidate_cost(*args)
-    with pytest.raises(ValueError, match="nonnegative facts"):
-        heuristic_candidate_cost(0, 0, 1, flop_byte_ratio=0)
 
 
 def test_fast_measurement_cannot_authorize_an_illegal_loop_schedule():

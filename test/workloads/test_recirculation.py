@@ -13,8 +13,9 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask, TOKENWISE_REPLAY_IMPLEMENTATION, mix_layer_outputs
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
-from pllm.execution.tokenwise_region import compile_tokenwise_region, heuristic_default_proposal
+from pllm.execution.tokenwise_region import compile_tokenwise_region
 from pllm.contracts.region_program import TensorType
+from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
@@ -44,7 +45,11 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
             return config
 
     plain = PlainRecurrence().compile_backend(facts).execution
-    execution = RecirculationWorkload(config).compile_backend(facts).execution
+    # The measured tuning protocol below is the explicit opt-in: specialize
+    # with it so the attachment funds catalog candidates, not just the
+    # reference the default heuristic path installs.
+    execution = RecirculationWorkload(config).compile_backend(
+        RecirculationWorkload(config).specialize(facts, ExecutionOptions(tuning="measured"))).execution
     assert plain.arena.plan.semantic_graph.tasks == execution.arena.plan.semantic_graph.tasks
     # A budget that fits only the reference must still install an auto-policy
     # model; expensive windows must not make the whole attachment inadmissible.
@@ -53,7 +58,8 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
     reference_budget = (max(serial_facts.timeline.reserved_bytes)
         + sum(f.workspace_bytes + f.resident_bytes for f in serial_facts.timeline.task_resources)
         + sum(f.bytes for f in serial_facts.timeline.value_resources))
-    tight_facts = workload.specialize(facts, ExecutionOptions(memory_budget_bytes=reference_budget))
+    tight_facts = workload.specialize(facts, ExecutionOptions(memory_budget_bytes=reference_budget,
+        tuning="measured"))
     tight = workload.compile_backend(tight_facts)
     task = TokenwiseReplayTask.from_implementation(tight.execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
     assert task.policy.schedule_policy == "auto" and len(task.region.candidate_proposals) == 1
@@ -188,10 +194,16 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
     assert execution.arena.pool_addresses == () and execution.arena.active_lineages == 0
     public_trace, rng = execution.trace.snapshot(), torch.random.get_rng_state().clone()
     proposals = compile_tokenwise_region(TensorType((1, 4), "torch.float32"), 8,
-        probe.causal_domain, config.effect(3)).candidate_proposals
-    # Default heuristic selection shares imports across the catalog, so static
-    # costs tie and the source-first rule keeps the reference proposal.
-    assert len(proposals) > 1 and heuristic_default_proposal(proposals, flop_byte_ratio=10) == 0
+        probe.causal_domain, config.effect(3), RegionSelectionPolicy(tuning="measured")).candidate_proposals
+    # Catalog candidates share the source imports, so logical traffic bounds
+    # are schedule-independent: every proposal models the same logical bytes
+    # as the reference, which is why the default path installs it directly.
+    reference_logical = sorted((device.logical_read_bytes_upper_bound, device.logical_write_bytes_upper_bound)
+                               for device in proposals[0].payload.capacity.devices)
+    assert len(proposals) > 1
+    for proposal in proposals[1:]:
+        assert (sorted((device.logical_read_bytes_upper_bound, device.logical_write_bytes_upper_bound)
+                       for device in proposal.payload.capacity.devices) == reference_logical)
     tuning = TokenwiseTuning(execution, TOKENWISE_REPLAY_IMPLEMENTATION, proposals)
     samples = []
     changed = False

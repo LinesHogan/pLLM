@@ -225,7 +225,8 @@ class BackendAuthoring(ABC):
     def specialize(self, facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
         from pllm.contracts.region_selection import RegionSelectionPolicy
         facts = replace(facts, timeline=replace(facts.timeline,
-            region_policy=RegionSelectionPolicy(options.allow_numerical_transforms, options.schedule_policy)))
+            region_policy=RegionSelectionPolicy(options.allow_numerical_transforms, options.schedule_policy,
+                options.tuning)))
         if options.state_memory_bytes:
             if options.state_memory_bytes > facts.state_memory_budget_bytes:
                 raise ValueError("requested state capacity exceeds available backend memory")

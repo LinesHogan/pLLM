@@ -24,7 +24,7 @@ from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImpo
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamPlan
 from pllm.contracts.region_selection import (
-    RegionPayloadLimit, RegionSelection, RegionSelectionPolicy, RegionSelectionRequest, heuristic_candidate_cost,
+    RegionPayloadLimit, RegionSelection, RegionSelectionPolicy, RegionSelectionRequest,
 )
 from pllm.contracts.tensor_rewrite import TensorRewrite
 from pllm.execution.codec import boundary_digest
@@ -401,24 +401,6 @@ class TokenwiseRegion:
         return tuple(outputs)
 
 
-def heuristic_default_proposal(proposals: tuple[RegionScheduleProposal, ...], *, flop_byte_ratio: int) -> int:
-    """Rank funded catalog proposals by static cost, source-first on ties.
-
-    Catalog candidates share the original source imports, so rewrite flops are
-    zero and modeled logical traffic is schedule-independent: the source-first
-    tie currently keeps the reference proposal. A future candidate whose facts
-    discriminate needs an install path before the default may choose it.
-    """
-    if not proposals:
-        raise ValueError("native heuristic selection requires the reference proposal")
-    def cost(proposal: RegionScheduleProposal) -> float:
-        logical = sum(device.logical_read_bytes_upper_bound + device.logical_write_bytes_upper_bound
-                      for device in proposal.payload.capacity.devices)
-        lanes = 1 if proposal.stream_plan is None else proposal.stream_plan.lanes
-        return heuristic_candidate_cost(logical, 0, lanes, flop_byte_ratio=flop_byte_ratio)
-    return min(range(len(proposals)), key=lambda index: (cost(proposals[index]), index))
-
-
 @lru_cache(maxsize=8)
 def compile_tokenwise_source(tensor: TensorType, max_rows: int, domain: CausalModelDomain,
                              effect: TokenwiseLayerReplay, *, source_imports: tuple[RegionTensorImport, ...] = (),
@@ -442,7 +424,13 @@ def compile_tokenwise_region(tensor: TensorType, max_rows: int, domain: CausalMo
     if type(stream_lanes) is not int or not 1 <= stream_lanes <= 8:
         raise ValueError("native catalog requires a bounded original stream capability")
     region = copy(compile_tokenwise_source(tensor, max_rows, domain, effect, source_imports=source_imports, function_bodies=function_bodies))
-    if policy.schedule_policy == "auto":
+    if policy.schedule_policy == "auto" and policy.tuning == "measured":
+        # Only measured tuning funds catalog candidates. The default heuristic
+        # path provably keeps the reference: logical traffic bounds are
+        # schedule-independent (instance counts x per-call facts; no schedule
+        # input) and catalog candidates carry no rewrite flops, so static
+        # source-first ranking is a constant function. Skipping the catalog
+        # also skips its per-candidate payloads and stream plans.
         catalog = explore_region_schedules(region.program)
         serial = (RegionScheduleProposal(analyze_region_payload(region.program,
             candidate.schedule_map, region.imports, region.retained)) for candidate in catalog.candidates[1:])

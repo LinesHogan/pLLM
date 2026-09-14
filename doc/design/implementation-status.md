@@ -82,7 +82,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 | 符号依赖与 ISL 调度 | 已实现并接入区域执行 | 保留参数域、值来源、RAW/WAR/WAW、动态效果边界；支持自动重排、分块、窗口及部分 wavefront。具体机会取决于真实依赖。 |
 | 计划执行和跨 stream 完成 | 已实现 | 使用既有执行器、原 owner 和完成协议；未知共享上下文不会被自动当作可并发。运行时不调用 ISL。 |
 | 数学与实现候选 | 已实现有界搜索及源重放 | 支持相邻调用 outlining、矩阵重结合、独立 GEMM 合批和受限 Torch 编译；不是任意数学等价证明器。 |
-| 模型候选选择 | 默认启发式成本选择；实测 TokenwiseTuning 为显式 opt-in | 默认按 `logical_bytes + flops/(10*N_parallel)` 静态排名（当前候选事实上并列，选参考候选）；`ExecutionOptions(tuning="measured")` 时 worker 才逐项测量并按完成时间选择。 |
+| 模型候选选择 | 默认直接安装参考调度；实测 TokenwiseTuning 为显式 opt-in | 逻辑流量上界调度无关且目录候选无 rewrite flops，静态排名恒为常数函数，默认路径因此不探索目录、不推导非参考 payload；`ExecutionOptions(tuning="measured")` 时才构建目录并由 worker 逐项测量按完成时间选择。 |
 | 状态正确性 | 保留原 PTTS 机制 | pin、COW、版本发布、KV 恢复和资源权限仍由原所有者管理；没有新增状态 owner。 |
 | 内存依据 | 已有区域范围的上界与拒绝机制 | 覆盖模型化张量、保留对象及已声明临时空间；尚不是包含所有库工作区、allocator、模型权重和 KV 的整设备预算保证。 |
 | 成本选择 | 以访问、存储生存期和完成时间为依据 | FLOPs 是辅助事实。逻辑读写量不等于实际 HBM 流量，样本计时不证明全局最优。 |
@@ -432,26 +432,34 @@ diff 门禁通过。改动 31 个文件，+105/−210。证据见
 
 ## 默认启发式选择与冷调优 opt-in
 
-默认冷启动不再对全部候选做 worker 实测。`ExecutionOptions.tuning` 默认
-`"heuristic"`：driver 在 `tune_native_schedules` 内对编译期已缓存的候选目录
-执行静态成本排名 `cost = logical_bytes + flops / (tuning_flop_byte_ratio *
-N_parallel)`（常数 `tuning_flop_byte_ratio=10` 可配置；logical bytes 取候选
-payload capacity 的 logical 读写上界，flops 取自 rewrite 证据，N_parallel 取
-stream lanes），不发 TUNE_BEGIN/CANDIDATE/FINISH，worker 不做任何测量绑定，
-`region_selection` 保持 None。
+默认冷启动不再对全部候选做 worker 实测，也不再为默认路径推导候选目录。
+`ExecutionOptions.tuning` 默认 `"heuristic"`：attachment 直接安装参考调度，
+不探索目录、不推导非参考 payload、不构造 stream 候选、不发
+TUNE_BEGIN/CANDIDATE/FINISH，`region_selection` 保持 None。
 
-实测核实当前目录上该公式是退化的：候选共享源 imports，logical bytes 与调度
-无关（小配置 8 个候选全为 8448/7936），rewrite flops 为零——成本并列，
-source-first 规则选中参考候选，即 attachment 本已安装的默认计划。若未来事实
-（如带 rewrite 证据的候选进入默认排名）使非参考候选胜出，该分支显式 raise，
-要求先建立默认安装路径，不静默退回参考。实测调优改为显式 opt-in：
-`ExecutionOptions(tuning="measured")` 时 TUNE_* 全程、`TokenwiseTuning` 与
-`with_measured_selection` 安装路径原样保留。
+这比 T3 的静态排名更进一步，依据是一个结构事实而非实测退化：候选逻辑
+流量上界是调度无关的（输入 storage 的读取实例数 × 根字节 + 语句域实例数
+× 每调用流量事实，推导不引用调度 map），目录候选又不携带 rewrite flops
+——任何 source-first 静态排名在此事实上都是常数函数，必然选中参考候选。
+排名函数（`heuristic_candidate_cost` / `heuristic_default_proposal`）与
+`tuning_flop_byte_ratio` 常量因此退役；边界测试改为直接断言全部候选的
+logical bytes 与参考一致。tuning 模式经 `RegionSelectionPolicy.tuning`
+进入签名时间线，worker 侧重推导与 driver 一致；`tune_native_schedules`
+以签名策略为唯一来源，启发式分支直接返回。
 
-验收：CPU 全套通过；新增启发式成本单测与 catalog 排名断言（参考候选胜出）；
-Qwen smoke 改跑默认启发式路径（参考候选正确安装、14 次独立数值比较不变），
-EngineCore smoke 以 `tuning="measured"` 保留实测路径的跨进程覆盖。证据见
-[启发式选择结果](evidence/heuristic-selection-results.json)。
+实测调优为显式 opt-in：`ExecutionOptions(tuning="measured")` 时才探索目录、
+推导全部候选 payload 与 stream 计划、按候选最大值储备 workspace，TUNE_*
+全程、`TokenwiseTuning` 与 `with_measured_selection` 安装路径原样保留。
+
+效果（Qwen2.5-0.5B recirculation，2 请求 × 24 层真实 probe facts）：
+`compile_tokenwise_region` 46.6s → 2.1s（剩余为 reference provenance +
+payload），`make_llm` 冷启动 82.6s → 36.7s。
+
+验收：CPU 全套通过（含签名时间线新字段的 Rust 镜像与 worker 重推导一致）；
+Qwen smoke 默认路径参考候选正确安装、14 次独立数值比较不变；EngineCore
+smoke 以 `tuning="measured"` 保留实测路径的跨进程覆盖。证据见
+[启发式选择结果](evidence/heuristic-selection-results.json)（T3 原始设计）
+与[默认路径消除结果](evidence/t4-followup-elimination-results.json)。
 
 ## 调度目录去重的单站点收敛（T4 关账）
 
