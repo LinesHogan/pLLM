@@ -12,6 +12,9 @@ from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_selection import RegionCandidate, RegionSelection, RegionSelectionRequest, RegionTuningSize
 from pllm.contracts.semantic_graph import ImplementationId
 from pllm.contracts.tensor_rewrite import TensorRewrite
+from pllm.execution.exported_cell import ExportedCell, warn_numerical_transforms
+from pllm.execution.region_execution import RegionInstructionExecution
+from pllm.execution.region_native import CompiledPrimitive
 from pllm.execution.region_optimization import prepare_region_implementations, select_region_candidate
 from pllm.execution.codec import boundary_digest, preserve_torch_rng
 from pllm.execution.region_storage import analyze_region_payload
@@ -146,8 +149,18 @@ class TokenwiseTuning(Generic[InputT, DataT, ResultT]):
         request = self._request(tuple(replace(candidate, elapsed_ns=elapsed)
             for candidate, elapsed in zip(self._candidates, samples, strict=True)))
         selection = select_region_candidate(region.program, request)
-        selected = self.source.with_schedule(request, selection, self._rewrites[selection.selected])
-        self.execution.rebind_implementation(selected)
+        # The visited-set check above guarantees the winner was measured, so its
+        # executor is already bound: install it instead of replaying the bind.
+        bound = self._measurements[selection.selected].execution
+        if not isinstance(bound, RegionInstructionExecution):
+            raise RuntimeError("native tuning measurement is not an instruction execution")
+        changed = selection.candidates[selection.selected].changed_functions
+        transforms = tuple(t for name, cell in bound.cells.items()
+            if name in changed and isinstance(cell, (ExportedCell, CompiledPrimitive))
+            for t in cell.transformations)
+        warn_numerical_transforms(selection.signature, transforms)
+        final = region.with_measured_selection(request, selection, self._rewrites[selection.selected], bound)
+        self.execution.rebind_implementation(replace(self.source, region=final))
         self._close()
         return selection
 

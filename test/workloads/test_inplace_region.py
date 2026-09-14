@@ -61,8 +61,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise_and_compiles_only_cold(
     def cold_only(*args, **kwargs):
         raise AssertionError("compilation entered the request execution path")
     monkeypatch.setattr(ExportedCell, "capture", cold_only)
-    for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings",
-                 "validate_region_bindings", "validate_lowered_region_schedule"):
+    for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, cold_only)
     for rows, phase in ((1, HiddenPhase.PREFILL), (7, HiddenPhase.PREFILL),
                         (2, HiddenPhase.DECODE), (1, HiddenPhase.DECODE)):

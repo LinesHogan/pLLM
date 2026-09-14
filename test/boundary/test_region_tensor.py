@@ -13,7 +13,7 @@ from pllm.contracts.region_program import (
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import (
-    analyze_region_program, lower_region_bindings, lower_region_schedule, validate_region_bindings,
+    analyze_region_program, lower_region_bindings, lower_region_schedule,
 )
 from pllm.execution.region_frame import lookup
 from pllm.execution.region_reference import interpret
@@ -145,15 +145,10 @@ def test_large_binding_plan_remains_symbolic():
     assert sizes[1] < sizes[0] * 2
 
 
-def test_tampered_sources_and_lifetimes_rejected_before_execution(cell):
+def test_mismatched_bindings_and_schedule_rejected_before_execution(cell):
     program = tensor_grid(3, 3, cell)
     schedule = analyze_region_program(program).candidates[-1].schedule_map
     bindings = lower_region_bindings(program, schedule)
-    for tampered in (replace(bindings, sources=()), replace(bindings, last_uses=()),
-                     replace(bindings, retained=()), replace(bindings, results=()),
-                     replace(bindings, signature="fake")):
-        with pytest.raises(ValueError, match="original program"):
-            validate_region_bindings(program, tampered)
     serial = lower_region_schedule(program, analyze_region_program(program).reference_schedule)
     with pytest.raises(ValueError, match="same schedule"):
         RegionExecution(program, serial, bindings, {cell.digest: cell})

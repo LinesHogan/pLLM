@@ -24,12 +24,6 @@ def lower_region_streams(program: Program, schedule: str, cells: RegionImportSou
         encode_boundary(import_region_functions(program, cells)), encode_boundary(retained), pipeline_depth), RegionStreamPlan)
 
 
-def validate_region_streams(program: Program, cells: RegionImportSource, plan: RegionStreamPlan,
-                            retained: tuple[RetainedAllocation, ...] = ()) -> None:
-    _core.validate_region_streams(encode_boundary(program), encode_boundary(import_region_functions(program, cells)),
-                                 encode_boundary(retained), encode_boundary(plan))
-
-
 def explore_region_streams(program: Program, cells: RegionImportSource, *, lanes: int,
                            max_candidates: int = 4, retained: tuple[RetainedAllocation, ...] = (),
                            max_pipeline_depth: int = 1) -> RegionStreamExploration:

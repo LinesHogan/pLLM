@@ -31,10 +31,7 @@ from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionSche
 from pllm.contracts.region_selection import RegionSelection
 from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, CompletionFeedback, FinishReason, RetryAction
 
-from pllm.execution.backend_attachment import (
-    attachment_buffer_bytes,
-    validate_backend_attachment_physical,
-)
+from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.backends.vllm.activation import VllmActivationPatch
@@ -187,7 +184,6 @@ class VllmSession(Generic[DataT, ResultT]):
     def __init__(self, deployment: BackendDeployment[DataT, ResultT],
                  model: Qwen2ForCausalLM, sampler: SamplerGuidance | None, max_sampler_rows: int) -> None:
         attachment = deployment.attachment
-        validate_backend_attachment_physical(attachment.inputs, attachment.decision, attachment.physical)
         plan = attachment.inputs.plan
         self._capture_feedback = any(isinstance(port.source, SamplerFeedbackInputSource)
             for task in plan.semantic_graph.tasks for port in task.inputs)
@@ -623,8 +619,7 @@ class Runner(Generic[SamplerT]):
 
     def worker_state(self) -> BackendWorkerState:
         session = self.require_session()
-        return BackendWorkerState(session.attachment.inputs.plan.schedule_decision.signature,
-            os.getpid(), session.diagnostics())
+        return BackendWorkerState(os.getpid(), session.diagnostics())
 
     @property
     def trace(self) -> ExecutionTrace:
@@ -790,7 +785,6 @@ class BackendStage:
 
 @dataclass(frozen=True, slots=True)
 class BackendWorkerState:
-    compilation_signature: str
     process_id: int
     diagnostics: StateDiagnostics
 
@@ -928,18 +922,15 @@ class VllmLlm(Generic[DataT, ResultT]):
         return replies[0]
 
     def worker_state(self) -> BackendWorkerState:
-        state = decode_boundary(self.command(BackendCommand.DIAGNOSTICS), BackendWorkerState)
-        if state.compilation_signature != self.attachment.inputs.plan.schedule_decision.signature:
-            raise RuntimeError("worker response belongs to another compilation")
-        return state
+        return decode_boundary(self.command(BackendCommand.DIAGNOSTICS), BackendWorkerState)
 
     def trace_snapshot(self) -> TraceSnapshot:
         if self._closed:
             raise RuntimeError("vLLM workload handle is closed")
         snapshot = (self._runner.trace.snapshot() if self._runner is not None else
             decode_boundary(self.command(BackendCommand.TRACE), TraceSnapshot))
-        if snapshot.schema_version != TRACE_SCHEMA_VERSION or snapshot.schedule_signature != self.attachment.physical.schedule_signature:
-            raise RuntimeError("worker trace differs from the original compilation or schema")
+        if snapshot.schema_version != TRACE_SCHEMA_VERSION:
+            raise RuntimeError("worker trace differs from the original schema")
         return snapshot
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
@@ -1266,8 +1257,7 @@ def create_vllm_llm(
             handle = VllmLlm[DataT, ResultT](llm, None, None, attachment, facts)
             installed = decode_boundary(handle.command(BackendCommand.INSTALL,
                 encode_boundary(BackendInstall(attachment, definition or ""))), BackendWorkerState)
-            if (installed.process_id == os.getpid()
-                or installed.compilation_signature != attachment.inputs.plan.schedule_decision.signature):
+            if installed.process_id == os.getpid():
                 raise RuntimeError("EngineCore did not install the original signed compilation in its child")
         else:
             match llm.llm_engine.engine_core:

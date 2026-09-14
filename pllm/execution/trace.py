@@ -101,7 +101,6 @@ class TraceEvent:
 class TraceSnapshot:
     execution_id: str
     process_id: int
-    schedule_signature: str
     events: tuple[TraceEvent, ...]
     dropped: int
     capacity: int
@@ -323,5 +322,5 @@ class ExecutionTrace:
                     else:
                         pending += 1
                 events.append(event)
-            return TraceSnapshot(self._execution_id, os.getpid(), self.plan.schedule_signature,
+            return TraceSnapshot(self._execution_id, os.getpid(),
                 tuple(events), self._dropped, self._events.maxlen or 0, pending)

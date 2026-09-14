@@ -13,7 +13,7 @@ from pllm.execution.codec import boundary_digest, decode_boundary, encode_bounda
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import (
-    assess_region_candidates, bind_selected_region, optimize_region, select_region_candidate, validate_region_selection,
+    assess_region_candidates, bind_selected_region, optimize_region, select_region_candidate,
 )
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.tensor_rewrites import matmul_reassociation_candidates
@@ -77,20 +77,8 @@ def test_an_infeasible_reference_does_not_prevent_a_smaller_variant_from_being_s
     assert selected.candidates[0].median_ns is None
 
 
-def test_selection_revalidates_measurements_imports_policy_and_winner():
+def test_selection_requires_the_reference_as_candidate_zero():
     _, program, _, request, _ = example()
-    selected = select_region_candidate(program, request)
-    validate_region_selection(program, request, selected)
-    assert decode_boundary(encode_boundary(request), RegionSelectionRequest) == request
-    assert decode_boundary(encode_boundary(selected), RegionSelection) == selected
-    for altered in (replace(selected, selected=0), replace(selected, signature="0" * 64),
-                    replace(selected, candidates=tuple(replace(c, feasible=False) for c in selected.candidates))):
-        with pytest.raises(ValueError, match="region selection"):
-            validate_region_selection(program, request, altered)
-    for changed in (replace(request, allow_numerical_transforms=False), replace(request, measurement_context="another device"),
-                    replace(request, candidates=(replace(request.candidates[0], elapsed_ns=(1,)), request.candidates[1]))):
-        with pytest.raises(ValueError, match="region selection"):
-            validate_region_selection(program, changed, selected)
     with pytest.raises(ValueError, match="reference execution"):
         select_region_candidate(program, replace(request, candidates=request.candidates[::-1]))
     with pytest.raises(ValueError, match="execution measurements"):
@@ -128,7 +116,7 @@ def test_selected_rewrite_is_replayed_once_without_request_time_planning(monkeyp
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
     def forbidden(*args):
         raise AssertionError("selected execution must not plan or select")
-    for name in ("select_region_candidate", "validate_region_selection", "lower_region_schedule", "lower_region_bindings",
+    for name in ("select_region_candidate", "lower_region_schedule", "lower_region_bindings",
                  "analyze_region_program", "analyze_region_capacity", "analyze_region_storage"):
         monkeypatch.setattr(_core, name, forbidden)
     for _ in range(2):

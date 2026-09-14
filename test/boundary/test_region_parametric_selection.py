@@ -14,7 +14,7 @@ from pllm.execution.codec import encode_boundary
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import (
-    assess_region_candidates, optimize_region, select_region_candidate, validate_region_selection,
+    assess_region_candidates, optimize_region, select_region_candidate,
 )
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.tensor_scan import TensorScan
@@ -40,9 +40,6 @@ def test_timing_a_short_scan_still_checks_capacity_for_the_full_range():
     # The two-step example fits, but the declared retained results do not.
     with pytest.raises(ValueError, match="no region candidate"):
         select_region_candidate(scan.program, replace(request, payload_limits=(RegionPayloadLimit("cpu", 100),)))
-    selected = select_region_candidate(scan.program, request)
-    with pytest.raises(ValueError, match="region selection"):
-        validate_region_selection(scan.program, other, selected)
 
 
 def test_native_selection_rejects_missing_duplicate_unknown_and_out_of_range_tuning_sizes():
@@ -72,7 +69,7 @@ def test_optimized_scan_reuses_one_symbolic_plan_and_preserves_original_callable
     assert tuned.selection.candidates[tuned.selection.selected].capacity.devices[0].peak_tensor_bytes_upper_bound == 48
     def forbidden(*args, **kwargs):
         raise AssertionError("a new execution length must not trigger planning or tuning")
-    for name in ("select_region_candidate", "assess_region_candidates", "validate_region_selection", "analyze_region_program",
+    for name in ("select_region_candidate", "assess_region_candidates", "analyze_region_program",
                  "lower_region_schedule", "lower_region_bindings", "analyze_region_capacity", "analyze_region_storage"):
         monkeypatch.setattr(_core, name, forbidden)
     for count in (0, 1, 7, 37):

@@ -175,7 +175,12 @@ decoder 与 recirculation 构造器现在直接生成数据端口程序，不再
 | 编译契约携带 kernel 数量，生产路径解析 wrapper 并要求至少一次调用 | 代码身份和本地编译重放绑定实现；实际分配与原复制约定决定容量；调用数只作测试诊断 | 已删除生产解析及 Python/Rust 字段，保留原融合断言；零 kernel 的 view 通过 CPU/CUDA 数值、独立输出及容量检查。 |
 | 并行候选先推导 payload，完整 stream 校验又重复推导；安装再单独校验 payload | 完整 stream 校验已从源重建其嵌套 payload | AER 复用已核对的 payload；Python 并行安装删除单独 payload 校验往返，保留 phase、预算及实际绑定检查。 |
 | 每个候选调度从 analyze 重算与调度无关的存储归属（来源闭包、路由、消费者、保留集、出生映射） | provenance 按（源, 导入）推导一次并缓存，候选共享；仅生存期 envelope 按调度特化 | 已替换；24 层配置下 4 个串行候选全部在 20M 配额内完成，派生 payload 与旧表述逐字节一致。envelope 的字典序比较改在时间空间全集上进行、经 schedule 接回实际时间，中间关系从约 7000 片降至约 100 片。 |
-| 其他安装路径反复编码完整源并重新核验同一派生产物 | 区分本地编译产物和真实传输边界，确定唯一安装检查点 | 仍需继续收敛；未增加“已校验”开关跳过动态权限。 |
+| 其他安装路径反复编码完整源并重新核验同一派生产物 | 区分本地编译产物和真实传输边界，确定唯一安装检查点 | 已收敛（2026-09-14）：本地 derive 出口即权威，同进程不再重派生；过线只留 codec 解析与纯 Python 一致性。详见下方 T2 追加行。 |
+| 计划组装与绑定时的同进程重派生校验（validate_region_payload/streams/bindings/lowered_schedule 的 D1/C1/C2/C3 调用点） | 纯 Python 一致性（canonical imports、payload 相等、预算、schedule_map 一致）；`run()` 动态权限不动 | 已删除四个生产调用点及 RegionExecutionPlan.retained 死字段；校验包装移入 `test/revalidation.py` 作为调试入口。 |
+| worker 对过线 proposals/selection 重派生比对 | codec 正常解析 + 参考 proposal 与本地派生参考逐项相等 + 预算/通道一致性 | `with_catalog` 不再逐 proposal 触发 Rust 重派生；`with_schedule`/`bind_selected_region` 保留完整核验，标注为外部/调试入口。 |
+| 调优 finish 经 with_schedule/bind_selected_region 重放重 lower（含第二次编译） | `_visited` 全集检查保证胜者已测量，直接安装已绑定执行器；数值变换警告照发（取自实际绑定 cells） | TokenwiseTuning.finish 与 optimize_region 均已改为复用测量执行器；编译次数 2→1 的断言已更新。 |
+| digest/签名一致性比对层（BackendWorkerState.compilation_signature、TraceSnapshot.schedule_signature 及运行期比对） | 取消（未发布无历史遗留）；codec 解析级严格性保留 | 已删字段与三处运行期比对（worker_state 两处、trace_snapshot 一处）；PTTS 页描述符的签名门（语义物理层）与功能性 digest（候选去重、Function 命名、警告标签）保留。 |
+| VllmSession 构造时重复物理核验 | `bind_backend` 的唯一物理核验（authoring.py:309），两条构造路径必经 | 已删除重复调用。 |
 | 共享目录先完整生成窗口/分块结果，再交错截取；各组重复取得源分析 | 同一份源分析与按需候选迭代 | 已删除共享目录中的两个提前生成结果列表；实际候选仍逐项完成合法性和完整域等价检查。 |
 | 函数体先追加外层声明检查一遍，再按原 imports 检查一遍；每次内联继续重查 | 原源 verifier 同时核对外层签名，内部内联只重命名变量 | 已删除重复 body 遍历与 native 的整 Program 复制；公开入口、原 imports 作用域和组合后检查保留。 |
 | Python 与 Rust 分别维护 SSA、操作/区域签名、参数和资源语义规则 | Python 入口与 native 规划共用原 Rust verifier | Python verify 从 209 行缩为 18 行；通用 codec 只有一份，表示类型和动态权限仍在各自边界检查。 |

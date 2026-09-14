@@ -1,0 +1,69 @@
+{
+  "date": "2026-09-14",
+  "scope": "T2 install-path convergence: same-process re-derivation removal, worker over-wire re-derivation removal, digest/signature comparison layer removal, finish-reuse installation",
+  "changes": {
+    "deleted_production_call_sites": [
+      "RegionExecutionPlan.__post_init__: validate_region_payload / validate_region_streams (D1)",
+      "RegionInstructionExecution.__init__: validate_region_bindings (C1), validate_region_streams (C2)",
+      "RegionScheduleExecution.__init__: validate_lowered_region_schedule (C3)",
+      "VllmSession.__init__: duplicate validate_backend_attachment_physical (bind_backend:309 is the single physical check)"
+    ],
+    "deleted_fields": [
+      "RegionExecutionPlan.retained (dead after D1 removal)",
+      "RegionInstructionExecution.retained parameter",
+      "BackendWorkerState.compilation_signature (wire)",
+      "TraceSnapshot.schedule_signature (wire)"
+    ],
+    "deleted_runtime_comparisons": [
+      "runtime.py worker_state compilation_signature gate",
+      "runtime.py install compilation_signature gate (process-id topology check retained)",
+      "runtime.py trace_snapshot schedule_signature gate (schema_version check retained)"
+    ],
+    "finish_reuse": [
+      "TokenwiseTuning.finish installs the measured executor via TokenwiseRegion.with_measured_selection (visited-set check guarantees the winner was measured); numerical warning still emitted from actually bound cells",
+      "optimize_region installs executors[selection.selected] instead of replaying bind_selected_region; candidate compilation count 2 -> 1"
+    ],
+    "worker_over_wire": [
+      "with_catalog: codec parse + reference proposal equality with locally derived reference + budget/lane consistency; no per-proposal Rust re-derivation"
+    ],
+    "moved_to_test_revalidation": [
+      "validate_backend_attachment",
+      "validate_backend_attachment_reconstruction",
+      "validate_region_payload",
+      "validate_region_streams",
+      "validate_region_bindings",
+      "validate_lowered_region_schedule"
+    ],
+    "retained_debug_entries": [
+      "TokenwiseRegion.with_schedule (full verification, external entry)",
+      "bind_selected_region / bind_selected_schedule (validate_region_selection kept)",
+      "PTTS page-descriptor signature gate (semantic/physical layer)",
+      "functional digests: candidate dedup, Function naming, warning labels, benchmark tooling"
+    ],
+    "retained_pure_python_consistency": [
+      "canonical imports check, stream/proposal payload equality, budget checks, schedule_map consistency, cell-declaration matching, run() dynamic permissions"
+    ]
+  },
+  "tests_deleted_or_narrowed": [
+    "test_region_control.py: test_control_modification_rejected_by_native_reconstruction (deleted)",
+    "test_schedule_instructions.py: test_modified_instructions_are_rejected_before_opening_a_cursor (deleted)",
+    "test_region_selection.py: test_selection_revalidates... replaced by test_selection_requires_the_reference_as_candidate_zero",
+    "test_region_tensor.py: tamper loop removed; same-schedule consistency kept as test_mismatched_bindings_and_schedule_rejected",
+    "test_model_effect_schedule.py / test_import_only_planning.py / test_region_parametric_selection.py: same-process validate calls removed",
+    "test_region_streams.py: validate_region_streams tamper loops removed from two tests; forbidden lists narrowed",
+    "test_region_windows.py / test_region_model_proposals.py: forged-evidence worker rejection assertions removed",
+    "test_region_replay.py / test_region_sizes.py / test_inplace_region.py / test_region_stream_selection.py: monkeypatch forbidden lists narrowed",
+    "test_tensor_compilation.py: compile count assertion 2 -> 1 (finish no longer replays compilation)",
+    "test_host_transaction.py: snapshot schedule_signature assertion removed"
+  ],
+  "acceptance": {
+    "cargo_test": "21 passed (no functional Rust change, backstop)",
+    "pytest_full": "614 passed, 2 failed (test_inplace_region dtype1-cuda numerical, pre-existing: also fails on pre-T1 baseline eb75810)",
+    "typing": "0 errors",
+    "import_layers": "OK",
+    "region_authority": "OK",
+    "git_diff_check": "OK",
+    "diff_size": "31 files, +105/-210 (plus test/revalidation.py added)"
+  },
+  "notes": "vllm_recirculation_smoke and enginecore_smoke were run additionally (plan allows skipping): the tuning finish path and the MP wire format changed."
+}

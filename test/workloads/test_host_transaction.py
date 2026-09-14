@@ -105,7 +105,6 @@ def test_typed_host_transaction_abort_requeue_and_postpublish_settlement(monkeyp
     before = execution.trace.snapshot()
     assert before.schema_version == 5 and before.dropped == 0
     assert before.pending_device_timings == 0 and not before.device_task_times()
-    assert before.schedule_signature == execution.plan.schedule_signature
     assert any(event.phase is TracePhase.ABORT for event in before.events)
     assert sum(event.phase is TracePhase.SETTLED for event in before.events) == 2
     assert all(elapsed == calls * 10 for calls, elapsed in before.host_task_times().values())

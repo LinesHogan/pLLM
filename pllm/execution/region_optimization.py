@@ -22,7 +22,6 @@ from pllm import _core
 from pllm.contracts.region_program import BorrowedResource, Call, If, Map, Program, Region, Scan, TensorType, While, bind_sizes
 from pllm.contracts.region_outlining import CallOutlineEvidence, call_outline_sites
 from pllm.contracts.region_imports import BorrowedTensorImport, CompiledTensorImport, ExportedTensorImport, FunctionalKernelImport, NativeKernelImport, RegionTensorImport
-from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_streams import RegionStreamPlan
 from pllm.contracts.tensor_access import TensorAccessGraph
 from pllm.contracts.region_selection import (
@@ -89,10 +88,10 @@ def _replay(sources: Mapping[str, TensorSource], records: tuple[TensorRewrite, .
 
 
 def _executor(program: Program, candidate: RegionCandidate, cells: Mapping[str, RegionFunction],
-              payload_limits: tuple[RegionPayloadLimit, ...], retained: tuple[RetainedAllocation, ...] = ()) -> RegionInstructionExecution:
+              payload_limits: tuple[RegionPayloadLimit, ...]) -> RegionInstructionExecution:
     return RegionInstructionExecution(program, lower_region_schedule(program, candidate.schedule_map),
         lower_region_bindings(program, candidate.schedule_map), cells, stream_plan=candidate.stream_plan,
-        payload_limits=payload_limits, retained=retained)
+        payload_limits=payload_limits)
 
 
 def _replay_outlines(program: Program, sources: Mapping[str, TensorSource], records: tuple[CallOutlineEvidence, ...]
@@ -169,7 +168,7 @@ def bind_selected_schedule(program: Program, cells: Mapping[str, RegionFunction]
     if options.schedule_policy == "serial" and (candidate.stream_plan is not None or
         selection.candidates[selection.selected].capacity.schedule_map != selection.candidates[0].capacity.schedule_map):
         raise ValueError("region selection differs from the local serial schedule policy")
-    return SelectedRegion(request, selection, (), _executor(program, candidate, cells, request.payload_limits, request.retention_imports))
+    return SelectedRegion(request, selection, (), _executor(program, candidate, cells, request.payload_limits))
 
 
 def _check_tensor_sources(program: Program, sources: Mapping[str, TensorSource]) -> None:
@@ -220,7 +219,7 @@ def bind_region_candidate(program: Program, sources: Mapping[str, TensorSource],
     if not assessment.feasible:
         raise ValueError("region trial exceeds its payload or numerical policy")
     derived, cells = _candidate_sources(program, sources, request, index, assessment, records, options, compiler)
-    return _executor(derived, request.candidates[index], cells, request.payload_limits, request.retention_imports)
+    return _executor(derived, request.candidates[index], cells, request.payload_limits)
 
 
 def bind_selected_region(program: Program, sources: Mapping[str, TensorSource], request: RegionSelectionRequest,
@@ -229,15 +228,17 @@ def bind_selected_region(program: Program, sources: Mapping[str, TensorSource], 
                          compiler: TensorCompiler = DEFAULT_TENSOR_COMPILER) -> SelectedRegion:
     """Rebuild selected tensor changes while retaining original effectful calls.
 
-    Only exported tensor graphs may be rewritten or compiled; native effects
-    and accessors keep their original implementations. Binding never evaluates
-    a source. The caller provides the original invocation's resources at run.
+    External/debug entry with full re-verification; production finish paths
+    reuse the measured executor instead. Only exported tensor graphs may be
+    rewritten or compiled; native effects and accessors keep their original
+    implementations. Binding never evaluates a source. The caller provides
+    the original invocation's resources at run.
     """
     validate_region_selection(program, request, selection)
     candidate = request.candidates[selection.selected]
     derived, cells = _candidate_sources(program, sources, request, selection.selected,
         selection.candidates[selection.selected], records, options, compiler)
-    execution = _executor(derived, candidate, cells, request.payload_limits, request.retention_imports)
+    execution = _executor(derived, candidate, cells, request.payload_limits)
     changed = selection.candidates[selection.selected].changed_functions
     transforms = tuple(t for name, cell in cells.items() if name in changed and isinstance(cell, (ExportedCell, CompiledPrimitive))
                        for t in cell.transformations)
@@ -506,4 +507,12 @@ def optimize_region(program: Program, sources: Mapping[str, TensorSource], input
     request = replace(request, candidates=tuple(replace(c, elapsed_ns=tuple(samples.get(i, ())))
                                                 for i, c in enumerate(candidates)))
     selection = select_region_candidate(program, request)
-    return bind_selected_region(program, sources, request, selection, proposals[selection.selected].rewrites, options=options, compiler=compiler)
+    # The winner was measured, so its executor is already built from the
+    # replayed sources: install it instead of replaying the selection bind.
+    proposal = proposals[selection.selected]
+    execution = executors[selection.selected]
+    changed = selection.candidates[selection.selected].changed_functions
+    transforms = tuple(t for name, cell in proposal.cells.items()
+        if name in changed and isinstance(cell, (ExportedCell, CompiledPrimitive)) for t in cell.transformations)
+    warn_numerical_transforms(selection.signature, transforms)
+    return SelectedRegion(request, selection, proposal.rewrites, execution)

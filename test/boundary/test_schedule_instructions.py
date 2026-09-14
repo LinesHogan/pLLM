@@ -6,7 +6,7 @@ from itertools import islice
 import pytest
 
 from pllm.contracts.region_program import BankType, Call, Function, Map, Program, ScalarType, Value
-from pllm.contracts.schedule_instructions import LoweredSchedule, ScheduleLoop, ScheduleSequence
+from pllm.contracts.schedule_instructions import LoweredSchedule, ScheduleLoop
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_compilation import analyze_region_program, lower_region_schedule, preview_region_schedule
 from pllm.execution.region_schedule import RegionScheduleExecution
@@ -55,18 +55,3 @@ def test_large_lowering_and_cursor_are_lazy_and_repeatable():
     first = tuple(islice(execution.invocations(), 6))
     assert [x.coordinates for x in first] == [(0, 0), (0, 1), (1, 0), (0, 2), (1, 1), (2, 0)]
     assert tuple(islice(execution.invocations(), 6)) == first
-
-
-def test_modified_instructions_are_rejected_before_opening_a_cursor():
-    program = grid_program(3, 3)
-    analysis = analyze_region_program(program)
-    lowered = lower_region_schedule(program, analysis.candidates[-1].schedule_map)
-    for changed in (
-        replace(lowered, body=ScheduleSequence(())),
-        replace(lowered, statements=()),
-        replace(lowered, program_digest="a" * 64),
-        replace(lowered, signature="b" * 64),
-        replace(lowered, version=lowered.version + 1),
-    ):
-        with pytest.raises(ValueError, match="original program"):
-            RegionScheduleExecution(program, changed)

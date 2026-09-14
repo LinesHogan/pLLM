@@ -119,8 +119,7 @@ def test_one_native_schedule_handles_all_prefix_lengths_without_recompiling(monk
         lower_region_bindings(program, c.schedule_map), {}) for c in analysis.candidates)
     def forbidden(*args):
         raise AssertionError("bound execution must not compile or revalidate")
-    for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings",
-                 "validate_region_bindings", "validate_lowered_region_schedule"):
+    for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, forbidden)
     for count in (8, 0, 3, 1, 8):
         inputs = {"seed": 11, "xs": Bank(tuple(range(1, count + 1)))}

@@ -14,7 +14,7 @@ from pllm.execution.region_compilation import analyze_region_program, lower_regi
 from pllm.execution.region_execution import RegionExecution, RegionStreamExecution
 from pllm.execution.region_frame import lookup
 from pllm.execution.region_schedule import RegionScheduleExecution
-from pllm.execution.region_streams import RegionStreamBindings, RegionStreamFrame, explore_region_streams, lower_region_streams, validate_region_streams
+from pllm.execution.region_streams import RegionStreamBindings, RegionStreamFrame, explore_region_streams, lower_region_streams
 from test.boundary.test_region_tensor import inputs_for, tensor_grid
 
 
@@ -32,11 +32,10 @@ def limits(plan):
     return tuple(RegionPayloadLimit(d.device, d.peak_bytes_upper_bound) for d in plan.devices)
 
 
-def test_phase_legality_capacity_and_transport_are_rederived_from_source():
+def test_phase_legality_capacity_and_transport():
     program, cell, source, plan = grid()
     cells = {cell.digest: cell}
     assert decode_boundary(encode_boundary(plan), RegionStreamPlan) == plan
-    validate_region_streams(program, cells, plan)
     phase_capacity = plan.payload.capacity.devices[0]
     assert phase_capacity.call_scratch_bytes_upper_bound > 0
     assert plan.devices[0].concurrent_scratch_bytes_upper_bound == 2 * phase_capacity.call_scratch_bytes_upper_bound
@@ -56,13 +55,6 @@ def test_phase_legality_capacity_and_transport_are_rederived_from_source():
         lower_region_streams(program, source.reference_schedule, cells, axis=1, lanes=2)
     with pytest.raises(ValueError, match="budget"):
         RegionStreamExecution(program, cells, plan, payload_limits=(RegionPayloadLimit("cpu", 1),))
-    for tampered in (
-        replace(plan, phase_schedule=plan.schedule_map),
-        replace(plan, placements=()),
-        replace(plan, devices=(replace(plan.devices[0], peak_bytes_upper_bound=0),)),
-    ):
-        with pytest.raises(ValueError, match="stream plan differs"):
-            validate_region_streams(program, cells, tampered)
 
 
 def test_pipeline_frontiers_cover_each_grid_predecessor_and_fund_pending_values():
@@ -91,10 +83,6 @@ def test_pipeline_frontiers_cover_each_grid_predecessor_and_fund_pending_values(
             assert actual == expected
     with pytest.raises(ValueError, match="budget"):
         RegionStreamExecution(program, cells, plan, payload_limits=limits(base))
-    for bad in (replace(plan, waits=()), replace(plan, pipeline_depth=1),
-                replace(plan, host_fences=(0,)), replace(plan, devices=base.devices)):
-        with pytest.raises(ValueError, match="stream plan differs"):
-            validate_region_streams(program, cells, bad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -120,7 +108,7 @@ def test_wavefront_uses_borrowed_streams_drains_completion_and_keeps_exact_versi
     execution = RegionStreamExecution(program, {cell.digest: replace(cell, function=observed)}, plan, payload_limits=limits(plan))
     def forbidden(*args):
         raise AssertionError("runtime cannot plan, prove or allocate streams")
-    for name in ("lower_region_streams", "validate_region_streams", "lower_region_schedule", "lower_region_bindings"):
+    for name in ("lower_region_streams", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, forbidden)
     # Reject invalid lane bindings before touching any mathematical input.
     with pytest.raises(ValueError, match="distinct streams"):

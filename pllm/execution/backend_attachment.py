@@ -122,13 +122,6 @@ def compile_backend_attachment(
     return decode_boundary(_core.compile_backend_attachment(encode_boundary(inputs)), BackendAttachmentDecision)
 
 
-def validate_backend_attachment(
-    inputs: BackendAttachmentCompilerInputs,
-    decision: BackendAttachmentDecision,
-) -> None:
-    _core.validate_backend_attachment(encode_boundary(inputs), encode_boundary(decision))
-
-
 def lower_backend_attachment(
     inputs: BackendAttachmentCompilerInputs,
     decision: BackendAttachmentDecision,
@@ -145,22 +138,6 @@ def validate_backend_attachment_physical(
         encode_boundary(inputs),
         encode_boundary(decision),
         encode_boundary(physical),
-    )
-
-
-def validate_backend_attachment_reconstruction(
-    inputs: BackendAttachmentCompilerInputs,
-    decision: BackendAttachmentDecision,
-    physical: BackendAttachmentPhysicalPlan,
-    local_inputs: BackendAttachmentCompilerInputs,
-    local_physical: BackendAttachmentPhysicalPlan,
-) -> None:
-    _core.validate_backend_attachment_reconstruction(
-        encode_boundary(inputs),
-        encode_boundary(decision),
-        encode_boundary(physical),
-        encode_boundary(local_inputs),
-        encode_boundary(local_physical),
     )
 
 
@@ -214,7 +191,5 @@ __all__ = [
     "bind_backend_attachment",
     "compile_backend_attachment",
     "lower_backend_attachment",
-    "validate_backend_attachment",
     "validate_backend_attachment_physical",
-    "validate_backend_attachment_reconstruction",
 ]

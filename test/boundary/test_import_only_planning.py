@@ -19,8 +19,8 @@ from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.exported_resources import borrow_exported_inputs
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_execution import RegionExecutionPlan
-from pllm.execution.region_storage import analyze_region_payload, import_region_functions, validate_region_payload
-from pllm.execution.region_streams import explore_region_streams, validate_region_streams
+from pllm.execution.region_storage import analyze_region_payload, import_region_functions
+from pllm.execution.region_streams import explore_region_streams
 
 
 def test_import_only_planner_roundtrip_matches_local_graphs_without_initializing_cuda():
@@ -71,9 +71,6 @@ print(encode_boundary((payload, streams)))
         capture_output=True, text=True, check=True, timeout=45)
     payload, streams = decode_boundary(completed.stdout, tuple[RegionPayload, RegionStreamExploration])
     assert payload == expected and streams == expected_streams
-    # Local reconstruction checks the incoming plan against actual graphs.
-    validate_region_payload(program, functions, (), payload)
-    validate_region_streams(program, functions, streams.candidates[0])
     parallel = RegionScheduleProposal(streams.candidates[0].payload, streams.candidates[0])
     plan = RegionExecutionPlan(program, imports, parallel, parallel.peak_bytes)
     execution = plan.bind(functions)

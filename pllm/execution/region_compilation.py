@@ -65,14 +65,6 @@ def lower_region_schedule(program: Program, schedule_map: str) -> LoweredSchedul
     return decode_boundary(_core.lower_region_schedule(encode_boundary(program), schedule_map), LoweredSchedule)
 
 
-def validate_lowered_region_schedule(program: Program, lowered: LoweredSchedule) -> None:
-    _core.validate_lowered_region_schedule(encode_boundary(program), encode_boundary(lowered))
-
-
 def lower_region_bindings(program: Program, schedule_map: str) -> RegionBindings:
     """Compile exact source routing and last uses without enumerating instances."""
     return decode_boundary(_core.lower_region_bindings(encode_boundary(program), schedule_map), RegionBindings)
-
-
-def validate_region_bindings(program: Program, bindings: RegionBindings) -> None:
-    _core.validate_region_bindings(encode_boundary(program), encode_boundary(bindings))

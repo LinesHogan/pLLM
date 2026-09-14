@@ -133,9 +133,6 @@ print(encode_boundary(planned))
         source.with_catalog(proposals, budget)
     with pytest.raises(ValueError, match="payload reservation"):
         source.with_catalog(proposals, parallel.peak_bytes[0].bytes - 1, stream_lanes=2)
-    forged = replace(parallel.stream_plan, signature="0" * 64)
-    with pytest.raises(ValueError, match="stream plan differs"):
-        source.with_catalog((proposals[0], replace(parallel, stream_plan=forged)), budget, stream_lanes=2)
 
     # Only model loading is omitted. Dispatch, session checks, codec, local
     # validation, measurement binding and final AER installation are production.

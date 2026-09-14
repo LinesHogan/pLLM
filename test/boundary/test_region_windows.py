@@ -52,9 +52,6 @@ def test_bounded_model_window_is_eligible_when_faster_unbounded_candidate_exceed
     assert rebuilt.candidate_proposals == proposals and region.candidate_proposals == (RegionScheduleProposal(region.payload),)
     with pytest.raises(ValueError, match="payload reservation"):
         region.with_catalog(proposals, limit - 1)
-    forged = replace(payload, devices=(replace(payload.devices[0], peak_bytes_upper_bound=0),))
-    with pytest.raises(ValueError, match="region payload differs"):
-        region.with_catalog((RegionScheduleProposal(region.payload), RegionScheduleProposal(forged)), limit)
     # Fixed scores isolate the hard capacity constraint. This is not a timing
     # claim: production must supply completed measurements from its backend.
     request = RegionSelectionRequest(imports, (

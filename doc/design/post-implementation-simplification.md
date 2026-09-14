@@ -445,7 +445,7 @@ COW。计算块内部的 buffer 规划继续交给计算后端，pLLM 不另建�
 | 调度合法性 | 用原依赖关系复核覆盖、执行次数和依赖方向 |
 | 数学变换 | 规则前提、图变换和数值策略由对应 pass 维护 |
 | 物理执行 | 参数绑定、完成、存储复用和释放由执行层检查 |
-| 进程间产物 | 保留 schema、版本、完整性、身份和能力边界检查 |
+| 进程间产物 | codec 正常解析（schema、版本、封闭变体）与能力边界；不做重派生或签名一致性比对 |
 
 优先复用现有 Rust/ISL 实现，不为了减少重复就切换语言。Python 保留 PyTorch
 图操作；Rust 消费调度需要的紧凑事实。审查每个跨语言字段是否真的被使用，
@@ -460,11 +460,14 @@ ISL 的纯 imath 是重要成本，已改用同一上游版本的 `imath-32` 快
 摘要可以绑定身份与缓存，不能替代合法性检查。删除重复 verifier 前，必须指出
 原检查由哪里覆盖，以及原有错误用例如何继续被拒绝。
 
-当前已收掉一处重复：串行候选统一由 `region_payload::derive` 组合容量与保留关系；
-并行候选的 `region_streams::validate` 已重建完整计划，AER 在其通过后复用嵌套
-payload，并检查候选采用相同的 phase schedule。Python 安装同样只选择串行 payload
-校验或完整 stream 校验，不再对并行计划另做一次相同 payload 的跨语言往返。
-实际函数绑定与每次调用的原 owner 权限仍分别检查，尚未完成全部验证职责收敛。
+验证职责收敛已完成（2026-09-14）：校验按三层划界——语义与物理层（guard 重查、
+`run()` 动态权限、PTTS、owner）永远在线；传输卫生只保留 codec 正常解析；
+digest/签名一致性比对层整体取消。计划组装与绑定不再重派生（D1/C1/C2/C3 调用点
+已删），worker 对过线 proposals 只做 codec 解析与纯 Python 一致性；调优 finish
+直接安装已测量的执行器，不再重放绑定。完整重派生能力保留为外部/调试入口
+（`with_schedule`、`bind_selected_region`、`test/revalidation.py`）。串行候选仍
+由 `region_payload::derive` 组合容量与保留关系；并行候选的 AER 复用已核对的
+嵌套 payload。实际函数绑定与每次调用的原 owner 权限仍分别检查。
 
 函数体的外层声明现在作为同一次源校验的签名约束，而不再先追加进 imports、
 检查整个 body，然后再用原 imports 重查 body。进一步已删除 Python 的 SSA、

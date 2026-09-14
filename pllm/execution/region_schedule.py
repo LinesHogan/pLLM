@@ -14,7 +14,6 @@ from pllm.contracts.schedule_instructions import (
     ScheduleInvoke, ScheduleIterator, ScheduleLoop, ScheduleOperator, ScheduleSequence,
     StatementInvocation,
 )
-from pllm.execution.region_compilation import validate_lowered_region_schedule
 
 
 def checked_schedule_integer(value: int | bool) -> int:
@@ -112,7 +111,6 @@ class RegionScheduleExecution:
     """Bind the source-checked instructions once, then open independent cursors."""
 
     def __init__(self, program: Program, lowered: LoweredSchedule) -> None:
-        validate_lowered_region_schedule(program, lowered)
         self._lowered = lowered
         self._program = program
 

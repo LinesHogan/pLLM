@@ -129,7 +129,7 @@ def test_automatic_selection_replays_compiler_and_run_does_not_compile(device, m
             payload_limits=(RegionPayloadLimit(device, 10000),), options=options, warmup_rounds=0, measurement_rounds=1,
             compiler=RecordingCompiler())
     assert selected.selection.selected == 1 and not selected.rewrites
-    assert "supports" in calls and calls.count("compile") == 2  # Candidate and selected replay.
+    assert "supports" in calls and calls.count("compile") == 1  # Candidate only; finish installs the measured executor.
     calls.clear()
     assert selected.selection.candidates[1].changed_functions == (source.digest,)
     def forbidden(*args, **kwargs):

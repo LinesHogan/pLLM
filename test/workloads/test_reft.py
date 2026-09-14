@@ -8,7 +8,8 @@ import pytest
 import torch
 
 from pllm.execution.activation import low_rank_affine_delta
-from pllm.execution.backend_attachment import compile_backend_attachment, validate_backend_attachment
+from pllm.execution.backend_attachment import compile_backend_attachment
+from test.revalidation import validate_backend_attachment
 from pllm.authoring import BackendCompileFacts, StateTensorUpdate, TensorStepInput
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.execution.shared_tensor import SharedTensor

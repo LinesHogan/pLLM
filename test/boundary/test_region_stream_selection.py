@@ -56,8 +56,6 @@ def test_aer_checks_concurrent_peak_before_ranking_and_rejects_changed_physical_
     ):
         forged = replace(plan, payload=payload)
         with pytest.raises(ValueError, match="stream plan differs"):
-            RegionExecutionPlan(program, imports, RegionScheduleProposal(payload, forged), limits(plan))
-        with pytest.raises(ValueError, match="stream plan differs"):
             select_region_candidate(program, replace(request, candidates=(reference, replace(parallel, stream_plan=forged))))
     with pytest.raises(ValueError, match="same payload"):
         RegionExecutionPlan(program, imports, RegionScheduleProposal(replace(plan.payload, devices=()), plan), limits(plan))
@@ -105,7 +103,7 @@ def test_tuner_measures_parallel_candidates_and_rebinds_without_runtime_search(m
         select_region_candidate(program, serial_request), (), options=options)
     def forbidden(*args):
         raise AssertionError("selected execution must not search or recompile")
-    for name in ("explore_region_streams", "validate_region_streams", "select_region_candidate", "lower_region_schedule"):
+    for name in ("explore_region_streams", "select_region_candidate", "lower_region_schedule"):
         monkeypatch.setattr(_core, name, forbidden)
     with pytest.raises(ValueError, match="must be supplied together"):
         selected.run(inputs)

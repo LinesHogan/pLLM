@@ -11,7 +11,8 @@ from torch.nn import functional as F
 from pllm.authoring import BackendCompileFacts, CausalTrainBatch, ParameterTargetShape
 from pllm.contracts.auxiliary import validate_auxiliary
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.backend_attachment import compile_backend_attachment, validate_backend_attachment
+from pllm.execution.backend_attachment import compile_backend_attachment
+from test.revalidation import validate_backend_attachment
 from pllm.kernels.adamw import AdamWConfig
 from pllm.execution.ptts.page_bundle import PageBundleArena, PageWrite
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts

@@ -399,6 +399,37 @@ GPU/动态 Scan/worker 集合 **29 项通过**，原 recirculation 回归 **1 �
 零 fallback。typing、import layers、region authority、diff 门禁通过。执行
 对照见 [坐标与 tap 迁移对照](evidence/coordinate-tap-comparison.json)。
 
+## 安装路径收敛（校验三层化落地）
+
+校验按三层重新划界：语义与物理层（Torch guard 重查、`run()` 动态权限、PTTS、
+owner 权限）永远在线；传输卫生层只保留 codec 正常解析；digest/签名一致性
+比对层整体取消（项目未发布，无历史格式负担）。
+
+同进程重派生校验的四个生产调用点已删除：计划组装的
+`validate_region_payload`/`validate_region_streams`（D1）、绑定的
+`validate_region_bindings`（C1）与 stream 计划校验（C2）、游标打开的
+`validate_lowered_region_schedule`（C3）。组装与绑定保留纯 Python 一致性
+（canonical imports、payload 相等、预算、schedule_map 一致、cell 与声明逐项
+匹配），`RegionExecutionPlan.retained` 等随之失效的字段一并删除。worker 对过线
+proposals 不再逐份触发 Rust 重派生：`with_catalog` 的检查是 codec 解析、参考
+proposal 与本地派生参考逐项相等、预算与通道一致性。完整重派生能力保留为
+外部/调试入口：`with_schedule`、`bind_selected_region`、`bind_selected_schedule`
+及移入 `test/revalidation.py` 的六个校验包装。
+
+调优 finish 不再重放绑定：`TokenwiseTuning.finish` 与 `optimize_region` 直接
+安装已测量的执行器（`_visited` 全集检查保证胜者已测量），数值变换警告照发且
+取自实际绑定的 cells；候选编译从两次降为一次。VllmSession 构造时的重复物理
+核验已删除（`bind_backend` 的唯一核验两条构造路径必经）。digest/签名比对层
+删除了 `BackendWorkerState.compilation_signature`、`TraceSnapshot.schedule_signature`
+两个过线字段及三处运行期比对；PTTS 页描述符的签名门（语义物理层）、候选去重、
+Function 命名与警告标签中的功能性 digest 保留。
+
+验收：Rust **21 项通过**（无功能改动，作兜底）；完整 pytest **614 项通过**，
+仅剩 `test_inplace_region` 两个 CUDA 数值失败——该失败在 T1 前基线（eb75810）
+上同样出现，是存量问题，与本收敛无关。typing、import layers、region authority、
+diff 门禁通过。改动 31 个文件，+105/−210。证据见
+[安装路径收敛结果](evidence/install-convergence-results.json)。
+
 ## 最近完整收口的验收基线
 
 Python/pytest 环境统一为 `/workspace/pllm/.venv/bin/python`。CPU 集合在独立进程中

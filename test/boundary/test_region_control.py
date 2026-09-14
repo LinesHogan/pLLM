@@ -7,7 +7,7 @@ import weakref
 import pytest
 import torch
 
-from pllm.contracts.control_instructions import ControlIf, ControlWhile
+from pllm.contracts.control_instructions import ControlWhile
 from pllm.contracts.region_program import (
     BankType, Call, Constant, If, Map, Program, Scalar, ScalarKind,
     ScalarType, Scan, Select, SizeParameter, Value, While,
@@ -207,20 +207,6 @@ def test_dynamic_loop_does_not_retain_previous_iteration_tensors(cell):
     assert result.values[0] == 200
     assert max(peaks) <= 4
     assert sum(ref() is not None for ref in refs) == 1
-
-
-def test_control_modification_rejected_by_native_reconstruction(cell):
-    program = while_program(cell, 3)
-    schedule = analyze_region_program(program).reference_schedule
-    lowered = lower_region_schedule(program, schedule)
-    bindings = lower_region_bindings(program, schedule)
-    action, = lowered.actions
-    step = action.body.steps[0]
-    invalid_body = replace(action.body, steps=(replace(step, releases=()), *action.body.steps[1:]))
-    for changed in (replace(action, limit=4), replace(action, body=invalid_body),
-                    ControlIf(action.body, action.condition)):
-        with pytest.raises(ValueError, match="original program"):
-            RegionExecution(program, replace(lowered, actions=(changed,)), bindings, {cell.digest: cell})
 
 
 def dynamic_page_program(cell, limit):

@@ -25,12 +25,6 @@ def analyze_region_payload(program: Program, schedule_map: str, cells: RegionImp
         encode_boundary(import_region_functions(program, cells)), encode_boundary(retained)), RegionPayload)
 
 
-def validate_region_payload(program: Program, cells: RegionImportSource, retained: tuple[RetainedAllocation, ...],
-                            payload: RegionPayload) -> None:
-    _core.validate_region_payload(encode_boundary(program), encode_boundary(import_region_functions(program, cells)),
-        encode_boundary(retained), encode_boundary(payload))
-
-
 def import_region_functions(program: Program, cells: RegionImportSource, *,
                             catalog: tuple[RegionTensorImport, ...] = ()) -> tuple[RegionTensorImport, ...]:
     """Normalize local implementations or closed, transportable descriptions.

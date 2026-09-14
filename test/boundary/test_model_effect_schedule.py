@@ -11,7 +11,7 @@ from pllm.contracts.region_retention import RetainedAllocation, RetentionEndpoin
 from pllm.execution.host_borrow import TraceResourceView, validate_host_views
 from pllm.execution.region_compilation import analyze_region_program, analyze_region_retention, lower_region_schedule
 from pllm.execution.region_schedule import RegionScheduleExecution
-from pllm.execution.region_storage import analyze_region_payload, validate_region_payload
+from pllm.execution.region_storage import analyze_region_payload
 from pllm.execution.replay import Recurrence
 from pllm.execution.tokenwise_region import TokenwiseRegion
 from test.boundary.test_region_pages import owner_fixture
@@ -53,9 +53,6 @@ def test_model_candidates_preserve_trace_but_require_more_recovery_capacity():
     assert device.retained_bytes_upper_bound > 1
     assert device.peak_bytes_upper_bound == device.tensor_bytes_upper_bound + device.retained_bytes_upper_bound
     assert region.normal.first.name in payload.capacity.unknown_functions
-    with pytest.raises(ValueError, match="region payload"):
-        validate_region_payload(region.program, region.functions, imports,
-            replace(payload, devices=(replace(device, peak_bytes_upper_bound=0),)))
 
 
 def test_two_host_names_cannot_hide_the_same_original_trace():

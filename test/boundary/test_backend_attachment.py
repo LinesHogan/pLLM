@@ -14,12 +14,12 @@ from pllm import _core, Parameter
 from pllm.execution.backend_attachment import (
     compile_backend_attachment,
     lower_backend_attachment,
-    validate_backend_attachment, validate_backend_attachment_physical,
-    validate_backend_attachment_reconstruction,
+    validate_backend_attachment_physical,
 )
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
+from test.revalidation import validate_backend_attachment, validate_backend_attachment_reconstruction
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.execution.scheduler import intern_tensor_layouts
 from pllm.workloads.esamp_request import ESampRequestWorkload

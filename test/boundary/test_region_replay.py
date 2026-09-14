@@ -27,8 +27,7 @@ def test_replay_control_matches_original_loop_without_hot_compilation(monkeypatc
     compiled = ConditionalReplayRegion(TensorType((1, 2), "torch.float32", str(device)), effect)
     def cold_only(*args, **kwargs):
         raise AssertionError("replay compiled inside a model invocation")
-    for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings",
-                 "validate_region_bindings", "validate_lowered_region_schedule"):
+    for name in ("analyze_region_program", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, cold_only)
     calls, observed, recorded = [], [], []
     def step(carry):

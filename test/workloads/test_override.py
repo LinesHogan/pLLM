@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from pllm.execution.backend_attachment import validate_backend_attachment
+from test.revalidation import validate_backend_attachment
 from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm import authoring as a
 import pllm

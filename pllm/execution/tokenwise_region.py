@@ -187,7 +187,7 @@ class TokenwiseRegion:
         if self.retention.allocations[0].peak_bytes_upper_bound > retained:
             raise ValueError("tokenwise schedule exceeds the original recovery reservation")
         self._plan: RegionExecutionPlan | SelectedRegion = RegionExecutionPlan(self.program, self.imports,
-            self.candidate_proposals[0], self.payload_limits, self.retained)
+            self.candidate_proposals[0], self.payload_limits)
         self._execution: RegionInstructionExecution | SelectedRegion | None = None
 
     @property
@@ -210,12 +210,22 @@ class TokenwiseRegion:
             self._execution = self._plan if isinstance(self._plan, SelectedRegion) else self._plan.bind(self.functions)
         return self._execution
 
+    def with_measured_selection(self, request: RegionSelectionRequest, selection: RegionSelection,
+                                rewrites: tuple[TensorRewrite, ...], execution: RegionInstructionExecution) -> TokenwiseRegion:
+        """Install the measured winner's already bound executor after an AER decision."""
+        result = copy(self)
+        result._plan = SelectedRegion(request, selection, rewrites, execution)
+        result._execution = None
+        return result
+
     def with_schedule(self, request: RegionSelectionRequest, selection: RegionSelection,
                       policy: RegionSelectionPolicy, records: tuple[TensorRewrite, ...] = ()) -> TokenwiseRegion:
         """Bind measured work within this attachment's original payload envelope.
 
-        The source plan stays reusable. The returned plan borrows the same
-        invocation resources and keeps the same recovery/commit callbacks.
+        External/debug entry with full re-verification; production finish
+        reuses the measured executor instead. The source plan stays reusable.
+        The returned plan borrows the same invocation resources and keeps the
+        same recovery/commit callbacks.
         """
         if request.payload_limits != self.payload_limits or request.retention_imports != self.retained:
             raise ValueError("tokenwise selection differs from the original attachment payload reservation")
@@ -249,10 +259,11 @@ class TokenwiseRegion:
         return result
 
     def with_catalog(self, proposals: tuple[RegionScheduleProposal, ...], budget: int, *, stream_lanes: int = 1) -> TokenwiseRegion:
-        """Validate driver proposals against this source and the signed workspace.
+        """Check driver proposals against this source and the signed workspace.
 
-        Search is not authority: a worker checks each submitted schedule's
-        dependence and lifetime evidence without searching for it again.
+        The wire checkpoint is codec parsing plus local consistency: the
+        reference proposal must equal the locally derived reference, budgets
+        and stream payloads must agree. Proposal evidence is not re-derived.
         """
         if not proposals:
             raise ValueError("native schedule catalog requires its original reference")
@@ -269,7 +280,7 @@ class TokenwiseRegion:
             if proposal.stream_plan is not None:
                 if proposal.stream_plan.lanes != stream_lanes:
                     raise ValueError("native proposal exceeds the original backend stream capability")
-            RegionExecutionPlan(self.program, self.imports, proposal, limits, self.retained)
+            RegionExecutionPlan(self.program, self.imports, proposal, limits)
         result = copy(self)
         result.candidate_proposals = proposals
         result._funded_limits = limits
@@ -288,14 +299,14 @@ class TokenwiseRegion:
     def measurement_schedule(self, index: int) -> TokenwiseRegion:
         """Bind a catalog candidate for an isolated cold invocation, before timing.
 
-        Production installation requires with_schedule and an AER decision.
-        This operation only lowers the already funded source schedule.
+        Production finish installs this measured binding after an AER
+        decision. This operation only lowers the already funded source schedule.
         """
         if type(index) is not int or not 0 <= index < len(self.candidate_proposals):
             raise ValueError("tokenwise measurement has no such funded candidate")
         proposal = self.candidate_proposals[index]
         result = copy(self)
-        result._plan = RegionExecutionPlan(self.program, self.imports, proposal, self.payload_limits, self.retained)
+        result._plan = RegionExecutionPlan(self.program, self.imports, proposal, self.payload_limits)
         result._execution = None
         return result
 

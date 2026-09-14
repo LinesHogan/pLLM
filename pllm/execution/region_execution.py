@@ -13,23 +13,22 @@ import torch
 from pllm.contracts.region_bindings import RegionBindings
 from pllm.contracts.region_program import Program, bind_sizes
 from pllm.contracts.region_schedule import Statement
-from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.contracts.region_imports import RegionTensorImport
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamPlan
 from pllm.contracts.schedule_instructions import LoweredSchedule
 from pllm.execution.exported_cell import ExportedCell
-from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule, validate_region_bindings
+from pllm.execution.region_compilation import lower_region_bindings, lower_region_schedule
 from pllm.execution.region_resources import RegionResources
 from pllm.execution.region_native import BorrowedTensorPrimitive, CompiledPrimitive, FunctionalKernelPrimitive, NativePrimitive, RegionFunction
 from pllm.execution.region_frame import RegionValueFrame
 from pllm.execution.region_control import RegionActions
 from pllm.execution.region_schedule import RegionScheduleExecution
 from pllm.execution.region_values import Data, copy_data
-from pllm.execution.region_storage import import_region_functions, validate_region_payload
+from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_streams import (
-    RegionStreamBindings, RegionStreamFrame, record_stream, validate_region_streams, validate_stream_budget,
+    RegionStreamBindings, RegionStreamFrame, record_stream, validate_stream_budget,
 )
 
 
@@ -54,19 +53,14 @@ class RegionExecutionPlan:
     imports: tuple[RegionTensorImport, ...]
     proposal: RegionScheduleProposal
     payload_limits: tuple[RegionPayloadLimit, ...]
-    retained: tuple[RetainedAllocation, ...] = ()
 
     def __post_init__(self) -> None:
         if import_region_functions(self.program, self.imports) != self.imports:
             raise ValueError("execution plan requires canonical source imports")
-        if self.stream_plan is None:
-            validate_region_payload(self.program, self.imports, self.retained, self.proposal.payload)
-        else:
-            # Native stream validation rederives the entire nested payload.
-            # Check the proposal uses that same payload, without a second trip.
-            validate_region_streams(self.program, self.imports, self.stream_plan, self.retained)
-            if self.stream_plan.payload != self.proposal.payload:
-                raise ValueError("execution plan and stream plan require the same payload")
+        # Local derivation is authoritative: assembled facts are checked for
+        # plain consistency, never re-derived from source a second time.
+        if self.stream_plan is not None and self.stream_plan.payload != self.proposal.payload:
+            raise ValueError("execution plan and stream plan require the same payload")
         budgets = {limit.device: limit.bytes for limit in self.payload_limits}
         if len(budgets) != len(self.payload_limits) or any(type(value) is not int or value < 0 for value in budgets.values()):
             raise ValueError("execution plan budgets must be distinct nonnegative device bounds")
@@ -85,7 +79,7 @@ class RegionExecutionPlan:
         schedule = self.proposal.payload.capacity.schedule_map
         return RegionInstructionExecution(self.program, lower_region_schedule(self.program, schedule),
             lower_region_bindings(self.program, schedule), cells, stream_plan=self.stream_plan,
-            payload_limits=self.payload_limits, retained=self.retained)
+            payload_limits=self.payload_limits)
 
 
 class RegionInstructionExecution:
@@ -93,13 +87,11 @@ class RegionInstructionExecution:
 
     def __init__(self, program: Program, lowered: LoweredSchedule, bindings: RegionBindings,
                  cells: Mapping[str, RegionFunction], *, stream_plan: RegionStreamPlan | None = None,
-                 payload_limits: tuple[RegionPayloadLimit, ...] = (), retained: tuple[RetainedAllocation, ...] = ()) -> None:
-        validate_region_bindings(program, bindings)
+                 payload_limits: tuple[RegionPayloadLimit, ...] = ()) -> None:
         self._schedule = RegionScheduleExecution(program, lowered)
         if bindings.program_digest != lowered.program_digest or bindings.schedule_map != lowered.schedule_map:
             raise ValueError("tensor bindings and loop instructions must describe the same schedule")
         if stream_plan is not None:
-            validate_region_streams(program, cells, stream_plan, retained)
             validate_stream_budget(stream_plan, payload_limits)
             if bindings.schedule_map != stream_plan.payload.capacity.schedule_map:
                 raise ValueError("physical stream plan differs from the bound phase schedule")
@@ -122,6 +114,11 @@ class RegionInstructionExecution:
     @property
     def stream_plan(self) -> RegionStreamPlan | None:
         return self._stream_plan
+
+    @property
+    def cells(self) -> Mapping[str, RegionFunction]:
+        """The bound local implementations, as checked at bind time."""
+        return self._cells
 
     def _invoke(self, frame: RegionValueFrame, statement: Statement, coordinates: tuple[int, ...],
                 pages: RegionResources | None, sizes: Mapping[str, int], stream: torch.cuda.Stream | None = None) -> None:
@@ -206,9 +203,9 @@ class RegionStreamExecution(RegionInstructionExecution):
     """Bind source cells to a native concurrent plan within the original budget."""
 
     def __init__(self, program: Program, cells: Mapping[str, RegionFunction], plan: RegionStreamPlan, *,
-                 payload_limits: tuple[RegionPayloadLimit, ...], retained: tuple[RetainedAllocation, ...] = ()) -> None:
+                 payload_limits: tuple[RegionPayloadLimit, ...]) -> None:
         if any(isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations for cell in cells.values()):
             raise ValueError("transformed cells require a numerical selection decision")
         super().__init__(program, lower_region_schedule(program, plan.phase_schedule),
                          lower_region_bindings(program, plan.phase_schedule), cells, stream_plan=plan,
-                         payload_limits=payload_limits, retained=retained)
+                         payload_limits=payload_limits)
