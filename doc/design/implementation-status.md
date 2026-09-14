@@ -82,7 +82,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 | 符号依赖与 ISL 调度 | 已实现并接入区域执行 | 保留参数域、值来源、RAW/WAR/WAW、动态效果边界；支持自动重排、分块、窗口及部分 wavefront。具体机会取决于真实依赖。 |
 | 计划执行和跨 stream 完成 | 已实现 | 使用既有执行器、原 owner 和完成协议；未知共享上下文不会被自动当作可并发。运行时不调用 ISL。 |
 | 数学与实现候选 | 已实现有界搜索及源重放 | 支持相邻调用 outlining、矩阵重结合、独立 GEMM 合批和受限 Torch 编译；不是任意数学等价证明器。 |
-| 模型候选选择 | 已接入 TokenwiseTuning | worker 用本地原图生成实现，逐项计算 imports/容量/stream 证据，按原引擎完成时间选择；driver 不持有模型计算图。 |
+| 模型候选选择 | 默认启发式成本选择；实测 TokenwiseTuning 为显式 opt-in | 默认按 `logical_bytes + flops/(10*N_parallel)` 静态排名（当前候选事实上并列，选参考候选）；`ExecutionOptions(tuning="measured")` 时 worker 才逐项测量并按完成时间选择。 |
 | 状态正确性 | 保留原 PTTS 机制 | pin、COW、版本发布、KV 恢复和资源权限仍由原所有者管理；没有新增状态 owner。 |
 | 内存依据 | 已有区域范围的上界与拒绝机制 | 覆盖模型化张量、保留对象及已声明临时空间；尚不是包含所有库工作区、allocator、模型权重和 KV 的整设备预算保证。 |
 | 成本选择 | 以访问、存储生存期和完成时间为依据 | FLOPs 是辅助事实。逻辑读写量不等于实际 HBM 流量，样本计时不证明全局最优。 |
@@ -429,6 +429,29 @@ Function 命名与警告标签中的功能性 digest 保留。
 上同样出现，是存量问题，与本收敛无关。typing、import layers、region authority、
 diff 门禁通过。改动 31 个文件，+105/−210。证据见
 [安装路径收敛结果](evidence/install-convergence-results.json)。
+
+## 默认启发式选择与冷调优 opt-in
+
+默认冷启动不再对全部候选做 worker 实测。`ExecutionOptions.tuning` 默认
+`"heuristic"`：driver 在 `tune_native_schedules` 内对编译期已缓存的候选目录
+执行静态成本排名 `cost = logical_bytes + flops / (tuning_flop_byte_ratio *
+N_parallel)`（常数 `tuning_flop_byte_ratio=10` 可配置；logical bytes 取候选
+payload capacity 的 logical 读写上界，flops 取自 rewrite 证据，N_parallel 取
+stream lanes），不发 TUNE_BEGIN/CANDIDATE/FINISH，worker 不做任何测量绑定，
+`region_selection` 保持 None。
+
+实测核实当前目录上该公式是退化的：候选共享源 imports，logical bytes 与调度
+无关（小配置 8 个候选全为 8448/7936），rewrite flops 为零——成本并列，
+source-first 规则选中参考候选，即 attachment 本已安装的默认计划。若未来事实
+（如带 rewrite 证据的候选进入默认排名）使非参考候选胜出，该分支显式 raise，
+要求先建立默认安装路径，不静默退回参考。实测调优改为显式 opt-in：
+`ExecutionOptions(tuning="measured")` 时 TUNE_* 全程、`TokenwiseTuning` 与
+`with_measured_selection` 安装路径原样保留。
+
+验收：CPU 全套通过；新增启发式成本单测与 catalog 排名断言（参考候选胜出）；
+Qwen smoke 改跑默认启发式路径（参考候选正确安装、14 次独立数值比较不变），
+EngineCore smoke 以 `tuning="measured"` 保留实测路径的跨进程覆盖。证据见
+[启发式选择结果](evidence/heuristic-selection-results.json)。
 
 ## 最近完整收口的验收基线
 

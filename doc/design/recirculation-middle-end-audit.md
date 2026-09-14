@@ -182,6 +182,8 @@ decoder 与 recirculation 构造器现在直接生成数据端口程序，不再
 | digest/签名一致性比对层（BackendWorkerState.compilation_signature、TraceSnapshot.schedule_signature 及运行期比对） | 取消（未发布无历史遗留）；codec 解析级严格性保留 | 已删字段与三处运行期比对（worker_state 两处、trace_snapshot 一处）；PTTS 页描述符的签名门（语义物理层）与功能性 digest（候选去重、Function 命名、警告标签）保留。 |
 | VllmSession 构造时重复物理核验 | `bind_backend` 的唯一物理核验（authoring.py:309），两条构造路径必经 | 已删除重复调用。 |
 | 共享目录先完整生成窗口/分块结果，再交错截取；各组重复取得源分析 | 同一份源分析与按需候选迭代 | 已删除共享目录中的两个提前生成结果列表；实际候选仍逐项完成合法性和完整域等价检查。 |
+| 默认冷启动对全部候选做 worker 实测（TUNE_BEGIN/CANDIDATE/FINISH 全程，完整模型冷准备 >10 分钟） | 默认启发式成本选择（`cost = logical_bytes + flops/(10*N_parallel)`，常数在 ExecutionOptions），实测调优显式 opt-in | 已收敛（2026-09-14）：`ExecutionOptions.tuning` 默认 heuristic；driver 不发 TUNE_*，worker 不绑定测量，`region_selection` 为 None。实测核实 catalog 候选 logical bytes 与调度无关、rewrite flops 为零，成本并列时 source-first 选参考候选；非参考胜出时显式 raise 而非静默退回。opt-in measured 路径原样保留（TokenwiseTuning、`with_measured_selection` 安装）。 |
+| 启发式成本公式只存在于设计讨论 | `heuristic_candidate_cost`（contracts/region_selection.py）+ `heuristic_default_proposal`（execution/tokenwise_region.py），bytes 取 payload capacity 的 logical 上界、N_parallel 取 stream lanes | 已实现并对 catalog 实际排名（test_recirculation 断言参考候选胜出）；driver 默认路径每次 make_llm 执行该排名并校验结果。 |
 | 函数体先追加外层声明检查一遍，再按原 imports 检查一遍；每次内联继续重查 | 原源 verifier 同时核对外层签名，内部内联只重命名变量 | 已删除重复 body 遍历与 native 的整 Program 复制；公开入口、原 imports 作用域和组合后检查保留。 |
 | Python 与 Rust 分别维护 SSA、操作/区域签名、参数和资源语义规则 | Python 入口与 native 规划共用原 Rust verifier | Python verify 从 209 行缩为 18 行；通用 codec 只有一份，表示类型和动态权限仍在各自边界检查。 |
 | Python 重建 outlining 结果，再将原源和完整结果交给 Rust 重做 | 直接使用已有 native 提取结果，Torch 图仍从原调用重建 | 已删除 Python 提取器和递归区域替换器；外来工件的验证入口保留。 |

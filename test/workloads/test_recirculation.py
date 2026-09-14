@@ -13,7 +13,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.execution.replay import TokenwiseReplayPrimitive, TokenwiseReplayTask, TOKENWISE_REPLAY_IMPLEMENTATION, mix_layer_outputs
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
-from pllm.execution.tokenwise_region import compile_tokenwise_region
+from pllm.execution.tokenwise_region import compile_tokenwise_region, heuristic_default_proposal
 from pllm.contracts.region_program import TensorType
 from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_paged_access
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
@@ -189,6 +189,9 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
     public_trace, rng = execution.trace.snapshot(), torch.random.get_rng_state().clone()
     proposals = compile_tokenwise_region(TensorType((1, 4), "torch.float32"), 8,
         probe.causal_domain, config.effect(3)).candidate_proposals
+    # Default heuristic selection shares imports across the catalog, so static
+    # costs tie and the source-first rule keeps the reference proposal.
+    assert len(proposals) > 1 and heuristic_default_proposal(proposals, flop_byte_ratio=10) == 0
     tuning = TokenwiseTuning(execution, TOKENWISE_REPLAY_IMPLEMENTATION, proposals)
     samples = []
     changed = False

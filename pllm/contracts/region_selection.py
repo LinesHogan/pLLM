@@ -17,6 +17,19 @@ class RegionSelectionPolicy:
     schedule_policy: Literal["auto", "serial"] = "auto"
 
 
+def heuristic_candidate_cost(logical_bytes: int, flops: int, n_parallel: int, *, flop_byte_ratio: int = 10) -> float:
+    """Static candidate cost: modeled traffic plus parallelism-discounted math.
+
+    Facts come from existing payload/rewrite evidence, never new samples.
+    Measured execution time remains the ranking authority on the opt-in path.
+    """
+    if (type(logical_bytes) is not int or logical_bytes < 0 or type(flops) is not int or flops < 0
+        or type(n_parallel) is not int or n_parallel < 1
+        or type(flop_byte_ratio) is not int or flop_byte_ratio < 1):
+        raise ValueError("heuristic candidate cost requires nonnegative facts and positive parallelism")
+    return logical_bytes + flops / (flop_byte_ratio * n_parallel)
+
+
 @dataclass(frozen=True, slots=True)
 class RegionPayloadLimit:
     device: str

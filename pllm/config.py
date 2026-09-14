@@ -26,10 +26,19 @@ class ExecutionOptions:
     memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
     allow_numerical_transforms: bool = True
     schedule_policy: Literal["auto", "serial"] = "auto"
+    # Default native selection ranks funded catalog candidates by static cost
+    # (logical_bytes + flops / (tuning_flop_byte_ratio * N_parallel)) instead of
+    # cold worker measurement; "measured" opts into the full tuning protocol.
+    tuning: Literal["heuristic", "measured"] = "heuristic"
+    tuning_flop_byte_ratio: int = 10
 
     def __post_init__(self) -> None:
         if self.schedule_policy not in ("auto", "serial"):
             raise ValueError("schedule_policy must be auto or serial")
+        if self.tuning not in ("heuristic", "measured"):
+            raise ValueError("tuning must be heuristic or measured")
+        if type(self.tuning_flop_byte_ratio) is not int or self.tuning_flop_byte_ratio < 1:
+            raise ValueError("tuning flop/byte ratio must be a positive integer")
         if (self.training_rows < 1 or self.capture_memory_bytes < 1 or self.state_memory_bytes < 0
             or self.memory_budget_bytes is not None and self.memory_budget_bytes < 0):
             raise ValueError("training rows/capture capacity must be positive and memory limits nonnegative")

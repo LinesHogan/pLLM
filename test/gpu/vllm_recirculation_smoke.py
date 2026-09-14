@@ -33,8 +33,10 @@ def main():
     handle = pllm.make_llm(workload=RecirculationWorkload(config), config=ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16, 64, 2, 64, 0.25, seed=7))
     selection = handle.region_selection
-    assert selection is not None and len(selection.candidates) > 1
-    assert all(candidate.feasible and candidate.median_ns is not None for candidate in selection.candidates)
+    # The default heuristic path installs the reference proposal without cold
+    # worker measurement; measured tuning is the explicit opt-in covered by
+    # the EngineCore smoke.
+    assert selection is None
     assert handle.trace_snapshot().events == ()
     assert len(handle.attachment.inputs.probe.region_bodies) == 2
     execution = handle.deployment.execution
@@ -193,8 +195,7 @@ def main():
         diagnostics = execution.diagnostics()
         assert diagnostics.active_lineages == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
         print(dict(normal_rows=len(normal_calls), replay_rows=len(replay_calls), numerical_comparisons=len(numerical),
-            owned_state_roots=0, fallback=0, source_bodies=2, selected=selection.selected,
-            measured_ns=tuple(candidate.median_ns for candidate in selection.candidates)))
+            owned_state_roots=0, fallback=0, source_bodies=2, default_install="reference"))
     finally:
         handle.close()
 

@@ -25,7 +25,7 @@ from pllm.execution.host_runtime import CompletionCapture, CompletionInput
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.trace import ExecutionTrace, TraceSelection, TraceSnapshot, TRACE_SCHEMA_VERSION
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
-from pllm.execution.tokenwise_region import compile_tokenwise_region
+from pllm.execution.tokenwise_region import compile_tokenwise_region, heuristic_default_proposal
 from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelection
@@ -806,7 +806,8 @@ class VllmLlm(Generic[DataT, ResultT]):
     _pending_input: ExitStack | None = None
     region_selection: RegionSelection | None = None
 
-    def tune_native_schedules(self) -> None:
+    def tune_native_schedules(self, tuning: Literal["heuristic", "measured"] = "measured", *,
+                              flop_byte_ratio: int = 10) -> None:
         if (self.attachment.inputs.plan.timeline.region_policy.schedule_policy == "serial"
             or not any(isinstance(task.replay, TokenwiseLayerReplay)
                        for task in self.attachment.inputs.plan.semantic_graph.tasks)):
@@ -823,6 +824,13 @@ class VllmLlm(Generic[DataT, ResultT]):
             self.attachment.inputs.plan.timeline.region_policy,
             stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
             source_imports=probe.region_imports, function_bodies=probe.region_bodies).within_payload_budget(budget).candidate_proposals
+        if tuning == "heuristic":
+            # Default path: static cost replaces cold worker measurement. The
+            # attachment already runs the reference proposal; a discriminating
+            # winner needs a default install path before it may be chosen.
+            if heuristic_default_proposal(proposals, flop_byte_ratio=flop_byte_ratio) != 0:
+                raise RuntimeError("heuristic native default selected a non-reference candidate without an install path")
+            return
         count = decode_boundary(self.command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals), timeout=600.0), int)
         if not count:
             return
@@ -1285,7 +1293,7 @@ def create_vllm_llm(
             deployment = workload.compile_backend(facts)
             runner.attach_workload(deployment)
             handle = VllmLlm(llm, runner, deployment, deployment.attachment, facts)
-        handle.tune_native_schedules()
+        handle.tune_native_schedules(config.execution.tuning, flop_byte_ratio=config.execution.tuning_flop_byte_ratio)
         construction.pop_all()
         return handle
 

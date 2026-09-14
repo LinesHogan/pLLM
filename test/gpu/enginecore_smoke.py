@@ -293,7 +293,7 @@ def _recirculation_schedules() -> None:
     handle = pllm.make_llm(workload=RecirculationWorkload(RecirculationConfig(
         source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
-            64, 2, 64, 0.25, seed=7, multiprocessing=True))
+            64, 2, 64, 0.25, seed=7, multiprocessing=True, execution=ExecutionOptions(tuning="measured")))
     try:
         selection = handle.region_selection
         assert selection is not None and len(selection.candidates) > 1

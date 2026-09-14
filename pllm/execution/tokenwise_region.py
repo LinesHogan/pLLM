@@ -23,7 +23,9 @@ from pllm.contracts.region_retention import RetainedAllocation, RetentionEndpoin
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamPlan
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelection, RegionSelectionPolicy, RegionSelectionRequest
+from pllm.contracts.region_selection import (
+    RegionPayloadLimit, RegionSelection, RegionSelectionPolicy, RegionSelectionRequest, heuristic_candidate_cost,
+)
 from pllm.contracts.tensor_rewrite import TensorRewrite
 from pllm.execution.codec import boundary_digest
 from pllm.execution.decoder_region import DecoderSource, RowLayerForward, decoder_normalize_function, index_cell, kv_resource
@@ -397,6 +399,24 @@ class TokenwiseRegion:
                     raise RuntimeError("token region returned a non-tensor output")
                 outputs.append(value)
         return tuple(outputs)
+
+
+def heuristic_default_proposal(proposals: tuple[RegionScheduleProposal, ...], *, flop_byte_ratio: int) -> int:
+    """Rank funded catalog proposals by static cost, source-first on ties.
+
+    Catalog candidates share the original source imports, so rewrite flops are
+    zero and modeled logical traffic is schedule-independent: the source-first
+    tie currently keeps the reference proposal. A future candidate whose facts
+    discriminate needs an install path before the default may choose it.
+    """
+    if not proposals:
+        raise ValueError("native heuristic selection requires the reference proposal")
+    def cost(proposal: RegionScheduleProposal) -> float:
+        logical = sum(device.logical_read_bytes_upper_bound + device.logical_write_bytes_upper_bound
+                      for device in proposal.payload.capacity.devices)
+        lanes = 1 if proposal.stream_plan is None else proposal.stream_plan.lanes
+        return heuristic_candidate_cost(logical, 0, lanes, flop_byte_ratio=flop_byte_ratio)
+    return min(range(len(proposals)), key=lambda index: (cost(proposals[index]), index))
 
 
 @lru_cache(maxsize=8)

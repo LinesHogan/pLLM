@@ -1,0 +1,49 @@
+{
+  "date": "2026-09-14",
+  "scope": "T3 default heuristic candidate selection + measured cold tuning as explicit opt-in",
+  "user_decision": "Plan decision 5: default path does no measured tuning; selection uses cost = logical_bytes + flops / (10 * N_parallel) with configurable constants; TokenwiseTuning becomes explicit opt-in",
+  "changes": {
+    "config": [
+      "ExecutionOptions.tuning: Literal['heuristic', 'measured'] = 'heuristic' (the opt-in switch)",
+      "ExecutionOptions.tuning_flop_byte_ratio: int = 10 (the configurable formula constant)"
+    ],
+    "heuristic": [
+      "heuristic_candidate_cost (contracts/region_selection.py): logical_bytes + flops / (ratio * N_parallel), facts only from existing payload/rewrite evidence",
+      "heuristic_default_proposal (execution/tokenwise_region.py): ranks funded catalog proposals by (cost, index); logical bytes from candidate payload capacity logical read/write upper bounds, N_parallel from stream lanes"
+    ],
+    "driver_default_path": [
+      "tune_native_schedules(tuning, flop_byte_ratio): heuristic branch ranks the already-cached catalog and returns without any TUNE_* command; region_selection stays None; worker does no measurement binding",
+      "guard: a non-reference heuristic winner raises instead of silently running the reference (a default install path must be built first)",
+      "make_llm call site passes config.execution.tuning / tuning_flop_byte_ratio"
+    ],
+    "opt_in_measured_path": [
+      "unchanged: TUNE_BEGIN/CANDIDATE/FINISH, TokenwiseTuning, with_measured_selection installation",
+      "ExecutionOptions(tuning='measured') restores the full measured protocol"
+    ]
+  },
+  "key_finding": "On the current driver catalog the formula is degenerate: candidates share source imports, modeled logical read/write bytes are schedule-independent (small config: 8448/7936 for all 8 proposals, serial and stream alike), and rewrite flops are zero. Costs tie and the source-first rule selects the reference proposal, which the attachment already installs. Verified empirically on the small recirculation config and asserted in test_recirculation.",
+  "tests": {
+    "added": [
+      "test_region_selection.py: heuristic_candidate_cost value/validation unit tests",
+      "test_recirculation.py: catalog has >1 proposals and heuristic_default_proposal selects the reference (index 0)"
+    ],
+    "updated": [
+      "vllm_recirculation_smoke.py: runs the default heuristic path; asserts region_selection is None and keeps the 14 independent numerical oracle comparisons",
+      "enginecore_smoke.py _recirculation_schedules: opts into tuning='measured', keeping the cross-process measured-path coverage (parallel and transformed candidates)"
+    ],
+    "unaffected": [
+      "test_recirculation.py TokenwiseTuning direct construction (measured path CPU coverage)",
+      "test_region_model_proposals.py worker-session tuning protocol coverage"
+    ]
+  },
+  "acceptance": {
+    "typing": "0 errors",
+    "import_layers": "OK",
+    "region_authority": "OK",
+    "git_diff_check": "OK",
+    "pytest_targeted": "test_region_selection.py + test_recirculation.py: 14 passed",
+    "pytest_full_cpu": "612 passed, 2 failed (test_inplace_region dtype1-cuda numerical, pre-existing since pre-T1 baseline eb75810)",
+    "qwen_smoke_default_path": "passed: region_selection None, reference install, 8 normal rows, 6 replay rows, 14 numerical comparisons, 0 fallback",
+    "enginecore_smoke_measured_optin": "passed with tuning='measured' over multiprocessing EngineCore: catalog with parallel and transformed candidates measured, clean shutdown"
+  }
+}
