@@ -1,8 +1,11 @@
 """Actual Triton GEMM code, readonly ports and source-selected batch lowering."""
 
+import math
+
 import pytest
 import torch
 
+from pllm.backends.torch_inductor import COMPILER_SLACK_FRACTION
 from pllm.config import ExecutionOptions
 from pllm.contracts.region_program import Block, Call, Program, Region, Value
 from pllm.contracts.region_selection import RegionPayloadLimit
@@ -24,7 +27,16 @@ def test_gemm_epilogue_is_one_generated_kernel_with_unaligned_readonly_borrows(b
     before = tuple(base.clone() for base in bases)
     source = ExportedCell.capture(lambda x, w: ((x @ w) + 1,), ("x", "w"), ("out",), tensors)
     compiled = compile_tensor_cell(source)
-    assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == source.output_bytes
+    # Graph-derived account: the normalized graph upcasts both bf16 operands
+    # to f32, then materializes the bf16 GEMM result and the epilogue output.
+    # Batched matmul additionally decomposes through expand/view pairs, whose
+    # spans the account counts deliberately — an over-count, not an omission.
+    # The plain Triton template carries no workspace, so only slack is added.
+    input_bytes = sum(t.numel() * t.element_size() for t in tensors)
+    subtotal = (4 * input_bytes + 3 * source.output_bytes) if batch else (
+        2 * input_bytes + 2 * source.output_bytes)
+    assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == (
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
     expected = (tensors[0].float() @ tensors[1].float()).to(torch.bfloat16) + 1
     result, = compiled.invoke(tensors, None)
     torch.testing.assert_close(result, expected)
@@ -54,14 +66,21 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
     monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
         1 if any(isinstance(cell, CompiledPrimitive) and any("batching" in t for t in cell.transformations)
                  for cell in execution._cells.values()) else 100)
+    # The graph-derived account charges the packed operands twice (pack and
+    # view) plus their f32 upcasts — a deliberate over-count the payload
+    # limit must leave room for; the bound stays a bound, not an estimate.
     with pytest.warns(NumericalTransformWarning, match="batching.*kernel compilation"):
         selected = optimize_region(program, {source.digest: source}, dict(zip(names, tensors)),
-            payload_limits=(RegionPayloadLimit("cuda:0", 100000),),
+            payload_limits=(RegionPayloadLimit("cuda:0", 200000),),
             options=ExecutionOptions(schedule_policy="serial"), warmup_rounds=0, measurement_rounds=1)
     record, = selected.rewrites
     compiled = selected._execution._cells[record.source_digest]
     assert isinstance(compiled, CompiledPrimitive)
-    assert sum(a.bytes for a in compiled.implementation.allocations) >= record.packed_operand_bytes + 2 * source.output_bytes
+    # Normalized account: pack + view charge the packed operands twice, their
+    # f32 upcasts twice more; the bmm result and both select views follow.
+    subtotal = 4 * record.packed_operand_bytes + 4 * source.output_bytes
+    assert sum(a.bytes for a in compiled.implementation.allocations) == (
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
     # The second returned source slice has a nonzero offset in the batched
     # allocation. The selected compiled ABI still returns independent roots.
     warm = selected.run(dict(zip(names, tensors)))
@@ -121,7 +140,12 @@ def test_transposed_weight_borrow_keeps_stride_offset_and_has_no_materialization
     before = base.clone()
     source = ExportedCell.capture(lambda x, w: (x @ w,), ("x", "weight"), ("out",), (x, weight))
     compiled = compile_tensor_cell(source)
-    assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == source.output_bytes
+    # The normalized graph upcasts both bf16 operands to f32 and materializes
+    # one bf16 GEMM result; the transposed borrow appears nowhere but as a
+    # graph input — no copy, no transpose materialization in the account.
+    subtotal = 4 * (x.numel() + weight.numel()) + source.output_bytes
+    assert sum(buffer.bytes for buffer in compiled.implementation.allocations) == (
+        subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
     result, = compiled.invoke((x, weight), None)
     torch.testing.assert_close(result, (x.float() @ weight.float()).to(torch.bfloat16))
     torch.testing.assert_close(base, before, rtol=0, atol=0)

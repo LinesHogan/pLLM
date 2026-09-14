@@ -17,10 +17,13 @@ class UnsupportedTensorKernel(ValueError):
 class CompiledTensorCode:
     """Readonly inputs, issuing-stream completion, and explicit allocations.
 
-    Allocations cover result backings and internal workspace. The caller copies
-    results into independently owned SSA values and accounts for those copies.
-    Backend/code identities must be reproducible when rebuilding a selection.
-    Generated call counts are diagnostics, not execution or capacity evidence.
+    Allocations are the backend's capacity account: they must cover result
+    backings and any internal workspace with a stated upper bound, and are
+    derived without timing or profiling the compiled artifact. The caller
+    copies results into independently owned SSA values and accounts for those
+    copies. Backend/code identities must be reproducible when rebuilding a
+    selection. Generated call counts are diagnostics, not execution or
+    capacity evidence.
     """
 
     function: Callable[..., tuple[torch.Tensor, ...]]

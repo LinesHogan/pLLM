@@ -504,6 +504,40 @@ half_result_copy) + half_scratch；一般形式 live = half_live +
 ①，且只服务 measured opt-in 路径——③ 已把这笔钱从默认冷启动消除——故
 T4 定向后续以 ③+① 关账，合成律存档于证据文件备查。
 
+## 编译容量依据改为图帐加盈余（路线 2 主体）
+
+调度需要容量上界，原实现靠编译后读取 Inductor 的分配清单（GraphLowering
+捕获、buffer 枚举、调度器检查），并为让该读数精确而关掉 Inductor 的
+inplace buffers、buffer 复用和 memory planning。用户决策（2026-09-15）：
+**适配器不应禁止 Inductor 的功能**；容量依据只取 torch export 图上信息，
+加一个温和的高估盈余（当前 5%，命名常量 `COMPILER_SLACK_FRACTION`），
+替代全部代码生成后读数。
+
+新账户：每个设备 scratch = ⌈(1+5%) ×（规范化 fx 图中每个非占位符张量值
+的布局 span 之和 + 每个 sum/mean 规约算子的输入 span 之和）⌉。规约输入
+计费覆盖 split-reduction 部分和（split 数不超过被规约元素数，部分和缓冲
+恒不超过输入字节）；确定性 plain mm/bmm Triton 模板无工作区（extern
+cublas 由模板覆写排除，该覆写保留）；5% 盈余覆盖 concat 打包、信号量与
+allocator 取整。账户以 `KernelAllocation` 条目发出（唯一名、源设备），
+`aer.rs` 容量推导零改动；身份串升为 `inductor-tensor-readonly@7`，盈余
+比例编入身份，driver 与 worker 重放必然同值。
+
+保留的执行约定守卫：artifact 级 mutation/常量/torchbind/对齐复制拒绝、
+offset-1 假输入、`emulate_precision_casts`、cudagraphs 关闭。规范化图上
+设算子白名单（逐点、view、cat/stack、sum/mean、plain GEMM 族）：图外的
+算子可能落到图帐看不见的库工作区，后端拒编、原执行路径保留——这是
+后端收窄自己的容量承诺范围，不是禁用 Inductor 功能。
+
+账户性质随之改变：上界是上界不是估计——被融合消除的中间值照计（蓄意
+高估），实测峰值严格低于上界。测试从"读数等于实测"改为钉住账户公式
+与 `peak ≤ 上界`；合批用例的 payload 上限因蓄意高估从 100000 调到
+200000（打包操作数被 pack+view+f32 上转重复计费）。原两处
+test_inplace_region 的 CUDA 位级失败随默认 Inductor 功能恢复而消失
+（旧 pin 本身改变了代码生成）。验收：CPU 全套 614 项通过（此前 612
+通过 2 失败）；cargo 22 项；typing / layers / authority 全绿；两个
+smoke 复跑见 [图帐改造证据](evidence/graph-account-results.json)。
+路线 2 的容量依据主体至此落地；2.5 可读性/作者端验收另行进行。
+
 ## 调度目录去重的单站点收敛（T4 关账）
 
 语义去重原来分散在两处：window 族逐构造对参考和基各跑一次全域
@@ -568,7 +602,7 @@ git diff --check
 | 顺序 | 工作 | 完成条件 |
 | --- | --- | --- |
 | 1. 完成架构缩减 | 减少作者端不变量 carry 和坐标 Constant/Scalar 往返；确定唯一来源关系及校验职责 | 生产 token 构造器及旧 Order 兼容已退出，继续删除重复转换和校验路径；真实 recirculation 与不同依赖结构仍成立。不能只增加 builder。 |
-| 2. 收窄编译后端依赖 | 减少对 Inductor 私有配置、模板与源码检查的依赖，明确执行约定、容量依据和性能样本的区别 | 使用稳定接口或有同等保证的后端契约；不以取消容量保证或关掉原功能完成“精简”。 |
+| 2. 收窄编译后端依赖 | 减少对 Inductor 私有配置、模板与源码检查的依赖，明确执行约定、容量依据和性能样本的区别 | 使用稳定接口或有同等保证的后端契约；不以取消容量保证或关掉原功能完成“精简”。容量依据主体已落地（2026-09-15，图帐+盈余，见对应小节）；剩余 2.5 可读性/作者端验收。 |
 | 3. 完成模型与算法迁移 | 通用模型前端；完整异构层；全局 prefill/chunk × layer 在线更新；剩余训练路径 | 原模型计算保留；后续 chunk 读取正确权重版本；KV、更新次数、RNG、取消和 worker 重建全部有端到端证据。 |
 | 4. 补齐优化组合 | 结构变换后的并行调度、跨块合批、缓冲复用及完整算法的联合选择 | 每项重新提取来源、访问、容量与完成约束，通过原语义对照；原能力迁移后不永久保留两套核心。 |
 | 5. 完成成本与性能验收 | 整设备内存范围、真实库工作区、冷规划成本和对齐吞吐 | 在相同算法与工作量下报告完成时间、吞吐、延迟、内存和冷启动，收益稳定超过噪声；不能用短 smoke 代替。 |

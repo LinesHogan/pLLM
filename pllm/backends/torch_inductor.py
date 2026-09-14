@@ -1,9 +1,16 @@
-"""Pinned Torch/Inductor implementation and its closed allocation contract.
+"""Pinned Torch/Inductor implementation and its graph-derived capacity contract.
 
-This provider owns compiler configuration, template selection and inspection of
-version-specific lowering artifacts. Scheduling consumes only its result ABI.
+This provider owns compiler configuration, deterministic template selection and
+guards on version-specific execution artifacts. Scheduling consumes only its
+result ABI. Capacity facts come from the normalized export graph itself — the
+layout span of every tensor value, an explicit charge for reduction temporaries
+and a named slack fraction — never from timing, profiling or code-generation
+internals. Inductor features stay enabled; the account over-counts what fusion
+eliminates and covers what code generation invents.
 """
 
+import math
+import operator
 from collections.abc import Generator
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -25,6 +32,42 @@ class _InductorConfig(Protocol):
 
 
 _INDUCTOR_GEMM = frozenset({"aten.mm.default", "aten.matmul.default", "aten.bmm.default", "aten.addmm.default", "aten.linear.default"})
+
+# Slack added to the graph-derived account for code-generation side effects the
+# graph cannot name: concat packing slack, reduction semaphores and allocator
+# rounding. Split-reduction partial buffers are bounded separately by charging
+# each reduction operation's inputs (a split never exceeds the reduced element
+# count), and the deterministic plain mm/bmm template carries no workspace.
+# Named and versioned into the import identity so worker re-derivation and the
+# driver compute the same account.
+COMPILER_SLACK_FRACTION = 0.05
+
+# Reductions whose temporary partial buffers the account charges explicitly.
+_REDUCTION_PACKETS = frozenset({torch.ops.aten.sum, torch.ops.aten.mean})
+
+# Operations accepted after ATen normalization: pointwise math, metadata views,
+# cat/stack, sum/mean reductions and the plain GEMM family. Anything else can
+# lower to an external library call or an opaque workspace that a graph account
+# cannot see; those graphs stay on their original execution path instead.
+_ALLOWED_PACKETS = frozenset(packet for names in (
+    # Pointwise binary and comparison.
+    ("add", "sub", "mul", "div", "pow", "remainder", "fmod", "maximum", "minimum",
+     "eq", "ne", "lt", "le", "gt", "ge", "logical_and", "logical_or", "logical_xor", "where"),
+    # Pointwise unary and casts.
+    ("neg", "abs", "exp", "log", "sqrt", "rsqrt", "reciprocal", "sigmoid", "silu", "relu",
+     "gelu", "tanh", "erf", "clamp", "floor", "ceil", "round", "trunc", "sign",
+     "sin", "cos", "isnan", "isinf", "to", "clone", "contiguous", "detach", "type_as"),
+    # Metadata views and packing (a view never allocates; counting it anyway is
+    # a deliberate over-count, never an omission).
+    ("view", "reshape", "permute", "transpose", "t", "expand", "broadcast_to", "slice",
+     "select", "squeeze", "unsqueeze", "narrow", "as_strided", "flatten", "repeat",
+     "cat", "stack"),
+    # Bounded reductions and the plain GEMM family.
+    ("sum", "mean", "mm", "addmm", "bmm", "matmul", "linear"),
+) for packet in (getattr(torch.ops.aten, name) for name in names)) | frozenset({
+    # ATen decompositions emit pointwise prims for dtype conversion.
+    torch.ops.prims.convert_element_type,
+})
 
 
 def supports_inductor_tensor_graph(source: torch.fx.GraphModule) -> bool:
@@ -49,15 +92,63 @@ def supports_inductor_tensor_graph(source: torch.fx.GraphModule) -> bool:
     return bool(operations)
 
 
+def _span_bytes(value: torch.Tensor) -> int:
+    """Layout span of one tensor value; views of larger storage stay bounded."""
+    if value.numel() == 0:
+        return 0
+    elements = sum((size - 1) * stride for size, stride in zip(value.shape, value.stride())) + 1
+    return elements * value.element_size()
+
+
+def _graph_allocations(graph: torch.fx.GraphModule) -> tuple[KernelAllocation, ...]:
+    """Graph-derived capacity account for one normalized graph.
+
+    Every tensor value is charged its layout span as if it materialized — the
+    over-count covers fusion being disabled or partial, and views are counted
+    knowingly. Each sum/mean operation additionally charges its tensor inputs:
+    split-reduction partial buffers never exceed the reduced element count.
+    The named slack covers the remainder (concat packing, semaphores, rounding).
+    """
+    allocations: list[KernelAllocation] = []
+    subtotal = 0
+    for node in graph.graph.nodes:
+        if node.op != "call_function":
+            continue
+        packet = getattr(node.target, "overloadpacket", None)
+        if packet not in _ALLOWED_PACKETS and node.target is not operator.getitem:
+            raise UnsupportedTensorKernel(
+                f"normalized operation {node.target} stays outside the pointwise/sum-reduction/GEMM subset")
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            continue
+        bytes_ = _span_bytes(value)
+        subtotal += bytes_
+        allocations.append(KernelAllocation(node.name, str(value.device), bytes_))
+        if packet in _REDUCTION_PACKETS:
+            for index, argument in enumerate(node.all_input_nodes):
+                argument_value = argument.meta.get("val")
+                if not isinstance(argument_value, torch.Tensor):
+                    continue
+                charge = _span_bytes(argument_value)
+                subtotal += charge
+                allocations.append(KernelAllocation(
+                    f"{node.name}#reduction{index}", str(argument_value.device), charge))
+    slack = math.ceil(subtotal * COMPILER_SLACK_FRACTION)
+    if slack:
+        device = allocations[-1].device
+        allocations.append(KernelAllocation(f"compiler-slack@{COMPILER_SLACK_FRACTION}", device, slack))
+    return tuple(allocations)
+
+
 def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTensorCode:
-    """Pinned Inductor adapter: pointwise/reduction allocations after codegen.
+    """Pinned Inductor adapter: deterministic choice, graph-derived account.
 
     Dynamic library types and compiler hooks stay in this backend adapter. No
-    tensor memory number is obtained by timing or profiling a sample execution.
-    Inputs are borrowed read-only. Offset-one fake inputs force code generation
-    that accepts unaligned pointers; runtime alignment copies are rejected.
+    tensor memory number is obtained by timing, profiling or reading
+    code-generation allocations. Inputs are borrowed read-only. Offset-one fake
+    inputs force code generation that accepts unaligned pointers; runtime
+    alignment copies are rejected.
     """
-    from sympy import Integer
     from torch._dynamo.convert_frame import compile_lock
     from torch._inductor import config
     from torch._inductor.choices import InductorChoices
@@ -65,14 +156,9 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
     from torch._inductor.compile_fx import compile_fx_inner
     from torch._inductor.decomposition import select_decomp_table
     from torch._inductor.exc import InductorError
-    from torch._inductor.graph import GraphLowering
-    from torch._inductor.ir import (
-        ComputedBuffer, ConcatKernel, NonOwningLayout, Pointwise, Reduction, TritonTemplateBuffer, MultiTemplateBuffer,
-    )
     from torch._inductor.kernel_inputs import KernelInputs
     from torch._inductor.kernel_template_choice import KernelTemplateChoice
     from torch._inductor.output_code import CompiledFxGraph
-    from torch._inductor.scheduler import BaseSchedulerNode, NopKernelSchedulerNode, SchedulerNode
     from torch._inductor.select_algorithm import ExternKernelChoice, TritonTemplate, TritonTemplateCaller
     from torch._inductor.utils import BoxedBool
     from torch._inductor.virtualized import V
@@ -98,16 +184,17 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
                 raise UnsupportedTensorKernel("compiler input normalization requires fake tensors")
             examples.append(sample)
     FakeTensorProp(graph, examples[0].fake_mode if examples else None).propagate_dont_convert_inputs(*examples)
-    expected = tuple(tensor_node_metadata(n) for n in tensor_graph_result_nodes(graph))
-    captured: list[GraphLowering] = []
 
     class TensorChoices(InductorChoices):
         def _finalize_template_configs(self, template_choices: dict[str, Generator[KernelTemplateChoice, None, None]],
                 kernel_inputs: KernelInputs, templates: list[KernelTemplate | ExternKernelChoice], op_name: str,
                 kwarg_overrides: dict[str, dict[str, object]] | None = None) -> list[KernelTemplateChoice]:
             # One deterministic native Triton choice, without a second timing
-            # search or a library-workspace fallback. pLLM compares completed
-            # executions, including this template and its fused epilogue.
+            # search or a library-workspace fallback. Plain mm/bmm templates
+            # carry no workspace, which the graph account relies on; an extern
+            # library call would own workspace the graph cannot name. pLLM
+            # compares completed executions, including this template and its
+            # fused epilogue.
             for template in templates:
                 if not isinstance(template, TritonTemplate) or template.name not in ("mm", "bmm"):
                     continue
@@ -119,37 +206,15 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
                         return [choice]
             raise UnsupportedTensorKernel("GEMM has no supported deterministic Triton template")
 
-    def inspect(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        lowered = V.graph
-        for group in nodes:
-            for node in group.get_nodes():
-                if isinstance(node, NopKernelSchedulerNode) and isinstance(node.node, ConcatKernel):
-                    continue  # Allocation-only root; its producers fill disjoint views.
-                if not isinstance(node, SchedulerNode):
-                    raise UnsupportedTensorKernel("compiled allocation adapter requires pointwise/reduction scheduler nodes")
-                operation = node.node
-                if operation is None:
-                    raise UnsupportedTensorKernel("compiled scheduler node has no tensor operation")
-                if isinstance(operation, TritonTemplateBuffer) and not isinstance(operation, MultiTemplateBuffer):
-                    if operation.mutated_inputs:
-                        raise UnsupportedTensorKernel("GEMM template has extra mutation/workspace outputs")
-                    continue
-                if not isinstance(operation, ComputedBuffer) or not (
-                        isinstance(operation.data, Pointwise)
-                        or isinstance(operation.data, Reduction) and operation.data.reduction_type == "sum"):
-                    raise UnsupportedTensorKernel("compiled allocation adapter requires pointwise/sum-reduction kernels without external calls")
-        captured.append(lowered)
-        return nodes
-
     patches: dict[str, object] = {
         "fx_graph_cache": False, "fx_graph_remote_cache": False,
-        "inplace_buffers": False, "allow_buffer_reuse": False, "memory_planning": False,
         "assume_aligned_inputs": False,
         # Fusion must retain the source operators' low-precision rounding
         # boundaries, including updates to a loop-carried value.
         "emulate_precision_casts": True,
         "max_autotune": False, "max_autotune_pointwise": False, "max_autotune_gemm": False,
         "combo_kernels": False, "graph_partition": False, "wrap_inductor_compiled_regions": False,
+        # CUDA graph pools are allocator state the graph account cannot name.
         "triton.cudagraphs": False, "triton.autotune_pointwise": False, "triton.autotune_at_compile_time": True,
         "post_grad_custom_pre_pass": None, "post_grad_custom_post_pass": None, "_pre_fusion_custom_pass": None,
     }
@@ -162,13 +227,14 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
     devices = sorted({t.device.index for t in examples if t.device.type == "cuda"})
     # Use Torch's own cold compilation lock for its scoped global config hooks.
     try:
-        with (compile_lock, cast(_InductorConfig, config).patch({**patches, "_post_fusion_custom_pass": inspect}),
+        with (compile_lock, cast(_InductorConfig, config).patch({**patches, "_post_fusion_custom_pass": None}),
               V.set_choices_handler(TensorChoices()),
               torch.no_grad(), preserve_torch_rng(devices)):
             # Normalize to Inductor's ATen dialect under the same scoped
             # config/RNG guard. Only private fake inputs are traced; the
             # original graph and its output guards remain the source contract.
             graph = make_fx(graph, decomposition_table=select_decomp_table(), tracing_mode="fake")(*examples)
+            allocations = _graph_allocations(graph)
             artifact = compile_fx_inner(graph, examples, is_inference=True, cudagraphs=BoxedBool(False))
     except InductorError as error:
         cause: BaseException | None = error.inner_exception
@@ -179,43 +245,14 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
             seen.add(id(cause))
             cause = cause.__cause__ or cause.__context__
         raise
-    if not isinstance(artifact, CompiledFxGraph) or len(captured) != 1:
-        raise UnsupportedTensorKernel("Inductor allocation capture did not produce one compiled graph")
-    lowered, = captured
+    if not isinstance(artifact, CompiledFxGraph):
+        raise UnsupportedTensorKernel("Inductor compilation did not produce one compiled graph")
+    # Execution convention guards: the region borrows inputs read-only and
+    # accounts every output copy itself, so hidden mutation, captured
+    # constants or alignment copies break the contract rather than the account.
     if (artifact.mutated_inputs or artifact.constants or artifact.torchbind_constants
-            or lowered.wrapper_code.allocated_workspaces or artifact.inputs_to_check
-            or getattr(lowered, "_defers_input_alignment")):
-        raise UnsupportedTensorKernel("compiled tensor block has mutation, hidden constants, alignment copies or opaque workspace")
-
-    def integer(value: object) -> int:
-        if type(value) is int:
-            return value
-        if isinstance(value, Integer):
-            return int(value)
-        raise UnsupportedTensorKernel("compiled allocation layout must be static, not a sampled size")
-
-    allocations: list[KernelAllocation] = []
-    for buffer in lowered.buffers:
-        if buffer.get_name() in lowered.removed_buffers:
-            continue
-        # Mean lowers to a sum and scaling. Split reductions remain separate
-        # ComputedBuffers, so their partial sums enter the allocation envelope.
-        template = isinstance(buffer, TritonTemplateBuffer) and not isinstance(buffer, MultiTemplateBuffer)
-        if not template and not isinstance(buffer, ConcatKernel) and (not isinstance(buffer, ComputedBuffer) or not (
-                isinstance(buffer.data, Pointwise)
-                or isinstance(buffer.data, Reduction) and buffer.data.reduction_type == "sum")):
-            raise UnsupportedTensorKernel("compiled allocation has no supported tensor lowering")
-        if isinstance(buffer.get_output_spec(), NonOwningLayout):
-            continue  # Its owning concat/output root is already in lowered.buffers.
-        storage_size = integer(lowered.get_allocation_storage_size(buffer))
-        allocations.append(KernelAllocation(buffer.get_name(), str(buffer.get_device()),
-            storage_size * torch.empty((), dtype=buffer.get_dtype()).element_size()))
-    if len(lowered.graph_outputs) != len(expected):
-        raise UnsupportedTensorKernel("compiled tensor output arity differs from source")
-    for value, guard in zip(lowered.graph_outputs, expected, strict=True):
-        if guard is None or (tuple(integer(d) for d in value.get_size()), tuple(integer(d) for d in value.get_stride()),
-                value.get_dtype(), value.get_device()) != (tuple(guard.shape), tuple(guard.stride()), guard.dtype, guard.device):
-            raise UnsupportedTensorKernel("compiled tensor output layout differs from source")
+            or artifact.inputs_to_check):
+        raise UnsupportedTensorKernel("compiled tensor block has mutation, hidden constants or alignment copies")
 
     def invoke(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         values: object = artifact(list(args))
@@ -228,8 +265,9 @@ def compile_inductor_tensor_graph(source: torch.fx.GraphModule) -> CompiledTenso
             tensors.append(value)
         return tuple(tensors)
 
-    return CompiledTensorCode(invoke, encode_boundary(("inductor-tensor-readonly@6", torch.__version__, patches,
-                                                      "first-valid-mm-bmm-template-up-to-four@1")),
+    return CompiledTensorCode(invoke, encode_boundary(("inductor-tensor-readonly@7", torch.__version__, patches,
+                                                      "first-valid-mm-bmm-template-up-to-four@1",
+                                                      f"graph-account-slack@{COMPILER_SLACK_FRACTION}")),
         boundary_digest(artifact.source_code), tuple(allocations))
 
 

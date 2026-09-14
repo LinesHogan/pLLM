@@ -104,13 +104,16 @@ class CompiledTensorImport:
     source_access: TensorAccessGraph
     backend: str
     code_digest: str
-    # Actual compiler allocation layouts, after fusion/codegen. Summing all
-    # allocations is conservative even when their lifetimes do not overlap.
+    # Graph-derived capacity account: the layout span of every tensor value in
+    # the normalized graph, an explicit charge for reduction temporaries and a
+    # named slack fraction — never code-generation allocation reads. Summing
+    # all entries is conservative even when their lifetimes do not overlap.
     allocations: tuple[KernelAllocation, ...]
     # Execution borrows read-only inputs and independently copies each output.
     # Compiler replay rejects input mutations and runtime alignment copies.
     # Backend tensor allocations include raw results retained during copying;
-    # opaque external workspaces are rejected by this compiler adapter.
+    # graphs that could lower to opaque external workspaces are rejected by
+    # this compiler adapter's normalized-graph operator subset.
 
 
 RegionTensorImport: TypeAlias = ExportedTensorImport | NativeTensorImport | NativeKernelImport | FunctionalKernelImport | CompiledTensorImport | BorrowedTensorImport

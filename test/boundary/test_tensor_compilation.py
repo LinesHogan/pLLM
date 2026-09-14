@@ -1,6 +1,7 @@
-"""Real fused backend code, read-only borrows, and compiler allocation facts."""
+"""Real fused backend code, read-only borrows, and graph-derived capacity facts."""
 
 from dataclasses import replace
+import math
 import warnings
 
 import pytest
@@ -12,7 +13,7 @@ from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit,
 from pllm.contracts.region_program import Block, Call, Program, Region, ScalarType, Scan, SizeParameter, Value
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.contracts.tensor_compilation import UnsupportedTensorKernel
-from pllm.backends.torch_inductor import InductorTensorCompiler, compile_inductor_tensor_graph
+from pllm.backends.torch_inductor import COMPILER_SLACK_FRACTION, InductorTensorCompiler, compile_inductor_tensor_graph
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution, RegionInstructionExecution
@@ -49,8 +50,13 @@ def test_codegen_exports_real_allocations_and_preserves_values_inputs_and_rng(de
         compiled = compile_tensor_cell(source)
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
     assert len([n for n in source.graph.graph.nodes if n.op == "call_function"]) == 4
-    # Four ATen operations lower to one materialized output and one kernel.
-    assert sum(a.bytes for a in compiled.implementation.allocations) == tensors[0].numel() * tensors[0].element_size()
+    # Capacity is a graph-derived account: the layout span of every tensor
+    # value in the normalized graph plus the named compiler slack — never a
+    # code-generation allocation read. Fusion only makes the true peak lower.
+    subtotal = 4 * tensors[0].numel() * tensors[0].element_size()
+    allocations = compiled.implementation.allocations
+    assert sum(a.bytes for a in allocations) == subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION)
+    assert allocations[-1].name == f"compiler-slack@{COMPILER_SLACK_FRACTION}"
     actual, = compiled.invoke(tensors, None)
     torch.testing.assert_close(actual, torch.full_like(actual, 5), rtol=0, atol=0)
     torch.testing.assert_close(tensors[0], torch.full_like(tensors[0], 2), rtol=0, atol=0)
@@ -72,9 +78,10 @@ def test_capacity_includes_entry_inputs_raw_kernel_results_and_every_output_copy
     schedule = analyze_region_program(program).reference_schedule
     capacity = analyze_region_capacity(program, schedule, {source.digest: compiled})
     facts, = capacity.devices
+    scratch = sum(a.bytes for a in compiled.implementation.allocations)
     assert facts.entry_copy_bytes_upper_bound == 1024
-    assert facts.call_scratch_bytes_upper_bound == 512  # Raw result; inputs borrow entry roots.
-    assert facts.peak_tensor_bytes_upper_bound == (3072 if duplicate else 2048)
+    assert facts.call_scratch_bytes_upper_bound == scratch  # Graph account; inputs borrow entry roots.
+    assert facts.peak_tensor_bytes_upper_bound == 1024 + scratch + (1536 if duplicate else 512)
     # Access traffic is deliberately unknown: wrapper copies do not describe
     # the fused kernel's global/cache transactions.
     assert capacity.unknown_functions == (source.digest,)
@@ -89,9 +96,9 @@ def test_capacity_includes_entry_inputs_raw_kernel_results_and_every_output_copy
     actual = run.run(inputs)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() - before
-    # All buffers are 512-byte multiples, so allocator rounding does not
-    # obscure the compiler/wrapper tensor accounting in this fixture.
-    assert peak == facts.peak_tensor_bytes_upper_bound
+    # The graph-derived account charges every value as if it materialized, so
+    # the fused kernel's measured peak stays strictly under the bound.
+    assert peak <= facts.peak_tensor_bytes_upper_bound
     if duplicate:
         new, repeated, old = actual.values
         torch.testing.assert_close(new, torch.full_like(new, 3), rtol=0, atol=0)
@@ -200,7 +207,11 @@ def test_compiler_eliminated_view_keeps_output_copy_and_capacity_contract(device
     x = torch.arange(128, dtype=torch.float32, device=device)
     source = ExportedCell.capture(lambda x: (x.view(128),), ("x",), ("out",), (x,))
     compiled = compile_tensor_cell(source)
-    assert compiled.implementation.allocations == ()
+    # The compiler eliminates the view; the graph account still charges its
+    # span plus slack — a deliberate over-count, never an omission.
+    scratch = x.numel() * x.element_size()
+    scratch += math.ceil(scratch * COMPILER_SLACK_FRACTION)
+    assert sum(a.bytes for a in compiled.implementation.allocations) == scratch
     actual, = compiled.invoke((x,), None)
     torch.testing.assert_close(actual, x, rtol=0, atol=0)
     assert actual.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
@@ -208,8 +219,8 @@ def test_compiler_eliminated_view_keeps_output_copy_and_capacity_contract(device
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     capacity = analyze_region_capacity(program, schedule, {source.digest: compiled})
     facts, = capacity.devices
-    assert facts.call_scratch_bytes_upper_bound == 0
-    assert facts.peak_tensor_bytes_upper_bound == 2 * x.numel() * x.element_size()
+    assert facts.call_scratch_bytes_upper_bound == scratch
+    assert facts.peak_tensor_bytes_upper_bound == 2 * x.numel() * x.element_size() + scratch
 
 
 def test_optout_avoids_compilation_and_capacity_can_reject_a_faster_compiled_plan(monkeypatch):
@@ -415,7 +426,8 @@ def test_compiled_borrow_keeps_region_view_origin_and_old_versions(device):
     cells = {view.digest: view, update.digest: replace(compiled, function=record)}
     schedule = analyze_region_program(program).reference_schedule
     capacity = analyze_region_capacity(program, schedule, cells)
-    assert capacity.devices[0].call_scratch_bytes_upper_bound == 512
+    assert capacity.devices[0].call_scratch_bytes_upper_bound == sum(
+        a.bytes for a in compiled.implementation.allocations)
     run = RegionInstructionExecution(program, lower_region_schedule(program, schedule),
         lower_region_bindings(program, schedule), cells)
     old_base, old_view, new, again, old = run.run({"base": base}).values
