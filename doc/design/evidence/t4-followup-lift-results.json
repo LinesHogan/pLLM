@@ -30,5 +30,23 @@
   "pre_existing_fixes_landed_with_this_step": [
     "test/boundary/test_region_model_proposals.py: latent funding gap from step 3 — the measured tuning protocol now specializes with ExecutionOptions(tuning=measured) so the arena reservation funds every measured candidate (CUDA-only test, fails identically on the pre-lift build)",
     "test/gpu/enginecore_smoke.py: dropped assertions against BackendWorkerState.compilation_signature and TraceSnapshot.schedule_signature, fields deliberately removed by 3441c8b (completes the signature-layer removal)"
-  ]
+  ],
+  "step2_envelope_lift_prototype": {
+    "status": "prototyped, NOT implemented; T4 follow-up closed with these numbers (user decision 2026-09-15)",
+    "method": "derived capacity+retention on the 1-request half program (42 statements) and the full 2/3-request programs for every catalog candidate and compared terms",
+    "composition_law_verified_byte_exact_at_R2_R3": {
+      "logical_read_write_bytes": "R x half",
+      "result_copy_bytes": "R x half",
+      "live_tensor_bytes": "R x half",
+      "call_scratch_bytes": "1 x half (calls never overlap across request-block-sequential schedules)",
+      "retention_peak_bytes": "1 x half (tokenwise.recovery is request-scoped; its cross-request residual C_end is 0)",
+      "peak_tensor_bytes": "R x (half_live + half_result_copy) + half_scratch"
+    },
+    "general_form": "live = half_live + (R-1) x C_end where C_end is the end-of-request cross-request live bytes; exact on this workload because C_end = half_live (the live extremum is attained at the request boundary). Untested terms: entry_copy (0 on this config), retention allocations with cross-request accumulation",
+    "measured_payload_seconds": {
+      "full_catalog_full_domain": {"reference": 0.05, "isl-locality": 1.92, "isl-parallel": 2.81, "window-2-depth-1": 4.68, "window-4-depth-1": 6.30, "total": 15.76},
+      "half_domain_equivalent": {"isl-locality": 0.36, "isl-parallel": 0.57, "window-2-depth-1": 1.11, "window-4-depth-1": 1.59, "total": 3.64}
+    },
+    "closure_rationale": "production implementation (half-program surgery + boundary queries + roots/retention relation lift + signature reconstruction) is larger than step 1 and serves only the measured opt-in path, which step 3 already removed from the default cold start; the composition law is archived here for any future request-count-scaling work"
+  }
 }

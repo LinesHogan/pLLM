@@ -493,6 +493,17 @@ test_region_model_proposals 补上 measured opt-in 的资金储备（③ 遗留�
 专属测试），enginecore smoke 移除对 3441c8b 已删除签名字段的断言。证据见
 [跨请求提升结果](evidence/t4-followup-lift-results.json)。
 
+②payload envelope 提升止于原型（用户决策 2026-09-15，带数字关账）：在
+half（1 请求）与 full（2/3 请求）上逐候选对比 payload 各项，合成律在
+R=2、3 上逐字节成立——logical r/w、result_copy、live_tensor 为 R×half，
+call_scratch 与请求域 retention 为 1×half，peak = R×(half_live +
+half_result_copy) + half_scratch；一般形式 live = half_live +
+(R-1)×C_end（C_end 为请求结束时刻的跨界存活字节，本配置 C_end = half_live，
+极值点恰在请求边界）。half 推导 3.64s 对 full 15.76s（≈4.3×）。生产实现
+（半程序手术 + 边界查询 + roots/retention 关系提升 + 签名重建）明显大于
+①，且只服务 measured opt-in 路径——③ 已把这笔钱从默认冷启动消除——故
+T4 定向后续以 ③+① 关账，合成律存档于证据文件备查。
+
 ## 调度目录去重的单站点收敛（T4 关账）
 
 语义去重原来分散在两处：window 族逐构造对参考和基各跑一次全域
