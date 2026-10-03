@@ -27,7 +27,7 @@ def test_selected_tensor_rewrite_preserves_surrounding_invocation_effects():
     from pllm.contracts.region_program import ExternalResource, Function
     from pllm.execution.region_native import external_primitive
     from pllm.execution.region_resources import ExternalFunction, RegionResources
-    from pllm.execution.tensor_rewrites import explore_matmul_reassociations
+    from test.boundary.test_tensor_rewrites import reassociation_candidates
     from test.boundary.test_region_pages import owner_fixture
 
     pure, sources, inputs = chain()
@@ -42,9 +42,9 @@ def test_selected_tensor_rewrite_preserves_surrounding_invocation_effects():
     sources = {**sources, begin.name: external_primitive(begin), publish.name: external_primitive(publish)}
     original_imports = import_region_functions(program, sources)
     outlined = outline_region_calls(program, sources, CallOutline((), 1, 2))
-    path = explore_matmul_reassociations(outlined.cell)[0]
+    rewritten, = reassociation_candidates(outlined.cell)
     derived = outlined.outlined.program
-    functions = {**sources, outlined.cell.digest: path.cell}
+    functions = {**sources, outlined.cell.digest: rewritten.cell}
     proof = CallOutlineEvidence(outlined.site, import_tensor_access_graph(outlined.cell))
     candidates = (
         RegionCandidate(analyze_region_program(program, optimize=False).reference_schedule, original_imports, (100,)),
@@ -58,18 +58,18 @@ def test_selected_tensor_rewrite_preserves_surrounding_invocation_effects():
     selection = select_region_candidate(program, request)
     assert selection.selected == 1
     with pytest.warns(NumericalTransformWarning):
-        selected = bind_region_candidate(PreparedRegionCandidate(derived, candidates[1], path.rewrites, functions),
+        selected = bind_region_candidate(PreparedRegionCandidate(derived, candidates[1], (rewritten.rewrite,), functions),
             request.payload_limits, selection.candidates[1])
         warn_region_transforms(selected, selection.candidates[1], selection.signature)
     trials = replace(request, candidates=tuple(replace(candidate, elapsed_ns=()) for candidate in candidates))
     with warnings.catch_warnings(record=True) as caught:
-        trial = bind_region_candidate(PreparedRegionCandidate(derived, trials.candidates[1], path.rewrites, functions),
+        trial = bind_region_candidate(PreparedRegionCandidate(derived, trials.candidates[1], (rewritten.rewrite,), functions),
             trials.payload_limits, assess_region_candidates(program, trials)[1])
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
     for invalid in (replace(trials, payload_limits=(RegionPayloadLimit("cpu", 1),)),
                     replace(trials, allow_numerical_transforms=False)):
         with pytest.raises(ValueError, match="payload or numerical policy"):
-            bind_region_candidate(PreparedRegionCandidate(derived, invalid.candidates[1], path.rewrites, functions),
+            bind_region_candidate(PreparedRegionCandidate(derived, invalid.candidates[1], (rewritten.rewrite,), functions),
                 invalid.payload_limits, assess_region_candidates(program, invalid)[1])
     with pytest.raises(ValueError, match="pure program"):
         optimize_region(program, sources, inputs, payload_limits=request.payload_limits, options=RegionSelectionPolicy(tuning="measured"))

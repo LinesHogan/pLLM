@@ -109,10 +109,6 @@ class StateTaskContext(Generic[DataT]):
         pin = self.published_pin
         return None if pin is None else self.page_pins[pin]
 
-    @property
-    def publication_settled(self) -> bool:
-        return bool(self.page_publications) and all(self.page_publications.values())
-
     def current_owned_ref(self, original: StateRef) -> StateRef:
         if original not in self.pin.refs:
             raise ValueError("state lineage is outside this invocation's original pin")

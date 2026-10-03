@@ -17,7 +17,7 @@ from pllm.execution.region_compilation import analyze_region_program, lower_regi
 from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_outlining import bind_outlined_region, outline_region_calls
 from pllm.execution.region_storage import analyze_region_capacity, validate_region_capacity
-from pllm.execution.tensor_rewrites import explore_matmul_reassociations
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 from test.boundary.test_tensor_access import StorageObserver
 
 
@@ -54,8 +54,8 @@ def test_exact_composition_preserves_escaping_versions_and_enables_cross_call_ma
     assert native == result.outlined
     assert result.cell.transformations == ()
     assert result.outlined.body.yields == (("ab", "out") if escape else ("out",))
-    assert all(not explore_matmul_reassociations(c) for c in cells.values())
-    assert len(explore_matmul_reassociations(result.cell)) == (0 if escape else 1)
+    assert all(not reassociation_candidates(c) for c in cells.values())
+    assert len(reassociation_candidates(result.cell)) == (0 if escape else 1)
     assert not any(n.op == "call_module" for n in result.cell.graph.graph.nodes)
     assert len([n for n in result.cell.graph.graph.nodes if n.op == "call_function"]) == 2
     originals = execution(program, cells).run(inputs)

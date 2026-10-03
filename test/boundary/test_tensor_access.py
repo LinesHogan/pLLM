@@ -12,7 +12,7 @@ from pllm.contracts.tensor_access import TensorAccessKind, TensorMemoryProfile
 from pllm.execution.codec import decode_boundary, encode_boundary, tensor_node_metadata
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.tensor_access import import_tensor_access_graph, profile_tensor_memory, validate_tensor_memory
-from pllm.execution.tensor_rewrites import matmul_reassociation_candidates
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 
 
 class StorageObserver(TorchDispatchMode):
@@ -45,7 +45,7 @@ def chain(a, b, c):
 def test_less_arithmetic_can_increase_memory_traffic_and_peak_storage():
     inputs = tuple(torch.ones(shape, dtype=torch.float64) for shape in ((4, 1), (1, 4), (4, 32)))
     source = capture(chain, inputs)
-    candidate, = matmul_reassociation_candidates(source)
+    candidate, = reassociation_candidates(source)
     before, = profile_tensor_memory(source).devices
     after, = profile_tensor_memory(candidate.cell).devices
     assert candidate.rewrite.after.flops == 512 < candidate.rewrite.before.flops == 1056
@@ -120,7 +120,7 @@ def test_rewrite_refreshes_downstream_view_aliases_and_import_ignores_stale_meta
 
     inputs = (torch.ones(4, 2), torch.ones(2, 8), torch.ones(8, 3))
     source = capture(function, inputs, ("transpose", "slice"))
-    candidate, = matmul_reassociation_candidates(source)
+    candidate, = reassociation_candidates(source)
     nodes = {node.name: node for node in candidate.cell.graph.graph.nodes}
     product = tensor_node_metadata(nodes[candidate.rewrite.replacement_nodes[1]])
     view = next(n for n in nodes.values() if str(n.target) == "aten.permute.default")

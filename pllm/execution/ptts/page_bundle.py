@@ -926,15 +926,6 @@ class PageBundleArena:
             with self._scope(pin.stream):
                 return tuple(pools.tensor(field, page).detach().clone() for field, page in enumerate(root.pages))
 
-    def field_rows(self, pin: PagePin, field: LayoutFieldId) -> torch.Tensor:
-        with self._lock:
-            self._issued_pin(pin)
-            roots = tuple(self.root(ref) for ref in pin.refs)
-            if len({root.ref.layout_id for root in roots}) != 1:
-                raise ValueError("PageBundle batched reads require one signed layout")
-            with self._scope(pin.stream):
-                return torch.stack(tuple(self._pools[root.resource].tensor(field, root.pages[field]) for root in roots))
-
     def release_pin(self, pin: PagePin) -> PageRelease:
         with self._lock:
             held = self._issued_pin(pin)

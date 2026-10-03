@@ -92,41 +92,18 @@ def _candidate(cell: ExportedCell, outer: torch.fx.Node, association: MatmulAsso
 
 
 def _steps(cell: ExportedCell) -> Iterator[TensorRewriteCandidate[MatmulReassociation]]:
-    for outer in cell.graph.graph.nodes:
-        for association in MatmulAssociation:
-            candidate = _candidate(cell, outer, association)
-            if candidate is not None:
-                yield candidate
-
-
-def matmul_reassociation_candidates(cell: ExportedCell) -> tuple[TensorRewriteCandidate[MatmulReassociation], ...]:
-    """Enumerate single-site, rank-2 reassociations without choosing a winner.
+    """Single-site, rank-2 reassociations without choosing a winner.
 
     Matrix associativity preserves real arithmetic, but changes floating-point
     evaluation (including possible overflow). Every candidate therefore requires
     the numerical-transform policy. FLOPs and the internal product size are
     analytical facts, not guarantees of speed, peak memory or numerical error.
-
-    Start from the original imported graph. For multiple steps, use the bounded
-    search below, which retains and replays the whole provenance chain.
     """
-    if cell.transformations:
-        raise ValueError("matmul candidate generation requires the original exported cell")
-    return tuple(_steps(cell))
-
-
-def replay_matmul_reassociation(source: ExportedCell, record: MatmulReassociation) -> ExportedCell:
-    """Recheck evidence against source and rebuild locally, never trust a callable.
-
-    Plan binding can use this replay boundary after native candidate selection.
-    A digest alone does not establish the equation, prerequisites or costs.
-    """
-    return replay_matmul_reassociations(source, (record,))
-
-
-def replay_matmul_reassociations(source: ExportedCell, records: tuple[MatmulReassociation, ...]) -> ExportedCell:
-    """Replay every step in order; an intermediate graph is never an authority."""
-    return _replay(source, records, _steps)
+    for outer in cell.graph.graph.nodes:
+        for association in MatmulAssociation:
+            candidate = _candidate(cell, outer, association)
+            if candidate is not None:
+                yield candidate
 
 
 def _all_steps(cell: ExportedCell) -> Iterator[TensorRewriteCandidate[TensorRewrite]]:
@@ -143,50 +120,32 @@ def replay_tensor_rewrites(source: ExportedCell, records: tuple[TensorRewrite, .
 def _replay(source: ExportedCell, records: tuple[RewriteT, ...],
             steps: Callable[[ExportedCell], Iterator[TensorRewriteCandidate[RewriteT]]]) -> ExportedCell:
     if source.transformations:
-        raise ValueError("matmul replay requires the original exported cell")
+        raise ValueError("tensor rewrite replay requires the original exported cell")
     current = source
     for record in records:
         if source.digest != record.source_digest:
-            raise ValueError("matmul rewrite belongs to a different source")
+            raise ValueError("tensor rewrite belongs to a different source")
         for candidate in steps(current):
             if candidate.rewrite == record:
                 current = candidate.cell
                 break
         else:
-            raise ValueError("matmul rewrite evidence does not match the source graph and prerequisites")
+            raise ValueError("tensor rewrite evidence does not match the source graph and prerequisites")
     return current
-
-
-def explore_matmul_reassociations(source: ExportedCell, *, max_depth: int = 2,
-                                 max_candidates: int = 16) -> tuple[TensorRewritePath[MatmulReassociation], ...]:
-    """Bounded breadth-first search, without a local FLOP or byte ranking.
-
-    Intermediates can be locally more expensive: later rules and region-level
-    lifetimes determine the complete candidate's cost. The original graph and
-    already visited graph structures are excluded, preventing inverse cycles
-    from creating candidates just by giving their nodes new names.
-    """
-    return tuple(state[0] for state in _explore((source,), max_depth, max_candidates, _steps))
-
-
-def explore_matmul_combinations(sources: tuple[ExportedCell, ...], *, max_depth: int = 2,
-                                max_candidates: int = 16) -> tuple[tuple[MatmulReassociation, ...], ...]:
-    """Search joint changes across imported functions, under one total step budget.
-
-    Changing only one call can leave another call's large temporary unchanged.
-    Keep combinations until the region's actual lifetimes and completed time
-    can be assessed. Function order is canonical; commuting rewrites do not
-    create duplicate candidates. This composes proofs within existing function
-    boundaries, without fusing calls or changing their input/output contracts.
-    """
-    ordered = tuple(sorted(sources, key=lambda cell: cell.digest))
-    return tuple(tuple(record for path in state for record in path.rewrites)
-                 for state in _explore(ordered, max_depth, max_candidates, _steps))
 
 
 def explore_tensor_combinations(sources: tuple[ExportedCell, ...], *, max_depth: int = 2,
                                 max_candidates: int = 16) -> tuple[tuple[TensorRewrite, ...], ...]:
-    """Joint bounded search over reassociation and independent GEMM batching."""
+    """Joint bounded search over reassociation and independent GEMM batching.
+
+    Changing only one call can leave another call's large temporary unchanged.
+    Keep combinations until the region's actual lifetimes and completed time
+    can be assessed. Function order is canonical; commuting rewrites do not
+    create duplicate candidates. Intermediates can be locally more expensive:
+    later rules and region-level lifetimes determine the complete candidate's
+    cost. Already visited graph structures are excluded, preventing inverse
+    cycles from creating candidates just by giving their nodes new names.
+    """
     ordered = tuple(sorted(sources, key=lambda cell: cell.digest))
     return tuple(tuple(record for path in state for record in path.rewrites)
                  for state in _explore(ordered, max_depth, max_candidates, _all_steps))
@@ -196,11 +155,11 @@ def _explore(sources: tuple[ExportedCell, ...], max_depth: int,
              max_candidates: int, steps: Callable[[ExportedCell], Iterator[TensorRewriteCandidate[RewriteT]]]
              ) -> Iterator[tuple[TensorRewritePath[RewriteT], ...]]:
     if any(source.transformations for source in sources):
-        raise ValueError("matmul search requires the original exported cell")
+        raise ValueError("rewrite search requires the original exported cell")
     if len({source.digest for source in sources}) != len(sources):
-        raise ValueError("matmul search requires unique source function identities")
+        raise ValueError("rewrite search requires unique source function identities")
     if (type(max_depth) is not int or max_depth < 0 or type(max_candidates) is not int or max_candidates < 0):
-        raise ValueError("matmul search requires nonnegative depth and candidate limits")
+        raise ValueError("rewrite search requires nonnegative depth and candidate limits")
     if not sources or max_depth == 0 or max_candidates == 0:
         return
     initial_keys = tuple(tensor_graph_structure_digest(source.graph) for source in sources)

@@ -9,7 +9,7 @@ import torch
 from pllm.backends.torch_inductor import COMPILER_SLACK_FRACTION
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.tensor_compilation import compile_tensor_cell
-from pllm.execution.tensor_rewrites import matmul_reassociation_candidates
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 
 
 def test_existing_model_graph_import_does_not_recapture_execute_or_bind_weights():
@@ -37,7 +37,7 @@ def test_existing_model_graph_import_does_not_recapture_execute_or_bind_weights(
     expected = model(x)
     actual, = cell(model.left, model.right, x)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    candidate, = matmul_reassociation_candidates(cell)
+    candidate, = reassociation_candidates(cell)
     rewritten, = candidate.cell(model.left, model.right, x)
     torch.testing.assert_close(rewritten, expected, rtol=1e-12, atol=1e-12)
     # Another version is an explicit input, never an implicit read from model.

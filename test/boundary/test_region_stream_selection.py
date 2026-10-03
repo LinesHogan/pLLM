@@ -18,7 +18,7 @@ from pllm.execution.region_optimization import prepare_region_execution, warn_re
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_streams import RegionStreamBindings, explore_region_streams, lower_region_streams
 from pllm.execution.tensor_compilation import compile_tensor_cell
-from pllm.execution.tensor_rewrites import matmul_reassociation_candidates
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 from pllm.execution.tensor_scan import TensorScan
 from test.boundary.test_region_streams import grid, limits
 from test.boundary.test_region_tensor import inputs_for
@@ -122,7 +122,7 @@ def test_compiled_reassociation_and_parallel_placement_share_numerical_replay():
     cell = ExportedCell.capture(lambda a, b, c: ((a @ b) @ c,), ("a", "b", "c"), ("out",), tensors)
     scan = TensorScan(cell, SizeParameter("steps", 0, 5), carry=0, invariants=3)
     program = scan.program
-    variant, = matmul_reassociation_candidates(cell)
+    variant, = reassociation_candidates(cell)
     compiled = compile_tensor_cell(variant.cell)
     originals = {cell.digest: cell}
     changed = {cell.digest: compiled}

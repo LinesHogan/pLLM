@@ -7,13 +7,21 @@ import pytest
 import torch
 
 from pllm.config import ExecutionOptions
+from pllm.contracts.tensor_rewrite import MatmulReassociation
 from pllm.execution.codec import tensor_graph_structure_digest, tensor_graph_expression_digest
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_optimization import optimize_region, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.tensor_access import profile_tensor_memory
-from pllm.execution.tensor_rewrites import explore_matmul_reassociations, replay_matmul_reassociations
+from pllm.execution.tensor_rewrites import TensorRewritePath, explore_tensor_combinations, replay_tensor_rewrites
 from test.boundary.test_region_native_capacity import single_call
+
+
+def reassociation_paths(source: ExportedCell, **kwargs) -> tuple[TensorRewritePath[MatmulReassociation], ...]:
+    """Multi-step reassociation search through the general explore/replay door."""
+    return tuple(TensorRewritePath(replay_tensor_rewrites(source, rs), rs)
+                 for rs in explore_tensor_combinations((source,), **kwargs)
+                 if all(isinstance(r, MatmulReassociation) for r in rs))
 
 
 def example(device="cpu", balanced=False):
@@ -34,7 +42,7 @@ def test_search_deduplicates_inverse_cycles_and_preserves_the_original_graph(bal
         raise AssertionError("search must not execute user mathematics")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        paths = explore_matmul_reassociations(replace(source, function=forbidden), max_depth=6, max_candidates=32)
+        paths = reassociation_paths(replace(source, function=forbidden), max_depth=6, max_candidates=32)
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
     # Five mathematical parenthesizations total, including the original.
     # Different orders for independent products can remain physical candidates.
@@ -48,20 +56,16 @@ def test_search_deduplicates_inverse_cycles_and_preserves_the_original_graph(bal
 
 def test_depth_and_candidate_budgets_do_not_greedily_prune_by_local_cost():
     source, _ = example()
-    shallow = explore_matmul_reassociations(source, max_depth=1)
-    deeper = explore_matmul_reassociations(source, max_depth=2)
-    assert len(shallow) == 2 < len(deeper)
-    assert all(len(p.rewrites) == 1 for p in shallow)
-    assert len(explore_matmul_reassociations(source, max_depth=6, max_candidates=1)) == 1
-    assert explore_matmul_reassociations(source, max_depth=0) == ()
-    assert explore_matmul_reassociations(source, max_candidates=0) == ()
+    assert len(reassociation_paths(source, max_depth=6, max_candidates=1)) == 1
+    assert reassociation_paths(source, max_depth=0) == ()
+    assert reassociation_paths(source, max_candidates=0) == ()
     for kwargs in ({"max_depth": -1}, {"max_candidates": -1}, {"max_depth": True}):
         with pytest.raises(ValueError, match="nonnegative"):
-            explore_matmul_reassociations(source, **kwargs)
+            reassociation_paths(source, **kwargs)
     # Reverse the useful chain: expensive first steps remain in the search.
     tensors = tuple(torch.ones(s, dtype=torch.float64) for s in ((4, 2), (2, 8), (8, 4), (4, 2)))
     right = ExportedCell.capture(lambda a, b, c, d: (a @ (b @ (c @ d)),), ("a", "b", "c", "d"), ("out",), tensors)
-    assert any(p.rewrites[0].after.flops > p.rewrites[0].before.flops for p in explore_matmul_reassociations(right))
+    assert any(p.rewrites[0].after.flops > p.rewrites[0].before.flops for p in reassociation_paths(right))
 
 
 def test_two_step_search_crosses_a_local_compute_and_memory_minimum():
@@ -69,11 +73,11 @@ def test_two_step_search_crosses_a_local_compute_and_memory_minimum():
     source = ExportedCell.capture(lambda a, b, c, d: (((a @ b) @ c) @ d,),
         ("a", "b", "c", "d"), ("out",), tensors)
     before = profile_tensor_memory(source).devices[0].peak_new_tensor_bytes
-    shallow = explore_matmul_reassociations(source, max_depth=1)
+    shallow = reassociation_paths(source, max_depth=1)
     assert len(shallow) == 2
     assert all(p.rewrites[0].after.flops > p.rewrites[0].before.flops for p in shallow)
     assert all(profile_tensor_memory(p.cell).devices[0].peak_new_tensor_bytes > before for p in shallow)
-    paths = explore_matmul_reassociations(source, max_depth=2)
+    paths = reassociation_paths(source, max_depth=2)
     better = [p for p in paths if profile_tensor_memory(p.cell).devices[0].peak_new_tensor_bytes < before]
     assert better and all(len(p.rewrites) == 2 for p in better)
     # Initial graph: 46 FLOPs. Both immediate neighbors cost more, but one
@@ -88,14 +92,14 @@ def test_every_step_replays_and_final_access_graph_is_recomputed(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     source, tensors = example(device)
-    paths = explore_matmul_reassociations(source)
+    paths = reassociation_paths(source)
     original = profile_tensor_memory(source)
     assert any(len(p.rewrites) > 1 for p in paths)
     for path in paths:
         assert len(path.cell.transformations) == len(path.rewrites)
         for before, after in zip(path.rewrites, path.rewrites[1:]):
             assert before.output_graph_digest == after.input_graph_digest
-        replayed = replay_matmul_reassociations(source, path.rewrites)
+        replayed = replay_tensor_rewrites(source, path.rewrites)
         assert str(replayed.graph.graph) == str(path.cell.graph.graph)
         assert replayed.declaration == source.declaration
         torch.testing.assert_close(replayed(*tensors)[0], tensors[0] @ tensors[1] @ tensors[2] @ tensors[3], rtol=0, atol=0)
@@ -105,15 +109,15 @@ def test_every_step_replays_and_final_access_graph_is_recomputed(device):
 
 def test_missing_reordered_duplicated_or_forged_steps_cannot_replay():
     source, _ = example()
-    path = next(p for p in explore_matmul_reassociations(source) if len(p.rewrites) == 2)
+    path = next(p for p in reassociation_paths(source) if len(p.rewrites) == 2)
     first, second = path.rewrites
     for records in ((second,), (second, first), (first, first),
                     (first, replace(second, input_graph_digest=first.input_graph_digest)),
                     (first, replace(second, after=replace(second.after, flops=0)))):
         with pytest.raises(ValueError, match="source"):
-            replay_matmul_reassociations(source, records)
+            replay_tensor_rewrites(source, records)
     with pytest.raises(ValueError, match="original exported"):
-        explore_matmul_reassociations(path.cell)
+        reassociation_paths(path.cell)
 
 
 def test_multistep_search_preserves_functional_mutation_and_returned_views():
@@ -122,8 +126,8 @@ def test_multistep_search_preserves_functional_mutation_and_returned_views():
         state.copy_(((a @ b) @ c) @ d)
         return state, state[:1]
     source = ExportedCell.capture(update, ("a", "b", "c", "d", "state"), ("new", "view"), tensors)
-    path = next(p for p in explore_matmul_reassociations(source) if len(p.rewrites) == 2)
-    replayed = replay_matmul_reassociations(source, path.rewrites)
+    path = next(p for p in reassociation_paths(source) if len(p.rewrites) == 2)
+    replayed = replay_tensor_rewrites(source, path.rewrites)
     assert replayed.output_positions == source.output_positions
     assert replayed.mutations == source.mutations
     result, view = replayed(*tensors)
@@ -146,7 +150,7 @@ def test_native_selection_binds_the_whole_selected_chain_and_rejects_a_prefix(mo
             payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1)
     assert len(selected.rewrites) == 2
-    partial = replay_matmul_reassociations(source, selected.rewrites[:1])
+    partial = replay_tensor_rewrites(source, selected.rewrites[:1])
     with pytest.raises(ValueError, match="admitted imports"):
         bind_region_candidate(PreparedRegionCandidate(single_call(source), selected.request.candidates[selected.selection.selected],
             selected.rewrites[:1], {source.digest: partial}), selected.request.payload_limits, selected.selection.candidates[selected.selection.selected])

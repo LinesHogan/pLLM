@@ -18,7 +18,7 @@ from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_optimization import warn_region_transforms, assess_region_candidates, optimize_region, select_region_candidate, PreparedRegionCandidate, bind_region_candidate
 from pllm.execution.region_storage import import_region_functions
-from pllm.execution.tensor_rewrites import matmul_reassociation_candidates
+from test.boundary.test_tensor_rewrites import reassociation_candidates
 from test.boundary.test_region_native_capacity import single_call
 from test.boundary.test_region_tensor import tensor_grid, inputs_for
 
@@ -27,7 +27,7 @@ def example(device="cpu", shapes=((4, 1), (1, 4), (4, 32))):
     tensors = tuple(torch.ones(shape, dtype=torch.float64, device=device) for shape in shapes)
     cell = ExportedCell.capture(lambda a, b, c: ((a @ b) @ c,), ("a", "b", "c"), ("out",), tensors)
     program = single_call(cell)
-    variant, = matmul_reassociation_candidates(cell)
+    variant, = reassociation_candidates(cell)
     schedule = analyze_region_program(program).reference_schedule
     original = import_region_functions(program, {cell.digest: cell})
     rewritten = import_region_functions(program, {cell.digest: variant.cell})
