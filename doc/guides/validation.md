@@ -84,7 +84,7 @@ python -m maturin sdist
 依赖、许可证打包与已退役包/插件的缺席。
 
 但要明确：wheel 构建成功本身不授权发布。打 tag 或发布之前，必须完成
-[整体验收](../design/architecture-consolidation-10k-plan.md)：全部选中的
+[整体验收](../history/architecture-consolidation-10k-plan.md)：全部选中的
 39 项原始证据契约、组合证据 40/41 与采样反馈证据 42、共享/独立 LoRA 证据
 43/44、性能对比 45/46 与独立适配证据 47——合计 26 个 pytest、8 个 Rust、
 13 条运行时命令与 3 个基准对比，共 50 次选中执行——外加运行时边界与 30k

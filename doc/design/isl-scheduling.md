@@ -239,7 +239,7 @@ validity 是必须满足的顺序；coincidence 和 proximity 表达优化偏好
 各自需要候选生成与 lowering；不是调用一次 ISL 就自动完成全部优化。
 
 成本目标应补启动次数、传输、并行资源占用和关键路径估计，再辅以有界实测。
-现有 AER 的 materialization / transfer / region / peak / fence 评分没有
+现有 AER 的 materialization / region / peak / fence 评分没有
 完整设备延迟模型，不能把 region 更少解释为一定更快。在线路径使用冷编译的
 有界形状 / 别名分组缓存；候选比较必须保持算法语义和有效训练量一致。
 
@@ -282,7 +282,7 @@ validity 是必须满足的顺序；coincidence 和 proximity 表达优化偏好
 - [普通 overlay 的绑定](../../pllm/execution/tensor_binding.py)
 - [vLLM 的 forward 边界](../../pllm/backends/vllm/runtime.py)
 - [状态页所有权](../../pllm/execution/ptts/page_bundle.py)
-- [既有通用编程设计](programmable-inference-next-design.md)
+- [既有通用编程设计](../history/programmable-inference-next-design.md)
 - [ISL 官方手册](https://libisl.sourceforge.io/user.html)：Scheduling、Dependence Analysis、AST Generation。
 - [isl-rs 0.3.1](https://docs.rs/isl-rs/0.3.1/isl_rs/)；实验使用本地已构建的该版本，
   语义与接口同时核对了其随附 ISL `doc/user.pod`。

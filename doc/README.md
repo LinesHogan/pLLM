@@ -45,11 +45,21 @@
 
 ## 设计说明（解释导向）
 
-- [当前架构与所有权](design/architecture.md)
-- [In-Place-TTT 稠密 overlay 语义](design/inplace-ttt.md)
-- [整合计划：验收与排除项](design/architecture-consolidation-10k-plan.md)
-- [可编程推理设计与共享边界](design/programmable-inference-next-design.md)
-- [共享高性能原语设计](design/pllm-next-stage-design.md)
+当前权威：
 
-整合计划记录验收与排除项。可执行证据清单在 `test/evidence_manifest.toml`；
-不存在第二份进度台账。已退役的 API 指南与迁移报告不与当前架构并存维护。
+- [当前架构与所有权](design/architecture.md)
+- [Region IR](design/region-ir.md)
+- [计算模型](design/computation-model.md)
+- [ISL 调度](design/isl-scheduling.md)
+- [In-Place-TTT 稠密 overlay 语义](design/inplace-ttt.md)
+- [实现状态台账](design/implementation-status.md) —— 唯一进度入口
+- [精简路线](design/post-implementation-simplification.md)
+- [调度精简施工记录](design/scheduling-simplification-work-order.md)
+- [E1 上下文包：跨进程页授权](design/e1-cross-process-page-authorization.md) —— 复杂工程任务交接
+- [审计记录](audits/)（调度复杂度、未用代码、实现结果数据）
+
+历史归档（只读背景，不代表当前接口）：[history/](history/) —— 整合计划、
+AER/PTTS 研究原稿、早期架构报告与其修订。验收证据快照在
+[design/evidence/](design/evidence/)；可执行证据清单在
+`test/evidence_manifest.toml`。已退役的 API 指南与迁移报告不与当前架构
+并存维护。

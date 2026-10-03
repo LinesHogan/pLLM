@@ -536,7 +536,7 @@ backward scratch 成本声明：其无界模式不是有限内存保证，Rust �
 
 ### 原语目录与 `MathContract`
 
-[PLLM 设计](../design/pllm-next-stage-design.md) 区分普通数学执行与显式高性能
+[PLLM 设计](../history/pllm-next-stage-design.md) 区分普通数学执行与显式高性能
 原语绑定。`compute` 是不透明的原生操作；`a.ops` 放维护中的原语绑定。当前目录
 包含门控预测/loss/更新实现候选与既有的低秩 loss/AdamW 捕获绑定。它不是通用
 算子库，也不是任意 autograd 程序的自动下沉。

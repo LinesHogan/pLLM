@@ -69,7 +69,7 @@ If 从 10 降为 2。存储归属推导拆为调度无关的 provenance（一次
 - 除源摘要外，新旧分析事实和候选完全一致；此前值编号缩减通过了 ISL 来源／依赖等价对照。
 
 这些数量是源表示和编译产物的缩减，不能解释为 GPU 流量、显存或吞吐按相同比例改善。
-可复核过程见 [中段精简审计](recirculation-middle-end-audit.md)。
+可复核过程见 [中段精简审计](../history/recirculation-middle-end-audit.md)。
 后续层号清理又将数学值位置从 89 降为 85，具体对照见下方 DecoderSource 收口；
 后续新源不再是只删除 Order 的逐字投影。
 

@@ -155,4 +155,4 @@ replay 之后的显式快照受支持。这些观测不蕴含确定性的全模�
 性能声称。
 
 维护中的支持矩阵在 [README](../../README.md)；验收标准与显式排除项在
-[整合计划](architecture-consolidation-10k-plan.md)。
+[整合计划](../history/architecture-consolidation-10k-plan.md)。
