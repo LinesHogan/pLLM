@@ -1,10 +1,10 @@
 """Cold Python authoring boundary. Reflection stops at the original typed graph."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from inspect import Parameter as SignatureParameter, signature
-from types import FunctionType
+from types import FunctionType, MethodType
 from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 
 import torch
@@ -25,7 +25,7 @@ from pllm.execution.codec import boundary_digest
 from pllm.execution.declaration import Call, Dimensions, Shape, State, When
 from pllm.execution.tensor_binding import Buffer as Buffer, TensorUpdate as TensorUpdate
 from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorPort, Tensors, TensorOutput as TensorOutput, SGD as SGD
-from pllm.execution.freeze import NativeMath, fingerprint, freeze, members as _members, owner_snapshot, owner_values
+from pllm.execution.freeze import NativeMath, fingerprint, freeze, members as _members, owner_snapshot, owner_values, reachable_functions
 from pllm.execution.tensor_program import FunctionMath, Roots, InvocationOutput
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.host_runtime import (
@@ -382,17 +382,46 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         owner = _snapshot(self)
         members = _members(owner)
         values = _values(owner)
-        helpers: list[tuple[str, str]] = []
+        candidates: dict[str, FunctionType] = {}
         for cls in type(owner).__mro__:
             if cls is Workload:
                 break
             for name, member in vars(cls).items():
                 if name.startswith("__") or name in values or any(name in vars(base) for base in Workload.__mro__):
                     continue
-                if isinstance(member, FunctionType):
-                    function = cast(Callable[..., torch.Tensor], getattr(owner, name))
-                    helpers.append((name, fingerprint(function)))
-                    object.__setattr__(owner, name, freeze(function))
+                if isinstance(member, FunctionType) and name not in candidates:
+                    candidates[name] = member
+        # Helper signing is lazy: only methods reachable from bound mathematics
+        # (operations, state-declaring properties, and methods named by effect
+        # fields) are fingerprinted and frozen; unused methods neither enter
+        # the signature nor can fail the declaration.
+        seeds: list[FunctionType] = []
+        for name, member in members.items():
+            if isinstance(member, FunctionType) and isinstance(getattr(member, "__pllm_phase__", None), Phase):
+                seeds.append(member)
+            elif isinstance(member, property) and member.fget is not None and (
+                signature(member.fget, eval_str=False).return_annotation in (InstanceState, RequestState, Activation, Overlay, Recurrence)):
+                seeds.append(member.fget)
+            for attribute in ("__pllm_effect__", "__pllm_gradient__", "__pllm_rows__"):
+                marker = getattr(member, attribute, None)
+                texts = (marker,) if isinstance(marker, str) else (
+                    tuple(getattr(marker, item.name) for item in fields(marker))
+                    if is_dataclass(marker) and not isinstance(marker, type) else ())
+                seeds.extend(candidates[text] for text in texts if isinstance(text, str) and text in candidates)
+        for value in values.values():
+            if isinstance(value, InstanceState) and value.initialize is not None:
+                initialize = value.initialize.__func__ if isinstance(value.initialize, MethodType) else value.initialize
+                if isinstance(initialize, FunctionType):
+                    seeds.append(initialize)
+        seeded = {name for name, member in candidates.items() if any(member is seed for seed in seeds)}
+        reachable = reachable_functions(candidates, tuple(seeds)) | seeded
+        helpers: list[tuple[str, str]] = []
+        for name in candidates:
+            if name not in reachable:
+                continue
+            function = cast(Callable[..., torch.Tensor], getattr(owner, name))
+            helpers.append((name, fingerprint(function)))
+            object.__setattr__(owner, name, freeze(function))
         bindings = tuple((key, fingerprint(value)) for key, value in sorted(values.items()))
         states: dict[str, State] = {}
         parameters: dict[tuple[str, str], SemanticInputSource | TensorPort] = {}

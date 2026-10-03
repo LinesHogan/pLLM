@@ -242,3 +242,17 @@ def test_dummy_runs_graph_sign_plan_execute(monkeypatch: pytest.MonkeyPatch) -> 
     assert len(events) == 1 and torch.allclose(events[0][0], source)
     assert frozen_exec.diagnostics().fallback_count == 0
     frozen_exec.retire((identity,))
+
+
+def test_unused_helpers_are_neither_signed_nor_frozen() -> None:
+    class Lazy(pllm.Workload):
+        def unused(self):
+            import os  # Forbidden dependency: signing this helper would raise.
+            return os.getcwd()
+
+        @pllm.on(pllm.Phase.OBSERVE)
+        def observe(self, hidden: Annotated[torch.Tensor, pllm.Hidden(0)]) -> torch.Tensor:
+            return hidden * 2
+
+    execution = make_llm(workload=Lazy(), config=HostRuntimeFacts(torch.device("cpu")))
+    assert execution.plan.fallback_count == 0

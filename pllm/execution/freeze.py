@@ -96,6 +96,54 @@ def _global_names(code: CodeType) -> set[str]:
     return names
 
 
+def _self_attributes(code: CodeType, self_name: str, references: set[str]) -> bool:
+    """Attribute names loaded directly on the owner reference; False when it escapes analysis."""
+    instructions = tuple(get_instructions(code))
+    precise = True
+    for index, instruction in enumerate(instructions):
+        if instruction.opname == "LOAD_SUPER_ATTR" or instruction.argval == "super":
+            precise = False  # super() resolution crosses the class walk; sign the whole class
+        elif instruction.opname in ("LOAD_FAST", "LOAD_DEREF", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR",
+                                    "LOAD_CLASSDEREF") and instruction.argval == self_name:
+            follower = instructions[index + 1] if index + 1 < len(instructions) else None
+            if follower is not None and follower.opname in ("LOAD_ATTR", "LOAD_METHOD"):
+                references.add(str(follower.argval))
+            else:
+                precise = False  # aliased, passed, or stored — any method may be reached
+        elif instruction.opname in ("STORE_FAST", "STORE_DEREF", "STORE_NAME", "STORE_GLOBAL",
+                                    "DELETE_FAST", "DELETE_DEREF") and instruction.argval == self_name:
+            precise = False
+    for value in code.co_consts:
+        if isinstance(value, CodeType):
+            precise = _self_attributes(value, self_name, references) and precise
+    return precise
+
+
+def reachable_functions(candidates: Mapping[str, FunctionType],
+                        seeds: tuple[FunctionType, ...]) -> frozenset[str]:
+    """Candidate methods reachable from signed functions through the owner reference.
+
+    Cold reachability: attribute loads directly on the owner parameter, chased helper-to-helper
+    to a fixpoint. When the owner escapes the analysis anywhere (aliased, stored, super), every
+    candidate counts as reachable — the fallback signs the whole class as before.
+    """
+    reachable: set[str] = set()
+    pending = list(seeds)
+    while pending:
+        code = pending.pop().__code__
+        if not code.co_varnames:
+            continue
+        references: set[str] = set()
+        if not _self_attributes(code, code.co_varnames[0], references):
+            return frozenset(candidates)
+        for name in references:
+            target = candidates.get(name)
+            if target is not None and name not in reachable:
+                reachable.add(name)
+                pending.append(target)
+    return frozenset(reachable)
+
+
 def freeze(function: G) -> G:
     if isinstance(function, MethodType):
         return cast(G, MethodType(freeze(function.__func__), function.__self__))
