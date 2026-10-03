@@ -6,7 +6,7 @@
 //! Cold task allocations (including captured graph pools) remain resident at
 //! every anchor and sum across tasks, independently of region fusion.
 
-use super::scheduler::{GraphIndex, PhysicalTask, ValueTransfer};
+use super::scheduler::{GraphIndex, PhysicalTask};
 use super::semantic_graph::{
     ImplementationCandidate, InputSource, OutputKind, SemanticGraph, Timeline,
 };
@@ -497,9 +497,7 @@ struct ValueUse {
 pub(super) struct Solution {
     pub(super) regions: Vec<(Vec<usize>, u32)>,
     pub(super) materialized_values: Vec<u32>,
-    pub(super) score: [u64; 5],
-    pub(super) domains: Vec<u32>,
-    pub(super) transfers: Vec<ValueTransfer>,
+    pub(super) score: [u64; 4],
     pub(super) release_values: Vec<Vec<u32>>,
     slots: Vec<u32>,
 }
@@ -512,7 +510,6 @@ struct Search<'a> {
     state: Option<&'a StatePhysicalPlan>,
     values: Vec<ValueUse>,
     workspace: Vec<u64>,
-    domains: Vec<Vec<u32>>,
     best: Option<Solution>,
 }
 
@@ -539,14 +536,12 @@ fn prepare<'a>(
         );
     }
     let mut workspace = vec![0; graph.tasks.len()];
-    let mut domains = vec![vec![0]; graph.tasks.len()];
     for fact in &timeline.task_resources {
         let task = graph
             .tasks
             .binary_search_by(|task| task.symbol.cmp(&fact.task))
             .map_err(|_| "AER workspace references an unknown task")?;
         workspace[task] = fact.workspace_bytes;
-        domains[task] = fact.domains.clone();
     }
     let mut values = Vec::new();
     for (producer, task) in graph.tasks.iter().enumerate() {
@@ -555,7 +550,7 @@ fn prepare<'a>(
                 .value_resources
                 .iter()
                 .find(|fact| fact.task == task.symbol && fact.output == output.name);
-            if (timeline.memory_budget_bytes.is_some() || !timeline.domains.is_empty()) && fact.is_none() {
+            if timeline.memory_budget_bytes.is_some() && fact.is_none() {
                 return Err("memory-constrained AER requires every output size, including explicit zero-byte values".into());
             }
             let mut users: BTreeSet<_> = graph.tasks.iter().enumerate().filter_map(|(user, task)|
@@ -579,8 +574,7 @@ fn prepare<'a>(
             });
         }
     }
-    if (timeline.memory_budget_bytes.is_some() || !timeline.domains.is_empty()) && timeline.task_resources.len() != graph.tasks.len()
-    {
+    if timeline.memory_budget_bytes.is_some() && timeline.task_resources.len() != graph.tasks.len() {
         return Err("memory-constrained AER requires every task workspace size".into());
     }
     for fact in &timeline.value_resources {
@@ -590,40 +584,12 @@ fn prepare<'a>(
             return Err("AER value size references an unknown output".into());
         }
     }
-    if let Some(state) = state {
-        for provider in &state.representations {
-            if provider.execution_domain as usize >= timeline.domains.len().max(1)
-                || timeline.domains.get(provider.execution_domain as usize).is_some_and(|domain|
-                    domain.device_kind != provider.device_kind || domain.device_ordinal != provider.device_ordinal)
-            {
-                return Err("state provider differs from its signed execution domain".into());
-            }
-        }
-    } else if !timeline.domains.is_empty() && !graph.states.is_empty() {
-        return Err("distributed state tasks require their original selected provider plans".into());
-    }
-    for (id, task) in graph.tasks.iter().enumerate() {
-        domains[id].retain(|&domain| {
-            timeline.domains.get(domain as usize).is_none_or(|facts|
-                implementations[id].required_capabilities.iter().all(|cap| facts.capabilities.binary_search(cap).is_ok()))
-                && state.is_none_or(|state| state.representations.iter().all(|provider| {
-                    let uses = task.effects.iter().any(|effect| effect.resource == provider.resource)
-                        || task.inputs.iter().any(|input| matches!(&input.source,
-                            InputSource::StateSelection { resource, .. } if resource == &provider.resource));
-                    !uses || provider.execution_domain == domain
-                }))
-        });
-        if domains[id].is_empty() {
-            return Err("task has no execution domain covering its implementation and exact state".into());
-        }
-    }
     values
         .iter()
         .map(|value| value.bytes)
         .chain(workspace.iter().copied())
         .chain(timeline.task_resources.iter().map(|fact| fact.resident_bytes))
         .chain(timeline.reserved_bytes.iter().copied())
-        .chain(timeline.domains.iter().flat_map(|domain| domain.reserved_bytes.iter().copied()))
         .chain(state.map(|plan| plan.reserved_bytes))
         .try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
         .ok_or("AER resource envelope overflows u64")?;
@@ -635,7 +601,6 @@ fn prepare<'a>(
         state,
         values,
         workspace,
-        domains,
         best: None,
     })
 }
@@ -672,7 +637,6 @@ pub(super) fn check_placement(
     let mut positions = vec![usize::MAX; tasks.len()];
     let mut task_slots = vec![0; tasks.len()];
     let mut slots = Vec::new();
-    let mut domains = Vec::new();
     let mut start = 0;
     for &end in region_ends {
         let end = end as usize;
@@ -680,12 +644,10 @@ pub(super) fn check_placement(
             return Err("AER regions must be nonempty contiguous ranges".into());
         }
         let slot = tasks[start].anchor_id;
-        let domain = tasks[start].domain_id;
         let mut members = Vec::new();
         for (position, task) in tasks.iter().enumerate().take(end).skip(start) {
             let id = task.task_id as usize;
             if id >= tasks.len() || membership[id] != usize::MAX || task.anchor_id != slot
-                || task.domain_id != domain || !search.domains[id].contains(&domain)
                 || slot < index.windows[id].0 || slot >= index.windows[id].1
             {
                 return Err("AER task identity or timing differs from its declared region".into());
@@ -701,7 +663,6 @@ pub(super) fn check_placement(
             members.push(id);
         }
         slots.push(slot);
-        domains.push(domain);
         groups.push(members);
         start = end;
     }
@@ -719,7 +680,7 @@ pub(super) fn check_placement(
     if slots.windows(2).any(|pair| pair[0] > pair[1]) {
         return Err("AER regions are not in execution order".into());
     }
-    search.evaluate(&groups, &membership, &(0..groups.len()).collect::<Vec<_>>(), &predecessors, &slots, &domains);
+    search.evaluate(&groups, &membership, &(0..groups.len()).collect::<Vec<_>>(), &predecessors, &slots);
     search.best.ok_or_else(|| "selected AER placement exceeds its memory envelope".into())
 }
 
@@ -775,10 +736,6 @@ impl Search<'_> {
                 .unwrap()
                 .min(self.index.windows[next].1);
             if lo >= hi {
-                continue;
-            }
-            if !self.domains[next].iter().any(|domain|
-                groups[group].iter().all(|&task| self.domains[task].contains(domain))) {
                 continue;
             }
             groups[group].push(next);
@@ -843,7 +800,6 @@ impl Search<'_> {
             &predecessors,
             &bounds,
             &mut vec![0; groups.len()],
-            &mut vec![0; groups.len()],
             0,
         );
     }
@@ -856,7 +812,6 @@ impl Search<'_> {
         predecessors: &[BTreeSet<usize>],
         bounds: &[(u32, u32)],
         slots: &mut [u32],
-        domains: &mut [u32],
         next: usize,
     ) {
         if next != order.len() {
@@ -868,19 +823,13 @@ impl Search<'_> {
                     .max()
                     .unwrap_or(0),
             );
-            for domain in self.domains[groups[group][0]].clone() {
-                if !groups[group].iter().all(|&task| self.domains[task].contains(&domain)) {
-                    continue;
-                }
-                domains[group] = domain;
-                for anchor in after..bounds[group].1 {
-                    slots[group] = anchor;
-                    self.placements(groups, membership, order, predecessors, bounds, slots, domains, next + 1);
-                }
+            for anchor in after..bounds[group].1 {
+                slots[group] = anchor;
+                self.placements(groups, membership, order, predecessors, bounds, slots, next + 1);
             }
             return;
         }
-        self.evaluate(groups, membership, order, predecessors, slots, domains);
+        self.evaluate(groups, membership, order, predecessors, slots);
     }
 
     fn evaluate(
@@ -890,16 +839,12 @@ impl Search<'_> {
         order: &[usize],
         predecessors: &[BTreeSet<usize>],
         slots: &[u32],
-        domains: &[u32],
     ) {
-        let count = self.timeline.domains.len().max(1);
         let anchors = self.timeline.anchors.len();
         let mut internal = vec![0_u128; groups.len()];
-        let mut live = vec![vec![0_u128; anchors]; count];
+        let mut live = vec![0_u128; anchors];
         let mut materialized_values = Vec::new();
-        let mut transfers = Vec::new();
         let mut materialization = 0_u128;
-        let mut transfer_cost = 0_u128;
         let mut placed_order = order.to_vec();
         placed_order.sort_by_key(|&group| slots[group]);
         let execution_order: Vec<_> = placed_order.iter().flat_map(|&group|
@@ -909,7 +854,6 @@ impl Search<'_> {
         let mut release_values = vec![Vec::new(); membership.len()];
         for (value_id, value) in self.values.iter().enumerate() {
             let source = membership[value.producer];
-            let source_domain = domains[source] as usize;
             if !value.exported {
                 let last = value.users.iter().copied().chain(std::iter::once(value.producer))
                     .max_by_key(|&task| positions[task]).unwrap();
@@ -928,36 +872,14 @@ impl Search<'_> {
                         .max()
                         .unwrap_or(slots[source])
                 };
-                for bytes in &mut live[source_domain][slots[source] as usize..=last as usize] {
+                for bytes in &mut live[slots[source] as usize..=last as usize] {
                     *bytes += value.bytes as u128;
-                }
-                let targets: BTreeSet<_> = value.users.iter().map(|&user| domains[membership[user]])
-                    .filter(|&domain| domain as usize != source_domain).collect();
-                for target in targets {
-                    let Some(link) = self.timeline.transfer_links.iter().find(|link|
-                        link.source as usize == source_domain && link.target == target) else { return; };
-                    let users: Vec<_> = value.users.iter().copied()
-                        .filter(|&user| domains[membership[user]] == target).collect();
-                    let first = *users.iter().min_by_key(|&&user| positions[user]).unwrap();
-                    if (slots[membership[first]] as u64) < slots[source] as u64 + link.anchor_delay as u64 {
-                        return;
-                    }
-                    let last = users.iter().map(|&user| slots[membership[user]]).max().unwrap();
-                    // A destination owns one copy shared by all of its consumers.
-                    // Reserve it throughout the producer-to-last-reader envelope.
-                    for bytes in &mut live[target as usize][slots[source] as usize..=last as usize] {
-                        *bytes += value.bytes as u128;
-                    }
-                    materialization += value.bytes as u128;
-                    transfer_cost = transfer_cost.saturating_add(value.bytes as u128 * link.cost_per_byte as u128);
-                    transfers.push(ValueTransfer { value_id: value_id as u32, source: source_domain as u32,
-                        target, after_task: value.producer as u32, before_task: first as u32 });
                 }
             } else {
                 internal[source] += value.bytes as u128;
             }
         }
-        let mut scratch = vec![vec![0_u128; anchors]; count];
+        let mut scratch = vec![0_u128; anchors];
         for (group, members) in groups.iter().enumerate() {
             let bytes = internal[group]
                 + members
@@ -965,49 +887,38 @@ impl Search<'_> {
                     .map(|&task| self.workspace[task])
                     .max()
                     .unwrap() as u128;
-            let slot = &mut scratch[domains[group] as usize][slots[group] as usize];
+            let slot = &mut scratch[slots[group] as usize];
             *slot = (*slot).max(bytes);
         }
-        let mut resident = vec![0_u128; count];
+        let mut resident = 0_u128;
         for fact in &self.timeline.task_resources {
-            let task = self.graph.tasks.binary_search_by(|task| task.symbol.cmp(&fact.task)).unwrap();
-            resident[domains[membership[task]] as usize] += fact.resident_bytes as u128;
+            resident += fact.resident_bytes as u128;
         }
         if let Some(state) = self.state {
             for provider in &state.representations {
-                resident[provider.execution_domain as usize] += provider.reserved_bytes as u128;
+                resident += provider.reserved_bytes as u128;
             }
         }
         let mut peak = 0_u128;
         for anchor in 0..anchors {
-            let mut total = self.timeline.reserved_bytes.get(anchor).copied().unwrap_or(0) as u128;
-            for domain in 0..count {
-                let facts = self.timeline.domains.get(domain);
-                let used = live[domain][anchor] + scratch[domain][anchor] + resident[domain]
-                    + facts.and_then(|facts| facts.reserved_bytes.get(anchor)).copied().unwrap_or(0) as u128;
-                if facts.and_then(|facts| facts.memory_budget_bytes).is_some_and(|budget| used > budget as u128) {
-                    return;
-                }
-                total += used;
-            }
+            let total = self.timeline.reserved_bytes.get(anchor).copied().unwrap_or(0) as u128
+                + live[anchor] + scratch[anchor] + resident;
             peak = peak.max(total);
         }
         if self.timeline.memory_budget_bytes.is_some_and(|budget| peak > budget as u128) { return; }
-        let (Ok(materialization), Ok(transfer_cost), Ok(peak)) =
-            (u64::try_from(materialization), u64::try_from(transfer_cost), u64::try_from(peak)) else { return; };
+        let (Ok(materialization), Ok(peak)) =
+            (u64::try_from(materialization), u64::try_from(peak)) else { return; };
         let score = [
             materialization,
-            transfer_cost,
             groups.len() as u64,
             peak,
-            predecessors.iter().map(|p| p.len() as u64).sum::<u64>() + transfers.len() as u64,
+            predecessors.iter().map(|p| p.len() as u64).sum::<u64>(),
         ];
         let task_slots: Vec<_> = membership.iter().map(|&group| slots[group]).collect();
-        let task_domains: Vec<_> = membership.iter().map(|&group| domains[group]).collect();
         if self
             .best
             .as_ref()
-            .is_some_and(|best| (best.score, &best.slots, &best.domains) <= (score, &task_slots, &task_domains))
+            .is_some_and(|best| (best.score, &best.slots) <= (score, &task_slots))
         {
             return;
         }
@@ -1030,8 +941,6 @@ impl Search<'_> {
             materialized_values,
             score,
             slots: task_slots,
-            domains: task_domains,
-            transfers,
             release_values,
         });
     }

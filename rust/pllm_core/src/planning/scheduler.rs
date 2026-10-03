@@ -27,17 +27,12 @@ pub(crate) struct ScheduleDecision {
     peak_memory_bytes: u64,
     fence_count: u64,
     state_plan_digest: Option<String>,
-    #[serde(default)]
-    transfers: Vec<ValueTransfer>,
-    #[serde(default)]
-    transfer_cost: u64,
 }
 
 impl ScheduleDecision {
-    pub(super) fn score(&self) -> [u64; 5] {
+    pub(super) fn score(&self) -> [u64; 4] {
         [
             self.materialization_bytes,
-            self.transfer_cost,
             self.region_ends.len() as u64,
             self.peak_memory_bytes,
             self.fence_count,
@@ -52,19 +47,7 @@ pub(crate) struct PhysicalTask {
     pub(crate) implementation_id: String,
     pub(crate) anchor_id: u32,
     #[serde(default)]
-    pub(crate) domain_id: u32,
-    #[serde(default)]
     pub(crate) release_values: Vec<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ValueTransfer {
-    pub(crate) value_id: u32,
-    pub(crate) source: u32,
-    pub(crate) target: u32,
-    pub(crate) after_task: u32,
-    pub(crate) before_task: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -77,8 +60,6 @@ pub(crate) struct PhysicalPlan {
     pub(crate) schema_version: u64,
     pub(crate) region_ends: Vec<u32>,
     pub(crate) materialized_values: Vec<u32>,
-    #[serde(default)]
-    pub(crate) transfers: Vec<ValueTransfer>,
 }
 
 fn error(message: impl Into<String>) -> PyErr {
@@ -259,7 +240,6 @@ fn sign_solution(
                 task_id,
                 implementation_id: implementation.implementation_id.clone(),
                 anchor_id: *anchor_id,
-                domain_id: solution.domains[task_index],
                 release_values: solution.release_values[task_index].clone(),
             });
         }
@@ -275,10 +255,8 @@ fn sign_solution(
         region_ends,
         materialized_values: solution.materialized_values,
         materialization_bytes: solution.score[0],
-        transfer_cost: solution.score[1],
-        peak_memory_bytes: solution.score[3],
-        fence_count: solution.score[4],
-        transfers: solution.transfers,
+        peak_memory_bytes: solution.score[2],
+        fence_count: solution.score[3],
         state_plan_digest: state
             .map(canonical_ascii_json)
             .transpose()?
@@ -356,7 +334,6 @@ pub(super) fn project_physical(
         schema_version: SCHEMA_VERSION,
         region_ends: decision.region_ends.clone(),
         materialized_values: decision.materialized_values.clone(),
-        transfers: decision.transfers.clone(),
     })
 }
 
@@ -464,179 +441,6 @@ mod tests {
     use super::{compile, lower_physical, validate_decision, validate_physical, ScheduleDecision};
     use crate::planning::semantic_graph::{decode_graph, decode_timeline};
     use serde_json::json;
-
-    #[test]
-    fn distributed_placement_transfer_matches_small_topology_oracle() {
-        use std::collections::BTreeSet;
-        let bounds = [(0_u32, 2_u32), (1, 3), (1, 3)];
-        let workspace = [1_u64, 3, 2];
-        let resident = [1_u64, 2, 0];
-        let reserved = [[0_u64, 2, 0, 0], [0, 0, 4, 0]];
-        let graph = decode_graph(&json!({
-            "schema_version": 1, "workload_id": "distributed", "execution_parameters_digest": "a".repeat(64),
-            "states": [], "edges": [], "tasks": (0..3).map(|task| json!({
-                "symbol": format!("t{task}"), "timing": {"after": format!("a{}", bounds[task].0),
-                    "before": format!("a{}", bounds[task].1)},
-                "inputs": if task == 0 {vec![]} else {vec![json!({"name": "x", "source":
-                    {"kind": "result", "task": "t0", "output": "x"}})]},
-                "outputs": if task == 0 {vec![json!({"name": "x", "kind": "temporary", "schema": ""})]} else {vec![]},
-                "effects": [], "implementations": [{"implementation_id": "kernel", "execution_kind": "native_task",
-                    "required_capabilities": []}]
-            })).collect::<Vec<_>>()
-        }).to_string()).unwrap();
-        let mut feasible = 0;
-        let mut rejected = 0;
-        let mut witness = None;
-        for link_present in [false, true] {
-            for delay in [0_u32, 1, 2] {
-                for cost in [1_u64, 7] {
-                    for remote_last in [false, true] {
-                        for budgets in [[8_u64, 8], [32, 32]] {
-                            let allowed = [vec![0_u32], vec![1], if remote_last {vec![1]} else {vec![0, 1]}];
-                            let timeline = decode_timeline(&json!({
-                                "schema_version": 1, "capabilities": [],
-                                "anchors": (0..4).map(|id| json!({"symbol": format!("a{id}"), "ordinal": id})).collect::<Vec<_>>(),
-                                "domains": (0..2).map(|id| json!({"worker_id": id, "device_kind": "cpu", "device_ordinal": 0,
-                                    "memory_budget_bytes": budgets[id], "reserved_bytes": reserved[id]})).collect::<Vec<_>>(),
-                                "transfer_links": if link_present {vec![json!({"source": 0, "target": 1,
-                                    "cost_per_byte": cost, "anchor_delay": delay})]} else {vec![]},
-                                "value_resources": [{"task": "t0", "output": "x", "bytes": 5}],
-                                "task_resources": (0..3).map(|id| json!({"task": format!("t{id}"), "domains": allowed[id],
-                                    "workspace_bytes": workspace[id], "resident_bytes": resident[id]})).collect::<Vec<_>>()
-                            }).to_string()).unwrap();
-                            let mut expected = None;
-                            // Independent labelled partitions, task slots and domain assignments.
-                            for labels in 0..27 {
-                                let group = [labels % 3, labels / 3 % 3, labels / 9];
-                                if ![[0, 1, 2], [0, 2, 1]].iter().any(|order|
-                                    group[order[0]] != group[order[2]] || group[order[0]] == group[order[1]]) { continue; }
-                                let groups: BTreeSet<_> = group.into_iter().collect();
-                                for placement in 0..27_u32 {
-                                    let at = [placement % 3, placement / 3 % 3, placement / 9];
-                                    if (0..3).any(|id| at[id] < bounds[id].0 || at[id] >= bounds[id].1)
-                                        || at[0] > at[1] || at[0] > at[2] { continue; }
-                                    for assignment in 0..8_u32 {
-                                        let domain = [assignment % 2, assignment / 2 % 2, assignment / 4];
-                                        if (0..3).any(|id| !allowed[id].contains(&domain[id]))
-                                            || (0..3).any(|a| (0..3).any(|b| group[a] == group[b]
-                                                && (at[a] != at[b] || domain[a] != domain[b]))) { continue; }
-                                        let remote: Vec<_> = (1..3).filter(|&id| domain[id] != domain[0]).collect();
-                                        if !remote.is_empty() && (!link_present || remote.iter().any(|&id| at[id] < at[0] + delay)) { continue; }
-                                        let boundary = group[0] != group[1] || group[0] != group[2];
-                                        let copies = if remote.is_empty() {0_u64} else {1};
-                                        let mut peak = 0;
-                                        let mut fits = true;
-                                        for anchor in 0..4_u32 {
-                                            let mut total = 0;
-                                            for location in 0..2_u32 {
-                                                let mut used = reserved[location as usize][anchor as usize]
-                                                    + (0..3).filter(|&id| domain[id] == location).map(|id| resident[id]).sum::<u64>();
-                                                if boundary && at[0] <= anchor && anchor <= at[1].max(at[2]) && location == domain[0] { used += 5; }
-                                                if copies != 0 && location != domain[0] && at[0] <= anchor
-                                                    && anchor <= remote.iter().map(|&id| at[id]).max().unwrap() { used += 5; }
-                                                used += groups.iter().filter_map(|&label| {
-                                                    let members: Vec<_> = (0..3).filter(|&id| group[id] == label).collect();
-                                                    (domain[members[0]] == location && at[members[0]] == anchor).then(||
-                                                        members.iter().map(|&id| workspace[id]).max().unwrap()
-                                                        + if !boundary && members.contains(&0) {5} else {0})
-                                                }).max().unwrap_or(0);
-                                                fits &= used <= budgets[location as usize];
-                                                total += used;
-                                            }
-                                            peak = peak.max(total);
-                                        }
-                                        if !fits { continue; }
-                                        let fences = (1..3).filter_map(|id| (group[id] != group[0]).then_some(group[id])).collect::<BTreeSet<_>>().len() as u64;
-                                        let score = [if boundary {5} else {0} + 5 * copies, 5 * copies * cost,
-                                            groups.len() as u64, peak, fences + copies];
-                                        let candidate = (score, at, domain);
-                                        if expected.as_ref().is_none_or(|best| candidate < *best) { expected = Some(candidate); }
-                                    }
-                                }
-                            }
-                            let actual = compile(&graph, &timeline, None);
-                            assert_eq!(actual.is_ok(), expected.is_some(), "delay={delay}, remote={remote_last}, budgets={budgets:?}");
-                            if let Some((score, slots, domains)) = expected {
-                                feasible += 1;
-                                let decision = actual.unwrap();
-                                assert_eq!(decision.score(), score);
-                                for task in &decision.tasks {
-                                    assert_eq!((task.anchor_id, task.domain_id), (slots[task.task_id as usize], domains[task.task_id as usize]));
-                                }
-                                assert_eq!(decision.transfers.len(), 1);
-                                let transfer = &decision.transfers[0];
-                                assert_eq!((transfer.value_id, transfer.source, transfer.target, transfer.after_task), (0, 0, 1, 0));
-                                assert_eq!(transfer.before_task, decision.tasks.iter().find(|task| task.domain_id == 1).unwrap().task_id);
-                                let physical = lower_physical(&graph, &timeline, &decision, 7, None).unwrap();
-                                validate_physical(&graph, &timeline, &decision, &physical, None).unwrap();
-                                let mut tampered = decision.clone();
-                                tampered.transfers.clear();
-                                tampered.signature = decision_signature(&tampered).unwrap();
-                                assert!(validate_decision(&graph, &timeline, &tampered, None).is_err());
-                                let mut tampered = decision.clone();
-                                tampered.tasks[0].domain_id = 1;
-                                tampered.signature = decision_signature(&tampered).unwrap();
-                                assert!(validate_decision(&graph, &timeline, &tampered, None).is_err());
-                                witness = Some((timeline.clone(), decision));
-                            } else { rejected += 1; }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(feasible > 0 && rejected > 0);
-        let (mut timeline, decision) = witness.unwrap();
-        timeline.transfer_links[0].anchor_delay = 0;
-        let index = graph_index(&graph, &timeline, None).unwrap();
-        let implementations: Vec<_> = graph.tasks.iter().map(|task| &task.implementations[0]).collect();
-        let mut tasks = decision.tasks;
-        for task in &mut tasks { task.anchor_id = if task.task_id == 0 {1} else {2}; }
-        let placement = aer::check_placement(&graph, &timeline, &index, &implementations, None,
-            &tasks, &decision.region_ends).unwrap();
-        let signed = sign_solution(&graph, &timeline, None, &implementations, placement).unwrap();
-        validate_decision(&graph, &timeline, &signed, None).unwrap();
-        let mut changed = signed.clone();
-        changed.transfer_cost += 1;
-        changed.signature = decision_signature(&changed).unwrap();
-        assert!(validate_decision(&graph, &timeline, &changed, None).is_err());
-        timeline.domains[1].memory_budget_bytes = Some(1);
-        assert!(validate_decision(&graph, &timeline, &signed, None).is_err());
-        timeline.domains[1].memory_budget_bytes = Some(32);
-        // A globally available kernel may be unavailable on the task's actual domain.
-        let mut graph = graph.clone();
-        let mut special = graph.tasks[1].implementations[0].clone();
-        special.implementation_id = "a_special".into();
-        special.required_capabilities = vec!["special".into()];
-        graph.tasks[1].implementations.insert(0, special);
-        timeline.capabilities = vec!["special".into()];
-        timeline.domains[0].capabilities = vec!["special".into()];
-        let decision = compile(&graph, &timeline, None).unwrap();
-        assert_eq!(decision.tasks.iter().find(|task| task.task_id == 1).unwrap().implementation_id, "kernel");
-        let mut wire = serde_json::to_value(&graph).unwrap();
-        wire["states"] = json!((0..2).map(|id| json!({"resource": format!("r{id}"), "scope": "instance", "key_fields": []})).collect::<Vec<_>>());
-        for id in 0..2 {
-            wire["tasks"][id]["inputs"].as_array_mut().unwrap().push(json!({"name": "state", "source":
-                {"kind": "state_selection", "resource": format!("r{id}"), "phase": "decode"}}));
-        }
-        let graph = decode_graph(&wire.to_string()).unwrap();
-        let mut state = super::decode_state(&json!({
-            "plan_epoch": 1, "schema_version": 1, "request_digest": "a".repeat(64),
-            "representation_signature": "b".repeat(64), "reserved_bytes": 4,
-            "representations": (0..2).map(|id| json!({"resource": format!("r{id}"), "provider_id": format!("p{id}"),
-                "representation": "dense_page_arena", "execution_domain": id, "device_kind": "cpu", "device_ordinal": 0,
-                "layout_id": id, "layout_digest": "c".repeat(64), "layout_namespace": "d".repeat(64),
-                "max_admitted_lineages": 1, "page_capacity": 3, "root_page_count": 1, "reserved_bytes": 2,
-                "capture_stable": false, "capabilities": ["state/exact_versions@1"]})).collect::<Vec<_>>()
-        }).to_string()).unwrap();
-        compile(&graph, &timeline, Some(&state)).unwrap();
-        state.representations[1].execution_domain = 0;
-        assert!(compile(&graph, &timeline, Some(&state)).is_err());
-        state.representations[1].execution_domain = 1;
-        state.representations[1].device_kind = super::super::state_representation::StateDeviceKind::Cuda;
-        assert!(compile(&graph, &timeline, Some(&state)).is_err());
-        timeline.domains[1].device_kind = super::super::state_representation::StateDeviceKind::Cuda;
-        compile(&graph, &timeline, Some(&state)).unwrap();
-    }
 
     #[test]
     fn versioned_state_hazards_and_timing_match_oracle() {

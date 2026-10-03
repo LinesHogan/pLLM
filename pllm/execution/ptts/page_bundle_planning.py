@@ -12,7 +12,7 @@ from pllm.contracts.semantic_graph import SemanticGraph, SchedulerTimeline
 from pllm.contracts.state_representation import StateLayoutRequirement, StateRepresentationRequest
 from pllm.contracts.tensor_layout import TensorLayoutRequest
 
-from pllm.contracts.state_representation import ExecutionDomainId, StateDeviceKind, StateProviderPlan, StateRepresentation
+from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan, StateRepresentation
 from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutBinding, TensorLayoutSpec
 
 
@@ -61,7 +61,6 @@ class PageBundleProviderFacts:
     device_kind: StateDeviceKind = StateDeviceKind.CPU
     device_ordinal: int = 0
     shared_memory: bool = False
-    execution_domain: ExecutionDomainId = ExecutionDomainId(0)
 
     def materialize_plan(self, *, resource: str, layout: TensorLayoutSpec,
                          binding: TensorLayoutBinding, max_admitted_lineages: int) -> StateProviderPlan:
@@ -75,7 +74,6 @@ class PageBundleProviderFacts:
             resource=resource, provider_id=self.provider_id,
             representation=StateRepresentation.DENSE_PAGE_ARENA,
             device_kind=self.device_kind, device_ordinal=self.device_ordinal,
-            execution_domain=self.execution_domain,
             layout_id=binding.layout_id, layout_namespace=binding.layout_namespace, layout_digest=binding.layout_digest,
             max_admitted_lineages=max_admitted_lineages,
             page_capacity=capacity,

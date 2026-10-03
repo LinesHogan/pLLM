@@ -4,11 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import NewType
 
 from pllm.contracts.state_ref import LayoutId
-
-ExecutionDomainId = NewType("ExecutionDomainId", int)
 
 
 class StateRepresentation(StrEnum):
@@ -44,7 +41,6 @@ class StateProviderPlan:
     reserved_bytes: int
     capture_stable: bool
     capabilities: tuple[str, ...] = ()
-    execution_domain: ExecutionDomainId = ExecutionDomainId(0)
 
 
 @dataclass(frozen=True, slots=True)

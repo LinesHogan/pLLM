@@ -33,8 +33,6 @@ class TaskGraphExecution(Generic[ExecutionContextT]):
     release_values: Callable[[ExecutionContextT, tuple[int, ...]], None] | None = None
 
     def __post_init__(self) -> None:
-        if self.plan.transfers or any(task.domain_id != 0 for task in self.plan.tasks):
-            raise ValueError("local execution cannot consume a distributed physical plan")
         bindings = {implementation.implementation_id: implementation for implementation in self.implementations}
         if (len(bindings) != len(self.implementations)
             or set(bindings) != {task.implementation_id for task in self.plan.tasks}):

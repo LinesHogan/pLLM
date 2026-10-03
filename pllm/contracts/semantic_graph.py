@@ -8,7 +8,6 @@ from typing import Literal, NewType
 
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.request_identity import RequestKeyField
-from pllm.contracts.state_representation import ExecutionDomainId, StateDeviceKind
 from pllm.contracts.region_selection import RegionSelectionPolicy
 
 
@@ -268,25 +267,6 @@ class TaskResourceFact:
     resident_bytes: int = 0
     # Fixed cold buffers; native bindings define which input axes may be padded.
     input_shapes: tuple[tuple[int, ...], ...] = ()
-    domains: tuple[ExecutionDomainId, ...] = (ExecutionDomainId(0),)
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionDomainFact:
-    worker_id: int
-    device_kind: StateDeviceKind
-    device_ordinal: int
-    capabilities: tuple[str, ...] = ()
-    memory_budget_bytes: int | None = None
-    reserved_bytes: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class TransferLinkFact:
-    source: ExecutionDomainId
-    target: ExecutionDomainId
-    cost_per_byte: int
-    anchor_delay: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,8 +278,6 @@ class SchedulerTimeline:
     task_resources: tuple[TaskResourceFact, ...] = ()
     memory_budget_bytes: int | None = None
     reserved_bytes: tuple[int, ...] = ()
-    domains: tuple[ExecutionDomainFact, ...] = ()
-    transfer_links: tuple[TransferLinkFact, ...] = ()
     region_policy: RegionSelectionPolicy = RegionSelectionPolicy()
 
 
@@ -309,17 +287,7 @@ class PhysicalTask:
     task_id: TaskId
     implementation_id: ImplementationId
     anchor_id: AnchorId
-    domain_id: ExecutionDomainId = ExecutionDomainId(0)
     release_values: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class ValueTransfer:
-    value_id: int
-    source: ExecutionDomainId
-    target: ExecutionDomainId
-    after_task: TaskId
-    before_task: TaskId
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,8 +304,6 @@ class ScheduleDecision:
     fence_count: int
     state_plan_digest: str | None
     schema_version: int = 1
-    transfers: tuple[ValueTransfer, ...] = ()
-    transfer_cost: int = 0
 
 
 
@@ -350,16 +316,11 @@ class PhysicalPlan:
     region_ends: tuple[int, ...]
     materialized_values: tuple[int, ...]
     schema_version: int = 1
-    transfers: tuple[ValueTransfer, ...] = ()
 
 
 
 __all__ = [
-    "ExecutionDomainFact",
-    "ExecutionDomainId",
-    "TransferLinkFact",
-    "ValueTransfer",
-    "ConditionalLayerReplay",
+        "ConditionalLayerReplay",
     "TaskResourceFact",
     "ValueResourceFact",
     "AnchorId",

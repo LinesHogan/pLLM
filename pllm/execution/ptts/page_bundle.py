@@ -220,8 +220,6 @@ class PageBundleArena:
                  local_candidates: tuple[StateProviderPlan, ...] | None = None,
                  *, device: torch.device | None = None) -> None:
         validate_plan_bundle(plan, local_candidates=local_candidates)
-        if any(item.execution_domain != 0 for item in plan.state_physical.representations):
-            raise ValueError("local PageBundle arena cannot own a remote execution domain")
         self.plan = plan
         placements = {(item.device_kind, item.device_ordinal) for item in plan.state_physical.representations}
         if not placements and not plan.semantic_graph.states and device is not None:

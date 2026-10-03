@@ -249,34 +249,6 @@ pub(crate) struct TaskResourceFact {
     pub(crate) resident_bytes: u64,
     #[serde(default)]
     pub(crate) input_shapes: Vec<Vec<u64>>,
-    #[serde(default = "local_domain")]
-    pub(crate) domains: Vec<u32>,
-}
-
-fn local_domain() -> Vec<u32> { vec![0] }
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ExecutionDomainFact {
-    pub(crate) worker_id: u32,
-    pub(crate) device_kind: super::state_representation::StateDeviceKind,
-    pub(crate) device_ordinal: u64,
-    #[serde(default)]
-    pub(crate) capabilities: Vec<String>,
-    #[serde(default)]
-    pub(crate) memory_budget_bytes: Option<u64>,
-    #[serde(default)]
-    pub(crate) reserved_bytes: Vec<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TransferLinkFact {
-    pub(crate) source: u32,
-    pub(crate) target: u32,
-    pub(crate) cost_per_byte: u64,
-    #[serde(default)]
-    pub(crate) anchor_delay: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -293,10 +265,6 @@ pub(crate) struct Timeline {
     pub(crate) memory_budget_bytes: Option<u64>,
     #[serde(default)]
     pub(crate) reserved_bytes: Vec<u64>,
-    #[serde(default)]
-    pub(crate) domains: Vec<ExecutionDomainFact>,
-    #[serde(default)]
-    pub(crate) transfer_links: Vec<TransferLinkFact>,
     #[serde(default)]
     pub(crate) region_policy: super::region_selection::Policy,
 }
@@ -669,30 +637,6 @@ pub(crate) fn validate_timeline(timeline: &Timeline) -> Result<(), String> {
         return Err("timeline anchors must have unique IDs".to_owned());
     }
     require_sorted_unique_text(&timeline.capabilities, "timeline.capabilities")?;
-    for (id, domain) in timeline.domains.iter().enumerate() {
-        require_sorted_unique_text(&domain.capabilities, "domain.capabilities")?;
-        if (!domain.reserved_bytes.is_empty() && domain.reserved_bytes.len() != timeline.anchors.len())
-            || timeline.domains[..id].iter().any(|other| other.worker_id == domain.worker_id
-                && other.device_kind == domain.device_kind && other.device_ordinal == domain.device_ordinal)
-        {
-            return Err("execution domains require distinct physical locations and exact reservation coverage".into());
-        }
-    }
-    let count = timeline.domains.len().max(1);
-    if timeline.transfer_links.windows(2).any(|pair|
-        (pair[0].source, pair[0].target) >= (pair[1].source, pair[1].target))
-        || timeline.transfer_links.iter().any(|link| link.source == link.target
-            || link.source as usize >= count || link.target as usize >= count)
-    {
-        return Err("transfer links require sorted unique directed domain pairs".into());
-    }
-    for fact in &timeline.task_resources {
-        if fact.domains.is_empty() || fact.domains.windows(2).any(|pair| pair[0] >= pair[1])
-            || fact.domains.iter().any(|&domain| domain as usize >= count)
-        {
-            return Err("task resources require sorted distinct available execution domains".into());
-        }
-    }
     Ok(())
 }
 

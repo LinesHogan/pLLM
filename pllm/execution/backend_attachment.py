@@ -81,7 +81,7 @@ def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGra
     tasks = tuple(task for task in graph.tasks if isinstance(task.replay, TokenwiseLayerReplay))
     if not tasks:
         return timeline
-    if len(graph.tasks) != 1 or graph.states or timeline.domains or timeline.transfer_links:
+    if len(graph.tasks) != 1 or graph.states:
         raise ValueError("tokenwise attachment costs require the original standalone single-device task")
     task, = tasks
     effect = task.replay

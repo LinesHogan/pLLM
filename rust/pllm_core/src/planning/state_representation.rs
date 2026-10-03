@@ -47,8 +47,6 @@ pub(crate) struct StateProviderPlan {
     pub(crate) reserved_bytes: u64,
     capture_stable: bool,
     pub(crate) capabilities: Vec<String>,
-    #[serde(default)]
-    pub(crate) execution_domain: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -297,7 +295,7 @@ pub(super) fn compile(
             }
             return Ok(());
         }
-        if timeline.domains.is_empty() && plans.first().is_some_and(|first| {
+        if plans.first().is_some_and(|first| {
             plans.iter().any(|plan| {
                 plan.device_kind != first.device_kind || plan.device_ordinal != first.device_ordinal
             })
@@ -374,7 +372,7 @@ pub(super) fn validate(
         || decision.plans.first().is_some_and(|first| decision.plans.iter().any(|plan|
             plan.device_kind != first.device_kind || plan.device_ordinal != first.device_ordinal))
     {
-        return Err("selected state capacity or execution domain differs from its request".into());
+        return Err("selected state capacity or device differs from its request".into());
     }
     let mut unsigned = decision.clone();
     unsigned.signature.clear();
@@ -454,7 +452,7 @@ mod tests {
                         let (decision, physical, schedule) = actual.unwrap();
                         assert_eq!(decision.plans[0].provider_id, provider);
                         assert_eq!(decision.reserved_bytes, bytes);
-                        assert_eq!(schedule.score()[3], bytes + 9);
+                        assert_eq!(schedule.score()[2], bytes + 9);
                         assert_eq!(physical.representations, decision.plans);
                         assert_eq!(physical.representation_signature, decision.signature);
                         assert_eq!(physical.plan_epoch, 7);

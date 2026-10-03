@@ -1364,7 +1364,7 @@ def probe_backend(
     if timeline is None:
         timeline = observed
     elif (timeline.anchors != observed.anchors or timeline.capabilities != observed.capabilities
-          or timeline.schema_version != observed.schema_version or timeline.domains or timeline.transfer_links):
+          or timeline.schema_version != observed.schema_version):
         raise ValueError("worker timeline differs from the supported single-device anchors and capabilities")
     elif len(timeline.reserved_bytes) != len(required) or any(
             actual < minimum for actual, minimum in zip(timeline.reserved_bytes, required, strict=True)):

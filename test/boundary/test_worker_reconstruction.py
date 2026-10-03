@@ -1,34 +1,28 @@
 """Evidence 18: a spawned worker consumes the exact plan, without selection."""
 
 from dataclasses import dataclass, replace
-import json
-import multiprocessing as mp
 from multiprocessing.connection import Connection
-
-import pytest
-import torch
-
-import pllm
 from pllm import make_llm
+from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.semantic_graph import TaskResourceFact
+from pllm.contracts.state_ref import StateRef
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.workloads.dummy import DummyWorkload
-from pllm.execution.execution import TaskGraphExecution
 from pllm.execution.host_runtime import HostRuntimeFacts
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.scheduler import compile_state_schedule, compile_schedule, lower_physical_plan, validate_physical_plan
-from pllm.execution.trace import ExecutionTrace
+from pllm.execution.scheduler import compile_state_schedule
+from pllm.workloads.dummy import DummyWorkload
 from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
-from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.state_ref import StateRef
-from pllm.contracts.semantic_graph import (
-    AnchorSymbol, ExecutionDomainFact, ExecutionDomainId, ExecutionKind, ImplementationId, PhysicalPlan,
-    SchedulerTimeline, SemanticGraph, SemanticInput, SemanticOutput, SemanticOutputKind, SemanticTask,
-    TaskImplementationSpec, TaskResourceFact, TaskResultInputSource, TaskSymbol, TimelineAnchor,
-    TimingConstraint, TransferLinkFact, ValueResourceFact, WorkloadId,
-)
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import LayoutFieldId
+import json
+import multiprocessing as mp
+import pllm
+import pytest
+import torch
+
+
+
+
 
 
 def doubled_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -176,29 +170,3 @@ def test_worker_reconstructs_exact_signed_plan_and_rejects_local_drift() -> None
                     wire.replace('"schema_version":1', '"schema_version":1,"schema_version":1', 1)):
         with pytest.raises(ValueError):
             decode_boundary(payload, PlanBundle)
-    anchors = tuple(TimelineAnchor(AnchorSymbol(f"a{i}"), i) for i in range(3))
-    kernel = (TaskImplementationSpec(ImplementationId("kernel"), ExecutionKind.NATIVE_TASK),)
-    graph = SemanticGraph(WorkloadId("transfer"), (
-        SemanticTask(TaskSymbol("emit"), TimingConstraint(anchors[0].symbol, anchors[1].symbol), (),
-            (SemanticOutput("x", SemanticOutputKind.TEMPORARY),), kernel),
-        SemanticTask(TaskSymbol("read"), TimingConstraint(anchors[1].symbol, anchors[2].symbol),
-            (SemanticInput("x", TaskResultInputSource(TaskSymbol("emit"), "x")),), (), kernel),
-    ), "f" * 64)
-    timeline = SchedulerTimeline(anchors, domains=tuple(
-        ExecutionDomainFact(i, StateDeviceKind.CPU, 0, memory_budget_bytes=32) for i in range(2)),
-        task_resources=tuple(TaskResourceFact(task.symbol, 0, domains=(ExecutionDomainId(i),))
-            for i, task in enumerate(graph.tasks)),
-        value_resources=(ValueResourceFact(graph.tasks[0].symbol, "x", 16),),
-        transfer_links=(TransferLinkFact(ExecutionDomainId(0), ExecutionDomainId(1), 2, 1),))
-    decision = compile_schedule(graph, timeline)
-    physical = lower_physical_plan(graph, timeline, decision, plan_epoch=7)
-    decoded = decode_boundary(encode_boundary(physical), PhysicalPlan)
-    validate_physical_plan(graph, timeline, decision, decoded)
-    assert decoded == physical and decision.transfer_cost == 32
-    assert tuple(task.release_values for task in decoded.tasks) == ((), (0,))
-    with pytest.raises(ValueError, match="Rust projection"):
-        validate_physical_plan(graph, timeline, decision, replace(decoded, tasks=(decoded.tasks[0],
-            replace(decoded.tasks[1], release_values=()))))
-    assert len(decoded.transfers) == 1
-    with pytest.raises(ValueError, match="distributed physical plan"):
-        TaskGraphExecution(decoded, (), ExecutionTrace(decoded))
