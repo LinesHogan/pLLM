@@ -82,14 +82,3 @@ def outline_region_calls(program: Program, sources: Mapping[str, TensorSource], 
         raise ValueError("composed tensor graph differs from the outlined source ABI")
     import_tensor_access_graph(cell)
     return OutlinedRegion(program, site, outlined, cell)
-
-
-def bind_outlined_region(program: Program, sources: Mapping[str, TensorSource], result: OutlinedRegion) -> OutlinedRegion:
-    """Return a locally rebuilt graph, never a proposal's executable callable."""
-    if result.source != program:
-        raise ValueError("outlined region has a different original source")
-    replayed = outline_region_calls(program, sources, result.site)
-    if (replayed.outlined != result.outlined or import_tensor_access_graph(replayed.cell) != import_tensor_access_graph(result.cell)
-            or replayed.cell.declaration != result.cell.declaration):
-        raise ValueError("outlined region differs from locally replayed original calls")
-    return replayed

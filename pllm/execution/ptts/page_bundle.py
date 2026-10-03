@@ -216,15 +216,6 @@ class PageBundleArena:
     fields receive private slots. Only this arena chooses logical versions.
     """
 
-    @classmethod
-    def reconstruct(cls, payload: str, expected_signature: str,
-                    local_candidates: tuple[StateProviderPlan, ...],
-                    *, device: torch.device | None = None) -> PageBundleArena:
-        plan = decode_boundary(payload, PlanBundle)
-        if plan.schedule_decision.signature != expected_signature:
-            raise ValueError("worker plan differs from the submitted compilation")
-        return cls(plan, local_candidates, device=device)
-
     def __init__(self, plan: PlanBundle,
                  local_candidates: tuple[StateProviderPlan, ...] | None = None,
                  *, device: torch.device | None = None) -> None:

@@ -15,7 +15,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_outlining import bind_outlined_region, outline_region_calls
+from pllm.execution.region_outlining import outline_region_calls
 from pllm.execution.region_storage import analyze_region_capacity, validate_region_capacity
 from test.boundary.test_tensor_rewrites import reassociation_candidates
 from test.boundary.test_tensor_access import StorageObserver
@@ -156,9 +156,7 @@ def test_composition_rechecks_internal_layout_guards_without_executing_callables
         raise AssertionError("composition must not execute user mathematics")
     cells = {name: replace(cell, function=forbidden) for name, cell in cells.items()}
     outlined = outline_region_calls(program, cells, CallOutline((), 0, 2))
-    proposed = replace(outlined, cell=replace(outlined.cell, function=forbidden))
-    rebuilt = bind_outlined_region(program, cells, proposed)
-    actual, = rebuilt.cell.invoke(tuple(inputs.values()))
+    actual, = outlined.cell.invoke(tuple(inputs.values()))
     torch.testing.assert_close(actual, torch.full_like(actual, 384), rtol=0, atol=0)
 
 

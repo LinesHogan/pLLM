@@ -78,7 +78,9 @@ def _worker(connection: Connection, expected_signature: str) -> None:
                 catalog = tuple(provider.materialize_plan(resource=entry.resource, layout=entry.layout,
                     binding=binding, max_admitted_lineages=1)
                     for entry, binding in zip(plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True))
-                arena = PageBundleArena.reconstruct(payload, expected_signature, catalog)
+                if plan.schedule_decision.signature != expected_signature:
+                    raise ValueError("worker plan differs from the submitted compilation")
+                arena = PageBundleArena(plan, catalog)
                 resource, = arena.plan.semantic_graph.states
                 write = arena.prepare_admission((resource.resource,))
                 arena.write_field(write, 0, LayoutFieldId(0)).fill_(3)
