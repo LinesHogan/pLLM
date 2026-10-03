@@ -8,11 +8,17 @@ physical lowering path.  This checker scans only the small, production-owned
 surface listed below.  It deliberately excludes tests and compatibility
 adapters, where named fixtures are legitimate.
 
+Python files are checked on the AST: an attribute access, call, or name is a
+real use; comments and docstrings are documentation, not authority.  Rust
+files keep a line scan for consumer names (the production surface is small and
+the check is a substring guard, not a grammar).
+
 Usage: ``.venv/bin/python tools/check_region_authority.py``.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from dataclasses import dataclass
@@ -105,12 +111,6 @@ PHYSICAL_FILES = frozenset(
     }
 )
 
-COMPILER_DISPATCH_FILES = frozenset(
-    {
-        *PHYSICAL_FILES,
-    }
-)
-
 SAMPLER_FILES = frozenset(
     {
         Path("pllm/backends/vllm/sampler.py"),
@@ -129,6 +129,15 @@ CONSUMER_NAMES = (
     "tlm",
 )
 
+CONSUMER_PATTERN = re.compile(
+    r"pllm\.consumers|(?<![A-Za-z0-9_])(?:"
+    + "|".join(re.escape(name) for name in CONSUMER_NAMES)
+    + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
+REFCOUNT_NAMES = ("initial_refcounts", "_remaining_result_uses")
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -141,135 +150,122 @@ class Violation:
         return f"{self.path}:{self.line}: {self.rule}: {self.text.strip()}"
 
 
-def _production_rust(source: str) -> str:
-    """Drop the test module before applying production authority rules."""
-    marker = "#[cfg(test)]"
-    return source.split(marker, 1)[0]
+def _consumer_hit(text: str) -> bool:
+    return CONSUMER_PATTERN.search(text) is not None
 
 
-def _line_violations(path: Path, source: str) -> list[Violation]:
-    if path.suffix == ".rs":
-        source = _production_rust(source)
-    violations: list[Violation] = []
-    consumer_pattern = re.compile(
-        r"pllm\.consumers|(?<![A-Za-z0-9_])(?:"
-        + "|".join(re.escape(name) for name in CONSUMER_NAMES)
-        + r")(?![A-Za-z0-9_])",
-        re.IGNORECASE,
-    )
-    dispatch_patterns = (
-        ("physical path may not re-decide compile safety", r"\.compile_safe\b"),
-        ("physical path may not read raw compile policy", r"\.compile_policy\b"),
-    )
-    physical_patterns = (
-        (
-            "physical path may not inspect Region task membership",
-            r"\bregion\.tasks\b|\bexecution_region\.tasks\b",
-        ),
-        (
-            "physical path may not parse executor strings",
-            r"\bexecutor\s*\.\s*(split|partition|rsplit)\s*\(|"
-            r"\bimplementation_id\s*\.\s*(split|partition|rsplit)\s*\(",
-        ),
-        (
-            "native Region path may not inspect legacy adapter ownership",
-            r"\.legacy_consumer\b",
-        ),
-        (
-            "physical path may not silently retry with eager",
-            r"try:[\s\S]{0,240}torch\.compile[\s\S]{0,240}"
-            r"except[^\n]*:[\s\S]{0,240}\beager\b",
-        ),
-        (
-            "physical path may not derive materialization refcounts",
-            r"len\s*\(\s*binding\.consumer_regions\b|"
-            r"\binitial_refcounts\b|\b_remaining_result_uses\b",
-        ),
-    )
-    for line_number, line in enumerate(source.splitlines(), start=1):
-        if consumer_pattern.search(line):
-            violations.append(
-                Violation(path, line_number, "consumer authority leaked into Region core", line)
+def _attribute_on(node: ast.AST, attributes: tuple[str, ...], names: tuple[str, ...]) -> bool:
+    """Attribute access `name.attribute` for the given attribute and receiver names."""
+    return (isinstance(node, ast.Attribute) and node.attr in attributes
+            and isinstance(node.value, ast.Name) and node.value.id in names)
+
+
+class _PythonAuthority(ast.NodeVisitor):
+    """One AST pass applying the no-redecision rules the file's category selects."""
+
+    def __init__(self, path: Path, lines: list[str]) -> None:
+        self.path = path
+        self.lines = lines
+        self.violations: list[Violation] = []
+        physical = path in PHYSICAL_FILES
+        self.native = path in NATIVE_BINDING_FILES
+        self.prefix = "native binding" if self.native else "physical path"
+        self.check_consumers = path in AUTHORITY_FILES
+        self.check_redecision = physical or self.native
+        self.check_legacy = physical
+        self.check_eager = physical
+        self.check_sampler = path in SAMPLER_FILES
+
+    def _add(self, node: ast.expr | ast.stmt, rule: str) -> None:
+        self.violations.append(Violation(self.path, node.lineno, rule, self.lines[node.lineno - 1]))
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        # Bare strings are documentation; everything else is visited normally.
+        if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if self.check_consumers and _consumer_hit(node.id):
+            self._add(node, "consumer authority leaked into Region core")
+        if self.check_redecision and node.id in REFCOUNT_NAMES:
+            self._add(node, f"{self.prefix} may not derive materialization refcounts")
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if self.check_consumers and (_consumer_hit(node.attr) or _attribute_on(node, ("consumers",), ("pllm",))):
+            self._add(node, "consumer authority leaked into Region core")
+        if self.check_redecision:
+            if node.attr == "compile_safe":
+                self._add(node, f"{self.prefix} may not re-decide compile safety")
+            if node.attr == "compile_policy":
+                self._add(node, f"{self.prefix} may not read raw compile policy")
+            if node.attr in REFCOUNT_NAMES:
+                self._add(node, f"{self.prefix} may not derive materialization refcounts")
+            if _attribute_on(node, ("tasks",), ("region", "execution_region")):
+                self._add(node, f"{self.prefix} may not inspect Region task membership")
+        if self.check_legacy and node.attr == "legacy_consumer":
+            self._add(node, "native Region path may not inspect legacy adapter ownership")
+        if self.check_sampler and _attribute_on(node, ("config",), ("provider",)):
+            self._add(node, "sampler bridge may not infer policy from workload config")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if self.check_redecision and _attribute_on(node.func, ("split", "partition", "rsplit"), ("executor", "implementation_id")):
+            self._add(node, f"{self.prefix} may not parse executor strings")
+        if self.check_redecision and isinstance(node.func, ast.Name) and node.func.id == "len" and (
+            len(node.args) == 1 and _attribute_on(node.args[0], ("consumer_regions",), ("binding",))
+        ):
+            self._add(node, f"{self.prefix} may not derive materialization refcounts")
+        if self.check_sampler and isinstance(node.func, ast.Name) and node.func.id == "getattr" and (
+            len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and node.args[0].id == "provider"
+            and isinstance(node.args[1], ast.Constant) and node.args[1].value == "config"
+        ):
+            self._add(node, "sampler bridge may not infer policy from workload config")
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if self.check_consumers and isinstance(node.value, str) and _consumer_hit(node.value):
+            self._add(node, "consumer authority leaked into Region core")
+
+    def visit_Try(self, node: ast.Try) -> None:
+        if self.check_eager:
+            compiled = any(
+                _attribute_on(inner.func, ("compile",), ("torch",)) if isinstance(inner, ast.Call) else False
+                for statement in node.body for inner in ast.walk(statement)
             )
-        patterns = ()
-        if path in COMPILER_DISPATCH_FILES:
-            patterns += dispatch_patterns
-        if path in PHYSICAL_FILES:
-            patterns += physical_patterns[:3] + (physical_patterns[4],)
-        if path in SAMPLER_FILES:
-            patterns += (
-                (
-                    "sampler bridge may not infer policy from workload config",
-                    r"\bprovider\s*\.\s*config\b|"
-                    r"getattr\s*\(\s*provider\s*,\s*[\"']config[\"']",
-                ),
-            )
-        for rule, pattern in patterns:
-            if re.search(pattern, line):
-                violations.append(Violation(path, line_number, rule, line))
-    if path in PHYSICAL_FILES:
-        eager_retry_rule, eager_retry_pattern = physical_patterns[3]
-        for match in re.finditer(eager_retry_pattern, source):
-            line_number = source.count("\n", 0, match.start()) + 1
-            line = source.splitlines()[line_number - 1]
-            violations.append(
-                Violation(path, line_number, eager_retry_rule, line)
-            )
-    return violations
+            if compiled and any(
+                (isinstance(inner, ast.Name) and inner.id == "eager")
+                or (isinstance(inner, ast.Attribute) and inner.attr == "eager")
+                or (isinstance(inner, ast.Constant) and inner.value == "eager")
+                for handler in node.handlers for inner in ast.walk(handler)
+            ):
+                self._add(node, "physical path may not silently retry with eager")
+        self.generic_visit(node)
 
 
-def _native_binding_violations(path: Path, source: str) -> list[Violation]:
-    """Apply physical no-redecision checks to native worker/backend binders."""
-
-    violations: list[Violation] = []
-    patterns = (
-        ("native binding may not re-decide compile safety", r"\.compile_safe\b"),
-        ("native binding may not read raw compile policy", r"\.compile_policy\b"),
-        (
-            "native binding may not inspect Region task membership",
-            r"\bregion\.tasks\b|\bexecution_region\.tasks\b",
-        ),
-        (
-            "native binding may not parse executor strings",
-            r"\bexecutor\s*\.\s*(split|partition|rsplit)\s*\(|"
-            r"\bimplementation_id\s*\.\s*(split|partition|rsplit)\s*\(",
-        ),
-        (
-            "native binding may not derive materialization refcounts",
-            r"len\s*\(\s*binding\.consumer_regions\b|"
-            r"\binitial_refcounts\b|\b_remaining_result_uses\b",
-        ),
-    )
-    for line_number, line in enumerate(source.splitlines(), start=1):
-        for rule, pattern in patterns:
-            if re.search(pattern, line):
-                violations.append(Violation(path, line_number, rule, line))
-    return violations
+def _rust_violations(path: Path, source: str) -> list[Violation]:
+    """Consumer-name scan over the production half of a Rust planning file."""
+    production = source.split("#[cfg(test)]", 1)[0]
+    return [
+        Violation(path, number, "consumer authority leaked into Region core", line)
+        for number, line in enumerate(production.splitlines(), start=1)
+        if _consumer_hit(line)
+    ]
 
 
 def collect(root: Path = REPO_ROOT) -> list[Violation]:
     violations: list[Violation] = []
-    for relative_path in AUTHORITY_FILES:
+    for relative_path in (*AUTHORITY_FILES, *NATIVE_BINDING_FILES):
         path = root / relative_path
         if not path.is_file():
-            violations.append(
-                Violation(relative_path, 0, "authority file is missing", "")
-            )
+            violations.append(Violation(relative_path, 0, "authority file is missing", ""))
             continue
-        violations.extend(
-            _line_violations(relative_path, path.read_text(encoding="utf-8")))
-    for relative_path in NATIVE_BINDING_FILES:
-        path = root / relative_path
-        if not path.is_file():
-            violations.append(
-                Violation(relative_path, 0, "native binding file is missing", "")
-            )
+        source = path.read_text(encoding="utf-8")
+        if relative_path.suffix == ".rs":
+            violations.extend(_rust_violations(relative_path, source))
             continue
-        violations.extend(
-            _native_binding_violations(
-                relative_path, path.read_text(encoding="utf-8")
-            )
-        )
+        visitor = _PythonAuthority(relative_path, source.splitlines())
+        visitor.visit(ast.parse(source, filename=str(relative_path)))
+        violations.extend(visitor.violations)
     return violations
 
 
