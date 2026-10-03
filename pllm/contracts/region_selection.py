@@ -15,12 +15,8 @@ from pllm.contracts.region_streams import RegionStreamPlan
 class RegionSelectionPolicy:
     allow_numerical_transforms: bool = True
     schedule_policy: Literal["auto", "serial"] = "auto"
-    # "heuristic" (default): install the reference without exploring the
-    # catalog. Static ranking is a constant function — logical traffic bounds
-    # are schedule-independent (instance counts x per-call facts, no schedule
-    # input) and catalog candidates carry no rewrite flops — so any static
-    # source-first rule keeps the reference. "measured" opts into the full
-    # catalog/payload/stream derivation and the cold measurement protocol.
+    # Static preparation uses one ISL configuration and a fixed stream mapping.
+    # Extra schedule/math candidates and timing require "measured".
     tuning: Literal["heuristic", "measured"] = "heuristic"
 
 

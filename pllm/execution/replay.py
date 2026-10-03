@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from collections.abc import Callable
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from math import isfinite
 import struct
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
@@ -15,12 +15,11 @@ import torch
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.trace import TracePhase
 from pllm.execution.region_replay import ConditionalReplayRegion
-from pllm.execution.tokenwise_region import TokenwiseRegion, compile_tokenwise_source, mix_layer_outputs as mix_layer_outputs
+from pllm.execution.tokenwise_region import TokenwiseRegion, compile_tokenwise_region, mix_layer_outputs as mix_layer_outputs
 from pllm.contracts.region_program import BorrowedResource, TensorType
 from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_composition import RegionFunctionBody
-from pllm.contracts.region_selection import RegionSelection, RegionSelectionPolicy, RegionSelectionRequest
-from pllm.contracts.tensor_rewrite import TensorRewrite
+from pllm.contracts.region_selection import RegionSelectionPolicy
 from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding, RegionPageOwner
 from pllm.execution.host_borrow import TraceResourceView
 from pllm.execution.region_streams import RegionStreamBindings
@@ -127,18 +126,17 @@ class TokenwiseReplayTask(Generic[DataT]):
     @classmethod
     def bind(cls, task: SemanticTask, tensor: TensorType, max_rows: int, domain: CausalModelDomain,
              implementation_id: ImplementationId, policy: RegionSelectionPolicy, payload_budget: int, *,
+             stream_lanes: int = 1,
              source_imports: tuple[RegionTensorImport, ...] = (),
              function_bodies: tuple[RegionFunctionBody, ...] = ()) -> TokenwiseReplayTask[DataT]:
         effect = task.replay
         if not isinstance(effect, TokenwiseLayerReplay):
             raise ValueError("tokenwise region requires its declared recurrence")
-        region = compile_tokenwise_source(tensor, max_rows, domain, effect, source_imports=source_imports,
+        region = compile_tokenwise_region(tensor, max_rows, domain, effect, policy, stream_lanes=stream_lanes, source_imports=source_imports,
             function_bodies=function_bodies).within_payload_budget(payload_budget)
+        if set(region.functions) == {function.name for function in region.program.functions}:
+            region = region.bind_functions({})
         return cls(task, region, implementation_id, policy)
-
-    def with_schedule(self, request: RegionSelectionRequest, selection: RegionSelection,
-                      records: tuple[TensorRewrite, ...] = ()) -> TokenwiseReplayTask[DataT]:
-        return replace(self, region=self.region.with_schedule(request, selection, self.policy, records))
 
     def execute(self, context: StateTaskContext[DataT]) -> None:
         if self.policy != context.arena.plan.timeline.region_policy:

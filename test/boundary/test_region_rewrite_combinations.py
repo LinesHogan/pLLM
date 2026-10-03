@@ -1,5 +1,7 @@
 """Joint mathematical choices are assessed with the region's real lifetimes."""
 
+from pllm.contracts.region_selection import RegionSelectionPolicy
+
 from dataclasses import replace
 import warnings
 
@@ -10,7 +12,7 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.region_program import Block, Call, Program, Region, Value
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
-from pllm.execution.region_optimization import bind_selected_region, optimize_region
+from pllm.execution.region_optimization import optimize_region, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.execution.tensor_rewrites import explore_matmul_combinations, replay_matmul_reassociations
 from test.boundary.test_tensor_access import StorageObserver
 from test.boundary.test_tensor_rewrite_search import example as deep_example
@@ -102,17 +104,17 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
     options = ExecutionOptions(schedule_policy="serial")
     with pytest.warns(NumericalTransformWarning):
         selected = optimize_region(program, cells, inputs,
-            payload_limits=(RegionPayloadLimit(device, 5392),), options=options,
+            payload_limits=(RegionPayloadLimit(device, 5392),), options=replace(options, tuning="measured"),
             warmup_rounds=0, measurement_rounds=2)
     assert len(measured) == 2
-    assert selected.selection.selected == 3
-    assert [c.feasible for c in selected.selection.candidates] == [False, False, False, True]
-    assert [c.capacity.devices[0].peak_tensor_bytes_upper_bound for c in selected.selection.candidates] == [9440] * 3 + [5392]
-    assert all(c.elapsed_ns == () for c in selected.request.candidates[:3])
-    assert len(selected.request.candidates[3].elapsed_ns) == 2
-    assert selected.selection.candidates[3].changed_functions == tuple(sorted(cells))
+    winner = selected.selection.selected
+    assert winner != 0 and selected.selection.candidates[winner].feasible
+    assert selected.selection.candidates[winner].capacity.devices[0].peak_tensor_bytes_upper_bound == 5392
+    assert all(c.elapsed_ns == () for c, a in zip(selected.request.candidates, selected.selection.candidates) if not a.feasible)
+    assert len(selected.request.candidates[winner].elapsed_ns) == 2
+    assert selected.selection.candidates[winner].changed_functions == tuple(sorted(cells))
     with StorageObserver(tuple(inputs.values())) as observed:
-        result = selected.run(inputs)
+        result = selected.execution.run(inputs)
     assert result.invocations == 2
     assert observed.peak - sum(t.numel() * t.element_size() for t in inputs.values()) <= 5392
     for value in result.values:
@@ -122,18 +124,22 @@ def test_only_joint_rewrite_fits_and_only_feasible_candidates_are_measured(devic
         assert torch.equal(cuda_rng, torch.cuda.get_rng_state(device))
     for before, after in zip(saved, inputs.values(), strict=True):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="replayed mathematical evidence"):
-        bind_selected_region(program, cells, selected.request, selected.selection,
-                             selected.rewrites[:1], options=options)
+    from pllm.execution.tensor_rewrites import replay_tensor_rewrites
     first, second = selected.rewrites
+    partial = {**cells, first.source_digest: replay_tensor_rewrites(cells[first.source_digest], (first,))}
+    with pytest.raises(ValueError, match="admitted imports"):
+        bind_region_candidate(PreparedRegionCandidate(program, selected.request.candidates[winner], (first,), partial),
+            selected.request.payload_limits, selected.selection.candidates[winner])
     with pytest.raises(ValueError, match="source graph"):
-        bind_selected_region(program, cells, selected.request, selected.selection,
-            (first, replace(second, after=replace(second.after, flops=0))), options=options)
-    # Steps in different functions commute; only each function's internal
-    # proof chain has an execution order.
-    rebound = bind_selected_region(program, cells, selected.request, selected.selection,
-                                   selected.rewrites[::-1], options=options)
-    assert rebound.selection == selected.selection
+        replay_tensor_rewrites(cells[second.source_digest], (replace(second, after=replace(second.after, flops=0)),))
+    # Independent rule chains commute. Bind their locally replayed artifacts.
+    reversed_records = selected.rewrites[::-1]
+    rebuilt = {name: replay_tensor_rewrites(cell, tuple(r for r in reversed_records if r.source_digest == name))
+               for name, cell in cells.items()}
+    rebound = bind_region_candidate(PreparedRegionCandidate(program, selected.request.candidates[winner], reversed_records, rebuilt),
+        selected.request.payload_limits, selected.selection.candidates[winner])
+    for actual, expected in zip(rebound.run(inputs).values, selected.execution.run(inputs).values, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_optout_and_search_budgets_do_not_authorize_an_over_budget_candidate(monkeypatch):
@@ -144,10 +150,10 @@ def test_optout_and_search_budgets_do_not_authorize_an_over_budget_candidate(mon
         raise AssertionError("an infeasible candidate must not be measured")
     monkeypatch.setattr(tuning, "_measure", forbidden)
     with warnings.catch_warnings(record=True) as caught:
-        for kwargs in ({"max_rewrite_depth": 1}, {"max_candidates": 3},
+        for kwargs in ({"max_rewrite_depth": 1}, {"max_candidates": 1},
                        {"options": ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial")}):
             settings = {"options": ExecutionOptions(schedule_policy="serial"), **kwargs}
             with pytest.raises(ValueError, match="no region candidate"):
                 optimize_region(program, cells, inputs, payload_limits=(RegionPayloadLimit("cpu", 5392),),
-                                warmup_rounds=0, measurement_rounds=1, **settings)
+                                warmup_rounds=0, measurement_rounds=1, **{**settings, "options": replace(settings["options"], tuning="measured")})
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)

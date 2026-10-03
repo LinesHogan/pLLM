@@ -3,6 +3,7 @@
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -10,11 +11,13 @@ from pllm import _core
 from pllm.contracts.region_program import Program
 from pllm.contracts.region_retention import RetainedAllocation
 from pllm.contracts.region_selection import RegionPayloadLimit
+from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamExploration, RegionStreamPlan
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.region_frame import lookup
-from pllm.execution.region_storage import RegionImportSource, import_region_functions
+from pllm.execution.region_storage import RegionImportSource, analyze_region_payload, import_region_functions
+from pllm.execution.region_compilation import analyze_region_program
 from pllm.execution.region_values import Bank, Data
 
 
@@ -24,13 +27,53 @@ def lower_region_streams(program: Program, schedule: str, cells: RegionImportSou
         encode_boundary(import_region_functions(program, cells)), encode_boundary(retained), pipeline_depth), RegionStreamPlan)
 
 
-def explore_region_streams(program: Program, cells: RegionImportSource, *, lanes: int,
-                           max_candidates: int = 4, retained: tuple[RetainedAllocation, ...] = (),
-                           max_pipeline_depth: int = 1) -> RegionStreamExploration:
-    """Find physical phases in the shared ISL catalog for borrowed stream capacity."""
+def explore_region_streams(program: Program, cells: RegionImportSource, *, schedule: str,
+                           retained: tuple[RetainedAllocation, ...] = (),
+                           payload_limits: tuple[RegionPayloadLimit, ...] | None = None) -> RegionStreamExploration:
+    """First funded two-stream mapping of this order; no schedule search."""
     return decode_boundary(_core.explore_region_streams(encode_boundary(program),
-        encode_boundary(import_region_functions(program, cells)), encode_boundary(retained), lanes, max_candidates, max_pipeline_depth),
-        RegionStreamExploration)
+        encode_boundary(import_region_functions(program, cells)), encode_boundary(retained), schedule,
+        None if payload_limits is None else encode_boundary(payload_limits)), RegionStreamExploration)
+
+
+def plan_region_schedule(program: Program, cells: RegionImportSource, *,
+                         payload_limits: tuple[RegionPayloadLimit, ...] | None = None,
+                         retained: tuple[RetainedAllocation, ...] = (), parallel: bool = False,
+                         policy: Literal["auto", "serial"] = "auto") -> RegionScheduleProposal | None:
+    """Choose one funded order, then its first legal fixed two-stream mapping.
+
+    Source facts stay unchanged. No window/tile catalog or timing is involved;
+    the reference remains the admission baseline, never an execution retry.
+    """
+    budgets = None if payload_limits is None else {limit.device: limit.bytes for limit in payload_limits}
+    if budgets is not None and (len(budgets) != len(payload_limits or ())
+                               or any(type(n) is not int or n < 0 for n in budgets.values())):
+        raise ValueError("schedule budgets must be distinct nonnegative device bounds")
+    analysis = analyze_region_program(program, optimize=policy == "auto", parallel_only=True)
+    proposals = tuple(RegionScheduleProposal(analyze_region_payload(program, candidate.schedule_map, cells, retained))
+                      for candidate in reversed(analysis.candidates))
+    if parallel and policy == "auto":
+        for proposal in proposals:
+            mapped = arrange_region_schedule(program, proposal.payload.capacity.schedule_map, cells,
+                parallel=True, retained=retained, payload_limits=payload_limits)
+            if mapped.stream_plan is not None:
+                return mapped
+    for proposal in proposals:
+        if budgets is None or all(limit.device in budgets and limit.bytes <= budgets[limit.device] for limit in proposal.peak_bytes):
+            return proposal
+    return None
+
+
+def arrange_region_schedule(program: Program, schedule: str, cells: RegionImportSource, *,
+                            parallel: bool, retained: tuple[RetainedAllocation, ...] = (),
+                            payload_limits: tuple[RegionPayloadLimit, ...] | None = None) -> RegionScheduleProposal:
+    """One physical arrangement for an explicitly selected advanced order."""
+    if parallel:
+        found = explore_region_streams(program, cells, schedule=schedule, retained=retained, payload_limits=payload_limits)
+        if found.candidates:
+            plan, = found.candidates
+            return RegionScheduleProposal(plan.payload, plan)
+    return RegionScheduleProposal(analyze_region_payload(program, schedule, cells, retained))
 
 
 def validate_stream_budget(plan: RegionStreamPlan, limits: tuple[RegionPayloadLimit, ...]) -> None:

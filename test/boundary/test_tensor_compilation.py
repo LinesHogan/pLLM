@@ -18,7 +18,7 @@ from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution, RegionInstructionExecution
 from pllm.execution.region_native import CompiledPrimitive
-from pllm.execution.region_optimization import bind_selected_region, optimize_region, select_region_candidate
+from pllm.execution.region_optimization import optimize_region, select_region_candidate, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.execution.region_storage import analyze_region_capacity, import_region_functions
 from pllm.execution.tensor_compilation import compile_tensor_cell, supports_tensor_compilation
 from pllm.execution.tensor_scan import TensorScan
@@ -133,7 +133,7 @@ def test_automatic_selection_replays_compiler_and_run_does_not_compile(device, m
     options = ExecutionOptions(schedule_policy="serial")
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
         selected = optimize_region(single_call(source), {source.digest: source}, dict(zip(("in0", "in1"), tensors)),
-            payload_limits=(RegionPayloadLimit(device, 10000),), options=options, warmup_rounds=0, measurement_rounds=1,
+            payload_limits=(RegionPayloadLimit(device, 10000),), options=replace(options, tuning="measured"), warmup_rounds=0, measurement_rounds=1,
             compiler=RecordingCompiler())
     assert selected.selection.selected == 1 and not selected.rewrites
     assert "supports" in calls and calls.count("compile") == 1  # Candidate only; finish installs the measured executor.
@@ -149,7 +149,7 @@ def test_automatic_selection_replays_compiler_and_run_does_not_compile(device, m
         from triton.runtime.jit import JITFunction
         monkeypatch.setattr(triton, "compile", forbidden)
         monkeypatch.setattr(JITFunction, "_do_compile", forbidden)
-    actual, = selected.run(dict(zip(("in0", "in1"), tensors))).values
+    actual, = selected.execution.run(dict(zip(("in0", "in1"), tensors))).values
     torch.testing.assert_close(actual, torch.full_like(actual, 5), rtol=0, atol=0)
     assert not calls
 
@@ -165,9 +165,9 @@ def test_backend_declining_compilation_preserves_original_schedule_execution():
     inputs = dict(zip(("in0", "in1"), tensors))
     selected = optimize_region(single_call(source), {source.digest: source}, inputs,
         payload_limits=(RegionPayloadLimit("cpu", 10000),), compiler=DecliningCompiler(),
-        options=ExecutionOptions(schedule_policy="serial"), warmup_rounds=0, measurement_rounds=1)
+        options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
     assert len(selected.request.candidates) == 1
-    torch.testing.assert_close(selected.run(inputs).values, (torch.full_like(tensors[0], 5),), rtol=0, atol=0)
+    torch.testing.assert_close(selected.execution.run(inputs).values, (torch.full_like(tensors[0], 5),), rtol=0, atol=0)
 
 
 def test_closed_backend_facts_are_replayed_and_cannot_be_replaced_by_zero_cost_claims():
@@ -183,15 +183,17 @@ def test_closed_backend_facts_are_replayed_and_cannot_be_replaced_by_zero_cost_c
     # Old selections must be rebuilt from source; do not silently strip a
     # field from signed imports and reuse the previous capacity/selection.
     options = ExecutionOptions(schedule_policy="serial")
-    with pytest.warns(NumericalTransformWarning):
-        bind_selected_region(program, {source.digest: source}, request, select_region_candidate(program, request), (), options=options)
+    decision = select_region_candidate(program, request)
+    bind_region_candidate(PreparedRegionCandidate(program, request.candidates[1], (), {source.digest: compiled}),
+        request.payload_limits, decision.candidates[1])
     for fake in (replace(compiled.implementation, allocations=()),
                  replace(compiled.implementation, code_digest="0" * 64),
                  replace(compiled.implementation, backend="another compiler")):
         forged = replace(request, candidates=(request.candidates[0], replace(request.candidates[1], imports=(fake,))))
         decision = select_region_candidate(program, forged)
-        with pytest.raises(ValueError, match="backend code or allocation facts"):
-            bind_selected_region(program, {source.digest: source}, forged, decision, (), options=options)
+        with pytest.raises(ValueError, match="admitted imports"):
+            bind_region_candidate(PreparedRegionCandidate(program, forged.candidates[1], (), {source.digest: compiled}),
+                forged.payload_limits, decision.candidates[1])
     for fake in (replace(compiled.implementation, code_digest="not a digest"),
                  replace(compiled.implementation, allocations=compiled.implementation.allocations * 2)):
         with pytest.raises(ValueError):
@@ -233,7 +235,7 @@ def test_optout_avoids_compilation_and_capacity_can_reject_a_faster_compiled_pla
     with monkeypatch.context() as patch:
         patch.setattr(tuning, "compile_tensor_cell", forbidden)
         selected = optimize_region(program, cells, inputs, payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"),
+            options=replace(ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1)
     assert len(selected.request.candidates) == 1
     original = analyze_region_capacity(program, analyze_region_program(program).reference_schedule, cells)
@@ -243,7 +245,7 @@ def test_optout_avoids_compilation_and_capacity_can_reject_a_faster_compiled_pla
     monkeypatch.setattr(tuning, "_measure", measure)
     selected = optimize_region(program, cells, inputs,
         payload_limits=(RegionPayloadLimit("cpu", original.devices[0].peak_tensor_bytes_upper_bound),),
-        options=ExecutionOptions(schedule_policy="serial"), warmup_rounds=0, measurement_rounds=1)
+        options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
     assert selected.selection.selected == 0 and not selected.selection.candidates[1].feasible
     assert selected.request.candidates[1].elapsed_ns == ()
 
@@ -281,10 +283,10 @@ def test_reduction_normalization_enters_selection_with_owned_scratch_and_readonl
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
         selected = optimize_region(single_call(source), {source.digest: source}, {"in0": x},
             payload_limits=(RegionPayloadLimit(device, 1_000_000),),
-            options=ExecutionOptions(schedule_policy="serial"), max_candidates=2,
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), max_candidates=2,
             warmup_rounds=0, measurement_rounds=1)
     assert selected.selection.selected == 1
-    compiled = selected._execution._cells[source.digest]
+    compiled = selected.execution.cells[source.digest]
     assert isinstance(compiled, CompiledPrimitive)
     allocations = compiled.implementation.allocations
     assert allocations and sum(a.bytes for a in allocations) >= source.output_bytes
@@ -297,7 +299,7 @@ def test_reduction_normalization_enters_selection_with_owned_scratch_and_readonl
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)
     import torch._inductor.compile_fx as inductor
     monkeypatch.setattr(inductor, "compile_fx_inner", forbidden)
-    actual = selected.run({"in0": x}).values
+    actual = selected.execution.run({"in0": x}).values
     reference = x.double()
     expected = ((reference / torch.sqrt((reference * reference).sum(dim=1, keepdim=True) / 129 + 1e-5)).float(),
                 reference.sum(dim=0).float(), reference.sum())
@@ -327,12 +329,12 @@ def test_selection_combines_compilers_across_loop_boundary_without_singleton_win
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
         selected = optimize_region(program, {reduce.digest: reduce, advance.digest: advance}, {"x": x},
             payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=ExecutionOptions(schedule_policy="serial"), max_candidates=4,
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), max_candidates=4,
             warmup_rounds=0, measurement_rounds=1)
-    assert selected.selection.selected == 3
-    assert len(selected.selection.candidates[3].changed_functions) == 2
+    assert selected.selection.selected == 1
+    assert len(selected.selection.candidates[1].changed_functions) == 2
     assert all(not c.outlines for c in selected.request.candidates)
-    actual, = selected.run({"x": x}).values
+    actual, = selected.execution.run({"x": x}).values
     expected = sum(i * i for i in range(1, 130)) / 129
     for _ in range(3):
         expected = expected * 0.5 + 1
@@ -458,13 +460,13 @@ def test_outlined_calls_can_be_selected_as_one_real_backend_kernel(device, monke
         1 if any(isinstance(cell, CompiledPrimitive) and name not in sources for name, cell in execution._cells.items()) else 100)
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
         selected = optimize_region(program, sources, {"x": x, "y": y},
-            payload_limits=(RegionPayloadLimit(device, 10000),), options=ExecutionOptions(schedule_policy="serial"),
+            payload_limits=(RegionPayloadLimit(device, 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1)
     candidate = selected.request.candidates[selected.selection.selected]
     assert len(candidate.outlines) == 1
-    compiled = [c for c in selected._execution._cells.values() if isinstance(c, CompiledPrimitive)]
+    compiled = [c for c in selected.execution.cells.values() if isinstance(c, CompiledPrimitive)]
     assert len(compiled) == 1
-    result = selected.run({"x": x, "y": y})
+    result = selected.execution.run({"x": x, "y": y})
     assert result.invocations == 1
     torch.testing.assert_close(result.values[0], torch.full_like(x, 5), rtol=0, atol=0)
 
@@ -480,9 +482,9 @@ def test_zero_length_tuning_compiles_once_for_other_legal_scan_lengths(device, m
     monkeypatch.setattr(tuning, "_measure", lambda execution, *args:
         1 if isinstance(execution._cells[cell.digest], CompiledPrimitive) else 100)
     with pytest.warns(NumericalTransformWarning, match="kernel compilation"):
-        selected = scan.optimized((x,), (), (), count=0, payload_limits=(RegionPayloadLimit(device, 10000),),
-            options=ExecutionOptions(schedule_policy="serial"), warmup_rounds=0, measurement_rounds=1)
-    assert selected.selection.candidates[selected.selection.selected].changed_functions == (cell.digest,)
+        selected, selected_report = scan.optimized((x,), (), (), count=0, payload_limits=(RegionPayloadLimit(device, 10000),),
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
+    assert selected_report.selection.candidates[selected_report.selection.selected].changed_functions == (cell.digest,)
     def forbidden(*args, **kwargs):
         raise AssertionError("another loop count must not trigger compilation")
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)

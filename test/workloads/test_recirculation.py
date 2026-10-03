@@ -62,7 +62,9 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
         tuning="measured"))
     tight = workload.compile_backend(tight_facts)
     task = TokenwiseReplayTask.from_implementation(tight.execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
-    assert task.policy.schedule_policy == "auto" and len(task.region.candidate_proposals) == 1
+    assert task.policy.schedule_policy == "auto"
+    assert all(all(d.bytes <= task.region.payload_limits[0].bytes for d in p.peak_bytes)
+               for p in task.region.candidate_proposals)
     assert task.region.candidate_proposals[0].payload == task.region.payload
     assert tight.attachment.inputs.plan.timeline.memory_budget_bytes == reference_budget
     with pytest.raises(ValueError, match="reference payload exceeds"):

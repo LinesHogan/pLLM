@@ -53,10 +53,10 @@ def test_bound_scan_matches_original_chunk_math_bitwise_and_compiles_only_cold(
         base = base.T
     calls = []
     original = TensorScan.__call__
-    def record(self, *args):
+    def record(self, *args, **kwargs):
         assert self.program.parameters[0].name == "chunks"
         calls.append(len(args[2][0]))
-        return original(self, *args)
+        return original(self, *args, **kwargs)
     monkeypatch.setattr(TensorScan, "__call__", record)
     def cold_only(*args, **kwargs):
         raise AssertionError("compilation entered the request execution path")
@@ -159,8 +159,8 @@ def test_production_tuning_uses_signed_policy_and_remaining_transition_budget(mo
     target = ParameterTarget(0, ParameterModuleKind.MLP, ParameterRole.DOWN_PROJECTION_WEIGHT)
     workload = InPlaceTTTWorkload(InPlaceTTTConfig((target,), chunk_size=3))
     facts = workload.specialize(facts_for(torch.device("cpu"), torch.float32, target),
-        pllm.ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial", memory_budget_bytes=1 << 20))
-    policy = RegionSelectionPolicy(False, "serial")
+        pllm.ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial", tuning="measured", memory_budget_bytes=1 << 20))
+    policy = RegionSelectionPolicy(False, "serial", "measured")
     assert facts.timeline.region_policy == policy
     facts = decode_boundary(encode_boundary(facts), BackendCompileFacts)
     attachment = workload.plan_backend(facts)
@@ -173,7 +173,7 @@ def test_production_tuning_uses_signed_policy_and_remaining_transition_budget(mo
         # deducted from the transition's original declared workspace.
         assert kwargs["payload_limits"][0].bytes == 4 * (12 * (7 + 2 * 5) + 6 * 7 * 5)
         result = original(self, *args, **kwargs)
-        selected.append(result.selection)
+        selected.append(result[1].selection)
         return result
     def forbidden(*args, **kwargs):
         raise AssertionError("numerical optout reached backend compilation")

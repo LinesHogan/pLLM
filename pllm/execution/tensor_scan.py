@@ -14,12 +14,12 @@ from dataclasses import dataclass
 import torch
 
 from pllm.contracts.region_program import BankType, Block, Call, Program, Region, ScalarType, Scan, Select, SizeParameter, TensorType, Value, verify
-from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelection, RegionSelectionPolicy
+from pllm.contracts.region_selection import RegionPayloadLimit, RegionSelectionPolicy
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_native import RegionFunction
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_optimization import RegionOptimizationOptions, SelectedRegion, optimize_region
+from pllm.execution.region_execution import RegionExecution, RegionInstructionExecution
+from pllm.execution.region_optimization import RegionOptimizationOptions, SelectedRegion, optimize_region, prepare_region_execution
 from pllm.execution.region_values import Bank, Data
 from pllm.execution.region_streams import RegionStreamBindings
 
@@ -98,7 +98,7 @@ class TensorScan:
         schedule = analysis.reference_schedule
         self.program = program
         self._cells = cells
-        self._execution: RegionExecution | SelectedRegion = RegionExecution(program, lower_region_schedule(program, schedule),
+        self._execution: RegionInstructionExecution = RegionExecution(program, lower_region_schedule(program, schedule),
                                            lower_region_bindings(program, schedule), cells)
         self._carry, self._invariants = carry, invariants
         self._sequences = len(input_types) - fixed
@@ -118,15 +118,11 @@ class TensorScan:
         inputs: Mapping[str, Data] = dict(zip(self._names, (*carry, *invariants, *(Bank(s) for s in sequences)), strict=True))
         return inputs, sizes
 
-    @property
-    def selection(self) -> RegionSelection | None:
-        return self._execution.selection if isinstance(self._execution, SelectedRegion) else None
-
     def optimized(self, carry: tuple[torch.Tensor, ...], invariants: tuple[torch.Tensor, ...],
                   sequences: tuple[tuple[torch.Tensor, ...], ...], *, payload_limits: tuple[RegionPayloadLimit, ...],
-                  count: int | None = None, options: RegionOptimizationOptions = RegionSelectionPolicy(),
-                  warmup_rounds: int = 1, measurement_rounds: int = 3, max_candidates: int = 32,
-                  max_rewrite_depth: int = 2, streams: RegionStreamBindings | None = None) -> "TensorScan":
+                  count: int | None = None, options: RegionOptimizationOptions = RegionSelectionPolicy(tuning="measured"),
+                  warmup_rounds: int = 1, measurement_rounds: int = 3, max_candidates: int = 8,
+                  max_rewrite_depth: int = 2, streams: RegionStreamBindings | None = None) -> tuple["TensorScan", SelectedRegion]:
         """Return a cold-tuned scan with the same callable and source contract.
 
         Examples are privately copied. One selected symbolic plan serves every
@@ -145,8 +141,20 @@ class TensorScan:
             measurement_rounds=measurement_rounds, max_candidates=max_candidates, max_rewrite_depth=max_rewrite_depth,
             streams=streams)
         result = copy(self)
-        result._execution = execution
+        result._execution = execution.execution
+        return result, execution
+
+    def prepared(self, *, payload_limits: tuple[RegionPayloadLimit, ...], options: RegionOptimizationOptions,
+                 parallel: bool = False) -> "TensorScan":
+        """Static preparation needs no example invocation or measurement."""
+        result = copy(self)
+        result._execution = prepare_region_execution(self.program, self._cells, payload_limits=payload_limits,
+            options=options, parallel=parallel)
         return result
+
+    @property
+    def parallel(self) -> bool:
+        return self._execution.stream_plan is not None
 
     def __call__(self, carry: tuple[torch.Tensor, ...], invariants: tuple[torch.Tensor, ...],
                  sequences: tuple[tuple[torch.Tensor, ...], ...], *, count: int | None = None,
@@ -155,8 +163,7 @@ class TensorScan:
         if streams is not None:
             streams.validate_available()
         with nullcontext() if streams is None else torch.cuda.stream(streams.owner):
-            result = (self._execution.run(inputs, sizes=sizes, streams=streams) if isinstance(self._execution, SelectedRegion)
-                      else self._execution.run(inputs, sizes=sizes)).values
+            result = self._execution.run(inputs, sizes=sizes, streams=streams if self.parallel else None).values
         final: list[torch.Tensor] = []
         columns: list[tuple[torch.Tensor, ...]] = []
         for value in result[:self._carry]:

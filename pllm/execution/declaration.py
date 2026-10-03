@@ -299,6 +299,7 @@ class Builder(Generic[D]):
                     raise ValueError("tokenwise replay requires its original signed task workspace")
                 functions.append(TokenwiseReplayTask[D].bind(task, tensor, model_probe.max_packed_rows,
                     model_probe.causal_domain, identity, plan.timeline.region_policy, workspace,
+                    stream_lanes=2 if "execution/region_streams@1" in model_probe.capabilities else 1,
                     source_imports=model_probe.region_imports, function_bodies=model_probe.region_bodies))
             elif any(effect.kind is StateEffectKind.PUBLISH for effect in task.effects):
                 functions.append(PublishStateTask[D](identity))

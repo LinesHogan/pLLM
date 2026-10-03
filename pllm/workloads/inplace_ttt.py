@@ -16,6 +16,7 @@ from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.shared_tensor import tensor_dtype
 from pllm.execution.tensor_binding import TensorBinding, TensorFrame, TensorOutput, Tensors
 from pllm.execution.tensor_scan import TensorScan
+from pllm.execution.region_streams import RegionStreamBindings
 
 Input = Annotated[torch.Tensor, pllm.Operand.INPUT]
 Target = Annotated[torch.Tensor, pllm.Operand.TARGET]
@@ -86,6 +87,8 @@ class InPlaceTTTWorkload(pllm.Workload):
                    for _, cells in regions}
         transition.scans = {layout: _tune_chunk_scan(scan, sources[layout], rows, workspace, plan.timeline.region_policy)
                             for layout, scan in transition.scans.items()}
+        if any(scan.parallel for scan in transition.scans.values()):
+            transition.streams = (torch.cuda.Stream(device=facts.device),)
         b.lower_overlay("transition", transition)
         return super().operations(facts, plan, b)
 
@@ -183,6 +186,9 @@ def _tune_chunk_scan(scan: TensorScan, cells: tuple[ExportedCell, ...], rows: in
     outside = width * (rows * (inputs + 2 * outputs) + 2 * inputs * outputs)
     if workspace <= outside:
         raise ValueError("transition workspace leaves no capacity for its tensor region")
+    limits = (RegionPayloadLimit(str(specs[0].device), workspace - outside),)
+    if policy.tuning == "heuristic":
+        return scan.prepared(payload_limits=limits, options=policy, parallel=specs[0].device.type == "cuda")
     # Zero-valued cold examples use the actual guarded layouts. No request
     # state, initialization RNG or request-owned page is touched by tuning.
     examples = tuple(torch.empty_strided(spec.shape, spec.stride, dtype=spec.dtype, device=spec.device).zero_()
@@ -190,8 +196,8 @@ def _tune_chunk_scan(scan: TensorScan, cells: tuple[ExportedCell, ...], rows: in
     delta, base, x, y = examples
     count = min(3, scan.count.maximum)
     return scan.optimized((delta,), (base,), ((x,) * count, (y,) * count),
-        payload_limits=(RegionPayloadLimit(str(specs[0].device), workspace - outside),), options=policy,
-        max_candidates=16)
+        payload_limits=limits, options=policy,
+        max_candidates=8)[0]
 
 
 class _ChunkTransition:
@@ -199,6 +205,7 @@ class _ChunkTransition:
 
     def __init__(self, chunk: int, regions: tuple[ChunkRegion, ...], max_rows: int) -> None:
         self.chunk = chunk
+        self.streams: tuple[torch.cuda.Stream, ...] = ()
         # The bank length and recurrence share one invocation shape parameter.
         # Only tensor layout affects cold specialization, never the chunk count.
         unique = {(cells[0].input_signatures[0].shape, cells[0].input_signatures[1].stride): (program, cells)
@@ -222,9 +229,13 @@ class _ChunkTransition:
             # change GEMM rounding even without changing any math operators.
             private_base = base.detach().clone()
             key = (tuple(delta.shape), tuple(private_base.stride()))
-            result = self.scans[key]((delta,), (private_base,), (
+            scan = self.scans[key]
+            streams = None
+            if scan.parallel:
+                streams = RegionStreamBindings(torch.cuda.current_stream(delta.device), self.streams)
+            result = scan((delta,), (private_base,), (
                 tuple(inputs[start:start + chunk] for start in range(0, trained, chunk)),
-                tuple(targets[start:start + chunk] for start in range(0, trained, chunk))))
+                tuple(targets[start:start + chunk] for start in range(0, trained, chunk))), streams=streams)
             next_delta, = result.carry
             column, = result.columns
             outputs.extend(column)

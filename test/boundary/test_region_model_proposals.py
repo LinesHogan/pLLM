@@ -162,13 +162,13 @@ print(encode_boundary(planned))
     def forbidden(*args, **kwargs):
         raise AssertionError("worker verification must not repeat driver search")
     from pllm import _core
-    for name in ("explore_region_schedules", "explore_region_streams", "explore_region_windows", "explore_region_tiling"):
+    for name in ("explore_region_schedules", "explore_region_windows", "explore_region_tiling"):
         monkeypatch.setattr(_core, name, forbidden)
     public_trace = execution.trace.snapshot()
     rng = torch.random.get_rng_state().clone()
     count = decode_boundary(command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals)), int)
     assert count > 2
-    candidates = session._tuning._candidates
+    candidates = session._tuning._request.candidates
     compiled_index = next(index for index, candidate in enumerate(candidates)
         if candidate.stream_plan is not None and any(isinstance(item, CompiledTensorImport) for item in candidate.imports))
     assert candidates[compiled_index].stream_plan != parallel.stream_plan
@@ -297,7 +297,7 @@ print(encode_boundary(planned))
         assert selected.selected == compiled_index
         installed = TokenwiseReplayTask.from_implementation(execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION))
         assert installed.region.execution.stream_plan == candidates[compiled_index].stream_plan
-        assert installed.region.execution.request.source_imports == source.imports
+        assert installed.region.imports == source.imports
         assert selected.candidates[compiled_index].changed_functions
         assert execution.trace.snapshot() == public_trace
         torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)

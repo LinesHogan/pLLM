@@ -538,6 +538,78 @@ test_inplace_region 的 CUDA 位级失败随默认 Inductor 功能恢复而消�
 smoke 复跑见 [图帐改造证据](evidence/graph-account-results.json)。
 路线 2 的容量依据主体至此落地；2.5 可读性/作者端验收另行进行。
 
+## 可读性验收（路线 2.5）
+
+按 post-implementation-simplification §6.5，五个阅读任务各由一个未参与
+实现的 fresh agent 执行并记录阻碍，全部完成（答案链均落到具体源码
+位置）。任务涉及文件数 11/6/12/6/29。统计基线（2026-09-15）：Rust 调度
+核心 11,767 行，Python 运行时 11,419 行，图变换 411 行，后端适配 3,509
+行，契约 3,486 行（183 个 dataclass），测试 17,449 行；跨语言经单一
+JSON codec，pyo3 原生类型 2 类 47 字段。§6.5 四个结构问题：索引往返
+已消失、来源事实基本一份（两处等价 bind 构造点属轻微重复）、边界复制
+有明确理由、算法不再手工拼接资源 token。
+
+阻碍按主题收敛为五类（详见
+[可读性验收证据](evidence/readability-acceptance-2_5.json)，含逐任务
+原始记录与值得保留的设计）：
+
+- **诊断可读性**（两个任务的头号阻碍）：依赖与调度拒绝原因只有求解器
+  内部 ISL 文本；"哪条边阻止并行/哪条边导致拒绝"没有人读出口。
+- **概念导航**：参考调度无单一符号、默认路径入口三层间接、同名概念
+  多套名字（recirculation/Recurrence/TokenwiseLayerReplay/tokenwise
+  replay）、生产者链路跨五层。
+- **释放/等待语义分散**："释放"三层语义在互不引用的模块；PTTS 页归还
+  是惰性轮询、无专职回收者；两条跨 stream 等待机制易混。
+- **术语定义缺口**：builder 术语（seeds/uses/paths）首次出现无定义；
+  ISL 字符串模板拼接是调度核心认知成本最高处。
+- **authoring 导览缺口**：capture→拼 Program→执行路径只能从测试反向
+  挖；但 authoring 本身零真实卡点（任务 4 一次跑通，48 行脚本）。
+
+整改范围（用户决策 2026-10-04，按 P0–P5 排序执行）：四条结构抱怨全按
+推荐方案采纳——跨域规划链（TransferLinkFact + semantic_graph 校验 +
+aer.rs 跨域搬运 + execution.py 拒绝分布式计划）全删；StateRepresentation
+收敛到 DENSE；usage.py 冻结惰性化；check_region_authority 正则禁词改
+AST 化并瘦身。另有六项：field_rows 与 publication_settled 直删；
+matmul 专用枚举/搜索/重放入口收敛到通用 explore/replay（算法保留）；
+测试/调试专用入口（PageBundleArena.reconstruct、RegionStreamExecution、
+bind_outlined_region 等）减少；MutationGranularity 先诊断运行时无视粒度
+的位置再定去留；跨进程页授权补一个真实 workload 作 best practice（复杂
+工程，交 GPT6/codex gpt-6-astra）；inplace 调优路径不一致已被调度精简
+改造吸收（TensorScan.prepared 静态分支）。全程约束：测试行数须净减少，
+逐条报告增减；文档先于 GPT6 接手前完成清理重构。
+
+## 默认路径改为确定性准备加 funded 并发（调度精简入账）
+
+默认（heuristic）路径语义变化：原"参考安装、静态排序可证为常量"改为
+**确定性准备加 funded 流重叠**——一个 ISL parallel 配置，固定
+lanes=2 / pipeline_depth=2，按稳定轴序取第一个合法且预算内的映射即停；
+reference 保留为容量与合法性基线，连 reference 都容纳不下则准备失败。
+只有 tuning="measured" 才进入调度目录探索、实现变体与计时协议。施工
+记录与验证明细见 [调度精简施工记录](scheduling-simplification-work-order.md)
+和 [实现结果数据](../audits/scheduling-implementation-results.json)。
+
+结构收敛：region_optimization.py 518→332 行（净 −524 含测试适配共 43
+文件 +750/−827）；删除 _physical_candidates、_compiled_variants、
+bind_selected_region、bind_selected_schedule、RegionStreamExecution 等
+调试重建路径；SelectedRegion 变为 execution/request/selection/rewrites
+四字段冻结报告，不再是第二个执行包装；静态准备
+（prepare_region_execution）与显式测量（optimize_region）分成两个边界；
+TokenwiseRegion.planned(policy, stream_lanes) 由声明按能力
+execution/region_streams@1 传 lanes=2；执行器不再携带调优模式字段。
+
+本轮修复一个改造引入的**组合缺口**：线性短名单 + islice 尾部截断丢失了
+旧不变量"完整组合先于中间子集消耗预算"。measured 路径按 family 线性
+发射且族内 reference 在前，outlined+batched+compiled 排第 5 被预算 4
+截杀（截掉中间项可再生，截掉完整组合不可恢复），
+test_tensor_gemm_compilation 因此 DID NOT WARN。修复：measured 改写族
+内 compiled 先于 reference 发射；heuristic 不进改写分支，其"下标越大越
+优化"的选择假设不受影响。
+
+验收（2026-10-04）：CPU+CUDA 边界与 workload 615 项通过（修前 614 通过
+1 失败）、release 1 项；cargo 22 项；typing 0 错误、import layers 与
+region authority 全绿；两个 GPU smoke 复跑通过（fallback=0，默认安装
+static、实际发放 2 条 stream）。
+
 ## 调度目录去重的单站点收敛（T4 关账）
 
 语义去重原来分散在两处：window 族逐构造对参考和基各跑一次全域

@@ -1099,6 +1099,10 @@ pub(super) fn equivalent_order(left: &UnionMap, right: &UnionMap) -> Result<bool
 }
 
 pub(super) fn analyze(program: &Program, optimize: bool) -> Result<Analysis> {
+    analyze_schedules(program, optimize, false)
+}
+
+fn analyze_schedules(program: &Program, optimize: bool, parallel_only: bool) -> Result<Analysis> {
     thread_local! {
         static ANALYSES: RefCell<VecDeque<(String, Analysis)>> = const { RefCell::new(VecDeque::new()) };
     }
@@ -1110,7 +1114,7 @@ pub(super) fn analyze(program: &Program, optimize: bool) -> Result<Analysis> {
         thread_local! {
             static SCHEDULES: RefCell<VecDeque<(String, (Vec<ScheduleCandidate>, Vec<String>))>> = const { RefCell::new(VecDeque::new()) };
         }
-        let key = digest(&canonical_ascii_json(&(&analysis.domain, &analysis.dependencies))?);
+        let key = digest(&canonical_ascii_json(&(&analysis.domain, &analysis.dependencies, parallel_only))?);
         let (candidates, diagnostics) = super::region_cache::memoized(&SCHEDULES, key, || {
             let ctx = context()?;
             let domain = isl(UnionSet::read_from_str(&ctx, &analysis.domain))?;
@@ -1119,12 +1123,12 @@ pub(super) fn analyze(program: &Program, optimize: bool) -> Result<Analysis> {
             // scheduled on a single replica and lifted order-preservingly.
             // Any structural miss or check failure falls back to the exact
             // full-domain search.
-            match lifted_schedule_candidates(&ctx, &analysis.statements, &domain, &dependencies) {
+            match lifted_schedule_candidates(&ctx, &analysis.statements, &domain, &dependencies, parallel_only) {
                 Ok(Some(lifted)) => Ok(lifted),
-                Ok(None) => schedule_candidates(&ctx, &domain, &dependencies),
+                Ok(None) => schedule_candidates(&ctx, &domain, &dependencies, parallel_only),
                 Err(error) => {
                     let (candidates, mut diagnostics) =
-                        schedule_candidates(&ctx, &domain, &dependencies)?;
+                        schedule_candidates(&ctx, &domain, &dependencies, parallel_only)?;
                     diagnostics.push(format!(
                         "lifted schedule derivation fell back to full-domain search: {error}"
                     ));
@@ -1306,7 +1310,7 @@ fn derive_analysis(program: &Program) -> Result<Analysis> {
 
 // The ISL choice pass only needs invocation domains and proven dependencies.
 // No model classes, source instructions, tensor math or page state enter here.
-fn schedule_candidates(ctx: &Context, domain: &UnionSet, dependencies: &UnionMap)
+fn schedule_candidates(ctx: &Context, domain: &UnionSet, dependencies: &UnionMap, parallel_only: bool)
     -> Result<(Vec<ScheduleCandidate>, Vec<String>)>
 {
     let mut candidates = Vec::new();
@@ -1321,7 +1325,7 @@ fn schedule_candidates(ctx: &Context, domain: &UnionSet, dependencies: &UnionMap
                 isl(dependencies.copy())?
             },
         };
-        for parallel in [0, 1] {
+        for &parallel in if parallel_only { &[1][..] } else { &[0, 1][..] } {
             ctx.reset_operations();
             let candidate = (|| {
                 isl(Options::set_schedule_outer_coincidence(ctx, parallel))?;
@@ -1459,6 +1463,7 @@ fn lifted_schedule_candidates(
     statements: &[Statement],
     domain: &UnionSet,
     dependencies: &UnionMap,
+    parallel_only: bool,
 ) -> Result<Option<(Vec<ScheduleCandidate>, Vec<String>)>> {
     let space = isl(domain.get_space())?;
     let parameters = (0..isl(space.dim(DimType::Param))?)
@@ -1491,7 +1496,7 @@ fn lifted_schedule_candidates(
             half_dependencies = isl(half_dependencies.project_out(DimType::Param, index as u32, 1))?;
         }
     }
-    let (half_candidates, mut diagnostics) = schedule_candidates(ctx, &half_domain, &half_dependencies)?;
+    let (half_candidates, mut diagnostics) = schedule_candidates(ctx, &half_domain, &half_dependencies, parallel_only)?;
     if half_candidates.is_empty() {
         return Err("replicated program yielded no half-schedule candidates".into());
     }
@@ -1558,11 +1563,11 @@ fn lifted_schedule_candidates(
 }
 
 #[pyfunction]
-#[pyo3(signature = (program_json, optimize = true))]
-fn analyze_region_program(program_json: &str, optimize: bool) -> PyResult<String> {
+#[pyo3(signature = (program_json, optimize = true, parallel_only = false))]
+fn analyze_region_program(program_json: &str, optimize: bool, parallel_only: bool) -> PyResult<String> {
     let program: Program = serde_json::from_str(program_json)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    let analysis = analyze(&program, optimize).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let analysis = analyze_schedules(&program, optimize, parallel_only).map_err(pyo3::exceptions::PyValueError::new_err)?;
     canonical_ascii_json(&analysis).map_err(pyo3::exceptions::PyValueError::new_err)
 }
 

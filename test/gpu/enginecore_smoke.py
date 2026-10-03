@@ -288,28 +288,36 @@ def _independent_lora_input() -> None:
         handle.close()
 
 
-def _recirculation_schedules() -> None:
+def _recirculation_schedules(measured: bool = False) -> None:
     assert not torch.cuda.is_initialized()
-    handle = pllm.make_llm(workload=RecirculationWorkload(RecirculationConfig(
-        source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
-            64, 2, 64, 0.25, seed=7, multiprocessing=True, execution=ExecutionOptions(tuning="measured")))
+    original_command = VllmLlm.command
+    def command(self, kind, payload="", **kwargs):
+        assert measured or not kind.value.startswith("tune_")
+        return original_command(self, kind, payload, **kwargs)
+    with patch.object(VllmLlm, "command", command):
+        handle = pllm.make_llm(workload=RecirculationWorkload(RecirculationConfig(
+            source_layer=-1, destination_layer=22, alpha=0.6, beta=None, ramp_tokens=2)),
+            config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", VllmDType.BFLOAT16,
+                64, 2, 64, 0.25, seed=7, multiprocessing=True, execution=ExecutionOptions(tuning="measured" if measured else "heuristic")))
     try:
         selection = handle.region_selection
-        assert selection is not None and len(selection.candidates) > 1
+        assert (selection is not None) == measured
         imports = handle.attachment.inputs.probe.region_imports
         assert any(isinstance(item, ExportedTensorImport) for item in imports)
         assert any(isinstance(item, BorrowedTensorImport) for item in imports)
         assert any(isinstance(item, FunctionalKernelImport) and item.implementation.startswith("vllm.export-kernel@1:") for item in imports)
         assert len(handle.attachment.inputs.probe.region_bodies) == 2
-        assert all(candidate.feasible and candidate.median_ns is not None for candidate in selection.candidates)
-        parallel_candidates = tuple(index for index, candidate in enumerate(selection.candidates)
-            if any(limit.bytes > next(device.peak_bytes_upper_bound for device in candidate.payload.devices
-                                      if device.device == limit.device) for limit in candidate.peak_bytes))
-        assert parallel_candidates, "the model catalog must carry funded concurrent scratch through EngineCore"
-        transformed_candidates = tuple(index for index, candidate in enumerate(selection.candidates)
-            if candidate.changed_functions)
-        assert transformed_candidates, "the worker must measure source-derived tensor implementations"
+        parallel_candidates, transformed_candidates = (), ()
+        if measured:
+            assert selection is not None and 1 < len(selection.candidates) <= 8
+            assert all(candidate.feasible and candidate.median_ns is not None for candidate in selection.candidates)
+            parallel_candidates = tuple(index for index, candidate in enumerate(selection.candidates)
+                if any(limit.bytes > next(device.peak_bytes_upper_bound for device in candidate.payload.devices
+                                          if device.device == limit.device) for limit in candidate.peak_bytes))
+            assert parallel_candidates, "the model catalog must carry funded concurrent scratch through EngineCore"
+            transformed_candidates = tuple(index for index, candidate in enumerate(selection.candidates)
+                if candidate.changed_functions)
+            assert transformed_candidates, "the worker must measure source-derived tensor implementations"
         assert handle.trace_snapshot().events == ()
         prompts = ["The sky is", "Water freezes at"]
         sampling = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
@@ -322,8 +330,8 @@ def _recirculation_schedules() -> None:
         diagnostics = handle.worker_state().diagnostics
         assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
         assert not torch.cuda.is_initialized()
-        print(dict(engine_core=True, selected=selection.selected,
-            measured_ns=tuple(candidate.median_ns for candidate in selection.candidates),
+        print(dict(engine_core=True, mode="measured" if measured else "static",
+            measured_ns=() if selection is None else tuple(candidate.median_ns for candidate in selection.candidates),
             parallel_candidates=parallel_candidates,
             transformed_candidates=transformed_candidates,
             kernel_imports=tuple(kernel.implementation.split(":")[0] for kernel in handle.attachment.inputs.probe.region_imports
@@ -474,6 +482,8 @@ if __name__ == "__main__":
         _fttt_activation_retry()
     elif sys.argv[1:] == ["--recirculation-only"]:
         _recirculation_schedules()
+    elif sys.argv[1:] == ["--recirculation-measured"]:
+        _recirculation_schedules(measured=True)
     elif sys.argv[1:] == ["--dummy-only"]:
         _dummy_export()
     elif sys.argv[1:] == ["--user-only"]:

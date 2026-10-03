@@ -1,5 +1,7 @@
 """An original model graph reads the owner's parameter and buffer versions."""
 
+from pllm.contracts.region_selection import RegionSelectionPolicy
+
 import pytest
 import torch
 
@@ -66,17 +68,17 @@ def test_export_parameters_and_buffers_borrow_original_storage_through_the_regio
     pages = RegionResources(program, invocation.context, (), borrows=(proof,), tensor_borrows=loans)
     try:
         with pytest.raises(ValueError, match="original readonly resource bindings"):
-            optimize_region(program, functions, {"x": x}, payload_limits=(RegionPayloadLimit(device, 1 << 20),), max_candidates=1)
+            optimize_region(program, functions, {"x": x}, payload_limits=(RegionPayloadLimit(device, 1 << 20),), max_candidates=1, options=RegionSelectionPolicy(tuning="measured"))
         if streams is not None:
             streams.owner.wait_stream(torch.cuda.current_stream(device))
         with pages.scope():
             runner = optimize_region(program, functions, {"x": x}, pages=pages, streams=streams,
-                payload_limits=(RegionPayloadLimit(device, 1 << 20),), warmup_rounds=0, measurement_rounds=1, max_candidates=8)
+                payload_limits=(RegionPayloadLimit(device, 1 << 20),), warmup_rounds=0, measurement_rounds=1, max_candidates=8, options=RegionSelectionPolicy(tuning="measured"))
             if streams is not None:
                 assert any(candidate.elapsed_ns and any(isinstance(item, CompiledTensorImport) for item in candidate.imports)
                     for candidate in runner.request.candidates)
             with Copies() as copies:
-                actual = runner.run({"x": x}, pages=pages, streams=streams).values
+                actual = runner.execution.run({"x": x}, pages=pages, streams=streams).values
             assert tuple(model.weight.shape) not in copies.shapes
             for value, reference in zip(actual, model(x), strict=True):
                 torch.testing.assert_close(value, reference, rtol=1e-5, atol=1e-6)

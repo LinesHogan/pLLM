@@ -813,10 +813,8 @@ class VllmLlm(Generic[DataT, ResultT]):
                        for task in self.attachment.inputs.plan.semantic_graph.tasks)):
             return
         if policy.tuning == "heuristic":
-            # Default path: the reference proposal is already installed and the
-            # static ranking is provably constant (schedule-independent logical
-            # traffic, zero rewrite flops), so there is no catalog to fund and
-            # nothing to measure. See compile_tokenwise_region.
+            # Static preparation already installed the funded execution,
+            # including stream placement; no private generation is needed.
             return
         task = next(task for task in self.attachment.inputs.plan.semantic_graph.tasks
                     if isinstance(task.replay, TokenwiseLayerReplay))

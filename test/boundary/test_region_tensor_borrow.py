@@ -1,3 +1,4 @@
+from test.boundary.test_region_streams import stream_execution
 """Model mathematics reads original weights and returns independently owned values."""
 
 from dataclasses import replace
@@ -15,7 +16,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import index_cell
 from pllm.execution.exported_cell import ExportedCell
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
-from pllm.execution.region_execution import RegionExecution, RegionStreamExecution
+from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_native import BorrowedTensorPrimitive
 from pllm.execution.region_resources import ReadonlyResourceBinding, RegionResources
 from pllm.execution.region_storage import analyze_region_capacity, analyze_region_storage, validate_region_capacity
@@ -83,7 +84,7 @@ def test_swiglu_uses_original_weights_without_matrix_copies_and_owns_returned_vi
         streams.owner.wait_stream(torch.cuda.current_stream(device))
         plan = lower_region_streams(program, schedule, functions, axis=0, lanes=2, pipeline_depth=2)
         assert not plan.host_fences
-        runner = RegionStreamExecution(program, functions, plan, payload_limits=limits(plan))
+        runner = stream_execution(program, functions, plan, payload_limits=limits(plan))
     owner_stream = None if streams is None else streams.owner
     execution, _, rows, _ = owner_fixture(rounds=1, stream=owner_stream)
     invocation = execution.start_step(rows, owner_stream)

@@ -1,3 +1,4 @@
+from test.boundary.test_region_streams import stream_execution
 """The actual vLLM normalization kernel uses the original resource bindings."""
 
 from dataclasses import replace
@@ -16,7 +17,6 @@ from pllm.contracts.region_program import AffineIndex, BorrowedResource, Call, C
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.region_execution import RegionStreamExecution
 from pllm.execution.region_native import external_primitive
 from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, ReadonlyResourceBinding, RegionResources
 from pllm.execution.region_streams import RegionStreamBindings, lower_region_streams
@@ -56,7 +56,7 @@ def test_model_norm_contract_binds_actual_kernel_on_both_original_streams(dtype)
         assert not plan.host_fences
         # Only the two mutable wrapper inputs need private call scratch.
         assert plan.payload.capacity.devices[0].call_scratch_bytes_upper_bound == 2 * 16 * norm.weight.element_size()
-        runner = RegionStreamExecution(program, cells, plan, payload_limits=limits(plan))
+        runner = stream_execution(program, cells, plan, payload_limits=limits(plan))
         streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
         execution, _, rows, _ = owner_fixture(rounds=1, stream=streams.owner)
         invocation = execution.start_step(rows, streams.owner)

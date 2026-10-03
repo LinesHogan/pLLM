@@ -39,7 +39,7 @@ def test_import_only_planner_roundtrip_matches_local_graphs_without_initializing
     imports = import_region_functions(program, functions)
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     expected = analyze_region_payload(program, schedule, functions)
-    expected_streams = explore_region_streams(program, functions, lanes=2, max_candidates=1)
+    expected_streams = explore_region_streams(program, functions, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map)
     assert expected_streams.candidates
     script = """
 import sys
@@ -60,7 +60,7 @@ def forbidden(*args, **kwargs):
 with patch('pllm.execution.region_storage.import_tensor_access_graph', forbidden), patch.object(torch, 'empty', forbidden):
     schedule = analyze_region_program(program, optimize=False).reference_schedule
     payload = analyze_region_payload(program, schedule, imports)
-    streams = explore_region_streams(program, imports, lanes=2, max_candidates=1)
+    streams = explore_region_streams(program, imports, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map)
     proposal = RegionScheduleProposal(payload)
     plan = RegionExecutionPlan(program, imports, proposal, proposal.peak_bytes)
     assert plan.stream_plan is None

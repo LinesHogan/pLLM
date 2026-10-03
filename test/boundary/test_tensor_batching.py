@@ -39,7 +39,7 @@ def test_outlined_independent_calls_run_one_bmm_and_charge_packing(device, monke
     with pytest.warns(NumericalTransformWarning, match="batching"):
         selected = optimize_region(program, {cell.digest: cell}, dict(zip(("a", "b", "c", "d"), tensors)),
             payload_limits=(RegionPayloadLimit(device, 10000),),
-            options=ExecutionOptions(schedule_policy="serial"), warmup_rounds=0, measurement_rounds=1)
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
     record, = selected.rewrites
     assert isinstance(record, MatmulBatching) and record.dimensions == (2, 8, 4, 6)
     assert record.packed_operand_bytes == 2 * (8 * 4 + 4 * 6) * 8
@@ -49,7 +49,7 @@ def test_outlined_independent_calls_run_one_bmm_and_charge_packing(device, monke
     tighter = select_region_candidate(program, replace(selected.request,
         payload_limits=(RegionPayloadLimit(device, original_bytes),)))
     assert not tighter.candidates[selected.selection.selected].feasible
-    transformed = selected._execution._cells[record.source_digest]
+    transformed = selected.execution.cells[record.source_digest]
     assert isinstance(transformed, ExportedCell)
     profile = profile_tensor_memory(transformed)
     assert not profile.unknown_accesses
@@ -66,7 +66,7 @@ def test_outlined_independent_calls_run_one_bmm_and_charge_packing(device, monke
         raise AssertionError("bound batching must not search or rewrite at runtime")
     monkeypatch.setattr(tuning, "explore_tensor_combinations", forbidden)
     with Observe(tensors) as observed:
-        actual = selected.run(dict(zip(("a", "b", "c", "d"), tensors))).values
+        actual = selected.execution.run(dict(zip(("a", "b", "c", "d"), tensors))).values
     assert observed.products == [torch.ops.aten.bmm.default]
     for value, x, w in zip(actual, tensors[::2], tensors[1::2], strict=True):
         torch.testing.assert_close(value, x @ w, rtol=0, atol=0)

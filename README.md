@@ -132,6 +132,10 @@ dataclass、字段可封闭传输（原始配置值、typed contract、模块级
 WorkerTransportable）。默认 `multiprocessing=False` 进程内执行没有这些要求。
 
 `ExecutionOptions(capture=True)` 捕获的是受支持的训练内核，不是整个模型。
+Region 默认采用静态安排：在合法且预算足够时使用复用的双 stream，不运行私有调优请求。
+`ExecutionOptions(tuning="measured")` 才启用有界候选实测；`schedule_policy="serial"`
+保留参考顺序。计算分析与分块沿用现有实现，调度层不按算法名字分派。
+实现边界和验证状态见[调度精简记录](doc/design/scheduling-simplification-work-order.md)。
 模型维度与有界资源事实在签名前完成特化；`training_rows` 限制每个状态的
 外部训练行数，`capture_memory_bytes` 是每个任务的驻留上限。容量不足是
 错误，不是静默退回 eager。Overlay 不能使用共享前缀缓存。

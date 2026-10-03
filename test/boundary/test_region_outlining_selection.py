@@ -1,5 +1,7 @@
 """Original AER selects and replays structural and tensor transformations together."""
 
+from pllm.contracts.region_selection import RegionSelectionPolicy
+
 from dataclasses import replace
 import warnings
 
@@ -13,7 +15,7 @@ from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit,
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_optimization import bind_region_candidate, bind_selected_region, optimize_region, select_region_candidate
+from pllm.execution.region_optimization import warn_region_transforms, bind_region_candidate, optimize_region, select_region_candidate, PreparedRegionCandidate, assess_region_candidates
 from pllm.execution.region_outlining import outline_region_calls
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.tensor_access import import_tensor_access_graph
@@ -56,21 +58,23 @@ def test_selected_tensor_rewrite_preserves_surrounding_invocation_effects():
     selection = select_region_candidate(program, request)
     assert selection.selected == 1
     with pytest.warns(NumericalTransformWarning):
-        selected = bind_selected_region(program, sources, request, selection, path.rewrites)
+        selected = bind_region_candidate(PreparedRegionCandidate(derived, candidates[1], path.rewrites, functions),
+            request.payload_limits, selection.candidates[1])
+        warn_region_transforms(selected, selection.candidates[1], selection.signature)
     trials = replace(request, candidates=tuple(replace(candidate, elapsed_ns=()) for candidate in candidates))
     with warnings.catch_warnings(record=True) as caught:
-        trial = bind_region_candidate(program, sources, trials, 1, path.rewrites)
+        trial = bind_region_candidate(PreparedRegionCandidate(derived, trials.candidates[1], path.rewrites, functions),
+            trials.payload_limits, assess_region_candidates(program, trials)[1])
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
     for invalid in (replace(trials, payload_limits=(RegionPayloadLimit("cpu", 1),)),
                     replace(trials, allow_numerical_transforms=False)):
         with pytest.raises(ValueError, match="payload or numerical policy"):
-            bind_region_candidate(program, sources, invalid, 1, path.rewrites)
+            bind_region_candidate(PreparedRegionCandidate(derived, invalid.candidates[1], path.rewrites, functions),
+                invalid.payload_limits, assess_region_candidates(program, invalid)[1])
     with pytest.raises(ValueError, match="pure program"):
-        optimize_region(program, sources, inputs, payload_limits=request.payload_limits)
+        optimize_region(program, sources, inputs, payload_limits=request.payload_limits, options=RegionSelectionPolicy(tuning="measured"))
     # A source-bound native effect cannot become a mathematical replacement.
-    with pytest.raises(ValueError, match="resource accessors or opaque kernels"):
-        bind_selected_region(program, sources, request, selection,
-            (replace(path.rewrites[0], source_digest=publish.name),))
+    assert functions[begin.name] is sources[begin.name] and functions[publish.name] is sources[publish.name]
     with pytest.raises(ValueError):
         outline_region_calls(program, sources, CallOutline((), 0, 2))
 
@@ -119,7 +123,7 @@ def test_automatic_outlining_exposes_the_only_math_candidate_that_fits(device, m
     options = ExecutionOptions(schedule_policy="serial")
     with pytest.warns(NumericalTransformWarning):
         selected = optimize_region(program, sources, inputs, payload_limits=(RegionPayloadLimit(device, 5328),),
-            options=options, warmup_rounds=0, measurement_rounds=2)
+            options=replace(options, tuning="measured"), warmup_rounds=0, measurement_rounds=2)
     assert len(seen) == 2
     assert [c.feasible for c in selected.selection.candidates] == [False, False, True]
     assert [c.capacity.devices[0].peak_tensor_bytes_upper_bound for c in selected.selection.candidates] == [9376, 9376, 5328]
@@ -129,7 +133,7 @@ def test_automatic_outlining_exposes_the_only_math_candidate_that_fits(device, m
     assert selected.selection.candidates[2].changed_functions == (selected.rewrites[0].source_digest,)
     assert decode_boundary(encode_boundary(selected.request), RegionSelectionRequest) == selected.request
     with StorageObserver(tuple(inputs.values())) as observed:
-        actual = selected.run(inputs)
+        actual = selected.execution.run(inputs)
     assert actual.invocations == 1
     assert observed.peak - sum(t.numel() * t.element_size() for t in inputs.values()) <= 5328
     torch.testing.assert_close(actual.values[0], torch.full_like(actual.values[0], 384), rtol=0, atol=0)
@@ -138,13 +142,14 @@ def test_automatic_outlining_exposes_the_only_math_candidate_that_fits(device, m
         assert torch.equal(cuda_rng, torch.cuda.get_rng_state(device))
     for saved, tensor in zip(before, inputs.values(), strict=True):
         torch.testing.assert_close(saved, tensor, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="mathematical evidence"):
-        bind_selected_region(program, sources, selected.request, selected.selection, (), options=options)
+    with pytest.raises(ValueError, match="admitted imports"):
+        bind_region_candidate(PreparedRegionCandidate(program, candidate, (), sources),
+            selected.request.payload_limits, selected.selection.candidates[selected.selection.selected])
     def forbidden(*args, **kwargs):
         raise AssertionError("runtime must not compile, select or replay")
-    for name in ("outline_region_calls", "select_region_candidate", "_measure", "_replay", "_executor"):
+    for name in ("outline_region_calls", "select_region_candidate", "_measure", "_replay", "bind_region_candidate"):
         monkeypatch.setattr(tuning, name, forbidden)
-    torch.testing.assert_close(selected.run(inputs).values[0], actual.values[0], rtol=0, atol=0)
+    torch.testing.assert_close(selected.execution.run(inputs).values[0], actual.values[0], rtol=0, atol=0)
 
 
 def test_exact_outlining_is_available_with_numerical_transforms_disabled(monkeypatch):
@@ -154,15 +159,15 @@ def test_exact_outlining_is_available_with_numerical_transforms_disabled(monkeyp
     options = ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial")
     with warnings.catch_warnings(record=True) as caught:
         selected = optimize_region(program, sources, inputs, payload_limits=(RegionPayloadLimit("cpu", 10000),),
-            options=options, warmup_rounds=0, measurement_rounds=1)
+            options=replace(options, tuning="measured"), warmup_rounds=0, measurement_rounds=1)
     assert not any(isinstance(w.message, NumericalTransformWarning) for w in caught)
     assert selected.selection.selected == 1 and selected.rewrites == ()
     assert len(selected.request.candidates) == 2
     assert selected.selection.candidates[1].changed_functions == ()
-    actual, = selected.run(inputs).values
+    actual, = selected.execution.run(inputs).values
     torch.testing.assert_close(actual, torch.full_like(actual, 384), rtol=0, atol=0)
     limited = optimize_region(program, sources, inputs, payload_limits=(RegionPayloadLimit("cpu", 10000),),
-        options=options, max_candidates=1, warmup_rounds=0, measurement_rounds=1)
+        options=replace(options, tuning="measured"), max_candidates=1, warmup_rounds=0, measurement_rounds=1)
     assert len(limited.request.candidates) == 1 and not limited.request.candidates[0].outlines
 
 
@@ -172,7 +177,7 @@ def test_forged_outlining_baselines_cannot_authorize_different_math(monkeypatch)
     monkeypatch.setattr(tuning, "_measure", lambda execution, *args: 1 if len(execution._program.functions) == 3 else 100)
     options = ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial")
     selected = optimize_region(program, sources, inputs, payload_limits=(RegionPayloadLimit("cpu", 10000),),
-        options=options, warmup_rounds=0, measurement_rounds=1)
+        options=replace(options, tuning="measured"), warmup_rounds=0, measurement_rounds=1)
     candidate = selected.request.candidates[1]
     proof, = candidate.outlines
     # Native selection can validate the closed graph's storage, but only local
@@ -185,8 +190,9 @@ def test_forged_outlining_baselines_cannot_authorize_different_math(monkeypatch)
     request = replace(selected.request, candidates=(selected.request.candidates[0], forged_candidate))
     decision = select_region_candidate(program, request)
     assert decision.selected == 1 and not decision.candidates[1].changed_functions
-    with pytest.raises(ValueError, match="baseline differs"):
-        bind_selected_region(program, sources, request, decision, (), options=options)
+    with pytest.raises(ValueError, match="admitted imports"):
+        bind_region_candidate(PreparedRegionCandidate(selected.execution._program, forged_candidate, (), selected.execution.cells),
+            request.payload_limits, decision.candidates[1])
     for altered in (replace(proof, site=replace(proof.site, first=1)),
                     replace(proof, access=replace(proof.access, source_digest="forged"))):
         bad = replace(selected.request, candidates=(selected.request.candidates[0], replace(candidate, outlines=(altered,))))
@@ -216,7 +222,7 @@ def test_outlining_remains_symbolic_and_zero_sample_does_not_bypass_numerical_po
     monkeypatch.setattr(tuning, "_measure", lambda execution, *args: 1 if any(c.transformations for c in execution._cells.values()) else 100)
     with pytest.warns(NumericalTransformWarning):
         selected = optimize_region(program, sources, {"a": a, "b": b, "c": c},
-            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=ExecutionOptions(schedule_policy="serial"),
+            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             sizes={"steps": 0}, warmup_rounds=0, measurement_rounds=1)
     candidate = selected.request.candidates[selected.selection.selected]
     assert candidate.outlines[0].site == CallOutline((0, 0), 0, 2)
@@ -225,7 +231,7 @@ def test_outlining_remains_symbolic_and_zero_sample_does_not_bypass_numerical_po
     strict = select_region_candidate(program, replace(selected.request, allow_numerical_transforms=False))
     assert strict.selected == 0
     for count in (0, 1, 3):
-        result = selected.run({"a": a, "b": b, "c": c}, sizes={"steps": count})
+        result = selected.execution.run({"a": a, "b": b, "c": c}, sizes={"steps": count})
         assert result.invocations == count
         torch.testing.assert_close(result.values[0], torch.full_like(a, 32**count), rtol=0, atol=0)
 
@@ -250,8 +256,8 @@ def test_chained_structural_evidence_replays_against_each_intermediate_program()
                         import_region_functions(second.outlined.program, final), (1,), records),
     ), (RegionPayloadLimit("cpu", 10000),), False, "deterministic structural selection")
     decision = select_region_candidate(original, request)
-    selected = bind_selected_region(original, sources, request, decision, (),
-                                    options=ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"))
+    selected = bind_region_candidate(PreparedRegionCandidate(second.outlined.program, request.candidates[1], (), final),
+        request.payload_limits, decision.candidates[1])
     result = selected.run(inputs)
     assert result.invocations == 1 and not decision.candidates[1].changed_functions
     torch.testing.assert_close(result.values[0], torch.full_like(result.values[0], 385), rtol=0, atol=0)

@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from copy import copy
-from functools import lru_cache
-from itertools import islice, zip_longest
+from functools import lru_cache, partial
 from types import MappingProxyType
 import struct
 
@@ -24,19 +23,18 @@ from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImpo
 from pllm.contracts.region_proposal import RegionScheduleProposal
 from pllm.contracts.region_streams import RegionStreamPlan
 from pllm.contracts.region_selection import (
-    RegionPayloadLimit, RegionSelection, RegionSelectionPolicy, RegionSelectionRequest,
+    RegionPayloadLimit, RegionSelectionPolicy,
 )
-from pllm.contracts.tensor_rewrite import TensorRewrite
 from pllm.execution.codec import boundary_digest
 from pllm.execution.decoder_region import DecoderSource, RowLayerForward, decoder_normalize_function, index_cell, kv_resource
 from pllm.execution.region_compilation import analyze_region_program, explore_region_schedules
 from pllm.execution.region_execution import RegionExecutionPlan, RegionInstructionExecution
-from pllm.execution.region_optimization import SelectedRegion, bind_region_candidate, bind_selected_region
-from pllm.execution.region_native import NativePrimitive, PrimitiveResources, RegionFunction, original_region_sources, source_region_functions
+from pllm.execution.region_optimization import prepare_region_execution
+from pllm.execution.region_native import NativePrimitive, PrimitiveResources, RegionFunction, source_region_functions
 from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding, RegionPageOwner, RegionResources
 from pllm.execution.region_values import Bank, Data
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
-from pllm.execution.region_streams import RegionStreamBindings, explore_region_streams
+from pllm.execution.region_streams import RegionStreamBindings, plan_region_schedule, arrange_region_schedule
 
 
 Mix = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
@@ -177,7 +175,7 @@ class TokenwiseRegion:
                 RetentionEndpoint(self.complete.name, 0), tensor.device, retained),)
         # Reference evidence remains available after selecting a schedule.
         # The catalog's per-device maxima fund the attachment; the selected
-        # schedule's actual witness lives in SelectedRegion.selection.
+        # selected execution retains its own physical stream plan.
         self.payload = analyze_region_payload(self.program, schedule, self.imports, self.retained)
         self.candidate_proposals: tuple[RegionScheduleProposal, ...] = (RegionScheduleProposal(self.payload),)
         # A cold catalog estimates funding; attachment supplies the actual
@@ -185,12 +183,46 @@ class TokenwiseRegion:
         self._funded_limits: tuple[RegionPayloadLimit, ...] | None = None
         self.retention = self.payload.retention
         # Reference execution retains one row. Alternate schedules must fit
-        # the combined tensor/recovery reservation checked by with_schedule.
+        # the original combined tensor/recovery reservation.
         if self.retention.allocations[0].peak_bytes_upper_bound > retained:
             raise ValueError("tokenwise schedule exceeds the original recovery reservation")
-        self._plan: RegionExecutionPlan | SelectedRegion = RegionExecutionPlan(self.program, self.imports,
+        self._plan: RegionExecutionPlan = RegionExecutionPlan(self.program, self.imports,
             self.candidate_proposals[0], self.payload_limits)
-        self._execution: RegionInstructionExecution | SelectedRegion | None = None
+        self._execution: RegionInstructionExecution | None = None
+        self._policy = RegionSelectionPolicy(allow_numerical_transforms=False, schedule_policy="serial")
+        self._bind: Callable[[Mapping[str, RegionFunction]], RegionInstructionExecution] = self._plan.bind
+        self._parallel = False
+
+    def planned(self, policy: RegionSelectionPolicy, *, stream_lanes: int) -> TokenwiseRegion:
+        if type(stream_lanes) is not int or not 1 <= stream_lanes <= 8:
+            raise ValueError("native catalog requires a bounded original stream capability")
+        region = copy(self)
+        region._policy = policy
+        region._parallel = stream_lanes > 1 and any(d.device.startswith("cuda") for d in self.payload.devices)
+        proposal = plan_region_schedule(region.program, region.imports, retained=region.retained,
+            parallel=region._parallel, policy=policy.schedule_policy)
+        if proposal is None:
+            raise ValueError("tokenwise region has no legal source arrangement")
+        proposals = [RegionScheduleProposal(region.payload)]
+        if proposal != proposals[0]:
+            proposals.append(proposal)
+        if policy.schedule_policy == "auto" and policy.tuning == "measured":
+            for candidate in explore_region_schedules(region.program, max_candidates=4).candidates:
+                if len(proposals) == 4:
+                    break
+                extra = arrange_region_schedule(region.program, candidate.schedule_map, region.imports,
+                    parallel=region._parallel, retained=region.retained)
+                if extra not in proposals:
+                    proposals.append(extra)
+        region.candidate_proposals = tuple(proposals)
+        region._install_plan(proposal if policy.tuning == "heuristic" else proposals[0])
+        return region
+
+    def _install_plan(self, proposal: RegionScheduleProposal) -> None:
+        self._plan = RegionExecutionPlan(self.program, self.imports, proposal, self.payload_limits)
+        self._bind = (partial(prepare_region_execution, self.program, payload_limits=self.payload_limits,
+            options=self._policy, parallel=self._parallel, retained=self.retained)
+            if self._policy.tuning == "heuristic" else self._plan.bind)
 
     @property
     def stream_plan(self) -> RegionStreamPlan | None:
@@ -199,44 +231,18 @@ class TokenwiseRegion:
     def bind_functions(self, sources: Mapping[str, RegionFunction]) -> TokenwiseRegion:
         """Bind this worker's original graphs and kernels before measurement."""
         missing = {function.name for function in self.program.functions} - self.functions.keys()
-        if set(sources) != missing or isinstance(self._plan, SelectedRegion):
+        if set(sources) != missing or self._execution is not None:
             raise ValueError("worker must supply exactly the unbound original tensor implementations")
         result = copy(self)
         result.functions = MappingProxyType({**self.functions, **sources})
-        result._execution = self._plan.bind(result.functions)
+        _ = result.execution
         return result
 
     @property
-    def execution(self) -> RegionInstructionExecution | SelectedRegion:
-        if self._execution is None:
-            self._execution = self._plan if isinstance(self._plan, SelectedRegion) else self._plan.bind(self.functions)
+    def execution(self) -> RegionInstructionExecution:
+        if self._execution is None:  # Lazy binding boundary; all invocations use the same concrete executor.
+            self._execution = self._bind(self.functions)
         return self._execution
-
-    def with_measured_selection(self, request: RegionSelectionRequest, selection: RegionSelection,
-                                rewrites: tuple[TensorRewrite, ...], execution: RegionInstructionExecution) -> TokenwiseRegion:
-        """Install the measured winner's already bound executor after an AER decision."""
-        result = copy(self)
-        result._plan = SelectedRegion(request, selection, rewrites, execution)
-        result._execution = None
-        return result
-
-    def with_schedule(self, request: RegionSelectionRequest, selection: RegionSelection,
-                      policy: RegionSelectionPolicy, records: tuple[TensorRewrite, ...] = ()) -> TokenwiseRegion:
-        """Bind measured work within this attachment's original payload envelope.
-
-        External/debug entry with full re-verification; production finish
-        reuses the measured executor instead. The source plan stays reusable.
-        The returned plan borrows the same invocation resources and keeps the
-        same recovery/commit callbacks.
-        """
-        if request.payload_limits != self.payload_limits or request.retention_imports != self.retained:
-            raise ValueError("tokenwise selection differs from the original attachment payload reservation")
-        execution = bind_selected_region(self.program, original_region_sources(self.functions),
-            request, selection, records, options=policy)
-        result = copy(self)
-        result._plan = execution
-        result._execution = None
-        return result
 
     @property
     def payload_limits(self) -> tuple[RegionPayloadLimit, ...]:
@@ -250,7 +256,7 @@ class TokenwiseRegion:
 
     def within_payload_budget(self, budget: int) -> TokenwiseRegion:
         """Keep source candidates funded by the original task workspace fact."""
-        if type(budget) is not int or budget < 0 or isinstance(self._plan, SelectedRegion):
+        if type(budget) is not int or budget < 0 or self._execution is not None:
             raise ValueError("tokenwise payload budgeting requires an original source plan and nonnegative bytes")
         if any(device.peak_bytes_upper_bound > budget for device in self.payload.devices):
             raise ValueError("tokenwise reference payload exceeds the original task workspace budget")
@@ -258,6 +264,13 @@ class TokenwiseRegion:
         result.candidate_proposals = tuple(proposal for proposal in self.candidate_proposals
             if all(device.bytes <= budget for device in proposal.peak_bytes))
         result._funded_limits = tuple(RegionPayloadLimit(device.device, budget) for device in self.payload.devices)
+        if self._policy.tuning == "heuristic":
+            proposal = plan_region_schedule(self.program, self.imports, payload_limits=result.payload_limits,
+                retained=self.retained, parallel=self._parallel, policy=self._policy.schedule_policy)
+            if proposal is None:
+                raise ValueError("tokenwise region exceeds the signed payload budget")
+            result.candidate_proposals = tuple(dict.fromkeys((RegionScheduleProposal(self.payload), proposal)))
+            result._install_plan(proposal)
         return result
 
     def with_catalog(self, proposals: tuple[RegionScheduleProposal, ...], budget: int, *, stream_lanes: int = 1) -> TokenwiseRegion:
@@ -270,7 +283,7 @@ class TokenwiseRegion:
         if not proposals:
             raise ValueError("native schedule catalog requires its original reference")
         reference, *_ = proposals
-        if (isinstance(self._plan, SelectedRegion) or len(proposals) > 8
+        if (len(proposals) > 8
             or reference != RegionScheduleProposal(self.payload) or type(budget) is not int or budget < 0
             or type(stream_lanes) is not int or not 1 <= stream_lanes <= 8):
             raise ValueError("native schedule catalog requires the original reference and workspace")
@@ -288,28 +301,12 @@ class TokenwiseRegion:
         result._funded_limits = limits
         return result
 
-    def measurement_candidate(self, request: RegionSelectionRequest, index: int, records: tuple[TensorRewrite, ...],
-                              policy: RegionSelectionPolicy) -> TokenwiseRegion:
-        """Cold-bind a source-derived implementation for the owning engine's trial."""
-        if request.payload_limits != self.payload_limits or request.retention_imports != self.retained:
-            raise ValueError("tokenwise trial differs from the original attachment payload reservation")
+    def with_execution(self, execution: RegionInstructionExecution) -> TokenwiseRegion:
+        """Attach the existing worker's admitted executor, retaining the source and owners."""
+        if execution.payload_limits != self.payload_limits:
+            raise ValueError("bound execution differs from the original attachment payload reservation")
         result = copy(self)
-        result._execution = bind_region_candidate(self.program, original_region_sources(self.functions),
-            request, index, records, options=policy)
-        return result
-
-    def measurement_schedule(self, index: int) -> TokenwiseRegion:
-        """Bind a catalog candidate for an isolated cold invocation, before timing.
-
-        Production finish installs this measured binding after an AER
-        decision. This operation only lowers the already funded source schedule.
-        """
-        if type(index) is not int or not 0 <= index < len(self.candidate_proposals):
-            raise ValueError("tokenwise measurement has no such funded candidate")
-        proposal = self.candidate_proposals[index]
-        result = copy(self)
-        result._plan = RegionExecutionPlan(self.program, self.imports, proposal, self.payload_limits)
-        result._execution = None
+        result._execution = execution
         return result
 
     def run(self, owner: RegionPageOwner, eligible: tuple[bool, ...], requests: tuple[int, ...], offsets: tuple[int, ...], *,
@@ -421,29 +418,8 @@ def compile_tokenwise_region(tensor: TensorType, max_rows: int, domain: CausalMo
     The cached plan has no invocation, model tensors, page capabilities or RNG.
     Every run creates fresh frames and borrows its original owner's resources.
     """
-    if type(stream_lanes) is not int or not 1 <= stream_lanes <= 8:
-        raise ValueError("native catalog requires a bounded original stream capability")
-    region = copy(compile_tokenwise_source(tensor, max_rows, domain, effect, source_imports=source_imports, function_bodies=function_bodies))
-    if policy.schedule_policy == "auto" and policy.tuning == "measured":
-        # Only measured tuning funds catalog candidates. The default heuristic
-        # path provably keeps the reference: logical traffic bounds are
-        # schedule-independent (instance counts x per-call facts; no schedule
-        # input) and catalog candidates carry no rewrite flops, so static
-        # source-first ranking is a constant function. Skipping the catalog
-        # also skips its per-candidate payloads and stream plans.
-        catalog = explore_region_schedules(region.program)
-        serial = (RegionScheduleProposal(analyze_region_payload(region.program,
-            candidate.schedule_map, region.imports, region.retained)) for candidate in catalog.candidates[1:])
-        # The reference plus seven interleaved proposals is the funded catalog.
-        # Derive lifetimes only for serial entries that can actually enter it;
-        # likewise do not construct a fourth parallel plan that will be dropped.
-        parallel_limit = min(4, 7 - min(4, len(catalog.candidates) - 1))
-        parallel = (() if stream_lanes == 1 else tuple(RegionScheduleProposal(plan.payload, plan)
-            for plan in explore_region_streams(region.program, region.imports, lanes=stream_lanes,
-                retained=region.retained, max_candidates=parallel_limit, max_pipeline_depth=2).candidates))
-        region.candidate_proposals = (RegionScheduleProposal(region.payload), *islice((proposal
-            for pair in zip_longest(serial, parallel) for proposal in pair if proposal is not None), 7))
-    return region
+    return compile_tokenwise_source(tensor, max_rows, domain, effect, source_imports=source_imports,
+        function_bodies=function_bodies).planned(policy, stream_lanes=stream_lanes)
 
 
 def tokenwise_attachment_bytes(hidden: int, width: int, max_rows: int) -> int:

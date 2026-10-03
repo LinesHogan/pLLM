@@ -11,7 +11,7 @@ from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_selection import RegionCandidate, RegionPayloadLimit, RegionSelectionPolicy, RegionSelectionRequest, RegionTuningSize
 from pllm.execution.region_compilation import analyze_region_program, analyze_region_retention, explore_region_schedules, lower_region_schedule
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.region_optimization import select_region_candidate
+from pllm.execution.region_optimization import select_region_candidate, PreparedRegionCandidate, bind_region_candidate
 from pllm.execution.region_schedule import RegionScheduleExecution
 from pllm.execution.region_storage import analyze_region_payload, import_region_functions
 from pllm.execution.replay import Recurrence
@@ -72,10 +72,12 @@ def test_bounded_model_window_is_eligible_when_faster_unbounded_candidate_exceed
     # to exceed the original model attachment's reservation.
     inflated = replace(request, payload_limits=(RegionPayloadLimit("cpu", limit + 1),))
     with pytest.raises(ValueError, match="original attachment payload reservation"):
-        region.with_schedule(inflated, selection, RegionSelectionPolicy())
+        region.with_execution(bind_region_candidate(PreparedRegionCandidate(region.program,
+            inflated.candidates[selection.selected], (), cells), inflated.payload_limits, selection.candidates[selection.selected]))
     funded = replace(request, payload_limits=tuple(RegionPayloadLimit(d.device, d.peak_bytes_upper_bound)
                                                    for d in region.payload.devices))
     funded_selection = select_region_candidate(region.program, funded)
-    rebound = region.with_schedule(funded, funded_selection, RegionSelectionPolicy())
+    rebound = region.with_execution(bind_region_candidate(PreparedRegionCandidate(region.program,
+        funded.candidates[funded_selection.selected], (), cells), funded.payload_limits, funded_selection.candidates[funded_selection.selected]))
     assert rebound is not region and rebound.execution is not region.execution
     assert rebound.program is region.program and rebound.functions is region.functions

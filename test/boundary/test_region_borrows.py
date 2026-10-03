@@ -18,7 +18,7 @@ from pllm.execution.region_execution import RegionExecution
 from pllm.execution.region_native import external_primitive
 from pllm.execution.region_resources import ExternalFunction, PagedResourceBinding, ReadonlyResourceBinding, RegionResources
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
-from pllm.execution.region_optimization import bind_selected_schedule, select_region_candidate
+from pllm.execution.region_optimization import select_region_candidate, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.execution.region_storage import import_region_functions
 from test.boundary.test_paged_access import rows as paged_rows
 from test.boundary.test_region_pages import owner_fixture
@@ -123,7 +123,8 @@ def test_borrowed_schedule_uses_original_storage_and_rejects_unproved_accesses()
         (RegionPayloadLimit("cpu", 1024),), True, "schedule selection oracle")
     selection = select_region_candidate(program, request)
     assert selection.selected == 1
-    runner = bind_selected_schedule(program, cells, request, selection)
+    runner = bind_region_candidate(PreparedRegionCandidate(program, request.candidates[selection.selected], (), cells),
+        request.payload_limits, selection.candidates[selection.selected])
     result = runner.run({}, pages=pages)
     assert calls == [("write", 1), ("read", 0), ("write", 0), ("read", 0)]
     torch.testing.assert_close(result.values[0], old, rtol=0, atol=0)

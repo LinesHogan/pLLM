@@ -109,9 +109,9 @@ def test_tensor_region_body_keeps_lexical_names_and_can_be_optimized(monkeypatch
     scan = TensorScan(program, SizeParameter("steps", 0, 5), carry=1, invariants=1,
         functions={multiply.digest: multiply, addition.digest: addition})
     monkeypatch.setattr(tuning, "_measure", lambda execution, *args: len(execution._lowered.statements))
-    selected = scan.optimized((x,), (x * 2,), ((x, x),), payload_limits=(RegionPayloadLimit("cpu", 10000),),
-        options=ExecutionOptions(allow_numerical_transforms=False), warmup_rounds=0, measurement_rounds=1)
-    assert selected._execution.request.candidates[selected.selection.selected].outlines
+    selected, selected_report = scan.optimized((x,), (x * 2,), ((x, x),), payload_limits=(RegionPayloadLimit("cpu", 10000),),
+        options=replace(ExecutionOptions(allow_numerical_transforms=False), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
+    assert selected_report.request.candidates[selected_report.selection.selected].outlines
     for count in (0, 4):
         rows = tuple(x * (i + 1) for i in range(count))
         expected_old, expected_new, current = [], [], x

@@ -218,41 +218,33 @@ fn validate_region_streams(program_json: &str, imports_json: &str, retained_json
 }
 
 #[pyfunction]
-#[pyo3(signature = (program_json, imports_json, retained_json, lanes, max_candidates, max_pipeline_depth=1))]
+#[pyo3(signature = (program_json, imports_json, retained_json, schedule, limits_json=None))]
 fn explore_region_streams(program_json: &str, imports_json: &str, retained_json: &str,
-                          lanes: u32, max_candidates: usize, max_pipeline_depth: u32) -> PyResult<String> {
+                          schedule: &str, limits_json: Option<&str>) -> PyResult<String> {
     let run = || -> Result<String> {
-        if !(2..=8).contains(&lanes) || !(1..=8).contains(&max_pipeline_depth) || max_candidates > 8 {
-            return Err("stream exploration requires bounded lanes, pipeline depth and at most eight candidates".into());
-        }
         let program: Program = serde_json::from_str(program_json).map_err(|e| e.to_string())?;
         let imports: Vec<TensorImport> = serde_json::from_str(imports_json).map_err(|e| e.to_string())?;
         let retained: Vec<Allocation> = serde_json::from_str(retained_json).map_err(|e| e.to_string())?;
-        let source = super::region_tiling::explore_schedules(&program, 8)?;
+        let limits: Option<Vec<super::region_selection::PayloadLimit>> = limits_json
+            .map(|text| serde_json::from_str(text).map_err(|e| e.to_string())).transpose()?;
+        // Invalid source/imports are errors, not failed parallel opportunities.
+        region_payload::derive(&program, schedule, &imports, &retained)?;
+        let source = analyze(&program, false)?;
         let mut result = Exploration { program_digest: source.program_digest, candidates: vec![], diagnostics: source.diagnostics };
         let ctx = context()?;
-        let mut seen = std::collections::BTreeSet::new();
-        for candidate in source.candidates {
-            let pieces = super::region_capacity::maps(read_schedule(&ctx, &candidate.schedule_map)?)?;
-            let Some(first) = pieces.first() else { continue; };
-            let width = isl(first.dim(DimType::Out))? as usize;
-            for axis in 0..width {
-                if result.candidates.len() == max_candidates { return canonical_ascii_json(&result); }
-                match derive(&program, &candidate.schedule_map, axis, lanes, 1, &imports, &retained) {
+        let pieces = super::region_capacity::maps(read_schedule(&ctx, schedule)?)?;
+        if let Some(first) = pieces.first() {
+            for axis in 0..isl(first.dim(DimType::Out))? as usize {
+                match derive(&program, schedule, axis, 2, 2, &imports, &retained) {
                     Ok(plan) => {
-                        let identity = canonical_ascii_json(&(&plan.phase_schedule, &plan.placements))?;
-                        if seen.insert(identity) {
-                            result.candidates.push(plan);
-                            for depth in 2..=max_pipeline_depth {
-                                if result.candidates.len() == max_candidates { return canonical_ascii_json(&result); }
-                                match derive(&program, &candidate.schedule_map, axis, lanes, depth, &imports, &retained) {
-                                    Ok(pipeline) => result.candidates.push(pipeline),
-                                    Err(error) => result.diagnostics.push(format!("{} axis {axis} depth {depth}: {error}", candidate.source)),
-                                }
-                            }
+                        if limits.as_ref().is_some_and(|limits| plan.devices.iter().any(|device|
+                            !limits.iter().any(|limit| limit.device == device.device && limit.bytes >= device.peak_bytes_upper_bound))) {
+                            continue;
                         }
+                        result.candidates.push(plan);
+                        break;
                     },
-                    Err(error) => result.diagnostics.push(format!("{} axis {axis}: {error}", candidate.source)),
+                    Err(error) => result.diagnostics.push(format!("axis {axis}: {error}")),
                 }
             }
         }

@@ -1,5 +1,7 @@
 """Example-size timing cannot narrow symbolic legality or payload bounds."""
 
+from pllm.contracts.region_selection import RegionSelectionPolicy
+
 from dataclasses import replace
 import warnings
 
@@ -60,13 +62,13 @@ def test_optimized_scan_reuses_one_symbolic_plan_and_preserves_original_callable
     cell = ExportedCell.capture(lambda x: (x + 1,), ("x",), ("y",), (torch.ones(4, device=device),))
     scan = TensorScan(cell, SizeParameter("steps", 0, 1_000_000), carry=1, invariants=0)
     x = torch.ones(4, device=device)
-    tuned = scan.optimized((x,), (), (), count=3, payload_limits=(RegionPayloadLimit(device, 48),),
-        options=ExecutionOptions(allow_numerical_transforms=False), measurement_rounds=2)
-    assert scan.selection is None
-    assert tuned.selection is not None
+    tuned, tuned_report = scan.optimized((x,), (), (), count=3, payload_limits=(RegionPayloadLimit(device, 48),),
+        options=replace(ExecutionOptions(allow_numerical_transforms=False), tuning="measured"), measurement_rounds=2)
+    assert tuned is not scan and tuned._execution is tuned_report.execution
+    assert tuned_report.selection is not None
     assert tuned.program is scan.program
     assert tuned.count == scan.count
-    assert tuned.selection.candidates[tuned.selection.selected].capacity.devices[0].peak_tensor_bytes_upper_bound == 48
+    assert tuned_report.selection.candidates[tuned_report.selection.selected].capacity.devices[0].peak_tensor_bytes_upper_bound == 48
     def forbidden(*args, **kwargs):
         raise AssertionError("a new execution length must not trigger planning or tuning")
     for name in ("select_region_candidate", "assess_region_candidates", "analyze_region_program",
@@ -94,11 +96,11 @@ def test_selected_math_rewrite_runs_through_the_scan_authoring_interface(monkeyp
     times = iter((100, 10))
     monkeypatch.setattr(tuning, "_measure", lambda *args: next(times))
     with pytest.warns(NumericalTransformWarning):
-        tuned = scan.optimized(tensors[:1], tensors[1:], (), count=2,
-            payload_limits=(RegionPayloadLimit(device, 1 << 20),), options=ExecutionOptions(schedule_policy="serial"),
+        tuned, tuned_report = scan.optimized(tensors[:1], tensors[1:], (), count=2,
+            payload_limits=(RegionPayloadLimit(device, 1 << 20),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1)
-    assert tuned.selection.selected == 1
-    assert scan.selection is None
+    assert tuned_report.selection.selected == 1
+    assert tuned is not scan and tuned._execution is tuned_report.execution
     for count in (0, 1, 3, 5):
         actual, = tuned(tensors[:1], tensors[1:], (), count=count).carry
         # These powers of two are exactly representable; no tolerance widening.
@@ -113,7 +115,7 @@ def test_tuned_sequence_inputs_keep_length_guards_and_collection_order():
     scan = TensorScan(cell, SizeParameter("steps", 0, 8), carry=1, invariants=0)
     x = torch.zeros(4)
     rows = tuple(torch.full((4,), float(i + 1)) for i in range(5))
-    tuned = scan.optimized((x,), (), (rows[:2],), payload_limits=(RegionPayloadLimit("cpu", 10000),), measurement_rounds=1)
+    tuned, tuned_report = scan.optimized((x,), (), (rows[:2],), payload_limits=(RegionPayloadLimit("cpu", 10000),), measurement_rounds=1, options=RegionSelectionPolicy(tuning="measured"))
     for count in (0, 1, 5):
         result = tuned((x,), (), (rows[:count],))
         torch.testing.assert_close(result.carry[0], torch.full_like(x, count * (count + 1) / 2), rtol=0, atol=0)
@@ -130,10 +132,10 @@ def test_two_parameter_tuning_signs_the_example_without_specializing_the_program
     program = replace(tensor_grid("chunks", "layers", cell),
         parameters=(SizeParameter("layers", 0, 5), SizeParameter("chunks", 0, 8)))
     selected = optimize_region(program, {cell.digest: cell}, inputs_for(2, 3), sizes={"layers": 3, "chunks": 2},
-        payload_limits=(RegionPayloadLimit("cpu", 10000),), measurement_rounds=1)
+        payload_limits=(RegionPayloadLimit("cpu", 10000),), measurement_rounds=1, options=RegionSelectionPolicy(tuning="measured"))
     assert selected.request.tuning_sizes == (RegionTuningSize("chunks", 2), RegionTuningSize("layers", 3))
     for chunks, layers in ((0, 0), (0, 5), (3, 0), (1, 4), (8, 5)):
-        result = selected.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})
+        result = selected.execution.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})
         assert result.invocations == chunks * layers
         weights, hidden = result.values
         for l, value in enumerate(weights.elements):
@@ -143,7 +145,7 @@ def test_two_parameter_tuning_signs_the_example_without_specializing_the_program
                                        rtol=0, atol=0)
     for sizes in ({}, {"layers": 3}, {"layers": 3, "chunks": 9}, {"layers": 3, "chunks": 2, "extra": 0}):
         with pytest.raises(ValueError, match="size parameter"):
-            selected.run(inputs_for(2, 3), sizes=sizes)
+            selected.execution.run(inputs_for(2, 3), sizes=sizes)
 
 
 @pytest.mark.parametrize("maximum", (0, 9))
@@ -156,11 +158,11 @@ def test_rounding_warning_uses_the_source_domain_not_the_zero_trip_timing_exampl
     monkeypatch.setattr(tuning, "_measure", lambda *args: next(times))
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        tuned = scan.optimized(tensors[:1], tensors[1:], (), count=0,
-            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=ExecutionOptions(schedule_policy="serial"),
+        tuned, tuned_report = scan.optimized(tensors[:1], tensors[1:], (), count=0,
+            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1)
     numerical = [w for w in caught if isinstance(w.message, NumericalTransformWarning)]
     assert len(numerical) == (1 if maximum else 0)
-    assert tuned.selection.candidates[1].changed_functions == ((cell.digest,) if maximum else ())
+    assert tuned_report.selection.candidates[1].changed_functions == ((cell.digest,) if maximum else ())
     result, = tuned(tensors[:1], tensors[1:], (), count=0).carry
     torch.testing.assert_close(result, tensors[0], rtol=0, atol=0)

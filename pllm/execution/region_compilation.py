@@ -22,9 +22,9 @@ def validate_region_retention(program: Program, imports: tuple[RetainedAllocatio
     _core.validate_region_retention(encode_boundary(program), encode_boundary(imports), encode_boundary(retention))
 
 
-def analyze_region_program(program: Program, *, optimize: bool = True) -> RegionAnalysis:
+def analyze_region_program(program: Program, *, optimize: bool = True, parallel_only: bool = False) -> RegionAnalysis:
     """Derive dependencies; reference-only binding can omit candidate search."""
-    return decode_boundary(_core.analyze_region_program(encode_boundary(program), optimize), RegionAnalysis)
+    return decode_boundary(_core.analyze_region_program(encode_boundary(program), optimize, parallel_only), RegionAnalysis)
 
 
 def explore_region_tiling(program: Program, *, tile_sizes: tuple[int, ...] = (2, 4, 8, 16),

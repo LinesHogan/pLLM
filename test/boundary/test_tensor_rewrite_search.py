@@ -9,7 +9,7 @@ import torch
 from pllm.config import ExecutionOptions
 from pllm.execution.codec import tensor_graph_structure_digest, tensor_graph_expression_digest
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
-from pllm.execution.region_optimization import bind_selected_region, optimize_region
+from pllm.execution.region_optimization import optimize_region, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.tensor_access import profile_tensor_memory
 from pllm.execution.tensor_rewrites import explore_matmul_reassociations, replay_matmul_reassociations
@@ -143,17 +143,18 @@ def test_native_selection_binds_the_whole_selected_chain_and_rejects_a_prefix(mo
     monkeypatch.setattr(tuning, "_measure", measure)
     with pytest.warns(NumericalTransformWarning):
         selected = optimize_region(single_call(source), {source.digest: source}, inputs,
-            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=ExecutionOptions(schedule_policy="serial"),
+            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1)
     assert len(selected.rewrites) == 2
-    with pytest.raises(ValueError, match="replayed mathematical evidence"):
-        bind_selected_region(single_call(source), {source.digest: source}, selected.request, selected.selection,
-            selected.rewrites[:1], options=ExecutionOptions(schedule_policy="serial"))
-    actual, = selected.run(inputs).values
+    partial = replay_matmul_reassociations(source, selected.rewrites[:1])
+    with pytest.raises(ValueError, match="admitted imports"):
+        bind_region_candidate(PreparedRegionCandidate(single_call(source), selected.request.candidates[selected.selection.selected],
+            selected.rewrites[:1], {source.digest: partial}), selected.request.payload_limits, selected.selection.candidates[selected.selection.selected])
+    actual, = selected.execution.run(inputs).values
     torch.testing.assert_close(actual, tensors[0] @ tensors[1] @ tensors[2] @ tensors[3], rtol=0, atol=0)
     for depth, expected_candidates in ((0, 1), (1, 3)):
         limited = optimize_region(single_call(source), {source.digest: source}, inputs,
-            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=ExecutionOptions(schedule_policy="serial"),
+            payload_limits=(RegionPayloadLimit("cpu", 10000),), options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"),
             warmup_rounds=0, measurement_rounds=1, max_rewrite_depth=depth)
         assert len(limited.request.candidates) == expected_candidates
         assert limited.rewrites == ()  # All measured times tie without depth two.

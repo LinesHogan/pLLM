@@ -14,7 +14,7 @@ from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.exported_cell import ExportedCell, NumericalTransformWarning
 from pllm.execution.region_execution import RegionExecutionPlan
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_optimization import bind_selected_region, optimize_region, select_region_candidate
+from pllm.execution.region_optimization import prepare_region_execution, warn_region_transforms, optimize_region, select_region_candidate, PreparedRegionCandidate, bind_region_candidate, assess_region_candidates
 from pllm.execution.region_storage import import_region_functions
 from pllm.execution.region_streams import RegionStreamBindings, explore_region_streams, lower_region_streams
 from pllm.execution.tensor_compilation import compile_tensor_cell
@@ -88,26 +88,27 @@ def test_tuner_measures_parallel_candidates_and_rebinds_without_runtime_search(m
     monkeypatch.setattr(tuning, "_measure", measured_rank)
     options = ExecutionOptions(allow_numerical_transforms=False)
     selected = optimize_region(program, {cell.digest: cell}, inputs, streams=streams,
-        options=options, payload_limits=(RegionPayloadLimit("cuda:0", 1 << 20),),
+        options=replace(options, tuning="measured"), payload_limits=(RegionPayloadLimit("cuda:0", 1 << 20),),
         warmup_rounds=0, measurement_rounds=1, max_candidates=3)
     assert any(measured) and not all(measured)
     assert selected.request.candidates[selected.selection.selected].stream_plan is not None
-    with pytest.raises(ValueError, match="serial schedule policy"):
-        bind_selected_region(program, {cell.digest: cell}, selected.request, selected.selection, (),
-            options=ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"))
+    sequential = prepare_region_execution(program, {cell.digest: cell}, payload_limits=selected.request.payload_limits,
+        options=ExecutionOptions(allow_numerical_transforms=False, schedule_policy="serial"))
+    assert sequential.stream_plan is None
     # Make serial win using the same measured candidate evidence. Both bindings
     # execute on the original owner when given the same available streams.
     serial_request = replace(selected.request, candidates=tuple(replace(c, elapsed_ns=(1 if i == 0 else 100,))
         for i, c in enumerate(selected.request.candidates)))
-    serial = bind_selected_region(program, {cell.digest: cell}, serial_request,
-        select_region_candidate(program, serial_request), (), options=options)
+    serial_choice = select_region_candidate(program, serial_request)
+    serial = bind_region_candidate(PreparedRegionCandidate(program, serial_request.candidates[serial_choice.selected], (), {cell.digest: cell}),
+        serial_request.payload_limits, serial_choice.candidates[serial_choice.selected])
     def forbidden(*args):
         raise AssertionError("selected execution must not search or recompile")
     for name in ("explore_region_streams", "select_region_candidate", "lower_region_schedule"):
         monkeypatch.setattr(_core, name, forbidden)
     with pytest.raises(ValueError, match="must be supplied together"):
-        selected.run(inputs)
-    got, want = selected.run(inputs, streams=streams), serial.run(inputs, streams=streams)
+        selected.execution.run(inputs)
+    got, want = selected.execution.run(inputs, streams=streams), serial.run(inputs, streams=streams)
     with torch.cuda.stream(streams.owner):
         for left, right in zip(got.values, want.values, strict=True):
             for a, b in zip(left.elements, right.elements, strict=True):
@@ -126,7 +127,7 @@ def test_compiled_reassociation_and_parallel_placement_share_numerical_replay():
     originals = {cell.digest: cell}
     changed = {cell.digest: compiled}
     source = analyze_region_program(program, optimize=False)
-    plan, = explore_region_streams(program, changed, lanes=2, max_candidates=1).candidates
+    plan, = explore_region_streams(program, changed, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map).candidates
     plan = lower_region_streams(program, plan.schedule_map, changed, axis=plan.axis, lanes=2, pipeline_depth=2)
     imports = import_region_functions(program, originals)
     candidate = RegionCandidate(plan.phase_schedule, import_region_functions(program, changed), (1,), stream_plan=plan)
@@ -136,8 +137,10 @@ def test_compiled_reassociation_and_parallel_placement_share_numerical_replay():
     assert select_region_candidate(program, replace(request, allow_numerical_transforms=False)).selected == 0
     selection = select_region_candidate(program, request)
     with pytest.warns(NumericalTransformWarning):
-        selected = bind_selected_region(program, originals, request, selection, (variant.rewrite,))
-    assert selected.selection.selected == 1
+        selected = bind_region_candidate(PreparedRegionCandidate(program, candidate, (variant.rewrite,), changed),
+            request.payload_limits, selection.candidates[selection.selected])
+        warn_region_transforms(selected, selection.candidates[selection.selected], selection.signature)
+    assert selection.selected == 1
     streams = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
     streams.owner.wait_stream(torch.cuda.current_stream())
     inputs = dict(zip(("arg0", "arg1", "arg2"), tensors, strict=True))

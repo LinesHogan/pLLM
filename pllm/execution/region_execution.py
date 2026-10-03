@@ -104,6 +104,7 @@ class RegionInstructionExecution:
             if cell.declaration != declaration:
                 raise ValueError("cell differs from its imported source declaration")
         self._program = program
+        self.payload_limits = payload_limits
         self._lowered = lowered
         self._bindings = bindings
         self._cells = dict(cells)
@@ -136,8 +137,15 @@ class RegionInstructionExecution:
     def run(self, inputs: Mapping[str, Data], *, pages: RegionResources | None = None,
             sizes: Mapping[str, int] = {}, streams: RegionStreamBindings | None = None) -> RegionExecutionResult:
         sizes = bind_sizes(self._program, sizes)
-        if (streams is None) != (self._stream_plan is None):
+        if streams is None and self._stream_plan is not None:
             raise ValueError("borrowed streams and a verified physical stream plan must be supplied together")
+        owner = None if streams is None else streams.owner
+        if streams is not None:
+            streams.validate_available()
+            if pages is not None:
+                pages.validate_stream(streams.owner)
+            if self._stream_plan is None:
+                streams = None  # Available lanes can be unused by the installed plan.
         if streams is not None and self._stream_plan is not None:
             streams.validate(self._stream_plan)
             if pages is not None:
@@ -149,7 +157,7 @@ class RegionInstructionExecution:
             pages.validate_native_kernels({name: cell.implementation for name, cell in self._cells.items()
                                            if isinstance(cell, NativePrimitive)})
             pages.validate_tensor_borrows(self._tensor_borrows)
-        scope = pages.scope() if pages is not None else (nullcontext() if streams is None else torch.cuda.stream(streams.owner))
+        scope = pages.scope() if pages is not None else (nullcontext() if owner is None else torch.cuda.stream(owner))
         with torch.no_grad(), scope:
             frame = RegionValueFrame(self._bindings, inputs, sizes)
             count = 0
@@ -197,15 +205,3 @@ class RegionExecution(RegionInstructionExecution):
         if any(isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations for cell in cells.values()):
             raise ValueError("transformed cells require a numerical selection decision")
         super().__init__(program, lowered, bindings, cells)
-
-
-class RegionStreamExecution(RegionInstructionExecution):
-    """Bind source cells to a native concurrent plan within the original budget."""
-
-    def __init__(self, program: Program, cells: Mapping[str, RegionFunction], plan: RegionStreamPlan, *,
-                 payload_limits: tuple[RegionPayloadLimit, ...]) -> None:
-        if any(isinstance(cell, CompiledPrimitive) or isinstance(cell, ExportedCell) and cell.transformations for cell in cells.values()):
-            raise ValueError("transformed cells require a numerical selection decision")
-        super().__init__(program, lower_region_schedule(program, plan.phase_schedule),
-                         lower_region_bindings(program, plan.phase_schedule), cells, stream_plan=plan,
-                         payload_limits=payload_limits)

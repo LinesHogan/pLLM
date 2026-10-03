@@ -193,15 +193,15 @@ def test_million_row_parameterized_tiles_are_symbolic_and_reach_the_tuner(monkey
     lowered_target = lower_region_schedule(program, target).schedule_map
     monkeypatch.setattr(tuning, "_measure", lambda execution, *args: 1 if execution._lowered.schedule_map == lowered_target else 100)
     selected = optimize_region(program, {cell.digest: cell}, inputs_for(2, 3), sizes={"chunks": 2, "layers": 3},
-        payload_limits=(RegionPayloadLimit("cpu", 1 << 30),), options=ExecutionOptions(allow_numerical_transforms=False),
+        payload_limits=(RegionPayloadLimit("cpu", 1 << 30),), options=replace(ExecutionOptions(allow_numerical_transforms=False), tuning="measured"),
         warmup_rounds=0, measurement_rounds=1)
-    assert selected.request.candidates[selected.selection.selected].schedule_map == target
+    assert lower_region_schedule(program, selected.request.candidates[selected.selection.selected].schedule_map).schedule_map == lowered_target
     def forbidden(*args):
         raise AssertionError("execution must not generate tiles or recompile")
     for name in ("explore_region_tiling", "analyze_region_program", "select_region_candidate", "lower_region_schedule", "lower_region_bindings"):
         monkeypatch.setattr(_core, name, forbidden)
     for chunks, layers in ((0, 0), (0, 7), (3, 0), (1, 1), (5, 7)):
-        result = selected.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})
+        result = selected.execution.run(inputs_for(chunks, layers), sizes={"chunks": chunks, "layers": layers})
         assert result.invocations == chunks * layers
         for c, value in enumerate(result.values[1].elements):
             expected = c + 2 + layers * c + layers * (layers + 1) / 2

@@ -26,9 +26,8 @@ class ExecutionOptions:
     memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
     allow_numerical_transforms: bool = True
     schedule_policy: Literal["auto", "serial"] = "auto"
-    # Default native selection installs the reference schedule without cold
-    # worker measurement or catalog exploration; "measured" opts into the full
-    # catalog derivation and tuning protocol.
+    # Deterministic preparation and funded stream overlap by default.
+    # Only "measured" searches and times additional implementations.
     tuning: Literal["heuristic", "measured"] = "heuristic"
 
     def __post_init__(self) -> None:

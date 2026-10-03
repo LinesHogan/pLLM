@@ -132,11 +132,11 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
         # The test assesses source scheduling. Numerical rewrites have their
         # own fixed-tolerance tests; no tolerance changes hide a source mismatch.
         selected = optimize_region(program, sources, inputs, payload_limits=(RegionPayloadLimit("cuda:0", 1 << 20),),
-            options=RegionSelectionPolicy(allow_numerical_transforms=False), streams=streams,
+            options=replace(RegionSelectionPolicy(allow_numerical_transforms=False), tuning="measured"), streams=streams,
             warmup_rounds=1, measurement_rounds=1, max_candidates=2)
         assert len(selected.request.candidates) == 2
         assert all(candidate.elapsed_ns for candidate in selected.request.candidates)
-        result = selected.run(inputs, streams=streams).values
+        result = selected.execution.run(inputs, streams=streams).values
         streams.owner.synchronize()
         for actual, reference in zip(result, expected, strict=True):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
@@ -150,4 +150,4 @@ def test_original_qwen_export_retains_swiglu_and_enters_measured_selection(dtype
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
         with pytest.raises(ValueError, match="audited pure kernels"):
             optimize_region(program, {**sources, native.declaration.name: NativePrimitive(native.declaration, lambda values, resources: values)}, inputs,
-                payload_limits=proposal.peak_bytes, max_candidates=1)
+                payload_limits=proposal.peak_bytes, max_candidates=1, options=RegionSelectionPolicy(tuning="measured"))

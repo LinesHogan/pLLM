@@ -1,0 +1,96 @@
+{
+  "date": "2026-09-15",
+  "scope": "Roadmap step 2.5: readability acceptance per post-implementation-simplification.md §6.5 — five reading tasks executed by fresh agents (not involved in the implementation), obstacles recorded verbatim",
+  "method": "five parallel fresh general-purpose agents, one per §6.5 task; read-only except task 4 (scratch script in /tmp only); each reported: completion, reading path, obstacles, helpful designs",
+  "tasks": {
+    "1_producer_state_version_dependencies": {
+      "completed": true,
+      "files_read": 11,
+      "answer": "rows0[t] <- V31 normal_output (S6 normalize call); layer calls read kv[req,layer,[0,token)] write kv[req,layer,token]; replay S7 overwrites same-coordinate slots; value RAW via seeds/paths/uses (region_dependence.rs:1223), resource raw/war/waw intersected with reference order (1244-1251)",
+      "obstacles": [
+        "起点误导：inplace_ttt 与 recirculation 是不同负载（读 249 行后排除）",
+        "同名概念四套名字：recirculation / Recurrence(replay.py) / TokenwiseLayerReplay / tokenwise replay",
+        "生产者链路跨 5 层（Workload→effect→bind→程序构造→oracle），算法一半在构造器一半在测试 oracle",
+        "依赖在 Python 侧是不透明字符串字段；要读 Rust ISL 文本构造并实跑对齐 S/V 编号",
+        "'状态版本'不是一等概念：值级=SSA id，资源级隐含在依赖与参考序的交里",
+        "replay 分支是单个原子语句 S7；tap 命中分段产生 extent=1 的 Scan 段，均需读构造逻辑才懂"
+      ],
+      "helpful": ["audit 文档输入契约表", "ResourceAccess 声明直接回答读写", "运行时坐标校验", "测试内独立 oracle", "analyze 可实跑核对"]
+    },
+    "2_legal_vs_illegal_reorder": {
+      "completed": true,
+      "files_read": 6,
+      "answer": "legal() (region_dependence.rs:1018-1050) checks single-valued full-domain cover + dependency image subset of lex_lt; legal: grid wavefront theta=(c+l,c) both edges lex-forward; illegal: [-c,l] reverses RAW edge -> rejected at subset check",
+      "obstacles": [
+        "依赖文本不可直接读：求解器内部形式需手工展开；isl-scheduling.md 承诺的'哪些边阻止并行'诊断未实现",
+        "builder 术语 seeds/uses/aliases/paths 首次出现无定义，靠用法反推",
+        "拒绝信息合并两类违规（未覆盖全域 vs 多值），不指明违规边",
+        "ISL 关系字符串模板拼接是全文件认知成本最高处",
+        "Scan/Select/Update 操作语义只在 Rust 分析器注释里，无双语对照"
+      ],
+      "helpful": ["测试名即合法性命题，合法/非法成对", "单一 legal() 权威检查点（候选/lift/外部 witness 三路径汇入）", "注释解释为什么不那样做", "文档与代码可互查", "Python 边界极薄"]
+    },
+    "3_cuda_waits_and_releases": {
+      "completed": true,
+      "files_read": 12,
+      "answer": "waits: region_streams.rs derive_plan lexmax 前沿 -> waits 表; RegionStreamFrame.enter 查表 order_on -> wait_event; host_fences drain+join; PTTS publish/pin 独立 readiness 机制. releases: 三层——Torch 引用 last-use 释放 (region_frame), PTTS 页惰性轮询归还 (collect_completed 调用点 7+ 处), 后端 stream 句柄关闭",
+      "obstacles": [
+        "'释放'三种语义分散在互不引用的模块，无总览入口",
+        "页归还是惰性轮询：无专职回收者，结论只能枚举调用点归纳（最大卡点）",
+        "所有权词汇密集且相近：owner/arena/pin/token/publication/receipt/root/lineage",
+        "两条跨 stream 等待机制（区域阶段事件 vs PTTS readiness）易混；隐式耦合只在注释里",
+        "Rust waits 表是参数化 AccessTable，需同时懂前沿语义与坐标代入"
+      ],
+      "helpful": ["region-ir.md 并发段落（建议先读文档再读码）", "CudaStreamReadiness 35 行能力对象", "否定式模块 docstring", "Rust validate 重推导让运行时只解释表"]
+    },
+    "4_add_compute_call": {
+      "completed": true,
+      "files_read": 6,
+      "answer": "48 行脚本一次跑通：ExportedCell.capture + 手拼 Program/Region/Block/Call + RegionInstructionExecution 直接绑定原始 cell，数值精确验证；未改任何仓库文件",
+      "obstacles": [
+        "authoring 路径（capture→拼 Program→执行）无教程导览，入口清单靠读测试 import 反向挖",
+        "'直接绑未编译原始 cell'的组合没有现成示例，需读绑定类型白名单确认",
+        "Call 位置参数含义需对照 dataclass 字段名（轻微）"
+      ],
+      "helpful": ["single_call 6 行模板", "capture 签名自解释", "cell.declaration/digest 桥接", "绑定时显式校验兜底", "契约全是 frozen dataclass 命名字段"]
+    },
+    "5_basic_schedule_path": {
+      "completed": true,
+      "files_read": 29,
+      "answer": "默认路径: ExecutionOptions(tuning=heuristic) -> specialize 写 timeline -> compile_tokenwise_region 跳过目录(:427) -> analyze(optimize=False).reference_schedule -> payload -> RegionExecutionPlan 惰性 bind (lower schedule+bindings) -> RegionInstructionExecution.run 纯 Python 解释; 测试级 optimize_region 关数学变体仍探索目录",
+      "obstacles": [
+        "'参考调度'无一同名符号：分散在 reference_schedule 字段、'reference' 候选字符串、注释、candidate_proposals[0]",
+        "'默认路径'两条含义不同（生产 heuristic 直装 vs optimize_region 关数学仍探索目录），文档表述需自己调和",
+        "入口三层间接：specialize -> derive_attachment_resources -> compile_tokenwise_region",
+        "Rust 内部归属不直观：FFI 名 1:1 但 pub(super) 函数无模块索引",
+        "绑定有两处等价构造点（RegionExecutionPlan.bind 与 region_optimization._executor）",
+        "最后一公里分散：纯张量走 ExportedCell.invoke eager，生产层前向走 ExternalFunction 回调"
+      ],
+      "helpful": ["跨语言 FFI 名 1:1", "关键注释写理由（常数排名证明）", "analyze(optimize=False) 开关显式表达", "绑定交叉校验", "运行时纯 Python 三小类"]
+    }
+  },
+  "statistics_2026-09-15": {
+    "rust_planning_core_lines": 11767,
+    "python_execution_lines_excl_graph_transforms": 11419,
+    "graph_transform_lines": 411,
+    "backend_adapter_lines": 3509,
+    "contracts_lines": 3486,
+    "contracts_dataclasses": 183,
+    "test_lines": 17449,
+    "cross_language": "single canonical JSON codec (contracts/codec.py 345 lines + execution/codec.py 503 lines); pyo3-native types 2 classes / 47 fields",
+    "files_touched_per_task": [11, 6, 12, 6, 29]
+  },
+  "structural_questions_6_5": {
+    "索引往返转换消失": "是（Coordinate 直达，T1 确认坐标即仿射下标）",
+    "来源事实只维护一份": "基本是（T5 发现两处等价 bind 构造点，属轻微重复）",
+    "调用边界复制有明确理由": "是（entry copies 文档化）",
+    "算法还需手工拼接资源 token": "否（ResourceAccess 声明直接回答读写）"
+  },
+  "themes": {
+    "A_diagnostics_readability": "最强信号（T1+T2 头号阻碍）：依赖与拒绝原因只有求解器内部 ISL 文本；isl-scheduling.md 承诺的'哪些边阻止并行'诊断未实现",
+    "B_concept_navigation": "T1+T5：参考调度无单一符号、默认路径入口三层间接、同名概念多套名字、生产者链路五层",
+    "C_release_wait_dispersion": "T3：释放三层语义分散、页归还惰性轮询无专职者、两条跨 stream 等待机制易混",
+    "D_terminology_gaps": "T2+T3：builder 术语首次出现无定义、RegionPageOwner docstring 不透明、ISL 字符串模板拼接认知成本最高",
+    "E_authoring_guidance": "T4+T5：capture→Program→执行路径只能从测试反向挖；但 authoring 本身零真实卡点（T4 一次跑通）"
+  }
+}

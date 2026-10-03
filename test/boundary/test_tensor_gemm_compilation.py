@@ -1,5 +1,7 @@
 """Actual Triton GEMM code, readonly ports and source-selected batch lowering."""
 
+from dataclasses import replace
+
 import math
 
 import pytest
@@ -72,9 +74,9 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
     with pytest.warns(NumericalTransformWarning, match="batching.*kernel compilation"):
         selected = optimize_region(program, {source.digest: source}, dict(zip(names, tensors)),
             payload_limits=(RegionPayloadLimit("cuda:0", 200000),),
-            options=ExecutionOptions(schedule_policy="serial"), warmup_rounds=0, measurement_rounds=1)
+            options=replace(ExecutionOptions(schedule_policy="serial"), tuning="measured"), warmup_rounds=0, measurement_rounds=1)
     record, = selected.rewrites
-    compiled = selected._execution._cells[record.source_digest]
+    compiled = selected.execution.cells[record.source_digest]
     assert isinstance(compiled, CompiledPrimitive)
     # Normalized account: pack + view charge the packed operands twice, their
     # f32 upcasts twice more; the bmm result and both select views follow.
@@ -83,7 +85,7 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
         subtotal + math.ceil(subtotal * COMPILER_SLACK_FRACTION))
     # The second returned source slice has a nonzero offset in the batched
     # allocation. The selected compiled ABI still returns independent roots.
-    warm = selected.run(dict(zip(names, tensors)))
+    warm = selected.execution.run(dict(zip(names, tensors)))
     del warm
     torch.cuda.synchronize()
     allocated = torch.cuda.memory_allocated()
@@ -93,7 +95,7 @@ def test_automatic_batching_can_select_compiled_gemm_with_packing_and_output_cop
     monkeypatch.setattr(tuning, "compile_tensor_cell", forbidden)
     from triton.runtime.jit import JITFunction
     monkeypatch.setattr(JITFunction, "_do_compile", forbidden)
-    actual = selected.run(dict(zip(names, tensors))).values
+    actual = selected.execution.run(dict(zip(names, tensors))).values
     torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() - allocated <= (
         selected.selection.candidates[selected.selection.selected].capacity.devices[0].peak_tensor_bytes_upper_bound)

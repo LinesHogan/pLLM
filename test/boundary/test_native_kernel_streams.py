@@ -1,3 +1,4 @@
+from test.boundary.test_region_streams import stream_execution
 """Native stream placement needs locally bound completion and workspace facts."""
 
 from dataclasses import replace
@@ -11,7 +12,6 @@ from pllm.contracts.region_selection import RegionPayloadLimit
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.decoder_region import index_cell
 from pllm.execution.region_compilation import analyze_region_program
-from pllm.execution.region_execution import RegionStreamExecution
 from pllm.execution.region_native import NativePrimitive, external_primitive
 from pllm.execution.region_resources import ExternalFunction, ReadonlyResourceBinding, RegionResources
 from pllm.execution.region_storage import analyze_region_capacity
@@ -47,12 +47,12 @@ def test_native_kernel_import_includes_backing_storage_and_rejects_incomplete_id
     cells = {cell.declaration.name: cell}
     capacity = analyze_region_capacity(program, source.reference_schedule, cells)
     assert capacity.devices[0].call_scratch_bytes_upper_bound == 16 + 64
-    plan, = explore_region_streams(program, cells, lanes=2, max_candidates=1).candidates
+    plan, = explore_region_streams(program, cells, schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map).candidates
     assert plan.devices[0].concurrent_scratch_bytes_upper_bound == 2 * (16 + 64)
     # A generic callback is still opaque, even when its Python code happens
     # to be the same as a kernel carrying an explicit backend ABI.
     assert not explore_region_streams(program, {cell.declaration.name: replace(cell, implementation=None)},
-        lanes=2, max_candidates=1).candidates
+        schedule=analyze_region_program(program, parallel_only=True).candidates[-1].schedule_map).candidates
     for invalid in (
         replace(cell.implementation, implementation=""),
         replace(cell.implementation, device="cuda:0"),
@@ -66,8 +66,8 @@ def test_native_kernel_import_includes_backing_storage_and_rejects_incomplete_id
 def test_native_kernels_execute_on_auxiliary_stream_with_independent_output_copies():
     scan, cell, launches = native_scan("cuda:0")
     cells = {cell.declaration.name: cell}
-    plan, = explore_region_streams(scan.program, cells, lanes=2, max_candidates=1).candidates
-    runner = RegionStreamExecution(scan.program, cells, plan,
+    plan, = explore_region_streams(scan.program, cells, schedule=analyze_region_program(scan.program, parallel_only=True).candidates[-1].schedule_map).candidates
+    runner = stream_execution(scan.program, cells, plan,
         payload_limits=(RegionPayloadLimit("cuda:0", plan.devices[0].peak_bytes_upper_bound),))
     bindings = RegionStreamBindings(torch.cuda.Stream(), (torch.cuda.Stream(),))
     values = tuple(torch.full((4,), float(i), device="cuda:0") for i in range(3))
@@ -112,7 +112,7 @@ def test_external_kernel_borrows_original_weights_and_requires_matching_local_ab
     abi = NativeKernelImport(function, "test.borrowed_weights.current_stream@1", "cuda:0", ())
     cells = {function.name: external_primitive(function, abi)}
     plan = lower_region_streams(program, "{ S0[] -> [0]; S1[] -> [1] }", cells, axis=0, lanes=2)
-    runner = RegionStreamExecution(program, cells, plan, payload_limits=(RegionPayloadLimit("cuda:0", 1024),))
+    runner = stream_execution(program, cells, plan, payload_limits=(RegionPayloadLimit("cuda:0", 1024),))
     value = torch.tensor([3., 7.], device="cuda:0")
     view = ReadonlyTensorView(weights, tuple(ReadonlyTensorCell.bind((i,), (value,)) for i in range(2)))
     launches = []
