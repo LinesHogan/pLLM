@@ -24,7 +24,7 @@ from pllm.execution.scheduler import validate_plan_bundle
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
-from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan, StateRepresentation
+from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutSpec
 from pllm.kernels.paged_linear import PagedRows
 from pllm.execution.ptts.page_capture import CapturedPageFields, PagedKernel
@@ -236,8 +236,6 @@ class PageBundleArena:
         self._pools: dict[str, _Pools] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
         for selected in plan.state_physical.representations:
-            if selected.representation is not StateRepresentation.DENSE_PAGE_ARENA:
-                raise ValueError("PageBundle arena cannot reconstruct the signed representation")
             self._pools[selected.resource] = _Pools(layouts[selected.resource], selected, self.device)
         self._roots: dict[StateRef, _Root] = {}
         self._lineages: dict[LineageId, StateRef | None] = {}

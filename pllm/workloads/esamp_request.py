@@ -21,7 +21,7 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch
 from pllm.contracts.semantic_graph import (
     SchedulerTimeline, SemanticGraph, TaskImplementationSpec, TaskResourceFact, TaskSymbol, ValueResourceFact,
 )
-from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorLayoutRequest
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorLayoutRequest
 
 ADAM_FIELDS = AdamWFields(LayoutFieldId(0), LayoutFieldId(1), LayoutFieldId(2), LayoutFieldId(3), LayoutFieldId(4))
 
@@ -91,7 +91,7 @@ class ESampRequestWorkload(pllm.Workload):
         return pllm.RequestState({"up": lambda m: (m.hidden_size, rank), "gate": lambda m: (m.hidden_size, rank),
             "down": lambda m: (rank, m.hidden_size), "bias": (rank,),
             "scale": lambda m: (m.hidden_size if norm else 0,), "shift": lambda m: (m.hidden_size if norm else 0,)},
-            initialize=initialize, optimizer=self.optimizer, alignment=4, mutation=MutationGranularity.PAGE,
+            initialize=initialize, optimizer=self.optimizer, alignment=4,
             namespace="canonical.low_rank_gated_adamw@1", keys=config.key_fields)
 
     def ready(self, versions: Annotated[torch.Tensor, pllm.StateVersion("request_distiller")]) -> torch.Tensor:

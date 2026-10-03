@@ -113,7 +113,7 @@ class CompletionWorkload(NativeMath, _LearningMath[CompletionInput, ContextT, Re
         b = Builder[ContextT](self.name, boundary_digest(facts, fingerprint(owner_values(owner, _MARKERS)),
             fingerprint(definition), identity, fingerprint(owner.trained_rows)), Dimensions(facts.hidden_size, 0))
         state = b.state("parameters", tuple(Field(name, shape,
-            TensorDType(str(definition.dtype).removeprefix("torch.")), definition.alignment, definition.mutation) for name, shape in shapes.items()),
+            TensorDType(str(definition.dtype).removeprefix("torch.")), definition.alignment) for name, shape in shapes.items()),
             namespace=definition.namespace, optimizer=definition.optimizer)
         layout, = b.layouts.layouts
         device = "cpu" if facts.device.type == "cpu" else f"cuda:{facts.device.index or 0}"

@@ -13,18 +13,6 @@ const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum StateRepresentation {
-    ResidentModule,
-    DensePageArena,
-    SparsePageArena,
-    VersionedOverlay,
-    ShardedState,
-    HostService,
-    ExternalHandle,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum StateDeviceKind {
     Cpu,
     Cuda,
@@ -35,7 +23,6 @@ pub(crate) enum StateDeviceKind {
 pub(crate) struct StateProviderPlan {
     pub(crate) resource: String,
     provider_id: String,
-    representation: StateRepresentation,
     pub(crate) device_kind: StateDeviceKind,
     pub(crate) device_ordinal: u64,
     pub(crate) layout_id: u64,
@@ -397,7 +384,7 @@ mod tests {
         };
         let candidate = |resource, provider, bytes, retained| {
             json!({
-                "resource": resource, "provider_id": provider, "representation": "dense_page_arena",
+                "resource": resource, "provider_id": provider,
                 "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
                 "layout_digest": "a".repeat(64), "layout_namespace": "b".repeat(64),
                 "max_admitted_lineages": 1, "page_capacity": 3,

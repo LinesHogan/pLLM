@@ -12,7 +12,7 @@ import torch
 from pllm.authoring import BackendWorkload, BackendCompileFacts, BackendRequirements, TensorStepInput
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, ActivationPatchOperator, AttachmentKind
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType, TensorLayoutRequest
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.hidden_locator import HiddenSite, HiddenPhase
 from pllm.contracts.parameter_overlay import ParameterTarget, ParameterOverlayOperator
 from pllm.contracts.request_identity import RequestKeyField
@@ -130,7 +130,6 @@ class InstanceState:
     shape: Shape | None = None
     dtype: torch.dtype = torch.float32
     alignment: int = field(default=16, kw_only=True)
-    mutation: MutationGranularity = field(default=MutationGranularity.WHOLE_TENSOR, kw_only=True)
     # Plain per-lineage tensors carried across steps; never optimizer-managed.
     memory: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
 
@@ -183,8 +182,8 @@ class Overlay:
 def _buffers(state: InstanceState) -> dict[str, Buffer]:
     if state.optimizer is not None or state.initialize is not None:
         raise ValueError("buffer effects require zero-initialized state without an optimizer")
-    if state.alignment != 16 or state.mutation is not MutationGranularity.WHOLE_TENSOR:
-        raise ValueError("buffer effect layouts use their original target alignment and mutation granularity")
+    if state.alignment != 16:
+        raise ValueError("buffer effect layouts use their original target alignment")
     result: dict[str, Buffer] = {}
     for key, value in state.fields.items():
         if isinstance(value, Buffer):
@@ -426,7 +425,7 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                     initialize=None if definition.initialize is None else freeze(definition.initialize),
                     scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
                     dtype=TensorDType(str(definition.dtype).removeprefix("torch.")),
-                    alignment=definition.alignment, mutation=definition.mutation,
+                    alignment=definition.alignment,
                     keys=definition.keys if isinstance(definition, RequestState) else (),
                     memory=definition.memory)
                 states[name] = state

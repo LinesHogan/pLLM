@@ -27,7 +27,7 @@ from pllm.contracts.semantic_graph import (
     SemanticTask, StateEffectKind, StateResource, StateScope, TaskImplementationSpec, TaskSymbol, TimingConstraint, WorkloadId,
 )
 from pllm.contracts.tensor_layout import (
-    LayoutFieldId, MutationGranularity, StateTensorLayout, TensorDType, TensorFieldSpec, TensorLayoutRequest, TensorLayoutSpec,
+    LayoutFieldId, StateTensorLayout, TensorDType, TensorFieldSpec, TensorLayoutRequest, TensorLayoutSpec,
 )
 
 
@@ -39,7 +39,7 @@ def _plan(max_admitted_lineages: int = 1) -> PlanBundle:
         (SemanticEffect(resource, StateEffectKind.READ),)),), "a" * 64,
         states=(SemanticState(resource, StateScope.INSTANCE, ()),))
     layout = TensorLayoutRequest((StateTensorLayout(resource, TensorLayoutSpec("test.shared@1", (
-        TensorFieldSpec(LayoutFieldId(0), (2, 3), TensorDType.FLOAT64, 16, MutationGranularity.WHOLE_TENSOR),
+        TensorFieldSpec(LayoutFieldId(0), (2, 3), TensorDType.FLOAT64, 16),
     ))),))
     return compile_page_bundle_plan((graph, layout), HostRuntimeFacts(torch.device("cpu")).timeline(),
         (PageBundleProviderFacts("test.shared@1", 3 * max_admitted_lineages, shared_memory=True),), max_admitted_lineages, 65536, torch.device("cpu"))

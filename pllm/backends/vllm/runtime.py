@@ -67,7 +67,7 @@ from pllm.contracts.semantic_graph import (
     AnchorId, ConditionalLayerReplay, SamplerFeedbackInputSource, SchedulerTimeline, StateScope, HiddenInputSource, TokenwiseLayerReplay, TaskId,
 )
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType, TensorFieldSpec
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 
 from vllm import RequestOutput, SamplingParams, __version__ as _VLLM_VERSION
 from vllm.config import CacheConfig, VllmConfig
@@ -1140,7 +1140,7 @@ class VllmLlm(Generic[DataT, ResultT]):
             completion_wire = None
             if feedback_group is not None:
                 field = TensorFieldSpec(LayoutFieldId(0), (len(identities), self.attachment.inputs.probe.hidden_size),
-                    TensorDType.FLOAT32, 4, MutationGranularity.WHOLE_TENSOR)
+                    TensorDType.FLOAT32, 4)
                 with torch.inference_mode(False):
                     if self._runner is None:
                         destination, completion_wire = SharedTensor.allocate(field, lifetime, output_device)

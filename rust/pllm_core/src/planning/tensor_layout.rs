@@ -34,21 +34,12 @@ pub(crate) enum TensorDType {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MutationGranularity {
-    WholeTensor,
-    Row,
-    Page,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TensorFieldSpec {
     pub(crate) field_id: u64,
     shape: Vec<u64>,
     dtype: TensorDType,
     alignment_bytes: u64,
-    mutation_granularity: MutationGranularity,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -319,7 +310,7 @@ mod tests {
     use super::{compile, validate_decision, TensorLayoutDecision, TensorLayoutRequest};
 
     fn request_json() -> String {
-        r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16,"mutation_granularity":"row"}],"schema_version":1}},{"resource":"beta","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16,"mutation_granularity":"row"}],"schema_version":1}},{"resource":"gamma","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[1],"dtype":"float32","alignment_bytes":16,"mutation_granularity":"page"},{"field_id":1,"shape":[],"dtype":"float32","alignment_bytes":16,"mutation_granularity":"whole_tensor"}],"schema_version":1}}],"schema_version":1}"#.to_owned()
+        r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}},{"resource":"beta","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}},{"resource":"gamma","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[1],"dtype":"float32","alignment_bytes":16},{"field_id":1,"shape":[],"dtype":"float32","alignment_bytes":16}],"schema_version":1}}],"schema_version":1}"#.to_owned()
     }
 
     #[test]
@@ -327,7 +318,7 @@ mod tests {
         let request: TensorLayoutRequest = serde_json::from_str(&request_json()).unwrap();
         let decision = compile(&request).unwrap();
         let base_request: TensorLayoutRequest = serde_json::from_str(
-            r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16,"mutation_granularity":"row"}],"schema_version":1}}],"schema_version":1}"#,
+            r#"{"layouts":[{"resource":"alpha","layout":{"namespace":"adapter","fields":[{"field_id":0,"shape":[2,4],"dtype":"float32","alignment_bytes":16}],"schema_version":1}}],"schema_version":1}"#,
         )
         .unwrap();
         let base_decision = compile(&base_request).unwrap();

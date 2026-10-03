@@ -23,19 +23,12 @@ class TensorDType(StrEnum):
     FLOAT64 = "float64"
 
 
-class MutationGranularity(StrEnum):
-    WHOLE_TENSOR = "whole_tensor"
-    ROW = "row"
-    PAGE = "page"
-
-
 @dataclass(frozen=True, slots=True)
 class TensorFieldSpec:
     field_id: LayoutFieldId
     shape: tuple[int, ...]
     dtype: TensorDType
     alignment_bytes: int
-    mutation_granularity: MutationGranularity
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +69,6 @@ class TensorLayoutDecision:
 
 __all__ = [
     "LayoutFieldId",
-    "MutationGranularity",
     "StateTensorLayout",
     "TensorDType",
     "TensorFieldSpec",

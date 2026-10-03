@@ -13,7 +13,7 @@ from tempfile import TemporaryFile
 
 import torch
 from pllm.execution.codec import cuda_device_uuid, share_cuda_storage, open_cuda_storage
-from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType, TensorFieldSpec
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 
 
 TORCH_DTYPES = {
@@ -135,7 +135,7 @@ class SharedTensor:
         if dtype is None or tensor.layout != torch.strided:
             raise ValueError("auxiliary tensor must use a strided tensor in the closed dtype vocabulary")
         return TensorFieldSpec(LayoutFieldId(0), tuple(tensor.shape), dtype,
-            tensor.element_size(), MutationGranularity.WHOLE_TENSOR)
+            tensor.element_size())
 
     @staticmethod
     def _size(field: TensorFieldSpec) -> int:

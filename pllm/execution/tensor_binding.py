@@ -17,7 +17,7 @@ from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.parameter_overlay import ParameterTarget, ParameterOverlayFieldBinding, ParameterOverlayOperator
-from pllm.contracts.tensor_layout import LayoutFieldId, MutationGranularity, TensorDType
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -445,7 +445,7 @@ class TensorBinding(Builder[TensorFrame]):
     def parameters(self, name: str, shapes: Mapping[str, Shape], *, optimizer: AdamWConfig | SGD | None, namespace: str = "",
                    initialize: Callable[[Tensors, torch.Generator], None] | None = None,
                    scope: StateScope = StateScope.INSTANCE, dtype: TensorDType = TensorDType.FLOAT32,
-                   alignment: int = 16, mutation: MutationGranularity = MutationGranularity.WHOLE_TENSOR,
+                   alignment: int = 16,
                    keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,),
                    memory: Mapping[str, Shape] = {}) -> tuple[State, dict[str, SemanticInputSource | TensorPort]]:
         if self.graph.states:
@@ -458,9 +458,9 @@ class TensorBinding(Builder[TensorFrame]):
             return tuple(shape(model) if callable(shape) else shape for shape in shapes.values())
         # Without an optimizer the fields are the layout directly: readable, importable, never updated.
         raw = not isinstance(optimizer, AdamWConfig)
-        memory_fields = tuple(Field(key, shape, dtype, alignment, mutation) for key, shape in memory.items())
-        state = self.state(name, tuple(Field(key, shape, dtype, alignment, mutation) for key, shape in shapes.items()) if raw else
-            (Field("parameters", lambda m: (sum(prod(shape) for shape in sizes(m)),), dtype, alignment, mutation),),
+        memory_fields = tuple(Field(key, shape, dtype, alignment) for key, shape in memory.items())
+        state = self.state(name, tuple(Field(key, shape, dtype, alignment) for key, shape in shapes.items()) if raw else
+            (Field("parameters", lambda m: (sum(prod(shape) for shape in sizes(m)),), dtype, alignment),),
             namespace=namespace, optimizer=optimizer if isinstance(optimizer, AdamWConfig) else None, scope=scope,
             keys=keys if scope is StateScope.REQUEST else (), memory=memory_fields)
         dimensions = self.dimensions

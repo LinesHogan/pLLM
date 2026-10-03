@@ -451,7 +451,7 @@ mod tests {
         let state = super::decode_state(&json!({
             "plan_epoch": 1, "schema_version": 1, "request_digest": "a".repeat(64),
             "representation_signature": "b".repeat(64), "reserved_bytes": 32,
-            "representations": [{"resource": "state", "provider_id": "pages", "representation": "dense_page_arena",
+            "representations": [{"resource": "state", "provider_id": "pages",
                 "device_kind": "cpu", "device_ordinal": 0, "layout_id": 0,
                 "layout_digest": "c".repeat(64), "layout_namespace": "d".repeat(64),
                 "max_admitted_lineages": 1, "page_capacity": 3, "root_page_count": 1,

@@ -70,7 +70,7 @@ assert any(req.name == 'torch' and req.marker is None for req in requirements)
 request = json.dumps({'schema_version': 1, 'layouts': [{
     'resource': 'wheel', 'layout': {'namespace': 'wheel', 'schema_version': 1,
     'fields': [{'field_id': 0, 'shape': [2, 4], 'dtype': 'float32',
-    'alignment_bytes': 16, 'mutation_granularity': 'row'}]}}]})
+    'alignment_bytes': 16}]}}]})
 decision = _core.intern_tensor_layouts(request)
 _core.validate_tensor_layouts(request, decision)
 assert json.loads(decision)['bindings'][0]['layout_id'] == 0

@@ -12,7 +12,7 @@ from pllm.contracts.semantic_graph import SemanticGraph, SchedulerTimeline
 from pllm.contracts.state_representation import StateLayoutRequirement, StateRepresentationRequest
 from pllm.contracts.tensor_layout import TensorLayoutRequest
 
-from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan, StateRepresentation
+from pllm.contracts.state_representation import StateDeviceKind, StateProviderPlan
 from pllm.contracts.tensor_layout import TensorDType, TensorFieldSpec, TensorLayoutBinding, TensorLayoutSpec
 
 
@@ -72,7 +72,6 @@ class PageBundleProviderFacts:
             + max(field.alignment_bytes - DTYPE_BYTES[field.dtype], 0) for field in layout.fields)
         return StateProviderPlan(
             resource=resource, provider_id=self.provider_id,
-            representation=StateRepresentation.DENSE_PAGE_ARENA,
             device_kind=self.device_kind, device_ordinal=self.device_ordinal,
             layout_id=binding.layout_id, layout_namespace=binding.layout_namespace, layout_digest=binding.layout_digest,
             max_admitted_lineages=max_admitted_lineages,

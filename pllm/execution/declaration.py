@@ -27,7 +27,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.contracts.tensor_layout import (
-    LayoutFieldId, MutationGranularity, StateTensorLayout, TensorDType, TensorFieldSpec,
+    LayoutFieldId, StateTensorLayout, TensorDType, TensorFieldSpec,
     TensorLayoutRequest, TensorLayoutSpec,
 )
 from pllm.contracts.compilation import PlanBundle
@@ -74,13 +74,12 @@ class Field:
     shape: Shape
     dtype: TensorDType | Callable[[Dimensions], TensorDType] = TensorDType.FLOAT32
     alignment: int = 16
-    mutation: MutationGranularity = MutationGranularity.WHOLE_TENSOR
 
 
 def adam_fields(shape: Shape, *, dtype: TensorDType = TensorDType.FLOAT32,
-                alignment: int = 16, mutation: MutationGranularity = MutationGranularity.WHOLE_TENSOR) -> tuple[Field, ...]:
+                alignment: int = 16) -> tuple[Field, ...]:
     return tuple(Field(name, () if name == "step" else shape,
-        TensorDType.FLOAT32 if name == "step" else dtype, alignment, mutation)
+        TensorDType.FLOAT32 if name == "step" else dtype, alignment)
         for name in ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq"))
 
 
@@ -156,8 +155,7 @@ class Builder(Generic[D]):
         if optimizer is not None:
             fields = tuple(replace(part, name=f"{field.name}.{part.name}",
                 dtype=TensorDType.FLOAT32 if part.name == "step" else field.dtype)
-                for field in fields for part in adam_fields(field.shape,
-                    alignment=field.alignment, mutation=field.mutation))
+                for field in fields for part in adam_fields(field.shape, alignment=field.alignment))
             optimizer_fields = len(fields)
         fields = (*fields, *memory)
         if len({field.name for field in fields}) != len(fields):
@@ -180,7 +178,7 @@ class Builder(Generic[D]):
                     return field.dtype(self.dimensions)
                 return field.dtype
             layout = TensorLayoutSpec(namespace or f"{self.graph.workload_id}.{name}@1", tuple(TensorFieldSpec(LayoutFieldId(i), shape,
-                dtype(field), field.alignment, field.mutation) for i, (field, shape) in enumerate(zip(fields, shapes, strict=True))))
+                dtype(field), field.alignment) for i, (field, shape) in enumerate(zip(fields, shapes, strict=True))))
             self.layouts = TensorLayoutRequest((*self.layouts.layouts, StateTensorLayout(name, layout)))
         return State(declaration, fields, optimizer, optimizer_fields)
 
