@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
-from enum import StrEnum
+from dataclasses import dataclass
 from itertools import accumulate
 from math import prod
 from multiprocessing.connection import Connection
-from multiprocessing.reduction import recv_handle, send_handle
-import os
-from tempfile import TemporaryFile
-from typing import BinaryIO, Callable
+from typing import Callable
 from threading import RLock
 from weakref import WeakSet
 
@@ -19,7 +15,7 @@ import torch
 
 from pllm.execution.ptts.page_bundle_planning import DTYPE_BYTES, page_stride_bytes
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, map_cpu_storage, tensor_dtype
+from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion, tensor_dtype
 from pllm.execution.scheduler import validate_plan_bundle
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import StateEffectKind
@@ -76,16 +72,10 @@ class PageRelease:
     remote_reads: tuple[RemoteCompletion, ...] = ()
 
 
-class PageAccess(StrEnum):
-    READ = "read"
-    WRITE = "write"
-
-
 @dataclass(frozen=True, slots=True)
 class PageFieldTransfer:
     compilation_signature: str
-    access: PageAccess
-    owner_id: int  # Original PagePin.pin_id or PageWrite.operation_id, selected by access.
+    owner_id: int  # Original PagePin.pin_id; all remote grants are read-only.
     ref: StateRef
     resource: str
     field_id: LayoutFieldId
@@ -96,7 +86,7 @@ class PageFieldTransfer:
 
 @dataclass(slots=True)
 class BorrowedPage:
-    """Native alias with the declared access; discard all aliases before close."""
+    """Read-only native alias; discard all aliases before close (not OS-enforced)."""
 
     descriptor: PageFieldTransfer
     _tensor: torch.Tensor | None
@@ -130,8 +120,6 @@ class _Root:
 class _Write:
     targets: tuple[PageBundle, ...]
     fields: tuple[tuple[LayoutFieldId, ...], ...]
-    remote_writes: dict[tuple[int, LayoutFieldId], RemoteCompletion] = field(
-        default_factory=lambda: dict[tuple[int, LayoutFieldId], RemoteCompletion]())
 
 
 class _Pools:
@@ -139,23 +127,13 @@ class _Pools:
         self.layout, self.selected = layout, selected
         capacity = selected.page_capacity
         tensors: list[torch.Tensor] = []
-        self.shared_files: dict[LayoutFieldId, BinaryIO] = {}
         allocated_bytes = 0
         for field in layout.fields:
             size = DTYPE_BYTES[field.dtype]
             stride = page_stride_bytes(field) // size
             alignment = max(field.alignment_bytes // size, 1)
             count = capacity * stride + alignment - 1
-            if "state/shared_cpu@1" in selected.capabilities:
-                if device.type != "cpu":
-                    raise ValueError("shared CPU allocation differs from signed placement")
-                backing = TemporaryFile()
-                backing.truncate(count * size)
-                self.shared_files[field.field_id] = backing
-                pool = (map_cpu_storage(backing.fileno(), count * size, tensor_dtype(field.dtype), 0, (count,))
-                    if count else torch.empty(0, dtype=tensor_dtype(field.dtype)))
-            else:
-                pool = torch.zeros(count, dtype=tensor_dtype(field.dtype), device=device)
+            pool = torch.zeros(count, dtype=tensor_dtype(field.dtype), device=device)
             offset = (-pool.data_ptr() // size) % alignment
             tensors.append(pool[offset:offset + capacity * stride].view(capacity, stride)
                 [:, :prod(field.shape)].view(capacity, *field.shape))
@@ -460,8 +438,6 @@ class PageBundleArena:
     def publish(self, token: PageWrite) -> PagePublication:
         with self._lock:
             write = self._issued_write(token)
-            if not all(remote.query() for remote in write.remote_writes.values()):
-                raise RuntimeError("PageBundle publication requires the complete remote write quorum")
             for source in token.before_refs:
                 if self.latest(source.lineage_id) != source:
                     raise RuntimeError("PageBundle publication source is no longer latest")
@@ -489,9 +465,6 @@ class PageBundleArena:
     def abort(self, token: PageWrite) -> None:
         with self._lock:
             write = self._issued_write(token)
-            # An abort discards private values, but cannot reclaim a worker's live mapping.
-            for remote in write.remote_writes.values():
-                remote.synchronize()
             try:
                 completion = self._record(token.stream)
                 if completion is not None:
@@ -669,9 +642,6 @@ class PageBundleArena:
                     for field in fields:
                         if field not in write.fields[index]:
                             raise RuntimeError("PageBundle field is not writable in this transaction")
-                        remote = write.remote_writes.get((index, field))
-                        if remote is not None and not remote.query():
-                            raise RuntimeError("PageBundle field is exclusively borrowed by a remote writer")
                 roots = tuple(write.targets[index] for index in indices)
         if len({root.resource for root in roots}) != 1:
             raise ValueError("captured selection must use one original resource layout")
@@ -802,58 +772,34 @@ class PageBundleArena:
         with self._lock:
             value = self.borrow_field(pin, ref, field)
             root = self.root(ref)
-            descriptor, completion = self._export(root, field, value, PageAccess.READ, pin.pin_id, connection, pin.stream)
+            descriptor, completion = self._export(root, field, value, pin.pin_id, connection, pin.stream)
             self._issued_pin(pin).append(completion)
-            self._send_export(descriptor, value, connection, peer_pid)
-            return descriptor
-
-    def send_write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId,
-                         connection: Connection, peer_pid: int) -> PageFieldTransfer:
-        """Grant one private field to one worker; discard local aliases before export.
-
-        The original write owns the completion quorum and atomic commit/abort.
-        A field may be exported only once in a write, preventing overlapping grants.
-        """
-        with self._lock:
-            write = self._issued_write(token)
-            if (root_index, field) in write.remote_writes:
-                raise RuntimeError("PageBundle private field was already granted to a worker")
-            value = self.write_field(token, root_index, field)
-            descriptor, completion = self._export(write.targets[root_index], field, value,
-                PageAccess.WRITE, token.operation_id, connection, token.stream)
-            write.remote_writes[root_index, field] = completion
-            self._send_export(descriptor, value, connection, peer_pid)
+            # Retain completion before sending: even a partial send may expose the mapping.
+            connection.send_bytes(encode_boundary(descriptor).encode())
             return descriptor
 
     def _export(self, root: PageBundle, field: LayoutFieldId, value: torch.Tensor,
-                access: PageAccess, owner_id: int, connection: Connection,
+                owner_id: int, connection: Connection,
                 stream: torch.cuda.Stream | None) -> tuple[PageFieldTransfer, RemoteCompletion]:
-        if f"state/shared_{value.device.type}@1" not in self._pools[root.resource].selected.capabilities:
-            raise ValueError("page export requires a signed shared storage provider")
+        if (stream is None or value.device.type != "cuda"
+            or "state/shared_cuda@1" not in self._pools[root.resource].selected.capabilities):
+            raise ValueError("page export requires a signed shared CUDA provider and stream")
         held_reads = (read for reads in (*self._pins.values(), *(release.remote_reads for release in self._releases))
             for read in reads)
-        held_writes = (remote for write in self._writes.values() for remote in write.remote_writes.values())
-        if any(remote.connection is connection for remote in (*held_reads, *held_writes)):
+        if any(remote.connection is connection for remote in held_reads):
             raise ValueError("each remote page access requires its own completion channel")
-        descriptor = PageFieldTransfer(self.plan.schedule_decision.signature, access, owner_id, root.ref,
+        descriptor = PageFieldTransfer(self.plan.schedule_decision.signature, owner_id, root.ref,
             root.resource, field, root.pages[field], int(value.storage_offset()),
-            CudaIpcStorage.export(value, stream) if stream is not None and value.numel() else None)
+            CudaIpcStorage.export(value, stream) if value.numel() else None)
         return descriptor, RemoteCompletion(connection, encode_boundary(descriptor).encode())
-
-    def _send_export(self, descriptor: PageFieldTransfer, value: torch.Tensor,
-                     connection: Connection, peer_pid: int) -> None:
-        # The issued owner retains its proof before any partial transport failure.
-        connection.send_bytes(encode_boundary(descriptor).encode())
-        if value.numel() and value.device.type == "cpu":
-            send_handle(connection, self._pools[descriptor.resource].shared_files[descriptor.field_id].fileno(), peer_pid)
 
     @staticmethod
     def receive_field(plan: PlanBundle, connection: Connection,
-                      *, access: PageAccess = PageAccess.READ, stream: torch.cuda.Stream | None = None) -> BorrowedPage:
+                      *, stream: torch.cuda.Stream | None = None) -> BorrowedPage:
         descriptor = decode_boundary(connection.recv_bytes(65536).decode(), PageFieldTransfer)
         if (descriptor.compilation_signature != plan.schedule_decision.signature or descriptor.owner_id < 1
-            or descriptor.access is not access or descriptor.ref.lineage_id < 1 or descriptor.ref.version_id < 0):
-            raise ValueError("shared page belongs to another compilation, owner or access")
+            or descriptor.ref.lineage_id < 1 or descriptor.ref.version_id < 0):
+            raise ValueError("shared page belongs to another compilation or owner")
         entries = tuple((entry, binding, provider)
             for entry, binding in zip(plan.tensor_layout_request.layouts, plan.tensor_layout_decision.bindings, strict=True)
             for provider in plan.state_physical.representations
@@ -861,7 +807,7 @@ class PageBundleArena:
         if len(entries) != 1:
             raise ValueError("shared page resource is absent from the original plan")
         entry, binding, provider = entries[0]
-        if (f"state/shared_{provider.device_kind.value}@1" not in provider.capabilities
+        if (provider.device_kind is not StateDeviceKind.CUDA or "state/shared_cuda@1" not in provider.capabilities
             or binding.layout_id != descriptor.ref.layout_id or not 0 <= descriptor.field_id < len(entry.layout.fields)):
             raise ValueError("shared page differs from the signed layout or placement")
         spec = entry.layout.fields[descriptor.field_id]
@@ -874,33 +820,18 @@ class PageBundleArena:
             or not 0 <= head < alignment):
             raise ValueError("shared page slot or offset is outside signed capacity")
         nbytes = (capacity * stride + alignment - 1) * size
-        if provider.device_kind is StateDeviceKind.CUDA:
-            if stream is None or stream.device != torch.device("cuda", provider.device_ordinal):
-                raise ValueError("remote CUDA page requires its signed receiving device and stream")
-            if prod(spec.shape):
-                if descriptor.cuda_storage is None:
-                    raise ValueError("remote CUDA page is missing its storage handle")
-                tensor = descriptor.cuda_storage.map(nbytes, tensor_dtype(spec.dtype), descriptor.storage_offset, spec.shape, stream)
-                if tensor.data_ptr() % spec.alignment_bytes:
-                    raise ValueError("CUDA IPC page mapping violates the signed alignment")
-            else:
-                if descriptor.cuda_storage is not None:
-                    raise ValueError("empty CUDA page must not carry an allocation handle")
-                tensor = torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
-        elif descriptor.cuda_storage is not None or stream is not None:
-            raise ValueError("CPU shared page cannot carry CUDA storage or a CUDA stream")
-        elif prod(spec.shape):
-            fd = recv_handle(connection)
-            try:
-                if os.fstat(fd).st_size != nbytes:
-                    raise ValueError("shared allocation size differs from its signed pool")
-                tensor = map_cpu_storage(fd, nbytes, tensor_dtype(spec.dtype), descriptor.storage_offset, spec.shape)
-                if tensor.data_ptr() % spec.alignment_bytes:
-                    raise ValueError("shared page mapping violates the signed alignment")
-            finally:
-                os.close(fd)
+        if stream is None or stream.device != torch.device("cuda", provider.device_ordinal):
+            raise ValueError("remote CUDA page requires its signed receiving device and stream")
+        if prod(spec.shape):
+            if descriptor.cuda_storage is None:
+                raise ValueError("remote CUDA page is missing its storage handle")
+            tensor = descriptor.cuda_storage.map(nbytes, tensor_dtype(spec.dtype), descriptor.storage_offset, spec.shape, stream)
+            if tensor.data_ptr() % spec.alignment_bytes:
+                raise ValueError("CUDA IPC page mapping violates the signed alignment")
         else:
-            tensor = torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype))
+            if descriptor.cuda_storage is not None:
+                raise ValueError("empty CUDA page must not carry an allocation handle")
+            tensor = torch.empty(spec.shape, dtype=tensor_dtype(spec.dtype), device=stream.device)
         return BorrowedPage(descriptor, tensor, connection, stream)
 
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:

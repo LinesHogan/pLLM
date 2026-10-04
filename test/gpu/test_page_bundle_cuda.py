@@ -5,14 +5,13 @@ from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.contracts.semantic_graph import AnchorId
 from dataclasses import replace
 import multiprocessing as mp
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.ptts.page_bundle import PageAccess, PageBundleArena
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.workloads.esamp_request import ESampRequestWorkload
 from pllm.workloads.esamp_request import ESampRequestConfig
@@ -388,18 +387,14 @@ def _paged_adamw_lifecycle(captured=True):
             assert arena.free_pages == 6 and arena.active_lineages == 0
 
 
-def _cuda_ipc_worker(control, read_channel, write_channel, wire):
+def _cuda_ipc_worker(control, read_channel, wire, outcome):
     try:
         plan = decode_boundary(wire, PlanBundle)
         stream = torch.cuda.Stream(device=torch.device("cuda", 0))
-        with torch.cuda.stream(stream), patch("pllm.execution.ptts.page_bundle.map_cpu_storage",
-            side_effect=AssertionError("CUDA page transport must not stage through CPU storage")):
+        with torch.cuda.stream(stream):
             read = PageBundleArena.receive_field(plan, read_channel, stream=stream)
-            write = PageBundleArena.receive_field(plan, write_channel, access=PageAccess.WRITE, stream=stream)
-            assert read.tensor.is_cuda and write.tensor.is_cuda
-            assert read.descriptor.cuda_storage.handle == write.descriptor.cuda_storage.handle
-            assert read.descriptor.storage_offset != write.descriptor.storage_offset
             storage = read.descriptor.cuda_storage
+            assert storage is not None and read.tensor.is_cuda
             for invalid in (replace(storage, device_uuid="different GPU"), replace(storage, size_bytes=storage.size_bytes + 4),
                             replace(storage, handle="")):
                 with pytest.raises(ValueError):
@@ -410,30 +405,31 @@ def _cuda_ipc_worker(control, read_channel, write_channel, wire):
             expected = torch.arange(read.tensor.numel(), device=stream.device, dtype=read.tensor.dtype)
             torch.testing.assert_close(read.tensor, expected)
             torch.cuda._sleep(100_000_000)
-            write.tensor.copy_(read.tensor + 17)
+            consumed = read.tensor + 17
             done = torch.cuda.Event()
             done.record(stream)
             assert not done.query()
             control.send_bytes(b"queued")
             assert control.recv_bytes() == b"close"
-            write.close()
-            assert done.query()
-            read.close()
+            if outcome == "complete":
+                read.close()
+                assert done.query()
+                torch.testing.assert_close(consumed, expected + 17)
+            elif outcome == "bad_ack":
+                read_channel.send_bytes(b"another export")
+            else:
+                read_channel.close()
             control.send_bytes(b"completed")
         assert control.recv_bytes() == b"exit"
-    except Exception as exc:
-        control.send_bytes(f"{type(exc).__name__}: {exc}".encode())
-        raise
     finally:
         control.close()
         read_channel.close()
-        write_channel.close()
 
 
 def _cuda_ipc_lifecycle():
     context = mp.get_context("spawn")
     plan = _plan(shared=True)
-    for outcome in ("commit", "abort"):
+    for outcome in ("complete", "bad_ack", "eof"):
         arena = PageBundleArena(plan)
         stream = torch.cuda.Stream(device=arena.device)
         initial = arena.prepare_admission(("request_distiller",), stream)
@@ -441,60 +437,60 @@ def _cuda_ipc_lifecycle():
             field = arena.write_field(initial, 0, LayoutFieldId(0))
             expected = torch.arange(field.numel(), device=arena.device, dtype=field.dtype)
             field.copy_(expected)
+            del field
         initial = arena.publish(initial)
         arena.settle(initial)
         ref, = initial.after_refs
         pin = arena.pin_exact((ref,), stream)
-        observer = arena.pin_exact((ref,), stream)
-        write = arena.prepare_transition((ref,), stream, fields=((LayoutFieldId(0),),))
         control, child_control = context.Pipe()
         read_channel, child_read = context.Pipe()
-        write_channel, child_write = context.Pipe()
         process = context.Process(target=_cuda_ipc_worker,
-            args=(child_control, child_read, child_write, encode_boundary(plan)))
+            args=(child_control, child_read, encode_boundary(plan), outcome))
         process.start()
         child_control.close()
         child_read.close()
-        child_write.close()
         try:
             descriptor = arena.send_field(pin, ref, LayoutFieldId(0), read_channel, process.pid)
-            arena.send_write_field(write, 0, LayoutFieldId(0), write_channel, process.pid)
             assert descriptor.ref is ref and descriptor.cuda_storage is not None
             assert control.poll(20) and control.recv_bytes() == b"prepared"
-            with pytest.raises(RuntimeError, match="exclusively"):
-                arena.write_field(write, 0, LayoutFieldId(0))
+            for invalid in (replace(descriptor, owner_id=0), replace(descriptor, storage_offset=10**9),
+                            replace(descriptor, resource="unsigned"), replace(descriptor, compilation_signature="b" * 64)):
+                sender, receiver = context.Pipe()
+                try:
+                    sender.send_bytes(encode_boundary(invalid).encode())
+                    with pytest.raises(ValueError):
+                        PageBundleArena.receive_field(plan, receiver, stream=stream)
+                finally:
+                    sender.close()
+                    receiver.close()
+            # A local publication must not overwrite the remote reader's exact old version.
+            write = arena.prepare_transition((ref,), stream, fields=((LayoutFieldId(0),),))
+            with torch.cuda.stream(stream):
+                arena.write_field(write, 0, LayoutFieldId(0)).add_(99)
+            publication = arena.publish(write)
+            arena.settle(publication)
             released = arena.release_pin(pin)
+            arena.retire(publication.after_refs)
             assert not arena.release_complete(released)
             control.send_bytes(b"run")
             assert control.poll(20) and control.recv_bytes() == b"queued"
-            with pytest.raises(RuntimeError, match="quorum"):
-                arena.publish(write)
+            assert not arena.release_complete(released)
             control.send_bytes(b"close")
             assert control.poll(20) and control.recv_bytes() == b"completed"
-            if outcome == "commit":
-                publication = arena.publish(write)
-                arena.settle(publication)
-                latest, = publication.after_refs
-                current = arena.pin_exact((latest,), stream)
-                torch.testing.assert_close(arena.snapshot(current, latest)[0], expected + 17)
-                arena.wait_release(arena.release_pin(current))
+            if outcome == "complete":
+                arena.wait_release(released)
+                arena.collect_completed(wait=True)
+                assert arena.active_lineages == arena.pending_pin_releases == 0 and arena.free_pages == 6
             else:
-                arena.abort(write)
-                latest = arena.latest(ref.lineage_id)
-                assert latest == ref
-            torch.testing.assert_close(arena.snapshot(observer, ref)[0], expected)
-            arena.wait_release(released)
-            arena.wait_release(arena.release_pin(observer))
-            arena.retire((latest,))
-            arena.collect_completed(wait=True)
-            assert arena.active_lineages == arena.pending_pin_releases == 0 and arena.free_pages == 6
+                with pytest.raises(RuntimeError, match="completion proof"):
+                    arena.wait_release(released)
+                assert arena.root(ref).ref == ref and arena.pending_pin_releases == 1
             control.send_bytes(b"exit")
             process.join(10)
             assert process.exitcode == 0
         finally:
             control.close()
             read_channel.close()
-            write_channel.close()
             if process.is_alive():
                 process.terminate()
                 process.join(10)

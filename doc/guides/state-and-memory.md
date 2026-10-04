@@ -164,6 +164,30 @@ head = pllm.RequestState(
 
 ## 生命周期：谁回收状态
 
+### 跨进程借用与独立快照
+
+短期消费同一 GPU 上的精确状态版本，可以使用低层 `PageBundleArena.send_field`
+与 `receive_field`。发送者必须持有原 arena 签发的 `PagePin`，提供者必须在
+原计划中声明 `state/shared_cuda@1`。接收者先验证自己持有的同一 `PlanBundle`，
+再接收字段；签名、布局、设备和容量不能因跨进程而放宽。每个字段借用使用
+独立完成通道。接收者不获得页的所有权，也不获得修改或发布权限。
+
+`BorrowedPage` 返回 native tensor，只读是同一可信程序内的使用约定，不是
+OS 写保护或进程身份认证。用完全部别名和依赖它们的计算后，接收者在原接收
+stream 上 `close()`；它同步该 stream 后发回精确完成凭证。其他 stream 的
+计算须先归并到该 stream。发送者 `release_pin` 只签发释放 receipt，原 arena
+仍保留页，直到本地完成事件和全部远程读凭证满足；较新版本发布不会覆盖旧页。
+有界容量耗尽时拒绝新写，不能驱逐尚未完成的远程读者。
+
+`snapshot` 则复制出独立 tensor，适合要在 arena/worker 关闭后继续保留的结果。
+普通辅助输入和独立 completion 输出沿用 `SharedTensor`；它们不是版本页授权。
+页授权现在仅支持 CUDA 只读，CPU 本地 arena、CPU SharedTensor 和本地私有写
+仍保留。没有远程私有写或 CPU 页授权接口。
+
+坏凭证、断连或等待超时都不能作为完成：原 owner 保留相关资源。会话集成必须
+停止新工作，终止全部参与进程后丢弃实例；当前低层 arena 不提供自动崩溃恢复。
+进程退出码不能替代字段完成凭证，owner 崩溃后也不能依靠遗留 IPC mapping 继续服务。
+
 状态不因 Python 对象析构而回收——PTTS 的 pin 与完成协议管理其寿命。写入
 只在训练/overlay 迁移的私有副本上进行，发布是原子的；失败的发布保留原根，
 可以重试。观测与预测读到的是 pin 住的精确版本，永远不是「最新值」。

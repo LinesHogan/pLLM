@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from math import prod
-import mmap
 import torch
 
 from pllm.execution.scheduler import compile_state_schedule
@@ -64,9 +63,6 @@ class PageBundleProviderFacts:
 
     def materialize_plan(self, *, resource: str, layout: TensorLayoutSpec,
                          binding: TensorLayoutBinding, max_admitted_lineages: int) -> StateProviderPlan:
-        if self.shared_memory and self.device_kind is StateDeviceKind.CPU and any(
-            mmap.ALLOCATIONGRANULARITY % field.alignment_bytes for field in layout.fields):
-            raise ValueError("shared CPU page alignment must divide the OS mapping granularity")
         capacity = self.page_capacity
         reserved_bytes = sum(capacity * page_stride_bytes(field)
             + max(field.alignment_bytes - DTYPE_BYTES[field.dtype], 0) for field in layout.fields)
@@ -82,6 +78,6 @@ class PageBundleProviderFacts:
             capabilities=tuple(sorted((
                 f"device/{self.device_kind.value}@1", "optimizer/adamw@1", "state/exact_versions@1",
                 "transition/full_root@1", *(("state/fenced_reclaim@1",) if self.device_kind is StateDeviceKind.CUDA else ()),
-                *((f"state/shared_{self.device_kind.value}@1",) if self.shared_memory else ()),
+                *(("state/shared_cuda@1",) if self.shared_memory and self.device_kind is StateDeviceKind.CUDA else ()),
             ))),
         )

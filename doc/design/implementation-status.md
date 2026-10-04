@@ -3,6 +3,28 @@
 日期：2026-09-12。本文是当前实现、验收和剩余工作的统一入口。设计推演与历史实验
 不等于当前功能承诺；它们的阶段性描述以本页状态为准。
 
+## E1 工作区进展（2026-10-04，未验收完成）
+
+已按路线裁决移除远程私有写授权和 CPU 共享页池/句柄传递，保留同 GPU 精确
+版本的 READ 授予、原 pin 的远程完成与本地 COW/原子发布。CPU SharedTensor
+输入输出及 CPU 本地 arena 保留。共享 provider 暂沿用原开关，但只生成 CUDA
+共享能力；低层多余参数的签名收敛等待补充裁决。
+
+视频会话尚未接入。实际代码仍限制普通 Parameter/Activation 为单状态，本地
+TensorBatch 从 arena 取根；Activation 当前走 StateTensorUpdate 导入。跨进程
+四字段直接绑定到普通操作再写 ADD 状态，需要先确定最小绑定设计与文件边界，
+不能通过 snapshot clone 或复制到第二套页来声称已经完成零拷贝消费。
+
+本轮 Python/pytest 环境为 `/workspace/pllm/.venv/bin/python`。完整套件首轮
+505 passed、108 skipped、5 failed（包含通过的 release wheel 测试）；5 个失败
+在未修改 HEAD 的隔离副本同样复现：一个 vLLM 设备识别失败、四个重结合测试
+捕获了环境警告。Rust 实际 22 项全过；typing/layers/authority 首轮通过。
+两个 GPU 冒烟已执行，但因 CUDA 驱动不可用而失败，另有 vllm._C 缺失提示；
+没有真实 CUDA IPC 或 fallback/issued_streams 验收证据。不能将上述跳过或历史
+验收视为 E1 通过。后续实现、最终签名和 GPU 验收仍待完成。
+
+## 既有收口基线
+
 **整体计划尚未完成。本轮收口范围是架构缩减后的现有功能闭环，不是扩建优化目录。**
 最近一次完整收口已完成源事实／调度分离、运行时取值路径缩减，以及 decoder/recirculation 的数据
 端口迁移。构建、CPU 回归、Qwen 数值检查和 EngineCore 跨进程检查均已通过，
