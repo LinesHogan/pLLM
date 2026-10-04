@@ -56,6 +56,7 @@
 - [精简路线](design/post-implementation-simplification.md)
 - [调度精简施工记录](design/scheduling-simplification-work-order.md)
 - [E1 上下文包：跨进程页授权](design/e1-cross-process-page-authorization.md) —— 复杂工程任务交接
+- [E3 上下文包：模型与算法迁移（管线驱动）](design/e3-model-migration.md) —— 第 3 步程序与阶段任务卡
 - [审计记录](audits/)（调度复杂度、未用代码、实现结果数据）
 
 历史归档（只读背景，不代表当前接口）：[history/](history/) —— 整合计划、
