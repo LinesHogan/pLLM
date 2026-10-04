@@ -19,7 +19,8 @@ from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.replay import TOKENWISE_REPLAY_IMPLEMENTATION, TokenwiseReplayPrimitive, TokenwiseReplayTask
 from pllm.execution.decoder_region import DecoderRegion
 from pllm.execution.region_streams import RegionStreamBindings
-from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding, RegionPageOwner
+from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, PinnedResourceBinding, ReadonlyResourceBinding, RegionPageOwner
+from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.execution.region_values import Data
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.paged_access import PagedAccessPlan, PagedResourceView, validate_paged_views
@@ -205,11 +206,13 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
     def __init__(self, model: Qwen2ForCausalLM, task: SemanticTask,
                  execution: StateExecution[TensorStepInput, DataT, ResultT], anchor: AnchorId, *,
                  source_imports: tuple[RegionTensorImport, ...] = (),
-                 function_bodies: tuple[RegionFunctionBody, ...] = ()) -> None:
+                 function_bodies: tuple[RegionFunctionBody, ...] = (),
+                 activation: VllmActivationPatch | None = None) -> None:
         if not isinstance(task.replay, TokenwiseLayerReplay) or task.replay.layer_count != len(model.model.layers):
             raise ValueError("tokenwise replay differs from the specialized model")
         validate_attention_resources(tuple(layer.self_attn.attn for layer in model.model.layers), hidden_size=model.config.hidden_size)
         self.model, self.effect = model.model, task.replay
+        self.activation = activation
         tensor = TensorType((1, model.config.hidden_size), str(self.model.norm.weight.dtype), str(self.model.norm.weight.device))
         self._normalize_kernel = VllmRmsNormKernel.inspect(self.model.norm, tensor, len(self.model.layers)) if source_imports else None
         self._layer_bodies: VllmDecoderBodies | None = None
@@ -310,6 +313,16 @@ class VllmTokenwiseReplay(TokenwiseReplayPrimitive, Generic[DataT, ResultT]):
         if self._invocation is None or owner is not self._invocation.context:
             raise RuntimeError("tokenwise context requires its original model invocation")
         return HostResourceBinding(_TokenContextView(resource, self, id(self._tokens), self._rows), owner)
+
+    def bind_activation(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
+        if self._invocation is None or owner is not self._invocation.context or self.activation is None:
+            raise RuntimeError("activation fields require their original model invocation")
+        return self.activation.bind_pinned(resource, layer, owner)
+
+    def activation_selected(self, row: int, layer: int) -> bool:
+        if self._invocation is None or self.activation is None or self._rows[row] not in self._tokens:
+            raise RuntimeError("activation selection requires its prepared token")
+        return self.activation.selected(row, layer)
 
     def validate_context(self, resource: BorrowedResource, namespace: int, rows: tuple[PackedPhaseRow, ...]) -> None:
         if (self._invocation is None or namespace != id(self._tokens) or rows is not self._rows

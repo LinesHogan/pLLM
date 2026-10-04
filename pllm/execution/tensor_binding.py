@@ -311,7 +311,8 @@ class TensorBinding(Builder[TensorFrame]):
         self.overlay_import = False
 
     def recurrence(self, effect: Recurrence) -> None:
-        if self.host or self.attachment is not None or self.graph.tasks or self.graph.states:
+        activation = self.attachment is not None and self.attachment.kind is AttachmentKind.ACTIVATION_PATCH
+        if self.host or (not activation and (self.attachment is not None or self.graph.tasks or self.graph.states)):
             raise ValueError("tokenwise recurrence requires a standalone model effect")
         forward = self.compute("forward", inputs={"rows": self.rows()}, outputs=("normal_hidden",),
             when=When.MODEL_UPDATE, replay=None if self.dimensions is None else effect.effect(self.dimensions.layer_count),
@@ -411,7 +412,9 @@ class TensorBinding(Builder[TensorFrame]):
                          decode: DecodeWindow = DecodeWindow.NONE,
                          decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
                          on_missing: MissingPolicy = MissingPolicy.STOP) -> None:
-        if self.graph.tasks or self.graph.states or self.host:
+        replay = (self.attachment is not None and self.attachment.kind is AttachmentKind.MODEL_REPLAY
+            and not self.attachment.activation_bindings and len(self.graph.tasks) == 1 and not self.graph.states)
+        if self.host or (not replay and (self.graph.tasks or self.graph.states)):
             raise ValueError("activation replacement requires a sole model state and effect")
         width = 1 if operator is ActivationPatchOperator.ADD else 3
         if (not layers or tuple(sorted(set(layers))) != layers or layers[0] < 0
@@ -897,13 +900,14 @@ class TensorBinding(Builder[TensorFrame]):
         dimensions = self.dimensions
         if dimensions is None:
             raise ValueError("tensor execution requires specialized model dimensions")
-        if self.attachment is not None and self.attachment.kind is AttachmentKind.MODEL_REPLAY:
+        if (self.attachment is not None and self.attachment.kind is AttachmentKind.MODEL_REPLAY
+            and not self.attachment.activation_bindings):
             def prepare_replay(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
                 if value.auxiliary is not None or value.operands or value.hidden is not None or value.rows.plan_epoch != batch.epoch:
                     raise ValueError("tokenwise replay requires only original model rows at its signed epoch")
                 return TensorFrame(value, value.rows.rows)
             return prepare_replay
-        if self.attachment is not None and (self.attachment.kind is AttachmentKind.ACTIVATION_PATCH or self.overlay_import):
+        if self.attachment is not None and (self.attachment.activation_bindings or self.overlay_import):
             def prepare_replacement(value: TensorStepInput, batch: TensorBatch) -> TensorFrame:
                 if value.rows.plan_epoch != batch.epoch or value.hidden is not None or value.operands:
                     raise ValueError("import input differs from its signed sources or epoch")

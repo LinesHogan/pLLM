@@ -347,9 +347,9 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
             || replay.rows != "prefill" || replay.kv != "overwrite_current_slot"
             || replay.logits != "normal" || replay.rng != "preserve"
             || replay.gradient != "detach" || replay.cancellation != "between_tokens"
-            || !task.effects.is_empty()
+            || task.effects.iter().any(|effect| effect.kind != StateEffectKind::Read)
         {
-            return Err("unsupported tokenwise layer replay effect".to_owned());
+            return Err("unsupported tokenwise layer replay effect (state effects must be READ)".to_owned());
         }
     }
     require_text(&task.symbol, "tasks.symbol")?;

@@ -13,6 +13,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 import subprocess
 from types import TracebackType
+from typing import TYPE_CHECKING
 
 import torch
 import pllm
@@ -20,11 +21,18 @@ from pllm.config import ModelConfig
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
+from pllm.contracts.packed_rows import PackedSamplerRowBatch
+from pllm.authoring import TensorStepInput
+from pllm.execution.state_execution import StateExecution
+from pllm.execution.tensor_binding import TensorFrame, TensorOutput
 from pllm.execution.codec import decode_boundary, encode_boundary
-from pllm.execution.ptts.page_bundle import PageBundleArena, PageFieldTransfer, PageRelease
+from pllm.execution.ptts.page_bundle import BorrowedPage, PageBundleArena, PageFieldTransfer, PageRelease
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.scheduler import validate_plan_bundle
 from pllm.workloads.video import VideoWorkload, frame_features
+
+if TYPE_CHECKING:
+    from pllm.backends.vllm.runtime import ReadonlyStepInput
 
 Channels = tuple[tuple[Connection, ...], ...]
 
@@ -33,6 +41,12 @@ Channels = tuple[tuple[Connection, ...], ...]
 class Chunk:
     slot: int
     ref: StateRef
+    step_id: int
+
+
+@dataclass(frozen=True)
+class VideoRun:
+    steps: int
 
 
 @dataclass(frozen=True)
@@ -50,6 +64,42 @@ class Pending:
     fields: tuple[PageFieldTransfer, ...]
 
 
+class _StepReceiver:
+    """A finite explicit next-step protocol; partial receives remain owned here."""
+
+    def __init__(self, control: Connection, channels: Channels,
+                 execution: StateExecution[TensorStepInput, TensorFrame, TensorOutput]) -> None:
+        self.control, self.channels, self.execution = control, channels, execution
+        self.pending: Chunk | None = None
+        self.previous: StateRef | None = None
+        self.partial: list[BorrowedPage] = []
+
+    def report(self, text: str = "") -> None:
+        if self.previous is not None:
+            diagnostics = self.execution.diagnostics()
+            self.control.send_bytes(encode_boundary(VideoResult(self.previous, text,
+                diagnostics.update_count, diagnostics.fallback_count)).encode())
+            self.previous = None
+
+    def __call__(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> "ReadonlyStepInput":
+        from pllm.backends.vllm.runtime import ReadonlyStepInput
+        # The preceding step has settled before this next prepare boundary.
+        self.report()
+        chunk = self.pending
+        self.pending = None
+        if chunk is None:
+            chunk = decode_boundary(self.control.recv_bytes().decode(), Chunk)
+        if not 0 <= chunk.slot < len(self.channels) or self.partial:
+            raise ValueError("video step requires its original complete grant slot")
+        plan = self.execution.arena.plan
+        for channel in self.channels[chunk.slot]:
+            self.partial.append(PageBundleArena.receive_field(plan, channel, stream=stream))
+        root = BorrowedStateRoot(plan, "features", chunk.ref, tuple(self.partial))
+        self.partial.clear()
+        self.previous = chunk.ref
+        return ReadonlyStepInput(plan.schedule_physical.plan_epoch, chunk.step_id, (root,))
+
+
 def consume(control: Connection, channels: Channels, workload: VideoWorkload, config: ModelConfig) -> None:
     from vllm import SamplingParams
     try:
@@ -57,18 +107,18 @@ def consume(control: Connection, channels: Channels, workload: VideoWorkload, co
             execution = llm.deployment.execution
             plan = execution.arena.plan
             control.send_bytes(encode_boundary(plan).encode())
+            run = decode_boundary(control.recv_bytes().decode(), VideoRun)
+            if run.steps < 1:
+                raise ValueError("video generation requires a positive finite step count")
+            receiver = _StepReceiver(control, channels, execution)
+            llm.runner.require_session().bind_readonly_input(receiver)
             while (payload := control.recv_bytes()) != b"stop":
-                chunk = decode_boundary(payload.decode(), Chunk)
-                stream = torch.cuda.current_stream(execution.device)
-                with torch.cuda.stream(stream):
-                    pages = tuple(PageBundleArena.receive_field(plan, channel, stream=stream) for channel in channels[chunk.slot])
-                    root = BorrowedStateRoot(plan, "features", chunk.ref, pages)
-                    execution.stage_readonly((root,))
-                    outputs = llm.generate(["Describe the scene in this video frame:"],
-                        SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True))
-                diagnostics = execution.diagnostics()
-                control.send_bytes(encode_boundary(VideoResult(chunk.ref, outputs[0].outputs[0].text,
-                    diagnostics.update_count, diagnostics.fallback_count)).encode())
+                receiver.pending = decode_boundary(payload.decode(), Chunk)
+                outputs = llm.generate(["Describe the scene in this video frame:"],
+                    SamplingParams(max_tokens=run.steps, temperature=0.0, ignore_eos=True))
+                if len(outputs[0].outputs[0].token_ids) != run.steps:
+                    raise RuntimeError("generation did not consume all explicitly scheduled video steps")
+                receiver.report(outputs[0].outputs[0].text)
     finally:
         control.close()
         for row in channels:
@@ -79,9 +129,9 @@ def consume(control: Connection, channels: Channels, workload: VideoWorkload, co
 class VideoSession:
     """Example-local supervision. Worker replacement is for process-level test harnesses."""
 
-    def __init__(self, workload: VideoWorkload, config: ModelConfig, *, timeout: float = 120,
+    def __init__(self, workload: VideoWorkload, config: ModelConfig, *, timeout: float = 120, steps: int = 1,
                  worker: Callable[[Connection, Channels, VideoWorkload, ModelConfig], None] = consume) -> None:
-        if config.multiprocessing or timeout <= 0:
+        if config.multiprocessing or timeout <= 0 or steps < 1:
             raise ValueError("the video example owns spawn; its vLLM child must be in-process")
         context = mp.get_context("spawn")
         self.control, child_control = context.Pipe()
@@ -90,6 +140,7 @@ class VideoSession:
         child_channels = tuple(tuple(pair[1] for pair in row) for row in pipes)
         self.process = context.Process(target=worker, args=(child_control, child_channels, workload, config))
         self.timeout, self.workload = timeout, workload
+        self.steps = steps
         self.pending: deque[Pending] = deque()
         self.failed = False
         self.stream: torch.cuda.Stream | None = None
@@ -114,6 +165,7 @@ class VideoSession:
             admission = self.arena.publish(self.arena.prepare_admission(("features",), self.stream))
             self.arena.settle(admission)
             self.current, = admission.after_refs
+            self.control.send_bytes(encode_boundary(VideoRun(steps)).encode())
         except BaseException:
             self.failed = True
             self.close()
@@ -147,7 +199,7 @@ class VideoSession:
             self.current, = publication.after_refs
             pin = self.arena.pin_exact((self.current,), self.stream)
             slot = self._sequence % len(self.channels)
-            self.control.send_bytes(encode_boundary(Chunk(slot, self.current)).encode())
+            self.control.send_bytes(encode_boundary(Chunk(slot, self.current, self._sequence)).encode())
             assert self.process.pid is not None
             fields = tuple(self.arena.send_field(pin, self.current, LayoutFieldId(index), channel, self.process.pid)
                 for index, channel in enumerate(self.channels[slot]))
@@ -176,6 +228,9 @@ class VideoSession:
     def close(self) -> None:
         try:
             if not self.failed:
+                if self._sequence % self.steps:
+                    self.failed = True
+                    raise RuntimeError("video ended before all explicitly scheduled decode inputs were supplied")
                 while self.pending:
                     self.drain()
                 self.control.send_bytes(b"stop")
@@ -230,7 +285,7 @@ def main() -> None:
     args = parser.parse_args()
     workload = VideoWorkload()
     with VideoSession(workload, ModelConfig(args.model, max_model_len=64, max_num_seqs=1,
-        max_num_batched_tokens=64, gpu_memory_utilization=0.25)) as session:
+        max_num_batched_tokens=64, gpu_memory_utilization=0.25), steps=args.chunks) as session:
         for frame in video_frames(args.video, workload.grid_size, args.chunks):
             result = session.submit(frame)
             if result is not None:

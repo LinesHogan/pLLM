@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from math import prod
+from itertools import product
 from typing import Protocol
 
 import torch
@@ -17,10 +18,10 @@ from pllm.contracts.region_program import (
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.contracts.region_imports import BorrowedTensorImport, NativeKernelImport
 from pllm.contracts.tensor_layout import LayoutFieldId
-from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageRelease, PageWrite
 from pllm.execution.region_values import Bank, Data, check_data
 from pllm.execution.paged_access import PagedResourceView, validate_paged_views
-from pllm.execution.tensor_borrow import ReadonlyTensorView, validate_readonly_views
+from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView, validate_readonly_views
 from pllm.execution.host_borrow import HostResourceView, validate_host_views
 
 
@@ -31,6 +32,8 @@ class RegionPageOwner(Protocol):
     def arena(self) -> PageBundleArena: ...
     @property
     def pin(self) -> PagePin: ...
+    @property
+    def page_pins(self) -> Mapping[PagePin, PageRelease | None]: ...
     def current_owned_ref(self, original: StateRef) -> StateRef: ...
     def check_page_execution(self) -> None: ...
     def prepare_owned_write(self, sources: tuple[StateRef, ...],
@@ -61,6 +64,79 @@ class PagedResourceBinding:
 class ReadonlyResourceBinding:
     view: ReadonlyTensorView
     owner: RegionPageOwner
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedResourceCell:
+    indices: tuple[int, ...]
+    pin: PagePin
+    ref: StateRef
+    fields: tuple[LayoutFieldId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedTensorView(ReadonlyTensorView):
+    owner: RegionPageOwner
+    proofs: tuple[PinnedResourceCell, ...]
+
+    def check(self, mode: AccessMode, ranges: tuple[tuple[int, int], ...]) -> None:
+        self.owner.check_page_execution()
+        ReadonlyTensorView.check(self, mode, ranges)
+        proofs = {cell.indices: cell for cell in self.proofs}
+        if len(proofs) != len(self.proofs) or set(proofs) != {cell.indices for cell in self.cells if cell.identities}:
+            raise ValueError("pinned view requires exact nonempty cell proofs")
+        def metadata(tensor: torch.Tensor) -> tuple[int, int, int, int, torch.Size, tuple[int, ...], torch.dtype, torch.device, int]:
+            storage = tensor.untyped_storage()
+            return (tensor.data_ptr(), tensor.numel() * tensor.element_size(), storage.data_ptr(), storage.nbytes(),
+                tensor.shape, tensor.stride(), tensor.dtype, tensor.device, int(tensor.storage_offset()))
+        for cell in self.cells:
+            if not cell.identities or not all(lo <= coordinate < hi for coordinate, (lo, hi) in zip(cell.indices, ranges, strict=True)):
+                continue
+            proof = proofs[cell.indices]
+            # Published/admission versions use original invocation-held exact pins;
+            # never replace the begin pin used by E1's borrowed-root binding.
+            if (proof.pin not in self.owner.page_pins or self.owner.page_pins[proof.pin] is not None
+                or proof.pin.stream != self.owner.pin.stream or proof.ref not in proof.pin.refs
+                or len(proof.fields) != len(cell.identities) or len(set(proof.fields)) != len(proof.fields)):
+                raise ValueError("pinned view is outside its owner's live exact pin fields")
+            for identity, field in zip(cell.identities, proof.fields, strict=True):
+                original = self.owner.arena.borrow_field(proof.pin, proof.ref, field)
+                if metadata(identity.tensor) != metadata(original):
+                    raise ValueError("pinned view storage differs from its exact arena field")
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedResourceBinding:
+    """A read-only projection of exact pins held by the original invocation."""
+
+    view: _PinnedTensorView
+    owner: RegionPageOwner
+
+    @classmethod
+    def bind(cls, resource: BorrowedResource, owner: RegionPageOwner,
+             cells: tuple[PinnedResourceCell, ...]) -> "PinnedResourceBinding":
+        selected = {cell.indices: cell for cell in cells}
+        views: list[ReadonlyTensorCell] = []
+        for indices in product(*(range(size) for size in resource.domain)):
+            cell = selected.get(indices)
+            tensors = () if cell is None else tuple(owner.arena.borrow_field(cell.pin, cell.ref, field) for field in cell.fields)
+            views.append(ReadonlyTensorCell.bind(indices, tensors))
+        view = _PinnedTensorView(resource, tuple(views), owner, cells)
+        view.check(AccessMode.READ, tuple((0, size) for size in resource.domain))
+        return cls(view, owner)
+
+    def validate(self, program: Program, paged: tuple[PagedResourceView, ...]) -> None:
+        if self.view.owner is not self.owner:
+            raise ValueError("pinned view belongs to another invocation")
+        name = self.view.resource.name
+        for function in program.functions:
+            if name in function.resources:
+                accesses = tuple(access for access in function.accesses if access.resource == name)
+                if not accesses or any(access.mode is not AccessMode.READ for access in accesses):
+                    raise ValueError("pinned resources require explicit READ effects only")
+        # The pin proves the arena overlap; the existing writable-alias check
+        # remains mandatory. Ordinary readonly validation below is unchanged.
+        validate_readonly_views((self.view,), paged, ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +194,7 @@ class RegionResources:
 
     def __init__(self, program: Program, owner: RegionPageOwner,
                  cells: tuple[ResourcePageCell, ...], externals: tuple[ExternalFunction, ...] = (), *,
-                 sizes: Mapping[str, int] = {}, borrows: tuple[PagedResourceBinding | ReadonlyResourceBinding | HostResourceBinding, ...] = (),
+                 sizes: Mapping[str, int] = {}, borrows: tuple[PagedResourceBinding | ReadonlyResourceBinding | PinnedResourceBinding | HostResourceBinding, ...] = (),
                  tensor_borrows: tuple[BorrowedTensorImport, ...] = ()) -> None:
         sizes = bind_sizes(program, sizes)
         self._sizes = sizes
@@ -167,6 +243,9 @@ class RegionResources:
             validate_paged_views(paged, owner.arena.allocation_ranges)
             validate_readonly_views(readonly, paged, owner.arena.allocation_ranges)
             validate_host_views(host)
+            for binding in borrows:
+                if isinstance(binding, PinnedResourceBinding):
+                    binding.validate(program, paged)
         self._borrows = views
         external_names = {r.name for r in program.resources if isinstance(r, (ExternalResource, BorrowedResource))}
         expected = {f.name: f for f in program.functions if external_names.intersection(f.resources)}

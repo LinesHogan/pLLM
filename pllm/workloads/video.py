@@ -87,13 +87,14 @@ def _write_inject(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
 
 @dataclass(frozen=True)
 class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
-    """One borrowed feature root and one entirely local prefill injection root."""
+    """One borrowed feature root and one entirely local per-step injection root."""
 
     name: ClassVar[str] = "video.session"
     grid_size: int = 8
     layer: int = 0
     gain: float = 0.1
     page_capacity: int = 3
+    recurrence: pllm.Recurrence | None = None
 
     def __post_init__(self) -> None:
         if self.grid_size < 1 or self.layer < 0 or self.page_capacity < 2 or not isfinite(self.gain) or self.gain <= 0:
@@ -102,7 +103,8 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
     @property
     def activation(self) -> pllm.Activation:
         return pllm.Activation("inject", (self.layer,), first_tokens=1, last_tokens=1,
-            operator=pllm.ActivationPatchOperator.ADD)
+            operator=pllm.ActivationPatchOperator.ADD, decode=pllm.DecodeWindow.ALL,
+            decode_refresh=pllm.DecodeRefresh.STEP, on_missing=pllm.MissingPolicy.HOLD)
 
     def backend_requirements(self) -> BackendRequirements:
         return BackendRequirements(activation_layers=self.activation.layers)
@@ -134,7 +136,10 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
             function=_write_inject, implementations=(native("video.inject:write@1", "transition/full_root@1"),))
         publication = b.publish(update, inject, when=When.BEFORE_MODEL)
         b.overlay(inject, update, publication, activations=(ActivationPatchBinding(self.layer, (_DELTA,),
-            activation.first_tokens, activation.last_tokens, activation.operator),))
+            activation.first_tokens, activation.last_tokens, activation.operator,
+            activation.decode, activation.decode_refresh, activation.on_missing),))
+        if self.recurrence is not None:
+            b.recurrence(self.recurrence)
         b.graph = replace(b.graph, workload_id=WorkloadId(self.name), execution_parameters_digest=boundary_digest(b.graph.execution_parameters_digest,
             self, activation, ("features",), "video.inject:write@1"))
         return encoder, b

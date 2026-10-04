@@ -26,6 +26,7 @@ from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.trace import ExecutionTrace, TraceSelection, TraceSnapshot, TRACE_SCHEMA_VERSION
 from pllm.execution.tokenwise_tuning import TokenwiseTuning
 from pllm.execution.tokenwise_region import compile_tokenwise_region
+from pllm.execution.decoder_region import decoder_activations
 from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY, RegionScheduleProposal
 from pllm.contracts.region_selection import RegionSelection
@@ -103,7 +104,7 @@ _BACKEND_ABI_FIELDS = (
     "rows=one_logit_per_request",
     "attachment=shared_plan_v7",
     "attachments=sampler_training|parameter_overlay|activation_patch",
-    "activation=phase_windows/exact_step_pins@1",
+    "activation=phase_windows/exact_step_pins/source_readonly@2",
     "model=causal_indexed_layer@5",
 )
 _REQUEST_CAPABILITIES = (
@@ -224,15 +225,15 @@ class VllmSession(Generic[DataT, ResultT]):
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after == "request.prepare")
         self._overlay = VllmParameterOverlay(model, overlay_bindings,
             capture=not self._overlay_import) if overlay_bindings else None
+        tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
         self._activation = VllmActivationPatch(model, attachment.inputs.request.activation_bindings,
-            attachment.inputs.request.state_resource) if (
+            attachment.inputs.request.state_resource, install=not any(isinstance(task.replay, TokenwiseLayerReplay) for task in tasks)) if (
             attachment.inputs.request.activation_bindings) else None
         self._decode_injection = any(binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings)
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._readonly_receiver: ReadonlyStepReceiver | None = None
         self._received_readonly: ReadonlyStepInput | None = None
         self._input_failed = False
-        tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
         self._replay: VllmLayerReplay | VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
             task, = tasks
@@ -243,7 +244,7 @@ class VllmSession(Generic[DataT, ResultT]):
             elif isinstance(task.replay, TokenwiseLayerReplay):
                 self._replay = VllmTokenwiseReplay(model, task, deployment.execution,
                     attachment.inputs.request.task_bindings[0].anchor_id, source_imports=probe.region_imports,
-                    function_bodies=probe.region_bodies)
+                    function_bodies=probe.region_bodies, activation=self._activation)
             else:
                 raise ValueError("backend replay does not match its signed primitives")
         self._sampler = sampler
@@ -416,7 +417,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._step = step
         if self._capture is not None:
             self._capture.begin(rows.row_batch)
-        if isinstance(self._replay, VllmTokenwiseReplay):
+        if isinstance(self._replay, VllmTokenwiseReplay) and self._activation is None:
             execution = self._deployment.execution
             invocation = execution.start_step(TensorStepInput(rows.row_batch, rows),
                 torch.cuda.current_stream(execution.device))
@@ -452,7 +453,10 @@ class VllmSession(Generic[DataT, ResultT]):
             adapter.prepare(rows.row_batch, invocation.context, execution.directory)
         if self._activation is not None:
             self._activation.prepare(rows.row_batch, invocation.context, execution.directory)
-        if isinstance(self._replay, VllmLayerReplay):
+        if isinstance(self._replay, VllmTokenwiseReplay):
+            self._replay.prepare(rows.row_batch, invocation)
+            invocation.context.replay = self._replay
+        elif isinstance(self._replay, VllmLayerReplay):
             self._replay.prepare(rows.row_batch, invocation.context)
             invocation.context.replay = self._replay
 
@@ -895,7 +899,10 @@ class VllmLlm(Generic[DataT, ResultT]):
         proposals = compile_tokenwise_region(tensor, probe.max_packed_rows, probe.causal_domain, task.replay,
             self.attachment.inputs.plan.timeline.region_policy,
             stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
-            source_imports=probe.region_imports, function_bodies=probe.region_bodies).within_payload_budget(budget).candidate_proposals
+            source_imports=probe.region_imports, function_bodies=probe.region_bodies,
+            activations=decoder_activations(self.attachment.inputs.request.activation_bindings,
+                self.attachment.inputs.plan.tensor_layout_request, self.attachment.inputs.request.state_resource,
+                tensor.device)).within_payload_budget(budget).candidate_proposals
         count = decode_boundary(self.command(BackendCommand.TUNE_BEGIN, encode_boundary(proposals), timeout=600.0), int)
         if not count:
             return
@@ -1416,7 +1423,7 @@ def probe_backend(
         probe = replace(probe, region_imports=qwen_region_kernels(model.model.norm,
             TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), layer_count))
         if (probe.causal_domain is not None and not requirements.hidden_inputs
-            and not requirements.parameter_targets and not requirements.activation_layers):
+            and not requirements.parameter_targets):
             bodies = VllmDecoderBodies.inspect(tuple(model.model.layers),
                 TensorType((1, probe.hidden_size), str(runner.dtype), str(runner.device)), probe.causal_domain, probe.max_packed_rows)
             if bodies is not None:

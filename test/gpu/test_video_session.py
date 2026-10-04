@@ -77,24 +77,54 @@ def observed_worker(probe, start, close, control, channels, workload, config):
     original_make, original_read, original_close = pllm.make_llm, BorrowedStateRoot.tensors, BorrowedPage.close
     seen = set()
     fenced = False
+    steps, identities, phases = [], set(), []
     def make(*args, **kwargs):
         llm = original_make(*args, **kwargs)
         assert llm.deployment.execution.arena.owned_resources == ("inject",)
         assert len(llm.deployment.execution.arena.allocation_ranges) == 1
         layer = llm.runner.model.model.layers[workload.layer]
+        session = llm.runner.require_session()
         before = []
-        layer.mlp.register_forward_hook(lambda module, inputs, output: before.append(output.detach().clone()))
+        history, current_views = {}, {}
+        def views(module, rows):
+            from vllm.forward_context import get_forward_context
+            from pllm.backends.vllm.region_attention import attention_metadata
+            _, cache, slots = attention_metadata(get_forward_context(), module.self_attn.attn)
+            return tuple((row.token_offset, cache[int(slots[row.packed_row_index]) // cache.shape[2], :,
+                int(slots[row.packed_row_index]) % cache.shape[2], :]) for row in rows)
+        def capture(module, inputs, output):
+            rows = session._step.rows.row_batch.rows
+            before.append((output.detach().clone(), tuple(value.clone() for _, value in views(layer, rows))))
+        layer.mlp.register_forward_hook(capture)
         def check(module, inputs, output):
             execution = llm.deployment.execution
-            delta, = execution.snapshot(execution.directory.latest_refs(())[0], torch.cuda.current_stream())
-            expected = before.pop()
+            step = session._step
+            ref, = step.invocation.context.publication.after_refs
+            delta, = execution.snapshot(ref, torch.cuda.current_stream())
+            expected, prior_kv = before.pop()
             original = expected.clone()
             selected = torch.tensor(sorted({0, len(expected) - 1}), device=expected.device)
             expected.index_add_(0, selected, delta.to(expected).expand(len(selected), -1))
             torch.testing.assert_close(output[0], expected, rtol=0, atol=0)
             assert torch.count_nonzero(expected - original) > 0
+            rows = step.rows.row_batch.rows
+            for (_, actual), prior in zip(views(layer, rows), prior_kv, strict=True):
+                torch.testing.assert_close(actual, prior, rtol=0, atol=0)  # Layer-output injection cannot rewrite this layer's KV.
+            for ordinal, decoder in enumerate(llm.runner.model.model.layers):
+                current_views.update({(ordinal, position): value for position, value in views(decoder, rows)})
+            identities.update(row.identity for row in rows)
+            steps.append((step.rows.step_id, int(ref.version_id)))
+            phases.append(tuple(row.phase.value for row in rows))
             probe.send_bytes(b"patched")
         layer.register_forward_hook(check)
+        complete = session.complete_forward
+        def completed():
+            for view, saved in history.values():
+                torch.testing.assert_close(view, saved, rtol=0, atol=0)  # Previously cached positions stay unchanged.
+            history.update({key: (view, view.clone()) for key, view in current_views.items()})
+            current_views.clear()
+            complete()
+        session.complete_forward = completed
         return llm
     def read(root, pin):
         values = original_read(root, pin)
@@ -127,6 +157,10 @@ def observed_worker(probe, start, close, control, channels, workload, config):
     try:
         with patch.object(pllm, "make_llm", make), patch.object(BorrowedStateRoot, "tensors", read), patch.object(BorrowedPage, "close", finish):
             consume(control, channels, workload, config)
+        assert len(identities) == 1 and steps == [(i, i + 1) for i in range(4)]
+        assert all(phase == "prefill" for phase in phases[0])
+        assert phases[1:] == [("decode",)] * 3
+        probe.send_bytes(b"one-request-four-steps-kv-ok")
     finally:
         probe.close()
 
@@ -151,6 +185,99 @@ def fault_worker(mode, control, channels, workload, config):
         consume(control, channels, workload, config)
 
 
+def preempted_worker(probe, control, channels, workload, config):
+    from pllm.backends.vllm.runtime import VllmSession
+    original = VllmSession.before_execute
+    def preempt(session, output):
+        if session.next_step_id == 1:
+            assert session.diagnostics().update_count == 1
+            output = replace(output, preempted_req_ids=set(session._identities))
+        try:
+            return original(session, output)
+        except RuntimeError as error:
+            probe.send_bytes(str(error).encode())
+            raise
+    try:
+        with patch.object(VllmSession, "before_execute", preempt):
+            consume(control, channels, workload, config)
+    finally:
+        probe.close()
+
+
+def composed_worker(probe, control, channels, workload, config):
+    from pllm.backends.vllm.replay import VllmTokenwiseReplay
+    from pllm.execution.exported_cell import ExportedCell
+    from pllm.execution.replay import TokenwiseReplayTask, TOKENWISE_REPLAY_IMPLEMENTATION
+    from pllm.execution.region_execution import RegionInstructionExecution
+    original_make, original_invoke = pllm.make_llm, ExportedCell.invoke
+    original_normalize, original_finish = VllmTokenwiseReplay.normalize, VllmTokenwiseReplay.finish
+    original_issue = RegionInstructionExecution._invoke
+    holder, normals, history = {}, {}, {}
+    calls, completed, streams = [], [], set()
+    def make(*args, **kwargs):
+        llm = original_make(*args, **kwargs)
+        session = llm.runner.require_session()
+        primitive = session._replay
+        assert primitive.activation is session._activation and not primitive.activation.installed
+        assert len(llm.attachment.inputs.probe.region_bodies) == 2 and primitive._layer_bodies is not None
+        assert all(handle.layer.forward == handle.original for handle in primitive.activation.layers)
+        region = TokenwiseReplayTask.from_implementation(llm.deployment.execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION)).region
+        assert region.activation_resources and any(resource.name.startswith("activation.") for resource in region.program.resources)
+        holder.update(llm=llm, session=session, primitive=primitive, region=region)
+        return llm
+    def issue(self, *args, **kwargs):
+        if holder and self is holder["region"].execution:
+            streams.add(torch.cuda.current_stream().cuda_stream)
+        return original_issue(self, *args, **kwargs)
+    def invoke(cell, args):
+        result = original_invoke(cell, args)
+        if holder and cell.inputs == ("hidden", "delta") and cell.outputs == ("patched",):
+            hidden, delta = args
+            step = holder["session"]._step
+            context = step.invocation.context
+            ref, = context.publication.after_refs
+            original = context.arena.borrow_field(context.borrow_published((ref,)), ref, LayoutFieldId(0))
+            assert delta.data_ptr() == original.data_ptr() and delta.untyped_storage().nbytes() == original.untyped_storage().nbytes()
+            torch.testing.assert_close(result[0], hidden + delta.to(hidden.dtype), rtol=0, atol=0)
+            calls.append((step.rows.step_id, int(ref.version_id)))
+        return result
+    def normalize(self, row, hidden, residual):
+        result = original_normalize(self, row, hidden, residual)
+        if holder and self is holder["primitive"]:
+            normals[row] = result.clone()
+        return result
+    def finish(self, outputs):
+        if holder and self is holder["primitive"]:
+            for actual, row in zip(outputs, self.rows, strict=True):
+                torch.testing.assert_close(actual, normals.pop(row), rtol=0, atol=0)  # Sampling receives normal output, not replay output.
+            for view, saved in history.values():
+                torch.testing.assert_close(view, saved, rtol=0, atol=0)
+            for row in self.rows:
+                for ordinal, layer in enumerate(self.model.layers):
+                    block, offset = self._access.slot(layer.self_attn.attn.layer_name, row)
+                    view = layer.self_attn.attn.kv_cache[block, :, offset, :]
+                    history[ordinal, row.token_offset] = view, view.clone()
+            step = holder["session"]._step
+            selected = sum(self.activation.selected(row.packed_row_index, workload.layer)
+                * (2 if row.phase.value == "prefill" and workload.layer > self.effect.destination_layer else 1) for row in self.rows)
+            seen = [ref for step_id, ref in calls if step_id == step.rows.step_id]
+            assert len(seen) == selected and set(seen) == {step.rows.step_id + 1}
+            completed.append(tuple(row.identity for row in self.rows))
+        return original_finish(self, outputs)
+    try:
+        with patch.object(pllm, "make_llm", make), patch.object(ExportedCell, "invoke", invoke), \
+            patch.object(VllmTokenwiseReplay, "normalize", normalize), patch.object(VllmTokenwiseReplay, "finish", finish), \
+            patch.object(RegionInstructionExecution, "_invoke", issue):
+            consume(control, channels, workload, config)
+        assert len(completed) == 3 and len({identity for rows in completed for identity in rows}) == 1
+        assert len([step for step, _ in calls if step == 0]) > 2  # Real prefill suffix replay also applied the same injection.
+        region = holder["region"]
+        assert len(streams) == (region.stream_plan.lanes if region.stream_plan is not None else 1)
+        probe.send_bytes(b"composed-pins-hidden-normal-output-kv-ok")
+    finally:
+        probe.close()
+
+
 def model_config():
     return ModelConfig(os.environ.get("PLLM_VIDEO_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"),
         max_model_len=64, max_num_seqs=1, max_num_batched_tokens=64, gpu_memory_utilization=0.25)
@@ -163,7 +290,7 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
     probe, child_probe = context.Pipe()
     start, close = context.Event(), context.Event()
     try:
-        with VideoSession(VideoWorkload(grid_size=2), model_config(),
+        with VideoSession(VideoWorkload(grid_size=2), model_config(), steps=len(source),
             worker=partial(observed_worker, child_probe, start, close)) as session:
             child_probe.close()
             session.submit(source[0])
@@ -191,10 +318,32 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
             start.set()
             results = [session.drain() for _ in range(3)]
             assert results[-1].updates == 4 and all(result.fallback == 0 for result in results)
+            assert all(result.text == "" for result in results[:-1])
+            for _ in range(3):
+                assert probe.poll(120)
+                decode_boundary(probe.recv_bytes().decode(), tuple[PageFieldTransfer, ...])
+                assert probe.poll(120) and probe.recv_bytes() == b"patched"
         assert session.arena.active_lineages == session.arena.pending_pin_releases == 0
+        assert probe.poll(120) and probe.recv_bytes() == b"one-request-four-steps-kv-ok"
     finally:
         start.set()
         close.set()
+        probe.close()
+        child_probe.close()
+    probe, child_probe = context.Pipe()
+    try:
+        config = replace(model_config(), execution=ExecutionOptions(allow_numerical_transforms=False))
+        workload = VideoWorkload(grid_size=2, layer=1,
+            recurrence=pllm.Recurrence(source_layer=-1, destination_layer=0, alpha=0.6, beta=None))
+        with VideoSession(workload, config, steps=3, worker=partial(composed_worker, child_probe)) as combined:
+            child_probe.close()
+            for frame in source[:3]:
+                combined.submit(frame)
+            results = [combined.drain() for _ in range(3)]
+            assert results[-1].updates == 3 and all(result.fallback == 0 for result in results)
+        assert probe.poll(120) and probe.recv_bytes() == b"composed-pins-hidden-normal-output-kv-ok"
+        assert combined.arena.active_lineages == combined.arena.pending_pin_releases == 0
+    finally:
         probe.close()
         child_probe.close()
 
@@ -213,3 +362,23 @@ def test_video_session_failure_retains_owner_without_fallback(mode):
         with pytest.raises(RuntimeError, match="fail-stopped"):
             session.submit(frame)
     assert not session.process.is_alive()
+    if mode == "exit":
+        # Inject evidence into the real GPU scheduler boundary after one real
+        # forward; do not rely on allocator pressure to happen nondeterministically.
+        context = mp.get_context("spawn")
+        probe, child_probe = context.Pipe()
+        try:
+            with VideoSession(VideoWorkload(grid_size=2), model_config(), steps=2,
+                worker=partial(preempted_worker, child_probe)) as preempted:
+                child_probe.close()
+                with pytest.raises((EOFError, OSError, RuntimeError)):
+                    preempted.submit(frame)
+                    preempted.submit(frame)
+                    preempted.drain()
+                assert probe.poll(120)
+                assert b"per-decode activation injection and vLLM preemption cannot be enabled together" in probe.recv_bytes()
+                assert preempted.failed
+            assert not preempted.process.is_alive()
+        finally:
+            probe.close()
+            child_probe.close()

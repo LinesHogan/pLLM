@@ -38,6 +38,7 @@ from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import ReplayStateTask, TokenwiseReplayTask, REPLAY_IMPLEMENTATION
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.contracts.region_program import TensorType
+from pllm.execution.decoder_region import decoder_activations
 
 D = TypeVar("D")
 
@@ -298,7 +299,9 @@ class Builder(Generic[D]):
                 functions.append(TokenwiseReplayTask[D].bind(task, tensor, model_probe.max_packed_rows,
                     model_probe.causal_domain, identity, plan.timeline.region_policy, workspace,
                     stream_lanes=2 if "execution/region_streams@1" in model_probe.capabilities else 1,
-                    source_imports=model_probe.region_imports, function_bodies=model_probe.region_bodies))
+                    source_imports=model_probe.region_imports, function_bodies=model_probe.region_bodies,
+                    activations=() if self.attachment is None else decoder_activations(self.attachment.activation_bindings,
+                        plan.tensor_layout_request, self.attachment.state_resource, tensor.device)))
             elif any(effect.kind is StateEffectKind.PUBLISH for effect in task.effects):
                 functions.append(PublishStateTask[D](identity))
             else:
@@ -361,7 +364,6 @@ class Builder(Generic[D]):
             raise ValueError("model replay already declares state dependencies")
         output, = publication.outputs
         # Preserve both the value dependency and the exact state-version read.
-        # Semantic acceptance of tokenwise READ is enabled with source composition.
         forward = replace(forward, inputs=(*forward.inputs, SemanticInput("activation_publication",
             TaskResultInputSource(publication_symbol, output.name))),
             effects=(SemanticEffect(activation.state_resource, StateEffectKind.READ, publication_symbol),))

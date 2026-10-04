@@ -7,6 +7,7 @@ import pytest
 import torch
 import pllm
 from pllm.execution.trace import TracePhase
+from types import SimpleNamespace
 
 from pllm.authoring import BackendCompileFacts, TensorStepInput
 from pllm.execution.codec import decode_boundary, encode_boundary
@@ -20,8 +21,12 @@ from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_page
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.runtime_facts import RuntimeFacts
-from pllm.execution.backend_attachment import bind_backend_attachment, derive_attachment_resources
-from pllm.execution.declaration import Builder, Field, When, native
+from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment, derive_attachment_resources
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.state_execution import MathBinding
+from pllm.execution.tensor_program import FunctionMath, TaskOutput
+from pllm.execution.declaration import Builder, Dimensions, Field, When, native
+from pllm.execution.tensor_binding import TensorBinding, TensorFrame
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
 from pllm.execution.scheduler import compile_schedule
 from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
@@ -308,9 +313,116 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
     for invalid in (replace(config, source_layer=0), replace(config, destination_layer=3)):
         with pytest.raises(ValueError):
             RecirculationWorkload(invalid).compile_backend(facts)
+    _activation_source_matches_serial_oracle(Decoder, value, inputs, config, probe)
+
+
+def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config, probe):
+    from pllm.backends.vllm.activation import VllmActivationPatch
+    delta = torch.tensor([0.2, -0.3, 0.4, 0.1])
+    weight = torch.tensor([[0.1, 0.2, -0.1, 0.3], [-0.2, 0.1, 0.4, 0.2]])
+    bias = torch.tensor([0.07, -0.04])
+    rotation = torch.tensor([[0.2, 0.0], [0.1, 0.3], [-0.1, 0.2], [0.4, -0.1]])
+    tensors = ((delta,), (weight, bias, rotation))
+    bindings = tuple(ActivationPatchBinding(layer, tuple(LayoutFieldId(i + offset) for i in range(len(fields))),
+        1, 1, operator, DecodeWindow.ALL, DecodeRefresh.STEP)
+        for layer, operator, offset, fields in ((0, ActivationPatchOperator.ADD, 0, tensors[0]), (2, ActivationPatchOperator.LOW_RANK_AFFINE, 1, tensors[1])))
+    b = TensorBinding("owned.activation.replay", "a" * 64, Dimensions(4, 0, layer_count=3))
+    fields = (delta, weight, bias, rotation)
+    inject = b.state("inject", tuple(Field(str(i), tuple(tensor.shape)) for i, tensor in enumerate(fields)))
+    def write(data, batch):
+        return TaskOutput(field_writes=tuple((LayoutFieldId(i), tensor.unsqueeze(0)) for i, tensor in enumerate(fields)), changed=(0,), update_count=1)
+    update = b.compute("write", inputs={}, outputs=("updated",), changes=inject, effect=StateEffectKind.TRANSITION,
+        when=When.BEFORE_MODEL, function=write)
+    publication = b.publish(update, inject, when=When.BEFORE_MODEL)
+    b.overlay(inject, update, publication, activations=bindings)
+    b.recurrence(config)
+    graph, layouts, spec = b.finish()
+    reserve = attachment_buffer_bytes(probe, graph, layouts, spec)
+    timeline = replace(RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1", "transition/full_root@1")),
+        region_policy=RegionSelectionPolicy(schedule_policy="serial"), reserved_bytes=(reserve,) * 8,
+        task_resources=(TaskResourceFact(TaskSymbol("publish"), 0), TaskResourceFact(TaskSymbol("write"), 512)),
+        value_resources=(ValueResourceFact(TaskSymbol("publish"), "publication", 0), ValueResourceFact(TaskSymbol("write"), "updated", 0)))
+    timeline = derive_attachment_resources(probe, graph, timeline, layouts=layouts, attachment=spec)
+    plan = compile_page_bundle_plan((graph, layouts), timeline, (PageBundleProviderFacts("test.owned@1", 3),), 1, 65536, torch.device("cpu"))
+    signed = bind_backend_attachment(plan, probe, spec)
+    math = FunctionMath({"inject": lambda roots: None}, lambda value: (),
+        lambda value, batch: TensorFrame(value, value.rows.rows), lambda data, result: result.publication)
+    execution = MathBinding(math, b.bind_all(plan, model_probe=probe)).bind(PageBundleArena(plan), signed.inputs.request.sampler_anchor_id)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(forward=lambda *args: None) for _ in range(3)]))
+    selector = VllmActivationPatch(model, bindings, "inject", install=False)
+    assert all(handle.layer.forward is handle.original for handle in selector.layers)
+    class BoundDecoder(decoder_type):
+        def bind_activation(self, resource, layer, owner):
+            binding = selector.bind_pinned(resource, layer, owner)
+            assert {proof.ref for proof in binding.view.proofs} == set(owner.publication.after_refs)
+            return binding
+        def activation_selected(self, row, layer):
+            return selector.selected(row, layer)
+    decoder = BoundDecoder()
+    rows = decoder.rows
+    expected_cache = torch.zeros_like(decoder.cache)
+    expected = []
+    for row in rows:
+        index, request, position = row.packed_row_index, row.request_ordinal, row.token_offset
+        def layer(ordinal, hidden):
+            previous = expected_cache[request, ordinal, position - 1] if position else torch.zeros(4)
+            expected_cache[request, ordinal, position] = hidden
+            hidden = torch.tanh(hidden * (ordinal + 1) * 0.8 + previous * 0.6)
+            if index != 1:
+                if ordinal == 0:
+                    hidden = hidden + delta
+                elif ordinal == 2:
+                    hidden = hidden + (hidden @ weight.T + bias - hidden @ rotation) @ rotation.T
+            return hidden
+        hidden = inputs[index].clone()
+        for ordinal in range(3):
+            hidden = layer(ordinal, hidden)
+            if ordinal == 0:
+                destination = hidden.clone()  # The tap must include this layer's injection.
+        expected.append(hidden.clone())
+        if row.phase is HiddenPhase.PREFILL:
+            alpha = 0.7 * min(position, 2) / 2
+            hidden = destination * (1 - alpha) + hidden * alpha * (destination.square().sum() / hidden.square().sum()).sqrt()
+            for ordinal in (1, 2):
+                hidden = layer(ordinal, hidden)  # New hidden, same affine parameters; no repeat of layer zero.
+    execution.admit(())
+    invocation = execution.start_step(value)
+    execution.execute_anchor(invocation, AnchorId(0))
+    identities = tuple(dict.fromkeys(row.identity for row in rows))
+    execution.admit(identities)
+    selector.prepare(value.rows, invocation.context, execution.directory)
+    invocation.context.replay = decoder
+    try:
+        for anchor in range(1, 8):
+            execution.execute_anchor(invocation, AnchorId(anchor))
+            if anchor == execution.sampler_anchor_id:
+                execution.complete_sampler(invocation)
+        selector.clear()
+        execution.finish_step(invocation)
+        torch.testing.assert_close(decoder.output, torch.stack(expected))
+        torch.testing.assert_close(decoder.cache, expected_cache)
+        assert execution.diagnostics().update_count == 1 and execution.diagnostics().fallback_count == 0
+    finally:
+        selector.close()
+        if execution._active:
+            execution.cancel_step(invocation)
+        execution.retire(identities)
+        execution.retire(())
 
 
 def _activation_declaration_retains_publication_and_costs(probe):
+    tensor_declarations = []
+    for replay_first in (False, True):
+        binding = TensorBinding("activation.replay", "a" * 64, Dimensions(4, 0, layer_count=3))
+        if replay_first:
+            binding.recurrence(pllm.Recurrence())
+        binding.activation_patch("inject", {"delta": pllm.Buffer((4,), dtype=torch.float32)}, layers=(1,),
+            operator=ActivationPatchOperator.ADD, first_tokens=1, last_tokens=1, scope=pllm.StateScope.INSTANCE,
+            keys=(), namespace="test.inject", decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP)
+        if not replay_first:
+            binding.recurrence(pllm.Recurrence())
+        tensor_declarations.append(binding.finish())
+    assert tensor_declarations[0] == tensor_declarations[1]
     declarations = []
     for replay_first in (False, True):
         b = Builder("activation.replay", "a" * 64)
@@ -354,21 +466,42 @@ def _activation_declaration_retains_publication_and_costs(probe):
             TaskResourceFact(TaskSymbol("write"), 16)),
         value_resources=(ValueResourceFact(TaskSymbol("encode"), "value", 16),
             ValueResourceFact(TaskSymbol("publish"), "publication", 0), ValueResourceFact(TaskSymbol("write"), "updated", 0)))
-    funded = derive_attachment_resources(probe, graph, timeline)
+    funded = derive_attachment_resources(probe, graph, timeline, layouts=layouts, attachment=spec)
     assert set(timeline.task_resources) <= set(funded.task_resources)
     assert set(timeline.value_resources) <= set(funded.value_resources)
     assert funded.reserved_bytes == timeline.reserved_bytes
-    assert derive_attachment_resources(probe, graph, funded) == funded
+    assert derive_attachment_resources(probe, graph, funded, layouts=layouts, attachment=spec) == funded
     replay_cost = next(fact.workspace_bytes for fact in funded.task_resources if fact.task == forward.symbol)
     budget = 80 + sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources) + 16 + replay_cost
-    assert derive_attachment_resources(probe, graph, replace(timeline, memory_budget_bytes=budget)).task_resources == funded.task_resources
+    assert derive_attachment_resources(probe, graph, replace(timeline, memory_budget_bytes=budget), layouts=layouts, attachment=spec).task_resources == funded.task_resources
     with pytest.raises(ValueError, match="reference payload exceeds"):
-        derive_attachment_resources(probe, graph, replace(timeline, memory_budget_bytes=budget - 1))
+        derive_attachment_resources(probe, graph, replace(timeline, memory_budget_bytes=budget - 1), layouts=layouts, attachment=spec)
 
-    # Alpha1 signs the contract; semantic READ acceptance awaits the alpha3 source.
-    # Neither omission of READ nor a hidden reference is a permitted workaround.
-    with pytest.raises(ValueError, match="unsupported tokenwise layer replay effect"):
-        compile_schedule(graph, funded)
+    plan = compile_page_bundle_plan((graph, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),),
+        1, 65536, torch.device("cpu"))
+    signed = bind_backend_attachment(plan, probe, spec)
+    assert signed.inputs.request.activation_bindings == (patch,)
+    all_reads = replace(graph, tasks=tuple(replace(item, effects=(*item.effects, features.version()))
+        if item.symbol == forward.symbol else item for item in graph.tasks))
+    read_plan = compile_page_bundle_plan((all_reads, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),),
+        1, 65536, torch.device("cpu"))
+    with pytest.raises(ValueError, match="exact READ of its signed inject publication"):
+        bind_backend_attachment(read_plan, probe, spec)
+    # The semantic layer knows READ, not attachment names. Attachment signing
+    # must separately reject a legitimate READ of the wrong resource.
+    wrong = replace(graph, tasks=tuple(replace(item, effects=(features.version(),)) if item.symbol == forward.symbol else item
+        for item in graph.tasks))
+    wrong_plan = compile_page_bundle_plan((wrong, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),),
+        1, 65536, torch.device("cpu"))
+    with pytest.raises(ValueError, match="exact READ of its signed inject publication"):
+        bind_backend_attachment(wrong_plan, probe, spec)
+    for kind in StateEffectKind:
+        if kind is StateEffectKind.READ:
+            continue
+        mixed = replace(graph, tasks=tuple(replace(item, effects=(*item.effects, replace(features.version(), kind=kind)))
+            if item.symbol == forward.symbol else item for item in graph.tasks))
+        with pytest.raises(ValueError, match="unsupported tokenwise layer replay effect"):
+            compile_schedule(mixed, funded)
     unread = replace(graph, tasks=tuple(replace(item, effects=()) if item.symbol == forward.symbol else item
         for item in graph.tasks))
     with pytest.raises(ValueError, match="exact publication read"):

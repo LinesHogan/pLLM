@@ -5,29 +5,101 @@ and failure recovery belong to the backend invocation that binds these calls.
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.region_program import (
     AccessMode, AccessRange, AffineIndex, BankType, Block, BorrowedResource, Call, Coordinate, ExternalResource, Function,
-    IndexTerm, Op, Parameter, Program, ResourceAccess, Region, ScalarType, Scan, Select, SizeParameter, TensorType, Value,
+    If, IndexTerm, Op, Parameter, Program, ResourceAccess, Region, ScalarType, Scan, Select, SizeParameter, TensorType, Value,
 )
-from pllm.contracts.backend_attachment import CausalModelDomain
-from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies
+from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, CausalModelDomain
+from pllm.contracts.tensor_layout import TensorLayoutRequest
+from pllm.contracts.region_composition import RegionFunctionBody, inline_function_bodies, inline_region, select_function_bodies
 from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.codec import boundary_digest
 from pllm.execution.exported_cell import ExportedCell
+from pllm.execution.exported_resources import borrow_exported_inputs
+from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.region_compilation import analyze_region_program, lower_region_bindings, lower_region_schedule
 from pllm.execution.region_execution import RegionExecution
-from pllm.execution.region_native import source_region_functions
+from pllm.execution.region_native import RegionFunction, source_region_functions
 from pllm.execution.region_resources import ExternalFunction, PagedResourceBinding, RegionPageOwner, RegionResources
 from pllm.execution.region_values import Bank, Data
 
 
 LayerForward = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
 RowLayerForward = Callable[[int, int, int, int, torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
+
+
+@dataclass(frozen=True, slots=True)
+class DecoderActivation:
+    binding: ActivationPatchBinding
+    fields: tuple[TensorType, ...]
+
+    def resource(self, max_rows: int) -> BorrowedResource:
+        return BorrowedResource(f"activation.{self.binding.layer}", (max_rows,))
+
+
+def decoder_activations(bindings: tuple[ActivationPatchBinding, ...], layouts: TensorLayoutRequest,
+                        resource: str, device: str) -> tuple[DecoderActivation, ...]:
+    if not bindings:
+        return ()
+    layout, = (entry.layout for entry in layouts.layouts if entry.resource == resource)
+    fields = {field.field_id: TensorType(field.shape, "torch." + field.dtype.value, device) for field in layout.fields}
+    return tuple(DecoderActivation(binding, tuple(fields[field] for field in binding.fields)) for binding in bindings)
+
+
+def activation_selected_function(activation: DecoderActivation) -> Function:
+    return Function("activation.selected@1:" + boundary_digest(activation), (ScalarType.INDEX,), (ScalarType.BOOL,),
+        ("context",), (ResourceAccess("context", AccessMode.READ, (index_cell(0),)),))
+
+
+def _activation_body(tensor: TensorType, domain: CausalModelDomain, context: BorrowedResource,
+                     activations: tuple[DecoderActivation, ...]) -> tuple[RegionFunctionBody, dict[str, RegionFunction]]:
+    """A source-level layer dispatch; the backend supplies only immutable row predicates and fields."""
+    resources = tuple(activation.resource(context.domain[0]) for activation in activations)
+    index = ScalarType.INDEX
+    declaration = Function("decoder.activation@1:" + boundary_digest(tensor, domain, activations),
+        (index, index, tensor), (tensor,), (context.name, *(resource.name for resource in resources)),
+        tuple(ResourceAccess(resource.name, AccessMode.READ, (index_cell(0),)) for resource in (context, *resources)))
+    arguments = (Value("row", index), Value("layer", index), Value("hidden", tensor))
+    functions: dict[str, RegionFunction] = {}
+    variants: list[RegionFunctionBody] = []
+    for layer in range(domain.layers):
+        activation = next((item for item in activations if item.binding.layer == layer), None)
+        if activation is None:
+            variants.append(RegionFunctionBody(declaration, Program(Region(Block(arguments, (), ("hidden",))), (), (context, *resources))))
+            continue
+        dtypes = {"torch.float16": torch.float16, "torch.bfloat16": torch.bfloat16,
+            "torch.float32": torch.float32, "torch.float64": torch.float64}
+        dtype = dtypes[tensor.dtype]
+        convert = activation.fields[0].dtype != tensor.dtype
+        def add(hidden: torch.Tensor, delta: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            return (hidden + (torch.ops.aten._to_copy.default(delta, dtype=dtype) if convert else delta),)
+        def affine(hidden: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, rotation: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            return (hidden + low_rank_affine_delta(hidden, weight, bias, rotation),)
+        with FakeTensorMode():
+            examples = tuple(torch.empty(type_.shape, dtype=dtypes[type_.dtype], device=type_.device) for type_ in (tensor, *activation.fields))
+            if activation.binding.operator is ActivationPatchOperator.ADD:
+                cell = ExportedCell.capture(add, ("hidden", "delta"), ("patched",), examples)
+            else:
+                cell = ExportedCell.capture(affine, ("hidden", "weight", "bias", "rotation"), ("patched",), examples)
+        body, local = borrow_exported_inputs(cell, activation.resource(context.domain[0]),
+            {name: ordinal for ordinal, name in enumerate(cell.inputs[1:])})
+        functions.update(local)
+        selected = activation_selected_function(activation)
+        inputs = (Value("hidden", tensor), Value("row", index))
+        patched = inline_region(body.program, inputs, "patch")
+        yes = Region(Block(inputs, patched.operations, tuple(value.name for value in patched.results)))
+        no = Region(Block(inputs, (), ("hidden",)))
+        variants.append(RegionFunctionBody(declaration, Program(Region(Block(arguments, (
+            Call(("row",), (Value("selected", ScalarType.BOOL),), selected.name),
+            If(("selected", "hidden", "row"), (Value("patched", tensor),), yes, no),
+        ), ("patched",))), (selected, *body.program.functions), (context, *resources))))
+    return select_function_bodies(tuple(variants), selector="layer"), functions
 
 
 def index_cell(argument: int) -> AccessRange:
@@ -74,7 +146,8 @@ class DecoderSource:
     def __init__(self, tensor: TensorType, layers: tuple[int, ...], domain: CausalModelDomain, *, taps: tuple[int, ...] = (),
                  weights: BorrowedResource | None = None, context: ExternalResource | BorrowedResource = ExternalResource("model"),
                  source_imports: tuple[RegionTensorImport, ...] = (),
-                 function_bodies: tuple[RegionFunctionBody, ...] = ()) -> None:
+                 function_bodies: tuple[RegionFunctionBody, ...] = (),
+                 activations: tuple[DecoderActivation, ...] = ()) -> None:
         if (not layers or tuple(sorted(set(layers))) != layers or any(type(i) is not int or not 0 <= i < domain.layers for i in layers)
             or len(taps) > 2 or len(set(taps)) != len(taps) or any(i not in layers for i in taps)):
             raise ValueError("decoder region needs a positive layer count and at most two distinct layer taps")
@@ -114,13 +187,27 @@ class DecoderSource:
             self.first = decoder_layer_function(tensor, domain, residual=False)
             self.next = decoder_layer_function(tensor, domain, residual=True)
 
+        patch_body = None
+        patch_functions: dict[str, RegionFunction] = {}
+        patch_resources: tuple[BorrowedResource, ...] = ()
+        if activations:
+            if not isinstance(context, BorrowedResource):
+                raise ValueError("activation source requires the original packed-row context")
+            patch_body, patch_functions = _activation_body(tensor, domain, context, activations)
+            patch_resources = tuple(item.resource(context.domain[0]) for item in activations)
+        def patched(hidden: str, layer: str) -> tuple[Op, ...]:
+            return () if patch_body is None else (Call(("row", layer, "raw_" + hidden), (Value(hidden, tensor),), patch_body.declaration.name),)
+        def result_name(hidden: str) -> str:
+            return hidden if patch_body is None else "raw_" + hidden
+
         coordinates = (Value("row", index), Value("request", index), Value("token", index), Value("layer_ids", layer_ids), Value("positions", positions))
         entry = (*coordinates, Value("seed", tensor))
         contiguous = layers == tuple(range(layers[0], layers[0] + len(layers)))
         operations: list[Op] = [
             Coordinate((), (Value("first_layer", index),), AffineIndex(layers[0])),
             Call(("row", "request", "token", "first_layer", "positions", "seed"),
-                (Value("hidden0", tensor), Value("residual0", tensor)), self.first.name),
+                (Value(result_name("hidden0"), tensor), Value("residual0", tensor)), self.first.name),
+            *patched("hidden0", "first_layer"),
         ]
         # Tap hits are constructor-known positions: a tap on the first layer is
         # computed at entry, and any other tap starts as the seed passthrough.
@@ -169,7 +256,8 @@ class DecoderSource:
                     hidden, residual = f"{prefix}hidden", f"{prefix}residual"
                     operations.extend(layer_ops(None, i, prefix))
                     operations.append(Call(("row", "request", "token", f"{prefix}layer", "positions", current[0], current[1]),
-                        (Value(hidden, tensor), Value(residual, tensor)), self.next.name))
+                        (Value(result_name(hidden), tensor), Value(residual, tensor)), self.next.name))
+                    operations.extend(patched(hidden, f"{prefix}layer"))
                     n = hits[i]
                     tap = f"u{segment}_tap{n}"
                     assert addition is not None
@@ -185,7 +273,8 @@ class DecoderSource:
                     body = Region(Block((Value("index", index), *(Value(name, tensor) for name in slot_names), *coordinates), (
                         *layer_ops("index", i),
                         Call(("row", "request", "token", "layer", "positions", "hidden", "residual"),
-                             (Value("hidden1", tensor), Value("residual1", tensor)), self.next.name),
+                             (Value(result_name("hidden1"), tensor), Value("residual1", tensor)), self.next.name),
+                        *patched("hidden1", "layer"),
                     ), ("hidden1", "residual1", *slot_names[2:])))
                     outputs = tuple(Value(f"s{segment}_{name}", tensor) for name in slot_names)
                     operations.append(Scan((*current, *tuple(value.name for value in coordinates)),
@@ -196,10 +285,15 @@ class DecoderSource:
             returned = tuple(current)
         if addition is not None:
             declarations.append(addition.declaration)
+            patch_functions[addition.digest] = addition
+        if patch_body is not None:
+            declarations.append(patch_body.declaration)
         self.program = Program(Region(Block(entry, tuple(operations), returned)), tuple(declarations),
-            (context, self.kv, *(() if weights is None else (weights,))))
+            (context, self.kv, *(() if weights is None else (weights,)), *patch_resources))
+        if patch_body is not None:
+            self.program = inline_function_bodies(self.program, (patch_body,))
         self.program = inline_function_bodies(self.program, function_bodies) if function_bodies else self.program
-        self.functions = source_region_functions(self.program.functions, {} if addition is None else {addition.digest: addition}, source_imports)
+        self.functions = source_region_functions(self.program.functions, patch_functions, source_imports)
         self.layers = layers
 
     def externals(self, forward: RowLayerForward, kernel_imports: tuple[NativeKernelImport, ...] = ()) -> tuple[ExternalFunction, ...]:

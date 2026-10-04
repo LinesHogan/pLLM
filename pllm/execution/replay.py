@@ -16,11 +16,12 @@ from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.trace import TracePhase
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.tokenwise_region import TokenwiseRegion, compile_tokenwise_region, mix_layer_outputs as mix_layer_outputs
+from pllm.execution.decoder_region import DecoderActivation
 from pllm.contracts.region_program import BorrowedResource, TensorType
 from pllm.contracts.region_imports import NativeKernelImport, RegionTensorImport
 from pllm.contracts.region_composition import RegionFunctionBody
 from pllm.contracts.region_selection import RegionSelectionPolicy
-from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding, RegionPageOwner
+from pllm.execution.region_resources import ExternalFunction, HostResourceBinding, PagedResourceBinding, PinnedResourceBinding, ReadonlyResourceBinding, RegionPageOwner
 from pllm.execution.host_borrow import TraceResourceView
 from pllm.execution.region_streams import RegionStreamBindings
 from pllm.contracts.backend_attachment import CausalModelDomain
@@ -90,6 +91,12 @@ class TokenwiseReplayPrimitive(ABC):
     @abstractmethod
     def bind_context(self, resource: BorrowedResource, owner: RegionPageOwner) -> HostResourceBinding: ...
 
+    def bind_activation(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
+        raise ValueError("model replay has no signed activation binding")
+
+    def activation_selected(self, row: int, layer: int) -> bool:
+        raise ValueError("model replay has no prepared activation selection")
+
     @abstractmethod
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -128,12 +135,13 @@ class TokenwiseReplayTask(Generic[DataT]):
              implementation_id: ImplementationId, policy: RegionSelectionPolicy, payload_budget: int, *,
              stream_lanes: int = 1,
              source_imports: tuple[RegionTensorImport, ...] = (),
-             function_bodies: tuple[RegionFunctionBody, ...] = ()) -> TokenwiseReplayTask[DataT]:
+             function_bodies: tuple[RegionFunctionBody, ...] = (),
+             activations: tuple[DecoderActivation, ...] = ()) -> TokenwiseReplayTask[DataT]:
         effect = task.replay
         if not isinstance(effect, TokenwiseLayerReplay):
             raise ValueError("tokenwise region requires its declared recurrence")
         region = compile_tokenwise_region(tensor, max_rows, domain, effect, policy, stream_lanes=stream_lanes, source_imports=source_imports,
-            function_bodies=function_bodies).within_payload_budget(payload_budget)
+            function_bodies=function_bodies, activations=activations).within_payload_budget(payload_budget)
         if set(region.functions) == {function.name for function in region.program.functions}:
             region = region.bind_functions({})
         return cls(task, region, implementation_id, policy)
@@ -176,7 +184,10 @@ class TokenwiseReplayTask(Generic[DataT]):
                 begin=begin, layer=layer, normalize=normalize,
                 observe=observe, commit=commit, record=record, restore=primitive.restore, streams=streams,
                 kernel_imports=primitive.kernel_imports, function_bodies=primitive.function_bodies,
-                model_endpoints=primitive.model_endpoints())
+                model_endpoints=primitive.model_endpoints(),
+                activation_borrows=tuple(primitive.bind_activation(resource, activation.binding.layer, context)
+                    for resource, activation in zip(self.region.activation_resources, self.region.activations, strict=True)),
+                activation_selected=primitive.activation_selected)
             primitive.finish(outputs)
 
 

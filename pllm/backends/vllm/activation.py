@@ -12,6 +12,8 @@ from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.page_bundle import PagePin
 from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.region_resources import PinnedResourceBinding, PinnedResourceCell, RegionPageOwner
+from pllm.contracts.region_program import BorrowedResource
 from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, DecodeRefresh, DecodeWindow
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
@@ -27,6 +29,9 @@ _DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tu
 class _PatchRows:
     rows: torch.Tensor
     fields: tuple[torch.Tensor, ...]
+    indices: tuple[int, ...]
+    pin: PagePin
+    ref: StateRef
 
 
 class _ActivationLayer:
@@ -55,11 +60,14 @@ class _ActivationLayer:
 
 
 class VllmActivationPatch:
-    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ActivationPatchBinding, ...], resource: str) -> None:
+    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ActivationPatchBinding, ...], resource: str, *, install: bool = True) -> None:
         self.resource = StateResource(resource)
+        self.installed = install
+        self.row_count = 0
         self.layers = tuple(_ActivationLayer(model.model.layers[binding.layer], binding) for binding in bindings)
-        for handle in self.layers:
-            handle.layer.forward = handle.forward
+        if install:
+            for handle in self.layers:
+                handle.layer.forward = handle.forward
 
     @property
     def apply_count(self) -> int:
@@ -68,6 +76,7 @@ class VllmActivationPatch:
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT],
                 directory: RequestStateDirectory) -> None:
         versions: dict[tuple[RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
+        self.row_count = rows.total_rows
         for handle in self.layers:
             prepared: list[_PatchRows] = []
             for phase, phase_rows in ((HiddenPhase.PREFILL, rows.prefill_rows), (HiddenPhase.DECODE, rows.decode_rows)):
@@ -83,15 +92,38 @@ class VllmActivationPatch:
                         continue
                     key = (identity, refresh)
                     if key not in versions:
-                        versions[key] = self._version(identity, refresh, context, directory)
+                        pin, ref = self._version(identity, refresh, context, directory)
+                        if not self.installed and pin not in context.page_pins:
+                            # Admission pins belong to the request directory. Borrow
+                            # the same exact version for this invocation's source view.
+                            pin = next((candidate for candidate, release in context.page_pins.items()
+                                if release is None and ref in candidate.refs), None)
+                            if pin is None:
+                                pin = context.arena.pin_exact((ref,), context.pin.stream)
+                                context.page_pins[pin] = None
+                        versions[key] = pin, ref
                     pin, ref = versions[key]
                     if ref.version_id == 0:
                         if phase is HiddenPhase.DECODE:
                             raise RuntimeError("decode activation requires its first published injection")
                         continue
                     prepared.append(_PatchRows(torch.tensor(selected, device=context.arena.device, dtype=torch.long),
-                        tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields)))
+                        tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields), selected, pin, ref))
             handle.prepared = tuple(prepared)
+
+    def selected(self, row: int, layer: int) -> bool:
+        if not 0 <= row < self.row_count:
+            raise ValueError("activation selection is outside its original packed rows")
+        handle, = (handle for handle in self.layers if handle.binding.layer == layer)
+        return any(row in item.indices for item in handle.prepared)
+
+    def bind_pinned(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
+        if (self.installed or len(resource.domain) != 1 or resource.domain[0] < self.row_count
+            or resource.name != f"activation.{layer}"):
+            raise ValueError("source activation requires its unhooked model binding")
+        handle, = (handle for handle in self.layers if handle.binding.layer == layer)
+        return PinnedResourceBinding.bind(resource, owner, tuple(PinnedResourceCell((row,), item.pin, item.ref, handle.binding.fields)
+            for item in handle.prepared for row in item.indices))
 
     def _version(self, identity: RequestIdentity, refresh: bool, context: StateTaskContext[DataT],
                  directory: RequestStateDirectory) -> tuple[PagePin, StateRef]:
@@ -114,10 +146,12 @@ class VllmActivationPatch:
         return context.borrow_published(updated), ref
 
     def clear(self) -> None:
+        self.row_count = 0
         for handle in self.layers:
             handle.prepared = ()
 
     def close(self) -> None:
         self.clear()
-        for handle in self.layers:
-            handle.layer.forward = handle.original
+        if self.installed:
+            for handle in self.layers:
+                handle.layer.forward = handle.original

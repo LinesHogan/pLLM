@@ -111,6 +111,7 @@ def test_video_binding_keeps_remote_roots_out_of_local_ownership():
             if anchor.ordinal == execution.sampler_anchor_id:
                 execution.complete_sampler(invocation)
         assert not any(peer.poll() for peer in peers)  # Publication is not remote completion.
+        _owned_readonly_requires_exact_pin(invocation.context)
         del batch, frame
         receipt = execution.finish_step(invocation)
         torch.testing.assert_close(execution.snapshot(receipt.after_refs[0])[0], torch.full((2,), 10.))
@@ -122,6 +123,52 @@ def test_video_binding_keeps_remote_roots_out_of_local_ownership():
             execution.begin(())  # Never silently read local inject as the next features chunk.
     if find_spec("vllm") is not None:
         _decode_steps_keep_exact_publications_and_ack_order()
+
+
+def _owned_readonly_requires_exact_pin(owner):
+    from pllm.contracts.region_program import AccessMode, Block, BorrowedResource, Call, Function, Program, Region, ResourceAccess, ScalarType, TensorType, Value
+    from pllm.contracts.region_imports import BorrowedTensorImport
+    from pllm.execution.decoder_region import index_cell
+    from pllm.execution.region_resources import PinnedResourceBinding, PinnedResourceCell, ReadonlyResourceBinding, RegionResources
+    from pllm.execution.tensor_borrow import ReadonlyTensorCell
+    from pllm.execution.paged_access import CausalAccess, PagedAccessPlan, PagedResourceView
+    ref, = owner.publication.after_refs
+    pin = owner.borrow_published((ref,))
+    resource = BorrowedResource("inject.read", (1,))
+    tensor = TensorType((2,), "torch.float32", "cpu")
+    getter = Function("read.inject", (ScalarType.INDEX,), (tensor,), (resource.name,),
+        (ResourceAccess(resource.name, AccessMode.READ, (index_cell(0),)),))
+    program = Program(Region(Block((Value("row", ScalarType.INDEX),),
+        (Call(("row",), (Value("value", tensor),), getter.name),), ("value",))), (getter,), (resource,))
+    imported = BorrowedTensorImport(getter, 0)
+    proof = PinnedResourceCell((0,), pin, ref, (LayoutFieldId(0),))
+    bound = PinnedResourceBinding.bind(resource, owner, (proof,))
+    pages = RegionResources(program, owner, (), borrows=(bound,), tensor_borrows=(imported,))
+    actual = pages.borrow_tensor(imported, (0,))
+    expected = owner.arena.borrow_field(pin, ref, LayoutFieldId(0))
+    assert actual.data_ptr() == expected.data_ptr() and actual.untyped_storage().nbytes() == expected.untyped_storage().nbytes()
+    with pytest.raises(ValueError, match="overlaps original arena"):
+        RegionResources(program, owner, (), borrows=(ReadonlyResourceBinding(bound.view, owner),), tensor_borrows=(imported,))
+    forged = replace(bound, view=replace(bound.view, cells=(ReadonlyTensorCell.bind((0,), (actual.clone(),)),)))
+    with pytest.raises(ValueError, match="storage differs"):
+        RegionResources(program, owner, (), borrows=(forged,), tensor_borrows=(imported,))
+    for wrong in (replace(proof, pin=replace(pin)), replace(proof, pin=owner.pin), replace(proof, fields=(LayoutFieldId(99),))):
+        with pytest.raises((ValueError, RuntimeError)):
+            PinnedResourceBinding.bind(resource, owner, (wrong,))
+    writable = replace(getter, accesses=(replace(getter.accesses[0], mode=AccessMode.WRITE),))
+    with pytest.raises(ValueError, match="READ effects only"):
+        RegionResources(replace(program, functions=(writable,)), owner, (), borrows=(bound,))
+    # Exercise the new binding's writable-alias check directly, independently
+    # of the ordinary paged-vs-arena disjointness check in RegionResources.
+    write = CausalAccess("kv", RequestIdentity("reader", 0, 0), 0, 0, 1, str(actual.device),
+        actual.data_ptr(), actual.numel() * actual.element_size(), actual.numel() * actual.element_size())
+    access = PagedAccessPlan((), (write,), {}, ("kv",), {("kv", 0): (0, 1)})
+    paged = PagedResourceView(BorrowedResource("kv", (1, 1, 1)), access, ((0, "kv"),))
+    with pytest.raises(ValueError, match="aliases writable paged"):
+        bound.validate(program, (paged,))
+    owner.release_owned_pin(pin)
+    with pytest.raises(ValueError, match="live exact pin"):
+        pages.borrow_tensor(imported, (0,))
 
 
 @pytest.mark.parametrize("failure", ("alias", "close", "cancel", "missing", "mixed", "staging", "write"))

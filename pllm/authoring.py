@@ -246,7 +246,7 @@ class BackendAuthoring(ABC):
         buffers = attachment_buffer_bytes(facts.probe, graph, layouts, attachment)
         reserved = (tuple(value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors)))
             if buffers else timeline.reserved_bytes)
-        timeline = derive_attachment_resources(facts.probe, graph, replace(timeline, reserved_bytes=reserved))
+        timeline = derive_attachment_resources(facts.probe, graph, replace(timeline, reserved_bytes=reserved), layouts=layouts, attachment=attachment)
         return replace(facts, timeline=timeline)
 
     @abstractmethod
@@ -256,7 +256,7 @@ class BackendAuthoring(ABC):
 
     def plan_backend(self, facts: BackendCompileFacts) -> SignedBackendAttachment:
         graph, layouts, attachment = self.declare(facts)
-        timeline = derive_attachment_resources(facts.probe, graph, derive_framework_resources(graph, facts.timeline))
+        timeline = derive_attachment_resources(facts.probe, graph, derive_framework_resources(graph, facts.timeline), layouts=layouts, attachment=attachment)
         plan = compile_page_bundle_plan((graph, layouts), timeline, facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
             facts.state_memory_budget_bytes, facts.device)
@@ -297,7 +297,8 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         plan = attachment.inputs.plan
         if (attachment.inputs.probe != facts.probe
             or plan.timeline != derive_attachment_resources(facts.probe, plan.semantic_graph,
-                derive_framework_resources(plan.semantic_graph, facts.timeline))):
+                derive_framework_resources(plan.semantic_graph, facts.timeline), layouts=plan.tensor_layout_request,
+                attachment=attachment.inputs.request)):
             raise ValueError("worker backend facts differ from the original signed attachment")
         if (plan.state_decision.reserved_bytes > facts.state_memory_budget_bytes
             or any(item.max_admitted_lineages > facts.max_admitted_lineages for item in plan.state_request.states)):

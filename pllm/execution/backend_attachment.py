@@ -7,7 +7,7 @@ from dataclasses import replace
 from pllm import _core
 from pllm.execution.codec import decode_boundary, encode_boundary
 from pllm.execution.region_replay import replay_region_workspace_bytes
-from pllm.execution.decoder_region import decoder_region_workspace_bytes
+from pllm.execution.decoder_region import decoder_activations, decoder_region_workspace_bytes
 from pllm.execution.tokenwise_region import compile_tokenwise_region, compile_tokenwise_source, tokenwise_attachment_bytes
 from pllm.contracts.region_program import TensorType
 from pllm.contracts.region_proposal import REGION_STREAMS_CAPABILITY
@@ -71,7 +71,8 @@ def attachment_buffer_bytes(probe: BackendPlacementProbe, graph: SemanticGraph,
 
 
 def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGraph,
-                                timeline: SchedulerTimeline) -> SchedulerTimeline:
+                                timeline: SchedulerTimeline, *, layouts: TensorLayoutRequest | None = None,
+                                attachment: BackendAttachmentSpec | BackendAttachmentRequest | None = None) -> SchedulerTimeline:
     """Fund native region candidates through the original AER workspace facts.
 
     Preserve producer task/value facts when the model reads a publication.
@@ -100,16 +101,20 @@ def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGra
         raise ValueError("tokenwise attachment requires its original model domain")
     tensor = TensorType((1, probe.hidden_size), "torch." + probe.tensor_dtype.value,
         "cpu" if probe.device_kind.value == "cpu" else f"cuda:{probe.device_ordinal}")
+    if task.effects and (layouts is None or attachment is None or not attachment.activation_bindings):
+        raise ValueError("composed tokenwise costs require signed activation bindings and layouts")
+    activations = () if layouts is None or attachment is None else decoder_activations(
+        attachment.activation_bindings, layouts, attachment.state_resource, tensor.device)
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
     if existing is not None:
         region = compile_tokenwise_source(tensor, probe.max_packed_rows, probe.causal_domain, effect,
-            source_imports=probe.region_imports, function_bodies=probe.region_bodies)
+            source_imports=probe.region_imports, function_bodies=probe.region_bodies, activations=activations)
         region.within_payload_budget(existing.workspace_bytes)
         task_facts = timeline.task_resources
     else:
         region = compile_tokenwise_region(tensor, probe.max_packed_rows, probe.causal_domain, effect, timeline.region_policy,
             stream_lanes=2 if REGION_STREAMS_CAPABILITY in probe.capabilities else 1,
-            source_imports=probe.region_imports, function_bodies=probe.region_bodies)
+            source_imports=probe.region_imports, function_bodies=probe.region_bodies, activations=activations)
         maximum, = region.payload_limits
         available = maximum.bytes
         if timeline.memory_budget_bytes is not None:
