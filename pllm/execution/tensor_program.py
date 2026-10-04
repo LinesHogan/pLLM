@@ -11,12 +11,13 @@ import torch
 
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
-from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, TaskSymbol
+from pllm.contracts.semantic_graph import ImplementationId, SemanticOutputKind, StateResource, TaskSymbol
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PagePublication, PagePin, PageWrite
+from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.kernels.paged_linear import PagedRows, TensorRows
 from pllm.execution.ptts.request_state import RequestStateSelection
@@ -47,6 +48,20 @@ class TensorBatch:
     observing: bool = False
     paged: Callable[[tuple[int, ...], tuple[int, ...]], tuple[PagedRows, ...]] = _no_pages
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]())
+    borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
+    local_pin: PagePin | None = None
+
+    def parameter_root(self, resource: str) -> tuple[torch.Tensor, ...]:
+        # No borrowed state: preserve the original sole-root reader (existing workload suite).
+        if not self.borrowed_roots:
+            return self.roots[0]
+        borrowed = borrowed_root(self.borrowed_roots, resource)
+        if borrowed is not None:
+            assert self.local_pin is not None
+            return borrowed.tensors(self.local_pin)
+        group = self.selection.for_resource(StateResource(resource))
+        ref, = group.refs
+        return self.roots[self.selection.refs.index(ref)]
 
     def tensor_rows(self, fields: tuple[int, ...], rows: tuple[int, ...]) -> tuple[TensorRows, ...]:
         """Pack fields once per logical state; share one mapping or an existing equal-row grouping."""
@@ -139,6 +154,7 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         context.sampler_feedback, epoch=context.arena.plan.state_physical.plan_epoch,
         observing=context.trace.observing,
         results=context.results,
+        borrowed_roots=context.borrowed_roots, local_pin=context.pin,
         paged=lambda fields, rows: context.arena.paged_rows(access, refs, tuple(LayoutFieldId(field) for field in fields), rows))
 
 

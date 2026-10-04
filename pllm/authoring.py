@@ -310,7 +310,7 @@ class BackendWorkload(BackendAuthoring, Generic[DataT, ResultT]):
         validate_backend_attachment_physical(attachment.inputs, attachment.decision, attachment.physical)
         math = self.bind_math(facts, plan)
         device = torch.device("cpu") if facts.probe.device_kind.value == "cpu" else torch.device("cuda", facts.probe.device_ordinal)
-        arena = PageBundleArena(plan, candidates, device=device)
+        arena = PageBundleArena(plan, candidates, device=device, _owned_resources=math.local_resources(plan))
         return BackendDeployment(math.bind(arena, attachment.inputs.request.sampler_anchor_id), attachment)
 
     def compile_backend(self, facts: BackendCompileFacts) -> BackendDeployment[DataT, ResultT]:

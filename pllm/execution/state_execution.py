@@ -13,6 +13,7 @@ import torch
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation, TaskGraphInvocation
 from pllm.execution.ptts.page_bundle import PageBundleArena, PageBundleUsage, PagePin, PagePublication, PageRelease, PageWrite
+from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
 from pllm.execution.replay import LayerReplayPrimitive, TokenwiseReplayPrimitive
@@ -20,7 +21,8 @@ from pllm.execution.trace import ExecutionTrace, TracePhase
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
-from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, SamplerFeedbackInputSource, TaskSymbol
+from pllm.contracts.semantic_graph import AnchorId, ImplementationId, PhysicalPlan, SamplerFeedbackInputSource, StateEffectKind, StateScope, TaskSymbol
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.state_representation import StatePhysicalPlan
@@ -66,6 +68,7 @@ class StateTaskContext(Generic[DataT]):
     updated_refs: tuple[StateRef, ...] = ()
     replay_started: bool = False
     cancel_requested: Event = field(default_factory=Event)
+    borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
 
     def data(self) -> DataT:
         if self.value is None:
@@ -202,6 +205,17 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
     math: StateMath[InputT, DataT, ResultT]
     tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...]
     captures: tuple[KernelCapture, ...] = ()
+    borrowed_resources: tuple[str, ...] = ()
+
+    def local_resources(self, plan: PlanBundle) -> tuple[str, ...]:
+        states = plan.semantic_graph.states
+        borrowed = set(self.borrowed_resources)
+        if (len(borrowed) != len(self.borrowed_resources) or not borrowed <= {state.resource for state in states}
+            or any(state.scope is not StateScope.INSTANCE for state in states if state.resource in borrowed)
+            or any(effect.kind is not StateEffectKind.READ for task in plan.semantic_graph.tasks
+                for effect in task.effects if effect.resource in borrowed)):
+            raise ValueError("borrowed bindings require distinct read-only instance resources from the original plan")
+        return tuple(str(state.resource) for state in states if state.resource not in borrowed)
 
     def bind(self, arena: PageBundleArena, sampler_anchor_id: AnchorId) -> StateExecution[InputT, DataT, ResultT]:
         # Reject any underfunded kernel before allocating/capturing the first one's inputs.
@@ -210,8 +224,14 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
         for capture in self.captures:
             capture.bind(arena)
         states = arena.plan.semantic_graph.states
-        return StateExecution(arena, RequestStateDirectory(arena, states),
-            self.math, self.tasks, sampler_anchor_id)
+        if set(arena.owned_resources) != set(self.local_resources(arena.plan)):
+            raise ValueError("local and borrowed resources must partition the original plan")
+        # A borrowed binding owns only its local directory; test_video verifies no remote lineage.
+        if self.borrowed_resources:
+            states = tuple(state for state in states if state.resource in arena.owned_resources)
+        execution = StateExecution(arena, RequestStateDirectory(arena, states), self.math, self.tasks, sampler_anchor_id,
+            _borrowed_resources=self.borrowed_resources)
+        return execution
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,7 +266,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def __init__(self, arena: PageBundleArena, directory: RequestStateDirectory,
                  math: StateMath[InputT, DataT, ResultT],
                  implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT]], ...],
-                 sampler_anchor_id: AnchorId) -> None:
+                 sampler_anchor_id: AnchorId, *, _borrowed_resources: tuple[str, ...] = ()) -> None:
         self.arena, self.directory, self.math = arena, directory, math
         self.sampler_anchor_id = sampler_anchor_id
         self.trace = ExecutionTrace(arena.plan.schedule_physical)
@@ -256,6 +276,31 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
         self._lock = RLock()
+        self._borrowed_resources = _borrowed_resources
+        self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
+        self._borrow_failed = False
+
+    def _require_borrow_live(self) -> None:
+        if self._borrow_failed:
+            raise RuntimeError("borrowed execution is fail-stopped with resources retained")
+
+    def stage_readonly(self, roots: tuple[BorrowedStateRoot, ...]) -> None:
+        """Internal transport handoff; no change to workload authoring signatures."""
+        with self._lock:
+            self._require_borrow_live()
+            if not self._borrowed_resources or self._active or self._pending_borrows is not None:
+                raise RuntimeError("read-only staging requires an idle borrowed execution")
+            self._pending_borrows = roots  # Retain even invalid incoming mappings until the session terminates.
+            try:
+                if (len(roots) != len(self._borrowed_resources)
+                    or {root.resource for root in roots} != set(self._borrowed_resources)
+                    or any(root.signature != self.arena.plan.schedule_decision.signature for root in roots)):
+                    raise ValueError("received roots differ from the required signed resources")
+                for root in roots:
+                    root.claim(self.arena.allocation_ranges)
+            except Exception:
+                self._borrow_failed = True
+                raise
 
     @property
     def plan(self) -> PhysicalPlan:
@@ -291,6 +336,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def admit(self, identities: tuple[RequestIdentity, ...],
               stream: torch.cuda.Stream | None = None) -> tuple[StateRef, ...]:
         with self._lock:
+            # Only borrowing executions have a terminal transport state; test_video covers it.
+            if self._borrowed_resources:
+                self._require_borrow_live()
             if not self.directory.states:
                 return ()
             batch = self.directory.prepare_admission(identities, stream)
@@ -317,6 +365,12 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def begin(self, rows: tuple[PackedPhaseRow, ...],
               stream: torch.cuda.Stream | None = None) -> TaskGraphInvocation[StateTaskContext[DataT]]:
         with self._lock:
+            # Complete exact input before any local pin/write; test_video rejects missing staging.
+            if self._borrowed_resources:
+                self._require_borrow_live()
+                if self._active or self._pending_borrows is None or any(root.stream != stream for root in self._pending_borrows):
+                    self._borrow_failed = True
+                    raise RuntimeError("borrowed step requires complete staged roots on the receiving stream")
             self.arena.collect_completed()
             selection = self.directory.select(rows)
             self.directory.acquire_transition_lease(selection)
@@ -329,6 +383,15 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             invocation = TaskGraphInvocation(self._runner, context, self._next_invocation)
             self._next_invocation += 1
             self._active[invocation.invocation_id] = invocation
+            if self._borrowed_resources:
+                assert self._pending_borrows is not None
+                context.borrowed_roots = self._pending_borrows
+                self._pending_borrows = None
+                try:
+                    for root in context.borrowed_roots:
+                        root.bind(pin)
+                except Exception as exc:
+                    self._failed(invocation, context, exc)
             self.trace.record(TracePhase.BEGIN, invocation.invocation_id, refs=pin.refs, pin_id=pin.pin_id,
                 identities=tuple(row.identity for row in selection.rows))
             return invocation
@@ -364,8 +427,11 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 if self.directory.select(self.math.rows(value)) != context.selection:
                     raise ValueError("state invocation input differs from its selected rows")
                 context.value = self.math.prepare(value, context)
-            except Exception:
+            except Exception as exc:
                 self.trace.record(TracePhase.FAILED, invocation.invocation_id)
+                # Failed preparation can leave aliases in traceback frames; test_video retains grants.
+                if context.borrowed_roots:
+                    self._failed(invocation, context, exc)
                 self.cancel_step(invocation)
                 raise
 
@@ -446,6 +512,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         invocation.context.cancel_requested.set()
         with self._lock:
             context = self._context(invocation)
+            # Cancellation cannot prove that remote aliases were discarded; test_video checks no ACK.
+            if context.borrowed_roots:
+                self._failed(invocation, context, RuntimeError("borrowed invocation cancelled; resources retained"))
             self._order_sampler(invocation, context.sampler_stream)
             context.abort_owned_writes()
             self.trace.record(TracePhase.ABORT, invocation.invocation_id)
@@ -460,12 +529,30 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         context.cancel_requested.set()
         self.trace.record(TracePhase.FAILED, invocation.invocation_id,
             operation_id=None if context.publication is None else context.publication.operation_id)
+        # Quarantine borrowed failures, including exception-frame aliases; test_video covers both publication outcomes.
+        if context.borrowed_roots:
+            self._borrow_failed = True
+            if context.publication is None:
+                try:
+                    context.abort_owned_writes()
+                except Exception as cleanup:
+                    exc.add_note(f"local abort also failed; resources retained: {cleanup}")
+                raise exc
         if context.publication is not None:
             raise StateSettlementError(invocation, context.publication) from exc
         self.cancel_step(invocation)
         raise exc
 
     def _release(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]], context: StateTaskContext[DataT]) -> None:
+        # Only borrowed steps clear aliases and ACK before settlement; test_video checks ACK/failure ordering.
+        if context.borrowed_roots:
+            context.value = None
+            context.results.clear()
+            context.loss = None
+            context.guidance = context.sampler_feedback = None
+            context.guidance_ready = None
+            for root in context.borrowed_roots:
+                root.close()
         for pin in context.page_pins:
             context.release_owned_pin(pin)
         for receipt in context.page_publications:
@@ -494,6 +581,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             CudaStreamReadiness(stream).order_on(consumer)
 
     def _context(self, invocation: TaskGraphInvocation[StateTaskContext[DataT]]) -> StateTaskContext[DataT]:
+        if self._borrowed_resources:
+            self._require_borrow_live()
         if (self._active.get(invocation.invocation_id) is not invocation
             or invocation.execution is not self._runner):
             raise RuntimeError("state invocation is not registered as active")

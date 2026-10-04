@@ -196,7 +196,7 @@ class PageBundleArena:
 
     def __init__(self, plan: PlanBundle,
                  local_candidates: tuple[StateProviderPlan, ...] | None = None,
-                 *, device: torch.device | None = None) -> None:
+                 *, device: torch.device | None = None, _owned_resources: tuple[str, ...] | None = None) -> None:
         validate_plan_bundle(plan, local_candidates=local_candidates)
         self.plan = plan
         placements = {(item.device_kind, item.device_ordinal) for item in plan.state_physical.representations}
@@ -213,8 +213,13 @@ class PageBundleArena:
             raise ValueError("PageBundle arena requires one signed device placement")
         self._pools: dict[str, _Pools] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
+        self._owned_resources = tuple(layouts) if _owned_resources is None else _owned_resources
+        if len(set(self._owned_resources)) != len(self._owned_resources) or not set(self._owned_resources) <= layouts.keys():
+            raise ValueError("arena ownership must name distinct original plan resources")
         for selected in plan.state_physical.representations:
-            self._pools[selected.resource] = _Pools(layouts[selected.resource], selected, self.device)
+            # Partial materialization owns no remote pool; test_video tests the partition.
+            if selected.resource in self._owned_resources:
+                self._pools[selected.resource] = _Pools(layouts[selected.resource], selected, self.device)
         self._roots: dict[StateRef, _Root] = {}
         self._lineages: dict[LineageId, StateRef | None] = {}
         self._writes: dict[PageWrite, _Write] = {}
@@ -230,6 +235,11 @@ class PageBundleArena:
         self._admission_capacity_failures = 0
         self._lock = RLock()
         self._initialization = self._record(torch.cuda.current_stream(self.device)) if self.device.type == "cuda" else None
+
+    @property
+    def owned_resources(self) -> tuple[str, ...]:
+        """Internal materialization partition; the original plan remains complete."""
+        return self._owned_resources
 
     @property
     def active_lineages(self) -> int:

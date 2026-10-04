@@ -29,6 +29,7 @@ from pllm.execution.declaration import Builder, Call, Dimensions, Field, Shape, 
 from pllm.execution.codec import register_gradient_hook
 from pllm.execution.tensor_program import InvocationOutput, Observation, TaskOutput, TensorBatch
 from pllm.execution.ptts.page_bundle import PagePublication
+from pllm.execution.ptts.page_borrow import borrowed_root
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.trace import MAX_SNAPSHOT_BYTES
 from pllm.execution.shared_tensor import tensor_dtype
@@ -482,7 +483,7 @@ class TensorBinding(Builder[TensorFrame]):
                 return root[index]
             views[key] = memory_view
         def port(view: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> TensorPort:
-            return TensorPort(state.read(), lambda data, batch: view(batch.roots[0]), rowwise=False)
+            return TensorPort(state.read(), lambda data, batch: view(batch.parameter_root(str(state.declaration.resource))), rowwise=False)
         if scope is StateScope.REQUEST:
             def port(view: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> TensorPort:
                 def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
@@ -615,6 +616,12 @@ class TensorBinding(Builder[TensorFrame]):
     @staticmethod
     def state_metadata(state: State, *, version: bool) -> TensorPort:
         def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+            # Remote instance metadata never indexes local refs; test_video covers colliding lineage IDs.
+            borrowed = borrowed_root(batch.borrowed_roots, str(state.declaration.resource))
+            if borrowed is not None:
+                tensors = batch.parameter_root(str(state.declaration.resource))
+                return torch.full((len(data.rows),), int(borrowed.ref.version_id) if version else 0,
+                    device=tensors[0].device, dtype=torch.long)
             indices = tuple(batch.selection.row_states[row.identity] for row in data.rows)
             values = tuple(batch.selection.refs[index].version_id for index in indices) if version else indices
             return torch.tensor(values, device=batch.roots[0][0].device, dtype=torch.long)
@@ -696,6 +703,9 @@ class TensorBinding(Builder[TensorFrame]):
                     with torch.set_grad_enabled(bool(policy.input_gradients or policy.parameter_gradients)):
                         inputs, rows = values(data, batch)
                         result = function(inputs)
+                        # Borrowed inputs cannot escape as result aliases; test_video exercises rejection.
+                        for borrowed in batch.borrowed_roots:
+                            borrowed.check_output(result)
                         if policy.forward_rows:
                             if result.ndim == 0 or result.shape[0] != len(rows):
                                 raise ValueError("selected forward functions must preserve their logical row axis")
