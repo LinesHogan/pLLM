@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from pllm.contracts.auxiliary import StateTensorUpdate, WeightedCEBatch
-from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, AttachmentKind, BackendPlacementProbe
+from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, AttachmentKind, BackendPlacementProbe, DecodeWindow, DecodeRefresh, MissingPolicy
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.request_identity import RequestKeyField
@@ -407,7 +407,10 @@ class TensorBinding(Builder[TensorFrame]):
 
     def activation_patch(self, name: str, buffers: Mapping[str, Buffer], *, layers: tuple[int, ...],
                          operator: ActivationPatchOperator, first_tokens: int, last_tokens: int,
-                         scope: StateScope, keys: tuple[RequestKeyField, ...], namespace: str) -> None:
+                         scope: StateScope, keys: tuple[RequestKeyField, ...], namespace: str,
+                         decode: DecodeWindow = DecodeWindow.NONE,
+                         decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
+                         on_missing: MissingPolicy = MissingPolicy.STOP) -> None:
         if self.graph.tasks or self.graph.states or self.host:
             raise ValueError("activation replacement requires a sole model state and effect")
         width = 1 if operator is ActivationPatchOperator.ADD else 3
@@ -437,7 +440,8 @@ class TensorBinding(Builder[TensorFrame]):
         publication = self.publish(update, state, when=When.BEFORE_MODEL)
         self.overlay(state, update, publication, activations=tuple(ActivationPatchBinding(layer,
             tuple(state.field(state.fields[index * width + offset].name) for offset in range(width)),
-            first_tokens, last_tokens, operator) for index, layer in enumerate(layers)))
+            first_tokens, last_tokens, operator, decode=decode, decode_refresh=decode_refresh,
+            on_missing=on_missing) for index, layer in enumerate(layers)))
 
     @staticmethod
     def sampled_tokens() -> TensorPort:

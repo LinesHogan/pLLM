@@ -35,6 +35,7 @@ from pllm.learning import (
 from pllm.contracts.request_identity import RequestKeyField as RequestKeyField
 from pllm.contracts.semantic_graph import ConditionalLayerReplay as ConditionalLayerReplay, StateScope as StateScope
 from pllm.contracts.backend_attachment import ActivationPatchOperator as ActivationPatchOperator
+from pllm.contracts.backend_attachment import DecodeWindow as DecodeWindow, DecodeRefresh as DecodeRefresh, MissingPolicy as MissingPolicy
 from pllm.contracts.auxiliary import (StateTensorUpdate as StateTensorUpdate, CausalTrainBatch as CausalTrainBatch,
     WeightedCEBatch as WeightedCEBatch)
 from pllm.execution.codec import load_tensor_fields as load_tensor_fields
@@ -101,7 +102,7 @@ __all__ = ["make_llm", "ModelConfig", "ExecutionOptions", "HostRuntimeFacts", "W
     "export", "add_logits", "guide_sampling", "train", "Config", "Hidden", "Samples", "Parameter", "Capture", "StateIndex", "StateVersion", "Result",
     "InstanceState", "RequestState", "BaseLogits", "SampledTokens", "AdamW", "HiddenSite",
     "overlay", "Operand", "Buffer", "TensorUpdate", "ParameterOverlayOperator", "ParameterTarget", "RequestKeyField", "ConditionalLayerReplay", "differentiate",
-    "Activation", "Overlay", "ActivationPatchOperator", "StateScope", "StateTensorUpdate", "load_tensor_fields", "Recurrence",
+    "Activation", "Overlay", "ActivationPatchOperator", "DecodeWindow", "DecodeRefresh", "MissingPolicy", "StateScope", "StateTensorUpdate", "load_tensor_fields", "Recurrence",
     "transaction", "HostWorkload", "HostTransactionCoordinator", "TransactionHostBinding", "CompletionInput", "NoHostRequest",
     "CompletionWorkload", "InvocationOutput", "PagePublication", "StateRef", "CausalAdapterWorkload", "CausalModel", "CausalTrainBatch",
     "TensorRows", "PagedRows", "SGD", "Batch", "WeightedCEBatch", "TensorResult"]

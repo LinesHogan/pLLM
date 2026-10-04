@@ -118,15 +118,39 @@ class ActivationPatchOperator(StrEnum):
     ADD = "add"
 
 
+class DecodeWindow(StrEnum):
+    """Which decode rows a signed activation patch applies to."""
+
+    NONE = "none"
+    ALL = "all"
+
+
+class DecodeRefresh(StrEnum):
+    """INHERIT keeps the admission-pinned version; STEP selects the version at step entry."""
+
+    INHERIT = "inherit"
+    STEP = "step"
+
+
+class MissingPolicy(StrEnum):
+    """Declared behavior when a refreshing decode step has no new input version."""
+
+    STOP = "stop"
+    HOLD = "hold"
+
+
 @dataclass(frozen=True, slots=True)
 class ActivationPatchBinding:
-    """Signed tensor operation on selected prefill block-output rows."""
+    """Signed tensor operation on selected prefill and declared decode block-output rows."""
 
     layer: int
     fields: tuple[LayoutFieldId, ...]
     first_tokens: int
     last_tokens: int
     operator: ActivationPatchOperator = ActivationPatchOperator.LOW_RANK_AFFINE
+    decode: DecodeWindow = DecodeWindow.NONE
+    decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT
+    on_missing: MissingPolicy = MissingPolicy.STOP
 
 
 @dataclass(frozen=True, slots=True)

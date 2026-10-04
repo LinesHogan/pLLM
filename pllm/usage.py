@@ -10,7 +10,7 @@ from typing import Annotated, ClassVar, TypeVar, cast, get_args, get_origin
 import torch
 
 from pllm.authoring import BackendWorkload, BackendCompileFacts, BackendRequirements, TensorStepInput
-from pllm.contracts.backend_attachment import BackendAttachmentSpec, ActivationPatchOperator, AttachmentKind
+from pllm.contracts.backend_attachment import BackendAttachmentSpec, ActivationPatchOperator, AttachmentKind, DecodeWindow, DecodeRefresh, MissingPolicy
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorLayoutRequest
 from pllm.contracts.hidden_locator import HiddenSite, HiddenPhase
@@ -165,6 +165,14 @@ class Activation:
     first_tokens: int = 0
     last_tokens: int = 2
     operator: ActivationPatchOperator = ActivationPatchOperator.LOW_RANK_AFFINE
+    decode: DecodeWindow = DecodeWindow.NONE
+    decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT
+    on_missing: MissingPolicy = MissingPolicy.STOP
+
+    def __post_init__(self) -> None:
+        if self.decode is DecodeWindow.NONE and (
+            self.decode_refresh is not DecodeRefresh.INHERIT or self.on_missing is not MissingPolicy.STOP):
+            raise ValueError("decode window is off; refresh and missing policies require decode rows")
 
 
 @dataclass(frozen=True)
@@ -484,6 +492,7 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
             definitions.append((name, fingerprint(effect)))
             b.activation_patch(effect.state, _buffers(definition), layers=effect.layers, operator=effect.operator,
                 first_tokens=effect.first_tokens, last_tokens=effect.last_tokens, namespace=definition.namespace,
+                decode=effect.decode, decode_refresh=effect.decode_refresh, on_missing=effect.on_missing,
                 scope=StateScope.REQUEST if isinstance(definition, RequestState) else StateScope.INSTANCE,
                 keys=definition.keys if isinstance(definition, RequestState) else ())
 

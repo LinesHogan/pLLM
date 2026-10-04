@@ -203,6 +203,27 @@ pub(crate) enum ActivationPatchOperator {
     Add,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DecodeWindow {
+    None,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DecodeRefresh {
+    Inherit,
+    Step,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissingPolicy {
+    Stop,
+    Hold,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ActivationPatchBinding {
@@ -211,6 +232,9 @@ pub(crate) struct ActivationPatchBinding {
     pub(crate) first_tokens: u32,
     pub(crate) last_tokens: u32,
     pub(crate) operator: ActivationPatchOperator,
+    pub(crate) decode: DecodeWindow,
+    pub(crate) decode_refresh: DecodeRefresh,
+    pub(crate) on_missing: MissingPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
