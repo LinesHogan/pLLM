@@ -584,7 +584,11 @@ bind_outlined_region 等）减少；MutationGranularity 先诊断运行时无视
 （只有从已签署数学可达的助手方法才进签名并冻结；owner 引用逃逸静态
 分析时回退全量签署，签名行为不收紧；测试 +12 行）与 authority 门禁
 AST 化（两套正则表与 240 字符窗口改单遍 AST 访问器，注释/docstring
-不再误伤，Rust 侧保留行扫描；逐条自测与旧正则语法对齐）。
+不再误伤，Rust 侧保留行扫描；逐条自测与旧正则语法对齐）；⑪诊断
+出口最小版——legal() 拒绝时把逆序时间对经（单值）调度映射回语句
+实例，报字典序最小的首条违规边（"first violated edge: { A[i] ->
+B[i' = i] : ... }"），兑现 isl-scheduling.md"哪些边阻止并行"的
+承诺；cargo +1 测试，Python 测试不变。
 
 ## 默认路径改为确定性准备加 funded 并发（调度精简入账）
 

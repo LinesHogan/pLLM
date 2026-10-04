@@ -1044,7 +1044,17 @@ pub(super) fn legal(domain: &UnionSet, dependencies: &UnionMap, schedule: &Union
     let scheduled = isl(isl(isl(dependencies.copy())?.apply_domain(isl(schedule.copy())?))?
         .apply_range(isl(schedule.copy())?))?;
     if !isl(scheduled.is_subset(&before))? {
-        return Err("schedule violates an original value or resource dependency".into());
+        // Name the offending edge, not just the failure class: map the wrongly
+        // ordered time pairs back through the (single-valued) schedule and
+        // report the lexicographically first original dependency edge.
+        let inverse = isl(isl(schedule.copy())?.reverse())?;
+        let edges = isl(isl(isl(scheduled.subtract(before))?
+            .apply_domain(isl(inverse.copy())?))?
+            .apply_range(inverse))?;
+        let minimal = isl(edges.lexmin())?;
+        return Err(format!(
+            "schedule violates an original value or resource dependency; first violated edge: {}",
+            map_text(&minimal)?));
     }
     Ok(())
 }
@@ -1737,6 +1747,17 @@ mod tests {
             let map = isl(UnionMap::read_from_str(&ctx, &candidate.schedule_map)).unwrap();
             legal(&domain, &deps, &map).unwrap();
         }
+    }
+
+    #[test]
+    fn illegal_schedule_names_the_first_violated_edge() {
+        let ctx = context().unwrap();
+        let domain = isl(UnionSet::read_from_str(&ctx, "{ A[i] : 0<=i<4; B[i] : 0<=i<4 }")).unwrap();
+        let dependencies = isl(UnionMap::read_from_str(&ctx, "{ A[i] -> B[i] }")).unwrap();
+        // B strictly before A violates A -> B on every instance.
+        let schedule = isl(UnionMap::read_from_str(&ctx, "{ B[i] -> [0,i] : 0<=i<4; A[i] -> [1,i] : 0<=i<4 }")).unwrap();
+        let error = legal(&domain, &dependencies, &schedule).unwrap_err();
+        assert!(error.contains("first violated edge: { A[i] -> B[i' = i]"), "{error}");
     }
 
     #[test]
