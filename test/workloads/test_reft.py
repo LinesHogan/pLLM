@@ -76,13 +76,51 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     assert compile_backend_attachment(changed) != signed.decision
     with pytest.raises(ValueError):
         validate_backend_attachment(changed, signed.decision)
+    if find_spec("vllm") is not None:
+        _decode_low_rank_keeps_parameters_and_recomputes_delta(deployment, value, update, identity, hidden, expected, bias, rotation)
     execution.retire((identity,))
     execution.retire(())
     diagnostics = execution.diagnostics()
-    assert diagnostics.update_count == 1
+    assert diagnostics.update_count == (2 if find_spec("vllm") is not None else 1)
     assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
     if find_spec("vllm") is not None:
         _request_edits_share_publication_and_exact_prefill_rows(facts)
+
+
+def _decode_low_rank_keeps_parameters_and_recomputes_delta(deployment, value, update, identity, hidden, expected, bias, rotation):
+    from pllm.backends.vllm.activation import VllmActivationPatch
+    execution = deployment.execution
+    binding, = deployment.attachment.inputs.request.activation_bindings
+    layer = SimpleNamespace(forward=lambda positions, hidden, residual: (hidden.clone(), residual))
+    adapter = VllmActivationPatch(SimpleNamespace(model=SimpleNamespace(layers=[layer])),
+        (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),),
+        deployment.attachment.inputs.request.state_resource)
+    rows = PackedPhaseRowBatch(1, 0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity)
+        for i in range(len(hidden))))
+    invocation = execution.start_step(replace(value, auxiliary=update))
+    execution.execute_anchor(invocation, AnchorId(0))
+    try:
+        adapter.prepare(rows, invocation.context, execution.directory)
+        actual, _ = layer.forward(torch.arange(len(hidden)), hidden, None)
+        torch.testing.assert_close(actual, hidden + expected)
+        # The same exact parameters must operate on each forward's current hidden.
+        actual, _ = layer.forward(torch.arange(len(hidden)), hidden * 2, None)
+        constant = sum(bias[k] * rotation[:, k] for k in range(len(bias)))
+        torch.testing.assert_close(actual, 2 * hidden + 2 * expected - constant)
+        assert invocation.context.published_pin.refs == invocation.context.publication.after_refs
+        adapter.clear()
+        for anchor in execution.arena.plan.timeline.anchors[1:]:
+            execution.execute_anchor(invocation, AnchorId(anchor.ordinal))
+            if anchor.ordinal == execution.sampler_anchor_id:
+                execution.complete_sampler(invocation)
+        execution.finish_step(invocation)
+        missing = execution.start_step(value)
+        execution.execute_anchor(missing, AnchorId(0))
+        with pytest.raises(RuntimeError, match="requires a new publication"):
+            adapter.prepare(rows, missing.context, execution.directory)
+        execution.cancel_step(missing)
+    finally:
+        adapter.close()
 
 
 def _decode_declarations_require_resigning(facts, signed):
@@ -181,7 +219,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
             return self.output, residual
     layer = Layer()
     adapter = VllmActivationPatch(SimpleNamespace(model=SimpleNamespace(layers=[layer])),
-        deployment.attachment.inputs.request.activation_bindings)
+        deployment.attachment.inputs.request.activation_bindings, deployment.attachment.inputs.request.state_resource)
     try:
         adapter.prepare(rows, context, execution.directory)
         assert context.published_pin is not None and context.published_pin.refs == context.publication.after_refs

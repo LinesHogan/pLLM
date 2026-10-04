@@ -1,4 +1,4 @@
-"""Signed prefill activation patches borrowing original instance admission pins."""
+"""Signed phase windows borrowing admission or exact invocation publication pins."""
 
 from __future__ import annotations
 
@@ -10,10 +10,14 @@ from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM, Qwen2DecoderLayer
 
 from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.ptts.request_state import RequestStateDirectory
+from pllm.execution.ptts.page_bundle import PagePin
 from pllm.execution.state_execution import DataT, StateTaskContext
-from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator
+from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, DecodeRefresh, DecodeWindow
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
-from pllm.contracts.semantic_graph import StateScope
+from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.semantic_graph import StateResource, StateScope
+from pllm.contracts.state_ref import StateRef
 
 
 _DecoderForward = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]
@@ -51,7 +55,8 @@ class _ActivationLayer:
 
 
 class VllmActivationPatch:
-    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ActivationPatchBinding, ...]) -> None:
+    def __init__(self, model: Qwen2ForCausalLM, bindings: tuple[ActivationPatchBinding, ...], resource: str) -> None:
+        self.resource = StateResource(resource)
         self.layers = tuple(_ActivationLayer(model.model.layers[binding.layer], binding) for binding in bindings)
         for handle in self.layers:
             handle.layer.forward = handle.forward
@@ -62,29 +67,51 @@ class VllmActivationPatch:
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT],
                 directory: RequestStateDirectory) -> None:
-        published = (context.borrow_published(context.publication.after_refs)
-            if directory.scope is StateScope.REQUEST and context.publication is not None else None)
+        versions: dict[tuple[RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
         for handle in self.layers:
             prepared: list[_PatchRows] = []
-            for identity in dict.fromkeys(row.identity for row in rows.prefill_rows):
-                source = tuple(row for row in rows.prefill_rows if row.identity == identity)
-                length = len(source)
-                selected = tuple(row.packed_row_index for index, row in enumerate(source)
-                    if index < handle.binding.first_tokens or index >= length - handle.binding.last_tokens)
-                if directory.scope is StateScope.INSTANCE:
-                    pin = directory.inference_pin(identity, context.pin.stream)
-                    (ref,) = pin.refs
-                else:
-                    ref, pin = context.selection.ref_for(identity), context.pin
-                    if published is not None:
-                        replacement = next((candidate for candidate in published.refs if candidate.lineage_id == ref.lineage_id), None)
-                        if replacement is not None:
-                            ref, pin = replacement, published
-                if not selected or ref.version_id == 0:
+            for phase, phase_rows in ((HiddenPhase.PREFILL, rows.prefill_rows), (HiddenPhase.DECODE, rows.decode_rows)):
+                if phase is HiddenPhase.DECODE and handle.binding.decode is DecodeWindow.NONE:
                     continue
-                prepared.append(_PatchRows(torch.tensor(selected, device=context.arena.device, dtype=torch.long),
-                    tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields)))
+                refresh = phase is HiddenPhase.DECODE and handle.binding.decode_refresh is DecodeRefresh.STEP
+                for identity in dict.fromkeys(row.identity for row in phase_rows):
+                    source = tuple(row for row in phase_rows if row.identity == identity)
+                    selected = tuple(row.packed_row_index for index, row in enumerate(source)
+                        if phase is HiddenPhase.DECODE or index < handle.binding.first_tokens
+                        or index >= len(source) - handle.binding.last_tokens)
+                    if not selected:
+                        continue
+                    key = (identity, refresh)
+                    if key not in versions:
+                        versions[key] = self._version(identity, refresh, context, directory)
+                    pin, ref = versions[key]
+                    if ref.version_id == 0:
+                        if phase is HiddenPhase.DECODE:
+                            raise RuntimeError("decode activation requires its first published injection")
+                        continue
+                    prepared.append(_PatchRows(torch.tensor(selected, device=context.arena.device, dtype=torch.long),
+                        tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields)))
             handle.prepared = tuple(prepared)
+
+    def _version(self, identity: RequestIdentity, refresh: bool, context: StateTaskContext[DataT],
+                 directory: RequestStateDirectory) -> tuple[PagePin, StateRef]:
+        if directory.scope is StateScope.INSTANCE and not refresh:
+            pin = directory.inference_pin(identity, context.pin.stream)
+            ref, = (ref for ref in pin.refs if context.arena.root(ref).resource == self.resource)
+            return pin, ref
+        if directory.scope is StateScope.INSTANCE:
+            original, = context.selection.for_resource(self.resource).refs
+        else:
+            original = context.selection.ref_for(identity, self.resource)
+        ref = context.current_owned_ref(original)
+        if refresh and ref == original:
+            # No implicit HOLD: its signed no-input branch is a separate lifecycle.
+            raise RuntimeError("decode STEP requires a new publication; missing-input handling is not enabled")
+        if ref == original:
+            return context.pin, ref
+        updated = tuple(context.current_owned_ref(candidate) for candidate in context.selection.for_resource(self.resource).refs
+            if context.current_owned_ref(candidate) != candidate)
+        return context.borrow_published(updated), ref
 
     def clear(self) -> None:
         for handle in self.layers:

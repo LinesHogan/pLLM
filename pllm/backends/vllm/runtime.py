@@ -33,6 +33,7 @@ from pllm.contracts.feedback import BarrierState, Completion, CompletionBatch, C
 
 from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.replay import VllmLayerReplay, VllmTokenwiseReplay
@@ -58,6 +59,7 @@ from pllm.contracts.backend_attachment import (
     AttachmentTopology,
     BackendPlacementProbe,
     CausalModelDomain,
+    DecodeWindow,
     SignedBackendAttachment,
 )
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
@@ -101,6 +103,7 @@ _BACKEND_ABI_FIELDS = (
     "rows=one_logit_per_request",
     "attachment=shared_plan_v7",
     "attachments=sampler_training|parameter_overlay|activation_patch",
+    "activation=phase_windows/exact_step_pins@1",
     "model=causal_indexed_layer@5",
 )
 _REQUEST_CAPABILITIES = (
@@ -153,6 +156,7 @@ class _RunnerSession(Protocol):
     @property
     def updated_apply_count(self) -> int: ...
     def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None: ...
+    def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None: ...
     def identity(self, request_id: str) -> RequestIdentity: ...
     def before_execute(self, scheduler_output: SchedulerOutput) -> None: ...
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None: ...
@@ -176,6 +180,18 @@ class _RunnerSession(Protocol):
 class _PackedStep(Generic[DataT]):
     rows: PackedSamplerRowBatch
     invocation: TaskGraphInvocation[StateTaskContext[DataT]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReadonlyStepInput:
+    """Internal handoff of complete received grants for one original engine step."""
+
+    plan_epoch: int
+    step_id: int
+    roots: tuple[BorrowedStateRoot, ...]
+
+
+ReadonlyStepReceiver = Callable[[PackedSamplerRowBatch, torch.cuda.Stream], ReadonlyStepInput]
 
 
 class VllmSession(Generic[DataT, ResultT]):
@@ -208,8 +224,14 @@ class VllmSession(Generic[DataT, ResultT]):
             plan.semantic_graph.tasks[attachment.inputs.request.task_bindings[0].task_id].timing.after == "request.prepare")
         self._overlay = VllmParameterOverlay(model, overlay_bindings,
             capture=not self._overlay_import) if overlay_bindings else None
-        self._activation = VllmActivationPatch(model, attachment.inputs.request.activation_bindings) if (
+        self._activation = VllmActivationPatch(model, attachment.inputs.request.activation_bindings,
+            attachment.inputs.request.state_resource) if (
             attachment.inputs.request.activation_bindings) else None
+        self._decode_injection = any(binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings)
+        self._token_frontiers: dict[RequestIdentity, int] = {}
+        self._readonly_receiver: ReadonlyStepReceiver | None = None
+        self._received_readonly: ReadonlyStepInput | None = None
+        self._input_failed = False
         tasks = tuple(task for task in attachment.inputs.plan.semantic_graph.tasks if task.replay is not None)
         self._replay: VllmLayerReplay | VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
@@ -236,6 +258,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.admit((), torch.cuda.current_stream(execution.device))
 
     def stage_input(self, batch: AuxiliaryInput[torch.Tensor] | None, identities: tuple[RequestIdentity, ...]) -> None:
+        self._require_input_live()
         if self._tuning is not None and batch is not None:
             raise ValueError("private native tuning cannot consume user auxiliary input")
         if self._auxiliary is not None or self._step is not None or self._pending_identities or self._identities:
@@ -243,6 +266,36 @@ class VllmSession(Generic[DataT, ResultT]):
         validate_auxiliary(batch, self._deployment.attachment.inputs.plan, SharedTensor.describe)
         self._auxiliary = batch
         self._pending_identities = {identity.request_id: identity for identity in identities}
+
+    def bind_readonly_input(self, receiver: ReadonlyStepReceiver) -> None:
+        """Install example-owned transport before requests; it supplies no model mathematics."""
+        self._require_input_live()
+        if (self._readonly_receiver is not None or self._step is not None or self._next_step_id
+            or self._identities or self._pending_identities or self._auxiliary is not None or self._tuning is not None
+            or self._activation is None or all(state.resource in self._deployment.execution.arena.owned_resources
+                for state in self.attachment.inputs.plan.semantic_graph.states)):
+            raise RuntimeError("read-only step input requires an idle borrowed activation session")
+        self._readonly_receiver = receiver
+
+    def _require_input_live(self) -> None:
+        if self._input_failed:
+            raise RuntimeError("canonical step input is fail-stopped; received grants remain retained")
+
+    def _receive_readonly(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> None:
+        if self._readonly_receiver is None:
+            return
+        try:
+            self._received_readonly = self._readonly_receiver(rows, stream)
+            received = self._received_readonly
+            if (received.plan_epoch, received.step_id) != (rows.plan_epoch, rows.step_id):
+                raise ValueError("read-only input differs from the original epoch/step; grants retained")
+            if any(root.stream != stream for root in received.roots):
+                raise ValueError("read-only input differs from the receiving stream; grants retained")
+            self._deployment.execution.stage_readonly(received.roots)
+            self._received_readonly = None  # Ownership is now the original execution's pending/active borrow.
+        except BaseException:
+            self._input_failed = True
+            raise
 
     def identity(self, request_id: str) -> RequestIdentity:
         return self._identities[request_id]
@@ -310,8 +363,12 @@ class VllmSession(Generic[DataT, ResultT]):
         return 0 if self._overlay is None else self._overlay.updated_apply_count
 
     def before_execute(self, scheduler_output: SchedulerOutput) -> None:
+        self._require_input_live()
         if self._step is not None:
             raise RuntimeError("prior vLLM workload step is still active")
+        if self._decode_injection and (scheduler_output.preempted_req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids):
+            self._input_failed = True
+            raise RuntimeError("per-decode activation injection and vLLM preemption cannot be enabled together")
         execution = self._deployment.execution
         execution.arena.collect_completed()
         finished = tuple(self._identities[request_id] for request_id in sorted(
@@ -338,6 +395,7 @@ class VllmSession(Generic[DataT, ResultT]):
         return self._next_step_id
 
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
+        self._require_input_live()
         if self._tuning is not None:
             self._tuning.record_rows(rows.row_batch.rows)
         if self._step is not None:
@@ -346,6 +404,12 @@ class VllmSession(Generic[DataT, ResultT]):
             raise ValueError("backend rows differ from the original execution step")
         if rows.row_batch.total_rows > self.attachment.inputs.probe.max_packed_rows:
             raise ValueError("packed input exceeds the signed backend row capacity")
+        if self._decode_injection:
+            if any(row.token_offset < self._token_frontiers.get(row.identity, 0) for row in rows.row_batch.rows):
+                self._input_failed = True
+                raise RuntimeError("per-decode activation injection and vLLM preemption/history recomputation cannot be enabled together")
+            for row in rows.row_batch.rows:
+                self._token_frontiers[row.identity] = max(self._token_frontiers.get(row.identity, 0), row.token_offset + 1)
         requests = rows.identities
         self._next_step_id += 1
         step = _PackedStep[DataT](rows)
@@ -369,6 +433,7 @@ class VllmSession(Generic[DataT, ResultT]):
             key=lambda identity: (identity.request_id, identity.prompt_idx, identity.sample_idx)))
         stream = torch.cuda.current_stream(execution.device)
         if execution.directory.scope is StateScope.INSTANCE or self._activation is not None or self._overlay_import:
+            self._receive_readonly(rows, stream)
             value = TensorStepInput(rows.row_batch, rows, auxiliary=self._auxiliary)
             invocation = execution.start_step(value, stream)
             if execution.directory.scope is StateScope.INSTANCE or not self._pending_identities:
@@ -493,6 +558,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.retire(held)
         for identity in identities:
             self._identities.pop(identity.request_id)
+            self._token_frontiers.pop(identity, None)
 
     def retire_all(self) -> None:
         if self._step is not None:
@@ -562,6 +628,8 @@ class Runner(Generic[SamplerT]):
     ) -> None:
         if self._workload_session is not None:
             raise RuntimeError("canonical runner already owns a workload session")
+        if self.cache_config.enable_prefix_caching and deployment.attachment.inputs.request.activation_bindings:
+            raise ValueError("signed activation injection does not support shared prefix caching")
         if self.cache_config.enable_prefix_caching and any(task.replay is not None
             for task in deployment.attachment.inputs.plan.semantic_graph.tasks):
             raise ValueError("signed KV replay does not support shared prefix caching")
