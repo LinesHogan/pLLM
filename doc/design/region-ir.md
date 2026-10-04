@@ -4,6 +4,16 @@
 [功能与进展收口](implementation-status.md) 为准；下文初版的 order 示例已退出支持，
 仅保留为设计演进记录，不能作为当前可执行接口使用。
 
+## 代码在哪里（capture → Program → 调度 → 执行）
+
+| 环节 | 入口 | 说明 |
+| --- | --- | --- |
+| 捕获 | `pllm/execution/module_graph.py::capture_module_export` / `capture_module_partition`；单格用 `exported_cell.py::ExportedCell.capture` | torch export → 区域 IR 节点 |
+| 程序 | `pllm/execution/exported_region.py::ExportedRegion` / `import_exported_region` | 拼 Program（资源声明 + 函数 + 入口） |
+| 分析与调度 | Rust `region_dependence.rs::analyze`；Python 入口 `region_streams.py::plan_region_schedule` | 依赖闭包、ISL 候选、合法性；`legal()` 拒绝时报首条违规边 |
+| 准备与绑定 | `region_optimization.py::prepare_region_execution`（默认路径）/ `optimize_region`（显式测量） | 确定准备、候选绑定 |
+| 执行 | `region_execution.py::RegionExecution` | 指令下沉、stream 发射 |
+
 ## 当前源接口
 
 所有生产构造器均使用数据端口形式。资源通过 Program 的资源声明、函数的

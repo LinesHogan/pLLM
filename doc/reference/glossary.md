@@ -57,7 +57,14 @@
 - **Overlay** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
   与字段的生产方式无关。
 - **重放（Replay）** —— 签名重跑一个层区间（`ConditionalLayerReplay`）或逐
-  token 循环，由同一发布纪律内的逐层 KV 备份/恢复支撑。
+  token 循环，由同一发布纪律内的逐层 KV 备份/恢复支撑。同一概念的四个
+  名字：`recirculation` 是场景/负载名（`pllm/workloads/recirculation.py`），
+  `Recurrence` 是负载作者的声明 DSL（`pllm/execution/replay.py`），
+  `TokenwiseLayerReplay` / tokenwise replay 是逐 token 循环的执行机制
+  （`pllm/execution/tokenwise_region.py`、`pllm/backends/vllm/replay.py`）。
+- **参考调度（Reference schedule）** —— 按程序原始语句顺序排列的那份
+  schedule。它没有独立公开符号：构造在 Rust `region_dependence.rs::analyze`
+  内部（`reference`），是容量与合法性的基线，也是测量路径的对照组。
 - **Route lineage** —— 由用户计算的路由键匹配的请求共享的 lineage，可休眠
   存续；会话关闭时显式退役。
 - **证据（Evidence）** —— 编号的、记入 manifest 的可观测契约，带一条能证明
