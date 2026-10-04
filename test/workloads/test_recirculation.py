@@ -20,14 +20,18 @@ from pllm.execution.paged_access import PagedLayer, PagedResourceView, bind_page
 from pllm.execution.region_resources import HostResourceBinding, PagedResourceBinding, ReadonlyResourceBinding
 from pllm.execution.tensor_borrow import ReadonlyTensorCell, ReadonlyTensorView
 from pllm.execution.runtime_facts import RuntimeFacts
+from pllm.execution.backend_attachment import bind_backend_attachment, derive_attachment_resources
+from pllm.execution.declaration import Builder, Field, When, native
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
+from pllm.execution.scheduler import compile_schedule
 from pllm.workloads.recirculation import RecirculationConfig, RecirculationWorkload
-from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, CausalModelDomain
+from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, AttachmentGraphMode, AttachmentKind, AttachmentTaskRole, AttachmentTopology, BackendPlacementProbe, CausalModelDomain, DecodeWindow, DecodeRefresh, MissingPolicy
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId
+from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, TaskResourceFact, TaskSymbol, ValueResourceFact
 from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import TensorDType
+from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.config import ExecutionOptions
 
 
@@ -37,6 +41,7 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
         TensorDType.FLOAT32, 4, 8, (), ("model/tokenwise_replay@1",), causal_domain=CausalModelDomain(2, 3, 8))
     facts = BackendCompileFacts(probe, RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1",)),
         (), 2, 0, 0, layer_count=3)
+    _activation_declaration_retains_publication_and_costs(probe)
     config = RecirculationConfig(alpha=0.7, beta=None, ramp_tokens=2)
     assert RecirculationConfig is pllm.Recurrence
     class PlainRecurrence(pllm.Workload):
@@ -303,3 +308,80 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
     for invalid in (replace(config, source_layer=0), replace(config, destination_layer=3)):
         with pytest.raises(ValueError):
             RecirculationWorkload(invalid).compile_backend(facts)
+
+
+def _activation_declaration_retains_publication_and_costs(probe):
+    declarations = []
+    for replay_first in (False, True):
+        b = Builder("activation.replay", "a" * 64)
+        features = b.state("features", (Field("value", (4,)),))
+        inject = b.state("inject", (Field("delta", (4,)),))
+        encode = b.compute("encode", inputs={}, outputs=("value",), reads=(features.version(),), when=When.BEFORE_MODEL)
+        write = b.compute("write", inputs={"hidden": encode["value"]}, outputs=("updated",), changes=inject,
+            effect=StateEffectKind.TRANSITION, when=When.BEFORE_MODEL)
+        publication = b.publish(write, inject, when=When.BEFORE_MODEL)
+        forward = b.compute("forward", inputs={"rows": b.rows()}, outputs=("normal_hidden",),
+            when=When.MODEL_UPDATE, replay=pllm.Recurrence().effect(3),
+            implementations=(native(TOKENWISE_REPLAY_IMPLEMENTATION, "model/tokenwise_replay@1"),))
+        patch = ActivationPatchBinding(1, (LayoutFieldId(0),), 1, 1, ActivationPatchOperator.ADD,
+            DecodeWindow.ALL, DecodeRefresh.STEP, MissingPolicy.HOLD)
+        if replay_first:
+            b.model_effect(forward, AttachmentKind.MODEL_REPLAY)
+        b.overlay(inject, write, publication, activations=(patch,))
+        if not replay_first:
+            b.model_effect(forward, AttachmentKind.MODEL_REPLAY)
+        graph, layouts, spec = b.finish()
+        assert spec.kind is AttachmentKind.MODEL_REPLAY and spec.activation_bindings == (patch,)
+        assert spec.state_resource == inject.declaration.resource and spec.sampler_anchor == "sampler.pre_draw"
+        assert spec.tasks == ((AttachmentTaskRole.COMPUTE, forward.symbol),
+            (AttachmentTaskRole.TRANSITION, write.symbol), (AttachmentTaskRole.PUBLISH, publication.symbol))
+        task = next(task for task in graph.tasks if task.symbol == forward.symbol)
+        assert task.effects == (inject.version(publication),)
+        assert task.inputs[-1].source == publication["publication"]
+        declarations.append((graph, layouts, spec))
+        before = b.finish()
+        with pytest.raises(ValueError, match="one activation publication"):
+            b.overlay(inject, write, publication, activations=(patch,))
+        assert b.finish() == before
+        with pytest.raises(ValueError, match="only activation and tokenwise"):
+            b.model_effect(forward)  # An observation cannot silently replace the pair.
+        assert b.finish() == before
+    assert declarations[0] == declarations[1], "declaration order cannot discard either effect"
+
+    timeline = replace(RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1", "transition/full_root@1")),
+        region_policy=RegionSelectionPolicy(schedule_policy="serial"), reserved_bytes=(80,) * 8,
+        task_resources=(TaskResourceFact(TaskSymbol("encode"), 32, 8), TaskResourceFact(TaskSymbol("publish"), 0),
+            TaskResourceFact(TaskSymbol("write"), 16)),
+        value_resources=(ValueResourceFact(TaskSymbol("encode"), "value", 16),
+            ValueResourceFact(TaskSymbol("publish"), "publication", 0), ValueResourceFact(TaskSymbol("write"), "updated", 0)))
+    funded = derive_attachment_resources(probe, graph, timeline)
+    assert set(timeline.task_resources) <= set(funded.task_resources)
+    assert set(timeline.value_resources) <= set(funded.value_resources)
+    assert funded.reserved_bytes == timeline.reserved_bytes
+    assert derive_attachment_resources(probe, graph, funded) == funded
+    replay_cost = next(fact.workspace_bytes for fact in funded.task_resources if fact.task == forward.symbol)
+    budget = 80 + sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources) + 16 + replay_cost
+    assert derive_attachment_resources(probe, graph, replace(timeline, memory_budget_bytes=budget)).task_resources == funded.task_resources
+    with pytest.raises(ValueError, match="reference payload exceeds"):
+        derive_attachment_resources(probe, graph, replace(timeline, memory_budget_bytes=budget - 1))
+
+    # Alpha1 signs the contract; semantic READ acceptance awaits the alpha3 source.
+    # Neither omission of READ nor a hidden reference is a permitted workaround.
+    with pytest.raises(ValueError, match="unsupported tokenwise layer replay effect"):
+        compile_schedule(graph, funded)
+    unread = replace(graph, tasks=tuple(replace(item, effects=()) if item.symbol == forward.symbol else item
+        for item in graph.tasks))
+    with pytest.raises(ValueError, match="exact publication read"):
+        derive_attachment_resources(probe, unread, timeline)
+    plan = compile_page_bundle_plan((unread, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),),
+        1, 65536, torch.device("cpu"))
+    with pytest.raises(ValueError, match="exact READ of its signed inject publication"):
+        bind_backend_attachment(plan, probe, spec)
+    for invalid, reason in (
+        (replace(spec, tasks=spec.tasks[:1]), "distinct compute, transition and publish"),
+        (replace(spec, state_resource="features"), "transition semantics"),
+        (replace(spec, activation_bindings=(replace(patch, fields=(LayoutFieldId(9),)),)), "field is absent"),
+        (replace(spec, activation_bindings=(patch, patch)), "unique layers"),
+    ):
+        with pytest.raises(ValueError, match=reason):
+            bind_backend_attachment(plan, probe, invalid)

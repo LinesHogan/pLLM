@@ -1,14 +1,17 @@
 """Evidence 26: independent LoReFT math, explicit publication and no-update path."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib.util import find_spec
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
+import pllm
 
 from pllm.execution.activation import low_rank_affine_delta
 from pllm.execution.backend_attachment import compile_backend_attachment
+from pllm.execution.codec import encode_boundary
 from test.revalidation import validate_backend_attachment
 from pllm.authoring import BackendCompileFacts, StateTensorUpdate, TensorStepInput
 from pllm.contracts.auxiliary import validate_auxiliary
@@ -16,7 +19,7 @@ from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import RuntimeFacts
 from pllm.workloads.reft import ActivationConfig, ActivationWorkload, load_loreft_interventions
-from pllm.contracts.backend_attachment import ActivationPatchOperator, AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe
+from pllm.contracts.backend_attachment import ActivationPatchOperator, AttachmentGraphMode, AttachmentTopology, BackendPlacementProbe, DecodeWindow, DecodeRefresh, MissingPolicy
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
@@ -36,6 +39,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     workload = ActivationWorkload(ActivationConfig((0,), 2, first_tokens=1, last_tokens=1))
     deployment = workload.compile_backend(assert_finite_resources(workload, facts))
     execution, signed = deployment.execution, deployment.attachment
+    _decode_declarations_require_resigning(facts, signed)
     assert_auxiliary_preflight(signed, StateTensorUpdate(tuple(torch.empty(shape, device="meta", dtype=torch.float64)
         for shape in ((2, 5), (2,), (4, 2)))))
     rows = PackedPhaseRowBatch(1, 0, 0, ())
@@ -79,6 +83,58 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     assert diagnostics.active_lineages == diagnostics.inference_pins == diagnostics.pending_state_releases == diagnostics.fallback_count == 0
     if find_spec("vllm") is not None:
         _request_edits_share_publication_and_exact_prefill_rows(facts)
+
+
+def _decode_declarations_require_resigning(facts, signed):
+    legacy = pllm.Activation("intervention", (0,), 1, 1, ActivationPatchOperator.ADD)
+    with pytest.raises(TypeError):
+        pllm.Activation("intervention", (0,), 1, 1, ActivationPatchOperator.ADD, DecodeWindow.ALL)
+    assert (legacy.decode, legacy.decode_refresh, legacy.on_missing) == (
+        DecodeWindow.NONE, DecodeRefresh.INHERIT, MissingPolicy.STOP)
+    for change in (dict(decode_refresh=DecodeRefresh.STEP), dict(on_missing=MissingPolicy.HOLD)):
+        with pytest.raises(ValueError, match="decode window is off"):
+            replace(legacy, **change)
+        # Direct compiler callers cannot bypass the author-side check.
+        binding, = signed.inputs.request.activation_bindings
+        invalid = replace(signed.inputs, request=replace(signed.inputs.request,
+            activation_bindings=(replace(binding, **change),)))
+        with pytest.raises(ValueError, match="decode window is off"):
+            compile_backend_attachment(invalid)
+
+    @dataclass(frozen=True)
+    class DeclaredActivation(pllm.Workload):
+        patch: pllm.Activation
+
+        @property
+        def intervention(self) -> pllm.InstanceState:
+            return pllm.InstanceState({"delta": pllm.Buffer((4,), dtype=torch.float32)})
+
+    declarations = [legacy, replace(legacy, decode=DecodeWindow.ALL)]
+    declarations.append(replace(declarations[-1], decode_refresh=DecodeRefresh.STEP))
+    declarations.append(replace(declarations[-1], on_missing=MissingPolicy.HOLD))
+    plans = tuple(DeclaredActivation(declaration).plan_backend(facts) for declaration in declarations)
+    assert len({plan.inputs.plan.semantic_graph.execution_parameters_digest for plan in plans}) == 4
+    assert len({plan.decision.signature for plan in plans}) == 4
+    for declaration, plan in zip(declarations, plans, strict=True):
+        binding, = plan.inputs.request.activation_bindings
+        assert (binding.decode, binding.decode_refresh, binding.on_missing) == (
+            declaration.decode, declaration.decode_refresh, declaration.on_missing)
+    for previous, current in zip(plans, plans[1:]):
+        # Changing only the attachment contract also requires a new signature.
+        changed = replace(previous.inputs, request=current.inputs.request)
+        assert compile_backend_attachment(changed) != previous.decision
+        with pytest.raises(ValueError):
+            validate_backend_attachment(changed, previous.decision)
+
+    for field in ("decode", "decode_refresh", "on_missing"):
+        payload = json.loads(encode_boundary(plans[-1].inputs))
+        del payload["request"]["activation_bindings"][0][field]
+        with pytest.raises(ValueError, match="missing field"):
+            pllm._core.compile_backend_attachment(json.dumps(payload))
+    payload = json.loads(encode_boundary(plans[-1].inputs))
+    payload["request"]["activation_bindings"][0]["unknown_policy"] = "hold"
+    with pytest.raises(ValueError, match="unknown field"):
+        pllm._core.compile_backend_attachment(json.dumps(payload))
 
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:

@@ -330,9 +330,9 @@ class Builder(Generic[D]):
     def overlay(self, state: State, transition: Call, publication: Call,
                 bindings: tuple[ParameterOverlayFieldBinding, ...] = (), *,
                 activations: tuple[ActivationPatchBinding, ...] = ()) -> None:
-        self.attachment = BackendAttachmentSpec(AttachmentKind.ACTIVATION_PATCH if activations else AttachmentKind.PARAMETER_OVERLAY,
+        self._attach(BackendAttachmentSpec(AttachmentKind.ACTIVATION_PATCH if activations else AttachmentKind.PARAMETER_OVERLAY,
             ((AttachmentTaskRole.TRANSITION, transition.symbol), (AttachmentTaskRole.PUBLISH, publication.symbol)),
-            AnchorSymbol("sampler.complete"), state.declaration.resource, bindings, activations)
+            AnchorSymbol("sampler.complete"), state.declaration.resource, bindings, activations))
 
     def finish(self) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         if self.attachment is None:
@@ -340,5 +340,32 @@ class Builder(Generic[D]):
         return self.graph, self.layouts, self.attachment
 
     def model_effect(self, call: Call, kind: AttachmentKind = AttachmentKind.OBSERVATION) -> None:
-        self.attachment = BackendAttachmentSpec(kind, ((AttachmentTaskRole.COMPUTE, call.symbol),),
-            AnchorSymbol("sampler.pre_draw"), StateResource(""))
+        self._attach(BackendAttachmentSpec(kind, ((AttachmentTaskRole.COMPUTE, call.symbol),),
+            AnchorSymbol("sampler.pre_draw"), StateResource("")))
+
+    def _attach(self, spec: BackendAttachmentSpec) -> None:
+        previous = self.attachment
+        if previous is None:
+            self.attachment = spec
+            return
+        if {previous.kind, spec.kind} != {AttachmentKind.ACTIVATION_PATCH, AttachmentKind.MODEL_REPLAY}:
+            raise ValueError("only activation and tokenwise model effects can share an attachment")
+        activation, replay = (previous, spec) if previous.kind is AttachmentKind.ACTIVATION_PATCH else (spec, previous)
+        if replay.activation_bindings or replay.overlay_bindings or activation.overlay_bindings:
+            raise ValueError("model replay requires one activation publication")
+        (_, forward_symbol), = replay.tasks
+        (_, _), (_, publication_symbol) = activation.tasks
+        forward = next(task for task in self.graph.tasks if task.symbol == forward_symbol)
+        publication = next(task for task in self.graph.tasks if task.symbol == publication_symbol)
+        if forward.effects or any(port.name == "activation_publication" for port in forward.inputs):
+            raise ValueError("model replay already declares state dependencies")
+        output, = publication.outputs
+        # Preserve both the value dependency and the exact state-version read.
+        # Semantic acceptance of tokenwise READ is enabled with source composition.
+        forward = replace(forward, inputs=(*forward.inputs, SemanticInput("activation_publication",
+            TaskResultInputSource(publication_symbol, output.name))),
+            effects=(SemanticEffect(activation.state_resource, StateEffectKind.READ, publication_symbol),))
+        self.graph = replace(self.graph, tasks=tuple(forward if task.symbol == forward_symbol else task
+            for task in self.graph.tasks))
+        self.attachment = replace(replay, tasks=(*replay.tasks, *activation.tasks),
+            state_resource=activation.state_resource, activation_bindings=activation.activation_bindings)

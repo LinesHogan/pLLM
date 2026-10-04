@@ -28,7 +28,7 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import (
     AnchorId, ConditionalLayerReplay, SchedulerTimeline, SemanticGraph, TaskResourceFact, TaskSymbol,
-    TokenwiseLayerReplay, ValueResourceFact,
+    StateEffectKind, TaskResultInputSource, TokenwiseLayerReplay, ValueResourceFact,
 )
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
@@ -74,16 +74,27 @@ def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGra
                                 timeline: SchedulerTimeline) -> SchedulerTimeline:
     """Fund native region candidates through the original AER workspace facts.
 
-    The current tokenwise attachment is one standalone task. Its adapter keeps
-    embeddings and output concatenation in reserved_bytes; the task workspace
-    pays for the region's tensors and recovery lifetimes at its scheduled anchor.
+    Preserve producer task/value facts when the model reads a publication.
+    The adapter keeps embeddings and output concatenation in reserved_bytes;
+    the replay task pays for its own tensors and recovery lifetimes.
     """
     tasks = tuple(task for task in graph.tasks if isinstance(task.replay, TokenwiseLayerReplay))
     if not tasks:
         return timeline
-    if len(graph.tasks) != 1 or graph.states:
-        raise ValueError("tokenwise attachment costs require the original standalone single-device task")
+    if len(tasks) != 1:
+        raise ValueError("tokenwise attachment costs require one model replay task")
     task, = tasks
+    if len(graph.tasks) != 1 or graph.states:
+        if len(task.effects) != 1 or task.effects[0].kind is not StateEffectKind.READ:
+            raise ValueError("composed tokenwise costs require an exact publication read")
+        read, = task.effects
+        publication = next((candidate for candidate in graph.tasks if candidate.symbol == read.version), None)
+        if (publication is None or not any(state.resource == read.resource for state in graph.states)
+            or not any(effect.resource == read.resource and effect.kind is StateEffectKind.PUBLISH
+                for effect in publication.effects)
+            or not any(isinstance(port.source, TaskResultInputSource) and port.source.task == publication.symbol
+                and any(output.name == port.source.output for output in publication.outputs) for port in task.inputs)):
+            raise ValueError("composed tokenwise costs require their declared publication dependency")
     effect = task.replay
     if not isinstance(effect, TokenwiseLayerReplay) or probe.causal_domain is None:
         raise ValueError("tokenwise attachment requires its original model domain")
@@ -103,7 +114,7 @@ def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGra
         available = maximum.bytes
         if timeline.memory_budget_bytes is not None:
             available = min(available, timeline.memory_budget_bytes - max(timeline.reserved_bytes, default=0)
-                - sum(fact.resident_bytes for fact in timeline.task_resources)
+                - sum(fact.workspace_bytes + fact.resident_bytes for fact in timeline.task_resources)
                 - sum(fact.bytes for fact in timeline.value_resources))
         funded, = region.within_payload_budget(max(0, available)).payload_limits
         task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, funded.bytes))
