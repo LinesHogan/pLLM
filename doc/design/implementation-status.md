@@ -1,27 +1,48 @@
 # pLLM 编译中段：功能与进展收口
 
-日期：2026-09-12。本文是当前实现、验收和剩余工作的统一入口。设计推演与历史实验
+日期：2026-10-04。本文是当前实现、验收和剩余工作的统一入口。设计推演与历史实验
 不等于当前功能承诺；它们的阶段性描述以本页状态为准。
 
-## E1 工作区进展（2026-10-04，未验收完成）
+## E1 跨进程只读页授权：完成（2026-10-04）
 
-已按路线裁决移除远程私有写授权和 CPU 共享页池/句柄传递，保留同 GPU 精确
-版本的 READ 授予、原 pin 的远程完成与本地 COW/原子发布。CPU SharedTensor
-输入输出及 CPU 本地 arena 保留。共享 provider 暂沿用原开关，但只生成 CUDA
-共享能力；低层多余参数的签名收敛等待补充裁决。
+删除、核心绑定、视频消费者三步已由 Claude 逐项审查并在本机验收，代码落在
+`752b4c5`、`0b35c9e`、`27f25b5`。第三步文档收尾同步本节、状态指南与架构说明，
+E1 关账；整体后续计划仍以各自立项和验收为准。
 
-视频会话尚未接入。实际代码仍限制普通 Parameter/Activation 为单状态，本地
-TensorBatch 从 arena 取根；Activation 当前走 StateTensorUpdate 导入。跨进程
-四字段直接绑定到普通操作再写 ADD 状态，需要先确定最小绑定设计与文件边界，
-不能通过 snapshot clone 或复制到第二套页来声称已经完成零拷贝消费。
+- 删除远程私有写授权及其簿记、PageAccess、CPU 共享页池/句柄传递；保留 CUDA
+  READ 授予、原 pin 的远程完成、本地 COW/原子发布/event 回收，以及普通
+  CPU SharedTensor 输入输出。共享页能力只生成 `state/shared_cuda@1`。
+- 两进程验证同一完整 PlanBundle，只分配各自拥有的资源；绑定层显式检查本地
+  与借用资源互斥且完整覆盖所需集合。features 仅属于摄取 arena，worker 的
+  Parameter 从原 BorrowedPage 映射解析，不建立第二个 features pool/lineage；
+  inject 完全由 worker 本地拥有。无借用负载的原生命周期保持不变。
+- [视频负载](../../pllm/workloads/video.py)经既有扩展点组合普通 Parameter 编码、
+  本地 inject transition/publish 与原 Activation ADD；[会话示例](../../examples/video_session.py)
+  使用 spawn + 子进程 in-process vLLM，同一 pin 导出四字段，以签署容量施加背压。
+  每 chunk 一个新请求、一次 prefill、max_tokens=1，ACK 前不复用旧页。
 
-本轮 Python/pytest 环境为 `/workspace/pllm/.venv/bin/python`。完整套件首轮
-505 passed、108 skipped、5 failed（包含通过的 release wheel 测试）；5 个失败
-在未修改 HEAD 的隔离副本同样复现：一个 vLLM 设备识别失败、四个重结合测试
-捕获了环境警告。Rust 实际 22 项全过；typing/layers/authority 首轮通过。
-两个 GPU 冒烟已执行，但因 CUDA 驱动不可用而失败，另有 vllm._C 缺失提示；
-没有真实 CUDA IPC 或 fallback/issued_streams 验收证据。不能将上述跳过或历史
-验收视为 E1 通过。后续实现、最终签名和 GPU 验收仍待完成。
+四信号由真实灰度帧近似计算（QP 代理、残差能量、位移幅度、纹理/活动分区），
+编码器是固定 Fourier 投影；生产 AV1/NVDEC 解析、训练好的视觉编码器和逐 decode
+刷新不在本次能力范围。授予协议面向同一可信程序，不是身份认证或 OS 只读保护。
+缺失完成证明时停止实例并保留资源，不以进程退出码代替 ACK，不提供在线恢复。
+
+以下为 **Claude 提供的本机验收结果**，Python/pytest 使用仓库环境
+`/workspace/pllm/.venv/bin/python`；不混用此前沙箱跳过或环境失败的结果：
+
+| 验收项 | 结果 |
+| --- | --- |
+| 完整 Python 套件 | 623 passed |
+| release wheel | 1 passed |
+| typing / import layers / region authority | 0 errors、0 warnings / 全绿 / 全绿 |
+| cargo test | 22 passed |
+| enginecore_smoke.py | 顺序执行通过，6×fallback=0 |
+| vllm_recirculation_smoke.py | 顺序执行通过，fallback=0、issued_streams=2 |
+| 视频 5 用例 | CPU 数学 1 passed；GPU 成功单独运行 1 passed；故障三例单独运行 3 passed |
+| 真实视频示例 `1.mp4 --chunks 8` | v1…v8 逐版本消费，updates=1…8、fallback=0，正常收尾 |
+
+成功用例单独运行无 CUDA IPC 警告，清理干净；整组尾部的 CudaIPCTypes 警告已
+归因到故意杀进程/坏凭证的故障组，保留该诊断，不掩盖或强制回收。E1 无未决设计
+问题；GPU 成功、背压、零拷贝、完成寿命和漂移拒绝已有真实 LLM 证据。
 
 ## 既有收口基线
 

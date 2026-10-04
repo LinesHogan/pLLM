@@ -202,6 +202,7 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
 @pytest.mark.parametrize("mode", ("bad_ack", "exit", "drift"))
 def test_video_session_failure_retains_owner_without_fallback(mode):
+    # The group's trailing CudaIPCTypes warning comes from deliberate process death; the isolated success path has none.
     frame, = frames(1)
     with VideoSession(VideoWorkload(grid_size=2), model_config(), worker=partial(fault_worker, mode)) as session:
         with pytest.raises((EOFError, OSError, RuntimeError)):

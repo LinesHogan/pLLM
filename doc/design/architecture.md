@@ -81,6 +81,7 @@ Python 在 FFI 边界序列化同样的不可变描述符，只加封闭的输�
 | 行/页映射 | Arena 派生的调用/捕获操作数；无单独版本选择 | 共享映射工作区或固定捕获存储 |
 | 捕获输入、scratch 与图池 | KernelCapture；一次性冷准入被中止，replay 结果只在必须存续时拷贝 | Meta 预检、真实输入/scratch 检查与图池核算 |
 | 共享输入/completion 输出 | 原始 SharedTensor 作用域与接收完成确认 | 原始 TensorFieldSpec；关闭失败保留未确认输入所有权 |
+| 跨进程只读特征页 | 摄取 arena 的原 pin；worker 仅持映射，全部字段 ACK 后回收 | 同一签署计划、CUDA 共享能力与页容量；无第二份 features pool/lineage |
 | 冻结因果模型 | HF 模型/句柄；唯一张量存储计数，成功 close 丢弃引擎所有权 | 驻留字节不约束 HF backward 或库 scratch |
 | Trace | 有界事件队列；快照编码自持 CPU 字节，不是活张量/autograd 引用 | 每事件至多 32 KiB 负载；截断的跨步张量用有界 `take`，不是整源扁平拷贝 |
 
@@ -129,6 +130,24 @@ vLLM 执行；这不是全模型捕获或自动区域融合。TLM 的训练与�
 之外。后端局部 overlay 存储与旧的后端/回调 replay 契约已删除。条件 replay 是
 原始签名 SemanticTask；其新版本 pin 与释放属于同一 StateTaskContext 与
 arena。后端只快照选中的解码器输入/当前 KV 槽并执行原生层。
+
+E1 视频会话由摄取进程和一个 spawn 的 in-process vLLM 子进程组成，使用同一
+完整 PlanBundle，不裁剪或另签 worker 计划。arena 只物化自身拥有的资源；
+MathBinding 显式验证本地与 borrowed 集合互斥且覆盖所需资源，再为本地集合建立
+目录。features 完全属于摄取方，inject 完全属于 worker；接收方的合法性来自
+原 receive_field 校验及本次 grant 对应关系，不来自本地 features admission。
+
+普通 Parameter reader 按资源名将 features 解析到 BorrowedStateRoot 关联的
+ReadonlyTensorView；原映射不进入本地 roots、pin.refs 或写选择。完整借用输入
+绑定到一次步，encode 的独立 hidden 经原 TaskResult/field_writes/publish 写入
+本地 inject，再由原 Activation ADD 消费。接收 stream 完成、别名清除后才发
+ACK，原 owner 的 release receipt 决定旧槽位回收；输出不得以别名携带特征页
+逃逸。无 borrowed resources 的负载继续使用原生命周期。
+
+示例以签署容量约束积压，一 chunk 一新请求、一次 prefill；帧特征提取属于输入
+生产者，不冒充 worker 任务图中的签署计算。只读授予是同一可信程序内的协议，
+不是身份认证、动态血缘认证或 OS 写保护。缺失完成证明会保留资源并停止实例，
+不回退本地空页、不在线恢复。真实成功/故障证据见[唯一进度入口](implementation-status.md)。
 
 宿主与状态执行共享一个任务游标与有界执行 trace。`execution.trace.snapshot()`
 或公开模型句柄的 `trace_snapshot()` 返回至多 256 个元数据事件，带显式溢出
