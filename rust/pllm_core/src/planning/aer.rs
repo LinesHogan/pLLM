@@ -984,7 +984,7 @@ mod tests {
                         let resident = if mixed_kind { [2_u64, 5, 1] } else { [0; 3] };
                         let graph = decode_graph(&json!({
                 "workload_id": "aer_oracle", "execution_parameters_digest": "a".repeat(64),
-                "schema_version": 1, "edges": [], "states": [],
+                "schema_version": 1, "input_groups": [], "edges": [], "states": [],
                 "tasks": (0..3).map(|task| json!({
                     "symbol": format!("t{task}"),
                     "timing": {"after": format!("a{}", bounds[task].0), "before": format!("a{}", bounds[task].1)},

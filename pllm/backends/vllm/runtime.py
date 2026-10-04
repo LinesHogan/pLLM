@@ -192,7 +192,19 @@ class ReadonlyStepInput:
     roots: tuple[BorrowedStateRoot, ...]
 
 
-ReadonlyStepReceiver = Callable[[PackedSamplerRowBatch, torch.cuda.Stream], ReadonlyStepInput]
+@dataclass(frozen=True, slots=True)
+class ReadonlyStepAbsent:
+    plan_epoch: int
+    step_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReadonlyStepEnd:
+    plan_epoch: int
+    step_id: int
+
+
+ReadonlyStepReceiver = Callable[[PackedSamplerRowBatch, torch.cuda.Stream], ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd]
 
 
 class VllmSession(Generic[DataT, ResultT]):
@@ -232,7 +244,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._decode_injection = any(binding.decode is DecodeWindow.ALL for binding in attachment.inputs.request.activation_bindings)
         self._token_frontiers: dict[RequestIdentity, int] = {}
         self._readonly_receiver: ReadonlyStepReceiver | None = None
-        self._received_readonly: ReadonlyStepInput | None = None
+        self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
         self._replay: VllmLayerReplay | VllmTokenwiseReplay[DataT, ResultT] | None = None
         if tasks:
@@ -290,9 +302,13 @@ class VllmSession(Generic[DataT, ResultT]):
             received = self._received_readonly
             if (received.plan_epoch, received.step_id) != (rows.plan_epoch, rows.step_id):
                 raise ValueError("read-only input differs from the original epoch/step; grants retained")
-            if any(root.stream != stream for root in received.roots):
-                raise ValueError("read-only input differs from the receiving stream; grants retained")
-            self._deployment.execution.stage_readonly(received.roots)
+            if isinstance(received, (ReadonlyStepAbsent, ReadonlyStepEnd)):
+                self._deployment.execution.stage_hold(tuple(rows.identities),
+                    "end" if isinstance(received, ReadonlyStepEnd) else "absent", step_id=rows.step_id)
+            else:
+                if any(root.stream != stream for root in received.roots):
+                    raise ValueError("read-only input differs from the receiving stream; grants retained")
+                self._deployment.execution.stage_readonly(received.roots)
             self._received_readonly = None  # Ownership is now the original execution's pending/active borrow.
         except BaseException:
             self._input_failed = True

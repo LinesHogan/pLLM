@@ -236,6 +236,23 @@ class SemanticEdge:
 
 
 @dataclass(frozen=True, slots=True)
+class ConditionalInputGroup:
+    """Atomic producer closure; absent input reads the invocation's pinned version.
+
+    Existing edges/effects describe the complete-input branch and conservatively
+    schedule both branches. Only the named readers may omit publication inputs.
+    """
+
+    resource: StateResource
+    borrowed_resources: tuple[StateResource, ...]
+    tasks: tuple[TaskSymbol, ...]
+    publication: TaskSymbol
+    readers: tuple[TaskSymbol, ...]
+    allow_absent: bool
+    held_version: Literal["input"] = "input"
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticGraph:
     workload_id: WorkloadId
     tasks: tuple[SemanticTask, ...]
@@ -243,6 +260,7 @@ class SemanticGraph:
     states: tuple[SemanticState, ...] = ()
     edges: tuple[SemanticEdge, ...] = ()
     schema_version: int = 1
+    input_groups: tuple[ConditionalInputGroup, ...] = ()
 
 
 
@@ -342,6 +360,7 @@ __all__ = [
     "SemanticEdge",
     "SemanticEffect",
     "SemanticGraph",
+    "ConditionalInputGroup",
     "SemanticInput",
     "SemanticOutput",
     "SemanticOutputKind",

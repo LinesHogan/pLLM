@@ -17,7 +17,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.declaration import Dimensions, Field, When
-from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, DecodeWindow, DecodeRefresh
+from pllm.contracts.backend_attachment import ActivationPatchBinding, ActivationPatchOperator, DecodeWindow, DecodeRefresh, MissingPolicy
 from pllm.execution.backend_attachment import attachment_buffer_bytes, bind_backend_attachment
 from pllm.authoring import BackendDeployment
 from pllm.execution.codec import encode_boundary
@@ -32,7 +32,7 @@ from test.backend_facts import backend_facts
 
 
 @contextmanager
-def binding_case(*, alias=False, write_failure=False, runtime=False):
+def binding_case(*, alias=False, write_failure=False, runtime=False, missing=None):
     b = TensorBinding("video.binding", "a" * 64, Dimensions(2, 0))
     features, ports = b.parameters("features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None)
     encoded = b.tensor("encode", inputs=ports, when=When.BEFORE_MODEL)(
@@ -48,8 +48,11 @@ def binding_case(*, alias=False, write_failure=False, runtime=False):
     timeline = RuntimeFacts(torch.device("cpu")).timeline(("transition/full_root@1",))
     if runtime:
         b.overlay(inject, transition, publication, activations=tuple(ActivationPatchBinding(i, (LayoutFieldId(0),),
-            1, 1, ActivationPatchOperator.ADD, DecodeWindow.NONE if i == 2 else DecodeWindow.ALL,
-            DecodeRefresh.STEP if i == 0 else DecodeRefresh.INHERIT) for i in range(3)))
+            1, 1, ActivationPatchOperator.ADD, DecodeWindow.NONE if i == 2 and missing is None else DecodeWindow.ALL,
+            DecodeRefresh.STEP if i == 0 else DecodeRefresh.INHERIT,
+            MissingPolicy.STOP if missing is None else missing) for i in range(3)))
+        if missing is not None:
+            b.conditional_input(("features",))
         facts = backend_facts(2, (), timeline, PageBundleProviderFacts("video.binding@1", 3))
         buffers = attachment_buffer_bytes(facts.probe, b.graph, b.layouts, b.attachment)
         timeline = replace(timeline, reserved_bytes=(buffers,) * len(timeline.anchors))
@@ -123,6 +126,7 @@ def test_video_binding_keeps_remote_roots_out_of_local_ownership():
             execution.begin(())  # Never silently read local inject as the next features chunk.
     if find_spec("vllm") is not None:
         _decode_steps_keep_exact_publications_and_ack_order()
+        _hold_steps_require_settled_injection_and_skip_the_producer()
 
 
 def _owned_readonly_requires_exact_pin(owner):
@@ -357,3 +361,97 @@ def _step_input_errors_retain_grants():
                 session.stage_input(None, identities)
             session.close()
             assert not any(peer.poll() for peer in peers), "closing the session cannot forge a read ACK"
+
+
+def _hold_steps_require_settled_injection_and_skip_the_producer():
+    from pllm.backends.vllm.runtime import ReadonlyStepInput, ReadonlyStepAbsent, ReadonlyStepEnd
+    identity = RequestIdentity("hold", 0, 0)
+    def rows(step):
+        batch = PackedPhaseRowBatch(1, step, 1, (PackedPhaseRow(0, 0, step,
+            HiddenPhase.PREFILL if step == 0 else HiddenPhase.DECODE, identity),))
+        return PackedSamplerRowBatch(batch, (PackedSamplerRowLink(0, 0),))
+    with binding_case(runtime=True, missing=MissingPolicy.HOLD) as (b, _, _, binding, execution, first, peers), \
+        received_features(execution.arena.plan, version=8, scale=2) as (second, second_peers), \
+        patch("torch.cuda.current_stream", return_value=None):
+        session, model, _ = _session(b, execution)
+        with pytest.raises(ValueError, match="signed task closure"):
+            replace(binding, tasks=tuple(task.original for task in binding.tasks)).bind(execution.arena, execution.sampler_anchor_id)
+        with pytest.raises(ValueError, match="signed conditional producer guard"):
+            execution.rebind_implementation(binding.tasks[0].original)
+        outcomes = (ReadonlyStepInput(1, 0, (first,)), ReadonlyStepAbsent(1, 1),
+            ReadonlyStepInput(1, 2, (second,)), ReadonlyStepEnd(1, 3))
+        session.bind_readonly_input(lambda batch, stream: outcomes[batch.step_id])
+        session.stage_input(None, (identity,))
+        refs = []
+        for step in range(4):
+            session.before_execute(_scheduler(*( (identity,) if step == 0 else () )))
+            rng = torch.random.get_rng_state().clone()
+            session.prepare_input(rows(step))
+            context = session._step.invocation.context
+            hold = step in (1, 3)
+            assert (context.held_input is not None) == hold
+            assert bool(context.borrowed_roots) != hold
+            assert (context.publication is None) == hold
+            if hold:
+                assert not context.results and not context.page_writes and not context.page_publications
+                assert context.held_input.successful[0][2] == step - 1
+            current = execution.directory.latest_refs(())[0]
+            refs.append(current)
+            assert current.version_id == (1 if step < 2 else 2)
+            for index, layer in enumerate(model.model.layers):
+                delta = 20 if step >= 2 and index == 0 else 10
+                actual, _ = layer(torch.zeros(1), torch.ones(1, 2))
+                torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
+            before = execution.diagnostics()
+            session.complete_forward()
+            session.complete_sampler(False)
+            assert execution.diagnostics().hold_count == before.hold_count
+            session.commit_token()
+            assert torch.equal(rng, torch.random.get_rng_state())
+            assert execution.diagnostics().hold_count == (step + 1) // 2
+            assert execution.diagnostics().update_count == (step // 2 + 1)
+            assert all(release is not None for release in context.page_pins.values())
+            if not hold:
+                root, incoming = (first, peers) if step == 0 else (second, second_peers)
+                assert all(peer.recv_bytes() == encode_boundary(page.descriptor).encode()
+                    for peer, page in zip(incoming, root.pages, strict=True))
+            else:
+                assert not any(peer.poll() for peer in (*peers, *second_peers))
+        assert refs[0] == refs[1] and refs[2] == refs[3] and refs[0] != refs[2]
+        assert execution.diagnostics().fallback_count == 0
+        assert execution.diagnostics().last_hold.reason == "end"
+        # Cancelling a held step cannot register success or revive a poisoned session.
+        execution.stage_hold((identity,), "absent", step_id=4)
+        invocation = execution.begin(())
+        with pytest.raises(RuntimeError, match="cancelled"):
+            execution.cancel_step(invocation)
+        assert execution.diagnostics().hold_count == 2
+        with pytest.raises(RuntimeError, match="fail-stopped"):
+            execution.stage_hold((identity,), "absent", step_id=4)
+    for policy, seeded in ((MissingPolicy.HOLD, False), (MissingPolicy.STOP, False), (MissingPolicy.STOP, True)):
+        with binding_case(runtime=True, missing=policy) as (b, _, _, _, execution, root, peers), \
+            patch("torch.cuda.current_stream", return_value=None):
+            session, model, _ = _session(b, execution)
+            session.bind_readonly_input(lambda batch, stream: ReadonlyStepInput(1, 0, (root,)) if seeded and batch.step_id == 0
+                else ReadonlyStepAbsent(1, batch.step_id))
+            session.stage_input(None, (identity,))
+            session.before_execute(_scheduler(identity))
+            if seeded:
+                session.prepare_input(rows(0))
+                model.model.layers[0](torch.zeros(1), torch.ones(1, 2))
+                session.complete_forward()
+                session.complete_sampler(False)
+                session.commit_token()
+                assert execution.diagnostics().update_count == 1
+                for peer in peers:
+                    peer.recv_bytes()
+            with pytest.raises(RuntimeError, match="first successful injection" if policy is MissingPolicy.HOLD else "STOP"):
+                session.prepare_input(rows(int(seeded)))
+            assert not execution._active and not any(peer.poll() for peer in peers)
+            with pytest.raises(RuntimeError, match="fail-stopped"):
+                session.prepare_input(rows(0))
+    with binding_case(runtime=True, missing=MissingPolicy.HOLD) as (_, _, _, _, execution, root, peers):
+        execution.stage_readonly((root,))
+        with pytest.raises(RuntimeError, match="first successful injection"):
+            execution.stage_hold((identity,), "absent", step_id=0)
+        assert execution._pending_borrows == (root,) and not any(peer.poll() for peer in peers)

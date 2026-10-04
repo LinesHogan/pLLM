@@ -55,6 +55,7 @@ class TracePhase(StrEnum):
     SETTLED = "settled"
     ABORT = "abort"
     FAILED = "failed"
+    INPUT_SKIPPED = "input_skipped"
     RETIRE = "retire"
 
 

@@ -121,6 +121,28 @@ token、算子），同样经 `auxiliary=` 送入。`LOW_RANK_AFFINE` 每层用
 weight/bias/rotation 字段，`ADD` 用一个 FP32 向量。见维护中的
 [ReFT](../../pllm/workloads/reft.py)。
 
+`first_tokens/last_tokens` 仍只选择 prefill 行。逐 decode 通过三个 keyword-only
+字段声明：`decode=pllm.DecodeWindow.ALL`、
+`decode_refresh=pllm.DecodeRefresh.STEP`、`on_missing=pllm.MissingPolicy.HOLD`
+（默认分别为 NONE/INHERIT/STOP）。NONE 携带非默认刷新/缺席策略会在声明期拒绝。
+INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新发布的 exact ref；
+只有签署且成功验证的 HOLD 分支可以在没有新 publication 时读已成功的输入版本。
+单独声明 HOLD 不会给任意缺根图添加保持能力，完整生命周期见
+[状态与记忆](state-and-memory.md#没有新特征时签署的-hold--stop)。
+
+Activation 可与 Recurrence 组合：注入在 DecoderSource 层输出之后、tap 之前，
+normal/replay 使用同一 ref 和选择位；低秩算子用 replay 新 hidden 重算 delta，
+ADD 不在已注入的结果上重复累加。HOLD 的 source 数学与正常输入相同，只改变
+签署的版本来源；borrowed 输入生产组全部关闭，模型 READ 仍精确绑定 inject。
+公共作者入口只放行状态/任务符号精确匹配签署 activation 链的组合；额外状态或
+普通训练不能借此绕过 standalone 限制。REQUEST 组合保留原请求行，INSTANCE
+仍通过实例目录取值。
+
+干预遵循 forward-only KV：层后注入不改变该层自身已计算的 KV，可能影响更深层
+和后续 token；旧 token 的 KV 不回改。同 invocation replay 仍重放本步版本，
+不能换成较新版本。逐 decode 注入与 vLLM 抢占/历史重算互斥，Activation 与
+prefix caching 仍拒绝组合；没有按注入版本 cache_salt 键控或历史版本重建。
+
 ## 组合边界：失败关闭
 
 overlay、激活与两种 replay 是彼此独立的声明。**可表达不等于支持任意组合**：

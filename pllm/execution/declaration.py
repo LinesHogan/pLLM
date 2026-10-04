@@ -10,7 +10,7 @@ from typing import Generic, TypeVar
 import torch
 
 from pllm.contracts.backend_attachment import (
-    ActivationPatchBinding, AttachmentKind, AttachmentTaskRole, BackendAttachmentSpec, BackendPlacementProbe,
+    ActivationPatchBinding, AttachmentKind, AttachmentTaskRole, BackendAttachmentSpec, BackendPlacementProbe, MissingPolicy,
 )
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
@@ -23,7 +23,7 @@ from pllm.contracts.semantic_graph import (
     SemanticState, SemanticTask, StateEffectKind, StateResource, StateScope, StateSelectionInputSource,
     TaskImplementationSpec, TaskResultInputSource, TaskSymbol, TimingConstraint, TokenwiseLayerReplay,
     WorkloadId, PackedRowsInputSource, PackedSamplerRowsInputSource, SamplerFeedbackInputSource, MathContract,
-    StepIdInputSource, TaskResourceFact,
+    StepIdInputSource, TaskResourceFact, ConditionalInputGroup,
 )
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.contracts.tensor_layout import (
@@ -33,7 +33,7 @@ from pllm.contracts.tensor_layout import (
 from pllm.contracts.compilation import PlanBundle
 from pllm.execution.tensor_program import TensorBatch, TensorOperation, TaskOutput
 from pllm.execution.execution import TaskGraphImplementation
-from pllm.execution.state_execution import StateTaskContext, PublishStateTask
+from pllm.execution.state_execution import StateTaskContext, PublishStateTask, ConditionalProducerTask
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.replay import ReplayStateTask, TokenwiseReplayTask, REPLAY_IMPLEMENTATION
 from pllm.execution.region_replay import ConditionalReplayRegion
@@ -306,7 +306,23 @@ class Builder(Generic[D]):
                 functions.append(PublishStateTask[D](identity))
             else:
                 raise ValueError(f"{task.symbol}: no explicit native implementation")
-        return tuple(functions)
+        guarded = {item.implementation_id for item in (() if plan is None else plan.schedule_physical.tasks)
+            if any(graph.tasks[item.task_id].symbol in group.tasks for group in graph.input_groups)}
+        if graph.input_groups and plan is None:
+            raise ValueError("conditional input binding requires its original signed plan")
+        return tuple(ConditionalProducerTask(function) if function.implementation_id in guarded else function
+            for function in functions)
+
+    def conditional_input(self, borrowed_resources: tuple[str, ...]) -> None:
+        """Declare one atomic input closure without changing the task/state symbols."""
+        if self.attachment is None or not self.attachment.activation_bindings or self.graph.input_groups:
+            raise ValueError("conditional input requires one original activation chain")
+        publication = self.attachment.tasks[-1][1]
+        readers = tuple(task.symbol for task in self.graph.tasks if task.replay is not None)
+        self.graph = replace(self.graph, input_groups=(ConditionalInputGroup(self.attachment.state_resource,
+            tuple(StateResource(name) for name in sorted(borrowed_resources)),
+            tuple(task.symbol for task in self.graph.tasks if task.symbol not in readers), publication, readers,
+            all(binding.on_missing is MissingPolicy.HOLD for binding in self.attachment.activation_bindings)),))
 
     def publish(self, transition: Call, state: State, *, when: When = When.PUBLISH,
                 name: str = "publish", schema: str = "canonical.page_publication@1",

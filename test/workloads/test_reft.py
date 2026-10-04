@@ -173,6 +173,13 @@ def _decode_declarations_require_resigning(facts, signed):
     payload["request"]["activation_bindings"][0]["unknown_policy"] = "hold"
     with pytest.raises(ValueError, match="unknown field"):
         pllm._core.compile_backend_attachment(json.dumps(payload))
+    # HOLD on the author face does not synthesize a no-input graph; that graph
+    # is separately signed, and even an empty group list is mandatory on wire.
+    assert plans[-1].inputs.plan.semantic_graph.input_groups == ()
+    payload = json.loads(encode_boundary(plans[-1].inputs))
+    del payload["plan"]["semantic_graph"]["input_groups"]
+    with pytest.raises(ValueError, match="missing field.*input_groups"):
+        pllm._core.compile_backend_attachment(json.dumps(payload))
 
 
 def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:

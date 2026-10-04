@@ -85,6 +85,12 @@ def derive_attachment_resources(probe: BackendPlacementProbe, graph: SemanticGra
     if len(tasks) != 1:
         raise ValueError("tokenwise attachment costs require one model replay task")
     task, = tasks
+    for group in graph.input_groups:
+        if (attachment is None or group.resource != attachment.state_resource
+            or group.readers != (task.symbol,) or group.held_version != "input"):
+            raise ValueError("conditional tokenwise costs require the exact signed pinned READ")
+        # Both branches use this same model source. Retain all producer facts:
+        # the complete DAG funds the worst case, including the fresh encoding.
     if len(graph.tasks) != 1 or graph.states:
         if len(task.effects) != 1 or task.effects[0].kind is not StateEffectKind.READ:
             raise ValueError("composed tokenwise costs require an exact publication read")

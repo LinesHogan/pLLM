@@ -216,6 +216,22 @@ pub(crate) struct SemanticEdge {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ConditionalInputGroup {
+    pub(crate) resource: String,
+    pub(crate) borrowed_resources: Vec<String>,
+    pub(crate) tasks: Vec<String>,
+    pub(crate) publication: String,
+    pub(crate) readers: Vec<String>,
+    pub(crate) allow_absent: bool,
+    pub(crate) held_version: InputVersion,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputVersion { Input }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SemanticGraph {
     pub(crate) workload_id: String,
     pub(crate) tasks: Vec<SemanticTask>,
@@ -223,6 +239,7 @@ pub(crate) struct SemanticGraph {
     pub(crate) edges: Vec<SemanticEdge>,
     pub(crate) states: Vec<SemanticState>,
     pub(crate) schema_version: u64,
+    pub(crate) input_groups: Vec<ConditionalInputGroup>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -449,6 +466,7 @@ fn validate_task(task: &SemanticTask) -> Result<(), String> {
 }
 
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
+    validate_input_groups(graph)?;
     if graph.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported SemanticGraph schema_version: {}",
@@ -605,6 +623,89 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
+    if graph.input_groups.len() > 1 {
+        return Err("one atomic conditional input group is supported".into());
+    }
+    for group in &graph.input_groups {
+        require_sorted_unique_text(&group.tasks, "input group tasks")?;
+        require_sorted_unique_text(&group.borrowed_resources, "input group borrowed resources")?;
+        require_sorted_unique_text(&group.readers, "input group readers")?;
+        let producer = |name: &String| group.tasks.contains(name);
+        if group.tasks.is_empty() || group.borrowed_resources.is_empty()
+            || group.borrowed_resources.contains(&group.resource)
+            || !producer(&group.publication)
+            || group.tasks.iter().chain(&group.readers).any(|name|
+                !graph.tasks.iter().any(|task| &task.symbol == name))
+            || group.readers.iter().any(producer)
+            || graph.states.len() != group.borrowed_resources.len() + 1
+            || !graph.states.iter().any(|state| state.resource == group.resource)
+            || group.borrowed_resources.iter().any(|resource| !graph.states.iter().any(|state|
+                &state.resource == resource && state.scope == StateScope::Instance))
+        {
+            return Err("conditional input group must name its exact producer closure and states".into());
+        }
+        let publication = graph.tasks.iter().find(|task| task.symbol == group.publication).unwrap();
+        if publication.effects.len() != 1 || publication.effects[0].kind != StateEffectKind::Publish
+            || publication.effects[0].resource != group.resource
+        {
+            return Err("conditional input requires its exact owned publication".into());
+        }
+        let writes: Vec<_> = graph.tasks.iter().filter(|task| producer(&task.symbol) && task.symbol != group.publication)
+            .flat_map(|task| &task.effects).filter(|effect| effect.resource == group.resource).collect();
+        if writes.len() != 1 || !matches!(writes[0].kind, StateEffectKind::Transition | StateEffectKind::TransitionMaybe)
+            || writes[0].version.is_some()
+        {
+            return Err("conditional input requires one owned transition and no hidden writers".into());
+        }
+        let mut closure = std::collections::BTreeSet::from([group.publication.clone()]);
+        loop {
+            let before = closure.len();
+            for task in &graph.tasks {
+                if closure.contains(&task.symbol) {
+                    for port in &task.inputs {
+                        if let InputSource::Result { task, .. } = &port.source { closure.insert(task.clone()); }
+                    }
+                }
+            }
+            if before == closure.len() { break; }
+        }
+        if closure.into_iter().collect::<Vec<_>>() != group.tasks {
+            return Err("conditional producer group must be the complete publication closure".into());
+        }
+        for task in &graph.tasks {
+            if producer(&task.symbol) {
+                if task.replay.is_some() || task.effects.iter().any(|effect|
+                    if group.borrowed_resources.contains(&effect.resource) {
+                        effect.kind != StateEffectKind::Read || effect.version.is_some()
+                    } else { effect.resource != group.resource })
+                    || task.inputs.iter().any(|port| matches!(&port.source,
+                        InputSource::Result { task, .. } if !producer(task)))
+                {
+                    return Err("conditional producer cannot read outside its closed input group".into());
+                }
+            } else if !group.readers.contains(&task.symbol) || task.effects.len() != 1
+                || task.effects[0].kind != StateEffectKind::Read
+                || task.effects[0].resource != group.resource
+                || task.effects[0].version.as_ref() != Some(&group.publication)
+                || task.inputs.iter().any(|port| match &port.source {
+                    InputSource::PackedRows => false,
+                    InputSource::Result { task, .. } => task != &group.publication,
+                    _ => true,
+                })
+            {
+                return Err("conditional reader requires only its publication or pinned input version".into());
+            }
+        }
+        if group.borrowed_resources.iter().any(|resource| !graph.tasks.iter().any(|task|
+            producer(&task.symbol) && task.effects.iter().any(|effect| &effect.resource == resource)))
+        {
+            return Err("conditional input cannot hide unused borrowed resources".into());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_timeline(timeline: &Timeline) -> Result<(), String> {
     if timeline.schema_version != SCHEMA_VERSION {
         return Err(format!(
@@ -677,7 +778,7 @@ mod tests {
     fn semantic_graph_closed_codec_rejects_schema_drift() {
         let graph = json!({
             "schema_version": 1, "workload_id": "closed",
-            "execution_parameters_digest": "a".repeat(64), "edges": [],
+            "execution_parameters_digest": "a".repeat(64), "input_groups": [], "edges": [],
             "states": [{"resource": "weights", "scope": "request", "key_fields": ["request_id"]}],
             "tasks": [{
                 "symbol": "predict", "timing": {"after": "begin", "before": "end"},

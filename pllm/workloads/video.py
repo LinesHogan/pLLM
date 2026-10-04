@@ -140,6 +140,7 @@ class VideoWorkload(BackendWorkload[TensorFrame, TensorOutput]):
             activation.decode, activation.decode_refresh, activation.on_missing),))
         if self.recurrence is not None:
             b.recurrence(self.recurrence)
+        b.conditional_input(("features",))
         b.graph = replace(b.graph, workload_id=WorkloadId(self.name), execution_parameters_digest=boundary_digest(b.graph.execution_parameters_digest,
             self, activation, ("features",), "video.inject:write@1"))
         return encoder, b

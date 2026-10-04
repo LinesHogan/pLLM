@@ -189,7 +189,8 @@ stream 上 `close()`；它同步该 stream 后发回精确完成凭证。其他 
 worker 只拥有 inject。本地与借用集合必须互斥且覆盖全部所需资源；worker 没有
 features 的本地准入、lineage 或副本，普通 `Parameter("features", field)` 直接
 读取映射根。最终 hidden 写入 worker 的私有 inject 页并原子发布，属于计算
-结果物化。这个内建组合使用既有扩展点，Parameter/Activation 的作者签名不变。
+结果物化。四字段 Parameter 数学签名不变；Activation 的 decode 策略使用
+keyword-only 字段，变更声明必须重新编译签署定义并重建 worker。
 
 一次 chunk 的时序如下：
 
@@ -198,11 +199,37 @@ features 的本地准入、lineage 或副本，普通 `Parameter("features", fie
    或覆盖旧槽位。当前版本、私有写和旧版本 pin 都占容量，不能只按队列长度估算。
 2. worker 收齐同一版本的合法 grant 后绑定到该步；在 request.prepare 读取特征、
    编码、写入并发布本地 inject。新请求随后取得 inject 的 inference pin，模型
-   通过原 ADD 消费它。示例每 chunk 发起一个新请求，max_tokens=1，沿用 prefill-only
-   语义；不在同一请求的 decode 过程中更换版本。
+   通过原 ADD 消费它。示例支持一个请求内多个 decode 步，每个新输入步使用新
+   grant/root，发布后按该步 exact ref 注入；旧的请求准入 pin 不重指。
 3. 步结束时清除映射别名、完成原接收 stream 上的依赖，再逐字段 close/ACK。
    摄取方持有的 release receipt 收齐凭证及本地完成事件后，才可回收旧页并推进
    generation。inject 发布或模型返回结果本身都不是远程读完成凭证。
+
+### 没有新特征时：签署的 HOLD / STOP
+
+视频负载声明 `decode=ALL、decode_refresh=STEP、on_missing=HOLD`。完整输入与保持
+共用一个 invocation 和完整静态 DAG；签署的条件生产组在解析输入之前分支。
+HOLD 步不读取 borrowed features，不执行 encode/write/publish；模型只读本地
+最后成功注入的 exact pin。静态依赖和最坏情况预算保留，不在运行时删任务。
+
+供给方必须明确发送本步 Absent 或正常 End：示例的 `session.missing()` 声明
+本步缺席，`session.missing(end=True)` 声明当前请求的输入流结束。End 后保持到
+该请求结束；下一请求必须重新提供首版。空 roots、超时、EOF 和部分收到的字段
+都不是 Absent。α 使用显式 next-step 协议，FIFO/latest-ready/跳帧仍不在此协议中。
+
+同一借用资源组原子分流，绑定中任一 `on_missing=STOP` 就在缺席时停实例。
+HOLD 也必须已有成功首版：只有模型实际使用过、sampler 完成、ACK 与 settle
+全部成功的版本才能成为保持凭据。初始化版本零、仅发布尚未收束的版本不算。
+同 ref 再发新 grant 是一次新消费和本地更新，不能记作 HOLD。
+
+`hold_count` 只在保持步成功收束时增加，`last_hold` 给出缺席原因、当前步号、
+held refs 与各请求的最后成功输入步；`update_count` 只计真实写入，fallback 不变。
+保持步的本地 pin 仍持有到 sampler/收束后，没有远端根便不产生 ACK。例子每步
+独立报告，保持步的 feature ref 为 `None`，不会把上一帧结果冒充新消费。
+
+这是可配置的**数据缺席**策略；完整性、别名、ACK 故障及活动借用/保持步的取消
+仍然 fail-stop。HOLD 必须在 begin 前通过签署分支入口，不能先触发 E1 缺根错误
+再捕获继续。没有条件组的直接缺根、STEP 未授权无发布与故障后续跑仍响亮拒绝。
 
 `snapshot` 则复制出独立 tensor，适合要在 arena/worker 关闭后继续保留的结果。
 普通辅助输入和独立 completion 输出沿用 `SharedTensor`；它们不是版本页授权。

@@ -32,6 +32,8 @@ class _PatchRows:
     indices: tuple[int, ...]
     pin: PagePin
     ref: StateRef
+    identity: RequestIdentity
+    used: dict[RequestIdentity, set[StateRef]]
 
 
 class _ActivationLayer:
@@ -55,6 +57,7 @@ class _ActivationLayer:
                 weight, bias, rotation = item.fields
                 delta = low_rank_affine_delta(hidden.index_select(0, item.rows), weight, bias, rotation)
             hidden.index_add_(0, item.rows, delta)
+            item.used.setdefault(item.identity, set()).add(item.ref)
             self.apply_count += item.rows.numel()
         return hidden, residual
 
@@ -75,6 +78,10 @@ class VllmActivationPatch:
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT],
                 directory: RequestStateDirectory) -> None:
+        if context.held_input is not None and (context.held_input.step_id != rows.step_id
+            or {identity for identity, _, _ in context.held_input.successful} != {row.identity for row in rows.rows}):
+            raise RuntimeError("HOLD input differs from its original step and request identities")
+        context.input_step_id = rows.step_id
         versions: dict[tuple[RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
         self.row_count = rows.total_rows
         for handle in self.layers:
@@ -93,7 +100,7 @@ class VllmActivationPatch:
                     key = (identity, refresh)
                     if key not in versions:
                         pin, ref = self._version(identity, refresh, context, directory)
-                        if not self.installed and pin not in context.page_pins:
+                        if (not self.installed or context.arena.plan.semantic_graph.input_groups) and pin not in context.page_pins:
                             # Admission pins belong to the request directory. Borrow
                             # the same exact version for this invocation's source view.
                             pin = next((candidate for candidate, release in context.page_pins.items()
@@ -107,15 +114,23 @@ class VllmActivationPatch:
                         if phase is HiddenPhase.DECODE:
                             raise RuntimeError("decode activation requires its first published injection")
                         continue
+                    if context.held_input is not None and not any(identity == held_identity and ref in refs
+                        for held_identity, refs, _ in context.held_input.successful):
+                        raise RuntimeError("HOLD injection differs from the last successful exact ref")
                     prepared.append(_PatchRows(torch.tensor(selected, device=context.arena.device, dtype=torch.long),
-                        tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields), selected, pin, ref))
+                        tuple(context.arena.borrow_field(pin, ref, field) for field in handle.binding.fields), selected, pin, ref,
+                        identity, context.injected_refs))
             handle.prepared = tuple(prepared)
 
     def selected(self, row: int, layer: int) -> bool:
         if not 0 <= row < self.row_count:
             raise ValueError("activation selection is outside its original packed rows")
         handle, = (handle for handle in self.layers if handle.binding.layer == layer)
-        return any(row in item.indices for item in handle.prepared)
+        for item in handle.prepared:
+            if row in item.indices:
+                item.used.setdefault(item.identity, set()).add(item.ref)
+                return True
+        return False
 
     def bind_pinned(self, resource: BorrowedResource, layer: int, owner: RegionPageOwner) -> PinnedResourceBinding:
         if (self.installed or len(resource.domain) != 1 or resource.domain[0] < self.row_count
@@ -136,7 +151,7 @@ class VllmActivationPatch:
         else:
             original = context.selection.ref_for(identity, self.resource)
         ref = context.current_owned_ref(original)
-        if refresh and ref == original:
+        if refresh and ref == original and context.held_input is None:
             # No implicit HOLD: its signed no-input branch is a separate lifecycle.
             raise RuntimeError("decode STEP requires a new publication; missing-input handling is not enabled")
         if ref == original:

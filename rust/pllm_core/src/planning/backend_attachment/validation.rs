@@ -568,6 +568,21 @@ fn validate_cross_binding(
 ) -> Result<(), String> {
     validate_request(request, probe)?;
     validate_probe(probe)?;
+    for group in &graph.input_groups {
+        let readers: Vec<_> = if request.attachment_kind == AttachmentKind::ModelReplay {
+            vec![task_for_dense_id(graph, &request.task_bindings[0])?.symbol.clone()]
+        } else { vec![] };
+        if request.activation_bindings.is_empty() || group.resource != request.state_resource
+            || group.allow_absent != request.activation_bindings.iter().all(|binding| binding.on_missing == MissingPolicy::Hold)
+            || group.readers != readers
+            || !matches!(request.attachment_kind, AttachmentKind::ActivationPatch | AttachmentKind::ModelReplay)
+            || request.task_bindings.iter().filter(|binding| binding.role != AttachmentTaskRole::Compute)
+                .any(|binding| task_for_dense_id(graph, binding).map_or(true, |task| !group.tasks.contains(&task.symbol)))
+            || task_for_dense_id(graph, request.task_bindings.last().unwrap())?.symbol != group.publication
+        {
+            return Err("conditional activation requires its exact inject producer group and pinned READ".into());
+        }
+    }
     let replay_tasks = graph
         .tasks
         .iter()

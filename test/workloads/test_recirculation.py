@@ -338,6 +338,20 @@ def _usage_composed_declaration_keeps_request_rows(facts, config, value) -> None
     instance_math = instance_composed._functions(instance_composed.declaration(facts), facts.device, facts.initialization_seed)
     assert request_math.rows(value) == value.rows.rows
     assert instance_math.rows(value) == ()
+    class HoldingRecurrence(ComposedRecurrence):
+        @property
+        def patch(self) -> pllm.Activation:
+            return replace(super().patch, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP,
+                on_missing=MissingPolicy.HOLD)
+    for workload, expected_rows in ((request_composed, value.rows.rows), (instance_composed, ())):
+        holding = HoldingRecurrence(workload.config)
+        definition = holding.declaration(facts)
+        binding, = definition.attachment.activation_bindings
+        assert (binding.decode, binding.decode_refresh, binding.on_missing) == (
+            DecodeWindow.ALL, DecodeRefresh.STEP, MissingPolicy.HOLD)
+        assert definition.graph.execution_parameters_digest != workload.declaration(facts).graph.execution_parameters_digest
+        assert holding._functions(definition, facts.device, facts.initialization_seed).rows(value) == expected_rows
+        assert not definition.graph.input_groups  # A policy alone cannot authorize missing borrowed roots.
 
 
 def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config, probe):
@@ -348,37 +362,42 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
     rotation = torch.tensor([[0.2, 0.0], [0.1, 0.3], [-0.1, 0.2], [0.4, -0.1]])
     tensors = ((delta,), (weight, bias, rotation))
     bindings = tuple(ActivationPatchBinding(layer, tuple(LayoutFieldId(i + offset) for i in range(len(fields))),
-        1, 1, operator, DecodeWindow.ALL, DecodeRefresh.STEP)
+        1, 1, operator, DecodeWindow.ALL, DecodeRefresh.STEP, MissingPolicy.HOLD)
         for layer, operator, offset, fields in ((0, ActivationPatchOperator.ADD, 0, tensors[0]), (2, ActivationPatchOperator.LOW_RANK_AFFINE, 1, tensors[1])))
     b = TensorBinding("owned.activation.replay", "a" * 64, Dimensions(4, 0, layer_count=3))
+    _, ports = b.parameters("features", {name: (2,) for name in ("qp", "residual", "mv", "segmentation")}, optimizer=None)
+    encoded = b.tensor("encode", inputs=ports, when=When.BEFORE_MODEL)(lambda values: sum(values.values()))
     fields = (delta, weight, bias, rotation)
     inject = b.state("inject", tuple(Field(str(i), tuple(tensor.shape)) for i, tensor in enumerate(fields)))
     def write(data, batch):
         return TaskOutput(field_writes=tuple((LayoutFieldId(i), tensor.unsqueeze(0)) for i, tensor in enumerate(fields)), changed=(0,), update_count=1)
-    update = b.compute("write", inputs={}, outputs=("updated",), changes=inject, effect=StateEffectKind.TRANSITION,
+    update = b.compute("write", inputs={"encoded": encoded["value"]}, outputs=("updated",), changes=inject, effect=StateEffectKind.TRANSITION,
         when=When.BEFORE_MODEL, function=write)
     publication = b.publish(update, inject, when=When.BEFORE_MODEL)
     b.overlay(inject, update, publication, activations=bindings)
     b.recurrence(config)
+    b.conditional_input(("features",))
     graph, layouts, spec = b.finish()
     reserve = attachment_buffer_bytes(probe, graph, layouts, spec)
     timeline = replace(RuntimeFacts(torch.device("cpu")).timeline(("model/tokenwise_replay@1", "transition/full_root@1")),
         region_policy=RegionSelectionPolicy(schedule_policy="serial"), reserved_bytes=(reserve,) * 8,
-        task_resources=(TaskResourceFact(TaskSymbol("publish"), 0), TaskResourceFact(TaskSymbol("write"), 512)),
-        value_resources=(ValueResourceFact(TaskSymbol("publish"), "publication", 0), ValueResourceFact(TaskSymbol("write"), "updated", 0)))
+        task_resources=(TaskResourceFact(TaskSymbol("encode"), 32), TaskResourceFact(TaskSymbol("publish"), 0), TaskResourceFact(TaskSymbol("write"), 512)),
+        value_resources=(ValueResourceFact(TaskSymbol("encode"), "value", 8), ValueResourceFact(TaskSymbol("publish"), "publication", 0), ValueResourceFact(TaskSymbol("write"), "updated", 0)))
     timeline = derive_attachment_resources(probe, graph, timeline, layouts=layouts, attachment=spec)
     plan = compile_page_bundle_plan((graph, layouts), timeline, (PageBundleProviderFacts("test.owned@1", 3),), 1, 65536, torch.device("cpu"))
     signed = bind_backend_attachment(plan, probe, spec)
     math = FunctionMath({"inject": lambda roots: None}, lambda value: (),
         lambda value, batch: TensorFrame(value, value.rows.rows), lambda data, result: result.publication)
-    execution = MathBinding(math, b.bind_all(plan, model_probe=probe)).bind(PageBundleArena(plan), signed.inputs.request.sampler_anchor_id)
+    execution = MathBinding(math, b.bind_all(plan, model_probe=probe), borrowed_resources=("features",)).bind(
+        PageBundleArena(plan, _owned_resources=("inject",)), signed.inputs.request.sampler_anchor_id)
     model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(forward=lambda *args: None) for _ in range(3)]))
     selector = VllmActivationPatch(model, bindings, "inject", install=False)
     assert all(handle.layer.forward is handle.original for handle in selector.layers)
     class BoundDecoder(decoder_type):
         def bind_activation(self, resource, layer, owner):
             binding = selector.bind_pinned(resource, layer, owner)
-            assert {proof.ref for proof in binding.view.proofs} == set(owner.publication.after_refs)
+            assert {proof.ref for proof in binding.view.proofs} == set(
+                owner.pin.refs if owner.held_input else owner.publication.after_refs)
             return binding
         def activation_selected(self, row, layer):
             return selector.selected(row, layer)
@@ -410,6 +429,10 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
             for ordinal in (1, 2):
                 hidden = layer(ordinal, hidden)  # New hidden, same affine parameters; no repeat of layer zero.
     execution.admit(())
+    from test.workloads.test_video import received_features
+    received = received_features(plan)
+    root, peers = received.__enter__()
+    execution.stage_readonly((root,))
     invocation = execution.start_step(value)
     execution.execute_anchor(invocation, AnchorId(0))
     identities = tuple(dict.fromkeys(row.identity for row in rows))
@@ -426,12 +449,36 @@ def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config
         torch.testing.assert_close(decoder.output, torch.stack(expected))
         torch.testing.assert_close(decoder.cache, expected_cache)
         assert execution.diagnostics().update_count == 1 and execution.diagnostics().fallback_count == 0
+        assert all(peer.poll() and peer.recv_bytes() == encode_boundary(page.descriptor).encode()
+            for peer, page in zip(peers, root.pages, strict=True))
+        # Re-run the same kernel oracle with a separately signed no-input invocation.
+        # Normal/replay retain the exact version, but recompute affine delta from new hidden.
+        decoder = BoundDecoder()
+        execution.stage_hold(identities, "absent", step_id=1)
+        held_rows = replace(value.rows, step_id=1)
+        held_value = replace(value, rows=held_rows, sampler_rows=replace(value.sampler_rows, row_batch=held_rows))
+        invocation = execution.start_step(held_value)
+        execution.execute_anchor(invocation, AnchorId(0))
+        assert invocation.context.publication is None and not invocation.context.results
+        selector.prepare(held_rows, invocation.context, execution.directory)
+        invocation.context.replay = decoder
+        for anchor in range(1, 8):
+            execution.execute_anchor(invocation, AnchorId(anchor))
+            if anchor == execution.sampler_anchor_id:
+                execution.complete_sampler(invocation)
+        selector.clear()
+        execution.finish_step(invocation)
+        torch.testing.assert_close(decoder.output, torch.stack(expected))
+        torch.testing.assert_close(decoder.cache, expected_cache)
+        assert execution.diagnostics().update_count == execution.diagnostics().hold_count == 1
+        assert not any(peer.poll() for peer in peers)
     finally:
         selector.close()
         if execution._active:
             execution.cancel_step(invocation)
         execution.retire(identities)
         execution.retire(())
+        received.__exit__(None, None, None)
 
 
 def _activation_declaration_retains_publication_and_costs(probe):
@@ -505,6 +552,43 @@ def _activation_declaration_retains_publication_and_costs(probe):
         1, 65536, torch.device("cpu"))
     signed = bind_backend_attachment(plan, probe, spec)
     assert signed.inputs.request.activation_bindings == (patch,)
+    b.conditional_input(("features",))
+    conditional = b.graph
+    group, = conditional.input_groups
+    conditional_plan = compile_page_bundle_plan((conditional, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),),
+        1, 65536, torch.device("cpu"))
+    assert bind_backend_attachment(conditional_plan, probe, spec).inputs.plan == conditional_plan
+    assert conditional_plan.schedule_decision.signature != plan.schedule_decision.signature
+    assert derive_attachment_resources(probe, conditional, timeline, layouts=layouts, attachment=spec) == funded
+    with pytest.raises(ValueError, match="signature|original|differ"):
+        bind_backend_attachment(replace(plan, semantic_graph=conditional), probe, spec)
+    for invalid in (replace(group, tasks=group.tasks[1:]), replace(group, resource="features"),
+        replace(group, borrowed_resources=()), replace(group, readers=()), replace(group, held_version="latest")):
+        with pytest.raises(ValueError, match="conditional|input group|variant"):
+            compile_schedule(replace(conditional, input_groups=(invalid,)), funded)
+    for invalid in (replace(spec, activation_bindings=(replace(patch, on_missing=MissingPolicy.STOP),)),
+        replace(spec, state_resource="features")):
+        with pytest.raises(ValueError, match="conditional activation"):
+            bind_backend_attachment(conditional_plan, probe, invalid)
+    hidden_write = replace(conditional, tasks=tuple(replace(item, effects=(*item.effects, inject.version()))
+        if item.symbol == encode.symbol else item for item in conditional.tasks))
+    with pytest.raises(ValueError, match="hidden writers"):
+        compile_schedule(hidden_write, funded)
+    for effects in ((features.version(),), (*task.effects, features.version())):
+        wrong_read = replace(conditional, tasks=tuple(replace(item, effects=effects)
+            if item.symbol == forward.symbol else item for item in conditional.tasks))
+        with pytest.raises(ValueError, match="conditional reader"):
+            compile_schedule(wrong_read, funded)
+    import json
+    from pllm import _core
+    payload = json.loads(encode_boundary(conditional))
+    del payload["input_groups"]
+    with pytest.raises(ValueError, match="missing field.*input_groups"):
+        _core.compile_schedule(json.dumps(payload), encode_boundary(funded), None)
+    payload = json.loads(encode_boundary(conditional))
+    payload["input_groups"][0]["skip_any_task"] = True
+    with pytest.raises(ValueError, match="unknown field"):
+        _core.compile_schedule(json.dumps(payload), encode_boundary(funded), None)
     all_reads = replace(graph, tasks=tuple(replace(item, effects=(*item.effects, features.version()))
         if item.symbol == forward.symbol else item for item in graph.tasks))
     read_plan = compile_page_bundle_plan((all_reads, layouts), funded, (PageBundleProviderFacts("test.replay@1", 3),),

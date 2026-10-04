@@ -204,7 +204,7 @@ def preempted_worker(probe, control, channels, workload, config):
         probe.close()
 
 
-def composed_worker(probe, control, channels, workload, config):
+def composed_worker(probe, control, channels, workload, config, *, versions=(1, 2, 3)):
     from pllm.backends.vllm.replay import VllmTokenwiseReplay
     from pllm.execution.exported_cell import ExportedCell
     from pllm.execution.replay import TokenwiseReplayTask, TOKENWISE_REPLAY_IMPLEMENTATION
@@ -223,7 +223,8 @@ def composed_worker(probe, control, channels, workload, config):
         assert all(handle.layer.forward == handle.original for handle in primitive.activation.layers)
         region = TokenwiseReplayTask.from_implementation(llm.deployment.execution.implementation(TOKENWISE_REPLAY_IMPLEMENTATION)).region
         assert region.activation_resources and any(resource.name.startswith("activation.") for resource in region.program.resources)
-        holder.update(llm=llm, session=session, primitive=primitive, region=region)
+        holder.update(llm=llm, session=session, primitive=primitive, region=region,
+            execution=llm.deployment.execution)
         return llm
     def issue(self, *args, **kwargs):
         if holder and self is holder["region"].execution:
@@ -235,8 +236,14 @@ def composed_worker(probe, control, channels, workload, config):
             hidden, delta = args
             step = holder["session"]._step
             context = step.invocation.context
-            ref, = context.publication.after_refs
-            original = context.arena.borrow_field(context.borrow_published((ref,)), ref, LayoutFieldId(0))
+            if context.held_input is None:
+                ref, = context.publication.after_refs
+                pin = context.borrow_published((ref,))
+            else:
+                assert not context.borrowed_roots and context.publication is None and not context.page_writes
+                ref, = context.pin.refs
+                pin = context.pin
+            original = context.arena.borrow_field(pin, ref, LayoutFieldId(0))
             assert delta.data_ptr() == original.data_ptr() and delta.untyped_storage().nbytes() == original.untyped_storage().nbytes()
             torch.testing.assert_close(result[0], hidden + delta.to(hidden.dtype), rtol=0, atol=0)
             calls.append((step.rows.step_id, int(ref.version_id)))
@@ -261,7 +268,7 @@ def composed_worker(probe, control, channels, workload, config):
             selected = sum(self.activation.selected(row.packed_row_index, workload.layer)
                 * (2 if row.phase.value == "prefill" and workload.layer > self.effect.destination_layer else 1) for row in self.rows)
             seen = [ref for step_id, ref in calls if step_id == step.rows.step_id]
-            assert len(seen) == selected and set(seen) == {step.rows.step_id + 1}
+            assert len(seen) == selected and set(seen) == {versions[step.rows.step_id]}
             completed.append(tuple(row.identity for row in self.rows))
         return original_finish(self, outputs)
     try:
@@ -269,10 +276,14 @@ def composed_worker(probe, control, channels, workload, config):
             patch.object(VllmTokenwiseReplay, "normalize", normalize), patch.object(VllmTokenwiseReplay, "finish", finish), \
             patch.object(RegionInstructionExecution, "_invoke", issue):
             consume(control, channels, workload, config)
-        assert len(completed) == 3 and len({identity for rows in completed for identity in rows}) == 1
+        assert len(completed) == len(versions) and len({identity for rows in completed for identity in rows}) == 1
         assert len([step for step, _ in calls if step == 0]) > 2  # Real prefill suffix replay also applied the same injection.
         region = holder["region"]
         assert len(streams) == (region.stream_plan.lanes if region.stream_plan is not None else 1)
+        # The llm handle closes with consume; the detached execution keeps its counters.
+        diagnostics = holder["execution"].diagnostics()
+        assert diagnostics.update_count == len(set(versions))
+        assert diagnostics.hold_count == len(versions) - len(set(versions)) and diagnostics.fallback_count == 0
         probe.send_bytes(b"composed-pins-hidden-normal-output-kv-ok")
     finally:
         probe.close()
@@ -347,15 +358,38 @@ def test_video_session_zero_copy_backpressure_and_ack_lifetime():
         probe.close()
         child_probe.close()
 
+    probe, child_probe = context.Pipe()
+    try:
+        with VideoSession(workload, config, steps=5,
+            worker=partial(composed_worker, child_probe, versions=(1, 1, 2, 2, 2))) as held:
+            child_probe.close()
+            held.submit(source[0])
+            held.missing()
+            held.submit(source[1])
+            held.missing(end=True)
+            results = [held.drain() for _ in range(5)]
+            assert [result.step_id for result in results] == list(range(5))
+            assert [result.updates for result in results] == [1, 1, 2, 2, 2]
+            assert [result.holds for result in results] == [0, 1, 1, 2, 3]
+            assert [result.missing for result in results] == [None, "absent", None, "end", "end"]
+            assert [result.ref is None for result in results] == [False, True, False, True, True]
+            assert all(result.fallback == 0 for result in results)
+        assert probe.poll(120) and probe.recv_bytes() == b"composed-pins-hidden-normal-output-kv-ok"
+        assert held.arena.active_lineages == held.arena.pending_pin_releases == 0
+    finally:
+        probe.close()
+        child_probe.close()
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real LLM/CUDA IPC requires a GPU")
 @pytest.mark.parametrize("mode", ("bad_ack", "exit", "drift"))
 def test_video_session_failure_retains_owner_without_fallback(mode):
     # The group's trailing CudaIPCTypes warning comes from deliberate process death; the isolated success path has none.
     frame, = frames(1)
-    with VideoSession(VideoWorkload(grid_size=2), model_config(), worker=partial(fault_worker, mode)) as session:
+    with VideoSession(VideoWorkload(grid_size=2), model_config(), steps=2, worker=partial(fault_worker, mode)) as session:
         with pytest.raises((EOFError, OSError, RuntimeError)):
             session.submit(frame)
+            session.missing(end=True)  # An explicit End cannot mask an ACK/transport integrity failure.
             session.drain()
         assert session.failed and session.arena.root(session.current).ref == session.current
         assert session.arena.usage().pinned_versions > 0
@@ -373,7 +407,7 @@ def test_video_session_failure_retains_owner_without_fallback(mode):
                 child_probe.close()
                 with pytest.raises((EOFError, OSError, RuntimeError)):
                     preempted.submit(frame)
-                    preempted.submit(frame)
+                    preempted.missing(end=True)
                     preempted.drain()
                 assert probe.poll(120)
                 assert b"per-decode activation injection and vLLM preemption cannot be enabled together" in probe.recv_bytes()

@@ -727,6 +727,24 @@ git diff --check
 工作区文件摘要和依赖版本。本轮没有自动提交或推送。检查是在这些工作区改动上运行，
 不是把基准 commit 本身当作本轮交付版本。
 
+## E3-α4：逐 decode 缺席策略（待本机 GPU 验收）
+
+在 α3 与作者面 `4e0f1a3` 基础上，视频负载增加签署的条件输入生产组。
+FRESH/HOLD 共用一个 invocation、完整静态 DAG 和保守预算；FRESH 的原始
+publication/READ 校验保留，HOLD 明确读取已成功的输入 pin，关闭 encode/write/publish。
+通用语义校验只处理闭包/资源/依赖，attachment 另验证签署 inject 与策略。
+新增图字段进入 Python/Rust 闭合 wire 与指纹；旧 wire 拒绝，需要重编译并重建 worker。
+
+例子使用真实 Connection 的显式 Absent/End，End 只保持当前请求；首版缺席、
+任一 STOP、完整性/ACK/别名故障和取消都不能转为成功保持。`hold_count` 只在
+收束后增加，真实写入才增加 update_count，保持不计 fallback。sampler/RNG
+算法与区域调度核心未改变，REQUEST rows 作者面挂账已经关闭。
+
+CPU 故事覆盖交替供给、exact pin、ACK 时序以及 HOLD normal/replay 算术/KV；
+原 GPU 用例扩展真实连接的 Fresh→Absent→Fresh→End 和故障/抢占拒绝，收集数
+不增加。新增 GPU 故事仍需本机复跑，不以本环境 CUDA 跳过声称通过。持续流的
+供给选择、FIFO/跳帧归 E3-β；没有等待策略或历史 KV 版本仓库。
+
 ## 接下来按什么顺序完成整体功能
 
 | 顺序 | 工作 | 完成条件 |

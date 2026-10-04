@@ -32,7 +32,7 @@ from pllm.execution.scheduler import validate_plan_bundle
 from pllm.workloads.video import VideoWorkload, frame_features
 
 if TYPE_CHECKING:
-    from pllm.backends.vllm.runtime import ReadonlyStepInput
+    from pllm.backends.vllm.runtime import ReadonlyStepInput, ReadonlyStepAbsent, ReadonlyStepEnd
 
 Channels = tuple[tuple[Connection, ...], ...]
 
@@ -50,11 +50,25 @@ class VideoRun:
 
 
 @dataclass(frozen=True)
+class InputGap:
+    step_id: int
+    end: bool
+
+
+@dataclass(frozen=True)
+class VideoInput:
+    value: Chunk | InputGap
+
+
+@dataclass(frozen=True)
 class VideoResult:
-    ref: StateRef
+    ref: StateRef | None
     text: str
     updates: int
     fallback: int
+    step_id: int
+    holds: int
+    missing: str | None
 
 
 @dataclass(frozen=True)
@@ -70,25 +84,41 @@ class _StepReceiver:
     def __init__(self, control: Connection, channels: Channels,
                  execution: StateExecution[TensorStepInput, TensorFrame, TensorOutput]) -> None:
         self.control, self.channels, self.execution = control, channels, execution
-        self.pending: Chunk | None = None
-        self.previous: StateRef | None = None
+        self.pending: Chunk | InputGap | None = None
+        self.previous: tuple[int, StateRef | None, str | None] | None = None
+        self.ended_for: tuple[object, ...] = ()
         self.partial: list[BorrowedPage] = []
 
     def report(self, text: str = "") -> None:
         if self.previous is not None:
             diagnostics = self.execution.diagnostics()
-            self.control.send_bytes(encode_boundary(VideoResult(self.previous, text,
-                diagnostics.update_count, diagnostics.fallback_count)).encode())
+            step_id, ref, missing = self.previous
+            self.control.send_bytes(encode_boundary(VideoResult(ref, text,
+                diagnostics.update_count, diagnostics.fallback_count, step_id, diagnostics.hold_count, missing)).encode())
             self.previous = None
 
-    def __call__(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> "ReadonlyStepInput":
-        from pllm.backends.vllm.runtime import ReadonlyStepInput
+    def __call__(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> "ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd":
+        from pllm.backends.vllm.runtime import ReadonlyStepInput, ReadonlyStepAbsent, ReadonlyStepEnd
         # The preceding step has settled before this next prepare boundary.
         self.report()
         chunk = self.pending
         self.pending = None
+        identities = tuple(rows.identities)
+        if self.ended_for and identities != self.ended_for:
+            self.ended_for = ()  # A new request must supply a fresh first version.
         if chunk is None:
-            chunk = decode_boundary(self.control.recv_bytes().decode(), Chunk)
+            chunk = InputGap(rows.step_id, True) if self.ended_for else decode_boundary(
+                self.control.recv_bytes().decode(), VideoInput).value
+        if self.partial or chunk.step_id != rows.step_id:
+            raise ValueError("video input differs from the exact step or has partial received grants")
+        if isinstance(chunk, InputGap):
+            self.previous = rows.step_id, None, "end" if chunk.end else "absent"
+            if chunk.end:
+                self.ended_for = identities
+            outcome = ReadonlyStepEnd if chunk.end else ReadonlyStepAbsent
+            return outcome(rows.plan_epoch, rows.step_id)
+        if self.ended_for:
+            raise ValueError("video received a new grant after the current request's End")
         if not 0 <= chunk.slot < len(self.channels) or self.partial:
             raise ValueError("video step requires its original complete grant slot")
         plan = self.execution.arena.plan
@@ -96,7 +126,7 @@ class _StepReceiver:
             self.partial.append(PageBundleArena.receive_field(plan, channel, stream=stream))
         root = BorrowedStateRoot(plan, "features", chunk.ref, tuple(self.partial))
         self.partial.clear()
-        self.previous = chunk.ref
+        self.previous = chunk.step_id, chunk.ref, None
         return ReadonlyStepInput(plan.schedule_physical.plan_epoch, chunk.step_id, (root,))
 
 
@@ -113,7 +143,7 @@ def consume(control: Connection, channels: Channels, workload: VideoWorkload, co
             receiver = _StepReceiver(control, channels, execution)
             llm.runner.require_session().bind_readonly_input(receiver)
             while (payload := control.recv_bytes()) != b"stop":
-                receiver.pending = decode_boundary(payload.decode(), Chunk)
+                receiver.pending = decode_boundary(payload.decode(), VideoInput).value
                 outputs = llm.generate(["Describe the scene in this video frame:"],
                     SamplingParams(max_tokens=run.steps, temperature=0.0, ignore_eos=True))
                 if len(outputs[0].outputs[0].token_ids) != run.steps:
@@ -142,6 +172,7 @@ class VideoSession:
         self.timeout, self.workload = timeout, workload
         self.steps = steps
         self.pending: deque[Pending] = deque()
+        self._reports: deque[tuple[int, StateRef | None, str | None]] = deque()
         self.failed = False
         self.stream: torch.cuda.Stream | None = None
         self._previous: torch.Tensor | None = None
@@ -182,7 +213,9 @@ class VideoSession:
         assert self.stream is not None
         try:
             # Bound even completed-but-uncollected records by signed capacity (GPU backpressure test).
-            completed = self.drain() if len(self.pending) == len(self.channels) else None
+            completed = None
+            while len(self.pending) == len(self.channels):
+                completed = self.drain()
             write = self.arena.prepare_transition((self.current,), self.stream, copy_fields=())
             try:
                 with torch.cuda.stream(self.stream):
@@ -199,27 +232,50 @@ class VideoSession:
             self.current, = publication.after_refs
             pin = self.arena.pin_exact((self.current,), self.stream)
             slot = self._sequence % len(self.channels)
-            self.control.send_bytes(encode_boundary(Chunk(slot, self.current, self._sequence)).encode())
+            self.control.send_bytes(encode_boundary(VideoInput(Chunk(slot, self.current, self._sequence))).encode())
             assert self.process.pid is not None
             fields = tuple(self.arena.send_field(pin, self.current, LayoutFieldId(index), channel, self.process.pid)
                 for index, channel in enumerate(self.channels[slot]))
             self.pending.append(Pending(self.current, self.arena.release_pin(pin), fields))
+            self._reports.append((self._sequence, self.current, None))
             self._sequence += 1
             return completed
         except BaseException:
             self.failed = True
             raise
 
+    @property
+    def pending_steps(self) -> int:
+        return len(self._reports)
+
+    def missing(self, *, end: bool = False) -> None:
+        """Explicit next-step evidence, never inferred from a timeout or an empty queue."""
+        if self.failed:
+            raise RuntimeError("video session is fail-stopped")
+        try:
+            self.control.send_bytes(encode_boundary(VideoInput(InputGap(self._sequence, end))).encode())
+            count = self.steps - self._sequence % self.steps if end else 1
+            for _ in range(count):
+                self._reports.append((self._sequence, None, "end" if end else "absent"))
+                self._sequence += 1
+        except BaseException:
+            self.failed = True
+            raise
+
     def drain(self) -> VideoResult:
-        if self.failed or not self.pending:
+        if self.failed or not self._reports:
             raise RuntimeError("video session has no consumable pending chunk")
         try:
             result = decode_boundary(self._receive().decode(), VideoResult)
-            pending = self.pending[0]
-            if result.ref != pending.ref or result.fallback:
+            if (result.step_id, result.ref, result.missing) != self._reports[0] or result.fallback:
                 raise RuntimeError("video worker did not consume the original exact chunk without fallback")
-            self.arena.wait_release(pending.release)
-            self.pending.popleft()
+            if result.ref is not None:
+                pending = self.pending[0]
+                if result.ref != pending.ref:
+                    raise RuntimeError("video report differs from its outstanding grant")
+                self.arena.wait_release(pending.release)
+                self.pending.popleft()
+            self._reports.popleft()
             return result
         except BaseException:
             self.failed = True
@@ -231,7 +287,7 @@ class VideoSession:
                 if self._sequence % self.steps:
                     self.failed = True
                     raise RuntimeError("video ended before all explicitly scheduled decode inputs were supplied")
-                while self.pending:
+                while self._reports:
                     self.drain()
                 self.control.send_bytes(b"stop")
                 self.process.join(self.timeout)
@@ -286,11 +342,15 @@ def main() -> None:
     workload = VideoWorkload()
     with VideoSession(workload, ModelConfig(args.model, max_model_len=64, max_num_seqs=1,
         max_num_batched_tokens=64, gpu_memory_utilization=0.25), steps=args.chunks) as session:
+        supplied = 0
         for frame in video_frames(args.video, workload.grid_size, args.chunks):
             result = session.submit(frame)
+            supplied += 1
             if result is not None:
                 print(result)
-        while session.pending:
+        if supplied < args.chunks:
+            session.missing(end=True)  # Normal iterator exhaustion, never a decoder/transport exception.
+        while session.pending_steps:
             print(session.drain())
 
 

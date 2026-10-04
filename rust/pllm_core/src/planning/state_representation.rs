@@ -397,7 +397,7 @@ mod tests {
         for late_read in [false, true] {
             let graph = decode_graph(&json!({
                 "schema_version": 1, "workload_id": "joint", "execution_parameters_digest": "c".repeat(64),
-                "edges": [], "states": (["state", "unused"].map(|resource| json!({
+                "input_groups": [], "edges": [], "states": (["state", "unused"].map(|resource| json!({
                     "resource": resource, "scope": "instance", "key_fields": []}))),
                 "tasks": (["read", "update"].iter().enumerate().map(|(task, kind)| {
                     let at = usize::from((task == 0) == late_read);
