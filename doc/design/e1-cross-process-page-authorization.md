@@ -49,6 +49,32 @@ E1 的任务：让一个真实负载以文档化最佳实践的方式使用这�
 反向出口同样合法：如果充分探索后确认不存在诚实的消费者（所有候选集成点都是在为用而用），
 则交付物改为"带证据的删除提案"。优雅是选择不做什么；保留机制必须有真实负载作证。
 
+## 路线裁决（2026-10-04，用户给出真实场景后定案）
+
+GPT6 第一轮考察（`docs/e1-plan-gpt6.md`，9 个候选集成点逐一排除）曾建议走反向出口。
+随后用户给出真实业务场景：**编码域视觉编码器**——不抽 RGB 帧，直接消费 AV1 码流与
+NVDEC 中间信息（QP map、残差能量、MV 幅度、segmentation map），输出 hidden state 加回
+残差流。该场景是只读授权的诚实消费者：摄取进程快于 LLM 步进，特征页需要有界积压 +
+精确回收（pin 释放前不得回收 chunk 槽位），签署容量即背压；SharedTensor 无版本纪律，
+snapshot clone 是每步真实拷贝。
+
+裁决（Claude 选择，用户授权）：
+
+- **保留**：send_field/receive_field（READ）、PageFieldTransfer、BorrowedPage、
+  RemoteCompletion、generation/签名/能力校验。
+- **删除**：send_write_field 与远程写授权全部簿记（remote_writes、一字段一写规则、
+  PageAccess.WRITE；枚举塌缩删除 PageAccess）、CPU shared_memory provider
+  （TemporaryFile+mmap 池、send_handle/recv_handle）——新场景同为 CUDA 只读，写授权与
+  CPU 共享路径仍零消费者。
+- **E1 实现范围**：最小但真实的视频会话负载——摄取侧 arena 持特征状态（四个声明字段、
+  chunk 版本、签署容量背压），worker 经 READ grant 消费，编码器（worker 内普通 pLLM
+  操作，`Parameter` 源读特征字段）写 `Activation ADD` 注入缓冲。真实张量、真实版本
+  纪律、真实 CUDA IPC。
+- **明确不在 E1**：生产级 AV1 码流解析与 NVDEC 摄取管线、完整视觉编码器——属第 3 步
+  计划讨论（P5）的动机负载，不得在 E1 预埋接口。
+- 既有机制覆盖、不得重造：残差注入用 `ActivationPatchOperator.ADD`；跨状态读字段用
+  `Parameter(state, field)`；普通输入输出走 SharedTensor/CudaIpcStorage。
+
 ## 现状事实
 
 - `send_field`（`pllm/execution/ptts/page_bundle.py:799`）：导出一个已 pin 字段的只读授权。
@@ -121,5 +147,5 @@ E1 的任务：让一个真实负载以文档化最佳实践的方式使用这�
 | CPU 消费测试 | `test/boundary/test_shared_page.py`（含 mp 编解码、事务原子性） |
 | CUDA 消费测试 | `test/gpu/test_page_bundle_cuda.py:397,460` |
 | worker 重建协议 | `test/boundary/test_worker_reconstruction.py`（transport_payload / transport_rebuild / 签名校验） |
-| EngineCore 集成 | `pllm/backends/vllm/runtime.py:926,1259`；冒烟 `test/gpu/enginecore_smoke.py` |
-| 候选负载 | `pllm/workloads/inplace_ttt.py`、`pllm/execution/learning.py` |
+| EngineCore 集成 | `pllm/backends/vllm/runtime.py:926,1259`；冒烟 `test/gpu/enginecore_smoke.py`（fallback=0）、`test/gpu/vllm_recirculation_smoke.py`（fallback=0、issued_streams=2） |
+| 候选负载 | `pllm/workloads/inplace_ttt.py`、`pllm/learning.py` |
