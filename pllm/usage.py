@@ -1,7 +1,7 @@
 """Cold Python authoring boundary. Reflection stops at the original typed graph."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from inspect import Parameter as SignatureParameter, signature
 from types import FunctionType, MethodType
@@ -165,6 +165,7 @@ class Activation:
     first_tokens: int = 0
     last_tokens: int = 2
     operator: ActivationPatchOperator = ActivationPatchOperator.LOW_RANK_AFFINE
+    _: KW_ONLY
     decode: DecodeWindow = DecodeWindow.NONE
     decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT
     on_missing: MissingPolicy = MissingPolicy.STOP
