@@ -699,8 +699,13 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
                 raise ValueError("logits attachment requires a training operation")
             call, sampler = prediction
             b.logits(call, *training, stage=sampler.stage, beta=_setting(sampler.beta, owner, float))
-        if any(isinstance(value, Recurrence) for value in values.values()) and (len(b.graph.tasks) != 1 or b.graph.states):
-            raise ValueError("tokenwise recurrence requires a standalone model effect")
+        if any(isinstance(value, Recurrence) for value in values.values()):
+            attachment = b.attachment
+            composed = (attachment is not None and attachment.activation_bindings
+                and {state.resource for state in b.graph.states} == {attachment.state_resource}
+                and {task.symbol for task in b.graph.tasks} == {symbol for _, symbol in attachment.tasks})
+            if not composed and (len(b.graph.tasks) != 1 or b.graph.states):
+                raise ValueError("tokenwise recurrence requires a standalone model effect")
         declared = {state.resource for state in b.graph.states}
         if any(name not in declared for name, value in values.items() if isinstance(value, InstanceState)):
             raise ValueError("state buffers require an overlay effect; unused state is not allocated")
@@ -753,10 +758,10 @@ class Workload(NativeMath, BackendWorkload[TensorFrame, TensorOutput],
         def rows(value: TensorStepInput) -> tuple[PackedPhaseRow, ...]:
             if b.probe is not None and value.rows.total_rows > b.probe.max_packed_rows:
                 raise ValueError("packed input exceeds the signed backend row capacity")
+            if b.attachment is not None and b.attachment.activation_bindings:
+                return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             if b.attachment is not None and b.attachment.kind is AttachmentKind.MODEL_REPLAY:
                 return ()
-            if b.attachment is not None and b.attachment.kind is AttachmentKind.ACTIVATION_PATCH:
-                return value.rows.rows if b.graph.states[0].scope is StateScope.REQUEST else ()
             return value.rows.request_rows if b.overlay_targets else value.rows.decode_rows
         return FunctionMath({str(state.resource): initializer(str(state.resource)) for state in b.graph.states},
             rows, b.bind_prepare(), output)

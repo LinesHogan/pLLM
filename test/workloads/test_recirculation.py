@@ -34,7 +34,7 @@ from pllm.contracts.backend_attachment import ActivationPatchBinding, Activation
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, TaskResourceFact, TaskSymbol, ValueResourceFact
+from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, StateScope, TaskResourceFact, TaskSymbol, ValueResourceFact
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.config import ExecutionOptions
@@ -89,6 +89,7 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
         i if i < 3 else 0, HiddenPhase.PREFILL if i < 3 else HiddenPhase.DECODE, identities[int(i == 3)])
         for i in range(4)))
     value = TensorStepInput(rows, PackedSamplerRowBatch(rows, (PackedSamplerRowLink(0, 2), PackedSamplerRowLink(1, 3))))
+    _usage_composed_declaration_keeps_request_rows(facts, config, value)
     wrong_epoch = replace(rows, plan_epoch=2)
     with pytest.raises(ValueError, match="signed epoch"):
         execution.start_step(replace(value, rows=wrong_epoch, sampler_rows=replace(value.sampler_rows, row_batch=wrong_epoch)))
@@ -314,6 +315,29 @@ def test_recirculation_selects_rows_and_replays_typed_effect() -> None:
         with pytest.raises(ValueError):
             RecirculationWorkload(invalid).compile_backend(facts)
     _activation_source_matches_serial_oracle(Decoder, value, inputs, config, probe)
+
+
+def _usage_composed_declaration_keeps_request_rows(facts, config, value) -> None:
+    from pllm.workloads.reft import ActivationConfig, ActivationWorkload
+
+    class ComposedRecurrence(ActivationWorkload):
+        @property
+        def recurrence(self) -> pllm.Recurrence:
+            return config
+
+    request_composed = ComposedRecurrence(ActivationConfig((1,), 2, first_tokens=1, last_tokens=1,
+        operator=ActivationPatchOperator.ADD, scope=pllm.StateScope.REQUEST))
+    graph, _, spec = request_composed.declare(facts)
+    state, = graph.states
+    assert spec.kind is AttachmentKind.MODEL_REPLAY and len(spec.activation_bindings) == 1
+    assert state.scope is StateScope.REQUEST and state.resource == spec.state_resource
+    assert {task.symbol for task in graph.tasks} == {symbol for _, symbol in spec.tasks}
+    instance_composed = ComposedRecurrence(replace(request_composed.config, scope=pllm.StateScope.INSTANCE))
+    # The usage-level checkpoint rows follow the signed activation, not the replay kind.
+    request_math = request_composed._functions(request_composed.declaration(facts), facts.device, facts.initialization_seed)
+    instance_math = instance_composed._functions(instance_composed.declaration(facts), facts.device, facts.initialization_seed)
+    assert request_math.rows(value) == value.rows.rows
+    assert instance_math.rows(value) == ()
 
 
 def _activation_source_matches_serial_oracle(decoder_type, value, inputs, config, probe):
