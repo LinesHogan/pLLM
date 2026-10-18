@@ -727,7 +727,7 @@ git diff --check
 工作区文件摘要和依赖版本。本轮没有自动提交或推送。检查是在这些工作区改动上运行，
 不是把基准 commit 本身当作本轮交付版本。
 
-## E3-α4：逐 decode 缺席策略（待本机 GPU 验收）
+## E3-α4：逐 decode 缺席策略（已关账，34473b0，2026-10-05）
 
 在 α3 与作者面 `4e0f1a3` 基础上，视频负载增加签署的条件输入生产组。
 FRESH/HOLD 共用一个 invocation、完整静态 DAG 和保守预算；FRESH 的原始
@@ -742,8 +742,13 @@ publication/READ 校验保留，HOLD 明确读取已成功的输入 pin，关闭
 
 CPU 故事覆盖交替供给、exact pin、ACK 时序以及 HOLD normal/replay 算术/KV；
 原 GPU 用例扩展真实连接的 Fresh→Absent→Fresh→End 和故障/抢占拒绝，收集数
-不增加。新增 GPU 故事仍需本机复跑，不以本环境 CUDA 跳过声称通过。持续流的
-供给选择、FIFO/跳帧归 E3-β；没有等待策略或历史 KV 版本仓库。
+不增加。本机验收已通过：完整套件 631 passed、release wheel、cargo、typing、
+layers/authority、双冒烟及视频 5 用例（含单请求四步、组合三步、HOLD 五步、
+抢占互斥）。持续流的供给选择、FIFO/跳帧归 E3-β；没有等待策略或历史 KV 版本
+仓库。
+
+E3-α 五步全部关账：作者面 `ccfcdfd`/`fd3cd47`、契约 `4ab9d5e`、执行
+`91afb73`、源码组合 `3efbf6e`、作者面收窄 `4e0f1a3`、缺席策略 `34473b0`。
 
 ## 接下来按什么顺序完成整体功能
 
