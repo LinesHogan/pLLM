@@ -73,8 +73,8 @@ from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.region_replay import ConditionalReplayRegion
 from pllm.execution.replay import REPLAY_IMPLEMENTATION, ReplayStateTask, TokenwiseReplayTask
 from pllm.execution.state_execution import ConditionalProducerTask, PublishStateTask, StateTaskContext
-from pllm.execution.tensor_program import TaskOutput, TensorBatch, TensorOperation
-from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
+from pllm.execution.tensor_program import PoolAdamW, TaskOutput, TensorBatch, TensorOperation
+from pllm.kernels.adamw import AdamWConfig
 
 D = TypeVar("D")
 
@@ -323,16 +323,7 @@ class Builder(Generic[D]):
                 copy_fields = tuple(
                     LayoutFieldId(i) for i in range(len(changes.fields)) if i >= changes.optimizer_fields or i % 5 != 1
                 )
-
-                def update(roots: tuple[tuple[torch.Tensor, ...], ...], gradients: tuple[torch.Tensor, ...]) -> None:
-                    apply_adamw(
-                        tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(groups)),
-                        AdamWFields(*(LayoutFieldId(i) for i in range(5))),
-                        config,
-                        gradients,
-                    )
-
-                optimizer = update
+                optimizer = PoolAdamW(config, groups)
             self.operations[task.symbol] = TensorOperation(
                 implementations[0].implementation_id,
                 function,

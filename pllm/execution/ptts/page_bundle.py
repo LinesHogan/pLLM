@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -140,6 +141,10 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     def __len__(self) -> int:
         return len(self._roots)
 
+    def field_slots(self, field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """The field's page pool and each state's slot in it, from the access validated at creation."""
+        return self._arena._slots_of(self._roots, LayoutFieldId(field))  # pyright: ignore[reportPrivateUsage]
+
     @overload
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
 
@@ -185,7 +190,7 @@ class _Pools:
     def allocate(self, field: int) -> PageSlot:
         if not self.free[field]:
             raise RuntimeError("PageBundle capacity is exhausted")
-        slot = self.free[field].pop(0)
+        slot = heapq.heappop(self.free[field])
         self.users[field][slot] = 1
         return PageSlot(slot, self.generations[field][slot])
 
@@ -196,12 +201,13 @@ class _Pools:
 
     def release(self, pages: tuple[PageSlot, ...]) -> None:
         for field, page in enumerate(pages):
-            self.tensor(field, page)
+            if self.generations[field][page.slot_id] != page.generation or self.users[field][page.slot_id] < 1:
+                raise RuntimeError("PageBundle allocation generation was reclaimed")
             self.users[field][page.slot_id] -= 1
             if self.users[field][page.slot_id] == 0:
                 self.generations[field][page.slot_id] += 1
-                self.free[field].append(page.slot_id)
-                self.free[field].sort()
+                # A min-heap keeps allocation smallest-slot-first without re-sorting.
+                heapq.heappush(self.free[field], page.slot_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,7 +716,13 @@ class PageBundleArena:
         """
         with self._lock:
             self._require_live()
-            roots = self._held_roots(access, refs)
+            return self._slots_of(self._held_roots(access, refs), field)
+
+    def _slots_of(
+        self, roots: tuple[tuple[PageBundle, frozenset[int] | None], ...], field: LayoutFieldId
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        with self._lock:
+            self._require_live()
             if any(writable is not None and int(field) not in writable for _, writable in roots):
                 raise RuntimeError("PageBundle field is not writable in this transaction")
             if len({root.resource for root, _ in roots}) != 1:

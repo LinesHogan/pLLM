@@ -17,11 +17,12 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
-from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
+from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.page_capture import KernelCapture
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.trace import TracePhase
+from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adamw
 from pllm.kernels.paged_linear import PagedRows, TensorRows
 
 I = TypeVar("I")
@@ -184,7 +185,7 @@ def _read(context: StateTaskContext[D], version: Literal["input", "private", "pu
         paged=lambda fields, rows: context.arena.paged_rows(
             access, refs, tuple(LayoutFieldId(field) for field in fields), rows
         ),
-        field_slots=lambda field: context.arena.field_slots(access, refs, LayoutFieldId(field)),
+        field_slots=roots.field_slots,
     )
 
 
@@ -232,6 +233,37 @@ class FunctionMath(Generic[I, D, R]):
                 None if value is None else value.detach(),
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PoolAdamW:
+    """AdamW over a state's optimizer fields, five fields per parameter group.
+
+    On CUDA with one fp32 group it updates the page pools in place through the write's slots,
+    so the cost does not grow with a Python loop over states; otherwise it updates per-state views.
+    """
+
+    config: AdamWConfig
+    groups: int
+
+    def __call__(self, roots: Sequence[tuple[torch.Tensor, ...]], gradients: tuple[torch.Tensor, ...]) -> None:
+        apply_adamw(
+            tuple(root[5 * group : 5 * group + 5] for root in roots for group in range(self.groups)),
+            AdamWFields(*(LayoutFieldId(i) for i in range(5))),
+            self.config,
+            gradients,
+        )
+
+    def update_pages(self, arena: PageBundleArena, write: PageWrite, gradients: tuple[torch.Tensor, ...]) -> bool:
+        """Update in the pools when possible; False means the caller must use per-state views."""
+        if self.groups != 1 or arena.device.type != "cuda" or gradients[0].dtype != torch.float32:
+            return False
+        roots = arena.lazy_roots((write,) * len(write.after_refs), write.after_refs)
+        fields = tuple(roots.field_slots(i) for i in range(5))
+        pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
+        slots = torch.tensor([slots for _, slots in fields], dtype=torch.long, device=arena.device)
+        paged_adamw(pools, slots, torch.stack(gradients).reshape(len(gradients), -1), self.config)
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,7 +337,11 @@ class TensorOperation(Generic[D]):
                 context.write = context.arena.prepare_transition(
                     tuple(context.pin.refs[i] for i in selected), stream, copy_fields=self.copy_fields
                 )
-                self.optimizer(context.arena.writable_roots(context.write), output.gradients)
+                if not (
+                    isinstance(self.optimizer, PoolAdamW)
+                    and self.optimizer.update_pages(context.arena, context.write, output.gradients)
+                ):
+                    self.optimizer(context.arena.writable_roots(context.write), output.gradients)
             if output.field_writes:
                 if context.write is None:
                     raise ValueError("memory writes require the invocation's private transition")

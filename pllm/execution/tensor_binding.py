@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite, prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 import torch
 
@@ -292,6 +292,29 @@ def _state_rows(batch: TensorBatch, field: int) -> torch.Tensor:
     if len(slots) == 1:
         return pool[slots[0] : slots[0] + 1]
     return pool.index_select(0, torch.tensor(slots, dtype=torch.long, device=pool.device))
+
+
+class _LeafRoots(Sequence[tuple[torch.Tensor, ...]]):
+    """State roots whose first field reads the differentiable leaf; other fields are borrowed lazily."""
+
+    __slots__ = ("_leaf", "_roots")
+
+    def __init__(self, leaf: torch.Tensor, roots: Sequence[tuple[torch.Tensor, ...]]) -> None:
+        self._leaf, self._roots = leaf, roots
+
+    def __len__(self) -> int:
+        return len(self._roots)
+
+    @overload
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[tuple[torch.Tensor, ...], ...]: ...
+
+    def __getitem__(self, index: int | slice) -> tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor, ...], ...]:
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        return (self._leaf[index], *self._roots[index][1:])
 
 
 def state_leaf(data: "TensorFrame", batch: TensorBatch) -> torch.Tensor:
@@ -1211,9 +1234,7 @@ class TensorBinding(Builder[TensorFrame]):
                 def values(data: TensorFrame, batch: TensorBatch) -> tuple[dict[str, torch.Tensor], tuple[int, ...]]:
                     if policy.parameter_gradients:
                         leaf = state_leaf(data, batch)
-                        batch = replace(
-                            batch, roots=tuple((leaf[index], *root[1:]) for index, root in enumerate(batch.roots))
-                        )
+                        batch = replace(batch, roots=_LeafRoots(leaf, batch.roots))
                     inputs = {key: ports[key].read(data, batch) for key in domains}
                     for key in domains:
                         mask = inputs[key]

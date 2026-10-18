@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import pllm
-import pllm.execution.declaration as declaration
+import pllm.execution.tensor_program as tensor_program
 from pllm import _core
 from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
 from pllm.contracts.request_identity import RequestIdentity
@@ -107,7 +107,8 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(monkey
     def forbidden(*args, **kwargs):
         raise AssertionError("completion update used legacy mathematics or compiled on the request path")
 
-    monkeypatch.setattr(declaration, "apply_adamw", forbidden)
+    monkeypatch.setattr(tensor_program, "apply_adamw", forbidden)
+    monkeypatch.setattr(tensor_program, "paged_adamw", forbidden)
     for name in (
         "analyze_region_program",
         "lower_region_schedule",
